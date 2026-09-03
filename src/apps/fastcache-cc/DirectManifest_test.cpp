@@ -454,6 +454,116 @@ TEST_CASE("ParseIncludePaths ignores a marker that is not the start of the line"
     CHECK(ParseIncludePaths("char const* s = \"Note: including file: /usr/include/a.h\";\n").empty());
 }
 
+namespace
+{
+/// `/showIncludes` output as a Visual Studio carrying a language pack prints it.
+///
+/// Synthesised rather than captured, and the SHAPES are the point rather than the
+/// words. What a translated prefix does to a reader of these streams turns on three
+/// properties none of these locales shares with English: a different prefix, a
+/// different NUMBER of colons inside it (German has two), and a script with no ASCII
+/// before the path at all (Japanese). A fixture carrying only a German line would
+/// pass a fix that assumed one colon.
+///
+/// The paths are identical across all three, so a test comparing what was extracted
+/// is comparing the reader rather than the fixture.
+struct LocalizedNotes
+{
+    std::string_view language; ///< Named in failures, so a red case says which shape broke.
+    std::string_view text;     ///< The captured stream.
+};
+
+constexpr std::string_view EnglishNotes = "Note: including file: C:\\proj\\src\\a.hpp\r\n"
+                                          "Note: including file:  C:\\proj\\src\\b.hpp\r\n";
+
+// German's prefix carries a colon of its own, so a rule reading the FIRST colon
+// splits inside the prefix and one reading the last splits inside `C:`.
+constexpr std::string_view GermanNotes = "Hinweis: Einlesen der Datei:  C:\\proj\\src\\a.hpp\r\n"
+                                         "Hinweis: Einlesen der Datei:   C:\\proj\\src\\b.hpp\r\n";
+
+// Japanese has no ASCII before the path, which defeats any rule reaching for an
+// English word rather than for the shape.
+constexpr std::string_view JapaneseNotes = "\xE3\x83\xA1\xE3\x83\xA2: \xE3\x82\xA4\xE3\x83\xB3\xE3\x82\xAF\xE3\x83\xAB"
+                                           "\xE3\x83\xBC\xE3\x83\x89 \xE3\x83\x95\xE3\x82\xA1\xE3\x82\xA4\xE3\x83\xAB: "
+                                           "C:\\proj\\src\\a.hpp\r\n";
+
+/// The two localized streams, spelled once because both cases below walk them.
+constexpr std::array<LocalizedNotes, 2> Localized { {
+    { .language = "German", .text = GermanNotes },
+    { .language = "Japanese", .text = JapaneseNotes },
+} };
+} // namespace
+
+TEST_CASE("A localized cl reports its dependencies and the launcher reads none of them")
+{
+    // Issue #692, exercised rather than argued. This is the state an entire machine
+    // is in when its Visual Studio carries a language pack: the compiler reported
+    // every dependency, and `ParseIncludePaths` -- which matches the literal English
+    // `IncludeNoteMarker` -- extracts nothing from any of them.
+    //
+    // The case pins TODAY's answer rather than a repaired one, deliberately. The fix
+    // for #692 does not teach this parser to read German: it forces English on the
+    // one spawn whose output nobody sees (`VSLANG=1033` on the probe) and leaves
+    // user-visible diagnostics in the operator's language, so a localized stream
+    // stays unreadable BY DESIGN and the launcher's job is to know that it is. A
+    // parser that started returning paths here would mean somebody had loosened the
+    // recognition rule, which `SplitIncludeNotes` shares over a stream carrying
+    // preprocessed source -- the case above says what that deletes.
+    //
+    // English first, so the fixture is shown to be well formed. Without it two empty
+    // answers agree perfectly and the loop below passes for a stream that never
+    // carried a note at all.
+    CHECK(ParseIncludePaths(EnglishNotes).size() == 2);
+
+    for (auto const& [language, text]: Localized)
+    {
+        INFO("locale: " << language);
+        CHECK(ParseIncludePaths(text).empty());
+    }
+}
+
+TEST_CASE("An unreadable dependency note is a different state from no note at all")
+{
+    // The half of #692 an operator actually meets. Reported as one empty set, "this
+    // build asked for no dependencies" and "this machine's compiler answered in a
+    // language the launcher does not read" render identically, and the single
+    // sentence the launcher printed -- "the compile reported no dependencies" -- was
+    // true about what it observed and false about the world.
+    for (auto const& [language, text]: Localized)
+    {
+        INFO("locale: " << language);
+        CHECK(CarriesUnreadableIncludeNotes(text));
+    }
+
+    // And the states it must NOT claim, which are what make it a signal rather than
+    // a light that is always on. Notes it could read are not evidence of anything
+    // wrong; a stream with no notes is the ordinary build with no dependency flags,
+    // which is the state this exists to be distinguished FROM; a diagnostic is not a
+    // note. The warnings are the sharp ones -- they carry the `": "` separator twice
+    // and end in prose, in German exactly as in English, which is why the rule asks
+    // what the tail LOOKS like rather than how many separators there were.
+    CHECK_FALSE(CarriesUnreadableIncludeNotes(EnglishNotes));
+    CHECK_FALSE(CarriesUnreadableIncludeNotes(""));
+    CHECK_FALSE(CarriesUnreadableIncludeNotes("cl : Command line warning D9002 : ignoring unknown option\r\n"));
+    CHECK_FALSE(CarriesUnreadableIncludeNotes("a.cpp(3): warning C4100: 'p': unreferenced formal parameter\r\n"));
+    CHECK_FALSE(CarriesUnreadableIncludeNotes("a.cpp(3): Warnung C4100: 'p': Nicht referenzierter Parameter\r\n"));
+
+    // A quoted Windows path in source does NOT trip it, and the reason is worth
+    // pinning because it is not the reason it first looks like: the rule needs a
+    // `": "` separator, and `"C:\\proj\\src\\a.hpp"` has a colon followed by a
+    // backslash. This assertion was written the other way round -- as the false
+    // positive the rule was assumed to have -- and failed, which is how the bound
+    // came to be measured rather than guessed.
+    CHECK_FALSE(CarriesUnreadableIncludeNotes("char const* s = \"C:\\\\proj\\\\src\\\\a.hpp\";\n"));
+
+    // The false positive it DOES have, asserted so the cost is recorded rather than
+    // discovered later: a line carrying the separator and then a POSIX path. It
+    // costs a sentence that is occasionally wrong, which is the whole argument for
+    // keeping this predicate separate from `IncludeNotePath`, where the same
+    // looseness would cost a wrong build instead.
+    CHECK(CarriesUnreadableIncludeNotes("char const* s = \"see: /usr/include/a.h\";\n"));
+}
+
 TEST_CASE("ComputeManifestKey is stable and separates differing inputs")
 {
     std::vector<std::string> const args { "/O2", "<SRCROOT>/src/a.cpp" };

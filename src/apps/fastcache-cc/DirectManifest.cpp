@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -455,6 +456,66 @@ std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText)
             paths.emplace_back(*path);
     }
     return paths;
+}
+
+namespace
+{
+    /// Whether `text` begins where an absolute path begins.
+    ///
+    /// Three anchors, because a note names a file on whichever host printed it: a
+    /// Windows drive (`C:\`, and `C:/` since a driver may print either separator),
+    /// a UNC share (`\\`), and a POSIX root (`/`). Deliberately NOT a general path
+    /// test -- what this has to separate is "the line ends by naming a file" from
+    /// "the line ends by saying something", and every locale's ordinary diagnostic
+    /// ends with prose.
+    /// @param text The tail of a line, already trimmed of leading blanks.
+    /// @return True when it starts with an absolute-path anchor.
+    [[nodiscard]] bool StartsAbsolutePath(std::string_view text) noexcept
+    {
+        if (text.starts_with('/') || text.starts_with(R"(\\)"))
+            return true;
+        // A drive letter, its colon, and a separator. `size() > 2` rather than a
+        // three-character substring compare: the separator may be either.
+        return text.size() > 2 && std::isalpha(static_cast<unsigned char>(text.front())) != 0 && text[1] == ':'
+               && (text[2] == '\\' || text[2] == '/');
+    }
+} // namespace
+
+bool CarriesUnreadableIncludeNotes(std::string_view showIncludesText) noexcept
+{
+    std::size_t offset = 0;
+    while (offset < showIncludesText.size())
+    {
+        auto lineEnd = showIncludesText.find('\n', offset);
+        if (lineEnd == std::string_view::npos)
+            lineEnd = showIncludesText.size();
+        auto line = showIncludesText.substr(offset, lineEnd - offset);
+        offset = lineEnd + 1;
+
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+
+        // A line the marker DID match is not evidence of anything wrong, and asking
+        // `IncludeNotePath` rather than re-testing the marker keeps this from
+        // becoming a second spelling of the recognition rule.
+        if (IncludeNotePath(line).has_value())
+            continue;
+
+        // The LAST separator, not the first. A note's own prefix contains one in
+        // several languages -- German's `Hinweis: Einlesen der Datei:` has two --
+        // and a path on Windows contains a colon of its own, so the first is wrong
+        // in one direction and a bare colon search is wrong in the other.
+        auto const separator = line.rfind(": ");
+        if (separator == std::string_view::npos)
+            continue;
+
+        auto tail = line.substr(separator + 2);
+        while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t'))
+            tail.remove_prefix(1);
+        if (StartsAbsolutePath(tail))
+            return true;
+    }
+    return false;
 }
 
 namespace

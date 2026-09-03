@@ -368,6 +368,37 @@ inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
 /// @return Every included path, in emission order, with duplicates preserved.
 [[nodiscard]] std::vector<std::string> ParseIncludePaths(std::string_view showIncludesText);
 
+/// Whether a captured stream carried lines that LOOK like dependency notes this
+/// build could not read.
+///
+/// `IncludeNoteMarker` is the literal English `"Note: including file:"`, so on a
+/// Visual Studio carrying a language pack `cl` prints a translated prefix,
+/// `ParseIncludePaths` matches nothing, and an empty set comes back. That is
+/// indistinguishable from a compile that reported nothing at all, and the two are
+/// different states: one is a build with no dependency flags, the other is a machine
+/// where the launcher is reading the compiler in a language it does not speak.
+/// Reported as one string, an operator gets a sentence that is true about what the
+/// launcher observed and false about the world (issue #692).
+///
+/// **This answer feeds a MESSAGE and nothing else -- never a parse, never the key,
+/// never a manifest entry.** That is the whole reason it may use a loose rule where
+/// `IncludeNotePath` may not: the recognition rule there is shared with
+/// `SplitIncludeNotes`, which runs over a stream that also carries preprocessed
+/// SOURCE, so loosening IT deletes an ordinary source line from the bytes the key is
+/// hashed over -- a silent wrong build. Loosening a diagnostic costs a sentence that
+/// is occasionally wrong. The two must stay separate predicates, and this one must
+/// never grow a caller that acts on its answer.
+///
+/// The rule: a line that is not already a recognised note, whose text after the LAST
+/// `": "` begins with an absolute-path anchor. That is what survives translation --
+/// every locale's note ends by naming the file, and no locale's ordinary diagnostic
+/// does. A `cl` warning (`x.cpp(3): warning C4100: 'p': unreferenced formal
+/// parameter`) carries the separator and no anchor, in German exactly as in English.
+///
+/// @param showIncludesText Captured compiler output.
+/// @return True when at least one line looks like a note the marker did not match.
+[[nodiscard]] bool CarriesUnreadableIncludeNotes(std::string_view showIncludesText) noexcept;
+
 /// Extract the dependency paths from a GNU-style Makefile depfile (`-MF`).
 ///
 /// The GNU drivers report header dependencies here rather than on a stream, so
