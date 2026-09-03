@@ -354,6 +354,63 @@ set_tests_properties("catch-skip-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# ---------------------------------------------------------------------------
+# A case that could not RUN its check does not report a PASS.
+#
+# The converse of `catch-skip-return-code` above, and the insidious direction.
+# `SUCCEED("...")` records a passing assertion, so a case that bails out because its
+# environment could not be arranged -- no loopback listener, no IPv6 stack, no symlink
+# privilege -- reports green for a property nothing established (#685). A false RED gets
+# investigated; a false GREEN is believed, and it fires exactly on the constrained
+# runners where coverage is thinnest.
+#
+# Twenty-one sites were doing it, and the idiom spread by IMITATION: the launcher lane
+# copied it out of `DirectManifest_test.cpp`, comment and all. The comment there was
+# already correct, which is why a comment is not the fix and this is.
+#
+# In the default set with the other hygiene checks: it reads files and compares strings.
+add_test(
+    NAME "succeed-not-skip"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-succeed-not-skip.cmake"
+)
+set_tests_properties("succeed-not-skip" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be SEEN to fail, on each direction it claims.
+#
+# Ten synthetic trees, one verdict asserted each: a SUCCEED that ends a case passes, so
+# does `SUCCEED()` with no message and the idiom quoted in a comment; a SUCCEED followed
+# by `return;` fails and NAMES the file; a skip-vocabulary message with no return fails
+# on its own, so neither signal is decoration; a SUCCEED the scan cannot read on one line
+# fails as its own outcome; no SUCCEED at all and no test source at all each fail as a
+# broken scan, in different words because they are different repairs; a violation under a
+# build tree is ignored; and the git path -- the one CI takes -- ignores an untracked
+# vendored violation while still catching a tracked one.
+#
+# Per case rather than `WILL_FAIL`, because a check that stopped refusing and one that
+# refuses everything are opposite defects a bare inversion reports identically. Measured
+# against three mutants of the check: removing the bail-out signal reddens exactly the
+# `bail-out` case, emptying the vocabulary reddens the message-driven cases, and making
+# it refuse everything reddens all five that assert silence.
+add_test(
+    NAME "succeed-not-skip-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/succeed-not-skip-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-succeed-not-skip-selftest.cmake"
+)
+set_tests_properties("succeed-not-skip-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # The debug-path mapping cmake/portable/CompileCache.cmake appends so a replayed
 # object names no checkout (#203). A pure computation over two roots, checked
 # against a table of layouts -- including the out-of-tree and cross-mount ones

@@ -930,6 +930,57 @@ and ctest printed `***Failed` **for the very same run** (#499).
   code — `file(GLOB_RECURSE)` recurses from the base directory and treats only the
   last component as a pattern, so `src/*/CMakeLists.txt` does not mean one level down.
 
+## A `SUCCEED` where the case could not RUN is a false GREEN
+
+The converse of the rule above, and the direction nobody investigates. `SUCCEED("...")`
+records a **passing assertion**, so a case that bails out because its environment could
+not be arranged reports a pass for a property nothing established (#685).
+
+**`SUCCEED` is right when the case RAN and there was nothing to assert. It is wrong when
+the case could not run.** That is the whole distinction, and `SKIP("reason")` is the
+whole fix — it exits 4, every `catch_discover_tests` registration carries
+`SKIP_RETURN_CODE 4`, and ctest scores it as skipped.
+
+- **It fires where coverage is already thinnest.** All twenty-one sites converted for
+  #685 were environment-conditional: no loopback listener, no IPv6 stack, no symlink
+  privilege on a Windows agent, running as root, a test port already bound. Those are
+  precisely the runs on which a green is least justified and most believed — a
+  constrained CI runner reports the same colour as a full one, and nothing distinguishes
+  them.
+- **The four states again.** Skipped, absent, unstarted and failed. A case that could not
+  run is *skipped*, and rendering it as *passed* collapses two of them at exactly the
+  layer that decides whether anybody looks.
+- **A comment does not stop it, because it spread by IMITATION.**
+  `DirectManifest_test.cpp` carried the idiom under a comment that was *correct* — it
+  said the rule being demonstrated is unconditional, which is the reason the `SUCCEED`
+  was wrong — and the next test written was copied from it, comment and all. The
+  argument was there to be read and was not the thing being copied.
+- **What a check can see, and what it cannot.** `ctest -R succeed-not-skip` fires on two
+  signals: a `SUCCEED` whose next statement is a bare `return` (the bail-out shape, which
+  every one of the twenty-one had and no legitimate site in this tree has), and a message
+  in skip vocabulary — "unavailable", "could not", "privilege", "exercised by" — held as
+  a table with one row per phrase. A silent bail-out with a message in neither vocabulary
+  and no `return` is invisible to it. That limit is stated in the script rather than
+  papered over: the check closes the door the defect came through, and this rule covers
+  the rest.
+- **"Covered by another test" is a reason to SKIP, never a reason to pass.**
+  `ServiceControl_test.cpp` deliberately does not call `InstallService` on Windows and
+  macOS — a unit test must not register a service on the host — and said so in a
+  `SUCCEED`. The end-to-end scripts really do cover it; *this* case still observed
+  nothing.
+- **Inconclusive is refused, not passed.** A `SUCCEED` the check cannot read to a closing
+  parenthesis on one line is reported as its own outcome. A site it could not read is not
+  a site it cleared.
+- **The guard is shown failing on every direction it claims**
+  (`ctest -R succeed-not-skip-selftest`): ten synthetic trees, one verdict each, and each
+  refusal asserted by the phrase naming *that* refusal — so a mutation that reddens
+  everything fails the selftest instead of looking thorough. Measured against three
+  mutants: removing the bail-out signal reddens exactly the `bail-out` case, emptying the
+  vocabulary reddens the message-driven ones, and refusing everything reddens all five
+  cases that assert silence. Five of the ten exist only to assert the check stays
+  **quiet** — on `SUCCEED()` with no message, on a `SUCCEED` that ends a case, and on the
+  idiom quoted in a *comment*, since this rule is documented in prose that quotes it.
+
 ## A leader-pinned command goes to whoever leads NOW
 
 `$leader_endpoint` is derived by whichever section of `cluster-e2e.sh` needed it

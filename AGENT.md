@@ -1200,6 +1200,17 @@ and what they may assume.
   check (`catch-skip-return-code`, shown failing by `catch-skip-selftest`), because a
   sixth test binary reopens it by omission. And the list is written at BUILD time, so
   a reconfigure alone leaves a stale one that reads exactly like a current one.
+- The converse, and the direction nobody investigates: `SUCCEED` is right when a case
+  RAN and had nothing to assert, and wrong when the case could not run — where it stands
+  in for a skip it reports a PASS for a property nothing established (#685). Twenty-one
+  sites did, all environment-conditional (no loopback, no IPv6, no symlink privilege,
+  root, a bound port), so the green arrived exactly on the runs where coverage is
+  thinnest. "Covered by another test" is a reason to SKIP, never to pass. It spread by
+  IMITATION out of `DirectManifest_test.cpp`, under a comment that was already correct —
+  so the guard is a check (`succeed-not-skip`, shown failing by
+  `succeed-not-skip-selftest`) on two signals, a bail-out `return` after the `SUCCEED`
+  and a table of skip vocabulary in its message. What it cannot see is stated rather
+  than papered over, and a `SUCCEED` it cannot read is refused, not cleared.
 - A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process
   counter is not unique — `catch_discover_tests` gives every case its own
   process, and the suite runs in parallel.
