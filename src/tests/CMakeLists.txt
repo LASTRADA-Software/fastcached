@@ -920,6 +920,71 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# The documented way to build the tidy sweep's compile database is the way CI
+# builds it. Fails when `scripts/tidy-sweep.sh` or
+# `.agent/rules/build-and-toolchain.md` documents a configure line that differs
+# from the `clang-tidy` job's `Configure` step.
+#
+# `tidy-sweep.sh` opens by saying it is "for reproducing what CI will say", and
+# until #454 the line it documented was hand-rolled and had drifted — in the
+# flags that decide what the sweep reports and in the target set it can see at
+# all, in both directions at once, every one of them reading like a clean tree.
+# The measurements are in `.agent/rules/build-and-toolchain.md` beside the
+# configure line; restating them here is how the number in one place stops
+# matching the number in another.
+#
+# That is the same defect as the target-set rule the rulebook already carried —
+# twelve lines above a code block that violated it, which is why "the comment
+# says so" is not enough here.
+#
+# Derived from the workflow rather than tabulated, for `check-tsan-scope.cmake`'s
+# reason: a second copy of CI's line would not be a cross-check, it would be a
+# second thing to be wrong. WHICH files document a line is discovered by scanning
+# too, per #492 — a hand-kept list is silent about the site it does not know, and
+# silence reads identically to complete coverage.
+#
+# `if(NOT WIN32)` for the reason `ci-scope` carries the same guard: the script is
+# POSIX and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "tidy-sweep-database"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh"
+    )
+    set_tests_properties("tidy-sweep-database" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    # And the must-be-seen-to-bite half. A comparison nobody has watched refuse is
+    # not a check -- it passes identically whether it is comparing the right two
+    # things or nothing at all, which is precisely how the drift it now catches
+    # survived.
+    #
+    # All three moving parts are driven, because two of them decide what the third
+    # even sees: the COMPARISON (a changed preset, a dropped `-D`, an added one, a
+    # changed `-D` VALUE, an empty line, the pre-#454 hand-rolled line itself, and
+    # the OTHER spelling of each token — `--preset=NAME`, `-D NAME=VALUE` — on both
+    # sides at once, which is the arrangement in which an unrecognised token hides
+    # a disagreement instead of manufacturing one), the DOCUMENTATION extractor
+    # (fenced blocks, shell headers, an earlier unrelated `cmake --preset` line
+    # that must not be mistaken for the anchor, a SECOND copy in the same file,
+    # and the two ways a line fails to name this database), and the WORKFLOW
+    # extractor (the right job's step among three that all have one, added steps
+    # and an `id:` around it, an UNNAMED step after it that must not extend it, a
+    # blank line inside the block scalar that must not truncate it, an unfolded
+    # `run:`, and the two renames that must yield the empty string the main path
+    # refuses).
+    add_test(
+        NAME "tidy-sweep-database-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test
+    )
+    set_tests_properties("tidy-sweep-database-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The local gate pins its analyser and refuses a compiler cache. Fails when
 # `scripts/local-gate.sh` would run clang-tidy at a version nobody chose, would
 # accept a build directory that already caches one, or would build its objects

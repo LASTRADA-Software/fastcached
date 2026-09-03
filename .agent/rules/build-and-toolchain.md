@@ -1683,14 +1683,47 @@ makes it anyway and says so there.
   off**. Pointed at a GCC one it inherits flags clang does not know; and a database
   from a module-scanning generator carries `@…modmap` arguments that do not exist
   until that target has been built, so the translation unit fails to parse and the
-  file reports nothing at all. Configure a throwaway tree:
+  file reports nothing at all. Configure it **through the preset the CI job
+  configures**, into a directory of its own:
 
   ```sh
-  cmake -S . -B out/build/tidy22 -G Ninja \
-        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-        -DFASTCACHED_ENABLE_TLS=ON
+  cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF \
+        -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON \
+        -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
   ```
+
+  **Not a hand-rolled `cmake -S . -B …` equivalent**, which is what stood here and
+  what `tidy-sweep.sh` documented until #454. A bare configure line inherits
+  `PEDANTIC_COMPILER` and `PEDANTIC_COMPILER_WERROR` OFF, so its database carries
+  neither `-Wall -Wextra -Wconversion -pedantic` nor the `-Wno-…` suppressions that
+  accompany them — **29 flags apart on the same translation unit**. `.clang-tidy`
+  enables `clang-diagnostic-*`, so those flags decide what the sweep reports, and it
+  diverges *in both directions at once*: findings CI suppresses appear, and findings
+  CI raises do not. Measured: a `double`→`int` return that CI's database reports as
+  `clang-diagnostic-float-conversion` produced **nothing** from the hand-rolled one.
+  The noisy direction wastes a cycle; the blind direction ships to CI, and both read
+  like a clean tree.
+
+  It is also how the target-set bullet above gets violated by the very page that
+  states it: the old line omitted the two default-OFF app targets, so four
+  first-party translation units were absent from the database rather than clean.
+  A rule whose own example contradicts it is worse than no example.
+
+  `-B` overrides the preset's `binaryDir`, which is what keeps this out of the
+  `out/build/clang-debug` tree `local-gate.sh` builds — configuring the sweep's
+  database must not turn `ENABLE_TIDY` and module scanning off in that one.
+
+  The line is the `clang-tidy` job's `Configure` step verbatim plus `-B`, and
+  `ctest -R tidy-sweep-database` asserts it stays that way: nothing else connects
+  the workflow to the two places that document it.
+
+  Verbatim duplication is right *under the constraint it was written under* and
+  wrong permanently — [#615](https://github.com/LASTRADA-Software/fastcached/issues/615)
+  carries the `tidy22` preset that removes it, and must be taken by whoever can
+  change `build.yml` in the same change: a preset CI does not adopt is a fourth
+  copy, not a consolidation. The check moves to comparing against the preset in
+  that same change, or it fails correctly and confusingly against documentation
+  that is still right.
 
 - **A sweep that cannot prove the tool ran is worth nothing, and reads like
   success.** Every way of getting clang-tidy wrong above -- an unset execute bit
@@ -1716,6 +1749,22 @@ makes it anyway and says so there.
   out. The self-test also pins `LC_ALL=C` on its ordering — under `en_US.UTF-8`
   `sort` collates case-insensitively and the assertions fail on a developer's
   machine while passing on a runner's `C.UTF-8`.
+
+  And the sharper form of the same failure, because the canary above does **not**
+  catch it: **the tool can run, exit 0, and have analysed nothing.** Every guard in
+  this paragraph asks whether clang-tidy *executed*; none asks whether it had any
+  check enabled while it did. `--checks=-*,clang-diagnostic-c2y-extensions` selects
+  no check at all in clang-tidy 22 — `clang-diagnostic-*` is a **filter over compiler
+  diagnostics, not a check that can be enabled by a glob** — so a sweep spelled that
+  way reports `0 findings` for every translation unit, with a successful exit status,
+  a proven-executable binary and a database that parses. Measured while investigating
+  #454: six full sweeps across four compile databases, all reading zero, all
+  worthless. The only thing that exposed it was a deliberately planted finding that
+  *also* read zero. So a `--checks` expression narrowed for speed is itself an
+  instrument, and it is calibrated the way every other instrument here is — plant a
+  finding the expression must report, and watch it report it, before believing a run
+  of zeroes. `Error: no checks enabled` on stderr is the tell, and `--quiet` plus a
+  `grep` hides it.
 
 - **A `bool` in the middle of a config struct costs seven bytes, and four of them
   fail the build.** `clang-analyzer-optin.performance.Padding` permits 24 bytes more
