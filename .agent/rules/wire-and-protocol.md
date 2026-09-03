@@ -737,9 +737,13 @@ Every rule below has already been a bug.
 
   - **`ISocket::ShutdownWrite` exists so the question is askable in production.** It
     did not, and that absence is why the disagreement was unreachable from inside
-    the repository: `InMemorySocket` declared one privately and every consumer was a
-    test. A rule nothing can express is a rule nothing can be held to. The default
-    is a no-op for fakes; every transport this library hands out overrides it.
+    the repository. Not for want of VISIBILITY — `InMemorySocket::ShutdownWrite` has
+    been public since the MVP commit (`57076ec6`) and some forty tests call it — but
+    because it sat on the CONCRETE type. Nothing holding an `ISocket&` could reach
+    it, so every consumer was a test by construction, and "make it public" was never
+    the missing step: production code never names `InMemorySocket`. A rule nothing can
+    express is a rule nothing can be held to. The default is a no-op for fakes; every
+    transport this library hands out overrides it.
 
   - **The error-only reading detects neither way a client leaves.**
     `RedisResp.cpp`'s *"a full peer close surfaces as the error case"* is false on

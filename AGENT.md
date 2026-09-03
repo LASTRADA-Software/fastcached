@@ -608,9 +608,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   reference rather than by argument, and the measurement travels with the rule
   (`scripts/probes/redis-eof-semantics.py`) — a citation people can re-run is one
   they stop re-litigating. `ISocket::ShutdownWrite` exists so the question is
-  askable in PRODUCTION at all: it was declared privately on `InMemorySocket` with
-  every consumer a test, and a rule nothing can express is a rule nothing can be
-  held to. The answer does not transfer between wires — the compile surface reads
+  askable in PRODUCTION at all: `InMemorySocket` had one, public and widely called,
+  but on the CONCRETE type — so nothing holding an `ISocket&` could reach it, every
+  consumer was a test by construction, and a rule nothing can express is a rule
+  nothing can be held to. The answer does not transfer between wires — the compile surface reads
   a mid-compile EOF as *gone* under the SAME rule, because a compile's reply is not
   yet determined — so state which surface any measurement covers.
 - `Close()` can be the last thing that runs on a socket, so it must touch no

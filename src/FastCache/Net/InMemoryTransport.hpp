@@ -130,8 +130,6 @@ class InMemorySocket: public ISocket
     /// caller gains a suspension point it did not have.
     [[nodiscard]] IoAwaitable WaitReadable() override;
 
-    /// @copydoc ISocket::ShutdownWrite
-
   private:
     static void OnInboundProgress(void* state) noexcept;
 

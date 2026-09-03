@@ -261,10 +261,12 @@ class ISocket
     /// measurement it rests on; do not re-decide it here.
     ///
     /// **Why the interface has it at all.** It did not, and the absence is what made
-    /// the question unanswerable: `InMemorySocket` declared one privately and every
-    /// consumer was a test, so no production client could half-close and the
-    /// disagreement between this tree's surfaces was unreachable from inside the
-    /// repository. A rule nothing can express is a rule nothing can be held to.
+    /// the question unanswerable: `InMemorySocket` had one -- public, and called by
+    /// some forty-odd tests -- but it was on the CONCRETE type and not on this
+    /// interface, so no code holding an `ISocket&` could reach it and every consumer
+    /// was therefore a test. Not a visibility problem, which is why "make it public"
+    /// would have changed nothing: production code never names `InMemorySocket`. A
+    /// rule nothing can express is a rule nothing can be held to.
     ///
     /// **The default does nothing, and that is for FAKES.** Every transport this
     /// library hands out overrides it; a scripted test double that has no write half
@@ -275,6 +277,9 @@ class ISocket
     ///
     /// Idempotent, and not a `Close()`: reads keep working, and `IsClosed()` stays
     /// false. A caller that wants both calls both.
+    ///
+    /// `TlsSocket` qualifies the "reads keep working" half and says why on its own
+    /// override -- TLS reads write, so they are the one case a half-close can reach.
     virtual void ShutdownWrite() noexcept {}
 
     /// @return true if Close() has been called or the peer has closed and a
