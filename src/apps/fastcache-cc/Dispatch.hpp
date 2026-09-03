@@ -130,6 +130,38 @@ struct DispatchBudgets
     std::size_t maxDecompressedBytes { DefaultMaxDecompressedBytes };
 };
 
+/// The budgets a dispatch runs under, built from the launcher's three knobs.
+///
+/// **One producer, because the compile leg differs from the control leg in TWO
+/// fields and not one.** It was derived in `main.cpp` by copying the control budget
+/// and replacing its total, on the stated reasoning that only the total differs —
+/// which was true when it was written and stopped being true when the compile leg
+/// gained `keepAlive` (#247). The copy silently overwrote `KeepAlive::Yes` with the
+/// control leg's `No`, so no shipped launcher has ever armed keepalive on the one
+/// exchange it exists for, and a worker whose host vanished still cost the full
+/// `FASTCACHE_DISPATCH_TIMEOUT_MS`. Nothing could see it: the default member
+/// initializer above was the only statement of the intent, `main.cpp` is in no test
+/// target, and the docs described the unarmed behaviour, so code and prose agreed
+/// by accident.
+///
+/// So the derivation lives here, where a test reads it, and it *names* each field on
+/// which the two legs differ instead of inheriting the rest by copy. A fourth field
+/// that must differ is a line in this function, and the compiler does not have to be
+/// the thing that notices.
+/// @param connect Ceiling on opening either connection, name resolution included.
+/// @param controlTotal Ceiling on a LEASE or RELEASE round trip.
+/// @param compileTotal Ceiling on the whole COMPILE exchange.
+/// @return Both budgets.
+[[nodiscard]] constexpr DispatchBudgets DispatchBudgetsFor(std::chrono::milliseconds connect,
+                                                           std::chrono::milliseconds controlTotal,
+                                                           std::chrono::milliseconds compileTotal) noexcept
+{
+    return DispatchBudgets {
+        .control = ExchangeBudget { .connect = connect, .total = controlTotal, .keepAlive = KeepAlive::No },
+        .compile = ExchangeBudget { .connect = connect, .total = compileTotal, .keepAlive = KeepAlive::Yes },
+    };
+}
+
 /// How a dispatch attempt ended.
 ///
 /// There is deliberately no "failed" outcome. Every way this can go wrong ends

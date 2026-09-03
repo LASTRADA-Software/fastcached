@@ -946,19 +946,16 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// compiler has finished, so the client sits in one read for the whole compile and
 /// the cache's ten seconds abandoned every translation unit worth distributing
 /// (#223).
+///
+/// The derivation itself is `Cc::DispatchBudgetsFor`, and it is there rather than
+/// here for one reason: this file is in no test target, so a budget built here is
+/// unreadable by anything. That is how the compile leg's keepalive was dropped for
+/// every shipped launcher -- see that function's note.
 /// @param cfg The launcher's configuration.
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    // The compile budget is the ordinary one with its TOTAL replaced, rather than a
-    // second field-by-field construction: only the total differs, so a third field
-    // on `ExchangeBudget` must not need wiring into two places to reach dispatch.
-    // Derived from the SAME value the control leg gets, not from a second call, so
-    // the two cannot drift apart in anything but the total.
-    auto const control = BudgetOf(cfg);
-    auto compile = control;
-    compile.total = cfg.dispatchTimeout;
-    return Cc::DispatchBudgets { .control = control, .compile = compile };
+    return Cc::DispatchBudgetsFor(cfg.connectTimeout, cfg.ioTimeout, cfg.dispatchTimeout);
 }
 
 /// The grammar to tag the include-bearing stream with, per compiler flavor.
