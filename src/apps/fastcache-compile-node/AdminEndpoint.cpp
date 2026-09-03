@@ -858,10 +858,24 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
 
     auto listener = BlockingListener::Bind(endpoint.host, endpoint.port);
     if (!listener || !listener->IsBound())
-        return std::unexpected { std::format("cannot bind {}:{} ({})",
-                                             endpoint.host,
-                                             endpoint.port,
-                                             listener ? listener->BindError() : std::string_view { "null listener" }) };
+    {
+        // The verdict is the row's (#352), which carries why -- including why
+        // `fastcached` answers this same surface differently and is right to.
+        auto judged = JudgeBindFailure(RowFor(surface),
+                                       std::format("cannot bind {} ({})",
+                                                   FormatHostPort(endpoint.host, endpoint.port),
+                                                   listener ? listener->BindError() : std::string_view { "null listener" }),
+                                       logger);
+        if (!judged.has_value())
+            return std::unexpected { std::move(judged).error() };
+
+        // Refused rather than tolerated, because this opener cannot carry a tolerated
+        // verdict (#352): `StartAdminSurfaceOrExplain` reads `surface.endpoint` with
+        // no null check to log where metrics and the dashboard are, so a null returned
+        // inside a satisfied `expected` is a startup crash rather than a degraded node.
+        return std::unexpected { BindToleranceUnsupported(
+            RowFor(surface), "the caller logs surface.endpoint->BoundEndpoint() unconditionally") };
+    }
 
     // The endpoint's own values, not this caller's: the daemon serves the same
     // server on the same terms, and two spellings of one decision drift.

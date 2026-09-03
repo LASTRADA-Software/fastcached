@@ -303,10 +303,28 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // diagnostic rather than nothing at all, so testing for null tests nothing --
     // the defect the worker's own listener records having shipped once.
     if (_listener == nullptr || !_listener->IsBound())
-        return std::unexpected { std::format("cannot bind {}:{}: {}",
-                                             bindAddress,
-                                             bindPort,
-                                             _listener ? _listener->BindError() : std::string_view { "null listener" }) };
+    {
+        // Through the row (#352), which carries why this is fatal. Not restated
+        // here: a paraphrase beside a pointer is two copies that can disagree.
+        auto judged =
+            JudgeBindFailure(RowFor(NodeSurface::Raft),
+                             std::format("cannot bind {}: {}",
+                                         FormatHostPort(bindAddress, bindPort),
+                                         _listener ? _listener->BindError() : std::string_view { "null listener" }),
+                             _logger);
+        if (!judged.has_value())
+            return std::unexpected { std::move(judged).error() };
+
+        // Refused rather than tolerated (#352). This is the earliest point in `Launch`,
+        // so returning success here hands `Start` a tier whose `_transport`, `_driver`,
+        // `_sink` and `_peerServer` were never built -- it would log "consensus on ..."
+        // against a listener that never bound, and the first `Propose` would dereference
+        // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
+        // rest of this function.
+        _listener.reset();
+        return std::unexpected { BindToleranceUnsupported(
+            RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
+    }
 
     // Two lists out of two, and the split is the whole of how a node joins. Who
     // this node DIALS is everything its operator named; who consensus COUNTS is

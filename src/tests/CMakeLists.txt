@@ -658,6 +658,63 @@ set_tests_properties("worker-refusals-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Every surface the compile node opens reaches its bind-failure verdict through the
+# row, and no opener decides one itself.
+#
+# `NodeSurfaceTable()` carries a `BindFailurePolicy` column and the sentence saying
+# why, and a `static_assert` refuses a row that omits either (#352). That guard is
+# exact about the TABLE and silent about the CODE: a fifth opener can bind a port and
+# answer `std::unexpected { std::format("cannot bind ...") }`, which compiles, links,
+# passes every test, and puts the verdict back in the place the ticket was filed
+# about while the row it ignores sits there stating a policy.
+#
+# So the second half is a scan, on `worker-refusals-counted`'s model -- the precedent
+# for a rule enforced by the type system on one side of a seam and by nothing on the
+# other. It globs the node's own sources rather than listing them, because a list is
+# exact about the files it knows and silent about the ones it does not (#492).
+#
+# In the default set with the other hygiene checks: it reads files and compares
+# strings.
+add_test(
+    NAME "bind-failure-seam"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-bind-failure-seam.cmake"
+)
+set_tests_properties("bind-failure-seam" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be SEEN to refuse, in each of the ways it can.
+#
+# A source scan nobody has watched bite is indistinguishable from one that matches
+# nothing, which is the defect it was written to close. Six synthetic trees, each
+# verdict asserted separately rather than inverting the whole test with `WILL_FAIL`:
+# clean, an opener that bypasses the seam, a primitive named in PROSE that must NOT
+# be reported, a scan matching no file, a bind primitive nobody calls, and a renamed
+# seam nothing reaches.
+#
+# The prose case is there because the check's first two findings were both doc
+# comments -- a checker that fails on documentation of the thing it checks is one
+# nobody can document.
+#
+# In the default set: it writes a handful of small files and runs `cmake -P` six times.
+add_test(
+    NAME "bind-failure-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/bind-failure-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-bind-failure-selftest.cmake"
+)
+set_tests_properties("bind-failure-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # Every `*Explicit` bit a CLI flag sets must be consulted by the config merge.
 # A flag with no `MergeField` row parses, validates and appears in --help, and is
 # then silently discarded the moment the operator also has a config file. That has

@@ -980,9 +980,10 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         logger.Logf(LogLevel::Error, "{}; refusing to start", nodeSurfaceOrRefusal.error());
         return ExitUsage;
     }
-    // May legitimately be null: a node with neither component serves no 0xFC port, and
-    // a DEFAULT address already taken is a warning rather than a failure. Both have
-    // been logged.
+    // May legitimately be null, and for exactly one reason: a node with none of the
+    // three components serves no 0xFC port, which has been logged. A bind FAILURE is
+    // not that case -- this surface's row states `Refuse`, so it arrives as the error
+    // above rather than as a null. See `BindFailurePolicy` in NodeSurfaces.hpp.
     auto const nodeSurface = std::move(*nodeSurfaceOrRefusal);
 
     // Consensus, when the operator configured a cluster. It is what turns the
@@ -1016,9 +1017,9 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     auto discoveryOrRefusal = Node::StartDiscoveryOrExplain(cfg, consensusTier, logger);
     if (!discoveryOrRefusal.has_value())
     {
-        // Fatal, like the other two surfaces an operator has to ask for: a node that
-        // started without the discovery it was told to run looks healthy to a fleet
-        // that will never hear from it.
+        // Fatal; why is `RowFor(NodeSurface::Discovery).bindFailureReason` (#352).
+        // Not restated here -- this line and that row would be the two places the
+        // ticket is about.
         logger.Logf(LogLevel::Error, "--discovery {}; refusing to start", discoveryOrRefusal.error());
         return ExitUsage;
     }
@@ -1090,9 +1091,9 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     auto surfaceOrRefusal =
         Node::StartAdminSurfaceOrExplain(cfg, *host, metrics, std::move(snapshotProvider), fleetSources, &sampler, logger);
 
-    // Fatal rather than a warning, unlike the daemon's: an operator who asked a
-    // *worker* for an endpoint is almost always wiring a probe to it, and a worker
-    // that starts without one looks healthy to everything that would have noticed.
+    // Fatal here and not in the daemon, which is a real difference between the two
+    // binaries rather than a defect in either; the row says why
+    // (`RowFor(NodeSurface::Admin).bindFailureReason`, #352).
     if (!surfaceOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", surfaceOrRefusal.error());

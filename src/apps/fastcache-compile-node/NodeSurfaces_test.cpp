@@ -2,6 +2,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -405,4 +406,146 @@ TEST_CASE("The 0xFC row's note says what socket activation does to it", "[node][
     // And the STATE, which is what the vocabulary cannot carry.
     CHECK(note.contains("is served on this surface"));
     CHECK_FALSE(note.contains("NOT yet served"));
+}
+
+TEST_CASE("Every surface states what a bind failure does, and why", "[node][surfaces][bind]")
+{
+    // The verdict alone would have been satisfied by what every row already did --
+    // all four refuse, and did before #352. What was missing was the sentence, and
+    // for one surface it was missing everywhere: raft's bind site records only why
+    // the listener is a reactor one and why `IsBound()` beats a null check, and the
+    // only statement covering its fatality lived inside DISCOVERY's comment, in
+    // another file, as a parenthetical about "the other two surfaces".
+    //
+    // So the reason is asserted as well as the policy. The table `static_assert`s
+    // both; this case is what makes the requirement readable, and what fails loudly
+    // if somebody weakens the compile-time guard to get a build through.
+    for (auto const& row: NodeSurfaceTable())
+    {
+        INFO("surface " << row.name);
+        CHECK(row.bindFailure != BindFailurePolicy::Unstated);
+        CHECK_FALSE(row.bindFailureReason.empty());
+    }
+}
+
+TEST_CASE("A surface that refuses a bind failure passes its own message through", "[node][surfaces][bind]")
+{
+    // The opener's sentence reaches the operator unchanged. It names the REMEDY
+    // rather than the diagnosis (#229) -- "the usual cause is a fastcached holding
+    // that port" is worth more at three in the morning than any rationale -- so the
+    // row's reason must not be appended to it.
+    CapturingLogger logger;
+    auto const judged = JudgeBindFailure(RowFor(NodeSurface::Node), "cannot bind 0.0.0.0:6674 (in use)", logger);
+
+    REQUIRE_FALSE(judged.has_value());
+    CHECK(judged.error() == "cannot bind 0.0.0.0:6674 (in use)");
+
+    // And nothing is logged: the caller refuses, and main.cpp is what reports it.
+    // Logging here as well would print the same failure twice.
+    CHECK(logger.Snapshot().empty());
+}
+
+TEST_CASE("A surface that tolerates a bind failure warns and carries on", "[node][surfaces][bind]")
+{
+    // **The clause a test over the real table cannot satisfy.** Asserting that
+    // today's four surfaces refuse passes forever once somebody adds a tolerant
+    // fifth -- which is the failure this ticket exists to prevent, one level up. So
+    // the seam takes a ROW rather than a `NodeSurface`, and this hands it a shape no
+    // production row has.
+    SurfaceRow tolerant = RowFor(NodeSurface::Admin);
+    tolerant.bindFailure = BindFailurePolicy::Tolerate;
+    tolerant.bindFailureReason = "a stand-in reason, so the warning has something to carry";
+
+    CapturingLogger logger;
+    auto const judged = JudgeBindFailure(tolerant, "cannot bind 127.0.0.1:6677 (in use)", logger);
+
+    CHECK(judged.has_value());
+
+    // Snapshotted once: it returns by value, so calling it per assertion would
+    // compare four different copies and read as though it were one.
+    auto const records = logger.Snapshot();
+
+    // Warn, not info: the operator asked for a surface and is not getting it.
+    REQUIRE(records.size() == 1);
+    CHECK(records.front().level == LogLevel::Warn);
+
+    // The reason travels HERE and only here -- there is no refusal to carry it, and
+    // a tolerated failure is exactly the case where somebody later asks why the node
+    // thought this was survivable.
+    CHECK(records.front().message.contains("a stand-in reason"));
+    CHECK(records.front().message.contains("cannot bind 127.0.0.1:6677 (in use)"));
+    CHECK(records.front().message.contains("continuing without it"));
+}
+
+TEST_CASE("A row with no stated policy is refused rather than assumed", "[node][surfaces][bind]")
+{
+    // Unreachable through the table, which refuses `Unstated` at compile time. It is
+    // reachable by a caller that builds a row by hand and leaves the column out, and
+    // the answer there is a refusal ABOUT THE CALLER rather than about the surface --
+    // so the message says so instead of silently picking the safe-looking verdict.
+    SurfaceRow unstated = RowFor(NodeSurface::Raft);
+    unstated.bindFailure = BindFailurePolicy::Unstated;
+
+    CapturingLogger logger;
+    auto const judged = JudgeBindFailure(unstated, "cannot bind 0.0.0.0:6680 (in use)", logger);
+
+    REQUIRE_FALSE(judged.has_value());
+    CHECK(judged.error().contains("no bind-failure policy stated"));
+}
+
+TEST_CASE("Raft's reason is about the quorum, not about this node", "[node][surfaces][bind]")
+{
+    // Written for #352, and the one row whose sentence existed nowhere beforehand --
+    // which makes it the row where a plausible-sounding invention would go unnoticed.
+    // It is pinned on the fact that makes it true rather than on its wording: a node
+    // whose raft listener fails still serves compiles and still caches, so the reason
+    // cannot be "this node stops working". It is that the CLUSTER stalls, because a
+    // peer that cannot be dialled is still counted in the quorum it is absent from.
+    auto const& reason = RowFor(NodeSurface::Raft).bindFailureReason;
+
+    CHECK(reason.contains("quorum"));
+    CHECK(reason.contains("serve compiles"));
+}
+
+TEST_CASE("No production row is tolerated, because no opener can carry one", "[node][surfaces][bind]")
+{
+    // The seam understands `Tolerate` -- the case above proves it warns and continues
+    // -- but understanding the verdict and being able to ACT on it are two facts, and
+    // this asserts the second is currently false everywhere.
+    //
+    // It is not a restatement of the "every row states a policy" case. That one
+    // forbids the absence of a policy; this forbids the one policy whose caller-side
+    // half is unwritten. Two openers would return a null surface inside a satisfied
+    // `expected` and their callers dereference it with no check, so a flipped column
+    // is a startup crash rather than a degraded node.
+    //
+    // The table `static_assert`s this, so the case cannot fail without the build
+    // failing first. It is here to be READ: somebody adding a tolerant surface meets
+    // the requirement in the test file as well as in the compiler output, and the
+    // reason is written where they are already looking.
+    for (auto const& row: NodeSurfaceTable())
+    {
+        INFO("surface " << row.name);
+        CHECK(row.bindFailure == BindFailurePolicy::Refuse);
+    }
+}
+
+TEST_CASE("An opener handed a tolerated verdict blames itself, not the port", "[node][surfaces][bind]")
+{
+    // The distinction the sentence has to carry: an operator reading it must not go
+    // looking for whatever holds the port, because nothing does -- the bind failure
+    // was survivable and this binary could not survive it. So the text names the
+    // flag (which is where they would start), names the surface, and says plainly
+    // that the defect is in the build rather than in what they typed.
+    auto const message =
+        BindToleranceUnsupported(RowFor(NodeSurface::Admin), "the caller dereferences the endpoint unconditionally");
+
+    CHECK(message.contains("--admin-listen"));
+    CHECK(message.contains("admin"));
+    CHECK(message.contains("the caller dereferences the endpoint unconditionally"));
+
+    // The load-bearing half. Without it this reads as a configuration error, and the
+    // operator spends the night on a port that was never the problem.
+    CHECK(message.contains("defect in this binary"));
+    CHECK_FALSE(message.contains("refusing to start"));
 }
