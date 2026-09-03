@@ -523,6 +523,31 @@ Anchor AnchorForLayout(std::string_view path, Layout const& layout) noexcept
     return (path.front() == '\\' || path.front() == '/') ? Anchor::Absolute : Anchor::WorkingDirectory;
 }
 
+bool IsUnderRoot(std::string_view path, std::string_view root)
+{
+    // The comparison forms are built here rather than asked of the caller, so that
+    // the boundary byte `IsSegmentPrefix` looks for is the one `ComparisonForm`
+    // guarantees. That pairing is the whole reason this wrapper exists: the
+    // launcher's classifier folds separators to BACKSLASH (its toolchain markers
+    // are spelled that way), so handing its comparison form to `IsSegmentPrefix`
+    // would ask for a `/` that cannot be there and answer "not under root" for
+    // every path under every root.
+    return IsSegmentPrefix(ComparisonForm(path), ComparisonForm(root));
+}
+
+bool IsRootNearMiss(std::string_view path, std::string_view root)
+{
+    std::string const pathCmp = ComparisonForm(path);
+    std::string const rootCmp = ComparisonForm(root);
+    // The character-wise half is spelled here and the boundary half is not: both
+    // answers come from the one `IsSegmentPrefix`, so "near miss" is defined as the
+    // complement of "under root" over the same bytes rather than as a second
+    // opinion about them. An empty root prefixes everything character-wise and is
+    // under-root to nothing, which would make every path in a layout naming no
+    // build tree a near miss of it.
+    return !rootCmp.empty() && pathCmp.starts_with(rootCmp) && !IsSegmentPrefix(pathCmp, rootCmp);
+}
+
 std::string Canonicalize(std::string_view absolutePath, Layout const& layout)
 {
     return CanonicalizeOne(absolutePath, layout);

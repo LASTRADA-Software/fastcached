@@ -83,6 +83,24 @@ namespace
             case PathCanon::Anchor::Absolute:
                 break;
         }
+        // A near miss of a root is checked, and it is the one path outside the roots
+        // that is. The exclusion above rests on a REASON rather than on the word
+        // "outside": a path out here is toolchain or system content, which the
+        // toolchain stamp covers collectively, so a machine that has a different one
+        // has a different key and never sees this value at all. A root spelled
+        // almost right is outside the roots and covered by nothing -- it is a
+        // project header the roots failed to name -- so the stamp argument does not
+        // reach it, and skipping it would replay a path naming a file that may be
+        // somewhere else entirely on this machine, which is issue #53 exactly.
+        //
+        // This is a difference from the key filter's treatment of the same path,
+        // stated here because the two questions differ: the key asks what is safe to
+        // HASH (a machine-specific path, so it is dropped), and this asks what this
+        // machine is answerable for EXISTING (a project header, so it is probed).
+        // What they no longer differ about is which paths are outside the roots at
+        // all -- one `PathCanon::IsUnderRoot` decides that for both (issue #562).
+        if (IsNearMissRoot(path, layout))
+            return true;
         return !IsToolchainHeader(path, layout);
     }
 } // namespace

@@ -125,6 +125,53 @@ enum class Grammar : std::uint8_t
 /// @return True when either root is Windows-shaped.
 [[nodiscard]] bool IsWindowsLayout(Layout const& layout) noexcept;
 
+/// True when `path` lies under `root`, judged on a **segment boundary**.
+///
+/// This is the single definition of "is this path under this root", and it exists
+/// because there was briefly more than one. `Canonicalize` has always asked it
+/// segment-wise, while the launcher's `IsToolchainHeader` asked it with a bare
+/// `starts_with` — so under a source root `/home/dev/proj` the sibling directory
+/// `/home/dev/project-x/a.hpp` was project content to the classifier and under no
+/// root to the canonicalizer (issue #562). That failed safe, the classifier being
+/// the more permissive of the two, but the key filter, the manifest and the replay
+/// guard all judge by that one classifier *so that they cannot disagree* — and an
+/// invariant that is false in one of the places it is reasoned from is not
+/// available anywhere. The bug is the missing boundary check, so the fix is that
+/// there is one place the check can be missing from.
+///
+/// Both arguments are **native** forms — the spellings a compiler and a build
+/// system emit, mixed separators and mixed case included. Folding them is this
+/// function's job precisely so a caller holding native paths does not fold its own
+/// comparison form and get the boundary byte wrong; `Canonicalize` needs the folded
+/// roots for other reasons and so keeps its own internal spelling of the same test.
+///
+/// An empty root matches nothing: a layout that names no build tree must not make
+/// every path in the world lie under it.
+///
+/// @param path A path in native form.
+/// @param root A layout root in native form.
+/// @return True when the root prefixes the path on a segment boundary.
+[[nodiscard]] bool IsUnderRoot(std::string_view path, std::string_view root);
+
+/// True when `path` character-wise prefix-matches `root` and yet does **not** lie
+/// under it — `/home/dev/project-x/a.hpp` against a `/home/dev/proj` root.
+///
+/// A root spelled almost right. This is the state the missing boundary check used
+/// to produce silently, and it is named here rather than deleted with the bug: it
+/// is the one root fault an operator repairs by editing a *root*, and folding it
+/// into "under no root" would send them looking for a file that is exactly where
+/// they put it. What changes is that it is now asked, so every classifier can agree
+/// the path lies outside the roots while still reporting *which* kind of outside it
+/// is (issue #562).
+///
+/// Mutually exclusive with `IsUnderRoot` by construction — a path is under a root,
+/// or a near miss of it, or unrelated to it — and takes the same native forms.
+///
+/// @param path A path in native form.
+/// @param root A layout root in native form.
+/// @return True when the root prefixes the path without a segment boundary.
+[[nodiscard]] bool IsRootNearMiss(std::string_view path, std::string_view root);
+
 /// What a path a compiler emitted is anchored to — the property that decides
 /// whether another machine can make sense of it.
 ///

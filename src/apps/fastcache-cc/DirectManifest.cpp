@@ -293,10 +293,33 @@ bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& l
 
     // Anything under a build root is project content; anything else has no
     // canonical form, so it cannot be listed per-file and must ride the stamp.
-    auto const underRoot = [&comparable](std::string const& root) {
-        return !root.empty() && comparable.starts_with(ToComparable(root));
+    //
+    // `PathCanon::IsUnderRoot` rather than a prefix test written here, and it is
+    // the same predicate `Canonicalize` applies. This used to be a bare
+    // `comparable.starts_with(ToComparable(root))` with no segment-boundary check,
+    // so under a source root `/home/dev/proj` the sibling `/home/dev/project-x/a.hpp`
+    // was project content here and under no root to `Canonicalize` (issue #562).
+    // It failed safe -- this test being the more permissive of the two, the extra
+    // paths were hashed and revalidated rather than dropped -- but the key filter,
+    // the manifest and the replay guard all judge by THIS function so that the
+    // three cannot disagree, and they were all three inheriting a disagreement with
+    // the canonicalizer that decides whether any of them can name the path at all.
+    //
+    // Native forms go in: `IsUnderRoot` folds its own comparison form, whose
+    // boundary byte is `/`. `comparable` above is folded the other way -- to
+    // backslash, matching `ToolchainMarkers` -- and is for the marker scan only.
+    auto const underRoot = [absolutePath](std::string const& root) {
+        return PathCanon::IsUnderRoot(absolutePath, root);
     };
     return !underRoot(layout.sourceRoot) && !underRoot(layout.buildTree);
+}
+
+bool IsNearMissRoot(std::string_view absolutePath, PathCanon::Layout const& layout)
+{
+    if (PathCanon::IsUnderRoot(absolutePath, layout.sourceRoot) || PathCanon::IsUnderRoot(absolutePath, layout.buildTree))
+        return false;
+    return PathCanon::IsRootNearMiss(absolutePath, layout.sourceRoot)
+           || PathCanon::IsRootNearMiss(absolutePath, layout.buildTree);
 }
 
 std::string HashFileContents(std::string_view absolutePath)
@@ -673,15 +696,29 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
             // is the same correction `PathDisposition::DriveRelative` makes and for
             // the same reason. Canonicalizing IS that question: a token comes out
             // only for a path under a root.
-            auto const rooted = ProjectToken(resolved, layout).has_value();
-            return std::unexpected(ManifestFailure {
-                .fault = rooted ? ManifestFault::ToolchainLike : ManifestFault::OutsideRoots, .path = std::move(resolved) });
+            //
+            // Three facts, then, not two: the third is a root spelled almost right,
+            // which used to arrive at the bottom of this function by falling out of
+            // the gap between a character-wise root test here and a segment-wise one
+            // in `Canonicalize`. That gap is closed (issue #562) and the fault is
+            // asked for by name instead, because it is the one of the three an
+            // operator repairs by editing a root.
+            if (ProjectToken(resolved, layout).has_value())
+                return std::unexpected(
+                    ManifestFailure { .fault = ManifestFault::ToolchainLike, .path = std::move(resolved) });
+            auto const fault = IsNearMissRoot(resolved, layout) ? ManifestFault::Uncanonical : ManifestFault::OutsideRoots;
+            return std::unexpected(ManifestFailure { .fault = fault, .path = std::move(resolved) });
         }
         case PathRole::Project:
             break;
     }
 
     auto token = ProjectToken(resolved, layout);
+    // Answered rather than asserted. `PathRole::Project` means `IsToolchainHeader`
+    // placed the path under a root, and since issue #562 that is the same
+    // `PathCanon::IsUnderRoot` the canonicalizer applies, so a token comes out --
+    // but the alternative to answering here is a dereference, and the near miss
+    // this used to report is now asked for by name above.
     if (!token.has_value())
         return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = std::move(resolved) });
     return *std::move(token);
@@ -723,6 +760,21 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
         switch (ClassifyResolved(resolved, layout))
         {
             case PathRole::Toolchain:
+                // A root spelled almost right is REFUSED, not dropped, and it is the
+                // one path outside the roots that is. Everything else out here is
+                // covered collectively by the toolchain stamp, so listing it would
+                // make the manifest machine-specific for no gain in what a hit
+                // revalidates. A near miss is covered by nothing: it is a project
+                // header the roots failed to name, so dropping it would leave a hit
+                // revalidating everything except the file the operator is editing.
+                // Refusing costs this TU direct mode until the root is fixed, and
+                // the ordinary preprocessed key -- which hashes the header's
+                // contents into the preprocessed text -- still serves it correctly
+                // meanwhile. Before issue #562 this refusal happened one branch
+                // later, by way of a root test that disagreed with the
+                // canonicalizer's; the disagreement is gone and the refusal is not.
+                if (IsNearMissRoot(resolved, layout))
+                    return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = resolved });
                 // Covered by the stamp; listing it would make the manifest
                 // machine-specific for no gain in what a hit revalidates.
                 continue;
@@ -735,6 +787,9 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
                 return std::unexpected(ManifestFailure { .fault = ManifestFault::Unanchored, .path = resolved });
             case PathRole::Project: {
                 auto token = ProjectToken(resolved, layout);
+                // As in CanonicalSourceToken: answered rather than asserted, the two
+                // root tests having been one predicate since issue #562, and the near
+                // miss it used to report is asked for by name in the arm above.
                 if (!token.has_value())
                     return std::unexpected(ManifestFailure { .fault = ManifestFault::Uncanonical, .path = resolved });
                 if (auto const stored = record(*std::move(token), resolved); !stored.has_value())

@@ -110,9 +110,12 @@ enum class ManifestFault : std::uint8_t
                    ///< -- a TU inside a vendored tree such as `vcpkg_installed/`. Split
                    ///< from OutsideRoots because the roots are fine and saying otherwise
                    ///< sends an operator to fix what is not broken.
-    Uncanonical,   ///< Rooted by IsToolchainHeader's character-wise prefix test, but
-                   ///< Canonicalize's segment-wise one declined -- `/x/build-other/a.h`
-                   ///< against a `/x/build` root. A root spelled almost right.
+    Uncanonical,   ///< Under no root, and yet a character-wise prefix match for one --
+                   ///< `/x/build-other/a.h` against a `/x/build` root. A root spelled
+                   ///< almost right, and the only path outside the roots this refuses
+                   ///< over rather than dropping: nothing covers it, so a manifest
+                   ///< without it would revalidate everything but the header being
+                   ///< edited. Asked by name (`IsNearMissRoot`) since issue #562.
     Unreadable,    ///< Could not be read, so it could not be hashed. A manifest entry
                    ///< is only worth recording if its content hash is real.
     NoProjectDeps, ///< The compile reported dependencies and every one of them was
@@ -248,13 +251,40 @@ struct ManifestFailure
 /// Classify whether an absolute include path belongs to the immutable toolchain
 /// (and is therefore covered by the toolchain stamp rather than hashed).
 ///
-/// Judged by path prefix rather than by "outside the build roots": a vcpkg tree
-/// nested inside the build tree is still toolchain-like, and misclassifying a
-/// project header as toolchain would let an edit go undetected.
+/// Judged by a toolchain MARKER rather than by "outside the build roots": a vcpkg
+/// tree nested inside the build tree is still toolchain-like, and misclassifying a
+/// project header as toolchain would let an edit go undetected. Failing that, by
+/// whether the path lies under a root — asked of `PathCanon::IsUnderRoot`, the one
+/// definition of that, so this classifier and the canonicalizer that has to produce
+/// a token for whatever it calls project content cannot disagree about which paths
+/// those are (issue #562).
+///
+/// The key filter, the manifest and the replay guard all judge by this function, so
+/// what it means is what all three mean.
+///
 /// @param absolutePath Native-form absolute include path.
 /// @param layout       This build's roots.
 /// @return True when the path is a toolchain header.
 [[nodiscard]] bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& layout);
+
+/// Whether an absolute path lies under neither root while character-wise
+/// prefix-matching one — `<root>-other/a.hpp` against a `<root>` root.
+///
+/// The layout-wide form of `PathCanon::IsRootNearMiss`, and the "under neither"
+/// half is not redundant: with a build tree at `/w/src-other` and a source root at
+/// `/w/src`, a path can be a near miss of one root and legitimately under the
+/// other, and that path is project content rather than a misspelling.
+///
+/// Asked only about paths `IsToolchainHeader` has already placed outside the roots,
+/// to say WHICH kind of outside they are: an operator repairs this one by editing a
+/// root, and every other by moving a file or fixing a working directory. Reported
+/// as `PathDisposition::Uncanonical` on the key side and `ManifestFault::Uncanonical`
+/// on the manifest side.
+///
+/// @param absolutePath Native-form absolute path.
+/// @param layout       This build's roots.
+/// @return True when the path is a near miss of a root and under none.
+[[nodiscard]] bool IsNearMissRoot(std::string_view absolutePath, PathCanon::Layout const& layout);
 
 /// Hash a file's contents for manifest entry comparison. A missing or unreadable
 /// file yields an empty string, which never equals a recorded hash and so forces

@@ -54,6 +54,82 @@ TEST_CASE("Root match is on a segment boundary, not a bare prefix")
     CHECK(token == R"(C:\src\other\x.h)");
 }
 
+TEST_CASE("IsUnderRoot is the segment-boundary test Canonicalize applies")
+{
+    // The exported form of the rule the case above pins through Canonicalize, and
+    // the reason it is exported: the launcher's `IsToolchainHeader` used to answer
+    // this question with a bare `starts_with` and no boundary check, so the two
+    // disagreed about a sibling directory whose name merely extends the root's last
+    // segment (issue #562). Every assertion here is written twice on purpose --
+    // once against `IsUnderRoot`, once against `Canonicalize` -- because what
+    // failed was not either answer but the two being DIFFERENT, and a case that
+    // checks only one of them passes under the bug.
+    std::string const root = "/home/dev/proj";
+    Layout const layout { .sourceRoot = root, .buildTree = "/home/dev/proj/build" };
+
+    auto const canonicalizes = [&layout](std::string_view path) {
+        return PathCanon::Canonicalize(path, layout) != path;
+    };
+
+    SECTION("a sibling whose name extends the root's last segment is outside it")
+    {
+        std::string const sibling = "/home/dev/project-x/a.hpp";
+        CHECK_FALSE(PathCanon::IsUnderRoot(sibling, root));
+        CHECK_FALSE(canonicalizes(sibling));
+    }
+
+    SECTION("an ordinary path under the root is inside it")
+    {
+        std::string const inside = "/home/dev/proj/src/a.hpp";
+        CHECK(PathCanon::IsUnderRoot(inside, root));
+        CHECK(canonicalizes(inside));
+    }
+
+    SECTION("the root itself is under itself")
+    {
+        CHECK(PathCanon::IsUnderRoot(root, root));
+    }
+
+    SECTION("an empty root holds nothing")
+    {
+        // Not a technicality: a layout that names no build tree would otherwise
+        // place every path in the world under it.
+        CHECK_FALSE(PathCanon::IsUnderRoot("/home/dev/proj/a.hpp", ""));
+        CHECK_FALSE(PathCanon::IsRootNearMiss("/home/dev/proj/a.hpp", ""));
+    }
+
+    SECTION("separators and case are folded on both sides")
+    {
+        // The two spellings a real build mixes: CMake exports forward slashes while
+        // `cl` emits backslashes.
+        CHECK(PathCanon::IsUnderRoot(R"(D:\Project\src\a.hpp)", "D:/Project"));
+        CHECK(PathCanon::IsUnderRoot("d:/project/src/a.hpp", R"(D:\Project)"));
+        CHECK_FALSE(PathCanon::IsUnderRoot(R"(D:\Project-x\src\a.hpp)", "D:/Project"));
+    }
+}
+
+TEST_CASE("IsRootNearMiss names exactly what the missing boundary check used to hide")
+{
+    // The trichotomy: under the root, a near miss of it, or unrelated to it. The
+    // middle one is the state a bare `starts_with` produced by accident and reported
+    // by falling out of the gap between two disagreeing predicates; it is now a
+    // question with an answer, so a caller can agree the path is outside the roots
+    // and still say WHICH kind of outside.
+    std::string const root = "/home/dev/proj";
+
+    CHECK(PathCanon::IsRootNearMiss("/home/dev/project-x/a.hpp", root));
+    CHECK_FALSE(PathCanon::IsUnderRoot("/home/dev/project-x/a.hpp", root));
+
+    // Under the root is not a near miss of it -- the two are complementary, never
+    // both true, which is what lets a caller ask either one and get a total answer.
+    CHECK_FALSE(PathCanon::IsRootNearMiss("/home/dev/proj/src/a.hpp", root));
+    CHECK_FALSE(PathCanon::IsRootNearMiss(root, root));
+
+    // Nor is a path that shares no prefix at all: that is an ordinary outside-roots
+    // path, which is repaired by moving a file rather than by editing a root.
+    CHECK_FALSE(PathCanon::IsRootNearMiss("/usr/include/vector", root));
+}
+
 TEST_CASE("Matching is case-insensitive on Windows drive and path")
 {
     Layout const layout { .sourceRoot = R"(C:\Ci\Deep\Src)", .buildTree = R"(C:\Ci\Deep\Build)" };

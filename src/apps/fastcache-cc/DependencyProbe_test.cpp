@@ -463,12 +463,13 @@ TEST_CASE("A relative path with no working directory is tallied as unanchored")
 
 TEST_CASE("A root spelled almost right is tallied as having no canonical form")
 {
-    // The two root tests disagree here, and neither is wrong: IsToolchainHeader's
-    // prefix match is character-wise, so `/x/build-other` looks like project
-    // content under `/x/build`, while Canonicalize's is segment-wise and declines.
-    // Dropped either way — but it is a root off by a suffix rather than a system
-    // header, and folding it into "toolchain" would hide the only fault of the
-    // three the operator fixes by editing a root.
+    // `/x/build-other` is outside the roots — every classifier agrees on that since
+    // issue #562, `IsToolchainHeader` and `Canonicalize` having one segment-wise
+    // predicate between them. What survives that agreement is WHICH kind of outside:
+    // a root off by a suffix rather than a system header, asked for by name
+    // (`Cc::IsNearMissRoot`) rather than inferred from two predicates disagreeing.
+    // Folding it into "toolchain" would hide the only fault of the three the
+    // operator fixes by editing a root.
     PathCanon::Layout const layout { .sourceRoot = "/x/src", .buildTree = "/x/build" };
     auto const set = Classified({ "/x/build-other/a.h", "/x/build/gen/b.h" }, layout, "/x/build");
 

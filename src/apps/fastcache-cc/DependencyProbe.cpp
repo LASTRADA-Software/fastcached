@@ -241,19 +241,34 @@ namespace
             // exactly one root test.
             if (driveRelative && !RootToken(path, layout).has_value())
                 return Dropped(PathDisposition::DriveRelative);
+
+            // A root spelled almost right, asked as its own question rather than
+            // inferred from two classifiers disagreeing. It used to be the latter:
+            // `IsToolchainHeader` matched a root character-wise while `Canonicalize`
+            // matched segment-wise, so `/x/build-other/a.h` fell out of the gap
+            // between them and was reported here by arriving at the bottom of this
+            // function. That gap was a violation of the invariant the three
+            // classifiers exist to keep (issue #562) and is closed; the fault it
+            // happened to name is not, because it is the one root fault of the three
+            // an operator repairs by editing a root rather than by moving a file.
+            // Explicit is also cheaper to reason about: it now says what it means
+            // instead of meaning whatever two predicates happen to disagree about.
+            if (IsNearMissRoot(path, layout))
+                return Dropped(PathDisposition::Uncanonical);
             return Dropped(PathDisposition::Toolchain);
         }
 
         if (auto token = RootToken(path, layout); token.has_value())
             return { .disposition = PathDisposition::Keyed, .token = *std::move(token) };
 
-        // Under no root, and the two ways to arrive there are different repairs.
-        // `Uncanonical` means the two root tests disagreed: IsToolchainHeader's
-        // prefix match is character-wise and Canonicalize's is segment-wise, so
-        // `/x/build-other/a.h` is project content to the first and under no root to
-        // the second — a root spelled almost right, which folding into "toolchain"
-        // would make indistinguishable from an ordinary system header.
-        return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Uncanonical);
+        // `IsToolchainHeader` called this path rooted and `Canonicalize` then
+        // produced nothing, which the shared predicate leaves no way to reach: since
+        // issue #562 both ask `PathCanon::IsUnderRoot`, and the only remaining
+        // difference is the markers, which cannot make a path MORE rooted. Answered
+        // rather than asserted because the alternative to answering is keying a path
+        // with no portable form -- the producing machine's absolute spelling in the
+        // key -- and that is the one outcome here worth being total about.
+        return Dropped(driveRelative ? PathDisposition::DriveRelative : PathDisposition::Toolchain);
     }
 } // namespace
 
