@@ -8,7 +8,7 @@
 # everything -- so this drives the real check against synthetic trees and asserts each
 # verdict SEPARATELY rather than inverting one run with `WILL_FAIL`.
 #
-# A mutation that reddens everything must not pass here. That is why five cases assert
+# A mutation that reddens everything must not pass here. That is why seven cases assert
 # the check stays SILENT and each refusing case asserts the phrase naming ITS OWN
 # refusal: a check that objected for the wrong reason is a check that will object to the
 # wrong code tomorrow.
@@ -17,16 +17,20 @@
 # deliberately-wrong `SUCCEED` would be a violation of the rule under test, and
 # excluding it from the scan would put a hole in the thing being proved.
 #
-# Ten cases:
+# Thirteen cases:
 #
 #   clean          a `SUCCEED` that ends a case PASSES -- an always-failing check is as
 #                  useless as an always-passing one
 #   bare           `SUCCEED()` with no message PASSES. `Ranges_test.cpp` uses it after a
 #                  block of static_asserts: a case that ran with nothing left to assert
-#   commented      the idiom quoted in a COMMENT PASSES. This rule is written out in
+#   commented      the idiom quoted in a `//` COMMENT PASSES. This rule is written out in
 #                  `.agent/rules/testing.md` and cited in test comments, so a scan that
 #                  could not tell prose from code would refuse its own documentation
+#   block-comment  the same inside a `/* ... */` block written without leading stars,
+#                  which is what a historic note quoting the idiom looks like
 #   bail-out       `SUCCEED` followed by `return;` FAILS, and NAMES the file
+#   one-line       `if (!ready) { SUCCEED("x"); return; }` FAILS -- the same defect in one
+#                  line, which a scan starting at the FOLLOWING line walks past
 #   vocabulary     a skip-vocabulary message with NO return FAILS. The two signals must
 #                  each work alone, or the check is really one signal with a spare
 #   unreadable     a `SUCCEED` this scan cannot read on one line FAILS as its own
@@ -37,8 +41,10 @@
 #                  different repairs
 #   excluded       a violation under a build tree is IGNORED -- Catch2's own self-tests
 #                  are full of `SUCCEED` and nobody here can edit them
-#   git            the mode CI actually takes: an untracked vendored violation is
-#                  ignored, a TRACKED one is still caught
+#   git            the mode CI actually takes, three ways: an untracked vendored violation
+#                  is ignored, a TRACKED one is still caught, and an index entry whose
+#                  file was deleted from the worktree does not turn an unreadable path
+#                  into a finding this check's registration cannot tell from a real one
 #
 # Runs as `cmake -P`. See `check-script-check-signals.cmake` for why such a check reports
 # failure through its OUTPUT rather than an exit code.
@@ -179,6 +185,31 @@ else()
         "bail-out: the check objected for some other reason than the bail-out shape, so the structural signal is not what fired and may not work at all")
 endif()
 
+# 4b. The same defect written on ONE line. A scan that starts at the line AFTER the
+#     `SUCCEED` walks straight past it, and the message is in no vocabulary row, so
+#     nothing else would catch it either.
+fastcached_make_tree("one-line" "src/thing/Thing_test.cpp"
+    "TEST_CASE(\"bails\")\n{\n    if (!ready) { SUCCEED(\"all good here\")${SEMI} return${SEMI} }\n    CHECK(Property())${SEMI}\n}\n${cleanSite}" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    # No `${SEMI}` in a failure MESSAGE: a raw semicolon splits it into two list elements
+    # and tears the sentence in half, so one wrong verdict reports as three.
+    list(APPEND failures "one-line: a SUCCEED and its bare `return` written inside one set of braces on a single line passed -- the bail-out signal only looks at the FOLLOWING line, so the same defect written in one line is invisible")
+else()
+    fastcached_expect_text("${output}" "followed by a bare"
+        "one-line: the check objected for some other reason than the bail-out shape, so the one-line form is not what it caught")
+endif()
+
+# 4c. A `/* ... */` block written without leading stars. Its body is what a historic note
+#     quoting this rule looks like, and refusing it leaves a contributor no way to make
+#     the build green but rewording the comment.
+fastcached_make_tree("block-comment" "src/thing/Thing_test.cpp"
+    "/*\n    Historic note, do not do this:\n    SUCCEED(\"no loopback listener available on this host\")${SEMI}\n    return${SEMI}\n*/\n${cleanSite}" tree)
+fastcached_run_check("${tree}" objected output)
+if(objected)
+    list(APPEND failures "block-comment: the idiom quoted inside a /* ... */ block was reported as code, so this check refuses the prose that documents it and the only repair is to reword the comment")
+endif()
+
 # 5. Skip vocabulary with NO return. The two signals must each work alone, or one of them
 #    is decoration -- and it is the message half that catches the sites written as an
 #    `if`/`else` rather than an early return.
@@ -247,11 +278,12 @@ if(NOT FASTCACHED_GIT)
     list(APPEND failures
          "git-mode: no git executable, so the mode CI actually uses could not be exercised at all -- inconclusive, not a pass")
 else()
-    foreach(case "untracked" "tracked-bad")
+    foreach(case "untracked" "tracked-bad" "tracked-deleted")
         set(tree "${root}/git-${case}")
         file(REMOVE_RECURSE "${tree}")
         file(MAKE_DIRECTORY "${tree}/src/thing")
         file(WRITE "${tree}/src/thing/Thing_test.cpp" "${cleanSite}")
+        file(WRITE "${tree}/src/thing/Gone_test.cpp" "${cleanSite}")
         file(MAKE_DIRECTORY "${tree}/.cache/CPM/catch2/deadbeef/tests")
         file(WRITE "${tree}/.cache/CPM/catch2/deadbeef/tests/Vendored_test.cpp"
              "TEST_CASE(\"vendored\")\n{\n    SUCCEED(\"cannot run here\")${SEMI}\n}\n")
@@ -266,7 +298,8 @@ else()
         if(NOT gitStatus EQUAL 0)
             set(gitSetup "git init: ${gitError}")
         endif()
-        execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add "src/thing/Thing_test.cpp"
+        execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+                                "src/thing/Thing_test.cpp" "src/thing/Gone_test.cpp"
                         OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
         if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
             set(gitSetup "git add: ${gitError}")
@@ -288,6 +321,14 @@ else()
             continue()
         endif()
 
+        # An index entry whose file is gone. `git ls-files` names it, `file(READ)` then
+        # emits `CMake Error ... failed to open for reading`, and the registration's
+        # FAIL_REGULAR_EXPRESSION scores that as THIS check failing -- for a reason with
+        # nothing to do with `SUCCEED`. An ordinary state: `rm` before `git rm`.
+        if(case STREQUAL "tracked-deleted")
+            file(REMOVE "${tree}/src/thing/Gone_test.cpp")
+        endif()
+
         fastcached_run_check("${tree}" objected output)
         if(case STREQUAL "untracked")
             if(objected)
@@ -296,9 +337,20 @@ else()
             endif()
             fastcached_expect_text("${output}" "git ls-files"
                 "git-untracked: the check did not report scanning via git ls-files, so this case exercised the fallback and proves nothing about the mode CI uses")
+        elseif(case STREQUAL "tracked-deleted")
+            if(objected)
+                list(APPEND failures
+                     "git-tracked-deleted: a tracked file deleted from the worktree made the check fail -- an unreadable path is not a SUCCEED finding, and the registration cannot tell the two apart")
+            endif()
         elseif(NOT objected)
             list(APPEND failures
                  "git-tracked-bad: a TRACKED violation was not reported -- deriving the set from git must not degrade into ignoring everything")
+        else()
+            # The refusal is asserted by its own phrase, like every other failing case:
+            # a bare `objected` would accept the emptiness guard, or an unreadable file,
+            # as proof that a tracked violation was caught.
+            fastcached_expect_text("${output}" "says the check could not be performed"
+                "git-tracked-bad: the check objected for some other reason than the vendored file's message, so this case does not show a TRACKED violation being caught")
         endif()
     endforeach()
 endif()
@@ -317,4 +369,4 @@ if(failures)
     message(FATAL_ERROR "succeed-not-skip selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "succeed-not-skip selftest: 10 synthetic tree(s), every verdict as expected")
+message(STATUS "succeed-not-skip selftest: 13 synthetic tree(s), every verdict as expected")

@@ -26,9 +26,11 @@
 # lexical can decide that:
 #
 #   * **The bail-out shape.** A `SUCCEED` whose next statement is `return;` is leaving
-#     the case early. Every one of the twenty-one sites #685 converted had it, and no
-#     legitimate site in this tree does: a `SUCCEED` that means "the case ran and there
-#     was nothing to assert" is the LAST thing in the case and needs no return.
+#     the case early -- on the following line, or on its own line, since
+#     `if (!ready) { SUCCEED("x"); return; }` is the same defect written in one. Every
+#     one of the twenty-one sites #685 converted had it, and no legitimate site in this
+#     tree does: a `SUCCEED` that means "the case ran and there was nothing to assert"
+#     is the LAST thing in the case and needs no return.
 #   * **Skip vocabulary in the message.** A message saying the check could not be
 #     performed is the author telling you which state this is. The table below is data,
 #     one row per phrase with the reading that makes it a skip.
@@ -187,19 +189,48 @@ set(sites "")
 set(violations "")
 
 foreach(relative IN LISTS testFiles)
+    # `git ls-files` lists the INDEX, so a test file deleted from the worktree and not
+    # yet staged is still named here. Reading it emits `CMake Error ... failed to open
+    # for reading`, which the registration's FAIL_REGULAR_EXPRESSION scores as THIS check
+    # failing -- for a reason with nothing to do with `SUCCEED`.
+    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${relative}")
+        continue()
+    endif()
+
     fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${relative}" lines)
     list(LENGTH lines lineCount)
 
     set(lineNumber 0)
-    foreach(line IN LISTS lines)
+    set(inBlockComment FALSE)
+    foreach(rawLine IN LISTS lines)
         math(EXPR lineNumber "${lineNumber} + 1")
 
-        # Prose, not a call. This file's rule is written out in `.agent/rules/testing.md`
-        # and quoted in test comments, so a scan that could not tell those apart would
-        # refuse the documentation of its own rule.
-        if(line MATCHES "^[ \t]*(//|\\*|/\\*)")
-            continue()
+        # Prose, not a call. This rule is written out in `.agent/rules/testing.md` and
+        # quoted in test comments, so a scan that could not tell those apart would refuse
+        # the documentation of its own rule -- with no escape hatch but rewording the
+        # comment. A leading-`//` test is not enough: a `/* ... */` block written without
+        # leading stars carries whole paragraphs, and its body is what a historic note
+        # quoting the idiom looks like.
+        #
+        # The blind spot, stated rather than papered over: CMake's regex engine is greedy
+        # and has no lazy quantifier, so stripping inline `/* ... */` pairs takes
+        # everything between the FIRST `/*` and the LAST `*/` on a line. A `SUCCEED`
+        # sitting between two block comments on one line is therefore invisible here.
+        set(line "${rawLine}")
+        if(inBlockComment)
+            if(NOT line MATCHES "\\*/")
+                continue()
+            endif()
+            string(REGEX REPLACE "^.*\\*/" "" line "${line}")
+            set(inBlockComment FALSE)
         endif()
+        string(REGEX REPLACE "/\\*.*\\*/" " " line "${line}")
+        if(line MATCHES "/\\*")
+            string(REGEX REPLACE "/\\*.*$" "" line "${line}")
+            set(inBlockComment TRUE)
+        endif()
+        string(REGEX REPLACE "//.*$" "" line "${line}")
+
         if(NOT line MATCHES "SUCCEED[ \t]*\\(")
             continue()
         endif()
@@ -248,6 +279,13 @@ foreach(relative IN LISTS testFiles)
         # comment may sit between them -- being a bare `return` means the case is leaving
         # early, which is what a case does when its environment could not be arranged.
         #
+        # The `return` may also sit on the SUCCEED's OWN line: `if (!ready) { SUCCEED("x");
+        # return; }` is the defect in one line, and a scan that starts at the next line
+        # walks straight past it. Checked first, since it is the cheaper question.
+        if(reason STREQUAL "" AND line MATCHES "SUCCEED[ \t]*\\(.*\\)[ \t]*;.*return[ \t]*;")
+            set(reason "SUCCEED is followed by a bare `return`, so the case is bailing out and never reached the property it reports a pass for")
+        endif()
+
         # `lineNumber` is 1-based, so it is already the 0-based index of the NEXT line.
         if(reason STREQUAL "")
             set(scanIndex "${lineNumber}")

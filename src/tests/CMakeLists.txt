@@ -384,20 +384,24 @@ set_tests_properties("succeed-not-skip" PROPERTIES
 
 # And that check must be SEEN to fail, on each direction it claims.
 #
-# Ten synthetic trees, one verdict asserted each: a SUCCEED that ends a case passes, so
-# does `SUCCEED()` with no message and the idiom quoted in a comment; a SUCCEED followed
-# by `return;` fails and NAMES the file; a skip-vocabulary message with no return fails
-# on its own, so neither signal is decoration; a SUCCEED the scan cannot read on one line
-# fails as its own outcome; no SUCCEED at all and no test source at all each fail as a
-# broken scan, in different words because they are different repairs; a violation under a
-# build tree is ignored; and the git path -- the one CI takes -- ignores an untracked
-# vendored violation while still catching a tracked one.
+# Thirteen synthetic trees, one verdict asserted each: a SUCCEED that ends a case passes,
+# so does `SUCCEED()` with no message and the idiom quoted in a `//` comment or inside a
+# `/* ... */` block; a SUCCEED followed by `return;` fails and NAMES the file, and so does
+# the same defect written on ONE line, which a scan starting at the following line walks
+# past; a skip-vocabulary message with no return fails on its own, so neither signal is
+# decoration; a SUCCEED the scan cannot read on one line fails as its own outcome; no
+# SUCCEED at all and no test source at all each fail as a broken scan, in different words
+# because they are different repairs; a violation under a build tree is ignored; and the
+# git path -- the one CI takes -- ignores an untracked vendored violation, still catches a
+# tracked one, and does not turn an index entry whose file was deleted into an unreadable
+# path this registration cannot tell from a real finding.
 #
 # Per case rather than `WILL_FAIL`, because a check that stopped refusing and one that
 # refuses everything are opposite defects a bare inversion reports identically. Measured
-# against three mutants of the check: removing the bail-out signal reddens exactly the
-# `bail-out` case, emptying the vocabulary reddens the message-driven cases, and making
-# it refuse everything reddens all five that assert silence.
+# against six mutants of the check: removing each of the bail-out, one-line, block-comment
+# and deleted-file guards reddens exactly its own case, emptying the vocabulary reddens
+# the message-driven ones, and making it refuse everything reddens all seven that assert
+# silence.
 add_test(
     NAME "succeed-not-skip-selftest"
     COMMAND ${CMAKE_COMMAND}

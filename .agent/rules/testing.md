@@ -956,13 +956,21 @@ whole fix — it exits 4, every `catch_discover_tests` registration carries
   was wrong — and the next test written was copied from it, comment and all. The
   argument was there to be read and was not the thing being copied.
 - **What a check can see, and what it cannot.** `ctest -R succeed-not-skip` fires on two
-  signals: a `SUCCEED` whose next statement is a bare `return` (the bail-out shape, which
-  every one of the twenty-one had and no legitimate site in this tree has), and a message
-  in skip vocabulary — "unavailable", "could not", "privilege", "exercised by" — held as
-  a table with one row per phrase. A silent bail-out with a message in neither vocabulary
-  and no `return` is invisible to it. That limit is stated in the script rather than
-  papered over: the check closes the door the defect came through, and this rule covers
-  the rest.
+  signals: a `SUCCEED` whose next statement is a bare `return` — on the following line or
+  on its own, since `if (!ready) { SUCCEED("x"); return; }` is the same defect written in
+  one — and a message in skip vocabulary, "unavailable", "could not", "privilege",
+  "exercised by", held as a table with one row per phrase. A silent bail-out with a
+  message in neither vocabulary and no `return` is invisible to it, and so is a `SUCCEED`
+  sitting between two block comments on one line, because CMake's regex engine is greedy
+  and strips from the first `/*` to the last `*/`. Those limits are stated in the script
+  rather than papered over: the check closes the door the defect came through, and this
+  rule covers the rest.
+- **A check that refuses its own documentation has no escape hatch.** This rule is
+  written out in prose that quotes the idiom, and test files cite it in comments. The
+  scan therefore strips `//` comments and tracks `/* ... */` blocks across lines — a
+  leading-`//` test is not enough, because a block written without leading stars carries
+  whole paragraphs and its body is exactly what a historic note looks like. A contributor
+  tripped by that could make the build green only by rewording the comment.
 - **"Covered by another test" is a reason to SKIP, never a reason to pass.**
   `ServiceControl_test.cpp` deliberately does not call `InstallService` on Windows and
   macOS — a unit test must not register a service on the host — and said so in a
@@ -972,14 +980,21 @@ whole fix — it exits 4, every `catch_discover_tests` registration carries
   parenthesis on one line is reported as its own outcome. A site it could not read is not
   a site it cleared.
 - **The guard is shown failing on every direction it claims**
-  (`ctest -R succeed-not-skip-selftest`): ten synthetic trees, one verdict each, and each
-  refusal asserted by the phrase naming *that* refusal — so a mutation that reddens
-  everything fails the selftest instead of looking thorough. Measured against three
-  mutants: removing the bail-out signal reddens exactly the `bail-out` case, emptying the
-  vocabulary reddens the message-driven ones, and refusing everything reddens all five
-  cases that assert silence. Five of the ten exist only to assert the check stays
-  **quiet** — on `SUCCEED()` with no message, on a `SUCCEED` that ends a case, and on the
-  idiom quoted in a *comment*, since this rule is documented in prose that quotes it.
+  (`ctest -R succeed-not-skip-selftest`): thirteen synthetic trees, one verdict each, and
+  each refusal asserted by the phrase naming *that* refusal — so a mutation that reddens
+  everything fails the selftest instead of looking thorough. Measured against six mutants:
+  removing each of the bail-out, one-line, block-comment and deleted-file guards reddens
+  exactly its own case, emptying the vocabulary reddens the message-driven ones, and
+  refusing everything reddens all seven cases that assert silence. Seven of the thirteen
+  exist only to assert the check stays **quiet** — on `SUCCEED()` with no message, on a
+  `SUCCEED` that ends a case, and on the idiom quoted in a comment of either kind.
+- **A fixture that could not be STAGED says so.** The selftest's git cases build a real
+  repository, and under a long scratch path `git add` failed with "Filename too long" —
+  the tree then had no index, the check fell back to the directory walk, and two verdicts
+  came back wrong for a reason that had nothing to do with the check. Every git command
+  the fixture runs is checked, and a case that could not be arranged reports *that*,
+  naming what git said. The scratch directory is also the root rather than a directory
+  inside it, which is one long path component fewer.
 
 ## A leader-pinned command goes to whoever leads NOW
 
