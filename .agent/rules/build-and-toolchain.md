@@ -1665,14 +1665,39 @@ makes it anyway and says so there.
   off**. Pointed at a GCC one it inherits flags clang does not know; and a database
   from a module-scanning generator carries `@…modmap` arguments that do not exist
   until that target has been built, so the translation unit fails to parse and the
-  file reports nothing at all. Configure a throwaway tree:
+  file reports nothing at all. Configure it **through the preset the CI job
+  configures**, into a directory of its own:
 
   ```sh
-  cmake -S . -B out/build/tidy22 -G Ninja \
-        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-        -DFASTCACHED_ENABLE_TLS=ON
+  cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF \
+        -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON \
+        -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
   ```
+
+  **Not a hand-rolled `cmake -S . -B …` equivalent**, which is what stood here and
+  what `tidy-sweep.sh` documented until #454. A bare configure line inherits
+  `PEDANTIC_COMPILER` and `PEDANTIC_COMPILER_WERROR` OFF, so its database carries
+  neither `-Wall -Wextra -Wconversion -pedantic` nor the `-Wno-…` suppressions that
+  accompany them — **29 flags apart on the same translation unit**. `.clang-tidy`
+  enables `clang-diagnostic-*`, so those flags decide what the sweep reports, and it
+  diverges *in both directions at once*: findings CI suppresses appear, and findings
+  CI raises do not. Measured: a `double`→`int` return that CI's database reports as
+  `clang-diagnostic-float-conversion` produced **nothing** from the hand-rolled one.
+  The noisy direction wastes a cycle; the blind direction ships to CI, and both read
+  like a clean tree.
+
+  It is also how the target-set bullet above gets violated by the very page that
+  states it: the old line omitted the two default-OFF app targets, so four
+  first-party translation units were absent from the database rather than clean.
+  A rule whose own example contradicts it is worse than no example.
+
+  `-B` overrides the preset's `binaryDir`, which is what keeps this out of the
+  `out/build/clang-debug` tree `local-gate.sh` builds — configuring the sweep's
+  database must not turn `ENABLE_TIDY` and module scanning off in that one.
+
+  The line is the `clang-tidy` job's `Configure` step verbatim plus `-B`, and
+  `ctest -R tidy-sweep-database` asserts it stays that way: nothing else connects
+  the workflow to the two places that document it.
 
 - **A sweep that cannot prove the tool ran is worth nothing, and reads like
   success.** Every way of getting clang-tidy wrong above -- an unset execute bit

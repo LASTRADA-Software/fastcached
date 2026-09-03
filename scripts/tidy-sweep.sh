@@ -36,14 +36,43 @@
 # Run it from where it was unpacked, or through a wrapper that does: clang-tidy
 # resolves its resource headers relative to the binary.
 #
-# And the database must be a CLANG one with module scanning off -- the `@…modmap`
-# flags a module-scanning generator emits do not exist until that target has been
-# built, and a translation unit that fails to parse reports nothing:
+# And the database is configured **through the preset the CI job configures**,
+# with CI's own flags, into a directory of its own:
 #
-#   cmake -S . -B out/build/tidy22 -G Ninja \
-#         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
-#         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-#         -DFASTCACHED_ENABLE_TLS=ON
+#   cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF \
+#         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON \
+#         -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+#
+# That line is the `clang-tidy` job's `Configure` step verbatim plus `-B`, and
+# `check-tidy-sweep-database.sh` asserts it stays that way. It is NOT a
+# hand-rolled equivalent, because the two stopped being equivalent (#454): a bare
+# `cmake -S . -B … -DCMAKE_CXX_COMPILER=clang++ …` inherits `PEDANTIC_COMPILER`
+# and `PEDANTIC_COMPILER_WERROR` OFF, so the database it writes carries neither
+# `-Wall -Wextra -Wconversion -pedantic` nor the `-Wno-…` suppressions that go
+# with them -- 29 flags apart on the same translation unit. `.clang-tidy` enables
+# `clang-diagnostic-*`, so those flags decide what the sweep REPORTS, and it
+# diverges in both directions at once: findings CI suppresses appear, and
+# findings CI raises do not. Measured: a `double`->`int` return that CI's database
+# reports as `clang-diagnostic-float-conversion` produced *nothing* from a
+# hand-rolled one. A local sweep that is blind to what will turn CI red is the
+# expensive direction, and it reads exactly like a clean tree.
+#
+# It also omits the two default-OFF app targets CI turns on, which is the same
+# failure by a second route: four first-party translation units
+# (`compile-cache-testclient`, `fastcache-bench`) are then absent from the
+# database rather than clean, and the sweep prints a confident count without
+# them. See .agent/rules/build-and-toolchain.md, which states that rule.
+#
+# `-B` is what keeps this out of your own `out/build/clang-debug` tree -- it
+# overrides the preset's `binaryDir`, so configuring the sweep's database does not
+# turn `ENABLE_TIDY` and module scanning off in the build `local-gate.sh` uses.
+#
+# The preset settles the two things this database has to get right on its own:
+# it is a CLANG database (pointed at a GCC one, clang-tidy inherits flags it does
+# not know), and `-DCMAKE_CXX_SCAN_FOR_MODULES=OFF` is passed explicitly because
+# the `@…modmap` flags a module-scanning generator emits do not exist until that
+# target has been built, and a translation unit that fails to parse reports
+# nothing.
 #
 # Usage:  [TIDY=clang-tidy-22] [DB=out/build/tidy22] [BASE=origin/master] \
 #         [JOBS=4] scripts/tidy-sweep.sh [--all|--self-test]
