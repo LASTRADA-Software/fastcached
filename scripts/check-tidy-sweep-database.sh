@@ -1,50 +1,61 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# The two places that document how to configure the tidy sweep's compile
-# database must document what the `clang-tidy` CI job actually configures.
+# Every place that documents how to configure the tidy sweep's compile database
+# must document what the `clang-tidy` CI job actually configures.
 #
 # ## Why this is a test and not a review note
 #
 # `scripts/tidy-sweep.sh` opens by saying it is "for reproducing what CI will
 # say". A person who wants that reads its header and runs the line it prints.
-# Until #454 that line was hand-rolled, and it had drifted:
+# Until #454 that line was hand-rolled and had drifted -- in compile flags and in
+# target set, in both directions at once, so a local sweep both invented findings
+# CI suppresses and stayed silent on findings CI raises. **The measurements are in
+# `.agent/rules/build-and-toolchain.md`** beside the configure line itself; they
+# are deliberately not restated here, because a figure restated in four places is
+# a figure that gets updated in one.
 #
-#   * 29 compile flags apart on the same translation unit. The preset carries
-#     `-Wall -Wextra -Wconversion -pedantic -Werror` and the `-Wno-…`
-#     suppressions accompanying them; the hand-rolled line inherited
-#     `PEDANTIC_COMPILER`/`PEDANTIC_COMPILER_WERROR` OFF and carried none.
-#     `.clang-tidy` enables `clang-diagnostic-*`, so those flags decide what the
-#     sweep REPORTS.
-#   * Four first-party translation units absent from the database rather than
-#     clean, because it omitted the two default-OFF app targets CI turns on.
+# Nothing else connects the workflow to the files that document it, and the
+# rulebook had carried the target-set rule twelve lines above a code block that
+# violated it -- so "the comment says so" is demonstrably not enough.
 #
-# Both directions read like a clean tree, which is the whole problem: one wastes
-# a cycle chasing a finding CI suppresses, the other ships to CI code a local
-# sweep called clean. A tool that reports things that are not true trains people
-# to ignore it, and `tidy-sweep.sh` exists precisely because a sweep that cannot
-# prove it ran is worth nothing.
-#
-# Nothing else connects the workflow to the two files that document it. The
-# rulebook already carried the target-set rule twelve lines above a code block
-# that violated it, so "the comment says so" is demonstrably not enough.
-#
-# ## Derived, not tabulated
+# ## Derived, not tabulated -- twice
 #
 # CI's line is READ from `.github/workflows/build.yml` rather than restated here.
-# A second copy of it would not be a cross-check, it would be a second thing to be
-# wrong -- the reasoning `scripts/check-tsan-scope.cmake` records for reading the
-# gate's tag expression instead of repeating it, and `check-merge-queue-contexts.sh`
-# for deriving its context-to-job mapping.
+# A second copy would not be a cross-check, it would be a second thing to be wrong
+# -- the reasoning `scripts/check-tsan-scope.cmake` records for reading the TSan
+# gate's tag expression instead of repeating it.
+#
+# And WHICH files document a line is discovered by scanning for the sweep's own
+# database directory, never by a list. #492's rule: a list is exact about the
+# files it knows and silent about the ones it does not, and silence reads
+# identically to complete coverage. A guide or a README growing a third copy of
+# the configure line is exactly the drift this check exists for, and a two-entry
+# list would pass green forever while it rotted.
+#
+# One file is named, and only one: `scripts/tidy-sweep.sh` must be among the sites
+# found. That is not a tabulated set, it is the assertion that the header this
+# check was written for still documents anything at all -- a scan alone would go
+# quietly green if that header lost its configure line entirely.
 #
 # ## What it compares, and what it deliberately ignores
 #
-# The preset name and the set of `-D` options, as a SET: order is not meaningful
-# and neither is line wrapping. `-B` is ignored as a value but REQUIRED to be
-# present in the documented lines -- it is what keeps the sweep's database out of
-# the `out/build/clang-debug` tree `local-gate.sh` builds, and a documented line
-# without it silently turns `ENABLE_TIDY` and module scanning off in that build.
-# CI needs no `-B` because its runner has no such tree to protect.
+# The preset name and the `-D` options as a SET, values included: order and line
+# wrapping are not the contract. `-B` is ignored as a value here because the scan
+# anchor already pins it -- a documented line that does not name the sweep's
+# database directory is not found as a site at all, and `tidy-sweep.sh` defaults
+# `DB` to that same directory. CI needs no `-B` because its runner has no
+# `out/build/clang-debug` tree to protect.
+#
+# ## What it cannot assert, stated rather than left as an apparent omission
+#
+# Command equality is not database equality. `clang-debug` names bare `clang++`,
+# and `cmake/portable/PedanticCompiler.cmake` adds each warning flag only if
+# `check_cxx_compiler_flag` accepts it -- so following the documentation perfectly
+# on an older clang still yields a flag set that can differ from CI's, along the
+# very `clang-diagnostic-*` axis #454 is about. The rulebook pins the ANALYSER's
+# version; the CONFIGURING compiler is whatever `PATH` offers. Unchanged by #454
+# and not made worse by it, but not closed by this check either.
 #
 # ## Usage
 #
@@ -59,18 +70,38 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 Workflow=".github/workflows/build.yml"
-SweepScript="scripts/tidy-sweep.sh"
-RulesDoc=".agent/rules/build-and-toolchain.md"
+
+# The sweep's database directory, which is what makes a `cmake --preset` line a
+# documented TIDY SWEEP line rather than any other preset invocation. It is
+# `tidy-sweep.sh`'s own `DB` default.
+DatabaseDir="out/build/tidy22"
+
+# The one site named rather than discovered; see the header.
+RequiredSite="scripts/tidy-sweep.sh"
+
+# This file quotes configure lines -- correct ones and deliberately wrong ones --
+# as self-test fixtures, so scanning it would compare the check against its own
+# counter-examples.
+SelfPath="scripts/check-tidy-sweep-database.sh"
 
 problems=0
 Fail() { echo "  FAIL: $*" >&2; problems=$((problems + 1)); }
+
+# Report the tally and leave. Spelled once: three exit points printing the same
+# sentence three ways is how the wording drifts.
+Abort() {
+    echo "check-tidy-sweep-database: $problems problem(s); $1" >&2
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # The `run:` body of a named step inside a named job, folded to one line.
 #
 # Indentation is the discriminator, and it is reliable because this is the
 # repository's own workflow: a job key is two spaces, a step's `- name:` is six,
-# its `run:` eight, and a folded scalar's continuation ten.
+# its `run:` eight, and a folded scalar's continuation ten. The job scoping is
+# load-bearing rather than defensive -- `build.yml` carries a step named
+# `Configure` in a dozen jobs.
 #
 # It deliberately carries NO `/^[ \t]*#/ { next }` rule, which both sibling
 # walkers (`check-merge-queue-contexts.sh`, `check-gated-jobs.sh`) do have. Inside
@@ -114,31 +145,65 @@ ExtractWorkflowConfigure() {
 
 # ---------------------------------------------------------------------------
 # The documented configure line out of a file that documents one, folded to one
-# line. Anchored on `cmake --preset` plus `-B`, which is the sweep's database and
-# nothing else -- the rulebook shows plenty of other `cmake --preset` lines, and
-# an anchor that matched those would compare the wrong thing and pass.
+# line. Anchored on `cmake --preset` plus the sweep's database directory, which
+# together mean this database and nothing else -- the rulebook shows several other
+# `cmake --preset` lines, and an anchor matching those would compare the wrong
+# thing and pass.
 #
-# Continuation is a trailing backslash. A leading `#` (the script's header) or
-# nothing (the rulebook's fenced block) is stripped either way.
+# Continuation is a trailing backslash. A leading `#` (a script header) or nothing
+# (a fenced markdown block) is stripped either way.
 ExtractDocumentedConfigure() {
-    awk '
+    awk -v dir="$2" '
         function strip(s) {
             sub(/^[ \t]*#?[ \t]*/, "", s)
             return s
         }
-        !started && /cmake --preset/ && /-B / { started = 1
-                                                line = strip($0)
-                                                more = (line ~ /\\$/)
-                                                sub(/\\$/, "", line)
-                                                printf "%s ", line
-                                                if (!more) exit
-                                                next }
-        started                              { line = strip($0)
-                                               more = (line ~ /\\$/)
-                                               sub(/\\$/, "", line)
-                                               printf "%s ", line
-                                               if (!more) exit }
+        !started && /cmake --preset/ && index($0, "-B " dir) { started = 1 }
+        started { line = strip($0)
+                  more = (line ~ /\\$/)
+                  sub(/\\$/, "", line)
+                  # Trim what the backslash left behind, so the folded result is
+                  # single-spaced rather than carrying the wrapping as blanks.
+                  sub(/[ \t]+$/, "", line)
+                  printf "%s ", line
+                  if (!more) exit }
     ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Every file documenting a configure line for this database. Prints `mode:<how>`
+# first, then one path per line.
+#
+# A scan rather than a list, per the header. `git ls-files` is the preferred
+# source and not merely the faster one: it is the only one that answers for THIS
+# checkout. A configured build tree carries the string in its own generated
+# files, and `.claude/worktrees/<name>/` holds entire sibling checkouts in the
+# primary clone -- both are gitignored, so the index excludes them by
+# construction, while a walk has to be told and can only be told about the ones
+# somebody thought of.
+#
+# The fallback exists for an exported tarball with no index. It says which mode
+# produced the answer because the two are not interchangeable and a check that
+# cannot say which one it used is a check reporting on a file set nobody can
+# reconstruct -- `check-catch-skip-return-code` had six green self-test cases
+# that all exercised the FALLBACK while CI exercised git, and neither side
+# contradicted the other. Both modes are self-tested here for that reason.
+#
+# This file is always excluded: its self-test fixtures quote wrong lines on
+# purpose, so scanning it would compare the check against its own counter-examples.
+DocumentationSites() {
+    local tracked matches
+    if tracked="$(git ls-files 2>/dev/null)" && [[ -n "$tracked" ]]; then
+        echo "mode:git ls-files"
+        matches="$(printf '%s\n' "$tracked" | tr '\n' '\0' \
+                   | xargs -0 grep -l -e "-B ${DatabaseDir}" -- 2>/dev/null || true)"
+    else
+        echo "mode:directory walk (no git index)"
+        matches="$(grep -rl --exclude-dir=.git --exclude-dir=.claude \
+                        --exclude-dir=out --exclude-dir=_deps \
+                        -e "-B ${DatabaseDir}" . 2>/dev/null | sed 's|^\./||' || true)"
+    fi
+    printf '%s\n' "$matches" | grep -v "^${SelfPath}$" | grep -v '^$' | sort || true
 }
 
 # ---------------------------------------------------------------------------
@@ -156,129 +221,178 @@ NormaliseConfigure() {
     ' | sort
 }
 
-# Does this command name a `-B`?
-HasBinaryDirOption() {
-    case " $1 " in
-        *" -B "*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 # ---------------------------------------------------------------------------
 # Compare one documented line against CI's. Prints its own verdict; returns
 # non-zero when they disagree, so the self-test can drive it directly.
+#
+# It reports rather than counting, because the caller owns the tally -- a file can
+# disagree in more than one way and is still one site that needs fixing.
 CompareConfigure() {
     label="$1"
     ciCommand="$2"
     docCommand="$3"
-    requireBinaryDir="$4"
 
     if [[ -z "${docCommand// /}" ]]; then
-        echo "  FAIL: $label documents no \`cmake --preset … -B …\` line at all" >&2
+        echo "  FAIL: $label documents no \`cmake --preset … -B ${DatabaseDir}\` line at all" >&2
         return 1
     fi
 
     ciNormal="$(NormaliseConfigure "$ciCommand")"
     docNormal="$(NormaliseConfigure "$docCommand")"
 
-    bad=0
-    if [[ "$ciNormal" != "$docNormal" ]]; then
-        echo "  FAIL: $label does not document what the clang-tidy job configures." >&2
-        echo "        A person following it gets a database whose flags and target set differ from CI's," >&2
-        echo "        so the sweep reports findings CI suppresses and misses findings CI raises." >&2
-        # `diff` on process substitutions rather than a pipeline into `grep`:
-        # under `pipefail` a short-circuiting reader kills the producer with
-        # SIGPIPE and the pipeline reports the PRODUCER's status.
-        diff <(printf '%s\n' "$ciNormal") <(printf '%s\n' "$docNormal") \
-            | sed 's/^/          /' >&2 || true
-        bad=1
-    fi
-
-    if [[ "$requireBinaryDir" == "require-B" ]] && ! HasBinaryDirOption "$docCommand"; then
-        echo "  FAIL: $label documents no \`-B\`, so following it would configure the preset into" >&2
-        echo "        out/build/clang-debug and turn ENABLE_TIDY and module scanning off in the tree" >&2
-        echo "        local-gate.sh builds." >&2
-        bad=1
-    fi
-
-    if [[ $bad -eq 0 ]]; then
+    if [[ "$ciNormal" == "$docNormal" ]]; then
         echo "ok: $label documents the clang-tidy job's Configure step"
+        return 0
     fi
-    return $bad
+
+    echo "  FAIL: $label does not document what the clang-tidy job configures." >&2
+    echo "        A person following it gets a database whose flags and target set differ from CI's," >&2
+    echo "        so the sweep reports findings CI suppresses and misses findings CI raises." >&2
+    # `diff` on process substitutions rather than a pipeline into `grep`: under
+    # `pipefail` a short-circuiting reader kills the producer with SIGPIPE and the
+    # pipeline then reports the PRODUCER's status.
+    diff <(printf '%s\n' "$ciNormal") <(printf '%s\n' "$docNormal") \
+        | sed 's/^/          /' >&2 || true
+    return 1
 }
 
 # ---------------------------------------------------------------------------
 # Self-test: the check must be shown to BITE. A guard that cannot be made to fail
-# is indistinguishable from one that passes because nothing is wrong.
+# is indistinguishable from one that passes because nothing is wrong -- which is
+# how the drift it now catches survived in the first place.
 SelfTest() {
     ci='cmake --preset clang-debug -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
     failures=0
 
-    Expect() {
-        want="$1"; name="$2"; doc="$3"; mode="${4:-require-B}"
-        if CompareConfigure "synthetic" "$ci" "$doc" "$mode" >/dev/null 2>&1; then
-            got=agree
+    # One reporter for every kind of case, so a second helper cannot drift out of
+    # argument order with the first. `(name, want, got)` throughout.
+    Report() {
+        if [[ "$2" == "$3" ]]; then
+            echo "ok: self-test $1"
         else
-            got=differ
-        fi
-        if [[ "$got" == "$want" ]]; then
-            echo "ok: self-test '$name' -> $got"
-        else
-            echo "  FAIL: self-test '$name' expected $want, got $got" >&2
+            echo "  FAIL: self-test $1" >&2
+            echo "        wanted: [$2]" >&2
+            echo "        got:    [$3]" >&2
             failures=$((failures + 1))
         fi
     }
 
-    Expect agree  "identical but for -B and wrapping" \
-        'cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
-    Expect agree  "same options in a different order" \
-        'cmake --preset clang-debug -B out/build/tidy22 -DFASTCACHED_ENABLE_TLS=ON -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF'
-    Expect differ "a different preset" \
-        'cmake --preset clang-release -B out/build/tidy22 -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
-    Expect differ "a -D CI passes that the documentation drops" \
-        'cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF'
-    Expect differ "a -D the documentation adds that CI does not pass" \
-        'cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_NODE=OFF'
-    Expect differ "a changed -D VALUE, not just a changed name" \
-        'cmake --preset clang-debug -B out/build/tidy22 -DENABLE_TIDY=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
-    Expect differ "no -B, which would clobber the clang-debug tree" \
-        'cmake --preset clang-debug -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
-    Expect differ "nothing documented at all" ''
-    # And the hand-rolled line #454 removed, which is the actual regression: it
-    # names no preset, so it agrees with nothing.
-    Expect differ "the pre-#454 hand-rolled line" \
-        'cmake -S . -B out/build/tidy22 -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON'
+    # The comparison: does a documented line agree with CI's?
+    ExpectCompare() {
+        if CompareConfigure "synthetic" "$ci" "$3" >/dev/null 2>&1; then
+            Report "compare '$1'" "$2" agree
+        else
+            Report "compare '$1'" "$2" differ
+        fi
+    }
+
+    ExpectCompare "identical but for -B and wrapping" agree \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
+    ExpectCompare "same options in a different order" agree \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DFASTCACHED_ENABLE_TLS=ON -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF"
+    ExpectCompare "a different preset" differ \
+        "cmake --preset clang-release -B ${DatabaseDir} -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
+    ExpectCompare "a -D CI passes that the documentation drops" differ \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF"
+    ExpectCompare "a -D the documentation adds that CI does not pass" differ \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON -DFASTCACHED_BUILD_NODE=OFF"
+    ExpectCompare "a changed -D VALUE, not just a changed name" differ \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
+    ExpectCompare "nothing documented at all" differ ''
+    # The regression itself: the pre-#454 hand-rolled line names no preset, so it
+    # agrees with nothing.
+    ExpectCompare "the pre-#454 hand-rolled line" differ \
+        "cmake -S . -B ${DatabaseDir} -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON"
+
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
 
     # -----------------------------------------------------------------------
-    # The WORKFLOW-side extractor, which the cases above do not touch at all.
-    #
-    # It is the half that decides what everything else is compared AGAINST, and
-    # its failure mode is an empty string -- which the main path treats as fatal
-    # precisely because it would otherwise compare nothing against nothing. But
-    # "it returns empty when it should" and "it returns the RIGHT step when there
-    # are several" are different questions, and build.yml really does have a
-    # `Configure` step in more than one job.
-    #
-    # The added steps are not hypothetical: a queued pull request adds an `id:`
-    # and a further step to this very job, so a reader must be able to see that
-    # neither moves the answer.
-    workflowDir="$(mktemp -d)"
-    trap 'rm -rf "$workflowDir"' EXIT
+    # The DOCUMENTATION-side extractor. `-B <database dir>` is half the anchor, so
+    # a line that omits it is not a documented site at all -- which is what makes
+    # a separate "does it name -B" assertion unnecessary rather than missing.
+    ExpectDocument() {
+        printf '%s\n' "$3" > "$scratch/doc.md"
+        got="$(ExtractDocumentedConfigure "$scratch/doc.md" "$DatabaseDir")"
+        Report "document '$1'" "$2" "${got%"${got##*[![:space:]]}"}"
+    }
 
-    ExpectWorkflow() {
-        name="$1"; want="$2"; content="$3"
-        printf '%s\n' "$content" > "$workflowDir/wf.yml"
-        got="$(ExtractWorkflowConfigure "$workflowDir/wf.yml" "clang-tidy" "Configure")"
-        # Collapse trailing whitespace: the extractor joins with a trailing space.
-        got="${got%"${got##*[![:space:]]}"}"
-        if [[ "$got" == "$want" ]]; then
-            echo "ok: self-test workflow '$name'"
-        else
-            echo "  FAIL: self-test workflow '$name'" >&2
-            echo "        wanted: [$want]" >&2
-            echo "        got:    [$got]" >&2
-            failures=$((failures + 1))
+    ExpectDocument "a fenced block with backslash continuations" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF -DFASTCACHED_ENABLE_TLS=ON" \
+        "Configure it like so:
+
+\`\`\`sh
+cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF \\
+      -DFASTCACHED_ENABLE_TLS=ON
+\`\`\`"
+    ExpectDocument "a shell header comment" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF" \
+        "# And the database:
+#
+#   cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF
+#"
+    ExpectDocument "an earlier unrelated preset line is not the anchor" \
+        "cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF" \
+        "Build it with \`cmake --preset gcc-release\` first.
+Then \`cmake --preset clang-coverage\`.
+
+  cmake --preset clang-debug -B ${DatabaseDir} -DENABLE_TIDY=OFF"
+    ExpectDocument "a preset line naming no -B extracts nothing" "" \
+        "  cmake --preset clang-debug -DENABLE_TIDY=OFF"
+    ExpectDocument "a preset line naming a DIFFERENT -B extracts nothing" "" \
+        "  cmake --preset clang-debug -B out/build/somewhere-else -DENABLE_TIDY=OFF"
+
+    # -----------------------------------------------------------------------
+    # BOTH scan modes, against a synthetic tree. `check-catch-skip-return-code`
+    # is the recorded reason: its self-test drove the fallback six times while CI
+    # drove git, so the mode under test was never the mode in use and nothing
+    # disagreed. The mode is part of the assertion here, not just the file set.
+    #
+    # The git leg also pins the property that motivates preferring git: an
+    # IGNORED directory holding another checkout -- which `.claude/worktrees/` is
+    # in the primary clone -- must not contribute sites.
+    ExpectScan() {
+        name="$1"; wantMode="$2"; useGit="$3"
+        tree="$scratch/scan-$4"
+        mkdir -p "$tree/scripts" "$tree/.claude/worktrees/other/scripts"
+        printf '#   cmake --preset clang-debug -B %s -DENABLE_TIDY=OFF\n' "$DatabaseDir" \
+            > "$tree/scripts/tidy-sweep.sh"
+        printf '  cmake --preset clang-debug -B %s -DSTALE=YES\n' "$DatabaseDir" \
+            > "$tree/.claude/worktrees/other/scripts/tidy-sweep.sh"
+        printf '.claude/\n' > "$tree/.gitignore"
+        if [[ "$useGit" == git ]]; then
+            ( cd "$tree" && git init -q . && git add -A && \
+              git -c user.email=t@t -c user.name=t commit -qm t ) >/dev/null 2>&1
         fi
+        got="$( cd "$tree" && DocumentationSites )"
+        gotMode="$(printf '%s\n' "$got" | sed -n 's/^mode:\(.*\)/\1/p')"
+        gotSites="$(printf '%s\n' "$got" | grep -v '^mode:' | grep -v '^$' | tr '\n' ' ')"
+        Report "scan '$name' mode" "$wantMode" "$gotMode"
+        Report "scan '$name' sites" "scripts/tidy-sweep.sh " "$gotSites"
+    }
+
+    if command -v git >/dev/null 2>&1; then
+        ExpectScan "git index, ignored sibling checkout excluded" \
+            "git ls-files" git g
+    else
+        echo "ok: self-test scan 'git index' skipped -- no git on PATH"
+    fi
+    ExpectScan "no git index, ignored sibling checkout excluded" \
+        "directory walk (no git index)" nogit w
+
+    # -----------------------------------------------------------------------
+    # The WORKFLOW-side extractor, which decides what everything else is compared
+    # AGAINST. Its failure mode is an empty string, which the main path treats as
+    # fatal -- but "returns empty when it should" and "returns the RIGHT step when
+    # several jobs have one" are different questions, and `build.yml` really does
+    # carry a `Configure` step in the linux and windows matrix jobs too.
+    #
+    # The added steps are not hypothetical: a queued pull request adds an `id:` and
+    # a further step to this very job, so a reader can see neither moves the answer.
+    ExpectWorkflow() {
+        printf '%s\n' "$3" > "$scratch/wf.yml"
+        got="$(ExtractWorkflowConfigure "$scratch/wf.yml" "clang-tidy" "Configure")"
+        Report "workflow '$1'" "$2" "${got%"${got##*[![:space:]]}"}"
     }
 
     ExpectWorkflow "the clang-tidy job's step, not another job's" \
@@ -328,8 +442,6 @@ SelfTest() {
       - name: "Configure"
         run: cmake --preset clang-debug -DENABLE_TIDY=OFF'
 
-    # The fatal direction: the job or the step going away must yield EMPTY, which
-    # the main path refuses rather than passing vacuously.
     ExpectWorkflow "the Configure step renamed away" '' \
         'jobs:
   clang-tidy:
@@ -350,7 +462,7 @@ SelfTest() {
         echo "check-tidy-sweep-database --self-test: $failures case(s) wrong" >&2
         exit 1
     fi
-    echo "check-tidy-sweep-database --self-test: the comparison and the workflow extraction both bite"
+    echo "check-tidy-sweep-database --self-test: comparison, both extractors and both scan modes all bite"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -359,10 +471,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-for file in "$Workflow" "$SweepScript" "$RulesDoc"; do
-    [[ -f "$file" ]] || { Fail "$file does not exist"; }
-done
-[[ $problems -eq 0 ]] || { echo "check-tidy-sweep-database: $problems problem(s)" >&2; exit 1; }
+[[ -f "$Workflow" ]] || Abort "$Workflow does not exist"
 
 CiConfigure="$(ExtractWorkflowConfigure "$Workflow" "clang-tidy" "Configure")"
 
@@ -375,15 +484,39 @@ elif [[ "$CiConfigure" != *"--preset"* ]]; then
 else
     echo "ok: read the clang-tidy job's Configure step from $Workflow"
 fi
-[[ $problems -eq 0 ]] || { echo "check-tidy-sweep-database: $problems problem(s)" >&2; exit 1; }
+[[ $problems -eq 0 ]] || Abort "the check cannot say anything about the documentation without it"
 
-CompareConfigure "$SweepScript" "$CiConfigure" \
-    "$(ExtractDocumentedConfigure "$SweepScript")" require-B || problems=$((problems + 1))
-CompareConfigure "$RulesDoc" "$CiConfigure" \
-    "$(ExtractDocumentedConfigure "$RulesDoc")" require-B || problems=$((problems + 1))
+# A read loop and not `mapfile`, which is bash 4+; macOS ships 3.2. Process
+# substitution rather than a pipeline, so the scan's exit status cannot take the
+# script down under `pipefail`.
+sites=()
+scanMode="(not reported)"
+while IFS= read -r site; do
+    case "$site" in
+        mode:*) scanMode="${site#mode:}"; continue ;;
+        "") continue ;;
+    esac
+    sites+=("$site")
+done < <(DocumentationSites)
+echo "ok: documentation sites discovered by ${scanMode}"
+
+if [[ "${#sites[@]}" -eq 0 ]]; then
+    Fail "no file in the tree documents a \`cmake --preset … -B ${DatabaseDir}\` line, so this check would pass having compared nothing"
+    Abort "the scan found no documentation to check"
+fi
+
+foundRequired=no
+for site in "${sites[@]}"; do
+    [[ "$site" == "$RequiredSite" ]] && foundRequired=yes
+    CompareConfigure "$site" "$CiConfigure" \
+        "$(ExtractDocumentedConfigure "$site" "$DatabaseDir")" || problems=$((problems + 1))
+done
+
+if [[ "$foundRequired" != yes ]]; then
+    Fail "$RequiredSite documents no configure line for the sweep's database; it is the header a person reads to reproduce CI's sweep, and a scan alone would go green with it missing"
+fi
 
 if [[ $problems -gt 0 ]]; then
-    echo "check-tidy-sweep-database: $problems problem(s); a local sweep following the documentation would not agree with CI" >&2
-    exit 1
+    Abort "a local sweep following the documentation would not agree with CI"
 fi
-echo "check-tidy-sweep-database: both documented lines match the clang-tidy job's Configure step"
+echo "check-tidy-sweep-database: ${#sites[@]} documented line(s) match the clang-tidy job's Configure step"

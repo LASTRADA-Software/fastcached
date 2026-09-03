@@ -44,24 +44,18 @@
 #         -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
 #
 # That line is the `clang-tidy` job's `Configure` step verbatim plus `-B`, and
-# `check-tidy-sweep-database.sh` asserts it stays that way. It is NOT a
-# hand-rolled equivalent, because the two stopped being equivalent (#454): a bare
-# `cmake -S . -B … -DCMAKE_CXX_COMPILER=clang++ …` inherits `PEDANTIC_COMPILER`
-# and `PEDANTIC_COMPILER_WERROR` OFF, so the database it writes carries neither
-# `-Wall -Wextra -Wconversion -pedantic` nor the `-Wno-…` suppressions that go
-# with them -- 29 flags apart on the same translation unit. `.clang-tidy` enables
-# `clang-diagnostic-*`, so those flags decide what the sweep REPORTS, and it
-# diverges in both directions at once: findings CI suppresses appear, and
-# findings CI raises do not. Measured: a `double`->`int` return that CI's database
-# reports as `clang-diagnostic-float-conversion` produced *nothing* from a
-# hand-rolled one. A local sweep that is blind to what will turn CI red is the
-# expensive direction, and it reads exactly like a clean tree.
+# `check-tidy-sweep-database.sh` asserts it stays that way. It is deliberately NOT
+# a hand-rolled `cmake -S . -B … -DCMAKE_CXX_COMPILER=clang++ …` equivalent, which
+# is what stood here until #454: such a line inherits `PEDANTIC_COMPILER` and
+# `PEDANTIC_COMPILER_WERROR` OFF and omits the two default-OFF app targets CI
+# turns on, so it diverges from CI both in the flags that decide what the sweep
+# REPORTS and in the translation units it can see at all -- in both directions,
+# and every one of them reading like a clean tree.
 #
-# It also omits the two default-OFF app targets CI turns on, which is the same
-# failure by a second route: four first-party translation units
-# (`compile-cache-testclient`, `fastcache-bench`) are then absent from the
-# database rather than clean, and the sweep prints a confident count without
-# them. See .agent/rules/build-and-toolchain.md, which states that rule.
+# **The measurements are in .agent/rules/build-and-toolchain.md**, beside the same
+# configure line. They are not repeated here on purpose: a figure restated in
+# several places is a figure that gets updated in one, which is that file's own
+# rule and the reason it was worth writing down.
 #
 # `-B` is what keeps this out of your own `out/build/clang-debug` tree -- it
 # overrides the preset's `binaryDir`, so configuring the sweep's database does not
@@ -73,6 +67,14 @@
 # the `@…modmap` flags a module-scanning generator emits do not exist until that
 # target has been built, and a translation unit that fails to parse reports
 # nothing.
+#
+# What following this line does NOT buy you: the same COMPILER. `clang-debug`
+# names bare `clang++`, and `PedanticCompiler.cmake` adds each warning flag only
+# if `check_cxx_compiler_flag` accepts it, so an older clang on your `PATH` still
+# yields a flag set that can differ from CI's -- along the very
+# `clang-diagnostic-*` axis all of the above is about. The pinned version applies
+# to the ANALYSER (`TIDY=`, above); the configuring compiler is whatever `PATH`
+# offers, and nothing here checks it.
 #
 # Usage:  [TIDY=clang-tidy-22] [DB=out/build/tidy22] [BASE=origin/master] \
 #         [JOBS=4] scripts/tidy-sweep.sh [--all|--self-test]
