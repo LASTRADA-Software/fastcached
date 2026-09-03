@@ -818,6 +818,49 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# A full clang-tidy sweep still happens somewhere, and it still reaches a person.
+#
+# Since #554 a pull request and a merge-queue entry both diff-scope, and the
+# `push` on master is the only full sweep left. Both halves of what makes that
+# sound are invisible in a run. Take the `--all` off the push -- or respell its
+# guard as `event_name == 'push'`, so a trigger added later diff-scopes against a
+# base whose diff on master is empty -- and every run stays green while the
+# analysis is permanently narrower than the rulebook says. Delete the report step
+# and the full sweep still runs, still fails and still reaches nobody: 18 of 18
+# failed master-push runs were never once re-run.
+#
+# `scripts/tidy-sweep.sh --self-test` covers the scope COMPUTATION. Nothing
+# covered which events reach it with which scope, which is the half #554 changed.
+#
+# Two registrations for the reason `target-file-guards` carries: the check reads
+# the real workflow, and the self-test drives every rule against synthetic ones in
+# BOTH directions -- a rule that cannot be seen to fail has told you nothing, and
+# one that fails on a correct tree is worse than absent.
+#
+# `if(NOT WIN32)` for the reason `ci-scope` carries the same guard: the script is
+# POSIX and a Windows counterpart would be a translation rather than new coverage.
+# What it checks is platform-independent and the Linux and macOS jobs run it.
+if(NOT WIN32)
+    add_test(
+        NAME "tidy-sweep-scope"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh"
+    )
+    set_tests_properties("tidy-sweep-scope" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    add_test(
+        NAME "tidy-sweep-scope-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh" --self-test
+    )
+    set_tests_properties("tidy-sweep-scope-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # The local gate pins its analyser and refuses a compiler cache. Fails when
 # `scripts/local-gate.sh` would run clang-tidy at a version nobody chose, would
 # accept a build directory that already caches one, or would build its objects
