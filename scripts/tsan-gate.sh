@@ -52,10 +52,23 @@
 #   an object has no undefined __tsan_init-> "built WITHOUT ThreadSanitizer"
 #   the canary does not go red            -> "the deliberate race was NOT reported"
 #   the canary dies of something else     -> "reported no data race"
+#   the canary runs past its deadline     -> "tsan-canary did not finish within"
+#   the canary cannot be executed         -> "nothing proves the sanitizer reports"
 #   a tag expression matches nothing      -> "tested NOTHING"
 #   a target exits 0 with no assertions   -> "refusing to call that clean"
 #   a target runs past its deadline       -> "did not finish within"
+#   a target cannot be executed           -> "ran no cases at all"
 #   an unsuppressed race                  -> "reported an unsuppressed data race"
+#
+# The last three arrived with #488 and each is driven by a `--self-test` case, so
+# "verified by making it happen" holds for them as it does for the rest. The two
+# CANARY rows are why the phrases are what they are: a killed canary used to fall
+# through to "reported no data race", which is a different fault with a different
+# fix, so it needed a row rather than a rewording. And "ran no cases at all"
+# rather than the more natural "tested NOTHING", because that phrase already
+# discriminates the tag-expression row four lines up -- two refusals sharing the
+# one string this list identifies them by would make the list unable to tell them
+# apart, which is the failure it is written to prevent.
 #
 # The list is enumerated HERE and nowhere else. An earlier version of it said
 # "five refusals" in three files, in three different orders, having silently
@@ -96,11 +109,20 @@ BUILD_DIR="${1:-out/build/clang-tsan}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 
-# For `run_bounded` and `e2e_bound_outcome` only; see the bound below for why
-# this gate stopped resolving `timeout(1)` for itself (#488). This is not an e2e
-# fixture and uses none of the rest -- no port is drawn, no daemon started, and
-# the gate keeps its own `fatal`, which annotates for GitHub Actions where the
-# library's `fail` does not.
+# For `run_bounded`, `e2e_bound_outcome` and the outcome names only; see the
+# bound below for why this gate stopped resolving `timeout(1)` for itself (#488).
+# This is not an e2e fixture and uses none of the rest -- no port is drawn and no
+# daemon started -- so it keeps its own `fatal` and its own `note` rather than the
+# library's `fail` and `e2e_note`. That is a decision and not an oversight:
+# `fatal` annotates for GitHub Actions where `fail` does not, and `note` prints a
+# section header where `e2e_note` prints an indented line.
+#
+# WHICH MEANS `fail` IS NOW IN SCOPE BESIDE `fatal`, and a refusal added later and
+# spelled `fail` would exit 1 while silently losing the `::error::` annotation.
+# Nothing catches that -- `check-e2e-helpers.sh`'s collision scan looks for a
+# script DEFINING a library name, not for one shadowed by import -- and defining
+# `fail` here to override it is exactly what that scan refuses. So it is written
+# down instead: in this file the refusal is `fatal`.
 # shellcheck source=lib/e2e-common.sh
 . "${REPO_ROOT}/scripts/lib/e2e-common.sh"
 
@@ -399,19 +421,26 @@ AssertCanaryFires() {
     # but a bound expiring is not evidence that the runtime reports, it is
     # evidence that nothing here can be concluded, and this gate exists to refuse
     # exactly that substitution.
-    if [[ "$outcome" == "exceeded" ]]; then
-        fatal "tsan-canary did not finish within ${CanaryTimeoutSeconds}s and was killed, so whether the
+    # One `case` over the three-state outcome rather than a chain of `if`s, so a
+    # fourth state added to `run_bounded` has an obvious place to land here --
+    # and matched against the library's NAMES, never against string literals: a
+    # mistyped literal falls through to the `finished` path, which is this gate
+    # concluding "fine" from "I could not tell".
+    case "$outcome" in
+        "$E2eBoundOutcomeExceeded")
+            fatal "tsan-canary did not finish within ${CanaryTimeoutSeconds}s and was killed, so whether the
     sanitizer reports is UNKNOWN -- which this gate refuses rather than reads as
     either answer. The canary races on its own global and exits; a hang is the
     runtime or the machine, not the race. Output so far:
 ${canary_out}"
-    fi
-    if [[ "$outcome" == "unstartable" ]]; then
-        fatal "tsan-canary at ${path} could not be executed, so nothing proves the
+            ;;
+        "$E2eBoundUnstartable")
+            fatal "tsan-canary at ${path} could not be executed, so nothing proves the
     sanitizer reports. It exists -- AssertInstrumented checked that before this
     ran -- so this is a permission bit, an interpreter, or a binary for another
     architecture, and not a missing build."
-    fi
+            ;;
+    esac
 
     if [[ "$canary_rc" -eq 0 ]]; then
         fatal "the deliberate race in src/tests/TsanCanary.cpp was NOT reported.
@@ -469,18 +498,20 @@ RunTarget() {
     # reached, and sent whoever met it to look for a hang in a suite that had
     # simply failed. `run_bounded` records what it OBSERVED instead of leaving it
     # to be inferred from an integer that means two things.
-    if [[ "$outcome" == "exceeded" ]]; then
-        cat "$log"
-        fatal "${name} did not finish within ${TargetTimeoutSeconds}s and was killed.
+    case "$outcome" in
+        "$E2eBoundOutcomeExceeded")
+            cat "$log"
+            fatal "${name} did not finish within ${TargetTimeoutSeconds}s and was killed.
     Under ThreadSanitizer that is a deadlock until proven otherwise, and the last
     case in the log above is where to start. FASTCACHE_TSAN_TIMEOUT raises the
     bound if the suite has simply grown."
-    fi
-    if [[ "$outcome" == "unstartable" ]]; then
-        fatal "${name} at ${path} could not be executed, so this target tested NOTHING.
+            ;;
+        "$E2eBoundUnstartable")
+            fatal "${name} at ${path} could not be executed, so this target ran no cases at all.
     AssertInstrumented found the file and read its objects, so this is a
     permission bit, an interpreter, or a binary for another architecture."
-    fi
+            ;;
+    esac
 
     # A filter that matches nothing is the quietest way for this gate to test
     # nothing and say "clean" -- a typo in the TARGETS table above would do it.
@@ -521,12 +552,19 @@ RunTarget() {
 }
 
 # ---------------------------------------------------------------------------
-# `--self-test`: drive AssertInstrumented's verdicts against staged trees.
+# `--self-test`: drive this gate's refusals against staged artefacts.
 #
 # A guard that has never been seen to fire is the thing this repository keeps
 # finding, and #472 is precisely that -- a proof that had never been shown to
 # refuse anything, because it structurally could not. So each refusal is staged
 # here and required to happen.
+#
+# TWO DECISION PATHS, TWO KINDS OF STAGING, and the section headers below say
+# which is which. `AssertInstrumented`'s verdicts are driven against staged
+# OBJECT TREES read through a stub `nm`; the bound's three outcomes (#488) are
+# driven against staged EXECUTABLES, which need no stub, no objects and no
+# symbol table at all. Neither needs a compiler or a sanitizer, which is what
+# keeps the whole fixture in the default `ctest` set on every platform.
 #
 # THE ONE THAT MATTERS IS THE SUITE, NOT THE CANARY. An uninstrumented canary
 # already failed closed before #472: it exits 0, reports no race, and
@@ -632,7 +670,7 @@ STUB
         # "instrumented". That is #472 reproduced in the fixture rather than
         # merely described in its comment.
         printf '%s
-' "0000000000001234 T __tsan_init" > "${BUILD_DIR}/target/${target}"
+' "0000000000001234 T __tsan_init" > "$(BinaryPath "$target")"
         dir="${BUILD_DIR}/src/tests/CMakeFiles/${target}.dir"
         mkdir -p "$dir"
         for spec in "$@"; do
@@ -654,6 +692,73 @@ STUB
                 unreadable)   printf '%s\n' "unreadable" > "${dir}/${obj}-unreadable.o" ;;
             esac
         done
+    }
+
+
+    # -----------------------------------------------------------------------
+    # RunTarget's reading of the bound (#488).
+    #
+    # THE ONE THAT MATTERS IS 124, and it is deliberately first. `RunTarget` used
+    # to decide from the exit STATUS, and 124 is two facts there: `timeout`'s "I
+    # killed it", and Catch2's own `min(255, failed_assertions)` for a suite that
+    # ran to completion and failed 124 assertions. The second was reported as the
+    # first -- a deadlock diagnosis, quoting a bound the run never reached, for a
+    # suite that had merely failed. Nothing could have caught it, because the
+    # gate's only evidence was a number that means both things.
+    #
+    # The other two are the direction the ticket's reviewer asked about: a bound
+    # that expires, and a target that cannot start, must each still be a REFUSAL
+    # naming its own reason. A bound is not an improvement if it lets the gate
+    # conclude "fine" from "I could not tell".
+    #
+    # A staged target here is a SHELL SCRIPT at the path `BinaryPath` computes.
+    # Nothing on this path reads a symbol table, so these need no stub `nm`, no
+    # objects and no sanitizer -- which is what keeps them in the default `ctest`
+    # set beside the cases above, on every platform CI builds.
+    #
+    # @param 1 case name
+    # @param 2 which caller to drive: `target` or `canary`
+    # @param 3 the bound, in seconds
+    # @param 4 how to stage the artefact: `runnable` or `absent`
+    # @param 5 the shell a `runnable` artefact runs
+    # @param 6.. text the output must contain; a leading `!` means must NOT
+    BoundCase() {
+        local name="$1" driver="$2" seconds="$3" staging="$4" body="$5"; shift 5
+        local out rc=0 artefact
+        # One switch, two columns: which artefact the driver reaches for, and how
+        # it is called. `AssertCanaryFires` names `tsan-canary` itself while
+        # `RunTarget` is handed a name, so staging follows the driver rather than
+        # the case -- and asking that twice is how the two would drift apart.
+        local invoke=()
+        case "$driver" in
+            canary) artefact="tsan-canary";   invoke=(AssertCanaryFires) ;;
+            target) artefact="staged-target"; invoke=(RunTarget "staged-target" "") ;;
+            # Unreachable while every call site below spells a literal, and kept
+            # anyway because a typo would otherwise expand an empty `invoke`
+            # under `set -u` and fail somewhere that names bash rather than the
+            # case. Routed through `Expect` rather than reporting for itself, so
+            # it cannot report a failure the "${ran} cases ran" line has not
+            # counted -- which is what an inline `failures=$(( failures + 1 ))`
+            # here did.
+            *)      Expect "$name" 1 0 "unknown driver '${driver}'" "no such driver"
+                    return ;;
+        esac
+
+        BUILD_DIR="${scratch}/bound-${name}"
+        mkdir -p "${BUILD_DIR}/target"
+        # Through `BinaryPath`, which is where this layout is decided. Spelling
+        # `${BUILD_DIR}/target/...` here would be a second place that has to move
+        # when CMake's output directory does -- and the failure if it did not
+        # move is a fixture that stages an artefact the gate never looks at and
+        # still reports `ok`.
+        if [[ "$staging" == "runnable" ]]; then
+            printf '%s\n' '#!/bin/sh' "$body" > "$(BinaryPath "$artefact")"
+            chmod +x "$(BinaryPath "$artefact")"
+        fi
+        TargetTimeoutSeconds="$seconds"
+        CanaryTimeoutSeconds="$seconds"
+        out="$("${invoke[@]}" 2>&1)" || rc=$?
+        Expect "$name" 1 "$rc" "$out" "$@"
     }
 
     echo "== AssertInstrumented, against staged object trees"
@@ -694,60 +799,6 @@ STUB
     rm -f "${BUILD_DIR}/target/FastCacheTest"
     Case "binary-not-built" 1 "not built"
 
-    # -----------------------------------------------------------------------
-    # RunTarget's reading of the bound (#488).
-    #
-    # THE ONE THAT MATTERS IS 124, and it is deliberately first. `RunTarget` used
-    # to decide from the exit STATUS, and 124 is two facts there: `timeout`'s "I
-    # killed it", and Catch2's own `min(255, failed_assertions)` for a suite that
-    # ran to completion and failed 124 assertions. The second was reported as the
-    # first -- a deadlock diagnosis, quoting a bound the run never reached, for a
-    # suite that had merely failed. Nothing could have caught it, because the
-    # gate's only evidence was a number that means both things.
-    #
-    # The other two are the direction the ticket's reviewer asked about: a bound
-    # that expires, and a target that cannot start, must each still be a REFUSAL
-    # naming its own reason. A bound is not an improvement if it lets the gate
-    # conclude "fine" from "I could not tell".
-    #
-    # A staged target here is a SHELL SCRIPT at the path `BinaryPath` computes.
-    # Nothing on this path reads a symbol table, so these need no stub `nm`, no
-    # objects and no sanitizer -- which is what keeps them in the default `ctest`
-    # set beside the cases above, on every platform CI builds.
-    #
-    # @param 1 case name
-    # @param 2 which caller to drive: `target` or `canary`
-    # @param 3 the bound, in seconds
-    # @param 4 how to stage the artefact: `runnable` or `absent`
-    # @param 5 the shell a `runnable` artefact runs
-    # @param 6.. text the output must contain; a leading `!` means must NOT
-    BoundCase() {
-        local name="$1" driver="$2" seconds="$3" staging="$4" body="$5"; shift 5
-        local out rc=0 artefact
-        # One switch, two columns: which artefact the driver reaches for, and how
-        # it is called. `AssertCanaryFires` names `tsan-canary` itself while
-        # `RunTarget` is handed a name, so staging follows the driver rather than
-        # the case -- and asking that twice is how the two would drift apart.
-        local invoke=()
-        case "$driver" in
-            canary) artefact="tsan-canary";   invoke=(AssertCanaryFires) ;;
-            target) artefact="staged-target"; invoke=(RunTarget "staged-target" "") ;;
-            *)      echo "  FAIL ${name}: unknown driver '${driver}'" >&2
-                    failures=$(( failures + 1 )); return ;;
-        esac
-
-        BUILD_DIR="${scratch}/bound-${name}"
-        mkdir -p "${BUILD_DIR}/target"
-        if [[ "$staging" == "runnable" ]]; then
-            printf '%s\n' '#!/bin/sh' "$body" > "${BUILD_DIR}/target/${artefact}"
-            chmod +x "${BUILD_DIR}/target/${artefact}"
-        fi
-        TargetTimeoutSeconds="$seconds"
-        CanaryTimeoutSeconds="$seconds"
-        out="$("${invoke[@]}" 2>&1)" || rc=$?
-        Expect "$name" 1 "$rc" "$out" "$@"
-    }
-
     echo
     echo "== the bound's outcomes, against staged artefacts"
 
@@ -756,9 +807,21 @@ STUB
         "!did not finish within"
 
     # Real waits, and the only ones in this fixture: a bound proven by a stub that
-    # reports "expired" is a bound nobody has watched expire. One second plus
-    # `run_bounded`'s two-second TERM grace each, well inside the 60s ctest budget.
-    BoundCase "bound-expiry-is-refused-by-name" target 1 runnable 'sleep 30' \
+    # reports "expired" is a bound nobody has watched expire.
+    #
+    # What each COSTS, since that is the figure whoever adds a third wait will
+    # budget against. `run_bounded` reads bash's integer `SECONDS`, so a bound of
+    # 1 is the smallest it can express and enforces 0-1000 ms. Its two-second
+    # TERM grace is a CEILING reached only by a child that ignores TERM; `/bin/sh`
+    # running `sleep` takes the default disposition and dies on the first poll,
+    # so the grace costs one 0.2 s tick. Roughly 0.2-1.2 s each, against a 60 s
+    # ctest budget.
+    #
+    # `sleep 5` and not `sleep 30`: `run_bounded` signals the child and not the
+    # process group, so this sleeper is orphaned and outlives the fixture. It only
+    # has to outlast the bound plus the worst-case grace, and five seconds does
+    # that with room while leaving a stray process around for a sixth as long.
+    BoundCase "bound-expiry-is-refused-by-name" target 1 runnable 'sleep 5' \
         "did not finish within 1s and was killed"
 
     # THE CANARY'S EXPIRY, which is a hole this change closes rather than a
@@ -769,7 +832,7 @@ STUB
     # anything from. So the staged canary here does exactly that, and the bound
     # outcome has to be read BEFORE the grep for the refusal to happen at all.
     BoundCase "canary-expiry-outranks-a-reported-race" canary 1 runnable \
-        'echo "WARNING: ThreadSanitizer: data race"; sleep 30' \
+        'echo "WARNING: ThreadSanitizer: data race"; sleep 5' \
         "did not finish within 1s and was killed" \
         "!the sanitizer is live"
 
@@ -786,7 +849,7 @@ STUB
     # runs -- so the refusal keeps saying so, and this case exercises the branch
     # rather than that sentence.
     BoundCase "bound-unstartable-is-refused-by-name" target 30 absent '' \
-        "could not be executed, so this target tested NOTHING"
+        "could not be executed, so this target ran no cases at all"
 
     BoundCase "canary-unstartable-is-refused-by-name" canary 30 absent '' \
         "could not be executed, so nothing proves the" \

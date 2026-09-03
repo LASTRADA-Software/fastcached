@@ -796,6 +796,24 @@ http_get() {
 # is exactly the mis-bucketing #457 is about.
 E2eBoundExceeded=124
 
+# The three outcomes, NAMED -- for the reason the status above is named, carried
+# one level further. This file argued carefully for `E2eBoundExceeded` and then
+# left the outcomes as bare strings on both sides: `printf 'exceeded'` at the
+# producer and `[[ "$outcome" == "exceeded" ]]` at every consumer.
+#
+# A string comparison against a literal FAILS OPEN. `"exceed"` matches nothing,
+# falls through whatever the caller does for `finished`, and reads as a probe
+# that completed -- in `tsan-gate.sh`, whose entire subject is refusing to
+# conclude "fine" from "I could not tell". Compared against a name instead,
+# `$E2eBoundExceded` is an unbound variable and every caller here runs under
+# `set -u`, so the same typo stops the run and says where.
+#
+# The VALUES are unchanged, deliberately: a caller still comparing to a literal
+# keeps working, so this can be adopted per caller rather than in one sweep.
+E2eBoundFinished="finished"
+E2eBoundOutcomeExceeded="exceeded"
+E2eBoundUnstartable="unstartable"
+
 # Which of THREE things happened in the last `run_bounded`: `finished`,
 # `exceeded`, or `unstartable`. Read with `e2e_bound_outcome`, never as a
 # variable. Unambiguous where the status cannot be, because each is recorded from
@@ -842,7 +860,7 @@ _e2e_bound_outcome_path() { printf '%s' "${_e2e_workdir}/.bounded-outcome"; }
 e2e_bound_outcome() {
     local recorded
     recorded="$(cat "$(_e2e_bound_outcome_path)" 2>/dev/null || true)"
-    printf '%s' "${recorded:-finished}"
+    printf '%s' "${recorded:-$E2eBoundFinished}"
 }
 
 # Run a command under a wall-clock ceiling. Echoes its combined output.
@@ -940,7 +958,7 @@ run_bounded() {
     local seconds="$1"; shift
     local capture pid deadline grace status=0 exceeded=0 tick=0
 
-    printf 'finished' > "$(_e2e_bound_outcome_path)"
+    printf '%s' "$E2eBoundFinished" > "$(_e2e_bound_outcome_path)"
 
     # ASKED, not inferred. `command -v` answers whether this name resolves to
     # something executable -- a path, a PATH lookup, a function, a builtin -- and
@@ -959,7 +977,7 @@ run_bounded() {
     # That is #457's defect returning by a different route, and it is what the
     # self-test caught.
     if ! command -v "$1" >/dev/null 2>&1; then
-        printf 'unstartable' > "$(_e2e_bound_outcome_path)"
+        printf '%s' "$E2eBoundUnstartable" > "$(_e2e_bound_outcome_path)"
         return 127
     fi
 
@@ -1008,7 +1026,7 @@ run_bounded() {
     rm -f "$capture"
 
     if [ "$exceeded" -eq 1 ]; then
-        printf 'exceeded' > "$(_e2e_bound_outcome_path)"
+        printf '%s' "$E2eBoundOutcomeExceeded" > "$(_e2e_bound_outcome_path)"
         return "$E2eBoundExceeded"
     fi
     return "$status"
