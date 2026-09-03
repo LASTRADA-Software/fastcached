@@ -60,15 +60,19 @@
 #   a target cannot be executed           -> "ran no cases at all"
 #   an unsuppressed race                  -> "reported an unsuppressed data race"
 #
-# The last three arrived with #488 and each is driven by a `--self-test` case, so
-# "verified by making it happen" holds for them as it does for the rest. The two
-# CANARY rows are why the phrases are what they are: a killed canary used to fall
-# through to "reported no data race", which is a different fault with a different
-# fix, so it needed a row rather than a rewording. And "ran no cases at all"
-# rather than the more natural "tested NOTHING", because that phrase already
-# discriminates the tag-expression row four lines up -- two refusals sharing the
-# one string this list identifies them by would make the list unable to tell them
-# apart, which is the failure it is written to prevent.
+# The right-hand column is what a reader GREPS the output for, so each phrase is
+# contiguous in the message it names -- a phrase the code only emits across a
+# newline and an indent identifies nothing. Which is also why the target's
+# unstartable row says "ran no cases at all" and not the more natural "tested
+# NOTHING": that string already discriminates the tag-expression row four lines
+# up, and two refusals sharing the one phrase this list tells them apart by would
+# make the list stop being able to.
+#
+# The last three arrived with #488, and each has a `--self-test` case. Not "as
+# the rest do" -- five rows here have none, and saying otherwise would be this
+# gate's own defect in the prose describing it. The canary rows exist because a
+# killed canary used to fall through to "reported no data race", a different
+# fault with a different fix, so it needed a row rather than a rewording.
 #
 # The list is enumerated HERE and nowhere else. An earlier version of it said
 # "five refusals" in three files, in three different orders, having silently
@@ -187,14 +191,31 @@ export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressio
 # happened. The verdict comes from `e2e_bound_outcome`; the status is only the
 # convenience.
 #
-# What `run_bounded` does NOT do is signal the process GROUP. GNU `timeout`'s
-# manual documents `--foreground` as the way to STOP children being timed out, so
-# without it they are; `fastcache-compile-node-tests` spawns compilers, which can
-# now outlive a target this gate kills. Accepted, and accepted for a reason that
-# is about the VERDICT rather than about tidiness: expiry is a named refusal
-# either way, the gate exits immediately after it, and `run_bounded` captures
-# into a file rather than a pipe, so a surviving writer cannot block the read
-# that follows it.
+# What `run_bounded` does NOT do is signal the process GROUP, and this is the one
+# place the change is a REGRESSION rather than an improvement. GNU `timeout`'s
+# manual documents `--foreground` as the way to stop children being timed out, so
+# without it they are; `run_bounded` signals the direct child only, and says so
+# (`ONE PROCESS DEEP` in its header). `fastcache-compile-node-tests` spawns
+# compilers and claims scratch roots, so on expiry a grandchild can outlive the
+# target this gate killed.
+#
+# Two consequences, and the second is the one an argument about the verdict does
+# not reach:
+#
+#   * THIS run is unaffected. Expiry is a named refusal either way, the gate
+#     exits immediately after it, and `run_bounded` captures into a file rather
+#     than a pipe, so a surviving writer cannot block the read that follows.
+#   * The NEXT run can be. A survivor holding a scratch-root `flock` is a live
+#     lock owner, and the run after a deadlock then refuses by name in a way that
+#     reads as a scratch-claim defect rather than as debris from the kill. That
+#     is a worse diagnosis than the one this change removes, in the same family.
+#
+# Accepted rather than solved, because solving it means changing how a SHARED
+# helper signals: `run_bounded`'s header rejects both routes on stated grounds --
+# job control changes the calling fixture's own signal handling, and a watchdog
+# that fires after `wait` reaps can signal a REUSED pid. Neither is a decision to
+# take inside a ticket about a comment. Tracked with the ticket rather than left
+# in this paragraph, so it is somebody's rather than nobody's.
 TargetTimeoutSeconds="${FASTCACHE_TSAN_TIMEOUT:-900}"
 
 # The canary's own bound, which is much tighter because the canary is a few
@@ -435,10 +456,10 @@ AssertCanaryFires() {
 ${canary_out}"
             ;;
         "$E2eBoundUnstartable")
-            fatal "tsan-canary at ${path} could not be executed, so nothing proves the
-    sanitizer reports. It exists -- AssertInstrumented checked that before this
-    ran -- so this is a permission bit, an interpreter, or a binary for another
-    architecture, and not a missing build."
+            fatal "tsan-canary at ${path} could not be executed, so
+    nothing proves the sanitizer reports. It exists -- AssertInstrumented
+    checked that before this ran -- so this is a permission bit, an interpreter,
+    or a binary for another architecture, and not a missing build."
             ;;
     esac
 
@@ -852,7 +873,7 @@ STUB
         "could not be executed, so this target ran no cases at all"
 
     BoundCase "canary-unstartable-is-refused-by-name" canary 30 absent '' \
-        "could not be executed, so nothing proves the" \
+        "nothing proves the sanitizer reports" \
         "!the sanitizer is live"
 
     rm -rf "$scratch"
