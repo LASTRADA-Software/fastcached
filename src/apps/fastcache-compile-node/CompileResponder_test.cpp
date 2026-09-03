@@ -842,22 +842,33 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
 {
     // **The blocker, and this half is about the MECHANISM.** `FrameServer` armed one
     // five-second window across the whole request, answer included -- right for a cache
-    // round trip and fatal for a compile, which runs for minutes. The failure is silent
-    // in the worst way: `ServeConnection` is not parked on the socket while a responder
-    // answers, so the sweep closes it without waking anything. The compile runs to
-    // completion, hops home, and its write fails. Every translation unit worth
-    // distributing would be compiled, paid for and thrown away, while short ones
-    // succeeded -- so a smoke test passes.
+    // round trip and fatal for a compile, which runs for minutes. `ServeConnection` is
+    // not parked on the socket while a responder answers, so the sweep acts without
+    // waking anything: the compile runs to completion, hops home, and its answer is not
+    // the one the client gets. Every translation unit worth distributing would be
+    // compiled, paid for and discarded, while short ones succeeded -- so a smoke test
+    // passes.
     //
     // Proved in two halves rather than by holding a ten-minute compile:
     //
     //   * HERE, that the endpoint arms the window the RESPONDER names -- by making that
-    //     window short and watching the answer be lost, which is the bug's own shape
-    //     reproduced deliberately and in under a second.
+    //     window short and watching the compile's answer be replaced by the deadline
+    //     refusal, which is the bug's own shape reproduced deliberately and in under a
+    //     second.
     //   * In the case below, that `CompileResponder` names a window a compile fits in.
     //
     // Neither half means anything alone: the first would pass against a hard-coded
     // number, the second against an endpoint that ignored it.
+    //
+    // **What the client receives changed in #523 and what this case proves did not.**
+    // The swept peer used to get a bare close and read back nothing, and this case
+    // asserted that emptiness -- which was asserting the SYMPTOM, since a peer that
+    // cannot tell a sweep from a crash is the whole of that ticket. It now receives
+    // `RequestDeadlineExceeded`, written by the connection itself when `Answer` returns.
+    // That is a strictly stronger reading of the same fact: an empty result is also what
+    // a crash, a refused connect or an unrelated close look like, while this code can
+    // only be produced by the responder's own window expiring. The short window is still
+    // what governs, and now the client is told so.
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
@@ -886,12 +897,28 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     std::this_thread::sleep_for(FrameServer::SweepInterval * 2);
     worker.runner.Release();
 
-    CHECK(pending.get().empty());
+    // The window the RESPONDER named is what expired, and the client is told which
+    // fact that was. Asserted on the CODE rather than on emptiness: empty is also what
+    // a crash, a refused connect and an unrelated close produce, so it could never say
+    // that this particular window was the one that governed.
+    auto const swept = pending.get();
+    REQUIRE_FALSE(swept.empty());
+    auto const header = Wire::DecodeReplyHeader(swept);
+    REQUIRE(header.has_value());
+    REQUIRE(header->status == Wire::Status::Error);
+    REQUIRE(header->payloadLength != 0);
+    CHECK(static_cast<Wire::ErrorCode>(swept[Wire::ReplyHeaderSize]) == Wire::ErrorCode::RequestDeadlineExceeded);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == 1);
 
-    // And the worker paid in full: the compiler ran, the object was produced, the
-    // client got nothing, and NOTHING WAS REFUSED -- which is exactly what makes this
-    // silent rather than merely wrong. An operator watching the refusal series sees a
-    // flat graph while every distributed TU is discarded.
+    // And the worker still paid in full: the compiler ran and the object was produced,
+    // for an answer nobody receives. That is the half #523 did NOT change and this case
+    // still exists to hold -- the client now learns the request was abandoned, and the
+    // CPU is spent either way.
+    //
+    // None of the worker's own refusal series moved, which is the point: nothing about
+    // this is a capacity decision, a drain or an oversize frame, so an operator reading
+    // those graphs would still see a flat line. What rose is the endpoint's deadline
+    // rows, because the deadline is the endpoint's fact.
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNoSlot) == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedStopping) == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerFramesRefusedPayloadTooLarge) == 0);

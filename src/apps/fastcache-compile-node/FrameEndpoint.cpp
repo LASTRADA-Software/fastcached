@@ -938,6 +938,21 @@ namespace
             state->logger.Logf(LogLevel::Error, "{}: dropping a connection that threw", state->what);
         }
 
+        // **A throw out of `Answer` leaves `inResponder` set, and that is safe for a
+        // reason worth stating rather than leaving to be rediscovered.** Nothing
+        // between the throw and the `Untrack` below suspends -- `Logf` is an ordinary
+        // call, not a coroutine -- and the sweeper shares this reactor thread, so it
+        // cannot run in that gap and cannot observe the stale bit. `Untrack` then
+        // erases the entry the bit lives on.
+        //
+        // So it is NOT an RAII guard, unlike `OpenConnectionSlot` above, and the
+        // difference is which failure each prevents: a missed slot release leaks a
+        // permanent unit of capacity, while a missed clear here would at worst make one
+        // sweep defer rather than close, on an entry about to be erased anyway. What
+        // makes the argument hold is the absence of a suspension point, so anything
+        // added between the `catch` and this line has to preserve that or take the
+        // guard instead.
+        //
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
