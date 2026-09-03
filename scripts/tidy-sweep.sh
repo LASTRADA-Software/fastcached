@@ -57,12 +57,92 @@ set -u
 # `wait -n` is 4.3, and expanding an EMPTY array as `"${a[@]}"` under `set -u` stops
 # being an "unbound variable" error at 4.4 -- which this script does on any tree
 # with nothing changed. macOS ships 3.2; `brew install bash` is the answer there.
-if [[ -z "${BASH_VERSINFO:-}" ]] \
-   || [[ "${BASH_VERSINFO[0]}" -lt 4 ]] \
-   || { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 4 ]]; }; then
-    echo "TIDY SWEEP FATAL: bash >= 4.4 is required" >&2
-    exit 2
+#
+# What an interpreter below the floor MEANS depends on what was asked, and the two
+# answers are not the same (#588). A sweep genuinely cannot run here, so it refuses.
+# The self-test is registered in the DEFAULT ctest set, which runs on every platform
+# CI builds -- so on a stock macOS runner it has to produce a visible SKIPPED, and
+# the two ways of getting that wrong are symmetric: registering it naively turns a
+# silent non-registration into a red macOS leg, and "fixing" that by dropping it on
+# macOS at configure time puts it back to a check that does not exist and does not
+# say so. `SKIP_RETURN_CODE 77` -- the idiom `fetch-transfer-bound` already uses --
+# is how ctest is told which of the four states this is.
+#
+# A configure-time guard could not answer this anyway: the floor is a property of
+# whichever `bash` the machine has at RUN time, and a macOS runner can carry 3.2 at
+# /bin/bash and 5.x from Homebrew. Only the interpreter actually running can say.
+#
+# Asked HERE rather than after the argument loop far below, because it must be
+# settled before anything 4.4-only executes. `${1+"$@"}` and not `"$@"`, for the
+# very reason 4.4 is the floor: on 3.2 the bare form is an unbound-variable error
+# when there are no arguments, so this guard would die instead of reporting.
+# `--self-test` AND NOTHING ELSE. The canonical parse is far below, after code this
+# interpreter may not be able to run, so this is a second place the command line is
+# read -- and two readings that can disagree are worse than one that is coarse.
+# `--self-test --all` is a full sweep on a modern bash (the real loop is last-wins),
+# so answering "skipped self-test" for it on 3.2 would have the two interpreters
+# reporting different outcomes for one command line, in the green-reading direction.
+# Anything else falls through to the sweep's refusal, which is what a modern bash
+# does with it too.
+selfTestRequested=0
+if [[ "$#" -eq 1 ]] && [[ "${1:-}" == "--self-test" ]]; then
+    selfTestRequested=1
 fi
+
+# The decision, as a pure function of the three things it depends on.
+#
+# Split out because it is otherwise untestable BY CONSTRUCTION: `BASH_VERSINFO` is
+# read-only, so the skip path cannot be reached on any machine new enough to run
+# the rest of this script -- and every machine this is developed on is one. A guard
+# whose interesting branch only executes where nobody can run it is the shape of
+# defect the self-test exists to catch, one level down.
+#
+# Written to bash 3.2 deliberately: it runs BEFORE the floor check that everything
+# below it relies on, so it may use nothing the floor is there to guarantee.
+#
+# @param 1 Major version, or empty when the interpreter is not bash at all.
+# @param 2 Minor version.
+# @param 3 1 when `--self-test` was among the arguments, else 0.
+# @return Prints `ok`, `skip` or `fatal`.
+InterpreterVerdict() {
+    local major="$1" minor="$2" wantsSelfTest="$3"
+    if [[ -n "$major" ]]; then
+        if [[ "$major" -gt 4 ]]; then echo ok; return; fi
+        if [[ "$major" -eq 4 ]] && [[ "$minor" -ge 4 ]]; then echo ok; return; fi
+    fi
+    # Below the floor. A sweep cannot run; a self-test has an answer, and that
+    # answer is SKIPPED rather than passed or failed.
+    if [[ "$wantsSelfTest" -eq 1 ]]; then echo skip; return; fi
+    echo fatal
+}
+
+# Named once. "bash >= 4.4 is required" without saying what is actually HERE sends
+# somebody to check a version the message never showed them.
+interpreterIs="${BASH:-bash} is ${BASH_VERSION:-not bash}"
+
+case "$(InterpreterVerdict "${BASH_VERSINFO[0]:-}" "${BASH_VERSINFO[1]:-0}" "$selfTestRequested")" in
+    ok) ;;
+    skip)
+        echo "TIDY SWEEP SELF-TEST SKIPPED: ${interpreterIs}, and this needs bash >= 4.4." >&2
+        echo "  A SKIP is not a pass: the scope computation was NOT checked on this machine." >&2
+        echo "  Install a newer bash to run it here (on macOS: brew install bash)." >&2
+        exit 77
+        ;;
+    fatal)
+        echo "TIDY SWEEP FATAL: ${interpreterIs}, and bash >= 4.4 is required" >&2
+        exit 2
+        ;;
+    *)
+        # A verdict this case does not know renders as UNRECOGNISED rather than as
+        # the nearest plausible neighbour. Folding it into the `fatal` arm would be
+        # cheaper and would report a bash-version problem for what is actually a bug
+        # in the function above -- sending somebody to install a shell they already
+        # have. Same rule as `leg_summary`'s default arm in `local-gate.sh`, and for
+        # the same reason: a fourth state must not arrive silently as a third.
+        echo "TIDY SWEEP FATAL: InterpreterVerdict returned an unrecognised verdict; this is a bug in this script, not a problem with ${interpreterIs}" >&2
+        exit 2
+        ;;
+esac
 
 TIDY="${TIDY:-clang-tidy-${CLANG_TOOLS_VERSION:-22}}"
 DB="${DB:-out/build/tidy22}"
@@ -301,6 +381,43 @@ SelfTest() {
     ExpectForce "src/FastCache/Core/Logger.cpp" no
     ExpectForce "README.md" no
     ExpectForce ".agent/rules/testing.md" no
+
+    # Non-vacuity, asserted rather than inferred (#588).
+    #
+    # FIVE rows above survive an empty input, not one, and the count is measured
+    # rather than reasoned: `a changed TU sweeps itself` needs no graph at all (a
+    # .cpp is its own unit), and the four `ExpectForce ... no` rows all pass over an
+    # EMPTY escalation table because "no" is what an empty table answers. What keeps
+    # clause 3 satisfied is that each of them is paired with a positive row that does
+    # NOT survive -- the six `yes` rows guard the table, the two reach rows guard the
+    # graph.
+    #
+    # The `.hpp` row was the one with no pair: its expected value IS zero, so it
+    # passed perfectly over a graph that had never been built. That is the
+    # `node-config-reference` scar -- two empty answers agreeing -- and this
+    # assertion is its pair. A new row whose expected value is an absence needs one
+    # too.
+    Expect "the synthetic include graph was actually built" \
+           "yes" \
+           "$( [[ "${#includers[@]}" -gt 0 ]] && echo yes || echo no )"
+
+    # The interpreter verdict (#588). Pinned on BOTH sides of the floor, because a
+    # bound demonstrated once from the middle is where an off-by-one lives.
+    #
+    # These are the only way the skip path is ever exercised: it cannot run on a
+    # machine new enough to reach this function, and `BASH_VERSINFO` is read-only
+    # so it cannot be faked from outside.
+    Expect "a modern bash runs the sweep"            "ok"    "$(InterpreterVerdict 5 2 0)"
+    Expect "4.4 is at the floor and runs"            "ok"    "$(InterpreterVerdict 4 4 0)"
+    Expect "4.3 is below the floor"                  "fatal" "$(InterpreterVerdict 4 3 0)"
+    Expect "3.2 refuses a sweep"                     "fatal" "$(InterpreterVerdict 3 2 0)"
+    Expect "3.2 SKIPS a self-test rather than failing" "skip"  "$(InterpreterVerdict 3 2 1)"
+    Expect "4.3 SKIPS a self-test rather than failing" "skip"  "$(InterpreterVerdict 4 3 1)"
+    Expect "a modern bash never skips its own self-test" "ok" "$(InterpreterVerdict 5 2 1)"
+    # Not bash at all -- `sh script.sh`. A sweep refuses; a self-test still skips,
+    # because "this machine could not check it" is true either way.
+    Expect "a non-bash interpreter refuses a sweep"  "fatal" "$(InterpreterVerdict "" 0 0)"
+    Expect "a non-bash interpreter skips a self-test" "skip" "$(InterpreterVerdict "" 0 1)"
 
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"

@@ -142,10 +142,27 @@ determinism rests on.
   constraint was **already known**: `scripts/coverage.sh` carries a comment saying
   exactly this, in a place only a reader of `coverage.sh` would find it. A lesson
   recorded where it cannot be reached by the next person who needs it has not been
-  recorded. `scripts/tidy-sweep.sh` uses `mapfile` and `declare -A` and is fine, but
-  only because the `clang-tidy` job pins `ubuntu-24.04` -- so moving that logic into
-  a script `ctest` runs would break it the same way. The same holds for the
+  recorded. The same holds for the
   `mapfile` and `declare -A` inside `pr-labels.yml`.
+
+  **`scripts/tidy-sweep.sh` is the exception, and how it is one is the rule.** It
+  uses `mapfile`, `declare -A` and `wait -n`, which are intrinsic to the scope
+  computation rather than incidental to it, so it cannot be written to 3.2 the way
+  the fixtures above are. It is registered in the default `ctest` set anyway
+  (#588), because the alternative was the state it was in: the only thing running
+  its self-test was the `clang-tidy` job whose scope it computes, which is not an
+  independent check of anything. What makes that safe is that **below its floor it
+  exits `77` and the registration carries `SKIP_RETURN_CODE 77`**, so a stock macOS
+  runner reports SKIPPED rather than red -- and the message says a skip is not a
+  pass. Skipping is the fourth state, not a quiet success.
+
+  Two ways to get this wrong, and they are symmetric: registering such a script
+  without the skip code turns a silent non-registration into a red macOS leg, and
+  "repairing" that by dropping the registration on macOS at configure time puts it
+  back to a check that does not exist and does not say so. The guard cannot live at
+  configure time in any case -- the floor is a property of whichever `bash` the
+  machine has at RUN time, and a macOS runner can carry 3.2 at `/bin/bash` and 5.x
+  from Homebrew, which `if(NOT WIN32)` cannot tell apart.
 
   It is also a live instance of [#336](https://github.com/LASTRADA-Software/fastcached/issues/336):
   `local-gate.sh` cannot run in an agent-created Windows worktree, so nothing
