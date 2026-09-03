@@ -1323,13 +1323,17 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
     // What this fixture does NOT cover, stated so the next reader does not
     // assume it does: `CowTree::Open` reads only the two meta slots, and the
     // free-list walk that `FilePageStore::RecoverExistingFile` does at startup
-    // has no `InMemoryPageStore` equivalent. A damaged free-list page IS a
-    // startup refusal on a real store -- the operator page says so -- and
-    // nothing HERE exercises it. The `[filestore][freelist]` cases cover it on
-    // a file-backed store instead (#580). Named by tag and issue rather than by
-    // path: a path is the half of a cross-file pointer that goes stale on a
-    // move, and a comment claiming coverage that moved is worse than one
-    // claiming none.
+    // has no `InMemoryPageStore` equivalent, so nothing HERE exercises it. The
+    // `[filestore][freelist]` cases do, on a real file (#580) -- named by tag
+    // and issue rather than by path, since a path is the half of a cross-file
+    // pointer that goes stale on a move, and a comment claiming coverage that
+    // moved is worse than one claiming none.
+    //
+    // Those cases also bound what they prove, and it is less than the operator
+    // page implies: `CowTree::CommitTxn` writes `freeRoot = PageId::None()`
+    // unconditionally, so no store `CowTreeStorage` produces has a chain for
+    // that walk to find. The guard is pinned; the refusal is not one an
+    // operator can reach today.
     CowTree::InMemoryPageStore store { DamagePageSize };
     FastCache::CowTreeStorage::Options const opts;
     {

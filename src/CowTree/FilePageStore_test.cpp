@@ -116,8 +116,13 @@ auto OpenFreeListStore(std::filesystem::path const& path)
 /// fixture must not do.
 ///
 /// Both pages are written BEFORE the meta that names `freeRoot`, so this store
-/// walks nothing while it is open and the file it leaves behind is exactly the
-/// one a previous process would have.
+/// walks nothing while it is open -- the injection route is invisible in the
+/// file, which is the same one a patch-the-closed-file route would leave.
+///
+/// It is NOT a file any writer in this tree produces, and that is deliberate
+/// rather than an oversight: `CowTree::CommitTxn` writes
+/// `freeRoot = PageId::None()` unconditionally, so no real store has a chain
+/// at all. The block comment above the cases carries the whole argument.
 /// @param path Filesystem path to create the store at.
 /// @param nextOfOne What page 1 chains to.
 /// @param nextOfTwo What page 2 chains to.
@@ -145,7 +150,15 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
     meta.root = CowTree::PageId::None();
     meta.freeRoot = CowTree::PageId { 1 };
     meta.itemCount = 0;
-    REQUIRE((*store)->WriteMeta(CowTree::MetaSlot::A, meta).has_value());
+
+    // Derived, not chosen. `Meta`'s own contract is that the slot matching
+    // `txnId mod 2` holds the most recent commit attempt, and `CommitTxn`
+    // implements exactly this expression -- so a hard-coded slot would seed a
+    // parity no writer produces, and `RecoverExistingFile` would not notice
+    // because it tie-breaks on `txnId` alone. The chain is the only thing
+    // about this file that is meant to be unusual.
+    auto const slot = (meta.txnId % 2 == 0) ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
+    REQUIRE((*store)->WriteMeta(slot, meta).has_value());
 }
 
 } // namespace
