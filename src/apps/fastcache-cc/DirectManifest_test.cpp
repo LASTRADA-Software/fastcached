@@ -526,8 +526,12 @@ TEST_CASE("ValidateManifest rejects entries whose files do not exist")
     CHECK_FALSE(ValidateManifest(SampleManifest(), layout, "cl 19.51.36231 x64"));
 }
 
-TEST_CASE("A compile whose every reported dependency was dropped records no manifest")
+TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart")
 {
+    // Three states that an empty path list renders as two, which is what issue #512
+    // separated. Asserted in one case because they are only meaningful against each
+    // other: every wrong shape of this guard passes one of them.
+    //
     // The guard that turns #319 from a wrong object into a miss.
     //
     // `IsToolchainHeader` reports every path outside both roots as toolchain, so a
@@ -556,27 +560,88 @@ TEST_CASE("A compile whose every reported dependency was dropped records no mani
 
     // A path under neither root -- another checkout's header, which is exactly what
     // an uncanonicalized region replays.
-    auto const refused = BuildManifest({ .sourcePath = sourcePath.string(),
-                                         .includePaths = { R"(D:\some\other\checkout\src\dep.hpp)" },
-                                         .workingDirectory = root.string(),
-                                         .toolchainStamp = "cl-19.51",
-                                         .objectKey = "objkey-1" },
-                                       layout);
+    auto const refused =
+        BuildManifest({ .sourcePath = sourcePath.string(),
+                        .reportedDependencies = ReportedDependencies::Observed({ R"(D:\some\other\checkout\src\dep.hpp)" }),
+                        .workingDirectory = root.string(),
+                        .toolchainStamp = "cl-19.51",
+                        .objectKey = "objkey-1" },
+                      layout);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().fault == ManifestFault::NoProjectDeps);
 
-    // A TU that reported nothing is NOT refused: it has no headers to drop, so the
-    // source alone is the whole truth about it. The guard asks whether reported
-    // dependencies were dropped, never how few entries came out -- a count test
-    // would refuse this one too.
+    // A TU whose record was READ and named nothing is NOT refused: there are no
+    // headers to drop, so the source alone is the whole truth about it. The guard
+    // asks whether reported dependencies were dropped, never how few entries came
+    // out -- a count test would refuse this one too.
+    //
+    // `Observed({})`, not `NotObserved()`, and that this is now a choice is the whole
+    // of issue #512: the two were one value until `ReportedDependencies` separated
+    // them. This is the honest half; the dishonest half is the case below. They are a
+    // PAIR and neither means anything alone, because a change that collapses the
+    // states again passes whichever one it collapses toward.
+    //
+    // No production caller reaches this state, and the case is asserted anyway.
+    // `RecordManifest` cannot tell an empty record from an unreadable one -- a
+    // localized `cl` prints notes `IncludeNoteMarker` does not match -- so it says
+    // `NotObserved()` and the launcher never writes this manifest. What the assertion
+    // is for is the guard turning into "empty is always refused", which is the same
+    // collapse wearing the new spelling and which only a direct call can catch.
     auto const kept = BuildManifest({ .sourcePath = sourcePath.string(),
-                                      .includePaths = {},
+                                      .reportedDependencies = ReportedDependencies::Observed({}),
                                       .workingDirectory = root.string(),
                                       .toolchainStamp = "cl-19.51",
                                       .objectKey = "objkey-1" },
                                     layout);
     REQUIRE(kept.has_value());
     CHECK(kept->entries.size() == 1);
+
+    // And the state that used to be spelled identically to the one above: no record
+    // reached the caller at all, so nothing whatever is known about what this TU
+    // includes. Refused BY NAME rather than recorded as a manifest asserting the TU
+    // alone -- which is #368's mechanism, and which the entries count cannot tell
+    // apart from the honest manifest six lines up. That indistinguishability is why
+    // the refusal has to happen here, on the provenance, rather than at
+    // `ValidateManifest`, which never sees it.
+    auto const unobserved = BuildManifest({ .sourcePath = sourcePath.string(),
+                                            .reportedDependencies = ReportedDependencies::NotObserved(),
+                                            .workingDirectory = root.string(),
+                                            .toolchainStamp = "cl-19.51",
+                                            .objectKey = "objkey-1" },
+                                          layout);
+    REQUIRE_FALSE(unobserved.has_value());
+    CHECK(unobserved.error().fault == ManifestFault::DepsNotObserved);
+
+    // The refused-over path is the TU, because there is no dependency path to name --
+    // and the note an operator reads is the only account this refusal ever gets
+    // (issue #68). A distinct label from `NoProjectDeps`, deliberately: that one sends
+    // an operator to a root that fails to cover the headers the compile named, this
+    // one to a compile that named none.
+    CHECK(DescribeManifestFailure(unobserved.error())
+          == std::format("the compile produced no dependency record: {}", sourcePath.string()));
+    CHECK(DescribeManifestFailure(unobserved.error()) != DescribeManifestFailure(refused.error()));
+}
+
+TEST_CASE("BuildManifest refuses an unobserved dependency record before it looks at any path")
+{
+    // The ordering half, which the case above cannot show. `DepsNotObserved` is
+    // asked before the TU is even resolved, so a compile that observed nothing is
+    // refused for THAT rather than for whatever else is wrong with it -- here a
+    // source path under no root, which would otherwise answer `OutsideRoots`.
+    //
+    // It matters because the refusal an operator is shown is the one they act on. A
+    // build with no `-MD`/`-MF` reports every translation unit as a roots problem if
+    // this order is reversed, and the roots are fine.
+    FastCache::PathCanon::Layout const layout { .sourceRoot = "/home/dev/proj/src", .buildTree = "/home/dev/proj/out" };
+
+    auto const refused = BuildManifest({ .sourcePath = "/elsewhere/shared/t.cpp",
+                                         .reportedDependencies = ReportedDependencies::NotObserved(),
+                                         .workingDirectory = "/home/dev/proj/out",
+                                         .toolchainStamp = "cl-19.51",
+                                         .objectKey = "objkey-1" },
+                                       layout);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().fault == ManifestFault::DepsNotObserved);
 }
 
 TEST_CASE("ValidateManifest refuses an empty manifest rather than validating on nothing")
@@ -627,7 +692,7 @@ TEST_CASE("Build then validate a manifest against real files on disk")
 
     auto const inputs = [&](std::string_view objectKey) {
         return ManifestInputs { .sourcePath = sourcePath.string(),
-                                .includePaths = { headerPath.string() },
+                                .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                 .workingDirectory = root.string(),
                                 .toolchainStamp = std::string { stamp },
                                 .objectKey = std::string { objectKey } };
@@ -691,7 +756,7 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     // MSVC's /showIncludes lists only the header; the TU reaches BuildManifest as
     // its own `sourcePath` field, which is why a manifest can never omit it.
     auto built = BuildManifest({ .sourcePath = sourcePath.string(),
-                                 .includePaths = { headerPath.string() },
+                                 .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                  .workingDirectory = root.string(),
                                  .toolchainStamp = std::string { stamp },
                                  .objectKey = "objkey-1" },
@@ -750,7 +815,7 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
     // rather than taken from the process, so this asserts the real resolution rule
     // instead of whatever directory the test binary happens to run in.
     auto const inputs = ManifestInputs { .sourcePath = "src/a.cpp",
-                                         .includePaths = { "src/header.hpp" },
+                                         .reportedDependencies = ReportedDependencies::Observed({ "src/header.hpp" }),
                                          .workingDirectory = root.string(),
                                          .toolchainStamp = std::string { stamp },
                                          .objectKey = "objkey-rel" };
@@ -807,7 +872,7 @@ TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)
 
     // Run from the build tree, as Ninja does: `../src/t.cpp`.
     auto const inputs = ManifestInputs { .sourcePath = "../src/t.cpp",
-                                         .includePaths = { headerPath.string() },
+                                         .reportedDependencies = ReportedDependencies::Observed({ headerPath.string() }),
                                          .workingDirectory = (root / "out").string(),
                                          .toolchainStamp = std::string { stamp },
                                          .objectKey = "objkey-tu" };
@@ -869,7 +934,7 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
 
     auto const inputsWith = [&layout](std::string source, std::vector<std::string> includes, std::string cwd) {
         return BuildManifest({ .sourcePath = std::move(source),
-                               .includePaths = std::move(includes),
+                               .reportedDependencies = ReportedDependencies::Observed(std::move(includes)),
                                .workingDirectory = std::move(cwd),
                                .toolchainStamp = "cc-test-1",
                                .objectKey = "objkey-1" },
@@ -946,7 +1011,7 @@ TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #
                                                 .buildTree = (root / "out").string() };
     auto const build = [&](std::vector<std::string> includes, std::string cwd) {
         return BuildManifest({ .sourcePath = sourcePath.string(),
-                               .includePaths = std::move(includes),
+                               .reportedDependencies = ReportedDependencies::Observed(std::move(includes)),
                                .workingDirectory = std::move(cwd),
                                .toolchainStamp = "cc-test-1",
                                .objectKey = "objkey-1" },
@@ -1184,7 +1249,7 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
     };
 
     auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
-                                       .includePaths = includes,
+                                       .reportedDependencies = ReportedDependencies::Observed(includes),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "cl-test-1",
                                        .objectKey = "objkey-1" },
@@ -1231,7 +1296,7 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
     };
 
     auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
-                                       .includePaths = includes,
+                                       .reportedDependencies = ReportedDependencies::Observed(includes),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "cl-test-1",
                                        .objectKey = "objkey-1" },
@@ -1426,7 +1491,7 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     // The depfile names the source among its own dependencies, so this also covers
     // the source field deduplicating against the include list.
     auto const built = BuildManifest({ .sourcePath = sourcePath.string(),
-                                       .includePaths = paths,
+                                       .reportedDependencies = ReportedDependencies::Observed(paths),
                                        .workingDirectory = root.string(),
                                        .toolchainStamp = "gcc-test-1",
                                        .objectKey = "objkey-dep" },
@@ -1705,13 +1770,20 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // checkout's headers. Every one of those paths lies outside this checkout's
     // roots, `IsToolchainHeader` calls every such path toolchain, all of them
     // drop -- and what is recorded is the TU and nothing else. That route is
-    // closed on the produce side now, and closed in THREE places rather than the
-    // one this comment used to claim: `RecordManifest` refuses when the compile
-    // reported no dependencies at all, again when a reported path is not readable
-    // as text, and `BuildManifest` refuses when paths were reported and every one
-    // dropped. So this case builds the hollow manifest DIRECTLY, through a door
-    // the launcher no longer opens -- `BuildManifest` is a library entry point and
-    // its one production caller guards it.
+    // closed on the produce side now, in three places: `RecordManifest` refuses when
+    // a reported path is not readable as text, and `BuildManifest` refuses both when
+    // paths were reported and every one dropped (`NoProjectDeps`) and when no
+    // dependency record was observed at all (`DepsNotObserved`, issue #512 -- which
+    // used to be the caller's own early return, one translation unit away and
+    // invisible from `DirectManifest.cpp`). So this case builds the hollow manifest
+    // DIRECTLY, through a door the launcher no longer opens.
+    //
+    // The `Observed({})` below is a LIE this fixture tells deliberately, and it is
+    // now visible as one, which is the point of the type. This TU includes
+    // `dep.hpp`; saying its dependency record was read and named nothing is a claim
+    // no honest caller makes -- `RecordManifest` answers `NotObserved()` for an empty
+    // record, and would be refused. Spelling the lie explicitly is what keeps the
+    // next reader from "repairing" the fixture into a state that proves nothing.
     //
     // What it characterizes is therefore the VALIDATOR, not a live launcher path:
     // `ManifestAssertsNothing` is `entries.empty()`, a TU-only manifest is not
@@ -1724,13 +1796,16 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // is the defence-in-depth fix and is cheap, this case must be updated rather
     // than worked around: the `CHECK` below deliberately pins today's answer, and
     // an assertion that pins an answer is a change-detector unless it says so.
+    // Issue #512 did not do that, and did not make it unnecessary: it moved the
+    // PRODUCE-side question into `ReportedDependencies`, and this case is about a
+    // manifest that never went through the produce side at all.
     TwoCheckouts const checkouts;
 
     auto const oldCheckout = checkouts.LayoutOf("checkout-old");
     auto const newCheckout = checkouts.LayoutOf("checkout-new");
 
     auto const hollow = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
-                                        .includePaths = {},
+                                        .reportedDependencies = ReportedDependencies::Observed({}),
                                         .workingDirectory = oldCheckout.sourceRoot,
                                         .toolchainStamp = std::string { Stamp },
                                         .objectKey = "object-from-the-old-checkout" },
@@ -1771,12 +1846,13 @@ TEST_CASE("An honest manifest still records its header, and still fails in the o
     auto const oldCheckout = checkouts.LayoutOf("checkout-old");
     auto const newCheckout = checkouts.LayoutOf("checkout-new");
 
-    auto const sound = BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
-                                       .includePaths = { checkouts.Header("checkout-old") },
-                                       .workingDirectory = oldCheckout.sourceRoot,
-                                       .toolchainStamp = std::string { Stamp },
-                                       .objectKey = "object-key" },
-                                     oldCheckout);
+    auto const sound =
+        BuildManifest({ .sourcePath = checkouts.Source("checkout-old"),
+                        .reportedDependencies = ReportedDependencies::Observed({ checkouts.Header("checkout-old") }),
+                        .workingDirectory = oldCheckout.sourceRoot,
+                        .toolchainStamp = std::string { Stamp },
+                        .objectKey = "object-key" },
+                      oldCheckout);
     REQUIRE(sound.has_value());
     CHECK(sound->entries.size() == 2);
 
