@@ -216,7 +216,22 @@ tls_args=()
     > "${workdir}/node.log" 2>&1 &
 node_pid=$!
 
-wait_for_port 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
+# Ready, not merely bound (#634). The next statement dials this very port and
+# requires a 200 out of it, while `wait_for_port` returns as soon as the admin
+# surface is bound -- which is before the loop that accepts on it is running.
+#
+# What that costs is a DELAY, not a refusal, and the distinction is worth keeping
+# straight: a dial into a bound socket completes into the listen backlog and is
+# served once the loop starts, so nothing here fails because a listener was not
+# yet accepting. Measured on the daemon, whose equivalent gap is the same shape:
+# a real transaction succeeded on every run issued the instant the port answered.
+#
+# So this buys a flake removed rather than a false pass, and it is a weaker claim
+# than the n4 site in `cluster-e2e` -- which asserts on a REFUSAL and so cannot
+# tell a node that does not lead from one that could not answer. Every assertion
+# below fails loudly if it lands early: an unanswered request is an empty body,
+# not a wrong one.
+wait_for_node_ready 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
 
 # ---------------------------------------------------------------- 2. /metrics
 # First, because it is the assertion that protects every existing deployment: the
