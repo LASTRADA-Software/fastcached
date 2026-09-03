@@ -93,16 +93,22 @@ using LeaseValidator =
 ///        off the host that read it. Borrowed, so it must outlive the validator.
 /// @return The validator.
 ///
-/// The scheduler TERM is deliberately not checked here, and `LeaseEpochCheck` is the
-/// type that makes that a stated decision rather than a forgotten field: a worker
-/// learns the current term from nowhere, since the only term it ever sees is the one
-/// inside the token it is checking. The epoch is covered by the MAC regardless -- so
-/// it cannot be edited -- and enforced by the scheduler, which knows its own. Making
-/// it travel on REGISTER is #421.
+/// @param term Where this worker's knowledge of the scheduler's term lives. Borrowed,
+///        so it must outlive the validator -- and it is deliberately not captured by
+///        value, because the whole point is that the heartbeat thread writes it while
+///        the compile threads read it.
+///
+/// **The term is checked since #421, and the check is one-sided**: a grant from a
+/// term below what this worker has learned is refused, one from a term above it is
+/// accepted and adopted, and a worker that has learned nothing refuses none of them.
+/// `Distributed::LeaseEpochCheck`'s class comment owns the argument for that
+/// asymmetry -- it is the type that makes the decision, and one explanation copied to
+/// each site is four places to edit and four chances to drift.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
                                                   std::string clusterId,
-                                                  IWallClock const& clock);
+                                                  IWallClock const& clock,
+                                                  Distributed::KnownSchedulerTerm& term);
 
 /// The validator a worker with no cluster key builds: it refuses nothing.
 ///
@@ -303,6 +309,12 @@ class WorkerRegistrar
     /// its way of saying "register again" — a worker that ignored that would
     /// heartbeat into a void forever while the fleet ran without it. So this
     /// reports the need to re-register rather than merely failing.
+    /// **It deliberately learns nothing about the scheduler's term here** (#421).
+    /// The first shape of that change had this reply state the term, and review found
+    /// that this channel is unauthenticated -- so anything able to answer a worker's
+    /// `--scheduler` dial could push its expectation to `UINT64_MAX` and make it
+    /// refuse every authentic grant until restarted. The term is learned from the
+    /// grant, below the MAC, and this stays a liveness report.
     /// @param scheduler Connected transport; not owned.
     /// @param inFlight Jobs running right now.
     /// @param load What else this machine has to say about itself right now.

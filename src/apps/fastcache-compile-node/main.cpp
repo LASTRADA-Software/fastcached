@@ -789,11 +789,29 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
     // wants -- a local here was one more object whose outliving had to be reasoned
     // about, for no gain.
+    // What this worker has learned about the scheduler's term (#421). Declared here
+    // because the validator below borrows it for the rest of this node's life.
+    //
+    // Written by nothing but the validator itself: a grant that has passed its MAC
+    // teaches the term inside it. The first shape of #421 also had the heartbeat reply
+    // state it, and review found that channel is unauthenticated -- anything able to
+    // answer this node's `--scheduler` dial could push the expectation to `UINT64_MAX`
+    // and make this worker refuse every honest grant until it restarted. So the
+    // channel was deleted rather than defended, which is what `CacheResponder` taking
+    // no membership oracle already records as this repository's preference.
+    //
+    // Empty at this point, and that is a state rather than a gap: a worker that
+    // refused before it had ever seen a grant could not cold-start, so
+    // `KnownSchedulerTerm` reports `NotKnownHere` and accepts everything until an
+    // authentic grant has taught it something.
+    Distributed::KnownSchedulerTerm schedulerTerm;
+
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
                                        activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
+                                       schedulerTerm,
                                        logger);
     if (!validator.has_value())
     {

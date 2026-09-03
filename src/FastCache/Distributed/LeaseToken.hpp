@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -451,15 +452,29 @@ namespace Detail
 /// `PreAuth` and `PayloadCap` in the wire table are spelled the same way for the same
 /// reason.
 ///
-/// **`NotKnownHere` is a real answer and not a placeholder.** A worker learns the
-/// current term from nowhere: the only term it ever sees is the one inside the token
-/// it is checking, and comparing a claim against itself establishes nothing. Making
-/// it say so out loud is what keeps "this verifier does not check the epoch" a
-/// decision somebody wrote rather than a field somebody forgot. Closing that gap
-/// needs the term to travel on REGISTER or a heartbeat, which is
-/// [#421](https://github.com/LASTRADA-Software/fastcached/issues/421); until then the
-/// epoch is COVERED by the MAC -- so it cannot be edited -- and enforced by the
-/// scheduler, which knows its own.
+/// **`NotKnownHere` is a real answer and not a placeholder**, and it stayed the only
+/// answer until #421 gave a worker somewhere to learn the term FROM -- the heartbeat
+/// reply, plus any authentic grant naming a newer one. A verifier that has never
+/// learned one still says so here, because a worker that refused everything before
+/// its first heartbeat could not cold-start and every fleet would deadlock on
+/// restart. So the states are three, not two: never learned, learned, and a refusal
+/// reachable only from the second.
+///
+/// **`NotOlderThan`, not `MustEqual`, and the asymmetry is the design.** A grant
+/// naming a term BELOW the one this worker knows was issued by a scheduler that has
+/// since been deposed: that is what the epoch is for, and it is refused. A grant
+/// naming a term ABOVE it is accepted, because the worker is the one that is behind
+/// -- the scheduler is authoritative about its own term and the MAC has already
+/// proved the grant authentic. Refusing that direction would make a worker which
+/// missed one heartbeat reject the new leader, which is the fleet quietly ceasing to
+/// distribute right after an election: the exact failure #421 exists to prevent,
+/// produced by #421.
+///
+/// The consequence worth stating plainly is that **a worker's own staleness can never
+/// cause a refusal.** That is what removes the availability trade the ticket expected
+/// to have to make, and it is this project's caching rule in another setting:
+/// staleness is safe to hold when it fails closed and self-heals, and adopting
+/// forward is the self-healing half.
 class LeaseEpochCheck
 {
   public:
@@ -473,10 +488,14 @@ class LeaseEpochCheck
         return LeaseEpochCheck { false, 0 };
     }
 
-    /// This verifier knows the current term, and refuses any other.
-    /// @param epoch The term a grant must name.
+    /// This verifier knows a term, and refuses any grant issued STRICTLY BEFORE it.
+    ///
+    /// Named for what it does rather than for the field it holds: `MustEqual` was the
+    /// obvious spelling and would have been a lie, since a grant from a later term is
+    /// accepted. See the class comment for why that direction has to be accepted.
+    /// @param epoch The most recent term this verifier has learned.
     /// @return The check.
-    [[nodiscard]] static constexpr LeaseEpochCheck MustEqual(std::uint64_t epoch) noexcept
+    [[nodiscard]] static constexpr LeaseEpochCheck NotOlderThan(std::uint64_t epoch) noexcept
     {
         return LeaseEpochCheck { true, epoch };
     }
@@ -485,10 +504,11 @@ class LeaseEpochCheck
     /// @return True when this verifier accepts it.
     [[nodiscard]] constexpr bool Accepts(std::uint64_t claimed) const noexcept
     {
-        return !_checked || claimed == _epoch;
+        return !_checked || claimed >= _epoch;
     }
 
-    /// @return The term this verifier expects; meaningless when it checks none.
+    /// @return The most recent term this verifier has learned; meaningless when it
+    ///         has learned none.
     [[nodiscard]] constexpr std::uint64_t Expected() const noexcept
     {
         return _epoch;
@@ -509,6 +529,88 @@ class LeaseEpochCheck
 
     bool _checked;
     std::uint64_t _epoch;
+};
+
+/// The most recent scheduler term a worker has been told about, if any.
+///
+/// The mutable companion of `LeaseEpochCheck`, which is a value: this is the thing a
+/// worker LEARNS into and the check is the immutable reading it hands the verifier.
+/// It lives beside that type rather than beside the worker because both binaries
+/// compile `WorkerProtocol.cpp` and only one of them links `FastCache` -- a seam with
+/// a `.cpp` would need a new `_fc_cc_core` row, and this needs none.
+///
+/// **One channel writes it: an authentic grant.** #421's first shape also had the
+/// HEARTBEAT reply state the term, which was faster and scheduler-driven, and it was
+/// deleted before it shipped. That reply is unauthenticated -- `Credential` is
+/// client-to-server and the frame surface is plaintext -- so anything able to answer a
+/// worker's `--scheduler` dial could write `UINT64_MAX` here once and the worker would
+/// refuse every authentic grant until it restarted. A value that only ever rises is a
+/// ratchet, and a ratchet an unauthenticated peer can turn is a permanent denial of
+/// service rather than a transient one. The grant channel has no such problem: the MAC
+/// is verified first, so only the scheduler can move this number.
+///
+/// **Monotonic, so a late writer cannot walk it backwards.** Raft terms only ever
+/// increase within a cluster, and the MAC binds the cluster -- so a lower number
+/// reaching `Learn` is a stale message overtaking a fresh one, not a demotion, and
+/// taking the maximum is what makes the order two threads happen to write in
+/// irrelevant.
+///
+/// **Never-learned is a flag, not a term value.** `StandaloneSchedulerTerm` is
+/// literally `0`, so a zero sentinel would make a single-node fleet's real term
+/// indistinguishable from "nobody has told me anything" -- two states, one
+/// representation, which is the collapse this project keeps paying for. The cost is a
+/// second atomic and an ordering that has to be stated: `_term` is published first
+/// and `_learned` released after it, so a reader that acquires `_learned == true`
+/// sees a `_term` at least as new. A reader that sees `false` accepts everything,
+/// which is the safe direction.
+///
+/// A term learned too LATE costs nothing at all: the check accepts anything not older,
+/// so a worker that is behind refuses nothing and catches up from the next grant.
+///
+/// The sentence that used to sit here claimed a term could never be learned too EARLY,
+/// "because there is no channel that reports a term before a scheduler has entered
+/// it". It was written beside a channel for which it was false, and is recorded as
+/// deleted rather than quietly dropped: what makes the remaining channel safe is the
+/// MAC, not the absence of a way to lie.
+class KnownSchedulerTerm
+{
+  public:
+    /// Record a term this worker has been told about, keeping the highest seen.
+    /// @param term The scheduler term.
+    void Learn(std::uint64_t term) noexcept
+    {
+        auto seen = _term.load(std::memory_order_relaxed);
+        while (term > seen && !_term.compare_exchange_weak(seen, term, std::memory_order_relaxed))
+        {
+        }
+
+        // Guarded, because this runs on every dispatched compile and publishes a
+        // transition that happens once per process. The two members share a cache
+        // line, so an unconditional release store took it exclusive per compile and
+        // forced every other worker thread's next `Check()` to re-acquire it -- a
+        // coherence round trip to republish a flag that has been true since the first
+        // heartbeat. The relaxed load reads the line without invalidating it.
+        //
+        // What the guard gives up, stated because it is the half that is not obvious:
+        // a LATER `Learn` that raises `_term` no longer carries a release edge. Nothing
+        // races -- `_term` is atomic — and the only reachable effect is a reader seeing
+        // an older term, which accepts more and never refuses. That is the direction
+        // this class is safe in by design.
+        if (!_learned.load(std::memory_order_relaxed))
+            _learned.store(true, std::memory_order_release);
+    }
+
+    /// @return What a verifier should expect of a grant's term right now.
+    [[nodiscard]] LeaseEpochCheck Check() const noexcept
+    {
+        if (!_learned.load(std::memory_order_acquire))
+            return LeaseEpochCheck::NotKnownHere();
+        return LeaseEpochCheck::NotOlderThan(_term.load(std::memory_order_relaxed));
+    }
+
+  private:
+    std::atomic<std::uint64_t> _term { 0 };
+    std::atomic<bool> _learned { false };
 };
 
 /// What a verifier expects a grant to say about itself.
@@ -576,7 +678,7 @@ struct LeaseExpectation
     if (!expected.epoch.Accepts(authentic->epoch))
         return std::unexpected { LeaseRefusal {
             .reason = LeaseRefusalReason::EpochMismatch,
-            .detail = std::format("this lease was issued under scheduler term {}; term {} is current",
+            .detail = std::format("this lease was issued under scheduler term {}; this worker has seen term {}",
                                   authentic->epoch,
                                   expected.epoch.Expected()) } };
 

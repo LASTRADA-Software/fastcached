@@ -545,6 +545,18 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
     if (_history != nullptr && !history.empty())
         _history->AcceptHistory(*endpoint, history);
 
+    // **This reply deliberately carries no term.** #421 first put the scheduler's term
+    // here, and review found it: this channel is unauthenticated -- `Credential` is
+    // client-to-server, the frame surface is plaintext, and a reply has no integrity
+    // protection at all. Anything that can answer a worker's `--scheduler` dial could
+    // hand it a term of `UINT64_MAX` once and that worker would refuse every authentic
+    // grant until its process restarted, which is the fleet ceasing to distribute --
+    // the exact failure #421 exists to prevent, caused by #421, from one packet.
+    //
+    // A worker learns the term from the grant instead, where the MAC has already run.
+    // Deleting the surface rather than defending it is what this repository does when
+    // both are available: `CacheResponder` takes no membership oracle, and its absence
+    // IS the fix.
     return SchedulerReply::Success();
 }
 

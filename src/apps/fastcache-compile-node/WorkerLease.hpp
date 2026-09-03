@@ -73,12 +73,18 @@ enum class SocketActivation : std::uint8_t
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
+/// @param term What this node knows about the scheduler's term (#421). Borrowed by
+///        the validator, so it must outlive it -- and it is the one object the
+///        heartbeat thread and the compile threads share. Taken even on the paths
+///        that build an unchecked validator, because whether a node has a cluster key
+///        is not a reason for its caller to hold a different set of objects.
 /// @param logger Where the chosen mode is announced.
 /// @return The validator, or why the key file cannot serve as one.
 [[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
                                                                                       std::string_view advertise,
                                                                                       SocketActivation activation,
                                                                                       IWallClock const& clock,
+                                                                                      Distributed::KnownSchedulerTerm& term,
                                                                                       ILogger& logger);
 
 } // namespace FastCache::Node
