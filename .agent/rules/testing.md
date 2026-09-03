@@ -1071,6 +1071,92 @@ When a failure is fixed, the question is not "is this site now correct" but "wha
 else has this shape, and would I have seen it fail?"
 ([#172](https://github.com/LASTRADA-Software/fastcached/issues/172))
 
+## An identifier is READ, never reconstructed, and zero rows is not a verdict
+
+Two instrument failures in one session shared one shape, and neither returned an
+error. A query was answered about a set that did not contain the subject, and the
+caller promoted the empty result into a verdict
+([#683](https://github.com/LASTRADA-Software/fastcached/issues/683)).
+
+**A fabricated SHA.** A lane read a head as the abbreviated `b4331297`, needed forty
+characters for an API call, and **padded it** instead of reading the full value. `gh`
+answered `422 No commit found`; the script piped that into `awk`, the one-line error
+JSON matched no red rows and produced no pending rows, and the watcher reported
+**"ALL COMPLETE, NOTHING RED"** for a commit that does not exist.
+
+What makes that one expensive is that the fabricated SHA shares its prefix with the
+real one, so **every human-readable trace of the mistake reads correctly**. The
+transcript, the log line, the summary a reviewer skims -- all of them show the eight
+characters that are right. Only the raw response disagrees, and the raw response is
+the one thing nobody reads.
+
+**An absence nobody searched for.** In the same session a CI log was grepped for the
+ctest summary block, fixture output was not found *there*, and "CI produces no test
+output" was reported as a fact. `CMakePresets.json` sets
+`"output": { "outputOnFailure": true }` on every test preset, and the evidence was
+already in the log file on disk. A lane then spent a cycle diagnosing a fixture
+defect that was not the failure.
+
+So:
+
+- **An abbreviated identifier is a display form.** The full one is read, never
+  reconstructed. Padding, truncating or re-deriving one produces a well-formed value
+  for a thing that does not exist -- which is strictly worse than a malformed value,
+  because a malformed value is refused.
+- **Validate a response's SHAPE before drawing a verdict from it.** N rows with the
+  fields you expect, or it is not an answer. A query that does not parse is a hard
+  failure, never a quiet retry.
+- **Zero rows is not a verdict, it is the absence of one.** This is the same
+  distinction the required-context scan draws between absent and passing, and the
+  same one a `SUCCEED` gets wrong when it stands in for a skip: an instrument that
+  cannot tell "no answer" from "a good answer" reports the good one.
+- **Refuse a malformed identifier at the boundary.** A forty-hex-character check is
+  one line, and the padding that caused this is invisible in a shell argument.
+- **Before concluding "nothing there", state what was searched and whether that
+  search could have found it.** "I grepped the log for the ctest block" and "CI
+  produces no test output" are different claims, and only the first one was made.
+
+This is the `producer | grep -q` false negative's family, recorded in
+[`build-and-toolchain.md`](build-and-toolchain.md) -- same outcome, different
+mechanism. There the pipeline corrupted the answer; here the caller corrupted the
+question.
+
+### A third instance, found while writing this rule
+
+Worth recording because of when it happened. Auditing whether any Catch2 case name
+contains a comma -- which would be a spec metacharacter -- the census was:
+
+```sh
+git grep -h '^TEST_CASE("' -- 'src/**/*_test.cpp' | sed 's/^TEST_CASE("//'   | sed 's/".*$//' | grep -c ','
+0
+```
+
+Zero of 3135. The real answer is **428**, and one of them is at
+`src/CowTree/BasicCowTree_test.cpp:285`.
+
+This repository sets `grep.lineNumber = true`, so `git grep -h` emits
+`<lineno>:<content>` rather than `<content>`. The `^TEST_CASE("` anchor therefore
+matched nothing, the first `sed` stripped nothing, and the second truncated at the
+first quote and left `57:TEST_CASE(` -- a string with no comma in it. Every line
+produced an answer, the count was well formed, and it was false.
+
+Three properties made it convincing, and they are the ones to distrust:
+
+- **The pipeline did not fail.** No stage errored, no stage was empty, and the
+  arithmetic was over 3135 real lines.
+- **Zero was the expected answer.** A tree with no comma in any case name is exactly
+  what a healthy tree looks like, so the result confirmed the prior.
+- **The defect was in the environment, not the command.** The same pipeline is
+  correct on a machine without that config, which is why reading it does not reveal
+  anything.
+
+What caught it was cross-checking with a second extraction that had no shared
+assumption -- a Python `re.search` for the first quoted string -- and then confirming
+the disagreement against a raw `git grep` of one name. **A census that returns zero
+gets a positive control**: find one instance by other means, and check the census
+sees it. Otherwise "there are none" and "I did not look where they are" are the same
+output.
+
 ## Open work
 
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two
