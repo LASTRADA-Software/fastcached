@@ -71,7 +71,13 @@ endif()
 # fixture at all. Measured: the bail-out case passed until this was fixed.
 string(ASCII 59 SEMI)
 
-set(root "${FASTCACHED_SCRATCH_DIR}/succeed-not-skip-selftest")
+# The scratch directory IS the root, not a directory inside it. The obvious spelling
+# appends the test's own name a second time, and the paths here are already deep -- a
+# build tree, then `src/tests`, then a case name, then a synthetic `.git` whose object
+# files carry forty-character names. Measured in a checkout under a long temporary path:
+# `git add` inside the fixture failed with "Filename too long" and two verdicts came back
+# wrong for a reason that had nothing to do with the check under test.
+set(root "${FASTCACHED_SCRATCH_DIR}")
 file(REMOVE_RECURSE "${root}")
 set(failures "")
 
@@ -250,14 +256,36 @@ else()
         file(WRITE "${tree}/.cache/CPM/catch2/deadbeef/tests/Vendored_test.cpp"
              "TEST_CASE(\"vendored\")\n{\n    SUCCEED(\"cannot run here\")${SEMI}\n}\n")
 
-        execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}" RESULT_VARIABLE ignored)
+        # The fixture's own git commands are CHECKED. When `git add` fails -- it did,
+        # with "Filename too long", under a long scratch path -- the tree has no index
+        # and the check falls back to the directory walk, which reads as two unrelated
+        # verdicts being wrong. A broken fixture must say it is broken.
+        set(gitSetup "")
+        execute_process(COMMAND "${FASTCACHED_GIT}" init -q "${tree}"
+                        OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
+        if(NOT gitStatus EQUAL 0)
+            set(gitSetup "git init: ${gitError}")
+        endif()
         execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add "src/thing/Thing_test.cpp"
-                        RESULT_VARIABLE ignored)
+                        OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
+        if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
+            set(gitSetup "git add: ${gitError}")
+        endif()
         if(case STREQUAL "tracked-bad")
             # Forced in, since a real checkout would have it ignored.
             execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -f
                             ".cache/CPM/catch2/deadbeef/tests/Vendored_test.cpp"
-                            RESULT_VARIABLE ignored)
+                            OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
+            if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
+                set(gitSetup "git add -f: ${gitError}")
+            endif()
+        endif()
+        if(NOT gitSetup STREQUAL "")
+            string(REPLACE ";" "," gitSetup "${gitSetup}")
+            string(STRIP "${gitSetup}" gitSetup)
+            list(APPEND failures
+                 "git-${case}: this case could not be STAGED, so it says nothing about the check -- ${gitSetup}")
+            continue()
         endif()
 
         fastcached_run_check("${tree}" objected output)
