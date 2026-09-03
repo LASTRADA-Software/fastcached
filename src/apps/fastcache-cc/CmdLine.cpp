@@ -1300,13 +1300,28 @@ std::string CompilerWorkingDirectory(std::string_view physicalDirectory, std::st
     if (!logical.has_value() || !physical.has_value())
         return std::string { physicalDirectory };
 
-    // Absolute FIRST, and not merely as an optimisation: `equivalent` resolves a
+    // POSIX-ROOTED first, and not merely as an optimisation: `equivalent` resolves a
     // relative path against this process's own working directory, so `PWD=build` inside
-    // `.../build` would compare equal and be returned as a compilation directory that is
-    // not absolute. The driver rejects it -- measured, `PWD=relative/bits` fell back --
-    // and `is_absolute()` is the same test on a Windows layout, where an MSYS-style
-    // `/d/work` has no root name and so falls back too.
-    if (!logical->is_absolute())
+    // `.../build` compares EQUAL and would be returned as a compilation directory that
+    // is not absolute. Measured: `PWD=relative/bits` fell back on both drivers.
+    //
+    // A leading `/` and NOT `path::is_absolute()`, which is the same test on POSIX and
+    // strictly more permissive on a Windows layout -- it admits `D:/work` and
+    // `\\host\share`, and NEITHER Windows driver consults `PWD` for either. libiberty's
+    // `getpwd()`, which is where gcc's `DW_AT_comp_dir` comes from, gates on
+    // `*p == '/'` before it stats anything; LLVM does the `PWD` dance only in
+    // `Unix/Path.inc`, its Windows path being `GetCurrentDirectoryW` with no `PWD` in
+    // it. So modelling this as `is_absolute()` would make a MinGW client predict a
+    // spelling its own compiler never uses, send a mapping the local compile did not
+    // apply, and rebuild #506's asymmetry under a correct key.
+    //
+    // **Read rather than measured** -- the five-row table on the declaration is Linux,
+    // and no Windows GNU-layout driver was available to run it against. Stated
+    // separately because a reader cannot recover the difference and would otherwise
+    // inherit it as measurement. An MSYS-style `/d/work` still reaches the `stat` here
+    // and still falls back, because that spelling resolves for the shell and not for
+    // the driver -- so the two agree by the check below rather than by this one.
+    if (!logical->has_root_directory() || logical->has_root_name())
         return std::string { physicalDirectory };
 
     // `equivalent`, not a string compare: the question is whether `PWD` names the SAME

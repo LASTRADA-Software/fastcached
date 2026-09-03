@@ -1679,16 +1679,26 @@ mkdir -p "$mapdir"
 # `AT_comp_dir( "." )`. One awk: a quoted value if there is one, otherwise
 # everything after the LAST `: ` -- `sub` with a greedy `.*` takes the last.
 dwarf_dump_with() {
+    local dump=""
     case "$1" in
-        readelf) "$1" --debug-dump=info "$2" 2>/dev/null || true ;;
-        *dwarfdump) "$1" --debug-info "$2" 2>/dev/null || true ;;
+        readelf) dump="$("$1" --debug-dump=info "$2" 2>/dev/null || true)" ;;
+        *dwarfdump) dump="$("$1" --debug-info "$2" 2>/dev/null || true)" ;;
     esac
+    # A DUMP, not merely output. "Wrote something to stdout" is a different question:
+    # libdwarf's `dwarfdump` takes `-i`, not `--debug-info`, and a reader that answers
+    # an unknown option with usage text ON STDOUT would be classified as having read
+    # the object -- which turns the SKIPPED state into a failure of the subject, the
+    # exact collapse the selection below exists to prevent. So the dump must contain a
+    # compile unit, in one of the three renderings. Exit status is not enough on its
+    # own: a reader can exit 0 having printed a banner.
+    grep -qE 'DW_TAG_compile_unit|TAG_compile_unit|Compilation Unit' <<< "$dump" || return 0
+    printf '%s\n' "$dump"
 }
 
 # The dump arrives as an ARGUMENT, never on a pipe: `producer | awk` with an exiting
 # awk is a false negative under `set -o pipefail`, and it fails on the success path.
 comp_dir_of() {
-    awk '/_comp_dir/ {
+    awk '/comp_dir/ {
              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
              line = $0; sub(/.*: */, "", line)
              gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
@@ -1715,13 +1725,13 @@ case13_at() {
         export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
         cd "$spelling" && run_launcher "${workdir}/case13-${label}.log" -std=c++17 -O1 -g \
             "-fdebug-prefix-map=${spelling}=." -c "$src" -o "${mapdir}/thirteen-${label}.o"
-    ) || { cat "${workdir}/case13-${label}.log" >&2; fail "the case 13 dispatched compile failed (${label})"; }
+    ) || { cat "${workdir}/case13-${label}.log" >&2 || true; fail "the case 13 dispatched compile failed (${label})"; }
 
     grep -q "DISPATCHED to " "${workdir}/case13-${label}.log" \
         || {
-            cat "${workdir}/case13-${label}.log" >&2
+            cat "${workdir}/case13-${label}.log" >&2 || true
             echo "--- worker log ---" >&2
-            cat "${workdir}/worker.log" >&2
+            cat "${workdir}/worker.log" >&2 || true
             fail "case 13 (${label}) was not dispatched, so it says nothing about a dispatched object"
         }
 
@@ -1760,9 +1770,9 @@ case13_at() {
             echo "--- worker directory:   $(pwd -P)" >&2
             echo "--- reference comp_dir: '${reference_comp_dir}'" >&2
             echo "--- dispatched comp_dir:'${remote_comp_dir}'" >&2
-            cat "${workdir}/case13-${label}.log" >&2
+            cat "${workdir}/case13-${label}.log" >&2 || true
             echo "--- worker log ---" >&2
-            cat "${workdir}/worker.log" >&2
+            cat "${workdir}/worker.log" >&2 || true
             fail "the dispatched object records '${remote_comp_dir}', the local one '${reference_comp_dir}' (${label})"
         }
 
@@ -1788,7 +1798,9 @@ write_source "${proj}/thirteen-probe.cpp" "casethirteenprobe"
 if ! (cd "$mapdir" && "$compiler" -g "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen-probe.cpp" -o probe.o) \
         >/dev/null 2>&1; then
     echo "   SKIPPED: ${compiler} does not accept -fdebug-prefix-map, so neither half can be mapped"
-elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"* || "$(pwd -P)" == "$(cd "$mapdir" && pwd -P)"* ]]; then
+elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)" \
+    || "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"/* \
+    || "$(pwd -P)" == "$(cd "$mapdir" && pwd -P)"/* ]]; then
     # The arrangement, asserted, and CONTAINMENT rather than equality is the test.
     # Equal directories make the case vacuous -- the two objects would then agree with
     # the mapping removed entirely. But a worker directory that merely CONTAINS the
@@ -1796,6 +1808,10 @@ elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"* || "$(pwd -P)" == "$(cd "$ma
     # so the worker's own rule would rewrite the launcher's paths and the case would
     # fail for where it was invoked rather than for anything about the subject.
     # Reachable by running this fixture from a parent of $TMPDIR.
+    #
+    # Anchored on a SEPARATOR, with equality its own arm: a bare string prefix calls
+    # `/home/ci/work` an ancestor of `/home/ci/work2/...`, which are disjoint, and the
+    # whole fixture would then abort claiming an arrangement it does not have.
     fail "case 13 cannot bite: the worker's inherited directory and the launcher's are not disjoint"
 else
     # **The reader is chosen by TRYING it on this platform's object, never by name**,
@@ -1826,15 +1842,27 @@ else
 
         # The same case through a SYMLINK, which is the spelling that failed. `ln -s`
         # can be unavailable (a Windows host without the privilege, an exotic
-        # filesystem), and that is absent rather than passing.
+        # filesystem) or can quietly degrade to a COPY, and either is absent rather
+        # than passing.
+        #
+        # THREE clauses, because each rules out a different way of testing nothing:
+        # `-L` says a link was made rather than a copy (`ln -s` falls back to copying
+        # on MSYS without `winsymlinks:nativestrict` and on some FUSE mounts); the
+        # resolved-equality says it points where we meant rather than merely existing;
+        # and the spelling inequality is the PROPERTY under test -- a launcher
+        # directory whose spelling differs from its resolved form. Testing only the
+        # last one passes when `$TMPDIR` itself has a symlinked component, which is
+        # every macOS host, so a copy would sail through it.
         mapdir_link="${proj}/build/mapcase-link"
         rm -f "$mapdir_link"
         if ln -s "$mapdir" "$mapdir_link" 2>/dev/null \
-            && [[ "$(cd "$mapdir_link" && pwd -P)" != "$mapdir_link" ]]; then
+            && [[ -L "$mapdir_link" ]] \
+            && [[ "$(cd "$mapdir_link" && pwd -P)" == "$(cd "$mapdir" && pwd -P)" ]] \
+            && [[ "$mapdir_link" != "$(cd "$mapdir_link" && pwd -P)" ]]; then
             case13_at symlinked "$mapdir_link"
         else
-            echo "   SKIPPED (symlinked): this host cannot make a directory symlink, so the"
-            echo "            spelling that distinguishes \$PWD from getcwd(3) cannot be built here"
+            echo "   SKIPPED (symlinked): no usable directory symlink here, so the spelling"
+            echo "            that distinguishes \$PWD from getcwd(3) cannot be built"
         fi
     elif [[ -n "$dwarf_readable" ]]; then
         fail "case 13: ${dwarf_readable} read ${compiler}'s debug info but no DW_AT_comp_dir was recognised -- either the object records none, or this fixture does not know that reader's rendering"
