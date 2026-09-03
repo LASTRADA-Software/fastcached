@@ -15,6 +15,7 @@
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -739,19 +740,17 @@ class IdleListener final: public IListener
 /// @return Whether the in-flight count reached zero.
 [[nodiscard]] bool DrainedWithin(CompileCapacity const& capacity, std::chrono::milliseconds bound)
 {
-    // Against a real deadline, not by accumulating the NOMINAL poll: a 5 ms
-    // `sleep_for` returns in about 15 ms on Windows, so counting the requested
-    // interval made this bound roughly three times what it claimed -- a figure that
-    // reads like five seconds and is not.
-    constexpr auto Poll = std::chrono::milliseconds { 5 };
-    auto const deadline = std::chrono::steady_clock::now() + bound;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        if (capacity.InFlight() == 0)
-            return true;
-        std::this_thread::sleep_for(Poll);
-    }
-    return capacity.InFlight() == 0;
+    // Through `DrainWithin` rather than a loop of its own. This was a hand-rolled one,
+    // correct about the thing it warned of -- measuring a real deadline rather than
+    // accumulating the NOMINAL poll, since a 5 ms `sleep_for` costs ~15 ms on Windows
+    // and a counted bound is three times what it reads as -- and that is precisely the
+    // defect `DrainWithin` was extracted to stop being rewritten. Its note records the
+    // bug shipping twice, both times in a copy citing the implementation it had
+    // reimplemented. A file arguing that in one helper while hand-rolling the next is
+    // how the third copy gets written.
+    return DrainWithin([&capacity] { return capacity.InFlight() != 0; },
+                       DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
+           == DrainResult::Drained;
 }
 
 /// Wait until `counter` reaches `expected`, then report what it holds.
@@ -766,16 +765,24 @@ class IdleListener final: public IListener
 /// correctly every time (#699). Release scheduling merely loses the race more often;
 /// widening the window by 300 ms reproduces it on any build.
 ///
-/// **It returns the VALUE, not a bool.** A genuine regression then still prints the
-/// expansion that names it -- `0 == 1` where the refusal was never counted, `2 == 1`
-/// on a double count -- where a bare `false` would say only that something timed out
-/// and would make a real defect and a slow machine look identical.
+/// **It returns the VALUE, not a bool**, so a genuine regression still prints the
+/// expansion that names it -- `0 == 1` where the refusal was never counted -- rather
+/// than a bare `false` that says only that something timed out. It does NOT promise to
+/// catch a double count: the drain returns the moment the counter reaches `expected`,
+/// so a second increment arriving after that is missed exactly as the old immediate
+/// sample missed it. Only one that has already landed is caught, which is incidental
+/// and is written down here so nobody later relies on it.
 ///
-/// Bounded through `DrainWithin`, the tree's one bounded drain, rather than by a
-/// hand-rolled loop: that function's own note records the accumulate-the-nominal-poll
-/// defect shipping twice, both times in a copy citing the implementation it had
-/// reimplemented. And never by a fixed sleep -- the case below records a sleep being
-/// wrong here twice, in both directions.
+/// **And a wait that ran out says so**, because otherwise this helper reintroduces the
+/// thing it exists to prevent one level up: a refusal that is never counted and a
+/// machine slower than the ceiling both return `0` after 30 s and both print `0 == 1`.
+/// This instrument cannot separate those two, so on `Ceiling` it says which reading it
+/// is -- and says that it cannot tell them apart -- rather than reporting the nearest
+/// neighbour. `UNSCOPED_INFO` and not `INFO`, because a scoped message dies with this
+/// function and would never reach the assertion that consumes the value.
+///
+/// Bounded through `DrainWithin`, the tree's one bounded drain, and never by a fixed
+/// sleep -- the case below records a sleep being wrong here twice, in both directions.
 /// @param metrics Where the counter lives.
 /// @param counter Which counter to wait on.
 /// @param expected The value to wait for.
@@ -784,8 +791,20 @@ class IdleListener final: public IListener
                                             IMetricsSink::Counter counter,
                                             std::uint64_t expected)
 {
-    (void) DrainWithin([&metrics, counter, expected] { return metrics.Read(counter) < expected; },
-                       DrainBound { .ceiling = std::chrono::seconds { 30 }, .poll = std::chrono::milliseconds { 5 } });
+    constexpr auto Ceiling = std::chrono::seconds { 30 };
+    auto const drained = DrainWithin([&metrics, counter, expected] { return metrics.Read(counter) < expected; },
+                                     DrainBound { .ceiling = Ceiling, .poll = std::chrono::milliseconds { 5 } });
+    if (drained == DrainResult::Ceiling)
+    {
+        // Named from the catalog rather than as a number, so the line says the series
+        // an operator would grep for instead of an enumerator ordinal that moves.
+        auto const* const row = DescriptorOf(counter);
+        UNSCOPED_INFO("CounterReaching: waited " << Ceiling.count() << "s for "
+                                                 << (row != nullptr ? row->prometheusName : "an unnamed counter")
+                                                 << " to reach " << expected
+                                                 << " and it did not. INCONCLUSIVE: a value that is never written and "
+                                                    "a machine slower than the ceiling read identically here.");
+    }
     return metrics.Read(counter);
 }
 
