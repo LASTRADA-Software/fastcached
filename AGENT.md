@@ -376,8 +376,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A manifest naming the TU and no header revalidates forever: `IsToolchainHeader` calls
   every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
   exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
-  reported and none survived; `ValidateManifest` refuses an empty set rather than
-  letting `all_of` pass vacuously.
+  reported and none survived, and (`DepsNotObserved`) when no dependency record was
+  observed at all — a fact the caller STATES through `ReportedDependencies`, never one
+  inferred from an empty vector, since "depends on nothing" and "nothing was observed"
+  are two states one vector renders as one; `ValidateManifest` refuses an empty set
+  rather than letting `all_of` pass vacuously.
 - A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet:
   `Gate()` refuses `Register` as well, so a heartbeat that only LOGGED the redirect kept
   announcing to the demoted node, expired out of the new leader's registry, and every
@@ -1175,6 +1178,21 @@ and what they may assume.
   never ran, which is the defect itself.
 - A script-driven test naming more than one executable is registered in
   `src/tests`, not beside a binary.
+- An abbreviated identifier is a DISPLAY form: the full one is read, never padded,
+  truncated or re-derived. A fabricated SHA shares its prefix with the real one, so every
+  human-readable trace of the mistake reads correctly and only the raw `422` disagrees —
+  which is how a watcher reported ALL COMPLETE, NOTHING RED for a commit that does not
+  exist. **Zero rows is not a verdict, it is the absence of one**, so a response's SHAPE
+  is checked before any conclusion is drawn from it and an unparseable answer is a hard
+  failure, never a quiet retry. And before concluding "nothing there", state what was
+  searched and whether that search could have found it — a CI log grepped for the ctest
+  block, not found THERE, was reported as "CI produces no test output" while
+  `outputOnFailure` had put it in the file all along.
+  A census returning zero gets a POSITIVE CONTROL: this repository sets
+  `grep.lineNumber`, so `git grep -h` emits `<lineno>:<content>`, an anchored
+  `^TEST_CASE("` matched nothing, and the audit reported 0 of 3135 case names carrying
+  a comma when the answer is 428. Nothing errored, nothing was empty, and zero was the
+  expected answer — so find one instance by other means and check the census sees it.
 - Tests allocate their ports per run rather than fixing them — from **below** the
   kernel's ephemeral range, and remembered, because a connect probe cannot see a
   port already held as an outbound connection's local endpoint.
