@@ -87,13 +87,20 @@ class IEndpointExchange
 /// well past a minute, and a ceiling sized for the average reintroduces exactly the
 /// defect above, further out.
 ///
-/// **The cost is stated rather than absorbed.** This is also how long a genuinely
-/// dead worker goes unnoticed — a machine powered off, unplugged or suspended
-/// mid-compile — and against the ten seconds a dispatch used to get that is sixty
-/// times slower, which on a parallel build is a handful of stalled slots. A flat
-/// ceiling cannot separate that from a slow compile; splitting them needs the worker
-/// to say it is still there, so the idle bound can be seconds while the total stays
-/// long. That is a wire change tracked as #245.
+/// **The cost was stated rather than absorbed, and most of it has since been paid.**
+/// A flat ceiling cannot tell a slow compile from a dead peer, so this number used to
+/// be how long a genuinely dead worker went unnoticed as well — sixty times slower
+/// than the ten seconds a dispatch used to get, which on a parallel build is a
+/// handful of stalled slots. That half is keepalive's now: the compile leg dials with
+/// it armed (`DispatchBudgetsFor`), so a machine powered off, unplugged, suspended or
+/// cut off mid-compile is noticed in ~16 s on Linux and macOS and ~30 s on Windows,
+/// with this total untouched.
+///
+/// What is left is the narrow case keepalive cannot reach: a host whose kernel
+/// answers the probes while the worker process makes no progress toward a reply.
+/// Nothing below the protocol can see that, so separating it from a slow compile
+/// needs the worker to say it is still there — an idle bound of seconds against a
+/// total that stays long. That is a wire change tracked as #245.
 ///
 /// It is `FASTCACHE_DISPATCH_TIMEOUT_MS` at run time, and `fastcache-cc` is one
 /// process per translation unit, so the variable IS the runtime knob: the next
