@@ -1191,14 +1191,12 @@ TEST_CASE("A caller context outlives the storage its peer id came from", "[distr
     for ([[maybe_unused]] auto const index: std::views::iota(0, 64))
         churn.emplace_back(LongPeer.size(), 'x');
 
+    // The whole of the property, and the line the sanitizer reports on when the
+    // field borrows. Nothing follows it: a `Leading` fixture and a `Register` stood
+    // here, and they re-asserted that a member registers -- which this file already
+    // covers several times -- while contributing nothing to whether the case fails
+    // without the fix. Why the field MATTERS is worth saying and is said above; it
+    // is not worth a second read of it dressed as an assertion.
     REQUIRE(caller.has_value());
     CHECK(caller->peerId == LongPeer);
-
-    // And the context still decides what it is for. A dangling peer id is not a
-    // cosmetic defect: this field is the kernel's peer host and admission is
-    // decided from it, so the failure mode is a trust boundary read from freed
-    // memory rather than a wrong log line.
-    Leading fixture;
-    auto const reply = fixture.service.Register(*caller, OneSlot("gcc-14", "10.0.0.7:6680"));
-    CHECK(reply.status == Wire::Status::Ok);
 }
