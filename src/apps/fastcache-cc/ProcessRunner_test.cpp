@@ -154,7 +154,10 @@ namespace
 #if defined(_WIN32)
     return ShellCommand("echo %" + named + "%& echo %PATH%");
 #else
-    return ShellCommand("echo \"$" + named + "\"; echo \"$PATH\"");
+    // Raw literals: the expansions must be double-quoted so a `PATH` containing a
+    // space stays one word, and spelling that with escapes is what
+    // `modernize-raw-string-literal` refuses.
+    return ShellCommand(R"(echo "$)" + named + R"("; echo "$PATH")");
 #endif
 }
 } // namespace

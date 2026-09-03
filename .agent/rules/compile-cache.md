@@ -1116,6 +1116,55 @@ same on both — the same defect with no MSVC anywhere near it.
   as *missing*, which discards the hit and recompiles rather than serving one it
   could not check.
 
+## A compiler's WORDS are localized too, and `VSLANG` may only touch the probe
+
+- **`VSLANG=1033` goes on the probe spawn and never on the real compile.** The
+  launcher matches `cl`'s `/showIncludes` notes against the literal English
+  `IncludeNoteMarker`, so a Visual Studio carrying a language pack answered every
+  reader of them in a language the launcher does not read: the cache key lost its
+  dependency set and no manifest was ever recorded, on every translation unit,
+  forever, behind a cache that still hits on preprocessed keys and therefore looks
+  healthy ([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). The
+  fix is to ask the compiler to speak English — but only where **the output is
+  parsed and dropped**, which is `Preprocess`. The real compile's streams are read
+  by a human, and forcing English there trades a silent performance loss for
+  silently anglicizing every warning and error a developer sees. `IProcessRunner`
+  therefore gets a separate entry point rather than a flag, so the distinction is
+  made at the call site where it can be seen. The next person here will be tempted
+  by the real compile; that is the whole reason this is written down.
+
+- **The added environment is layered on the inherited one, never substituted for
+  it.** A spawn that replaced it loses `INCLUDE`, and a compiler that cannot find
+  `cstddef` reports a confident syntax error rather than a missing environment. A
+  test for this must assert something a replacement cannot survive — a real `PATH`'s
+  directory SEPARATOR, not its length: `cmd.exe` echoes an unset variable as the
+  literal `%PATH%`, so a length check passes against a runner that dropped the whole
+  inherited block, which is how the first version of that test certified the very
+  bug it was written to catch.
+
+- **`VSLANG` is best effort, so the residue is NAMED rather than reported as
+  nothing.** `cl` ignores it when the requested language pack is not installed, so
+  no caller may conclude from a successful spawn that the child obeyed — the check
+  is on the OUTPUT. When the probe still extracts nothing,
+  `CarriesUnreadableIncludeNotes` separates "this build asked for no dependencies"
+  from "this machine's compiler answered in a language I do not read", because one
+  empty set for both prints a sentence that is true about what the launcher observed
+  and false about the world. That predicate feeds a MESSAGE and nothing else, which
+  is exactly why it may be loose where `IncludeNotePath` may not: the recognition
+  rule is shared with `SplitIncludeNotes`, which runs over a stream that also
+  carries preprocessed SOURCE, so loosening THAT deletes a source line out of the
+  bytes the key hashes. Its separator table carries the full-width colon `U+FF1A` as
+  well as `": "`, because MSVC's CJK catalogues use it and a fixture typed by hand
+  will not discover that on its own.
+
+- **The reading side is fixed and the WRITING side is not.** `RenderShowIncludes`
+  emits the same English marker for Ninja, which matches `msvc_deps_prefix` — taken
+  by CMake from the actual localized compiler — so a localized build records no
+  dependencies for a dispatched compile and under-rebuilds. `VSLANG` cannot fix
+  that: you cannot produce a localized prefix by forcing English. See
+  [#700](https://github.com/LASTRADA-Software/fastcached/issues/700), which also
+  carries the stored-region half.
+
 ## An object file is not a byte string, and `FASTCACHE_VERIFY` is where that bites
 
 `FASTCACHE_VERIFY` compiles a sampled hit again and compares the two objects. It
