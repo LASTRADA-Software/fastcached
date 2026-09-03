@@ -157,18 +157,22 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     Observation observed;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
 
-    std::jthread client { [port, &observed] {
+    // Recorded here, asserted on the main thread: a `REQUIRE` that fires inside a
+    // `jthread` body is `std::terminate`, not a failed case.
+    std::atomic<bool> unresolvedBeforeClose { false };
+
+    std::jthread client { [port, &observed, &unresolvedBeforeClose] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
-        // Waited for: the server to reach its await. **Then asserted still unresolved**
+        // Waited for: the server to reach its await. **Then recorded still unresolved**
         // -- without that, a `WaitReadable` that answered synchronously would test the
         // other path entirely and this case would pass having never parked anything.
         (void) WaitForFlag(observed.arming);
-        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+        unresolvedBeforeClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // A full, graceful close: FIN, not RST.
         (*socket)->Close();
@@ -177,6 +181,7 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     reactor.Run();
     client.join();
 
+    CHECK(unresolvedBeforeClose.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed)); // EOF is not an error.
     CHECK(observed.count.load(std::memory_order_relaxed) == 0);
@@ -198,7 +203,10 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
     Observation observed;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ true);
 
-    std::jthread client { [port, &observed] {
+    // As above: recorded on the client thread, asserted on the main one.
+    std::atomic<bool> unresolvedBeforeWrite { false };
+
+    std::jthread client { [port, &observed, &unresolvedBeforeWrite] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
             connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
@@ -206,7 +214,7 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
             return;
 
         (void) WaitForFlag(observed.arming);
-        REQUIRE_FALSE(observed.resolved.load(std::memory_order_acquire));
+        unresolvedBeforeWrite.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         std::array<std::byte, 1> const payload { std::byte { 0x7A } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 1> p) -> FastCache::Task<bool> {
@@ -222,6 +230,7 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
     reactor.Run();
     client.join();
 
+    CHECK(unresolvedBeforeWrite.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
     REQUIRE(observed.hasValue.load(std::memory_order_relaxed));
     CHECK(observed.count.load(std::memory_order_relaxed) > 0);
