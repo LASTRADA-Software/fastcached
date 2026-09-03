@@ -200,6 +200,12 @@ endforeach()
 # any `python3` found by name that cannot run -- a dangling symlink, a venv shim
 # whose interpreter was removed, a wrapper naming an uninstalled toolchain.
 #
+# And what the swap buys on those platforms is VALIDATION, not a better search:
+# measured, FindPython stops at the first name match and does not go on to a working
+# interpreter later on PATH. So this trades a late failure for an early one, which is
+# the trade the gate above exists to make -- and the refusal has to name
+# `-DPython3_EXECUTABLE=`, or it strands somebody who does have an interpreter.
+#
 # QUIET plus an explicit check rather than REQUIRED, so the diagnostic below
 # survives.
 #
@@ -220,21 +226,10 @@ endforeach()
 #
 # `scripts/coverage.sh` is where python is used and locates none: it is handed
 # `--python3` from here. One lookup, passed down, is the shape to keep.
-find_package(Python3 COMPONENTS Interpreter QUIET)
-
-# `Python3_Interpreter_FOUND`, never `Python3_EXECUTABLE`: FindPython leaves the
-# latter naming the candidate it just REJECTED (measured), so the tidier spelling
-# passes and hands the target the interpreter this change exists to keep out.
-if(NOT Python3_Interpreter_FOUND)
-    message(FATAL_ERROR
-        "[Coverage] no Python 3 interpreter found that RUNS. scripts/coverage.sh needs one "
-        "to extract the coverage percentage from llvm-cov's JSON summary. Note the wording: "
-        "a `python3` on PATH that cannot execute -- a dangling symlink, a venv shim whose "
-        "interpreter is gone -- is found by name and is correctly not accepted here, so "
-        "`which python3` answering is not a contradiction.")
-endif()
-
-# `PYTHON3_PATH` is retired by #568 and read by nothing. Unset so that residue in
+# `PYTHON3_PATH` is retired by #568 and read by nothing. ABOVE the lookup, not
+# below it: the operator who set it did so BECAUSE PATH had no usable python3, so
+# below the refusal they hit the fatal and never learn the flag is dead or what
+# replaced it -- the one migration this block exists for is the one it missed. Unset so that residue in
 # an existing build tree warns once and is gone, while a `-D` somebody is still
 # passing warns every time -- which separates habit from leftover without having
 # to tell them apart. WARNING and not FATAL_ERROR, because inert residue must not
@@ -249,6 +244,23 @@ if(DEFINED PYTHON3_PATH)
         "it; point -DPython3_EXECUTABLE=... at a specific interpreter instead. The stale "
         "entry has been dropped from the cache.")
 endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# `Python3_Interpreter_FOUND`, never `Python3_EXECUTABLE`: FindPython leaves the
+# latter naming the candidate it just REJECTED (measured), so the tidier spelling
+# passes and hands the target the interpreter this change exists to keep out.
+if(NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR
+        "[Coverage] no Python 3 interpreter found that RUNS. scripts/coverage.sh needs one "
+        "to extract the coverage percentage from llvm-cov's JSON summary.\n"
+        "Note the wording, because `which python3` answering is not a contradiction: a "
+        "`python3` found by name that cannot execute -- a dangling symlink, a venv shim "
+        "whose interpreter is gone -- is correctly not accepted. FindPython stops at the "
+        "FIRST match on PATH and does not go on to a working interpreter later in it, so "
+        "if you have one, name it: -DPython3_EXECUTABLE=/path/to/python3")
+endif()
+
 
 message(STATUS "[Coverage] Clang ${COVERAGE_CLANG_MAJOR} source-based instrumentation enabled")
 

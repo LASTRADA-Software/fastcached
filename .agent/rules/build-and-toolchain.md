@@ -2081,14 +2081,26 @@ lookup asks** (#568). `find_program(NAMES python3)` returns the first name match
 and never executes it; `find_package(Python3 COMPONENTS Interpreter)` validates by running
 it. Measured, one tree, one configure: `find_program` selected a **0-byte** Windows App
 Execution Alias — a reparse point Windows puts on PATH that refuses to execute when no
-Store package backs it — while a real **171744-byte** interpreter sat further along the
-same PATH. So it is a SELECTION difference and not only a validation one, and it bites on
-a machine where Python IS installed. Reproduced end to end on Linux with a `python3` that
-cannot exec: the old spelling put it in the `coverage` target's command line and configure
-SUCCEEDED, which is exactly the late failure the gate exists to prevent, let through
-because the gate tested presence rather than function. Guard on
-`Python3_Interpreter_FOUND` and never `Python3_EXECUTABLE` — FindPython leaves the latter
-naming the candidate it just rejected, so the tidier spelling restores the bug.
+Store package backs it — while `find_package` produced a real **171744-byte** interpreter.
+**Attach the right mechanism to that second half**, because the obvious reading of it is
+wrong and the wrong reading is the useful-sounding one: the working interpreter was NOT
+further along the same PATH, it was not on PATH at all, and FindPython reached it through
+`Python3_FIND_REGISTRY` (registry first, on Windows only). On the POSIX legs there is no
+such second source — measured on CMake 3.28.3, `find_package` stops at the FIRST name
+match, validates it, gives up, and does not go on to a working `python3` or `python3.12`
+later on the same PATH. So what this buys is **validation, never better selection**, and
+a rule claiming otherwise would be cited into a design that cannot work.
+
+What validation is worth on its own is the whole point: reproduced end to end on Linux
+with a `python3` that cannot exec, the old spelling put it in the `coverage` target's
+command line and configure SUCCEEDED — the late failure the gate exists to prevent, let
+through because the gate tested presence rather than function. The trade is deliberate and
+has a cost worth stating: a broken shim early on PATH now refuses the configure outright
+where it used to configure and fail at the end of the run, so the diagnostic must name
+`-DPython3_EXECUTABLE=` or it strands an operator who has a perfectly good interpreter
+installed. Guard on `Python3_Interpreter_FOUND` and never `Python3_EXECUTABLE` —
+FindPython leaves the latter naming the candidate it just rejected, so the tidier spelling
+restores the bug.
 
 The rule generalises as *a tool the build will EXECUTE is located by something that
 executes it*, and it has **reasoned exceptions that must not be "fixed"**. `find_package`
