@@ -85,13 +85,26 @@ enum class BindFailurePolicy : std::uint8_t
     /// The node refuses to start. The opener's own message reaches the operator.
     Refuse,
 
-    /// The node logs and carries on without the surface.
+    /// `JudgeBindFailure` logs and reports that the caller may carry on.
     ///
-    /// No row is `Tolerate` today, and the column is not speculative for that: the
-    /// compile port held it until #290, on the provenance bit #286 added, and it was
-    /// removed for a reason specific to that surface rather than to the idea. It also
-    /// remains `fastcached`'s answer for the admin surface, which is why the node's
-    /// Admin row explains itself against the daemon rather than in isolation.
+    /// **No row is `Tolerate`, and no opener implements carrying one.** The seam
+    /// understands the verdict -- it is what the `Tolerate` tests exercise -- but
+    /// every opener today refuses one it is handed, because none of their callers can
+    /// use a surface that is absent: two would dereference the null they were given.
+    /// Flipping a row is therefore a change to this table AND to that surface's
+    /// opener, and the `static_assert` beside the table is what says so at the moment
+    /// somebody tries.
+    ///
+    /// Written rather than implemented, because a tolerance path nothing exercises
+    /// reads as supported and is not -- which is `PurgeExpired`'s shape, correct and
+    /// tested and with no production caller at all. The column's justification was
+    /// never the flip: it is that the four reasons had to be WRITTEN, and one of them
+    /// existed nowhere in the tree.
+    ///
+    /// The concept is not speculative even so: the compile port held this policy until
+    /// #290, on the provenance bit #286 added, and it remains `fastcached`'s answer for
+    /// the admin surface -- which is why the node's Admin row explains itself against
+    /// the daemon rather than in isolation.
     Tolerate,
 };
 
@@ -293,14 +306,36 @@ struct SurfaceRow
 /// It takes the ROW rather than a `NodeSurface`, which is what lets a test hand it a
 /// synthetic row -- including one whose policy is `Tolerate`, a shape no production
 /// row has. A test that only asserted today's four refuse would pass forever once
-/// somebody added a tolerant fifth, which is the failure this whole ticket is about
-/// one level up.
+/// somebody added a tolerant fifth.
+///
+/// **What this decides is the VERDICT, and that is the whole of the promise.** A
+/// success here means "this row does not consider the failure fatal", not "your
+/// caller is ready to run without the surface" -- see `BindFailurePolicy::Tolerate`,
+/// which no opener implements. Every opener refuses a tolerated verdict by name, so
+/// flipping a row is a two-file change and the build says so.
 ///
 /// @param row The surface that would not bind.
 /// @param message The opener's own operator-facing sentence, passed through unchanged.
 /// @param logger Where a tolerated failure is reported.
-/// @return Nothing when the caller may continue; @p message when it must refuse.
+/// @return Nothing when the row does not consider the failure fatal; @p message when it does.
 [[nodiscard]] std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::string message, ILogger& logger);
+
+/// The refusal an opener returns when it is handed a tolerated verdict it cannot carry.
+///
+/// `JudgeBindFailure` decides the verdict; whether an opener can CARRY a tolerated one
+/// is a separate fact, and today the answer is no for all four (see
+/// `BindFailurePolicy::Tolerate`). Rather than fabricating a success -- a null surface
+/// inside a satisfied `expected`, which two callers dereference unconditionally -- an
+/// opener refuses and says the refusal is about ITS code, not about the surface.
+///
+/// One sentence shape and four reasons, so the four openers do not each invent a
+/// spelling for the same programmer error. It is the same answer `JudgeBindFailure`
+/// gives an `Unstated` row: refuse, and name the caller rather than the port.
+///
+/// @param row The surface whose row said the failure was tolerable.
+/// @param why What this opener's caller would do with a surface that is not there.
+/// @return The refusal text.
+[[nodiscard]] std::string BindToleranceUnsupported(SurfaceRow const& row, std::string_view why);
 
 /// The flags a row names, without the empty second entry.
 /// @param row The surface to read.

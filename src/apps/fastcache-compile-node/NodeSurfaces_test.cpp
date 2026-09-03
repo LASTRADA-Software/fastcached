@@ -506,3 +506,46 @@ TEST_CASE("Raft's reason is about the quorum, not about this node", "[node][surf
     CHECK(reason.contains("quorum"));
     CHECK(reason.contains("serve compiles"));
 }
+
+TEST_CASE("No production row is tolerated, because no opener can carry one", "[node][surfaces][bind]")
+{
+    // The seam understands `Tolerate` -- the case above proves it warns and continues
+    // -- but understanding the verdict and being able to ACT on it are two facts, and
+    // this asserts the second is currently false everywhere.
+    //
+    // It is not a restatement of the "every row states a policy" case. That one
+    // forbids the absence of a policy; this forbids the one policy whose caller-side
+    // half is unwritten. Two openers would return a null surface inside a satisfied
+    // `expected` and their callers dereference it with no check, so a flipped column
+    // is a startup crash rather than a degraded node.
+    //
+    // The table `static_assert`s this, so the case cannot fail without the build
+    // failing first. It is here to be READ: somebody adding a tolerant surface meets
+    // the requirement in the test file as well as in the compiler output, and the
+    // reason is written where they are already looking.
+    for (auto const& row: NodeSurfaceTable())
+    {
+        INFO("surface " << row.name);
+        CHECK(row.bindFailure == BindFailurePolicy::Refuse);
+    }
+}
+
+TEST_CASE("An opener handed a tolerated verdict blames itself, not the port", "[node][surfaces][bind]")
+{
+    // The distinction the sentence has to carry: an operator reading it must not go
+    // looking for whatever holds the port, because nothing does -- the bind failure
+    // was survivable and this binary could not survive it. So the text names the
+    // flag (which is where they would start), names the surface, and says plainly
+    // that the defect is in the build rather than in what they typed.
+    auto const message =
+        BindToleranceUnsupported(RowFor(NodeSurface::Admin), "the caller dereferences the endpoint unconditionally");
+
+    CHECK(message.contains("--admin-listen"));
+    CHECK(message.contains("admin"));
+    CHECK(message.contains("the caller dereferences the endpoint unconditionally"));
+
+    // The load-bearing half. Without it this reads as a configuration error, and the
+    // operator spends the night on a port that was never the problem.
+    CHECK(message.contains("defect in this binary"));
+    CHECK_FALSE(message.contains("refusing to start"));
+}

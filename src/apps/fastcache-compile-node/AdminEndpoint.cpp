@@ -868,7 +868,13 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                        logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
-        return std::unique_ptr<AdminEndpoint> {};
+
+        // Refused rather than tolerated, because this opener cannot carry a tolerated
+        // verdict (#352): `StartAdminSurfaceOrExplain` reads `surface.endpoint` with
+        // no null check to log where metrics and the dashboard are, so a null returned
+        // inside a satisfied `expected` is a startup crash rather than a degraded node.
+        return std::unexpected { BindToleranceUnsupported(
+            RowFor(surface), "the caller logs surface.endpoint->BoundEndpoint() unconditionally") };
     }
 
     // The endpoint's own values, not this caller's: the daemon serves the same

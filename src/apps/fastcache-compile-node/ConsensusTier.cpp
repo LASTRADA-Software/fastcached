@@ -314,8 +314,16 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                              _logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
+
+        // Refused rather than tolerated (#352). This is the earliest point in `Launch`,
+        // so returning success here hands `Start` a tier whose `_transport`, `_driver`,
+        // `_sink` and `_peerServer` were never built -- it would log "consensus on ..."
+        // against a listener that never bound, and the first `Propose` would dereference
+        // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
+        // rest of this function.
         _listener.reset();
-        return {};
+        return std::unexpected { BindToleranceUnsupported(
+            RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
     }
 
     // Two lists out of two, and the split is the whole of how a node joins. Who

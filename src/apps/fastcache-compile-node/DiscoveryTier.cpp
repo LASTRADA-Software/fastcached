@@ -149,16 +149,23 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
         // Through the row (#352). Both ports are named because either can be the one
         // that failed and this cannot tell which -- a message blaming the beacon port
         // alone sends an operator to look at a port that bound perfectly.
-        auto judged = JudgeBindFailure(
-            RowFor(NodeSurface::Discovery),
-            std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on",
-                        FormatHostPort(bindHost, beaconSocket.port),
-                        cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
-                                                    : std::string { "a port of this node's own" }),
-            logger);
+        auto judged =
+            JudgeBindFailure(RowFor(NodeSurface::Discovery),
+                             std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on",
+                                         FormatHostPort(bindHost, beaconSocket.port),
+                                         cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
+                                                                     : std::string { "a port of this node's own" }),
+                             logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
-        return std::unique_ptr<DiscoveryTier> {};
+
+        // Refused rather than tolerated (#352). `main.cpp` does handle a null discovery
+        // tier -- it is how "no --discovery" is spelled -- so this is the one opener
+        // whose caller would survive it. It still refuses, because the two mean opposite
+        // things: one is an operator who asked for nothing, the other an operator who
+        // asked and silently did not get it, and only the row's reason distinguishes them.
+        return std::unexpected { BindToleranceUnsupported(RowFor(NodeSurface::Discovery),
+                                                          "a null tier already means \"--discovery was not asked for\"") };
     }
 
     // The port the operator configured, which is NOT the one the pair reports:

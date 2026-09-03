@@ -123,10 +123,16 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     if (!judged.has_value())
         return std::unexpected { std::move(judged).error() };
 
-    // Tolerated. Unreachable while this row is `Refuse`, and written rather than
-    // asserted because the row is what decides it: a build that flips the column
-    // must not also need this branch written.
-    return std::unique_ptr<NodeFrameSurface> {};
+    // The row called it tolerable and this opener cannot carry that, so it says so
+    // rather than fabricating one (#352). A null here is `StartNodeSurfaceOrExplain`'s
+    // spelling of "no component asked for this port" -- `main.cpp` reads it exactly
+    // that way and goes on to advertise the CONFIGURED endpoint, so returning one
+    // after a failed bind would announce an address nothing answers. That is the node
+    // row's own reason arriving through the door meant for a different fact.
+    return std::unexpected { BindToleranceUnsupported(RowFor(NodeSurface::Node),
+                                                      "a null surface here already means \"no component needs the "
+                                                      "port\", and the node would advertise its configured endpoint "
+                                                      "regardless") };
 }
 
 } // namespace FastCache::Node

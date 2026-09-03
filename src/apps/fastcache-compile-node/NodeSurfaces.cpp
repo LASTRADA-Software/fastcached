@@ -179,11 +179,12 @@ namespace
             .flags = { "--admin-listen", {} },
             .protocol = SurfaceProtocol::Tcp,
             .bindFailure = BindFailurePolicy::Refuse,
-            .bindFailureReason = "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
-                                 "it, so a worker that started without one looks healthy to the only thing that would have "
-                                 "noticed. fastcached continues past the same failure, and is right to for what it is: its "
-                                 "admin surface is shared infrastructure an operator watches deliberately, where a node's is "
-                                 "a probe target somebody attached. Same surface, two binaries, two right answers",
+            .bindFailureReason =
+                "an operator who asks a WORKER for an admin endpoint is almost always wiring a probe to "
+                "it, so a worker that started without one looks healthy to the only thing that would have "
+                "noticed. fastcached continues past the same failure, and is right to for what it is: its "
+                "admin surface is shared infrastructure an operator watches deliberately, where a node's is "
+                "a probe target somebody attached. Same surface, two binaries, two right answers",
             .defaultHost = AdminListenDefaultHost,
             .spec = &NodeConfig::adminListen,
             .grammar = ListenEndpointGrammar,
@@ -291,6 +292,24 @@ namespace
                                       }),
                   "every row states its bind-failure policy and the reason for it");
 
+    // **And no row is `Tolerate`, because no opener implements carrying one.**
+    //
+    // Not a second spelling of the assert above: that one forbids the ABSENCE of a
+    // policy, this one forbids the one policy whose caller-side half is unwritten.
+    // `JudgeBindFailure` understands `Tolerate` and is tested on it; what does not
+    // exist is any opener able to hand its caller a surface that is not there. Two of
+    // them would pass back a null inside a satisfied `expected`, and their callers
+    // dereference it unconditionally.
+    //
+    // So this is the notice, delivered at the moment somebody flips a column: a
+    // tolerated surface is a change HERE and in that surface's opener, and each opener
+    // states what its half would cost. Deliberately a build failure rather than a
+    // runtime check -- the point is that it cannot be started and observed.
+    static_assert(std::ranges::all_of(Surfaces,
+                                      [](SurfaceRow const& row) { return row.bindFailure != BindFailurePolicy::Tolerate; }),
+                  "no opener implements a tolerated bind failure yet: flipping a row means writing that surface's "
+                  "opener too, and its caller's null case with it");
+
     // A spec and its grammar travel together: text nothing validates is text an
     // operator can typo into a registration that replays forever, and a grammar with
     // no text to judge is a row that lies about having one. The grammar is one column,
@@ -380,8 +399,17 @@ std::expected<void, std::string> JudgeBindFailure(SurfaceRow const& row, std::st
     // Reached only by a caller that built a row by hand and left the column out --
     // which is a programmer error, and is the one case where refusing is not a
     // judgement about the surface but about the caller.
-    return std::unexpected { std::format(
-        "{}: {} (no bind-failure policy stated for this surface)", row.name, std::move(message)) };
+    return std::unexpected { std::format("{}: {} (no bind-failure policy stated for this surface)", row.name, message) };
+}
+
+std::string BindToleranceUnsupported(SurfaceRow const& row, std::string_view why)
+{
+    return std::format("{}: this node cannot continue without the {} surface, even though its row says the "
+                       "failure is tolerable -- {}. the row and this opener disagree, which is a defect in "
+                       "this binary rather than in the configuration",
+                       PrimaryFlag(row),
+                       row.name,
+                       why);
 }
 
 std::vector<std::string_view> FlagsOf(SurfaceRow const& row)
