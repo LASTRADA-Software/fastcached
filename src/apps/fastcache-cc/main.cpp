@@ -1819,26 +1819,31 @@ void RecordManifest(Config const& cfg,
     // **Read again here, and deliberately NOT the anchored value `RunCached` already
     // holds.** That one is put through `AnchorWorkingDirectory`, which re-spells the
     // resolved cwd in the vocabulary the layout's ROOTS use -- the right answer for
-    // every prefix test in `DirectManifest`, and the wrong one here. What this predicts
-    // is what the DRIVER will do, and the driver runs its `<from>` comparison over
-    // `getcwd(3)`'s RESOLVED answer. On a machine where the two differ (a build under
-    // macOS's `/tmp`, any symlinked `/home`) the build-tree rule spells the configured
-    // root, so the driver's own compare FAILS and the local object's `DW_AT_comp_dir`
-    // is left unmapped. Predicting from the anchored spelling would match, send `.`,
-    // and tell a worker to record `.` for a build whose local objects record an
-    // absolute path -- which is this ticket's asymmetry, manufactured by the fix. The
-    // un-anchored value says "no mapping is in force", which is the truth about that
-    // build. `main.cpp`'s read-once note twelve hundred lines below governs the three
-    // consumers that need the layout's vocabulary; this is a fourth question.
+    // every prefix test in `DirectManifest`, and the wrong one here, where the only
+    // vocabulary that decides anything is the DRIVER's. `main.cpp`'s read-once note
+    // twelve hundred lines below governs the three consumers that need the layout's;
+    // this is a fourth question.
+    //
+    // **And `current_path()` is not the driver's spelling either**, which is what
+    // `CompilerWorkingDirectory` is for. `current_path()` is `getcwd(3)`, which resolves
+    // every symlink, while both drivers report and compare `$PWD` when it names the same
+    // directory -- so on any build reached through a link (macOS's `$TMPDIR`, under
+    // `/var -> private/var`; a symlinked `/home`; a symlinked build directory) the rule
+    // on the line spells the link and the resolved cwd does not match it. This predicted
+    // "no mapping is in force" for a build that maps perfectly well, sent nothing, and
+    // left the dispatched object recording the WORKER's directory while the local one
+    // recorded `.` -- #506 unfixed, silently, by the fix for #506. The measurements are
+    // on `CompilerWorkingDirectory`.
     //
     // A named value and not a `value_or` temporary: `DispatchRequest` holds views, and
     // this repository has been bitten three times by a value that borrows from
     // something it outlives.
     std::error_code cwdError;
     auto const workingDirectory = std::filesystem::current_path(cwdError);
-    auto const compileDir =
-        cwdError ? std::optional<Cc::MappedCompileDir> {}
-                 : Cc::MappedCompileDirectory(argv, Cc::DriverOf(cmd.flavor).family, workingDirectory.string());
+    auto const compileDir = cwdError ? std::optional<Cc::MappedCompileDir> {}
+                                     : Cc::MappedCompileDirectory(argv,
+                                                                  Cc::DriverOf(cmd.flavor).family,
+                                                                  Cc::CompilerWorkingDirectory(workingDirectory.string()));
     auto const compileDirPath = compileDir.has_value() ? compileDir->directory : std::string {};
     auto const compileDirReplacement = compileDir.has_value() ? compileDir->replacement : std::string {};
 

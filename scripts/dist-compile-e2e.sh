@@ -1655,37 +1655,126 @@ echo "   the fleet compiled it with the cache unreachable, and said so"
 # whole arrangement. The node was started with no directory of its own, so it
 # inherits this fixture's -- and a case that compiled here too would produce
 # agreeing objects with the fix reverted, which is a case that passes under the bug.
+#
+# **And it is run twice, once through a symlink**, which is not a variation but the
+# case that fails. Both drivers report and prefix-match `$PWD` when it names the
+# same directory as `.`, while `current_path()` is getcwd(3) and resolves every
+# link -- so a build reached through a symlink puts a rule on the line that the
+# resolved spelling does not match, the launcher concludes that a build which maps
+# perfectly well maps nothing, and the dispatched object keeps the WORKER's
+# directory. That is #506 surviving its own fix, and it reached master green:
+# macOS's `/var` is a symlink so `$TMPDIR` is under one, Linux's `/tmp` is not, and
+# the direct spelling alone is green on every platform this is developed on.
 echo "== case 13: a dispatched object records the compilation directory a local one records"
 
 mapdir="${proj}/build/mapcase"
 mkdir -p "$mapdir"
-write_source "${proj}/thirteen.cpp" "casethirteen"
 
-# The compilation directory a DWARF object records, read with a NAMED reader.
+# The raw debug-info dump, and the compilation directory read out of one. Separate,
+# because "no reader could parse this" and "this object records no directory" are
+# two states and only the dump tells them apart -- see the selection below.
 #
 # Three readers, three renderings: `readelf` prints `... offset: 0x25): .`,
 # `llvm-dwarfdump` prints `DW_AT_comp_dir (".")`, macOS `dwarfdump` prints
 # `AT_comp_dir( "." )`. One awk: a quoted value if there is one, otherwise
 # everything after the LAST `: ` -- `sub` with a greedy `.*` takes the last.
-#
-# The dump is captured into a variable BEFORE it is filtered. `producer | awk` with
-# an exiting awk is a false negative under `set -o pipefail`, and it fails on the
-# success path.
-comp_dir_with() {
-    local reader="$1" obj="$2" dump=""
-    case "$reader" in
-        readelf) dump="$("$reader" --debug-dump=info "$obj" 2>/dev/null || true)" ;;
-        *dwarfdump) dump="$("$reader" --debug-info "$obj" 2>/dev/null || true)" ;;
-        *) return 0 ;;
+dwarf_dump_with() {
+    case "$1" in
+        readelf) "$1" --debug-dump=info "$2" 2>/dev/null || true ;;
+        *dwarfdump) "$1" --debug-info "$2" 2>/dev/null || true ;;
     esac
+}
+
+# The dump arrives as an ARGUMENT, never on a pipe: `producer | awk` with an exiting
+# awk is a false negative under `set -o pipefail`, and it fails on the success path.
+comp_dir_of() {
     awk '/_comp_dir/ {
              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
              line = $0; sub(/.*: */, "", line)
              gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
-         }' <<< "$dump"
+         }' <<< "$1"
 }
 
-if ! (cd "$mapdir" && "$compiler" -g "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen.cpp" -o probe.o) \
+# One spelling of the launcher's directory, compiled both ways and compared.
+# $1 is a label (it names the object files and the source, so the second spelling
+# cannot be served the first one's cached object and skip the dispatch that is the
+# whole point), $2 is how the launcher and the rule spell the directory.
+case13_at() {
+    local label="$1" spelling="$2"
+    local src="${proj}/thirteen-${label}.cpp"
+    write_source "$src" "casethirteen${label}"
+
+    (cd "$spelling" && "$compiler" -std=c++17 -O1 -g "-fdebug-prefix-map=${spelling}=." \
+        -c "$src" -o "${mapdir}/thirteen-${label}-ref.o") \
+        || fail "the case 13 reference compile failed (${label})"
+
+    local reference_comp_dir
+    reference_comp_dir="$(comp_dir_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}-ref.o")")"
+
+    (
+        export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
+        cd "$spelling" && run_launcher "${workdir}/case13-${label}.log" -std=c++17 -O1 -g \
+            "-fdebug-prefix-map=${spelling}=." -c "$src" -o "${mapdir}/thirteen-${label}.o"
+    ) || { cat "${workdir}/case13-${label}.log" >&2; fail "the case 13 dispatched compile failed (${label})"; }
+
+    grep -q "DISPATCHED to " "${workdir}/case13-${label}.log" \
+        || {
+            cat "${workdir}/case13-${label}.log" >&2
+            echo "--- worker log ---" >&2
+            cat "${workdir}/worker.log" >&2
+            fail "case 13 (${label}) was not dispatched, so it says nothing about a dispatched object"
+        }
+
+    local remote_comp_dir
+    remote_comp_dir="$(comp_dir_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}.o")")"
+
+    # THE assertion, and it is the ticket's own clause: the two objects must record
+    # the SAME compilation directory. The reference cannot be empty here -- a reader
+    # that reads this platform's objects was chosen before this ran -- so this cannot
+    # pass by both sides reading nothing.
+    [[ -n "$reference_comp_dir" ]] || fail "the case 13 reference object records no compilation directory (${label})"
+    [[ -n "$remote_comp_dir" && "$remote_comp_dir" == "$reference_comp_dir" ]] \
+        || {
+            # Everything the next reader needs, because a verdict with no evidence
+            # sends whoever meets it to re-run rather than to diagnose. A wrong
+            # compilation directory has two shapes and they are fixed in different
+            # places: the CLIENT's own means the object never came from a worker
+            # however the dispatch line reads, and the WORKER's means it came from one
+            # that was told nothing -- which is what a spelling mismatch looks like,
+            # since the launcher then sends no mapping at all.
+            echo "--- spelling: ${label}" >&2
+            echo "--- reader: ${dwarf_reader}" >&2
+            echo "--- launcher directory: ${spelling}" >&2
+            echo "--- resolved to:        $(cd "$spelling" && pwd -P)" >&2
+            echo "--- worker directory:   $(pwd -P)" >&2
+            echo "--- reference comp_dir: '${reference_comp_dir}'" >&2
+            echo "--- dispatched comp_dir:'${remote_comp_dir}'" >&2
+            cat "${workdir}/case13-${label}.log" >&2
+            echo "--- worker log ---" >&2
+            cat "${workdir}/worker.log" >&2
+            fail "the dispatched object records '${remote_comp_dir}', the local one '${reference_comp_dir}' (${label})"
+        }
+
+    # And the VALUE, where this platform's driver maps the way the rules assume.
+    # Separate from the agreement above on purpose: agreement is the ticket's clause
+    # and holds everywhere, while `.` is what `_fc_debug_prefix_map_rules` produces
+    # and is a fact about the driver. A driver that accepts the flag and does not
+    # remap `DW_AT_comp_dir` leaves the pair agreeing and unmapped, which is worth
+    # saying out loud rather than either asserting or ignoring.
+    if [[ "$reference_comp_dir" == "." ]]; then
+        echo "   ${label}: both objects record '.' as their compilation directory (${dwarf_reader})"
+    else
+        echo "   ${label}: both objects record '${reference_comp_dir}' (${dwarf_reader}); ${compiler} accepts"
+        echo "            -fdebug-prefix-map but does not rewrite DW_AT_comp_dir to '.' here, so the"
+        echo "            agreement is asserted and the value is not"
+    fi
+}
+
+# The probe compiles a source of its own rather than one of the cases': it is what
+# both the flag-acceptance question and the reader selection are asked about, and it
+# must exist whether or not either spelling below ever runs.
+write_source "${proj}/thirteen-probe.cpp" "casethirteenprobe"
+if ! (cd "$mapdir" && "$compiler" -g "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen-probe.cpp" -o probe.o) \
         >/dev/null 2>&1; then
     echo "   SKIPPED: ${compiler} does not accept -fdebug-prefix-map, so neither half can be mapped"
 elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"* || "$(pwd -P)" == "$(cd "$mapdir" && pwd -P)"* ]]; then
@@ -1698,86 +1787,51 @@ elif [[ "$(cd "$mapdir" && pwd -P)" == "$(pwd -P)"* || "$(pwd -P)" == "$(cd "$ma
     # Reachable by running this fixture from a parent of $TMPDIR.
     fail "case 13 cannot bite: the worker's inherited directory and the launcher's are not disjoint"
 else
-    (cd "$mapdir" && "$compiler" -std=c++17 -O1 -g "-fdebug-prefix-map=${mapdir}=." \
-        -c "${proj}/thirteen.cpp" -o "${mapdir}/thirteen-ref.o") \
-        || fail "the case 13 reference compile failed"
-
-    # **The reader is chosen by TRYING it on this platform's object, never by name.**
-    #
-    # Picking the first reader that merely EXISTS is what broke this case on macOS: the
-    # objects there are Mach-O, `readelf` cannot read them at all, and its empty output
-    # is indistinguishable from a compilation directory that is genuinely empty. The
-    # case then failed claiming the local mapping was wrong, which was a statement about
-    # the reader. An unreadable object and a wrong answer are two states and this told
-    # them apart by neither.
+    # **The reader is chosen by TRYING it on this platform's object, never by name**,
+    # and the DUMP is what separates the two ways of getting nothing. Picking the first
+    # reader that merely EXISTS is what broke this case on macOS: the objects there are
+    # Mach-O, `readelf` cannot read them at all, and an empty output is not the same
+    # answer as an object with no compilation directory in it. So there are three
+    # outcomes here and not two -- nothing could read it (SKIPPED, the case has not
+    # run), something read it and no directory was recognised (a FAILURE, and one that
+    # needs a human either way: a `-g` object must record one, so either the subject is
+    # broken or this parser does not know that reader's rendering), or a reader was
+    # found (the case runs).
     dwarf_reader=""
-    reference_comp_dir=""
+    dwarf_readable=""
     for candidate in readelf llvm-dwarfdump dwarfdump; do
         command -v "$candidate" >/dev/null 2>&1 || continue
-        reference_comp_dir="$(comp_dir_with "$candidate" "${mapdir}/thirteen-ref.o")"
-        if [[ -n "$reference_comp_dir" ]]; then
+        probe_dump="$(dwarf_dump_with "$candidate" "${mapdir}/probe.o")"
+        [[ -n "$probe_dump" ]] || continue
+        dwarf_readable="$candidate"
+        if [[ -n "$(comp_dir_of "$probe_dump")" ]]; then
             dwarf_reader="$candidate"
             break
         fi
     done
 
-    if [[ -z "$dwarf_reader" ]]; then
+    if [[ -n "$dwarf_reader" ]]; then
+        case13_at direct "$mapdir"
+
+        # The same case through a SYMLINK, which is the spelling that failed. `ln -s`
+        # can be unavailable (a Windows host without the privilege, an exotic
+        # filesystem), and that is absent rather than passing.
+        mapdir_link="${proj}/build/mapcase-link"
+        rm -f "$mapdir_link"
+        if ln -s "$mapdir" "$mapdir_link" 2>/dev/null \
+            && [[ "$(cd "$mapdir_link" && pwd -P)" != "$mapdir_link" ]]; then
+            case13_at symlinked "$mapdir_link"
+        else
+            echo "   SKIPPED (symlinked): this host cannot make a directory symlink, so the"
+            echo "            spelling that distinguishes \$PWD from getcwd(3) cannot be built here"
+        fi
+    elif [[ -n "$dwarf_readable" ]]; then
+        fail "case 13: ${dwarf_readable} read ${compiler}'s debug info but no DW_AT_comp_dir was recognised -- either the object records none, or this fixture does not know that reader's rendering"
+    else
         # Absent, skipped and failed are different states. No reader on this machine can
         # open this platform's objects, so the case has not run -- it has not passed.
         echo "   SKIPPED: no reader among readelf/llvm-dwarfdump/dwarfdump could read a"
         echo "            ${compiler} object here, so the compilation directory cannot be read"
-    else
-        (
-            export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
-            cd "$mapdir" && run_launcher "${workdir}/case13.log" -std=c++17 -O1 -g \
-                "-fdebug-prefix-map=${mapdir}=." -c "${proj}/thirteen.cpp" -o "${mapdir}/thirteen.o"
-        ) || { cat "${workdir}/case13.log" >&2; fail "the case 13 dispatched compile failed"; }
-
-        grep -q "DISPATCHED to " "${workdir}/case13.log" \
-            || {
-                cat "${workdir}/case13.log" >&2
-                echo "--- worker log ---" >&2
-                cat "${workdir}/worker.log" >&2
-                fail "case 13 was not dispatched, so it says nothing about a dispatched object"
-            }
-
-        remote_comp_dir="$(comp_dir_with "$dwarf_reader" "${mapdir}/thirteen.o")"
-
-        # THE assertion, and it is the ticket's own clause: the two objects must record
-        # the SAME compilation directory. The reference is known non-empty -- that is how
-        # the reader was chosen -- so this cannot pass by both sides reading nothing.
-        [[ -n "$remote_comp_dir" && "$remote_comp_dir" == "$reference_comp_dir" ]] \
-            || {
-                # Everything the next reader needs, because CI runs ctest without
-                # --output-on-failure and a verdict with no evidence sends whoever meets
-                # it to re-run rather than to diagnose. A wrong compilation directory has
-                # two shapes and they are fixed in different places: the CLIENT's own
-                # means the object never came from a worker however the dispatch line
-                # reads, and the WORKER's means it came from one that was told nothing.
-                echo "--- reader: ${dwarf_reader}" >&2
-                echo "--- launcher directory: ${mapdir}" >&2
-                echo "--- worker directory:   $(pwd -P)" >&2
-                echo "--- reference comp_dir: '${reference_comp_dir}'" >&2
-                echo "--- dispatched comp_dir:'${remote_comp_dir}'" >&2
-                cat "${workdir}/case13.log" >&2
-                echo "--- worker log ---" >&2
-                cat "${workdir}/worker.log" >&2
-                fail "the dispatched object records '${remote_comp_dir}', the local one '${reference_comp_dir}'"
-            }
-
-        # And the VALUE, where this platform's driver maps the way the rules assume.
-        # Separate from the agreement above on purpose: agreement is the ticket's clause
-        # and holds everywhere, while `.` is what `_fc_debug_prefix_map_rules` produces
-        # and is a fact about the driver. A driver that accepts the flag and does not
-        # remap `DW_AT_comp_dir` leaves the pair agreeing and unmapped, which is worth
-        # saying out loud rather than either asserting or ignoring.
-        if [[ "$reference_comp_dir" == "." ]]; then
-            echo "   both objects record '.' as their compilation directory (${dwarf_reader})"
-        else
-            echo "   both objects record '${reference_comp_dir}' (${dwarf_reader}); ${compiler} accepts"
-            echo "            -fdebug-prefix-map but does not rewrite DW_AT_comp_dir to '.' here, so the"
-            echo "            agreement is asserted and the value is not"
-        fi
     fi
 fi
 echo

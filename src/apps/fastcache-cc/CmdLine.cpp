@@ -2,10 +2,13 @@
 #include "CmdLine.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/NarrowText.hpp>
 
 #include <algorithm>
 #include <array>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -1280,6 +1283,50 @@ std::expected<std::vector<std::string>, std::string> RemoteCompileArgs(ParsedCom
     for (auto const& flag: *preprocessedInput)
         out.emplace_back(flag);
     return out;
+}
+
+std::string CompilerWorkingDirectory(std::string_view physicalDirectory, std::string_view environmentPwd)
+{
+    if (environmentPwd.empty() || physicalDirectory.empty())
+        return std::string { physicalDirectory };
+
+    // Both sides through `PathFromNarrowText`: `PWD` is text some other process wrote,
+    // so on a host where a `char` is not UTF-8 it can be bytes `std::filesystem::path`'s
+    // narrow constructor throws on, before any `error_code` overload runs. A spelling
+    // this host cannot read is one no comparison can be made about, which is the
+    // fallback answer anyway.
+    auto const logical = PathFromNarrowText(environmentPwd);
+    auto const physical = PathFromNarrowText(physicalDirectory);
+    if (!logical.has_value() || !physical.has_value())
+        return std::string { physicalDirectory };
+
+    // Absolute FIRST, and not merely as an optimisation: `equivalent` resolves a
+    // relative path against this process's own working directory, so `PWD=build` inside
+    // `.../build` would compare equal and be returned as a compilation directory that is
+    // not absolute. The driver rejects it -- measured, `PWD=relative/bits` fell back --
+    // and `is_absolute()` is the same test on a Windows layout, where an MSYS-style
+    // `/d/work` has no root name and so falls back too.
+    if (!logical->is_absolute())
+        return std::string { physicalDirectory };
+
+    // `equivalent`, not a string compare: the question is whether `PWD` names the SAME
+    // directory, which is what the driver asks and what a symlink makes different from
+    // spelling the same. It returns false on error and it is the only filesystem call
+    // here; a directory that cannot be stat'd falls back like everything else.
+    std::error_code ec;
+    if (!std::filesystem::equivalent(*logical, *physical, ec) || ec)
+        return std::string { physicalDirectory };
+
+    // `PWD` VERBATIM rather than `logical->string()`, because the driver's comparison is
+    // over the bytes it was handed and `path` may re-spell separators on a Windows
+    // layout. What this returns is compared byte-for-byte one call later.
+    return std::string { environmentPwd };
+}
+
+std::string CompilerWorkingDirectory(std::string_view physicalDirectory)
+{
+    auto const pwd = ReadEnvironmentVariable("PWD");
+    return CompilerWorkingDirectory(physicalDirectory, pwd.has_value() ? std::string_view { *pwd } : std::string_view {});
 }
 
 std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,

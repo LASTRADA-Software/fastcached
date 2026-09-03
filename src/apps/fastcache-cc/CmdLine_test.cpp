@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <expected>
+#include <filesystem>
 #include <iterator>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache::Cc;
@@ -1263,4 +1265,73 @@ TEST_CASE("MappedCompileDirectory reads no rule on an MSVC line")
     // will not perform.
     std::vector<std::string> const argv { "cl.exe", "/c", "a.cpp", "-fdebug-prefix-map=C:/ci/build=." };
     CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Msvc, "C:/ci/build").has_value());
+}
+
+// --- CompilerWorkingDirectory ------------------------------------------------
+
+TEST_CASE("CompilerWorkingDirectory falls back to the resolved directory in every unusable case")
+{
+    // Each row was measured against gcc 14 and clang 20 -- see the table on the
+    // declaration -- and each one is a spelling the driver ignored, leaving
+    // `DW_AT_comp_dir` at getcwd(3)'s answer. A test that only covered the symlink case
+    // would let this function trust any `PWD` at all, which is the shape that puts a
+    // directory nothing is in on the wire.
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "") == "/tmp/real/build");
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "/nonexistent/xyz") == "/tmp/real/build");
+    CHECK(CompilerWorkingDirectory("/tmp/real/build", "relative/bits") == "/tmp/real/build");
+
+    // And an unreadable physical directory has no answer to give.
+    CHECK(CompilerWorkingDirectory("", "/tmp/real/build").empty());
+}
+
+TEST_CASE("CompilerWorkingDirectory keeps the symlinked spelling a driver reports")
+{
+    // #506's macOS failure, in one call. `current_path()` is getcwd(3) and resolves
+    // every link, while both drivers report and prefix-match `$PWD` when it names the
+    // same directory -- so on a build reached through a link the rule on the line
+    // spells the link, the resolved cwd does not match it, and the client concludes
+    // that a build which maps perfectly well maps nothing. It then sends no mapping and
+    // the dispatched object keeps the WORKER's directory while the local one is `.`.
+    //
+    // The same arrangement as `AnchorWorkingDirectory`'s test, and for the same reason:
+    // macOS's `/var` is a symlink, so `$TMPDIR` is where CI meets this.
+    FastCache::Testing::ScratchDirectory const scratch { "fc-cc-logicalcwd" };
+    auto const& base = scratch.Path();
+    std::filesystem::create_directories(base / "real" / "build");
+
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(base / "real", base / "link", ec);
+    if (ec)
+    {
+        // Symlinks need a privilege or developer mode on Windows. The rule is
+        // unconditional; only this way of demonstrating it is not.
+        std::filesystem::remove_all(base);
+        SUCCEED("symlinks unavailable on this host");
+        return;
+    }
+
+    auto const physical = (base / "real" / "build").string();
+    auto const logical = (base / "link" / "build").string();
+    REQUIRE(physical != logical);
+
+    // The whole point: a different spelling of the same directory is KEPT.
+    CHECK(CompilerWorkingDirectory(physical, logical) == logical);
+
+    // A real directory that is not this one is not kept -- the driver checks identity
+    // rather than existence, and `equivalent` is that check.
+    std::filesystem::create_directories(base / "real" / "decoy");
+    CHECK(CompilerWorkingDirectory(physical, (base / "real" / "decoy").string()) == physical);
+
+    // And end to end through the consumer, which is where the bug actually bit: the
+    // build's rule names the directory the way the shell reached it, so the resolved
+    // spelling matches nothing and the pair never travels.
+    std::vector<std::string> const argv { "g++", "-c", "a.cpp", "-g", "-fdebug-prefix-map=" + logical + "=." };
+    CHECK_FALSE(MappedCompileDirectory(argv, DriverFamily::Gnu, physical).has_value());
+
+    auto const mapped = MappedCompileDirectory(argv, DriverFamily::Gnu, CompilerWorkingDirectory(physical, logical));
+    REQUIRE(mapped.has_value());
+    CHECK(mapped->directory == logical);
+    CHECK(mapped->replacement == ".");
+
+    std::filesystem::remove_all(base);
 }

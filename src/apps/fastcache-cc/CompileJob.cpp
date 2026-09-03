@@ -1015,7 +1015,16 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
                                                         "dispatched object cannot record the compilation directory "
                                                         "the client asked for" });
 
-        auto rules = WorkerPrefixMapRules(compileDirectory.string(), job.compileDir, job.compileDirReplacement, family);
+        // Through `CompilerWorkingDirectory` for the same reason the client's side is:
+        // the rule this builds has to match what the compiler about to be spawned will
+        // report, and that is `$PWD` rather than `getcwd(3)` whenever the two name one
+        // directory. A node whose working directory is reached through a symlink would
+        // otherwise emit a rule its own driver never matches, and the object would keep
+        // the worker's absolute path with every counter reading normal. The
+        // measurements are on `CompilerWorkingDirectory`; the child inherits this
+        // process's environment, so the `PWD` read here is the one it will see.
+        auto rules = WorkerPrefixMapRules(
+            CompilerWorkingDirectory(compileDirectory.string()), job.compileDir, job.compileDirReplacement, family);
         if (!rules.has_value())
             // Whichever fault it was, named where it was decided: the refusal knows
             // which of the two values it refused, where a caller reconstructing that
