@@ -925,6 +925,109 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
+TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not serve is refused", "[node][policy]")
+{
+    // **The startup reachability rules judged the advertised HOST and never its port**,
+    // so a node could tell every client to dial a port nothing on it listens on and
+    // start cleanly ([#594](https://github.com/LASTRADA-Software/fastcached/issues/594)).
+    // In the documented layout that sends every dispatched compile to 6674 -- the shared
+    // `fastcached` cache daemon -- while the registration succeeds and every counter
+    // reads normally.
+    //
+    // Reachable on a node with NO membership flags, which is the single-machine
+    // deployment: the three advertise rows are scoped to `NamesAMembershipPolicy`, so
+    // they answer a loopback advertise before this can. Measured with the binary, and
+    // the fixtures below are the same shapes.
+    auto const worker = [] {
+        NodeConfig cfg;
+        cfg.scheduler = std::string { SchedulerEndpoint };
+        cfg.toolchains = { "/usr/bin/g++" };
+        cfg.nodeListen = "6675";
+        return cfg;
+    };
+
+    SECTION("the port belongs to no surface: named, with the port this node does serve")
+    {
+        auto cfg = worker();
+        cfg.advertise = "127.0.0.1:6674";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--advertise"));
+
+        // **The port this node ACTUALLY serves, not a restatement of the mistake.** An
+        // operator who typed the wrong one of their own ports needs the right one; the
+        // ticket asks for this by name.
+        CHECK(Unwrap(refusal).contains("6675"));
+        CHECK(Unwrap(refusal).contains("6674"));
+    }
+
+    SECTION("the port is one of this node's OWN other surfaces, and is named as such")
+    {
+        // Sharper and unambiguous: the operator has named the wrong one of their own
+        // ports, and the message says which. Walked off `NodeSurfaceTable()`, so a
+        // surface added later is recognised without a second author.
+        auto cfg = worker();
+        cfg.adminListen = "6677";
+        cfg.advertise = "127.0.0.1:6677";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--admin-listen"));
+        CHECK(Unwrap(refusal).contains("6675"));
+    }
+
+    SECTION("a remote host with any port is accepted, because NAT is legitimate")
+    {
+        // **The control that stops this being a rule against port forwarding.**
+        // `--advertise` exists precisely so a node can name an address only clients can
+        // reach -- NAT, a proxy, a container publishing a different external port -- and
+        // `AdvertisesPastALoopbackBind`'s earlier draft was wrong for exactly this
+        // reason. Without this section, "the advertised port must equal --listen-node"
+        // would pass the section above.
+        auto cfg = worker();
+        cfg.advertise = "nat.example.com:9999";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a loopback advertise that AGREES with the bind is accepted")
+    {
+        // The single-machine fleet, and it is correct: the two halves agree.
+        auto cfg = worker();
+        cfg.advertise = "127.0.0.1:6675";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("no --advertise at all is accepted")
+    {
+        // The default case, and the one a fix that judged `cfg.advertise` directly would
+        // break: `AdvertisedEndpoint` falls back to the `Node` surface, so the endpoint
+        // this node would advertise agrees with its bind by construction. Judged through
+        // that function rather than the raw field, or this rule would refuse every node
+        // that names nothing.
+        CHECK_FALSE(StartupPolicyRejection(worker()).has_value());
+    }
+
+    SECTION("the host rows still answer first when both apply")
+    {
+        // Ordering, asserted rather than left to the reader. A membership node that
+        // advertises loopback is unreachable by any peer, which is a bigger problem than
+        // reaching it at the wrong port -- so that sentence is the one an operator gets.
+        auto cfg = worker();
+        cfg.nodeListen = "0.0.0.0:6675";
+        cfg.advertise = "127.0.0.1:6674";
+        cfg.fleetMembers = { "10.0.0.2" };
+        cfg.clusterKeyFile = "cluster.key";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        // The host row's words, not this rule's: it is the one that says every peer
+        // would be told to dial ITSELF. Matched on that phrase rather than on the
+        // absence of this rule's, because "the other rule answered" is the claim.
+        CHECK(Unwrap(refusal).contains("dial ITSELF"));
+    }
+}
+
 TEST_CASE("NodeConfig: an empty --scheduler is refused at STARTUP and not only at install", "[node][policy]")
 {
     // **The rule this ticket is about, asserted where it has to hold.** An empty
