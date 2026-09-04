@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -405,5 +406,68 @@ struct SurfaceRow
 /// @param cfg What the operator asked for.
 /// @return The worksheet, one line per endpoint plus each row's notes.
 [[nodiscard]] std::string RenderSurfaces(NodeConfig const& cfg);
+
+/// The worksheet, plus whether this configuration would also START.
+///
+/// **`--print-surfaces` printed the map and exited 0 for a configuration the node
+/// then refuses to run** ([#582](https://github.com/LASTRADA-Software/fastcached/issues/582)).
+/// The flag prints the RESOLVED configuration, which is exactly what makes it the
+/// natural thing to reach for before writing a unit file -- so used that way it is a
+/// pre-flight check, and it answered "fine" to a command line with no chance of
+/// starting. The operator writes the unit and finds out at deploy time.
+///
+/// **Printing the map for a broken configuration is the feature; reporting SUCCESS
+/// for it is not.** Those are two decisions that one `return 0` merged, and only the
+/// second was wrong -- so the map is rendered exactly as before, unconditionally and
+/// before any judgement, and the verdict travels beside it instead of replacing it.
+/// An operator reaches for this flag BECAUSE a port is wrong, and withholding the
+/// worksheet until the configuration is already valid would withhold it precisely
+/// when it is wanted.
+///
+/// **The refusal is `StartupPolicyRejection`'s own text, never a second phrasing.**
+/// A rule that depends on nothing but the parsed configuration belongs in that table,
+/// and a second copy of its wording is a second thing to be wrong -- which is the
+/// defect [#386](https://github.com/LASTRADA-Software/fastcached/issues/386) records
+/// for this very ladder, one flag along.
+///
+/// **Why this is a function here rather than four lines in `main()`.** It is one of
+/// FIVE verbs that answer and exit before the startup table ever runs
+/// (`--print-surfaces`, `--install-service`/`--uninstall-service`, `--migrate-cache`
+/// and the cluster actions), and that class has no name in the code. Written as a
+/// special case at the call site, the next verb to want a verdict gets the same four
+/// lines written a second time, in a file no test target compiles. The class members
+/// do NOT all want the same answer, which is the part worth recording:
+///
+/// - `--install-service` is judged already, and by the STRICTER
+///   `NodeInstallRejection` -- a registration replays its command line forever, so it
+///   must satisfy the install rules as well as these.
+/// - `--migrate-cache` deliberately is NOT judged. A store of the wrong vintage stops
+///   the node running, and demanding a valid `--scheduler` first would be demanding
+///   the operator fix a running configuration before being allowed to fix the thing
+///   that stops it running.
+/// - The cluster actions are NOT judged either: they are questions asked OF a running
+///   cluster rather than a node starting, and they need a scheduler endpoint but no
+///   toolchain.
+///
+/// So the mechanism is named and reusable, and each verb's answer is a decision on
+/// record rather than whatever the ladder happens to give it.
+struct SurfaceReport
+{
+    /// The worksheet. Always populated, whatever the verdict.
+    std::string text;
+
+    /// Why this configuration would not start, or nullopt when it would.
+    ///
+    /// The refusal rather than a `bool`, so a caller states the reason it was given
+    /// instead of inventing one -- and an `optional` rather than an empty string,
+    /// because "would start" and "was refused with no words" are different answers
+    /// and a string renders them the same.
+    std::optional<std::string> refusal;
+};
+
+/// Render the worksheet and judge the configuration behind it.
+/// @param cfg What the operator asked for.
+/// @return The worksheet, and the startup table's refusal when there is one.
+[[nodiscard]] SurfaceReport ReportSurfaces(NodeConfig const& cfg);
 
 } // namespace FastCache::Node
