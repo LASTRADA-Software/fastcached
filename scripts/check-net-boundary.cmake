@@ -165,8 +165,46 @@ fastcached_split_rows(FastCachedNetStandaloneLeaves standaloneLeaves standaloneL
 # @param includesOut Set to the list of in-tree include targets, relative to
 #        src/FastCache. A spelling that cannot be classified is returned verbatim
 #        behind a `!` marker, which the caller reports as its own violation.
+# Read whole and split by hand, never `file(STRINGS)`.
+#
+# `file(STRINGS)` returns a CMake LIST, and CMake's list parser treats an
+# UNBALANCED `[` or `]` as grouping -- so one stray bracket in a comment on a
+# KEPT line merges that element with the ones after it, and every include past
+# the bracket disappears from the scan. `file(STRINGS)` takes a PATH, so there is
+# no content to neutralise beforehand; the only fix is to read the file and split
+# it here.
+#
+# **Measured on this check, and it is the SILENT class rather than the loud one.**
+# Three arms on `src/FastCache/Net/TcpClient.cpp`, with a planted
+# `#include <FastCache/Core/Bytes.hpp>` -- a real boundary violation:
+#
+#   violation alone                      exit 1, violation NAMED, 33 lines
+#   violation + a stray `]` before it     exit 0, violation NOT named, 1 line
+#   stray `]` alone                       exit 0, clean  (the bracket is not itself a violation)
+#
+# So a comment bracket makes this check pass over a genuine violation. Note the
+# middle arm is why the obvious experiment proves nothing: on a CLEAN tree the
+# injection changes the output not at all, because everything the merge swallows
+# is something the check had nothing to say about. #518 classified this as
+# "summary identical, full output changes" from exactly that experiment; with a
+# violation planted, the real behaviour is a green run over a broken boundary.
+#
+# A `REGEX` filter is not a defence either, only a coincidence of which lines
+# survive it: exposure is a property of (reader, file, surviving lines), so the
+# filter is applied AFTER the split instead.
+#
+# Fifth-and-counting copy of this splitting idiom; consolidating them into one
+# module is [#495](https://github.com/LASTRADA-Software/fastcached/issues/495)
+# and deliberately not done here, because doing it inside a fix for #518 would
+# swallow another ticket silently.
 function(fastcached_fastcache_includes filePath includesOut)
-    file(STRINGS "${filePath}" lines REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
+    file(READ "${filePath}" content)
+    string(REPLACE "\\" " " content "${content}")
+    string(REPLACE ";" " " content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
+    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
+    list(FILTER lines INCLUDE REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
     set(includes "")
     foreach(line IN LISTS lines)
         set(target "")
