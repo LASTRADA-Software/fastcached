@@ -78,6 +78,15 @@ constexpr std::string_view MetricsHeading = "## Metrics";
 /// Only series in the daemon's own namespace are checked. See the note above.
 constexpr std::string_view DaemonPrefix = "fastcached_";
 
+/// The page that carries the compile node's per-series tables.
+constexpr std::string_view NodePage = "docs/tools/fastcache-compile-node.md";
+
+/// The node's namespace.
+///
+/// It cannot collide with the daemon's despite the shared stem: `fastcached_` has a
+/// `d` where this one has its separator, so no name matches both prefixes.
+constexpr std::string_view NodePrefix = "fastcache_";
+
 /// A snapshot with every optional part present, so the renderer emits every line
 /// it is capable of emitting.
 ///
@@ -100,10 +109,25 @@ constexpr std::string_view DaemonPrefix = "fastcached_";
     return snapshot;
 }
 
+/// The same, as a compile NODE answers it.
+///
+/// The two optionals the daemon leaves empty are populated here, because their
+/// series are exactly the ones the node's page documents — and a snapshot without
+/// them would let the page lose those rows unnoticed, which is the direction this
+/// check exists for.
+/// @return A snapshot exercising the node-only branches of `RenderPrometheus`.
+[[nodiscard]] MetricsSnapshot NodeShapedSnapshot()
+{
+    auto snapshot = FullySpecifiedSnapshot();
+    snapshot.host = HostCapacity {};
+    snapshot.upstreamConfigured = true;
+    return snapshot;
+}
+
 /// Every `fastcached_*` series name in a rendered exposition.
 /// @param exposition Prometheus text exposition.
 /// @return The distinct series names, sorted.
-[[nodiscard]] std::set<std::string> SeriesIn(std::string_view exposition)
+[[nodiscard]] std::set<std::string> SeriesIn(std::string_view exposition, std::string_view prefix)
 {
     std::set<std::string> names;
     constexpr std::string_view Marker = "# HELP ";
@@ -114,7 +138,7 @@ constexpr std::string_view DaemonPrefix = "fastcached_";
         if (nameEnd == std::string_view::npos)
             continue;
         auto const name = exposition.substr(nameStart, nameEnd - nameStart);
-        if (name.starts_with(DaemonPrefix))
+        if (name.starts_with(prefix))
             names.emplace(name);
     }
     return names;
@@ -134,16 +158,16 @@ constexpr std::string_view DaemonPrefix = "fastcached_";
 /// the sentence around it.
 /// @param text Markdown to scan.
 /// @return The distinct names, sorted.
-[[nodiscard]] std::set<std::string> DocumentedSeriesIn(std::string_view text)
+[[nodiscard]] std::set<std::string> DocumentedSeriesIn(std::string_view text, std::string_view prefix)
 {
     std::set<std::string> names;
-    for (std::size_t at = text.find(DaemonPrefix); at != std::string_view::npos; at = text.find(DaemonPrefix, at + 1))
+    for (std::size_t at = text.find(prefix); at != std::string_view::npos; at = text.find(prefix, at + 1))
     {
         auto end = at;
         while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) != 0 || text[end] == '_'))
             ++end;
         auto const name = text.substr(at, end - at);
-        if (name.size() > DaemonPrefix.size() && !name.ends_with('_'))
+        if (name.size() > prefix.size() && !name.ends_with('_'))
             names.emplace(name);
     }
     return names;
@@ -217,8 +241,8 @@ TEST_CASE("Every fastcached_ series the daemon renders is documented, and vice v
 
     AtomicMetricsSink sink;
     auto const exposition = RenderPrometheus(sink, FullySpecifiedSnapshot());
-    auto const rendered = SeriesIn(exposition);
-    auto const documented = DocumentedSeriesIn(section);
+    auto const rendered = SeriesIn(exposition, DaemonPrefix);
+    auto const documented = DocumentedSeriesIn(section, DaemonPrefix);
 
     // A census returning zero is the absence of a verdict, not a verdict. Both sets
     // are asserted non-trivial before either difference is believed, and the floor
@@ -255,4 +279,75 @@ TEST_CASE("The daemon's two compile-cache store refusals are named on the page",
     // And the node's twin is named beside it, or the page documents one end of a
     // two-ended question.
     CHECK(page.contains("fastcache_node_cache_requests_refused_foreign_generation_total"));
+}
+
+TEST_CASE("Every fastcache_ series the node renders is documented, and vice versa", "[metrics][docs]")
+{
+    // #553, the node's half of the same gap. Both directions are live drift, and
+    // both are invisible: a counter exported and undocumented is one an operator
+    // never learns exists, and a documented series never exported is one they are
+    // told to scrape that will never appear -- which `AGENT.md`'s scar list already
+    // names as one of the four failures the rulebook was written from.
+    //
+    // ## Why this compares against the RENDERER and not against `MetricsCatalog`
+    //
+    // The ticket proposes reading the catalog. Measured, that produces a wrong
+    // answer in the dangerous direction: `fastcache_node_upstream_configured` is
+    // documented, is exported, and is **not a `CounterTable` row** -- it is rendered
+    // from `MetricsSnapshot::upstreamConfigured`. It appears in `MetricsCatalog.hpp`
+    // only inside another row's help text. So a scan keyed on `prometheusName`
+    // reports it as documented-but-never-exported, and the remedy that reading
+    // suggests is deleting a correct row from the page.
+    //
+    // That is a check inventing a finding rather than missing one, which is the
+    // worse direction and the one that gets acted on. `RenderPrometheus` is the
+    // authority on what is exported; the catalog is the authority on what is
+    // counted, and they are not the same set.
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    auto const read = ReadWhole(root / NodePage);
+    // A page that cannot be read is not a page with nothing wrong in it.
+    REQUIRE(read.has_value());
+    auto const& page = Unwrap(read);
+
+    AtomicMetricsSink sink;
+    auto const exposition = RenderPrometheus(sink, NodeShapedSnapshot());
+    auto const rendered = SeriesIn(exposition, NodePrefix);
+    auto const documented = DocumentedSeriesIn(page, NodePrefix);
+
+    // Both censuses non-trivial before either difference is believed: two empty
+    // lists agree perfectly, which is `node-config-reference`'s rule and the one
+    // this check would otherwise pass vacuously under the day somebody renames a
+    // heading.
+    REQUIRE(rendered.size() > 30);
+    REQUIRE(documented.size() > 20);
+
+    INFO("the node renders " << rendered.size() << " series, the page names " << documented.size());
+    INFO("rendered and undocumented: [" << Missing(rendered, documented) << "]");
+    INFO("documented and never rendered: [" << Missing(documented, rendered) << "]");
+    CHECK(Missing(rendered, documented).empty());
+    CHECK(Missing(documented, rendered).empty());
+}
+
+TEST_CASE("The node's page is scanned whole, not just its tables", "[metrics][docs]")
+{
+    // The daemon's check scopes itself to one `## Metrics` section because that page
+    // mentions no series anywhere else. The node's page names them in prose, in
+    // several tables, and in a sample transcript -- so scoping to one heading would
+    // silently exclude most of them and the check would pass while guarding a
+    // fraction.
+    //
+    // Asserted rather than left as a comment: the scan must see series from more
+    // than one region of the page, or it has been narrowed without anybody noticing.
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    auto const read = ReadWhole(root / NodePage);
+    REQUIRE(read.has_value());
+    auto const& page = Unwrap(read);
+
+    auto const all = DocumentedSeriesIn(page, NodePrefix);
+    REQUIRE_FALSE(all.empty());
+
+    // A series documented only in the refusal-counter table, and one documented only
+    // in the cache-tier discussion. Neither is in the other's section.
+    CHECK(all.contains("fastcache_worker_jobs_refused_no_slot_total"));
+    CHECK(all.contains("fastcache_node_cache_hits_total"));
 }

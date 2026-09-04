@@ -1664,6 +1664,93 @@ cache rather than as no cache at all.
 tell that the process is alive but not that it is *answering*, which is the state
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
+### Every other series a node exports
+
+The tables below complete the set: every `fastcache_*` series a node renders that is
+not covered by the refusal table or the cache-tier discussion above. They were
+exported and documented nowhere until
+[#553](https://github.com/LASTRADA-Software/fastcached/issues/553) — a counter an
+operator never learns exists, which costs the same as one they are told to scrape
+that never appears.
+
+`MetricsDocumentation_test` now fails in both directions, so this page and the
+exposition cannot drift apart again without a red build.
+
+
+**What the worker did.** The compile surface's throughput. `..._compile_milliseconds_total` beside `..._jobs_completed_total` is a duration as a `_sum`/`_count` pair — a rate over either window gives the mean for that window, which is what a gauge of "the last compile took N ms" cannot do.
+
+| Series | Says |
+|---|---|
+| `fastcache_worker_jobs_started_total` | Compiles this worker began. Minus jobs_completed_total, the number running right now. |
+| `fastcache_worker_jobs_completed_total` | Compiles that finished, whatever the compiler concluded. Also the count half of the compile-time sum below. |
+| `fastcache_worker_compile_milliseconds_total` | Total wall time spent compiling. Divide by jobs_completed_total, or take rate() of both, for the average compile. |
+| `fastcache_worker_jobs_abandoned_client_gone_total` | Compiles whose client had disconnected before the object could be written back. The compile itself still counts in jobs_completed_total -- the compiler ran and this machine paid for it; only the delivery found nobody there. Never a refusal: nothing was declined and no reply was sent. |
+| `fastcache_worker_bytes_received_total` | Request payload bytes read from clients. |
+| `fastcache_worker_bytes_returned_total` | Reply payload bytes written back to clients. |
+
+
+**Compiles this node would not run.** Refusals decided after the request was understood. Each names a different thing to go and fix, which is why they are not one counter.
+
+| Series | Says |
+|---|---|
+| `fastcache_worker_jobs_refused_rejected_argument_total` | Jobs refused over an argument this worker will not pass to a compiler. |
+| `fastcache_worker_jobs_refused_scratch_unavailable_total` | Jobs refused because the scratch directory could not be prepared: a full or read-only disk, not a client or fleet problem. |
+| `fastcache_worker_jobs_refused_spawn_failed_total` | Jobs refused because the compiler could not be spawned: the toolchain this worker advertises is not usable here. |
+| `fastcache_worker_jobs_refused_survey_in_flight_total` | Jobs refused because this worker had not finished identifying its toolchains: it is still starting, not misconfigured. Rises only from clients dialling this port directly -- the scheduler is not offered this worker until the survey completes. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | Connections refused because the caller is neither on this machine nor a cluster member. A rise means something is trying to spend a machine it has no claim on. |
+| `fastcache_worker_jobs_refused_stopping_total` | Jobs refused because this worker had begun stopping. Never sum with no_slot: that one says the fleet is too small, this one says a node is draining and a retry will land somewhere else. |
+
+
+**A dispatched compile whose envelope or lease did not hold.** The envelope rows are about the bytes; the lease rows are about the credential. A rise in a lease row on a healthy fleet names a clock, a cluster key or a rollout rather than a client.
+
+| Series | Says |
+|---|---|
+| `fastcache_worker_jobs_refused_envelope_malformed_total` | Jobs refused because the request's codec envelope could not be parsed, or an uncompressed one disagreed with the bytes beside it: a version skew, or a peer not speaking this protocol. |
+| `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | Jobs refused because the payload is in a codec this build cannot decode: two honest processes packaged differently. Every one cost a local compile. |
+| `fastcache_worker_jobs_refused_envelope_declared_too_large_total` | Jobs refused because the envelope declared it expands past this endpoint's ceiling, before a byte was decompressed. Nothing honest declares that by accident: read it as a probe or a mis-set client. |
+| `fastcache_worker_jobs_refused_envelope_corrupt_total` | Jobs refused because the payload did not expand to its declared size. The only envelope refusal that implicates the transport: a codec version skew, or a link damaging payloads. |
+| `fastcache_worker_jobs_refused_lease_unauthorized_total` | Jobs refused because the lease was not signed by this cluster. A security signal, not a capacity one -- or a launcher predating signed leases, which presents a token that cannot authenticate. |
+| `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | Jobs refused because an authentic lease was issued by a different fleet. A rise means two clusters are running from the same --cluster-key-file, which is what copying a working configuration to a second site produces. |
+| `fastcache_worker_jobs_refused_lease_stale_epoch_total` | Jobs refused because an authentic lease named a scheduler term that is no longer current. A replay window across a leadership change, not a provisioning mistake; zero on a fleet that is not electing. |
+| `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | Jobs refused because an authentic lease named a different worker. Usually a registered endpoint that is not the one clients dial, not a replay. |
+| `fastcache_worker_jobs_refused_lease_expired_total` | Jobs refused because an authentic lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases. |
+
+
+**Frames the compile surface would not read.** Decided before or during framing, so none of these reached a verb.
+
+| Series | Says |
+|---|---|
+| `fastcache_worker_frames_refused_unsupported_version_total` | Frames refused for naming a protocol version this build does not serve: a peer built against another release. |
+| `fastcache_worker_frames_refused_truncated_total` | Frames shorter than the payload their own header declared: a framing or transport fault, or a peer sending nonsense. Never sum with malformed_payload -- they share a wire code and nothing else. |
+| `fastcache_worker_frames_refused_unknown_opcode_total` | Frames naming an opcode this build has no row for. |
+| `fastcache_worker_frames_refused_unimplemented_verb_total` | Frames naming a verb that exists and is not served here, such as AUTH on a worker that checks no credential. |
+| `fastcache_worker_frames_refused_not_permitted_total` | Frames naming a verb this node serves on another surface: a client reached the compile port with a cache or scheduler request. |
+| `fastcache_worker_frames_refused_malformed_payload_total` | Frames whose payload did not decode into the fields its verb requires: a version or encoding mismatch between two ends that agree on the framing. |
+| `fastcache_worker_frames_refused_unauthenticated_total` | Frames refused for reaching a compile verb before a credential. Flat at zero BY CONSTRUCTION, not for want of anybody probing: the compile surface answers AuthRequired false -- a compile carries its own per-job lease instead -- so the pre-payload gate never reaches this. Do not read the flat line as 'nothing is asking'. A rise means that answer changed, which is a change to who may compile here. |
+
+
+**Connections swept on a deadline.** A sweep is not a refusal: the peer ran out of time rather than being told no. The two sweep rows are split by whether a verb had been named, because a peer that connected and never spoke is a different problem from one whose answer outran its window.
+
+| Series | Says |
+|---|---|
+| `fastcache_frame_request_deadline_sweeps_total` | Connections swept before the peer named a verb. A peer counted here connected and did not speak, so no honest client of this surface appears in it. Never sum with answer_deadline: that one is a request this node accepted outrunning its budget, this one is a knock at the door. |
+| `fastcache_frame_answer_deadline_sweeps_total` | Connections swept after the peer named a verb, meaning the answer outran the window that verb allows. For a compile that is a translation unit outliving its lease grant, so a rise is a question about the lease timeout rather than about this worker. |
+| `fastcache_frame_deadline_refusals_sent_total` | Swept connections whose peer was sent a frame saying why. A second event, not a restatement of answer_deadline_sweeps: only a connection parked inside the surface can be told, because a connection parked on the socket is ended by the close and the close is the write side gone. The gap between the two is how many swept peers were left to infer it. |
+
+**What this machine is, and how loaded it is.** Rendered only by a process that has a
+capacity to report, so a daemon emits none of them — `MetricsSnapshot::host` is absent
+there rather than zeroed, because cores a daemon does not schedule against are not a
+fact about it. These are gauges, not counters.
+
+| Series | Says |
+|---|---|
+| `fastcache_node_logical_cores` | Schedulable hardware threads on this node. |
+| `fastcache_node_memory_total_bytes` | Physical memory, or the container ceiling when that binds first. |
+| `fastcache_node_disk_capacity_bytes` | Size of the filesystem this node compiles on. |
+| `fastcache_node_disk_free_bytes` | Space on that filesystem an unprivileged process may still write. |
+| `fastcache_node_slots_configured` | Concurrent compiles this node advertises to the scheduler. |
+| `fastcache_node_slots_busy` | Compiles running right now — **sampled**, so it is a reading and not a difference of two counters. |
+
 ### What a refused connection looks like
 
 These are what a probe of that port looks like from outside the machine. They are
