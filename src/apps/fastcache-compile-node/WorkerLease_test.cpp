@@ -81,7 +81,73 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
                                    .epoch = epoch });
 }
 
+/// A grant from ANOTHER fleet, signed with the same key.
+///
+/// The shape two sites provisioned from one `--cluster-key-file` produce, which is
+/// what copying a working configuration or cloning staging from production gives you.
+/// The MAC verifies; only the fleet differs.
+/// @param epoch The scheduler term it is issued under.
+/// @return The token, as a client would present it.
+[[nodiscard]] std::string ForeignGrantUnder(std::uint64_t epoch)
+{
+    return Distributed::MintLeaseToken(
+        TestClusterKey(),
+        Distributed::LeaseClaims { .serial = "17",
+                                   .endpoint = std::string { ThisWorker },
+                                   .fingerprint = "gcc-13",
+                                   .key = "obj-abc",
+                                   .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
+                                   .clusterId = "fleet-b",
+                                   .epoch = epoch });
+}
+
 } // namespace
+
+TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "[node][lease][epoch]")
+{
+    // **#401's acceptance clause, asserted at the production seam.**
+    //
+    // That ticket says a worker "pins the first identity it authenticates", leaving a
+    // window in which one that has verified nothing accepts whichever fleet reaches it
+    // first. It is not so at this ref, and this case is what says so rather than a
+    // reading of the code: the worker is TOLD its fleet by `--cluster-id`, that value
+    // reaches `LeaseExpectation::clusterId` through the factory `main.cpp` calls, and
+    // `VerifyLeaseToken` compares it before it looks at anything else.
+    //
+    // Written through `MakeWorkerLeaseValidator` rather than `VerifyLeaseToken`,
+    // because the primitive already had a case and the primitive is not where the
+    // window would be. What #401 describes could only exist in the PATH -- a worker
+    // whose expectation came from somewhere other than its configuration -- so that is
+    // where it has to be looked for.
+    Testing::ScratchDirectory const scratch { "fc-worker-lease-fleet" };
+    auto const keyFile = scratch.Path() / "cluster.key";
+    WriteClusterKey(keyFile);
+
+    auto const cfg = ConfigWithKey(keyFile);
+    Distributed::KnownSchedulerTerm term;
+    NullLogger logger;
+
+    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, logger);
+    REQUIRE(validator.has_value());
+
+    // Nothing has been verified: the epoch check is `NotKnownHere` and accepts any
+    // term. Asserted, because if the worker had already learnt something this case
+    // would be about the epoch rather than the fleet.
+    REQUIRE_FALSE(term.Check().Checked());
+
+    // And the foreign fleet is refused anyway -- on the identity, not the term.
+    auto const foreign = (*validator)(ForeignGrantUnder(CurrentTerm), "gcc-13");
+    REQUIRE(foreign.has_value());
+    CHECK(Testing::Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
+
+    // Still nothing learnt: a refused grant must teach this worker nothing, or anybody
+    // holding the wire could move its expectation by sending one.
+    CHECK_FALSE(term.Check().Checked());
+
+    // The control, and it is what stops this passing against a validator that refuses
+    // everything: this node's OWN fleet is served, first grant and all.
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
+}
 
 TEST_CASE("The production factory wires the term through, grant to refusal", "[node][lease][epoch]")
 {
