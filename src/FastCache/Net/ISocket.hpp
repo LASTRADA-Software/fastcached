@@ -282,6 +282,18 @@ class ISocket
 
     /// Close the socket. Idempotent; subsequent Read/Write resolves with
     /// NetErrorCode::BadFileHandle.
+    ///
+    /// **A parked read is retrieved here, and this is the only thing that can
+    /// retrieve one.** Nothing else takes a wait back off a socket, so an
+    /// implementation that leaves a parked `Read` or `WaitReadable` alone leaves a
+    /// coroutine frame nobody can free. Every transport this library hands out
+    /// completes such an awaitable with `NetErrorCode::Cancelled`.
+    ///
+    /// The order is load-bearing: detach the awaitable from the operation FIRST,
+    /// complete it LAST, and touch no member afterwards. Completing resumes the
+    /// awaiting coroutine, and a coroutine that OWNS the socket runs to its end and
+    /// destroys it before `Complete` returns -- which is a heap-use-after-free this
+    /// tree has already had (see `EpollSocket::Close`).
     virtual void Close() noexcept = 0;
 
     /// Close this socket's WRITE half, leaving the read half open, so the peer
