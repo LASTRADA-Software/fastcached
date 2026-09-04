@@ -255,9 +255,24 @@ AcceptAwaitable InMemoryListener::Accept()
             NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) };
 
     // No connection waiting — park until ConnectClient() or Close() fires.
+    //
+    // Registered from inside `await_suspend`, exactly as `InMemorySocket::Read` does
+    // and for the same reason: at that moment `self` is the awaitable living in the
+    // AWAITING coroutine's frame. This local is returned by value and destroyed, so
+    // recording `&awaitable` here left `_pendingAwaitable` naming storage that was
+    // already gone -- and both `Close` and `TryCompletePendingAccept` then completed
+    // through it. Latent only because every case in this file used the lazy `Task`
+    // shape and reached `Shutdown()` before anything parked
+    // ([#734](https://github.com/LASTRADA-Software/fastcached/issues/734)).
     AcceptAwaitable awaitable;
-    _pendingAwaitable = &awaitable;
+    awaitable.SetSuspendCallback(&InMemoryListener::OnAcceptSuspended, this);
     return awaitable;
+}
+
+void InMemoryListener::OnAcceptSuspended(AcceptAwaitable* awaitable, std::coroutine_handle<> /*handle*/) noexcept
+{
+    auto* const self = static_cast<InMemoryListener*>(awaitable->CallbackState());
+    self->_pendingAwaitable = awaitable;
 }
 
 void InMemoryListener::Close() noexcept

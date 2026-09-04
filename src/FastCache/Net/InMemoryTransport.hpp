@@ -210,6 +210,19 @@ class InMemoryListener final: public IListener
     /// complete the awaitable.
     void TryCompletePendingAccept();
 
+    /// await_suspend hook for a parked Accept. Records `awaitable` -- which lives in
+    /// the awaiting coroutine's frame, so its address is stable -- as the pending
+    /// accept, to be completed by `TryCompletePendingAccept` or `Close`.
+    ///
+    /// It exists because the pointer cannot be taken in `Accept` itself: the awaitable
+    /// there is a local, returned by value, and the object the caller suspends on is a
+    /// different one (#734). The owning listener is recovered from the awaitable's
+    /// callback state, as everywhere else in this file.
+    /// @param awaitable The awaitable being suspended (callback `self`).
+    /// @param handle The suspending coroutine's handle; already recorded by the
+    ///        awaitable's own await_suspend, so unused here.
+    static void OnAcceptSuspended(AcceptAwaitable* awaitable, std::coroutine_handle<> handle) noexcept;
+
     std::deque<Pending> _ready;
     AcceptAwaitable* _pendingAwaitable { nullptr };
     bool _closed { false };

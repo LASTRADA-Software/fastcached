@@ -654,6 +654,11 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   not the decorator's own buffering. A raw EOF before a full record is EOF too.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
+- An awaitable's address is taken in `await_suspend`, never in the factory that returns
+  it — that one is a LOCAL returned by value, so the caller suspends on a different
+  object (#734, a SIGSEGV once an eager coroutine parks). `SetSuspendCallback` is what
+  makes the right answer the only reachable one. Third of a family in one week: a fake
+  more PERMISSIVE than the thing it stands for.
 - And it is the ONLY thing that retrieves a parked read, so the shared FAKE owes that
   too: `InMemorySocket::Close` cleared its progress callback and walked away, which
   made the abandonment final and leaked the awaiting coroutine's frame. Detach first,
