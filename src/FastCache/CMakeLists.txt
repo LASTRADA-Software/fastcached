@@ -32,6 +32,7 @@ target_sources(FastCache
         Config/ConfigReloader.cpp
         Config/DefaultConfigPath.cpp
         Config/EnvExpand.cpp
+        Config/SecretProvenance.cpp
         Config/YamlReader.cpp
         Consensus/FileRaftStorage.cpp
         Consensus/InMemoryRaftStorage.cpp
