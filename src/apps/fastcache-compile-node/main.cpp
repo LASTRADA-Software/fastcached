@@ -807,12 +807,27 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // authentic grant has taught it something.
     Distributed::KnownSchedulerTerm schedulerTerm;
 
+    // Beside the term, because it is the same kind of thing: per-worker mutable state
+    // the validator writes and this scope owns. It says once, per entry into the
+    // condition, that this worker is refusing every grant because its learned term is
+    // higher than the ones arriving -- which on the worker showed only as
+    // `WorkerLeaseStaleEpoch` climbing, and reads as an election storm rather than the
+    // scheduler reset it usually is (#614).
+    //
+    // `Warn` rather than `Error`: the worker is healthy and doing exactly what it was
+    // told to, and the fleet may be mid-election with nothing wrong at all. What may
+    // have changed under it is the operator's own configuration.
+    Distributed::LeaseEpochNotice epochNotice { [&logger](std::string_view line) {
+        logger.Logf(LogLevel::Warn, "{}", line);
+    } };
+
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
                                        activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
                                        schedulerTerm,
+                                       epochNotice,
                                        logger);
     if (!validator.has_value())
     {

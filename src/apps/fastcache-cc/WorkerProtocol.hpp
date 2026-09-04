@@ -104,11 +104,17 @@ using LeaseValidator =
 /// `Distributed::LeaseEpochCheck`'s class comment owns the argument for that
 /// asymmetry -- it is the type that makes the decision, and one explanation copied to
 /// each site is four places to edit and four chances to drift.
+/// @param epochNotice Where "this worker is refusing every grant because its learned
+///        term is higher" is said, once per entry into that condition. Borrowed like
+///        `term`, and for the same reason: it is per-worker mutable state the validator
+///        writes and something outside it owns. See `Distributed::LeaseEpochNotice` for
+///        why the line exists and what it deliberately does NOT settle (#614).
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
                                                   std::string clusterId,
                                                   IWallClock const& clock,
-                                                  Distributed::KnownSchedulerTerm& term);
+                                                  Distributed::KnownSchedulerTerm& term,
+                                                  Distributed::LeaseEpochNotice& epochNotice);
 
 /// The validator a worker with no cluster key builds: it refuses nothing.
 ///

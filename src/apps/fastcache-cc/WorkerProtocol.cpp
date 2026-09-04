@@ -129,13 +129,15 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     std::string clusterId,
                                     IWallClock const& clock,
-                                    Distributed::KnownSchedulerTerm& term)
+                                    Distributed::KnownSchedulerTerm& term,
+                                    Distributed::LeaseEpochNotice& epochNotice)
 {
     return [key = std::move(signingKey),
             endpoint = std::move(advertisedEndpoint),
             cluster = std::move(clusterId),
             &clock,
-            &term](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+            &term,
+            &epochNotice](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -168,8 +170,26 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // adoption, a validator that accepted everything and one that adopts
             // forward are indistinguishable from outside.
             term.Learn(verified->epoch);
+
+            // The latch is cleared by an ACCEPTED grant, so the notice marks each entry
+            // into the refusing condition rather than only the first ever (#614). A
+            // worker that refuses once to a stale token and then goes on working must
+            // still be able to report a real reset an hour later.
+            epochNotice.Accepted();
             return std::nullopt;
         }
+
+        // **Said once per entry into the condition, on the WORKER.** The refusal below
+        // travels to the client and is rendered there, which is how an operator running
+        // a build learns of it -- but an operator looking at the worker saw only
+        // `WorkerLeaseStaleEpoch` climbing, which reads like an election storm rather
+        // than like the scheduler reset it usually is (#614). A wrong signal, not a
+        // missing one.
+        //
+        // It reports only the epoch reason; every other refusal here is about one grant
+        // and is already answered per request. This one is a condition that persists
+        // until the process restarts, which is what makes it worth a line.
+        (void) epochNotice.Observe(verified.error());
 
         // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
         // permission, and the object key inside it is the SCHEDULER's bookkeeping, so

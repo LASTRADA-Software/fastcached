@@ -169,12 +169,17 @@ constexpr std::uint64_t GrantTerm = 4;
 /// Build one of the two production lease validators.
 /// @param lease Which policy.
 /// @param term What the verifying one borrows; the unchecked one ignores it.
+/// @param notice Where an epoch refusal would be reported; borrowed like `term`, and
+///        for the same reason -- both outlive the validator and both are written by it.
 /// @return The validator.
-[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease, Distributed::KnownSchedulerTerm& term)
+[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease,
+                                                Distributed::KnownSchedulerTerm& term,
+                                                Distributed::LeaseEpochNotice& notice)
 {
     if (lease == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, term);
+    return SignedLeaseValidator(
+        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, term, notice);
 }
 
 struct Fixture
@@ -191,6 +196,10 @@ struct Fixture
     /// teach it and then read what the worker does about it.
     Distributed::KnownSchedulerTerm term;
 
+    /// Silent, because these cases assert on the REPLY rather than on the log. Named
+    /// through `Silent()` rather than defaulted, which is that factory's own rule.
+    Distributed::LeaseEpochNotice epochNotice { Distributed::LeaseEpochNotice::Silent() };
+
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
@@ -199,7 +208,7 @@ struct Fixture
     /// @param lease Which production lease policy to build; see `LeasePolicy`.
     explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(lease, term), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(lease, term, epochNotice), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;

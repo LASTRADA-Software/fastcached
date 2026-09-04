@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -611,6 +612,106 @@ class KnownSchedulerTerm
   private:
     std::atomic<std::uint64_t> _term { 0 };
     std::atomic<bool> _learned { false };
+};
+
+/// Says once, per condition, that this worker is refusing grants because its learned
+/// term is higher than the ones arriving.
+///
+/// **The signal it replaces is not missing, it is WRONG**
+/// ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Three ordinary
+/// operator actions drop a scheduler's term back to 0 -- wiping the Raft directory,
+/// re-bootstrapping the cluster, turning consensus off -- and every worker that has
+/// learned a higher term then refuses every grant until its process restarts. On the
+/// worker that shows only as `WorkerLeaseStaleEpoch` climbing, which reads like an
+/// election storm: an operator whose fleet stopped distributing is pointed at consensus
+/// instability when the cause is a reset they performed themselves.
+///
+/// **It settles nothing about the downward path**, which is still open: an authentic,
+/// unexpired grant naming a lower term is either a fresh grant from a reset scheduler
+/// or a captured one replayed inside its expiry window, and nothing in the token
+/// separates them. This is the observability half, and it is true under every shape
+/// that question could be answered with -- which is why it can land before the answer.
+///
+/// **Latched, and cleared by an accepted grant rather than never.** Once per PROCESS
+/// would spend the one line on the first stale token to arrive and leave a real reset
+/// an hour later silent, which is the failure this exists to prevent, reached by the
+/// mechanism meant to prevent it. Cleared on acceptance, the line marks each entry into
+/// the condition: a lone blip says it once, a reset says it once, and a worker refusing
+/// thousands of compiles still says it once.
+///
+/// Header-only and beside `KnownSchedulerTerm` for that class's reason: both binaries
+/// compile `WorkerProtocol.cpp` and only one links `FastCache`, so a seam with a `.cpp`
+/// would need a new `_fc_cc_core` row and this needs none. It takes a SINK rather than
+/// an `ILogger` for the same reason -- and it is the shape `Cc::CredentialNotice`
+/// already uses to say a thing once.
+class LeaseEpochNotice
+{
+  public:
+    /// Where the line goes. Empty means say nothing.
+    using Sink = std::function<void(std::string_view)>;
+
+    /// @param sink Where to report; may be empty.
+    explicit LeaseEpochNotice(Sink sink) noexcept:
+        _sink { std::move(sink) }
+    {
+    }
+
+    /// A notice that reports nowhere.
+    ///
+    /// Named rather than a default argument, for `CredentialNotice::Silent`'s reason: a
+    /// defaulted parameter is how a diagnostic comes to be dropped at six call sites. A
+    /// caller with nowhere to report has to say so.
+    /// @return A notice with no sink.
+    [[nodiscard]] static LeaseEpochNotice Silent()
+    {
+        return LeaseEpochNotice { Sink {} };
+    }
+
+    /// Report, if this refusal is an epoch mismatch and nothing has said so since the
+    /// last accepted grant.
+    ///
+    /// **Thread-safe, unlike `CredentialNotice`, and it has to be**: a worker answers
+    /// compiles on a pool sized to its slot cap, so this runs concurrently. The
+    /// `exchange` is what makes exactly one caller the reporter -- a plain read-then-set
+    /// would let every thread in flight print the same paragraph.
+    /// @param refusal Why the grant was refused.
+    /// @return True when this call was the one that reported.
+    bool Observe(LeaseRefusal const& refusal)
+    {
+        if (refusal.reason != LeaseRefusalReason::EpochMismatch)
+            return false;
+        if (_said.exchange(true, std::memory_order_relaxed))
+            return false;
+        if (_sink)
+            _sink(std::format(
+                "refusing every lease: {}. A scheduler whose term went BACKWARDS has been reset -- its Raft "
+                "directory wiped, the cluster re-bootstrapped, or consensus turned off -- and a worker cannot tell "
+                "that from a captured grant being replayed, so it goes on refusing until this process restarts. If "
+                "the reset was intentional, restart this worker; if it was not, the fleet has a scheduler it did "
+                "not mean to reset",
+                refusal.detail));
+        return true;
+    }
+
+    /// Note that a grant was accepted, so the next entry into the condition speaks.
+    ///
+    /// Relaxed, and the race is benign: an accept concurrent with a refusal may let one
+    /// extra line through. That is the direction to be wrong in -- the alternative is a
+    /// reset going unreported because a blip spent the latch.
+    void Accepted() noexcept
+    {
+        _said.store(false, std::memory_order_relaxed);
+    }
+
+    /// @return Whether the condition is currently reported.
+    [[nodiscard]] bool Reported() const noexcept
+    {
+        return _said.load(std::memory_order_relaxed);
+    }
+
+  private:
+    Sink _sink;
+    std::atomic<bool> _said { false };
 };
 
 /// What a verifier expects a grant to say about itself.

@@ -171,7 +171,15 @@ TEST_CASE("The production factory wires the term through, grant to refusal", "[n
     Distributed::KnownSchedulerTerm term;
     NullLogger logger;
 
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, logger);
+    // Recording rather than silent, because the notice's WIRING is the half no unit
+    // test of the notice itself can see: a `LeaseEpochNotice` that works perfectly and
+    // is never reached is the defect it was written to fix (#614). This case already
+    // drives the factory `main.cpp` calls, with a real key file and a real refusal, so
+    // it is the one place the whole chain is observable.
+    std::vector<std::string> said;
+    Distributed::LeaseEpochNotice epochNotice { [&said](std::string_view line) { said.emplace_back(line); } };
+
+    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
     REQUIRE(validator.has_value());
 
     // Nothing learned yet, so this is honoured -- and honouring it is what teaches the
@@ -182,9 +190,28 @@ TEST_CASE("The production factory wires the term through, grant to refusal", "[n
     CHECK(term.Check().Checked());
     CHECK(term.Check().Expected() == CurrentTerm);
 
+    // An accepted grant leaves nothing to report -- and clears the latch, which is what
+    // lets a reset AFTER a period of healthy service still be reported.
+    CHECK(said.empty());
+
     auto const stale = (*validator)(GrantUnder(DeposedTerm), "gcc-13");
     REQUIRE(stale.has_value());
     CHECK(Testing::Unwrap(stale).reason == Distributed::LeaseRefusalReason::EpochMismatch);
+
+    // **And the worker said so.** Without this the notice could be correct in isolation
+    // and reached by nothing, which is exactly the shape of a guard nothing constructs.
+    // Asserted on the CONTENT as well as the count: the line's whole value is that it
+    // carries both terms, so an operator reading it knows the scheduler went backwards
+    // rather than that the cluster is unstable.
+    REQUIRE(said.size() == 1);
+    CHECK(said.front().contains(std::to_string(DeposedTerm)));
+    CHECK(said.front().contains(std::to_string(CurrentTerm)));
+    CHECK(said.front().contains("restart"));
+
+    // Still once, however many more arrive -- a worker refusing every compile must not
+    // fill its log with the same paragraph.
+    CHECK((*validator)(GrantUnder(DeposedTerm), "gcc-13").has_value());
+    CHECK(said.size() == 1);
 }
 
 TEST_CASE("A node with no cluster key builds a validator that learns nothing", "[node][lease][epoch]")
@@ -196,9 +223,10 @@ TEST_CASE("A node with no cluster key builds a validator that learns nothing", "
     // authentic term to believe.
     NodeConfig cfg;
     Distributed::KnownSchedulerTerm term;
+    Distributed::LeaseEpochNotice epochNotice { Distributed::LeaseEpochNotice::Silent() };
     NullLogger logger;
 
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, logger);
+    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
     REQUIRE(validator.has_value());
 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
