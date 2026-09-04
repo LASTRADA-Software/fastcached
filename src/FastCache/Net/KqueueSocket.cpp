@@ -6,6 +6,7 @@
     #include <FastCache/Async/KqueueReactor.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
+    #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
@@ -457,7 +458,7 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
     if (errno != EAGAIN && errno != EINTR)
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 
-    _impl->readOp.awaitable = nullptr;
+    Detail::ClaimReadSlot(_impl->readOp.awaitable);
     _impl->readOp.readBuffer = buffer;
     _impl->readOp.readPeekOnly = false;
     IoAwaitable a;
@@ -488,7 +489,7 @@ IoAwaitable KqueueSocket::WaitReadable()
     if (errno != EAGAIN && errno != EINTR)
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 
-    _impl->readOp.awaitable = nullptr;
+    Detail::ClaimReadSlot(_impl->readOp.awaitable);
     _impl->readOp.readBuffer = {};
     _impl->readOp.readPeekOnly = true;
     IoAwaitable a;

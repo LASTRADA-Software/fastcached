@@ -6,6 +6,7 @@
     #include <FastCache/Async/EpollReactor.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
+    #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <sys/socket.h>
@@ -473,7 +474,7 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 
     // Park: arm EPOLLIN and wait for the reactor to deliver readability.
-    _impl->readOp.awaitable = nullptr;
+    Detail::ClaimReadSlot(_impl->readOp.awaitable);
     _impl->readOp.readBuffer = buffer;
     _impl->readOp.readPeekOnly = false;
     IoAwaitable a;
@@ -506,7 +507,7 @@ IoAwaitable EpollSocket::WaitReadable()
         return IoAwaitable { std::unexpected(MakePosixError(errno, "recv")) };
 
     // Park: arm EPOLLIN, completing without consuming when readable.
-    _impl->readOp.awaitable = nullptr;
+    Detail::ClaimReadSlot(_impl->readOp.awaitable);
     _impl->readOp.readBuffer = {};
     _impl->readOp.readPeekOnly = true;
     IoAwaitable a;

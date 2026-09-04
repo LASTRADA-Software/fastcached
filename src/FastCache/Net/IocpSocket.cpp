@@ -6,6 +6,7 @@
     #include <FastCache/Async/IocpReactor.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
+    #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <winsock2.h>
@@ -308,7 +309,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto& op = _impl->readOp;
-    op.awaitable = nullptr; // populated by the suspend callback below
+    Detail::ClaimReadSlot(op.awaitable); // repopulated by the suspend callback below
     op.readPeekOnly = false;
     op.completion.overlapped = OVERLAPPED {};
 
@@ -343,7 +344,7 @@ IoAwaitable IocpSocket::WaitReadable()
     // those cases, so `Dispatch` peeks to tell them apart -- see `Op::readPeekOnly`.
     // The caller is expected to issue a real Read next.
     auto& op = _impl->readOp;
-    op.awaitable = nullptr;
+    Detail::ClaimReadSlot(op.awaitable);
     op.readPeekOnly = true;
     op.completion.overlapped = OVERLAPPED {};
 
