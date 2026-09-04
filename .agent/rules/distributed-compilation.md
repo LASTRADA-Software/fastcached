@@ -590,12 +590,20 @@ Consequences that are each load-bearing:
       the only writer by construction; while the responder answers it writes nothing, so
       the pulse takes over, and `SettlePulse` is where that stops being true. A reply
       written over a pulse still suspended inside `Write` is two writes sharing one
-      write-op slot -- the read-side family this endpoint already arms a watch against --
-      and it does not fail loudly, it splices five bytes into an object file. A pulse
-      still parked past the bound therefore ENDS the connection, which is `SettleWatch`'s
-      rule applied to the write side, and the `break` falling through to `Close()` is the
-      only cancellation a parked write has. It is bounded and ordinarily costs one step,
-      because the pulse wakes on a clock this side owns rather than on the peer.
+      write-op slot -- the same family as the READ slot's #663, reached from the other
+      direction -- and it does not fail loudly, it splices five bytes into an object
+      file. A pulse still parked past the bound therefore ENDS the connection, which is
+      `SettleWatch`'s rule applied to the write side, and the `break` falling through to
+      `Close()` is the only cancellation a parked write has. It is bounded and ordinarily
+      costs one step, because the pulse wakes on a clock this side owns rather than on
+      the peer.
+      - **And nothing asserts it, which is the asymmetry to know about.** #663 put
+        `Detail::ClaimReadSlot` on the READ slot, so double-arming that one dies in a
+        Debug build naming itself; there is no `ClaimWriteSlot`, so the write slot is
+        exactly as shared and entirely silent. A reader arriving from #663 would
+        reasonably assume symmetry and there is none: `ReclaimFromPulse` is the whole
+        guarantee here, and the ordering test is the only thing that would notice it
+        going away.
     - **A test that only watches the answer cannot see any of it.** Reading one framed
       reply stops at the first terminal status, so a pulse emitted AFTER the reply -- what
       a missing settle produces -- is invisible, and a case asserting "every frame but the
