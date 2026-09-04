@@ -1184,9 +1184,19 @@ So:
 - **Before concluding "nothing there", state what was searched and whether that
   search could have found it.** "I grepped the log for the ctest block" and "CI
   produces no test output" are different claims, and only the first one was made.
-- **A tool that will not GIVE you the answer says so in a sentence that reads like
-  "there is no answer".** Retrieving a failing CI job's log, both of these are
-  false negatives and neither is an error:
+- **A finished job's log is available while its RUN is still in progress — and the
+  CLI says otherwise.** That is the fact; everything below is how to act on it.
+  It matters because the moment somebody wants a failing job's log is precisely
+  the moment the rest of the run is still going, so the tool's refusal arrives
+  exactly when it is most convincing and least true.
+
+  ```
+  gh api repos/<owner>/<repo>/actions/jobs/<id>/logs --allow-escape-sequences
+  ```
+
+  **A tool that will not GIVE you the answer says so in a sentence that reads like
+  "there is no answer".** Both of these are false negatives and neither is an
+  error:
 
   ```
   gh run view --job <id> --log
@@ -1198,12 +1208,7 @@ So:
          empty result
   ```
 
-  The log was available the whole time. What works is
-  `gh api repos/<owner>/<repo>/actions/jobs/<id>/logs --allow-escape-sequences`,
-  and the job need only be *finished itself* — the surrounding RUN may still be
-  in progress, which is exactly when somebody is trying to read it.
-
-  Cost of not knowing this: an hour treating a retrievable log as gated, and an
+  The log was available the whole time. Cost of not knowing this: an hour treating a retrievable log as gated, and an
   intermittent attributed to three successive wrong hypotheses while the answer
   sat one flag away. **Two different messages, both of which say "nothing here",
   neither of which means it** — which is this rule's own subject arriving in the
