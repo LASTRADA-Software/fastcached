@@ -2,6 +2,8 @@
 #include <FastCache/Config/ConfigMerge.hpp>
 
 #include <array>
+#include <expected>
+#include <filesystem>
 #include <format>
 #include <string>
 #include <string_view>
@@ -74,6 +76,9 @@ Config Merge(Config fileCfg, CliResult const& cli)
     MergeField(fileCfg, cli, &CliResult::compressionExplicit, &Config::compression);
     MergeField(fileCfg, cli, &CliResult::compressionLevelExplicit, &Config::compressionLevel);
     MergeField(fileCfg, cli, &CliResult::compressionMinBytesExplicit, &Config::compressionMinBytes);
+    MergeField(fileCfg, cli, &CliResult::memoryCompressionExplicit, &Config::memoryCompression);
+    MergeField(fileCfg, cli, &CliResult::memoryCompressionLevelExplicit, &Config::memoryCompressionLevel);
+    MergeField(fileCfg, cli, &CliResult::memoryCompressionMinBytesExplicit, &Config::memoryCompressionMinBytes);
 
     // Three legacy "value-comparison" shapes remain because they have no
     // explicit-bit: `configPath` and `pidfile` are non-empty when set
@@ -98,6 +103,44 @@ Config Merge(Config fileCfg, CliResult const& cli)
     if (!cliCfg.binds.empty())
         fileCfg.binds = cliCfg.binds;
     return fileCfg;
+}
+
+std::expected<EffectiveConfig, ConfigError> AssembleEffectiveConfig(std::filesystem::path const& configPath,
+                                                                    ConfigSources const& sources)
+{
+    EffectiveConfig assembled;
+
+    // The FILE first, because the command line runs over it. With no path there is
+    // no file, and `YamlConfigWithPresence{}` says exactly that: compiled-in
+    // defaults, and every presence bit false.
+    if (!configPath.empty())
+    {
+        auto loaded = ReadYamlConfigWithPresence(configPath);
+        if (!loaded.has_value())
+            return std::unexpected(std::move(loaded).error());
+        assembled.file = std::move(*loaded);
+    }
+
+    // The command line SECOND. That is the whole of "the command line wins" -- one
+    // loop over the same fields, running after the file's, consulting the
+    // provenance the parse recorded rather than comparing values to defaults.
+    assembled.config = Merge(assembled.file.config, sources.cli);
+
+    // The file the daemon is running from, so the snapshot names it. `Merge` cannot
+    // supply this: `configPath` reaches it only from the command line, and a
+    // DISCOVERED file was never typed there.
+    if (!configPath.empty())
+        assembled.config.configPath = configPath.string();
+
+    // The environment LAST, and only where neither of the two above named the
+    // setting. Precedence is therefore CLI > file > environment > default, so a
+    // stray `FASTCACHED_METRICS_PORT` cannot outrank a `metrics_port:` an operator
+    // wrote -- even when they wrote the compiled-in default, which the file's own
+    // presence bit is what makes distinguishable from silence.
+    if (sources.metricsPortEnv.has_value() && !sources.cli.metricsPortExplicit && !assembled.file.metricsPortExplicit)
+        assembled.config.metricsPort = *sources.metricsPortEnv;
+
+    return assembled;
 }
 
 std::expected<void, ConfigError> ValidateBindFlagShape(CliResult const& cli, std::span<BindConfig const> binds)

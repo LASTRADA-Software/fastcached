@@ -538,6 +538,42 @@ namespace
           .description = "skip compression for values smaller than this; k/m/g accepted (default 256)",
           .yamlKey = "compression_min_bytes",
           .same = FieldEq<&Config::compressionMinBytes>() },
+        // The IN-MEMORY tier's three, and they are separate flags rather than a
+        // second meaning for the ones above because they configure a different
+        // tier: `--compression` decides what the CoW store writes to disk, these
+        // decide what the L1 LRU holds in RAM, and a deployment routinely wants
+        // zstd on disk and nothing in memory. They arrived as file-only keys
+        // ([#623](https://github.com/LASTRADA-Software/fastcached/issues/623)),
+        // which made them invisible to everything the option table drives -- the
+        // reload column could not answer for them, and `--install-service` replays
+        // a command line, so an operator who set them in a file had no way for the
+        // setting to reach the unit at all.
+        { .primary = "--memory-compression",
+          .arity = Arity::Value,
+          .operand = "=<codec>",
+          .apply = AssignFrom<&Config::memoryCompression, ParseCompression>(),
+          .explicitBit = &CliResult::memoryCompressionExplicit,
+          .description = "in-memory value codec for the L1 tier: none|lz4|zstd (default none)\n"
+                         "independent of --compression, which is the on-disk one",
+          .yamlKey = "memory_compression",
+          .same = FieldEq<&Config::memoryCompression>() },
+        { .primary = "--memory-compression-level",
+          .arity = Arity::Value,
+          .operand = "=<N>",
+          .apply = AssignFrom<&Config::memoryCompressionLevel, ParseCompressionLevel>(),
+          .explicitBit = &CliResult::memoryCompressionLevelExplicit,
+          .description = "codec effort level for --memory-compression (1..22; default 3, zstd)",
+          .yamlKey = "memory_compression_level",
+          .same = FieldEq<&Config::memoryCompressionLevel>() },
+        { .primary = "--memory-compression-min-bytes",
+          .arity = Arity::Value,
+          .operand = "=<size>",
+          .apply = AssignFrom<&Config::memoryCompressionMinBytes, ParseCompressionMinBytes>(),
+          .explicitBit = &CliResult::memoryCompressionMinBytesExplicit,
+          .description = "keep in-memory values smaller than this uncompressed; k/m/g accepted\n"
+                         "(default 4096)",
+          .yamlKey = "memory_compression_min_bytes",
+          .same = FieldEq<&Config::memoryCompressionMinBytes>() },
         { .primary = "--lru-mode",
           .arity = Arity::Value,
           .operand = "=<mode>",
@@ -707,7 +743,7 @@ namespace
 
     /// Whether some option row is spelled @p flag.
     ///
-    /// The three assertions below are all "walk one table against another", and
+    /// The assertions below are all "walk one table against another", and
     /// written inline that is a nested lambda each time. Named, each assertion reads
     /// as the sentence it is checking.
     /// @param flag The primary spelling to look for.
@@ -715,14 +751,6 @@ namespace
     [[nodiscard]] constexpr bool IsOptionRow(std::string_view flag) noexcept
     {
         return std::ranges::any_of(Options, [flag](OptionSpec<CliResult> const& spec) { return spec.primary == flag; });
-    }
-
-    /// Whether some option row answers to the configuration-file key @p key.
-    /// @param key The YAML key to look for.
-    /// @return True when a row claims it.
-    [[nodiscard]] constexpr bool SomeRowClaimsKey(std::string_view key) noexcept
-    {
-        return std::ranges::any_of(Options, [key](OptionSpec<CliResult> const& spec) { return spec.yamlKey == key; });
     }
 
     /// Whether @p flag is excused from carrying a key, with a reason given.
@@ -783,45 +811,30 @@ namespace
                                              }),
                   "a reloadable row must be one a file can carry, and something must be reloadable");
 
-    /// Settings a file can carry that no flag can. See `YamlOnlySetting`.
-    constexpr auto YamlOnly = std::to_array<YamlOnlySetting>({
-        { .key = "memory_compression",
-          .reason = "no --memory-compression flag exists yet (#623)",
-          .same = FieldEq<&Config::memoryCompression>() },
-        { .key = "memory_compression_level",
-          .reason = "no --memory-compression-level flag exists yet (#623)",
-          .same = FieldEq<&Config::memoryCompressionLevel>() },
-        { .key = "memory_compression_min_bytes",
-          .reason = "no --memory-compression-min-bytes flag exists yet (#623)",
-          .same = FieldEq<&Config::memoryCompressionMinBytes>() },
-    });
-
-    /// An entry here is the option table's gap, so it must not overlap it, and it
-    /// must carry the comparator that is the only reason it is written down.
-    static_assert(std::ranges::all_of(YamlOnly,
-                                      [](YamlOnlySetting const& entry) {
-                                          return !entry.key.empty() && !entry.reason.empty() && entry.same != nullptr
-                                                 && !SomeRowClaimsKey(entry.key);
-                                      }),
-                  "a YAML-only setting must name a key no option row claims, and carry a reason and a comparator");
-
     /// How many settings a configuration file can carry.
-    /// @return The option rows with a key, plus the settings no flag can express.
+    ///
+    /// The option rows with a key, and nothing else. There used to be a second
+    /// source — three `memory_compression*` keys the reader accepted and no flag
+    /// could express — and #623 gave them rows and deleted it. It is worth stating
+    /// what that bought rather than leaving it as tidying: a setting reachable from
+    /// a file and not from argv is two mechanisms for one thing, invisible to
+    /// everything this table drives (the reload column could not answer for it) and
+    /// unable to survive `--install-service`, which replays a command line.
+    /// @return The number of option rows carrying a `yamlKey`.
     [[nodiscard]] consteval std::size_t ConfigFileSettingCount() noexcept
     {
         auto const keyed =
             std::ranges::count_if(Options, [](OptionSpec<CliResult> const& spec) { return !spec.yamlKey.empty(); });
-        return static_cast<std::size_t>(keyed) + YamlOnly.size();
+        return static_cast<std::size_t>(keyed);
     }
 
-    /// The two declarations merged, at compile time.
+    /// The keyed rows projected out of the option table, at compile time.
     ///
     /// `consteval` and an array rather than a lazily built `std::vector`: the
     /// accessor is `noexcept`, and a function-local static that allocates makes that
     /// a lie the first time it is called. It also removes the initialisation
-    /// entirely — the merged set is in `.rodata` beside the two tables it is built
-    /// from.
-    /// @return Every setting a file can carry, option rows first, in table order.
+    /// entirely — the set is in `.rodata` beside the table it is built from.
+    /// @return Every setting a file can carry, in table order.
     [[nodiscard]] consteval std::array<ConfigFileSetting, ConfigFileSettingCount()> MakeConfigFileSettings()
     {
         std::array<ConfigFileSetting, ConfigFileSettingCount()> merged {};
@@ -834,25 +847,21 @@ namespace
         for (auto const& spec: Options)
             if (!spec.yamlKey.empty())
                 merged[next++] = { .key = spec.yamlKey, .reloadable = spec.reloadable, .same = spec.same };
-        // No reloadability to decide for these: a setting nothing re-applies at
-        // runtime is immutable, which is why `YamlOnlySetting` carries no column.
-        for (auto const& entry: YamlOnly)
-            merged[next++] = { .key = entry.key, .reloadable = Reloadable::No, .same = entry.same };
         return merged;
     }
 
     constexpr auto FileSettings = MakeConfigFileSettings();
 
-    /// The merge is exact, or a caller sees fewer settings than are declared.
+    /// The projection is exact, or a caller sees fewer settings than are declared.
     ///
-    /// A dropped entry would satisfy every assertion above — those are about the two
-    /// SOURCES — while leaving the reload blind to whatever fell out, which is this
-    /// whole ticket's shape one level up.
+    /// A dropped entry would satisfy every assertion above — those are about the
+    /// SOURCE — while leaving the reload blind to whatever fell out, which is #406's
+    /// shape one level up.
     static_assert(std::ranges::all_of(FileSettings,
                                       [](ConfigFileSetting const& setting) {
                                           return !setting.key.empty() && setting.same != nullptr;
                                       }),
-                  "every merged config-file setting must carry a key and a comparator");
+                  "every config-file setting must carry a key and a comparator");
 
     /// The config locations `--help` lists, one per line, indented under the
     /// description column. Read straight off the table the lookup itself walks,
@@ -945,11 +954,6 @@ namespace
 std::span<OptionSpec<CliResult> const> CliOptions() noexcept
 {
     return Options;
-}
-
-std::span<YamlOnlySetting const> YamlOnlySettings() noexcept
-{
-    return YamlOnly;
 }
 
 std::span<ConfigFileSetting const> ConfigFileSettings() noexcept

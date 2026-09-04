@@ -331,6 +331,9 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
     emitIfExplicit("compression", cfg.compression, cli.compressionExplicit);
     emitIfExplicit("compression-level", cfg.compressionLevel, cli.compressionLevelExplicit);
     emitIfExplicit("compression-min-bytes", cfg.compressionMinBytes, cli.compressionMinBytesExplicit);
+    emitIfExplicit("memory-compression", cfg.memoryCompression, cli.memoryCompressionExplicit);
+    emitIfExplicit("memory-compression-level", cfg.memoryCompressionLevel, cli.memoryCompressionLevelExplicit);
+    emitIfExplicit("memory-compression-min-bytes", cfg.memoryCompressionMinBytes, cli.memoryCompressionMinBytesExplicit);
     emitIfExplicit("auth-username", cfg.authUsername, cli.authUsernameExplicit);
     emitSwitch("tls", {}, cfg.tlsEnabled, cli.tlsEnabledExplicit);
     emitPathIfExplicit("tls-cert", cfg.tlsCertPath, cli.tlsCertPathExplicit);

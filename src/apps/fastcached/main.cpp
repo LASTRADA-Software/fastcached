@@ -627,7 +627,15 @@ struct StorageBackendBundle
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
 /// IDaemonHost was selected (Foreground / Posix double-fork / Windows
 /// service).
-int DaemonBody(FastCache::Config const& effective, std::span<FastCache::RejectedCandidate const> rejected)
+/// @param effective The configuration this process starts with.
+/// @param rejected Config candidates the lookup declined, re-reported through the
+///        logger because a service has no console for the stderr line to land on.
+/// @param sources The command line and environment fallback that, with the file,
+///        produced @p effective. Handed to `ConfigReloader` so a SIGHUP rebuilds
+///        the candidate the same way (#622).
+int DaemonBody(FastCache::Config const& effective,
+               std::span<FastCache::RejectedCandidate const> rejected,
+               FastCache::ConfigSources const& sources)
 {
     // A service gets the event log, everything else gets stderr. The factory answers
     // nullptr wherever there is no event log, which is how this stays one expression
@@ -649,7 +657,7 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
     // operator edits a file it has declined to read.
     for (auto const& [path, reason]: rejected)
         logger.Logf(FastCache::LogLevel::Error, "{}: {}", path.string(), reason);
-    FastCache::ConfigReloader reloader { effective, effective.configPath };
+    FastCache::ConfigReloader reloader { effective, effective.configPath, sources };
     FastCache::SteadyClock steadyClock;
     // The engine reads the clock once per command, and on Windows that is a
     // QueryPerformanceCounter — ~16 ns, which measured as roughly a third of the
@@ -1155,64 +1163,59 @@ int main(int argc, char const* const* argv)
     for (auto const& [path, reason]: lookup.rejected)
         std::println(std::cerr, "fastcached: {}: {}", path.string(), reason);
 
-    FastCache::Config effective;
-    bool metricsPortYamlExplicit = false;
+    // The two sources besides the file, resolved once and KEPT: `ConfigReloader`
+    // below is handed the same object, so a SIGHUP rebuilds the candidate exactly
+    // the way this start built the live configuration. Re-reading the file alone
+    // republished every setting it did not mention at its built-in default —
+    // `--max-memory=8g` came back as a fraction of host RAM and the storage evicted
+    // down to it, silently (#622).
+    //
+    // The precedence the assembly implements is CLI > config-file > env > default,
+    // so a stray `FASTCACHED_METRICS_PORT` can never override a `metrics_port:` the
+    // operator wrote — even when they wrote the compiled-in default, which the YAML
+    // presence bit is what makes distinguishable from an absent key. A container
+    // that wants the env form simply omits the config/CLI value, letting both the
+    // daemon and its `--healthcheck` probe agree via a single `-e ...`.
+    FastCache::ConfigSources const sources { .cli = *parsed, .metricsPortEnv = MetricsPortFromEnv() };
+
+    auto assembled = FastCache::AssembleEffectiveConfig(configPath, sources);
+    if (!assembled.has_value())
+    {
+        // A file that does not parse is fatal for the command that *serves*,
+        // and for any file the operator named — but not for a discovered one
+        // on the way to some other action. Refusing to uninstall a service
+        // because the file at the default location has a typo blocks the very
+        // recovery the operator reached for, and fails a container health
+        // check whose daemon was started with explicit flags and is serving
+        // perfectly well.
+        // ...and for the conversion, which acts on the merged `storage_path`:
+        // proceeding on a config this run could not read would convert a
+        // different set of files than the daemon opens, or none at all, and
+        // report success either way.
+        if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run
+            || parsed->outcome == FastCache::CliOutcome::MigrateStorage)
+        {
+            std::println(std::cerr, "fastcached: {}", assembled.error().ToString());
+            return EXIT_FAILURE;
+        }
+
+        // Ignored, and the PATH ignored with it: re-assembling against no file at
+        // all is what leaves `configPath` empty, so nothing later re-reads a file
+        // this run declined — the reloader included, since it is handed
+        // `effective.configPath`. Assembling with no path cannot fail.
+        std::println(std::cerr, "fastcached: ignoring {}: {}", configPath, assembled.error().ToString());
+        assembled = FastCache::AssembleEffectiveConfig({}, sources);
+    }
+
+    FastCache::Config const& effective = assembled->config;
+
     // Aggregate "was the legacy single-bind triplet typed by the operator,
     // CLI or YAML?" so a downstream mix-with-`listeners:` check sees both
     // sources. Starts from the CLI explicit bits and ORs in YAML presence.
     auto bindShapeCli = *parsed;
-    effective = parsed->config;
-    if (!configPath.empty())
-    {
-        auto loaded = FastCache::ReadYamlConfigWithPresence(configPath);
-        if (!loaded.has_value())
-        {
-            // A file that does not parse is fatal for the command that *serves*,
-            // and for any file the operator named — but not for a discovered one
-            // on the way to some other action. Refusing to uninstall a service
-            // because the file at the default location has a typo blocks the very
-            // recovery the operator reached for, and fails a container health
-            // check whose daemon was started with explicit flags and is serving
-            // perfectly well.
-            // ...and for the conversion, which acts on the merged `storage_path`:
-            // proceeding on a config this run could not read would convert a
-            // different set of files than the daemon opens, or none at all, and
-            // report success either way.
-            if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run
-                || parsed->outcome == FastCache::CliOutcome::MigrateStorage)
-            {
-                std::println(std::cerr, "fastcached: {}", loaded.error().ToString());
-                return EXIT_FAILURE;
-            }
-
-            // Ignored, and `effective.configPath` deliberately left empty with
-            // it: nothing later should re-read a file this run declined.
-            std::println(std::cerr, "fastcached: ignoring {}: {}", configPath, loaded.error().ToString());
-        }
-        else
-        {
-            metricsPortYamlExplicit = loaded->metricsPortExplicit;
-            bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || loaded->bindAddressExplicit;
-            bindShapeCli.portExplicit = bindShapeCli.portExplicit || loaded->portExplicit;
-            bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || loaded->tlsEnabledExplicit;
-            effective = FastCache::Merge(std::move(loaded->config), *parsed);
-            effective.configPath = configPath;
-        }
-    }
-
-    // Environment fallback for the metrics port: honour FASTCACHED_METRICS_PORT
-    // only when the port has NOT been set explicitly on the CLI *or* in the YAML
-    // config. This makes the precedence CLI > config-file > env > default, so a
-    // stray environment variable can never silently override a `metrics_port:`
-    // the operator wrote in their config file — even when they wrote the
-    // compiled-in default value (e.g. `metrics_port: 9259` is now distinguishable
-    // from "the key was absent" thanks to the YAML presence bit). A container
-    // that wants the env form simply omits the config/CLI value, letting both
-    // the daemon and its `--healthcheck` probe agree on the port via a single
-    // `-e FASTCACHED_METRICS_PORT=...`.
-    if (!parsed->metricsPortExplicit && !metricsPortYamlExplicit)
-        if (auto const envPort = MetricsPortFromEnv())
-            effective.metricsPort = *envPort;
+    bindShapeCli.bindAddressExplicit = bindShapeCli.bindAddressExplicit || assembled->file.bindAddressExplicit;
+    bindShapeCli.portExplicit = bindShapeCli.portExplicit || assembled->file.portExplicit;
+    bindShapeCli.tlsEnabledExplicit = bindShapeCli.tlsEnabledExplicit || assembled->file.tlsEnabledExplicit;
 
     // Converting the store acts on the files and exits; it never runs the daemon
     // body. BEFORE the serving-shape checks below, and after the merge because it
@@ -1329,5 +1332,5 @@ int main(int argc, char const* const* argv)
     if (!host)
         host = std::make_unique<FastCache::ForegroundHost>();
 
-    return host->Run([&effective, &lookup] { return DaemonBody(effective, lookup.rejected); });
+    return host->Run([&effective, &lookup, &sources] { return DaemonBody(effective, lookup.rejected, sources); });
 }

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
 #include <atomic>
@@ -37,10 +38,14 @@ namespace FastCache
 /// So the type varies and the *pipeline* does not. What varies with it arrives as two
 /// injected steps rather than as branches:
 ///
-/// - **`Reparse`** — how a file becomes a candidate configuration. The daemon reads
-///   YAML straight into `Config`; the node applies the same appliers argv reaches, in
-///   the same order, so "the command line wins" stays a question of which loop ran
-///   second rather than a per-field merge.
+/// - **`Reparse`** — how a file becomes a candidate configuration. Both executables
+///   rebuild the candidate the way the START built the live configuration: the node
+///   replays the appliers argv reached, and the daemon re-runs
+///   `AssembleEffectiveConfig` — file, then command line, then environment. So "the
+///   command line wins" stays a question of which loop ran second, at a reload as
+///   much as at a start. The daemon used to read the file and nothing else, which
+///   published a setting nobody had asked for at every SIGHUP
+///   ([#622](https://github.com/LASTRADA-Software/fastcached/issues/622)).
 /// - **`ImmutabilityCheck`** — whether the candidate may replace the live snapshot.
 ///   Both executables now derive this from a **column of their own option table**
 ///   ([#406](https://github.com/LASTRADA-Software/fastcached/issues/406) closed the
@@ -181,25 +186,27 @@ class ConfigReloaderOf
 /// comparator does not compile.
 ///
 /// **The domain is what a FILE can express, and that is not an approximation of
-/// "every field".** The daemon's reload candidate is `ReadYamlConfig(path)` and is
-/// never re-merged with argv, so a field no key can set — `configPath`, `daemon`,
-/// `pidfile`, `serviceName` — sits at its default in every candidate. Guarding those
-/// would refuse *every* reload: `--daemon`, which the systemd unit passes, would
-/// alone be enough. Do not "complete" this by walking rows with no key.
-/// **What widening the guarded set costs, stated rather than discovered.** The
-/// candidate is built from the file alone, so a setting that is in force because
-/// somebody passed a flag — or set `FASTCACHED_METRICS_PORT`, which `main.cpp`
-/// applies after the merge — and that the file does not mention arrives here as a
-/// setting being changed back to its default. The reload is then refused, by name,
-/// until the file carries that value too. That was already true of the ten settings
-/// the old ladder guarded (`--port` with no `port:` has always refused); this makes
-/// it true of every setting a file can carry, which is a wider surface for one
-/// underlying defect: **the candidate is not built the way the live configuration
-/// was built.** Fixing that is
-/// [#622](https://github.com/LASTRADA-Software/fastcached/issues/622) — argv and the
-/// environment fallback are the same half of it — and it is what would change this
-/// domain. Refusing is the right answer until then: publishing instead is the
-/// split-brain the whole function exists to prevent.
+/// "every field".** A field no key can set — `daemon`, `pidfile`, `serviceName` —
+/// reaches the live configuration and every candidate through the *same*
+/// `ConfigSources::cli`, so the two cannot disagree about it however the file is
+/// edited. A row walked for those would be a guard that fires only when nothing is
+/// wrong. Do not "complete" this by walking rows with no key.
+///
+/// Note that this reasoning is the fix's, not the old code's: before #622 those
+/// fields sat at their default in every candidate and guarding them would have
+/// refused *every* reload — `--daemon`, which the systemd unit passes, was enough on
+/// its own. Same conclusion, opposite reason, and the old reason no longer holds.
+///
+/// **What this used to cost, and no longer does.** The candidate was
+/// `ReadYamlConfig(path)` alone, so a setting in force because somebody passed a
+/// flag — or set `FASTCACHED_METRICS_PORT` — and that the file did not mention
+/// arrived here as a setting being changed back to its default: refused by name for
+/// an immutable one, and for a reloadable one *published*, which is how
+/// `--max-memory=8g` became the host default at the first SIGHUP
+/// ([#622](https://github.com/LASTRADA-Software/fastcached/issues/622)). The
+/// candidate is now built by the same `AssembleEffectiveConfig` the start used, so
+/// what the operator asked for is in it whichever source they asked through, and a
+/// difference reaching this function is one the FILE really did introduce.
 ///
 /// @param previous What the daemon is running with.
 /// @param candidate What the file now says.
@@ -207,16 +214,25 @@ class ConfigReloaderOf
 ///         the candidate may be published.
 [[nodiscard]] std::vector<std::string_view> UnreloadableChanges(Config const& previous, Config const& candidate);
 
-/// The daemon's reloader: `Config`, read from YAML, guarded by its option table.
+/// The daemon's reloader: `Config`, reassembled from every source, guarded by its
+/// option table.
 ///
-/// A named type rather than an alias so every existing construction site keeps its
-/// two-argument shape.
+/// A named type rather than an alias, so the two steps the pipeline varies on — how
+/// a candidate is rebuilt and whether it may be published — are supplied by the type
+/// rather than spelled out at every construction site. What the construction site
+/// still has to supply is the one thing only it knows: the sources besides the file.
 class ConfigReloader final: public ConfigReloaderOf<Config>
 {
   public:
     /// @param initial Initial Config; copied into a snapshot.
     /// @param configPath YAML file path (may be empty).
-    ConfigReloader(Config initial, std::filesystem::path configPath);
+    /// @param sources The command line and the environment fallback that, together
+    ///        with the file, produced @p initial. **Required rather than defaulted**:
+    ///        a reloader built without them re-reads the file and publishes a
+    ///        configuration nobody asked for (#622), and a parameter that can be
+    ///        forgotten is a defect that comes back by omission. A caller with
+    ///        genuinely no command line passes `{}` and says so.
+    ConfigReloader(Config initial, std::filesystem::path configPath, ConfigSources sources);
 
     /// The daemon's immutability rule. Exposed so its tests can drive it directly.
     ///

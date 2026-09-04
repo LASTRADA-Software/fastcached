@@ -90,6 +90,9 @@ struct CliResult
     bool compressionExplicit { false };
     bool compressionLevelExplicit { false };
     bool compressionMinBytesExplicit { false };
+    bool memoryCompressionExplicit { false };
+    bool memoryCompressionLevelExplicit { false };
+    bool memoryCompressionMinBytesExplicit { false };
 };
 
 /// The accepted command-line options, in the order `--help` documents them.
@@ -101,39 +104,7 @@ struct CliResult
 /// @return A view of the static table; never empty.
 [[nodiscard]] std::span<OptionSpec<CliResult> const> CliOptions() noexcept;
 
-/// A setting a configuration FILE can carry that no command-line flag can.
-///
-/// **Every entry here is a defect, named rather than hidden.** A setting reachable
-/// from a file and not from argv is two mechanisms for one thing — the shape
-/// `TableIsWellFormed`'s own comment says the `yamlKey` column exists to remove —
-/// and it cannot be registered as a service either, because `--install-service`
-/// replays a command line. Closing that is
-/// [#623](https://github.com/LASTRADA-Software/fastcached/issues/623), which gives
-/// each of these a row and deletes this list.
-///
-/// Until then they still have to be answered for, because they are live-wired and
-/// a reload that accepted one would leave the running daemon disagreeing with the
-/// configuration that claims to describe it. That is what `same` is for: it is the
-/// *same* comparator type the option table's own column carries, so `ValidateImmutable`
-/// walks the two lists with one rule rather than two. There is no reloadability
-/// column, because there is nothing to decide — a setting nothing re-applies at
-/// runtime is immutable, and a fourth entry that were genuinely reloadable would
-/// have to earn a subscriber in `main.cpp` first.
-struct YamlOnlySetting
-{
-    std::string_view key;        ///< The YAML key, which is what a refusal names.
-    std::string_view reason;     ///< Why no option row answers for it.
-    SameFieldFn<CliResult> same; ///< Whether two configurations agree about this setting.
-};
-
-/// Every setting a file can carry that `CliOptions()` cannot express.
-///
-/// Exposed only so a test can state that this list is not empty. Everything that
-/// asks what a FILE can carry asks `ConfigFileSettings()` instead — see there.
-/// @return The list; empty once #623 lands.
-[[nodiscard]] std::span<YamlOnlySetting const> YamlOnlySettings() noexcept;
-
-/// One setting a configuration file can carry, whatever declares it.
+/// One setting a configuration file can carry.
 struct ConfigFileSetting
 {
     std::string_view key {};                  ///< The YAML key, which is what a refusal names.
@@ -141,18 +112,21 @@ struct ConfigFileSetting
     SameFieldFn<CliResult> same { nullptr };  ///< Whether two configurations agree about it.
 };
 
-/// Every setting a configuration file can carry, from both places that declare one.
+/// Every setting a configuration file can carry.
 ///
-/// **One accessor rather than two lists every caller remembers to walk.** The
-/// accepted key set is the option table's `yamlKey` column PLUS
-/// `YamlOnlySettings()`, and three consumers need it — the reader's gate, the
-/// reload check, and the test that connects them. A caller that walked only
-/// `CliOptions()` would be right about most settings and silently blind to the
-/// rest, which is
+/// **One accessor rather than a walk every caller re-spells.** The accepted key set
+/// is the option table's `yamlKey` column, and three consumers need it — the
+/// reader's gate, the reload check, and the test that connects them.
+///
+/// It used to be that column PLUS a second list of keys no flag could express, and
+/// the accessor existed so no consumer would walk one and be silently blind to the
+/// other — which is
 /// [#406](https://github.com/LASTRADA-Software/fastcached/issues/406)'s own failure
-/// shape one level up. So the split is not visible here, and #623 deletes a
-/// *source* rather than a walk in every consumer.
-/// @return The merged set, option rows first, in table order. Never empty.
+/// shape one level up. [#623](https://github.com/LASTRADA-Software/fastcached/issues/623)
+/// gave those three keys option rows and deleted the second source, so this now has
+/// one input; keeping the accessor is what made that a change to a *source* rather
+/// than to every consumer, and it is why the next such key costs nothing here.
+/// @return The settings, in table order. Never empty.
 [[nodiscard]] std::span<ConfigFileSetting const> ConfigFileSettings() noexcept;
 
 /// Whether a configuration file may carry @p key at its top level.
