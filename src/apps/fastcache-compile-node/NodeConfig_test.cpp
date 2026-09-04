@@ -925,6 +925,49 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
+TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][policy]")
+{
+    // **The configuration that took the packaging jobs red on master**
+    // ([#770](https://github.com/LASTRADA-Software/fastcached/issues/770)), written out
+    // exactly as `.github/workflows/build.yml` writes it into the file the unit's
+    // ExecStart names:
+    //
+    //     scheduler: 127.0.0.1:6675
+    //     advertise: 127.0.0.1:6676
+    //     toolchain:
+    //       - /usr/bin/g++
+    //
+    // No `listen_node:` -- under socket activation the UNIT owns the address, so the
+    // flag "still holds a value that describes nothing" and its default (6674) is not
+    // the port this worker serves. #594's rule compared the advertised port against
+    // that default, refused, and the service exited 2: the socket accepted the
+    // activating connection, nothing came up, and the job failed on "a connection did
+    // not bring the worker up".
+    //
+    // Invisible to every other suite because none of them is socket-activated, which
+    // is why this case is written from the workflow's own bytes rather than from a
+    // shape that seemed representative.
+    NodeConfig packaged;
+    packaged.scheduler = "127.0.0.1:6675";
+    packaged.advertise = "127.0.0.1:6676";
+    packaged.toolchains = { "/usr/bin/g++" };
+    // `nodeListen` keeps its default AND `nodeListenExplicit` stays false -- which is
+    // the whole point. Asserted rather than assumed, so a later change to the default
+    // cannot quietly turn this into a case about some other configuration.
+    REQUIRE_FALSE(packaged.nodeListenExplicit);
+    REQUIRE(packaged.nodeListen == "127.0.0.1:6674");
+    REQUIRE(packaged.advertise != packaged.nodeListen);
+
+    CHECK_FALSE(StartupPolicyRejection(packaged).has_value());
+
+    // And an install of the same shape is accepted too: `NodeInstallRejection`
+    // composes this table, and a socket-activated worker is installed exactly like
+    // this. Without it the rule would refuse at registration instead of at start --
+    // the same fault moved one step earlier, where an operator is watching.
+    packaged.installService = true;
+    CHECK_FALSE(NodeInstallRejection(packaged).has_value());
+}
+
 TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not serve is refused", "[node][policy]")
 {
     // **The startup reachability rules judged the advertised HOST and never its port**,
@@ -943,6 +986,12 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
         cfg.scheduler = std::string { SchedulerEndpoint };
         cfg.toolchains = { "/usr/bin/g++" };
         cfg.nodeListen = "6675";
+        // **Set together, because a parse cannot produce one without the other.** The
+        // rule only judges a port the operator NAMED (#770), and a fixture assigning
+        // the value while leaving the provenance bit false models a configuration no
+        // command line can produce -- the same shape as the nine fixtures #386
+        // exposed, one flag along.
+        cfg.nodeListenExplicit = true;
         return cfg;
     };
 
