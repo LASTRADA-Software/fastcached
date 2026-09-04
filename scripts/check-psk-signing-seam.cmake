@@ -213,7 +213,36 @@ foreach(source IN LISTS sources)
         continue()
     endif()
 
-    file(STRINGS "${source}" namingLines REGEX "${FastCachedPskCallRegex}")
+    # Read whole and split by hand, never `file(STRINGS)`: that call returns a CMake
+    # LIST, and an UNBALANCED `[` or `]` on a KEPT line merges that element with the
+    # ones after it, so everything past the bracket vanishes from the scan. It takes
+    # a PATH, so there is nothing to neutralise beforehand.
+    #
+    # Blanking the brackets is safe HERE and is not safe everywhere: this reader
+    # matches `HmacSha256[ \t]*\(`, which contains none. Where brackets are the data --
+    # `check-tsan-scope`, whose rows are Catch2 tags like `[async]` -- the remedy is
+    # a list-free offset walk instead, and blanking them makes that check refuse on a
+    # good tree. Measured, in this branch.
+    #
+    # Fifth-and-counting copy of this idiom; consolidating them is
+    # [#495](https://github.com/LASTRADA-Software/fastcached/issues/495) and is
+    # deliberately not done here.
+    #
+    # MEASURED, and this one is SILENT rather than loud: injecting one `]`
+    # into a comment on the FIRST of two matching lines in
+    # `Cluster/DiscoveryWire_test.cpp` took the reported count from 15 calls
+    # in test sources to 14, while the check still PASSED. A call to the PSK
+    # signing seam simply stopped being counted. Injecting on a file with only
+    # ONE matching line changes nothing, because there is no second element to
+    # merge with -- which is why exposure is a property of (reader, file,
+    # surviving lines) and never of the script.
+    file(READ "${source}" namingText)
+    string(REPLACE "\\" " " namingText "${namingText}")
+    string(REPLACE ";" " " namingText "${namingText}")
+    string(REPLACE "[" " " namingText "${namingText}")
+    string(REPLACE "]" " " namingText "${namingText}")
+    string(REGEX REPLACE "\r?\n" ";" namingLines "${namingText}")
+    list(FILTER namingLines INCLUDE REGEX "${FastCachedPskCallRegex}")
     if(namingLines STREQUAL "")
         # The name appears only in prose here. Not a violation, and not a match.
         continue()
