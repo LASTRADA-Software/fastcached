@@ -305,8 +305,26 @@ file(READ "${check}" checkText)
 # every quoted string after the table as well and staged a page under an empty
 # path. That is the reason the check itself walks its own subject, recorded two
 # files apart and learned twice.
+#
+# `[` and `]` are blanked along with `;`, and the omission was the point of #510:
+# this split escaped semicolons and left brackets alone, so one UNBALANCED
+# bracket anywhere in the check it reads would merge every line after it into a
+# single element and the exemption table would silently stop parsing.
+#
+# It is worth naming what this file is: a SELFTEST, written after #510 was filed,
+# reproducing the very defect #510 is about. A rule stated in the file that obeys
+# it is never learned by the file that does not -- and here the file that did not
+# is the one whose job is to watch a check refuse.
+#
+# Safe to blank here because the fields this parses are `path|phrase|reason` and
+# none is bracketed. Where brackets ARE the data, blanking them is wrong and the
+# remedy is a list-free offset walk instead -- see `check-tsan-scope`, whose rows
+# are Catch2 tags like `[async]`.
 string(REGEX REPLACE "\r\n" "\n" checkText "${checkText}")
-string(REPLACE ";" "\\;" checkText "${checkText}")
+string(REPLACE "\\" " " checkText "${checkText}")
+string(REPLACE ";" " " checkText "${checkText}")
+string(REPLACE "[" " " checkText "${checkText}")
+string(REPLACE "]" " " checkText "${checkText}")
 string(REPLACE "\n" ";" checkLines "${checkText}")
 set(FastCachedSelftestExemptions "")
 set(inExemptions FALSE)

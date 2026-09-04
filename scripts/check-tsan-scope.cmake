@@ -106,11 +106,45 @@ endif()
 # legally contain parentheses (`[a]&&([b]||[c])`), which is exactly the edit the
 # messages below invite; a block match would stop at the first of those, silently
 # drop every row after it, and then fail on unrelated files for "carrying no tag".
-file(STRINGS "${FastCachedTsanGate}" gateLines)
+# Walked with `FIND`/`SUBSTRING` and never turned into a CMake list -- not
+# `file(STRINGS)`, and NOT the neutralising split the sibling checks use.
+#
+# `file(STRINGS)` returns a LIST, and an UNBALANCED `[` or `]` on a KEPT line
+# merges elements. MEASURED here: one `]` added to a comment on the `TARGETS=(`
+# line took this check from a clean pass to a hard refusal, because it could no
+# longer find the table.
+#
+# **But the usual remedy is wrong for this reader, and trying it is how the
+# stronger rule gets learned twice.** Blanking `[` and `]` before splitting is
+# what the other checks do, and here the brackets ARE THE DATA: a Catch2 tag is
+# spelled `[async]`, so neutralising them makes the table name no tags at all and
+# the check refuses on a perfectly good tree. Measured -- the first attempt at
+# this fix did exactly that. The rulebook already says so: *where brackets must
+# survive, do not neutralise them -- read the lines without ever building a CMake
+# list, which is immune by construction rather than by convention*, and it
+# records the same over-broad fix taking `check-worker-refusals-counted` from
+# three refusal spellings to zero.
+#
+# So this walks the content by offset. Nothing here is ever a list, so there is
+# nothing for CMake's list parser to group, and every bracket reaches the tag
+# matcher untouched. `check-test-names.cmake` reads its sources the same way and
+# for the same reason.
+file(READ "${FastCachedTsanGate}" gateContent)
+string(REPLACE "\r\n" "\n" gateContent "${gateContent}")
 set(inTable FALSE)
 set(targetRows "")
 set(sawTable FALSE)
-foreach(line IN LISTS gateLines)
+while(NOT gateContent STREQUAL "")
+    string(FIND "${gateContent}" "\n" gateNewline)
+    if(gateNewline EQUAL -1)
+        set(line "${gateContent}")
+        set(gateContent "")
+    else()
+        string(SUBSTRING "${gateContent}" 0 ${gateNewline} line)
+        math(EXPR gateNewline "${gateNewline} + 1")
+        string(SUBSTRING "${gateContent}" ${gateNewline} -1 gateContent)
+    endif()
+
     if(inTable)
         if(line MATCHES "^\\)")
             set(inTable FALSE)
@@ -122,7 +156,7 @@ foreach(line IN LISTS gateLines)
         set(inTable TRUE)
         set(sawTable TRUE)
     endif()
-endforeach()
+endwhile()
 
 if(NOT sawTable OR inTable)
     message(FATAL_ERROR

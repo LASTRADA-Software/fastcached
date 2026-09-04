@@ -552,6 +552,46 @@ set_tests_properties("net-boundary" PROPERTIES
     TIMEOUT 60
 )
 
+# And the half that did not exist. `net-boundary` had NO selftest: nothing had
+# ever watched it refuse, which by this tree's standard means it was not a guard
+# -- and it had been carrying a wrong rule for as long as the rule existed (#517,
+# where `\.` is not a valid CMake escape, so the `..` test evaluated as
+# `(^|/)..(/|$)` and matched any two-character segment).
+#
+# Three defects, all found by writing this fixture, all invisible to a passing
+# run:
+#
+#   * one stray `]` in a comment on an include line made the check pass over a
+#     real cross-boundary include -- `file(STRINGS)` returns a list an unbalanced
+#     bracket merges (#518, which classified this as PARTIAL from a clean-tree
+#     injection; with a violation planted it is silent, not partial);
+#   * the empty-directory guard -- the one its own comment calls "the one failure
+#     mode a boundary test must not be allowed to have" -- could never fire,
+#     because `if(unitSources STREQUAL "")` reads an UNSET variable as the
+#     literal string `unitSources`; and
+#   * nothing pinned either direction of the `..` rule.
+#
+# Seven cases, and the three that carry the weight are `bracket` (a planted
+# violation behind a bracket), `bracketAlone` (so `bracket` cannot pass for the
+# wrong reason) and `vacuous`. Each has been WATCHED to fail: removing the
+# bracket neutralisation reddens `bracket` alone, unquoting the guard reddens
+# `vacuous` alone, and restoring the old `..` regex reddens `twochar` alone.
+#
+# Synthesised trees under a scratch directory, never the real source root, so
+# nothing can be left behind in the worktree.
+add_test(
+    NAME "net-boundary-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/net-boundary-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-net-boundary-selftest.cmake"
+)
+set_tests_properties("net-boundary-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 # ---------------------------------------------------------------------------
 # Test-name hygiene. Fails when a Catch2 case is named something the CTest
 # registration cannot hand back to the runner.

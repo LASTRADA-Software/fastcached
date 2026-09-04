@@ -165,8 +165,46 @@ fastcached_split_rows(FastCachedNetStandaloneLeaves standaloneLeaves standaloneL
 # @param includesOut Set to the list of in-tree include targets, relative to
 #        src/FastCache. A spelling that cannot be classified is returned verbatim
 #        behind a `!` marker, which the caller reports as its own violation.
+# Read whole and split by hand, never `file(STRINGS)`.
+#
+# `file(STRINGS)` returns a CMake LIST, and CMake's list parser treats an
+# UNBALANCED `[` or `]` as grouping -- so one stray bracket in a comment on a
+# KEPT line merges that element with the ones after it, and every include past
+# the bracket disappears from the scan. `file(STRINGS)` takes a PATH, so there is
+# no content to neutralise beforehand; the only fix is to read the file and split
+# it here.
+#
+# **Measured on this check, and it is the SILENT class rather than the loud one.**
+# Three arms on `src/FastCache/Net/TcpClient.cpp`, with a planted
+# `#include <FastCache/Core/Bytes.hpp>` -- a real boundary violation:
+#
+#   violation alone                      exit 1, violation NAMED, 33 lines
+#   violation + a stray `]` before it     exit 0, violation NOT named, 1 line
+#   stray `]` alone                       exit 0, clean  (the bracket is not itself a violation)
+#
+# So a comment bracket makes this check pass over a genuine violation. Note the
+# middle arm is why the obvious experiment proves nothing: on a CLEAN tree the
+# injection changes the output not at all, because everything the merge swallows
+# is something the check had nothing to say about. #518 classified this as
+# "summary identical, full output changes" from exactly that experiment; with a
+# violation planted, the real behaviour is a green run over a broken boundary.
+#
+# A `REGEX` filter is not a defence either, only a coincidence of which lines
+# survive it: exposure is a property of (reader, file, surviving lines), so the
+# filter is applied AFTER the split instead.
+#
+# Fifth-and-counting copy of this splitting idiom; consolidating them into one
+# module is [#495](https://github.com/LASTRADA-Software/fastcached/issues/495)
+# and deliberately not done here, because doing it inside a fix for #518 would
+# swallow another ticket silently.
 function(fastcached_fastcache_includes filePath includesOut)
-    file(STRINGS "${filePath}" lines REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
+    file(READ "${filePath}" content)
+    string(REPLACE "\\" " " content "${content}")
+    string(REPLACE ";" " " content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
+    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
+    list(FILTER lines INCLUDE REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
     set(includes "")
     foreach(line IN LISTS lines)
         set(target "")
@@ -262,7 +300,29 @@ foreach(dir IN LISTS standaloneDirs)
     # A directory that contributes nothing is a renamed or mistyped row, and the
     # whole check would then pass by scanning nothing at all -- which is the one
     # failure mode a boundary test must not be allowed to have.
-    if(unitSources STREQUAL "")
+    #
+    # `"${unitSources}"` is QUOTED, and that is the whole guard. Unquoted, this
+    # condition never fired in the one case it exists for. `file(GLOB_RECURSE)`
+    # over an empty directory yields an empty list, `set(unitSources ${unitAll})`
+    # with an empty argument UNSETS the variable, and CMake's `if(VAR STREQUAL
+    # "")` treats an UNDEFINED left operand as the literal string `unitSources` --
+    # which is not equal to `""`, so the check walked on and reported success.
+    #
+    # Measured, on 3.28 semantics and on the 4.3 here:
+    #
+    #     set(empty_list)
+    #     if(empty_list STREQUAL "")      did NOT fire
+    #     if("${empty_list}" STREQUAL "") FIRED
+    #     if(NOT empty_list)              FIRED
+    #
+    # The sibling accumulators in this file are safe only because
+    # `set(missingUnits "")` above DEFINES them as the empty string; this one is
+    # assigned inside the loop from a glob that can come back empty, so it is the
+    # single instance where the idiom breaks. `check-net-boundary-selftest`'s
+    # `vacuous` case is what caught it -- the check reported
+    # "0 source(s) across 2 directory/directories reach only themselves" and
+    # exited 0 over a tree with no sources in it at all.
+    if("${unitSources}" STREQUAL "")
         list(APPEND missingUnits "  ${dir}/\n      exists but holds no source this check knows how to read")
     endif()
     foreach(unitSource IN LISTS unitSources)

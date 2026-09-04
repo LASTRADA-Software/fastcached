@@ -72,7 +72,32 @@ list(SORT _tableKeys)
 # is the shape the whole file is written in. Prose mentioning a key in a sentence
 # is not a documented setting and must not count as one, or the check passes on a
 # file whose header happens to name everything.
-file(STRINGS "${_reference}" _lines)
+# Read whole and split by hand, never `file(STRINGS)`: that call returns a CMake
+# LIST, and an UNBALANCED `[` or `]` on a KEPT line merges that element with the
+# ones after it, so everything past the bracket vanishes from the scan. It takes
+# a PATH, so there is nothing to neutralise beforehand.
+#
+# Blanking the brackets is safe HERE and is not safe everywhere: this reader
+# matches `^#([a-z_]+):`, a commented YAML key, which contains none. Where brackets are the data --
+# `check-tsan-scope`, whose rows are Catch2 tags like `[async]` -- the remedy is
+# a list-free offset walk instead, and blanking them makes that check refuse on a
+# good tree. Measured, in this branch.
+#
+# Fifth-and-counting copy of this idiom; consolidating them is
+# [#495](https://github.com/LASTRADA-Software/fastcached/issues/495) and is
+# deliberately not done here.
+#
+# MEASURED: injecting one `]` into a comment in the reference YAML took this
+# check from a clean pass to a hard refusal -- "read 36 keys from the table
+# and 0 from the reference; one of the two scans matched nothing, so this
+# check proved nothing rather than passing". That is the vacuous-pass guard
+# working, and it stays: the fix makes the refusal rare, not absent.
+file(READ "${_reference}" _referenceText)
+string(REPLACE "\\" " " _referenceText "${_referenceText}")
+string(REPLACE ";" " " _referenceText "${_referenceText}")
+string(REPLACE "[" " " _referenceText "${_referenceText}")
+string(REPLACE "]" " " _referenceText "${_referenceText}")
+string(REGEX REPLACE "\r?\n" ";" _lines "${_referenceText}")
 set(_referenceKeys "")
 foreach(_line IN LISTS _lines)
     if(_line MATCHES "^#([a-z_]+):")

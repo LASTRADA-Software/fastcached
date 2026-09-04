@@ -129,6 +129,100 @@ determinism rests on.
   [#495](https://github.com/LASTRADA-Software/fastcached/issues/495) was nearly
   validated this way, by the very method this bullet recommends. A tool that cannot
   fail in the way a change fails is not validation, it is decoration.
+- **A bracket-vulnerable reader is judged per (reader, file, surviving lines) — never
+  per script — and the verdict flips on the corpus alone.** Measured across the six
+  remaining `file(STRINGS)` readers, by injecting one unbalanced `]` into a comment on a
+  line the reader KEEPS:
+
+  | reader | verdict |
+  |---|---|
+  | `check-tsan-scope:109` | clean pass -> hard refusal, **LOUD** |
+  | `check-node-config-reference:75` | clean pass -> hard refusal, **LOUD** |
+  | `check-net-boundary:169` | passed over a REAL violation, **SILENT** |
+  | `check-psk-signing-seam:216` | 15 calls counted -> 14, still passed, **SILENT** |
+  | `check-vslang-probe-only:122,198` | unchanged — **by coincidence, not defence** |
+  | `check-script-check-signals:256` | unchanged — `LIMIT_COUNT 1`, immune by construction |
+
+  The last two rows are the point. A merge can only reduce a count where ONE FILE holds
+  two or more matching lines with the bracket on a non-final one; `check-psk-signing-seam`
+  and `check-vslang-probe-only` are the same reader shape and land on opposite sides
+  purely because one corpus has a two-match file and the other does not. Injecting into a
+  one-match file changes nothing, which is why the first attempt on the psk check came
+  back clean and would have closed it as safe. **A reader left alone because today's files
+  happen to be safe is a defect scheduled for later**, and `LIMIT_COUNT 1` is the only
+  row in that table that is safe for a reason rather than by luck.
+- **The remedy is not one remedy, and applying the usual one to `check-tsan-scope` breaks
+  it.** Blanking `[` and `]` before splitting is right where the brackets are punctuation;
+  it is wrong where they are the DATA. A Catch2 tag is spelled `[async]`, so the neutralising
+  split made that check report the table as naming no tags at all and refuse on a perfectly
+  good tree — measured, because that was the first attempt at the fix. The standing rule
+  above already says *where brackets must survive, read the lines without ever building a
+  CMake list*; that reader is now a `FIND`/`SUBSTRING` offset walk, immune by construction,
+  and the rule is carried by the reader it governs rather than by a file three directories
+  away.
+- **`if(VAR STREQUAL "")` does not fire when VAR is UNSET, and the one place that matters
+  is a glob that came back empty.** `check-net-boundary`'s empty-directory guard — whose
+  own comment calls it *"the one failure mode a boundary test must not be allowed to
+  have"* — could never fire. `file(GLOB_RECURSE)` over an empty directory yields an empty
+  list, `set(x ${empty})` **unsets** x, and CMake then reads the left operand as the
+  literal string `unitSources`, which is not `""`. Measured:
+
+  ```
+  set(empty_list)
+  if(empty_list STREQUAL "")       did NOT fire
+  if("${empty_list}" STREQUAL "")  FIRED
+  if(NOT empty_list)               FIRED
+  ```
+
+  The sibling accumulators in the same file are safe only because a `set(x "")` above
+  DEFINES them; the broken one is assigned inside a loop from a glob. So the hazard is not
+  the idiom, it is the idiom applied to a variable whose assignment can vanish — and the
+  check reported *"0 source(s) across 2 directory/directories reach only themselves"* and
+  exited 0 over a tree with no sources in it at all. **Quote the variable.**
+- **A clean-tree injection understates a check that only reports violations.** #518
+  classified `check-net-boundary` as PARTIAL — summary byte-identical, full output changes
+  — from exactly that experiment, and the classification is too kind: everything a merged
+  element swallows is something the check had nothing to say about, so on a clean tree
+  nothing changes at all. Three arms with a violation PLANTED:
+
+  ```
+  violation alone                     exit 1, violation NAMED, 33 lines
+  violation + a stray `]` before it   exit 0, violation NOT named, 1 line
+  stray `]` alone                     exit 0, clean
+  ```
+
+  The third arm is not decoration: without it a check that refused every bracket would
+  pass the second for the wrong reason. **An injection is evidence only if the thing it is
+  meant to hide is there to be hidden** — the STORE lane's *a green probe of the wrong
+  shape is not a refutation*, met from the other direction.
+- **A census states its PATTERN, not only its number.** Two independent audits of the
+  same file set differed by exactly one, and neither party had miscounted — they had
+  counted through different patterns:
+
+  | pattern | cac9bda, all | cac9bda, excl. selftests | HEAD |
+  |---|---|---|---|
+  | `scripts/check-*.cmake` (the glob a ticket names) | **20** | **18** | **34** |
+  | `grep 'check-.*\.cmake$'` (unanchored) | 21 | 19 | 36 |
+
+  The whole difference is `scripts/script-check-canary.cmake` — and at HEAD also
+  `script-check-warning-canary.cmake` — because *"script-**check-**canary.cmake"*
+  contains `check-`. The unanchored form matches them; the glob does not. That is the
+  `pkill -f` lesson arriving in a `grep`, twice in two days: **a pattern is broader than
+  its author reads it as**, and a bare number carries no way to tell which pattern
+  produced it.
+
+  Worth recording that the second instance was a MANAGER quoting a corrected number back
+  to a developer — the correction was wrong for the same reason as the thing it was
+  correcting. Nobody is outside this; the remedy is that the pattern travels with the
+  figure, not that people count more carefully.
+- **"Only 4 of 16 defend" was wrong when it was written, and no slicing recovers it.**
+  #510's denominator matches nothing on its own cited ref: not 20, not 18, and not the
+  **13** that read file content. Today there are 34, none added by the branch that
+  audited them. **A ticket cannot be closed against a count that no longer describes the
+  tree**, so the acceptance became a per-reader audit and the consolidation stayed with
+  [#495](https://github.com/LASTRADA-Software/fastcached/issues/495), which is where
+  `check-glob-traversals.cmake`'s own comment already sent it. Absorbing it would have
+  closed one ticket by silently swallowing another.
 - **A count asserted in prose is a claim nothing verifies.** Two comments went stale in
   one session, both because the thing they counted changed underneath them and nothing
   was watching. "This is the fourth copy of this idiom" was counting the SPLITTER when

@@ -119,7 +119,30 @@ foreach(sourceFile IN LISTS scanFiles)
         continue()
     endif()
 
-    file(STRINGS "${sourceFile}" matchedLines REGEX "${vslangAssignmentPattern}")
+    # Read whole and split by hand, never `file(STRINGS)`: that returns a CMake
+    # LIST, and an UNBALANCED `[` or `]` on a KEPT line merges that element with
+    # the ones after it, so a matching line past the bracket stops being counted.
+    #
+    # **This reader is not exposed on today's tree, and that is a coincidence
+    # rather than a defence.** The merge can only reduce a count where a single
+    # file holds TWO OR MORE matching lines with the bracket on a non-final one,
+    # and every file here holds exactly one -- measured. Add a second assignment
+    # to either file and it becomes exposed with nothing to say so. #518 records
+    # the same trap from the other side: a `REGEX` filter protects only when an
+    # unbalanced bracket cannot land on a line the filter keeps, which is a
+    # property of the current file contents and not of the script.
+    #
+    # The sibling `check-psk-signing-seam` is the same reader on a corpus that
+    # DOES have a two-match file, and there one `]` took its count from 15 to 14
+    # while it still passed. Same shape, different corpus, opposite verdict --
+    # which is why exposure is judged per (reader, file, surviving lines).
+    file(READ "${sourceFile}" _vslangText)
+    string(REPLACE "\\" " " _vslangText "${_vslangText}")
+    string(REPLACE ";" " " _vslangText "${_vslangText}")
+    string(REPLACE "[" " " _vslangText "${_vslangText}")
+    string(REPLACE "]" " " _vslangText "${_vslangText}")
+    string(REGEX REPLACE "\r?\n" ";" matchedLines "${_vslangText}")
+    list(FILTER matchedLines INCLUDE REGEX "${vslangAssignmentPattern}")
     list(LENGTH matchedLines matchCount)
     if(matchCount EQUAL 0)
         continue()
@@ -195,7 +218,30 @@ foreach(row IN LISTS vslangEnglishEntryPoints)
         continue()
     endif()
 
-    file(STRINGS "${resolvedHelper}" helperLines REGEX "${helperName}")
+    # Read whole and split by hand, never `file(STRINGS)`: that returns a CMake
+    # LIST, and an UNBALANCED `[` or `]` on a KEPT line merges that element with
+    # the ones after it, so a matching line past the bracket stops being counted.
+    #
+    # **This reader is not exposed on today's tree, and that is a coincidence
+    # rather than a defence.** The merge can only reduce a count where a single
+    # file holds TWO OR MORE matching lines with the bracket on a non-final one,
+    # and every file here holds exactly one -- measured. Add a second assignment
+    # to either file and it becomes exposed with nothing to say so. #518 records
+    # the same trap from the other side: a `REGEX` filter protects only when an
+    # unbalanced bracket cannot land on a line the filter keeps, which is a
+    # property of the current file contents and not of the script.
+    #
+    # The sibling `check-psk-signing-seam` is the same reader on a corpus that
+    # DOES have a two-match file, and there one `]` took its count from 15 to 14
+    # while it still passed. Same shape, different corpus, opposite verdict --
+    # which is why exposure is judged per (reader, file, surviving lines).
+    file(READ "${resolvedHelper}" _vslangText)
+    string(REPLACE "\\" " " _vslangText "${_vslangText}")
+    string(REPLACE ";" " " _vslangText "${_vslangText}")
+    string(REPLACE "[" " " _vslangText "${_vslangText}")
+    string(REPLACE "]" " " _vslangText "${_vslangText}")
+    string(REGEX REPLACE "\r?\n" ";" helperLines "${_vslangText}")
+    list(FILTER helperLines INCLUDE REGEX "${helperName}")
     list(LENGTH helperLines helperCount)
     if(NOT helperCount EQUAL helperAllowed)
         list(APPEND extraEnglishCalls
