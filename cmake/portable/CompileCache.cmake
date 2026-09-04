@@ -174,6 +174,68 @@ function(_fc_resolve_addr present value outWanted outToken)
     endif()
 endfunction()
 
+# Does a fastcache-cc rejection PREDICT the hazard the chosen launcher carries?
+#
+# **Two facts this file already prints, eighty lines apart, neither mentioning the
+# other** (#658). A `fastcache-cc` row rejected for a WIRE VERSION mismatch reports
+# at `STATUS` -- correctly for most reasons, since "falling through in silence looks
+# exactly like it never being installed" -- and configure then falls through to
+# sccache, whose caveat this file spends a paragraph on. The operator is left to
+# join them.
+#
+# A version rejection says something the other reasons do not: a daemon **is**
+# running, it is one the operator installed, and it is out of step with the
+# launcher. That is operator-fixable and usually transient -- and it is precisely
+# the state that hands an MSVC-family build to the launcher that can silently
+# produce a wrong object. Observed on a real machine with a service 591 commits
+# behind master answering on the port.
+#
+# Narrow on purpose, all three clauses:
+#   * the rejection is a VERSION mismatch, not "not installed" or "no answer" --
+#     those predict nothing and keep `STATUS`;
+#   * the winner is sccache, not ccache and not nothing;
+#   * that sccache carries its caveat, which is already gated on the MSVC family,
+#     so this inherits the same gate rather than testing the compiler again.
+#     Warning where the hazard cannot happen is how a warning becomes one people
+#     learn to skip, and that reasoning is already written out beside the caveat.
+#
+# Not a refusal to configure: a stale daemon is a normal state during a rollout,
+# and refusing would be worse than caching through sccache.
+#
+# Pure, so `check-version-fallback-warning.cmake` can drive the combinations --
+# staging a genuinely version-mismatched daemon at configure time is not something
+# a test can arrange.
+#
+# @param ccReason   why the fastcache-cc row was rejected; empty when it was not.
+# @param chosen     the launcher id that won, empty when none did.
+# @param caveat     the chosen launcher's caveat, empty when it carries none.
+# @param addr       the daemon endpoint, for a message that names it.
+# @param outVar     the warning text, or empty when this is not that situation.
+function(_fc_cache_version_fallback_warning ccReason chosen caveat addr outVar)
+    set(${outVar} "" PARENT_SCOPE)
+
+    # `unsupported-version` is the launcher's own spelling, from the wire error
+    # table (`CompileCacheWire.hpp`). Matched rather than compared, because the
+    # launcher wraps it in a lead-in this module already strips loosely.
+    if(NOT ccReason MATCHES "unsupported-version")
+        return()
+    endif()
+    if(NOT chosen STREQUAL "sccache")
+        return()
+    endif()
+    if(caveat STREQUAL "")
+        return()
+    endif()
+
+    set(${outVar}
+"[cache] fastcache-cc was refused by the daemon at ${addr} for a WIRE VERSION mismatch, and this build has fallen through to sccache -- which carries the correctness hazard warned about below.
+
+A daemon IS running there and it is one you installed; it is simply out of step with this fastcache-cc. Rebuild or reinstall whichever is older and the safe launcher comes back. This is a normal state during a rollout, which is why it is a warning and not a refusal to configure.
+
+It is called out here because THIS rejection reason predicts that hazard, where the others -- not installed, no answer, an uncacheable probe -- do not."
+        PARENT_SCOPE)
+endfunction()
+
 # Everything below needs a project: there is no compiler to probe, no target to
 # front and no build to cache without one. `cmake -P` therefore stops here and
 # takes the pure computations above -- which is how `check-debug-prefix-map.cmake`
@@ -1250,6 +1312,11 @@ if(USE_COMPILER_CACHE)
                 # itself rather than looking like the faster one was never there.
                 _fc_cache_describe("${_id}" _fc_cache_desc)
                 list(APPEND _fc_cache_rejected "${_fc_cache_desc}: ${_fc_cache_why_not}")
+                # Kept per row rather than only inside the joined sentence: the
+                # warning below has to ask what the REASON was, and parsing it back
+                # out of display text is how a message rewording silently disables a
+                # warning (#658).
+                set(_fc_cache_${_id}_rejected_why "${_fc_cache_why_not}")
                 continue()
             endif()
         endif()
@@ -1291,6 +1358,21 @@ if(_fc_cache_chosen)
     # Never fatal, and never a `check` that skips the row: which launcher to run
     # is the developer's call, and a module vendored into other repositories does
     # not get to make it for them. It only has to make it an informed one.
+    # BEFORE the caveat, and that ordering is the whole point: this line says why
+    # the safe launcher is not being used, and the caveat immediately under it says
+    # what the replacement costs. Two messages eighty lines apart were the defect.
+    if(DEFINED _fc_cache_fastcache_cc_rejected_why)
+        _fc_cache_version_fallback_warning(
+            "${_fc_cache_fastcache_cc_rejected_why}"
+            "${_fc_cache_chosen}"
+            "${_fc_cache_${_fc_cache_chosen}_caveat}"
+            "${FASTCACHE_ADDR}"
+            _fc_cache_version_warning)
+        if(_fc_cache_version_warning)
+            message(WARNING "${_fc_cache_version_warning}")
+        endif()
+    endif()
+
     if(_fc_cache_${_fc_cache_chosen}_caveat)
         message(WARNING "[cache] ${_fc_cache_${_fc_cache_chosen}_caveat}")
     endif()

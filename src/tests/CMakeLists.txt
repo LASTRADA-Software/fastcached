@@ -514,6 +514,27 @@ set_tests_properties("fastcache-addr-opt-out" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A version-mismatched fastcache-cc falling through to sccache must say so where
+# the fallback happens, not eighty lines from the warning about what sccache
+# costs under MSVC (#658). Narrow: only that reason, only that winner, and only
+# where the caveat exists at all.
+#
+# Pure, because the real situation needs two binaries at disagreeing wire
+# versions plus an MSVC-family compiler -- a second machine and a downgrade
+# rather than a fixture.
+add_test(
+    NAME "version-fallback-warning"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-version-fallback-warning.cmake"
+)
+set_tests_properties("version-fallback-warning" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it
