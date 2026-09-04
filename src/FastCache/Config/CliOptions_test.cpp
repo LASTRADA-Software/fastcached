@@ -68,6 +68,12 @@ constexpr auto Samples = std::to_array<FlagSample>({
     { .flag = "--compression", .value = "none" },
     { .flag = "--compression-level", .value = "5" },
     { .flag = "--compression-min-bytes", .value = "128" },
+    // `none` on every codec row, because this table asks only whether the value
+    // PARSES and `Identity` is the one codec available in every build --
+    // `ParseCompression` refuses `zstd` where FASTCACHED_ENABLE_COMPRESSION is off.
+    { .flag = "--memory-compression", .value = "none" },
+    { .flag = "--memory-compression-level", .value = "5" },
+    { .flag = "--memory-compression-min-bytes", .value = "128" },
     { .flag = "--lru-mode", .value = "strict" },
     { .flag = "--cpu-affinity", .value = "none" },
     { .flag = "--threads", .value = "4" },
@@ -303,12 +309,11 @@ TEST_CASE("every key a configuration file may carry is one the reader handles", 
     // doing its job.
     FastCache::Testing::ScratchDirectory const scratch { "fastcached-declared-keys" };
 
-    // Neither source may be empty: two empty lists agree perfectly, and this case
-    // would then pass by finding nothing on either side. `ConfigFileSettings()`
-    // merges them, so both are named here rather than inferred from the merge.
+    // Neither the source nor the projection may be empty: two empty lists agree
+    // perfectly, and this case would then pass by finding nothing on either side.
+    // The source is named here rather than inferred from the projection.
     REQUIRE(!CliOptions().empty());
-    REQUIRE(!YamlOnlySettings().empty());
-    REQUIRE(ConfigFileSettings().size() > YamlOnlySettings().size());
+    REQUIRE(!ConfigFileSettings().empty());
 
     // One path, rewritten per key: 34 file creations prove nothing 34 rewrites do
     // not, and `INFO` already says which key failed. `ScratchDirectory::Write`
@@ -324,13 +329,14 @@ TEST_CASE("every key a configuration file may carry is one the reader handles", 
     }
 }
 
-TEST_CASE("a key no row and no YAML-only entry declares is refused", "[config][cli][options][reload]")
+TEST_CASE("a key no option row declares is refused", "[config][cli][options][reload]")
 {
     // The gate's own direction. A key a file carries and nothing reads is a
     // setting an operator believes is in force forever, which is why an unknown
-    // key is refused rather than ignored. `memory_compression` is in the case to
-    // pin that a YAML-only entry really does reach the reader, so the refusals
-    // below are the gate rather than an accident of the ladder.
+    // key is refused rather than ignored. `memory_compression` is in the case
+    // because it was the last key a file could carry and no flag could express
+    // (#623): it now answers to `--memory-compression` like everything else, and
+    // the refusals below are the gate rather than an accident of the ladder.
     CHECK(ConfigFileAcceptsKey("port"));
     CHECK(ConfigFileAcceptsKey("memory_compression"));
     CHECK_FALSE(ConfigFileAcceptsKey("prot"));
@@ -346,8 +352,8 @@ TEST_CASE("every setting a file can carry can be compared", "[config][cli][optio
     // `UnreloadableChanges` calls `setting.same` unconditionally for an immutable
     // setting, so a null one there is a crash rather than a missed guard. The
     // option-table half cannot happen -- `yamlKey.empty() == (same == nullptr)` is
-    // a static_assert beside the table -- but the merge is what a caller sees, and
-    // a merge that dropped a comparator would satisfy that assertion perfectly.
+    // a static_assert beside the table -- but the PROJECTION is what a caller sees,
+    // and one that dropped a comparator would satisfy that assertion perfectly.
     //
     // "A reloadable row is one a file can carry" is NOT restated here: it is the
     // fourth static_assert beside the table, and a runtime copy of a compile-time

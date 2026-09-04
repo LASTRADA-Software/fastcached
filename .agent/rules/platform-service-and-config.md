@@ -539,9 +539,42 @@ readable and silently ignored. Every rule below has already been one of them.
   flag which parsed and never merged has shipped four times. `fastcache-compile-node`
   has one list, `NodeOptions()`, and a row that parses cannot fail to merge because
   parsing and merging stopped being two things. `Config/FileOptions.hpp`.
+- **And a RELOAD rebuilds the candidate the way the START built the live
+  configuration, or the command line silently stops applying.** The daemon's SIGHUP
+  path was `ReadYamlConfig(path)` and nothing else, so a setting in force because
+  somebody typed a flag — or set `FASTCACHED_METRICS_PORT`, which is the same half
+  of it — arrived at the immutability check as a setting being changed back to its
+  default. **The two directions fail differently and the reloadable one is the
+  dangerous one**: an immutable setting refuses the reload by name, forever, until
+  the file is edited to agree with a flag it should have outranked; a *reloadable*
+  one is **published**, so `--max-memory=8g` became a fraction of host RAM at the
+  first logrotate hook, `InMemoryLruStorage::Resize` evicted down to it, and nothing
+  in the logs connected any of that to a flag nobody re-read
+  ([#622](https://github.com/LASTRADA-Software/fastcached/issues/622)). There is one
+  `AssembleEffectiveConfig` — file, then command line, then environment — and
+  `main()` and `ConfigReloader` both call it. The sources besides the file are held
+  for the life of the process in a `ConfigSources`, which the reloader takes as a
+  **required** constructor argument: a parameter that can be defaulted is this defect
+  re-entering by omission. And the environment fallback travels as a resolved VALUE
+  rather than as a reader, deliberately — a process's environment does not change
+  under it, so replaying what the start resolved makes the two assemblies identical
+  by construction rather than by inspection.
+- **A setting a FILE can carry and argv cannot is a defect, not a category.** Three
+  `memory_compression*` keys were exactly that: accepted by `ReadYamlConfig`,
+  documented in the shipped reference, live-wired at startup by `main.cpp`, and in no
+  row of `CliOptions()`. So everything the table drives was blind to them — the
+  reloadability column could not answer for them at all, which is #406 reading
+  *complete* while a documented setting slipped past — and no `--install-service`
+  could carry them, because a registration replays a command line. They have rows now
+  and the second source is deleted
+  ([#623](https://github.com/LASTRADA-Software/fastcached/issues/623)). Note that the
+  two AREAS move together: giving a key a row forces `BuildServiceArgv` to emit it, or
+  `ServiceControl_test`'s mechanical sweep goes red — so splitting such a change
+  across lanes leaves either a flag the installer drops or a sweep nobody can make
+  pass.
 - **Which key a row answers to is a COLUMN, never a derivation.** Measured on the
-  daemon: 44 flags, 34 keys, diverging four ways — `--storage` is `storage_path`,
-  `--expiry-scan` is `active_expiry_scan`, `--expiry-interval` is
+  daemon: 48 flag rows, 34 of which carry a key, diverging four ways — `--storage` is
+  `storage_path`, `--expiry-scan` is `active_expiry_scan`, `--expiry-interval` is
   `active_expiry_interval_ms` (renamed *and* carrying a unit the flag does not),
   and `--listen`/`--listen-tls` collapse into one `listeners:`. There is no rule
   with exceptions there, only a mapping, and a convention derived from flag names

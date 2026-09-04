@@ -686,8 +686,17 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   order, so "the command line wins" is which loop runs second — never a per-field
   merge with a per-field explicit bit and a per-field presence bit, which is the
   daemon's shape and has shipped a flag that parsed and never merged four times.
+  And a RELOAD rebuilds the candidate the way the START built it — one
+  `AssembleEffectiveConfig` (file, then argv, then the environment), which
+  `ConfigReloader` takes as a REQUIRED argument. Re-reading the file alone made an
+  immutable setting refuse every reload by name and a RELOADABLE one worse: it
+  PUBLISHED, so `--max-memory=8g` became a fraction of host RAM at the first SIGHUP
+  and the storage evicted down to it, silently. A setting a FILE can carry and argv
+  cannot is that same defect standing still — the option table is blind to it and no
+  registration replays it — so closing one spans `Config/` and `Platform/` in ONE
+  change, or the installer drops a flag or the registration sweep is red.
   Which key a row answers to is a COLUMN (`yamlKey`), because the mapping is not
-  derivable: 34 keys for 44 daemon flags, diverging four ways. A key naming no row
+  derivable: 34 keys across 48 daemon flag rows, diverging four ways. A key naming no row
   is REFUSED — a file is read at every start, so a key nothing reads is a setting an
   operator believes is in force forever. A row a file may not carry is on a named
   list with a per-row reason, and the compile-time guard READS that list.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -11,6 +12,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -949,9 +951,46 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
         { .flag = "--listen-tls", .reason = "repeatable; an empty listener set registers nothing" },
     });
 
+    // One row's stimulus is a property of the BUILD rather than a literal, so the
+    // table below is `const` and not `constexpr`. `--memory-compression` defaults to
+    // `none`, and every other value it accepts is a codec
+    // `FASTCACHED_ENABLE_COMPRESSION` compiled in -- `ParseCompression` refuses one
+    // that is not, so a literal `zstd` would fail this sweep on a supported
+    // configuration for a reason that has nothing to do with a registration. Asked
+    // of the codec table, which is the question `ParseCompression` itself asks.
+    //
+    // With no codec compiled in there is exactly ONE legal value, so for that row
+    // "the token moved" is not a weakened assertion but an unaskable one. It is
+    // named here rather than skipped at the assertion, and the presence half still
+    // runs on every build.
+    constexpr auto NonIdentityCodecs =
+        std::to_array({ FastCache::CompressionCodec::Zstd, FastCache::CompressionCodec::Lz4 });
+    //
+    // The loop holds no ITERATOR, which is portability rather than taste and is the
+    // reason `MakeConfigFileSettings` gives for the same shape: `std::array`'s
+    // iterator is a raw pointer on libstdc++, so clang-tidy's
+    // `readability-qualified-auto` demands `auto*` -- and it is a class type in
+    // MSVC's debug STL, which then refuses that spelling. A range-based `for` over
+    // values satisfies both.
+    auto const secondCodec = [&NonIdentityCodecs] -> std::optional<FastCache::CompressionCodec> {
+        for (auto const codec: NonIdentityCodecs)
+            if (FastCache::Compression::IsAvailable(codec))
+                return codec;
+        return std::nullopt;
+    }();
+    auto const memoryCodecStimulus =
+        FastCache::Compression::NameOf(secondCodec.value_or(FastCache::CompressionCodec::Identity));
+
+    // Whether a row's emitted token CAN move at all on this build: true for every
+    // row but the one above, and there only where something was compiled in to move
+    // to.
+    auto const movementIsAskable = [&secondCodec](std::string_view flag) {
+        return flag != "--memory-compression" || secondCodec.has_value();
+    };
+
     // One per value row, and every one differs from that row's default -- which is
     // what makes "the token moved" mean "this line reads this row's field".
-    constexpr auto TypedValues = std::to_array<Typed>({
+    auto const TypedValues = std::to_array<Typed>({
         { .flag = "--config", .value = "fastcached.yaml" },
         { .flag = "--bind", .value = "0.0.0.0" },
         { .flag = "--port", .value = "6000" },
@@ -973,6 +1012,9 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
         { .flag = "--compression", .value = "none" },
         { .flag = "--compression-level", .value = "9" },
         { .flag = "--compression-min-bytes", .value = "1024" },
+        { .flag = "--memory-compression", .value = memoryCodecStimulus },
+        { .flag = "--memory-compression-level", .value = "9" },
+        { .flag = "--memory-compression-min-bytes", .value = "1024" },
         { .flag = "--lru-mode", .value = "strict" },
         { .flag = "--cpu-affinity", .value = "none" },
         { .flag = "--threads", .value = "5" },
@@ -1035,8 +1077,9 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
         // already defaults off emits the same token either way -- so demanding it
         // there would demand a contradiction on one platform. A wrong FIELD on a
         // switch is caught above instead: the emission follows the other field, so
-        // no token under this spelling appears at all.
-        if (spec.arity == FastCache::Arity::Value)
+        // no token under this spelling appears at all. `movementIsAskable` is the
+        // other exemption and is a property of the BUILD -- see `secondCodec`.
+        if (spec.arity == FastCache::Arity::Value && movementIsAskable(spec.primary))
             CHECK(withValue != atDefault);
     }
 

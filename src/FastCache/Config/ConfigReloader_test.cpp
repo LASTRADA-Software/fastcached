@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -36,7 +40,7 @@ std::filesystem::path WriteYaml(std::string_view stem, std::string_view content)
 TEST_CASE("ConfigReloader: Current() returns the initial snapshot", "[config][reload]")
 {
     FastCache::Config initial { .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .port = 11500 };
-    FastCache::ConfigReloader reloader { initial, {} };
+    FastCache::ConfigReloader reloader { initial, {}, {} };
     auto const snapshot = reloader.Current();
     REQUIRE(snapshot->bindAddress == "127.0.0.1");
     REQUIRE(snapshot->port == 11500);
@@ -54,7 +58,7 @@ TEST_CASE("ConfigReloader::Reload picks up reloadable changes", "[config][reload
                                 .configPath = path.string(),
                                 .port = 11600,
                                 .logLevel = FastCache::LogLevel::Info };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     bool fired = false;
     FastCache::LogLevel newLevel { FastCache::LogLevel::Info };
@@ -85,7 +89,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to immutable fields", "[config
     FastCache::Config initial {
         .maxMemoryBytes = 1024, .bindAddress = "127.0.0.1", .configPath = path.string(), .port = 11700
     };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     // Try to change the port — should be rejected.
     {
@@ -120,7 +124,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_path (regression fo
         .storagePath = "/tmp/a.cow",
         .port = 11710,
     };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     {
         std::ofstream out { path, std::ios::trunc };
@@ -149,7 +153,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to storage_durability", "[conf
         .port = 11720,
         .storageDurability = FastCache::StorageDurability::Fsync,
     };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     {
         std::ofstream out { path, std::ios::trunc };
@@ -181,7 +185,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to the active expiry cycle", "
         .configPath = path.string(),
         .port = 11740,
     };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     // Turning the cycle off at runtime is the change an operator would most
     // plausibly try, and the one that would look most like it had worked.
@@ -226,7 +230,7 @@ TEST_CASE("ConfigReloader::Reload rejects changes to listeners (binds vector)", 
         .configPath = path.string(),
         .binds = { FastCache::BindConfig { .address = "127.0.0.1", .port = 11730, .tls = false } },
     };
-    FastCache::ConfigReloader reloader { initial, path };
+    FastCache::ConfigReloader reloader { initial, path, {} };
 
     // Add a second listener via SIGHUP — must reject, not silently accept.
     {
@@ -309,7 +313,7 @@ TEST_CASE("ConfigReloader: a live-wired setting is refused and the previous valu
         REQUIRE(read.has_value());
         auto initial = *read;
         initial.configPath = path.string();
-        FastCache::ConfigReloader reloader { initial, path };
+        FastCache::ConfigReloader reloader { initial, path, {} };
 
         bool published = false;
         reloader.Subscribe([&published](auto const& /*prev*/, auto const& /*next*/) { published = true; });
@@ -340,8 +344,109 @@ TEST_CASE("ConfigReloader: a live-wired setting is refused and the previous valu
 
 TEST_CASE("ConfigReloader: Reload with no config path returns FileNotFound", "[config][reload]")
 {
-    FastCache::ConfigReloader reloader { FastCache::Config {}, {} };
+    FastCache::ConfigReloader reloader { FastCache::Config {}, {}, {} };
     auto const result = reloader.Reload();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::ConfigErrorCode::FileNotFound);
+}
+
+TEST_CASE("ConfigReloader: a reload re-applies the command line", "[config][reload]")
+{
+    // **[#622](https://github.com/LASTRADA-Software/fastcached/issues/622).** The
+    // candidate used to be `ReadYamlConfig(path)` and nothing else, so a reloadable
+    // setting given on the command line and absent from the file was published at
+    // its built-in default at the first SIGHUP. `--max-memory` is the sharp one:
+    // the new value reaches `InMemoryLruStorage::Resize`, which evicts down to it,
+    // and nothing in the logs attributes that to a flag nobody re-read.
+    //
+    // The command line is PARSED rather than assembled by hand, because what makes
+    // the fix work is the provenance bit the parse records -- a `CliResult` written
+    // out here could set that bit without the parser ever having agreed to.
+    auto const path = WriteYaml("reload-argv", "log_level: info\n");
+
+    std::array<char const*, 2> const argv { "--max-memory=1024", "--log-level=info" };
+    auto const parsed = FastCache::ParseCli(argv);
+    REQUIRE(parsed.has_value());
+
+    FastCache::ConfigSources const sources { .cli = *parsed, .metricsPortEnv = std::nullopt };
+    auto const assembled = FastCache::AssembleEffectiveConfig(path, sources);
+    REQUIRE(assembled.has_value());
+    REQUIRE(assembled->config.maxMemoryBytes == 1024);
+
+    FastCache::ConfigReloader reloader { assembled->config, path, sources };
+    REQUIRE(reloader.Reload().has_value());
+
+    // The file never mentioned `max_memory`, so the flag is what decides -- at a
+    // reload exactly as at the start. Under the defect this is
+    // `DefaultMaxMemoryBytes()`, a fraction of host RAM, published silently. The
+    // second assertion is what makes the first mean something: 1024 is below the
+    // 512 MiB floor that default is clamped to, so no host can make them agree.
+    CHECK(reloader.Current()->maxMemoryBytes == 1024);
+    CHECK(reloader.Current()->maxMemoryBytes != FastCache::Config {}.maxMemoryBytes);
+}
+
+TEST_CASE("ConfigReloader: a reload keeps a flag typed at its own default", "[config][reload]")
+{
+    // The provenance half, and the input no value comparison can answer for: the
+    // operator read the port off the startup line and typed it to pin it. The file
+    // says something else, so under the defect the candidate came back carrying the
+    // FILE's port -- `port` is not reloadable, so every subsequent reload was
+    // refused by name until the file was edited to agree with a flag it should have
+    // outranked.
+    auto const path = WriteYaml("reload-provenance", "port: 12000\n");
+
+    // Off the constant, never a literal: the whole point is that the typed value
+    // IS the compiled-in default.
+    auto const portFlag = std::format("--port={}", FastCache::DefaultPort);
+    std::array<char const*, 1> const argv { portFlag.c_str() };
+    auto const parsed = FastCache::ParseCli(argv);
+    REQUIRE(parsed.has_value());
+
+    FastCache::ConfigSources const sources { .cli = *parsed, .metricsPortEnv = std::nullopt };
+    auto const assembled = FastCache::AssembleEffectiveConfig(path, sources);
+    REQUIRE(assembled.has_value());
+    REQUIRE(assembled->config.port == FastCache::DefaultPort);
+
+    FastCache::ConfigReloader reloader { assembled->config, path, sources };
+    auto const reloaded = reloader.Reload();
+    // The refusal text is reported, because a bare `has_value()` failure here says
+    // only that SOME row of the immutability table fired and not which.
+    INFO("refusal: " << (reloaded.has_value() ? std::string {} : reloaded.error().context));
+    REQUIRE(reloaded.has_value());
+    CHECK(reloader.Current()->port == FastCache::DefaultPort);
+}
+
+TEST_CASE("ConfigReloader: a reload re-applies the environment fallback", "[config][reload]")
+{
+    // The other half of #622, and it failed the same way for the same reason: a
+    // container that agrees on a port through `FASTCACHED_METRICS_PORT` and writes
+    // no `metrics_port:` had every reload refused, because the candidate was built
+    // from a source the environment never reached.
+    auto const path = WriteYaml("reload-env", "log_level: info\n");
+
+    FastCache::ConfigSources const sources { .cli = {}, .metricsPortEnv = std::uint16_t { 9999 } };
+    auto const assembled = FastCache::AssembleEffectiveConfig(path, sources);
+    REQUIRE(assembled.has_value());
+    REQUIRE(assembled->config.metricsPort == 9999);
+
+    FastCache::ConfigReloader reloader { assembled->config, path, sources };
+    auto const reloaded = reloader.Reload();
+    INFO("refusal: " << (reloaded.has_value() ? std::string {} : reloaded.error().context));
+    REQUIRE(reloaded.has_value());
+    CHECK(reloader.Current()->metricsPort == 9999);
+}
+
+TEST_CASE("ConfigReloader: a reload keeps naming the file it read", "[config][reload]")
+{
+    // `ReadYamlConfig` never filled `configPath`, so a published snapshot stopped
+    // naming its own file at the first reload -- invisible while nothing read it
+    // back, and exactly the kind of field a later subscriber would trust.
+    auto const path = WriteYaml("reload-path", "log_level: info\n");
+    FastCache::ConfigSources const sources {};
+    auto const assembled = FastCache::AssembleEffectiveConfig(path, sources);
+    REQUIRE(assembled.has_value());
+
+    FastCache::ConfigReloader reloader { assembled->config, path, sources };
+    REQUIRE(reloader.Reload().has_value());
+    CHECK(reloader.Current()->configPath == path.string());
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
-#include <FastCache/Config/YamlReader.hpp>
 
 #include <expected>
 #include <filesystem>
@@ -15,10 +15,26 @@
 namespace FastCache
 {
 
-ConfigReloader::ConfigReloader(Config initial, std::filesystem::path configPath):
+ConfigReloader::ConfigReloader(Config initial, std::filesystem::path configPath, ConfigSources sources):
     ConfigReloaderOf<Config> { std::move(initial),
                                std::move(configPath),
-                               [](std::filesystem::path const& path) { return ReadYamlConfig(path); },
+                               // The SAME assembly the start ran, with the same sources -- not
+                               // `ReadYamlConfig(path)`, which is the file and nothing else. A reload built
+                               // that way republished every setting the file did not mention at its
+                               // built-in default, so `--max-memory=8g` came back as a fraction of host RAM
+                               // and the storage evicted down to it, with no line anywhere naming the flag
+                               // (#622). Captured by value because the reloader outlives `main`'s locals
+                               // and a reload can run at any moment on the signal thread.
+                               [sources = std::move(sources)](
+                                   std::filesystem::path const& path) -> std::expected<Config, ConfigError> {
+                                   // By value rather than by rvalue reference: the file's
+                                   // presence bits are a START's question, so only the
+                                   // configuration is carried on, and a parameter this
+                                   // moves a MEMBER out of is one nothing moves from.
+                                   return AssembleEffectiveConfig(path, sources).transform([](EffectiveConfig assembled) {
+                                       return std::move(assembled.config);
+                                   });
+                               },
                                &ConfigReloader::ValidateImmutable }
 {
 }

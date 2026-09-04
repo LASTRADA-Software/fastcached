@@ -140,8 +140,8 @@ struct OptionSpec
     /// may not come from one.
     ///
     /// **A column rather than a derivation, because the mapping is not derivable.**
-    /// Measured on the daemon: 44 flags, 34 keys, diverging four ways -- `--storage`
-    /// is `storage_path`, `--expiry-scan` is `active_expiry_scan`,
+    /// Measured on the daemon: 48 flag rows, 34 of which carry a key, diverging four
+    /// ways -- `--storage` is `storage_path`, `--expiry-scan` is `active_expiry_scan`,
     /// `--expiry-interval` is `active_expiry_interval_ms` (renamed *and* carrying a
     /// unit the flag does not), and `--listen`/`--listen-tls` collapse into a single
     /// `listeners:` key. There is no rule with exceptions there, only a mapping, and
