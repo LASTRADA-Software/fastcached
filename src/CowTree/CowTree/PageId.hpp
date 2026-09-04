@@ -47,13 +47,28 @@ struct PageId
 };
 
 /// Identifies which of the two alternating meta-page slots is being read
-/// or written. The slot used for a given transaction is determined by
-/// `txnId mod 2`.
+/// or written. Which slot a commit takes is the page store's choice -- the one
+/// not holding the last durable meta -- and NOT `txnId mod 2`, which this
+/// comment claimed until #726; see `Meta`.
 enum class MetaSlot : std::uint8_t
 {
     A = 0, ///< First meta page (file offset 0).
     B = 1, ///< Second meta page (file offset PageSize).
 };
+
+/// The meta slot that is not `slot`.
+///
+/// One spelling, because "write the slot we did not last make durable" is the
+/// commit-point rule for BOTH the batched flush and the strict path, and the two
+/// wrote it out separately as inline ternaries. It also existed as a private
+/// helper in two test files, which is how a rulebook entry came to record that
+/// it "exists in no production file".
+/// @param slot One slot.
+/// @return The one it alternates with.
+[[nodiscard]] constexpr MetaSlot OtherSlot(MetaSlot slot) noexcept
+{
+    return slot == MetaSlot::A ? MetaSlot::B : MetaSlot::A;
+}
 
 /// Discriminator for data page kinds.
 enum class PageType : std::uint8_t

@@ -76,13 +76,33 @@ class IPageStore
     ///         slot if it validates); various errors on I/O failure.
     [[nodiscard]] virtual auto ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError> = 0;
 
-    /// Write and (durably) flush one of the two meta pages. This is the
-    /// single commit point: a torn write here leaves the *other* slot
-    /// as the live one on recovery, so the operation is naturally
-    /// atomic at the transaction granularity.
-    /// @param slot Meta-slot to overwrite.
+    /// Write and (durably) flush the meta page. This is the single commit
+    /// point: a torn write here leaves the *other* slot as the live one on
+    /// recovery, so the operation is naturally atomic at the transaction
+    /// granularity.
+    ///
+    /// **Which of the two slots is written is the store's decision, not the
+    /// caller's, and there is deliberately no argument for it** (#726). That
+    /// atomicity holds only if the slot written is the one NOT holding the last
+    /// durable meta, and which slot that is is state only the store has --
+    /// recovery records it at `Open` from the two slots it read. A caller
+    /// choosing for itself has to model the alternation, and a caller that
+    /// models it wrongly does not get a wrong slot, it gets a store with one
+    /// good meta page overwritten by the commit that was supposed to be
+    /// survivable.
+    ///
+    /// This used to take the slot, and `CowTree::CommitTxn` derived it from
+    /// `txnId mod 2`. That is right only while the parity holds, and a batched
+    /// flush breaks the parity routinely by writing the last commit's id into
+    /// the alternating slot -- so on an ordinary batched-written store the first
+    /// strict-durability commit after a one-slot recovery spent the survivor.
     /// @param meta Meta record to encode and write.
-    [[nodiscard]] virtual auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> = 0;
+    [[nodiscard]] virtual auto WriteMeta(Meta const& meta) -> std::expected<void, CowTreeError> = 0;
+
+    /// @return The slot the most recent `WriteMeta` made durable -- so the next
+    ///         one targets the other. Exposed so a test can assert the
+    ///         alternation itself rather than infer it from page contents.
+    [[nodiscard]] virtual auto LastDurableSlot() const noexcept -> MetaSlot = 0;
 
     /// @return The configured data-page size in bytes. Constant for the
     ///         lifetime of the page store.

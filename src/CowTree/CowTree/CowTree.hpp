@@ -216,7 +216,7 @@ class WriteTxn
 ///   1. Write all new data pages (via IPageStore::Write).
 ///   2. IPageStore::SyncData() — flush data pages.
 ///   3. Encode new Meta naming the new root + txnId + freeRoot.
-///   4. IPageStore::WriteMeta(slot = txnId mod 2, ...) — single-page
+///   4. IPageStore::WriteMeta(...) — the store picks the slot; single-page
 ///      durable write. This is the atomic commit point.
 /// Recovery picks the meta slot with the higher txnId and valid CRC; a
 /// torn meta write leaves the previous slot intact and rolls back the

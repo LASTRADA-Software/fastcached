@@ -161,14 +161,14 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
     meta.freeRoot = CowTree::PageId { 1 };
     meta.itemCount = 0;
 
-    // Derived, not chosen. `Meta`'s own contract is that the slot matching
-    // `txnId mod 2` holds the most recent commit attempt, and `CommitTxn`
-    // implements exactly this expression -- so a hard-coded slot would seed a
-    // parity no writer produces, and `RecoverExistingFile` would not notice
-    // because it tie-breaks on `txnId` alone. The chain is the only thing
-    // about this file that is meant to be unusual.
-    auto const slot = (meta.txnId % 2 == 0) ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
-    REQUIRE((*store)->WriteMeta(slot, meta).has_value());
+    // The slot is the store's, not this fixture's (#726). It used to be derived
+    // here as `txnId mod 2` to match a parity `Meta` documented and `CommitTxn`
+    // implemented; both are gone, because the parity was never maintained by a
+    // batched writer and deriving the slot from it is what spent a damaged
+    // store's surviving meta page. Nothing here needs a particular slot anyway:
+    // `RecoverExistingFile` tie-breaks on `txnId`, and the chain is the only
+    // thing about this file that is meant to be unusual.
+    REQUIRE((*store)->WriteMeta(meta).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -195,14 +195,18 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
 // same `<CowTree/...>` spelling.
 //
 // And what is duplicated is more than file I/O, which an earlier draft claimed:
-// `MetaDamageOffset`, `OtherSlot`, `SlotBytes`, `DecodeSlot` and `DamageMetaSlot`
-// all exist twice, and three of those encode the on-disk LAYOUT (the slot offset
-// and where the CRC'd payload is) rather than test plumbing. By the argument
-// above they would belong in `src/CowTree/CowTree/` if they earned a public
-// helper. They have not yet -- two call sites in two test binaries is not a
-// public contract, and putting a damage helper in the shipped library to serve
-// them would be worse. Stated so the third copy is a decision rather than a
-// habit.
+// `MetaDamageOffset`, `SlotBytes`, `DecodeSlot` and `DamageMetaSlot` all exist
+// twice, and three of those encode the on-disk LAYOUT (the slot offset and where
+// the CRC'd payload is) rather than test plumbing. By the argument above they
+// would belong in `src/CowTree/CowTree/` if they earned a public helper. They
+// have not -- two call sites in two test binaries is not a public contract, and
+// putting a damage helper in the shipped library to serve them would be worse.
+//
+// `OtherSlot` WAS on that list and has come off it: #726 needed "the slot we did
+// not last make durable" in two production paths, so it is now
+// `CowTree::OtherSlot` in `PageId.hpp` and both copies here are gone. That is
+// the test of whether one of these earns promotion -- a production caller, not a
+// second test.
 //
 // Damaged meta bytes have no API route -- `WriteMeta` encodes and CRCs whatever
 // it is handed -- so the file is patched directly, at `Meta.hpp`'s own
@@ -292,14 +296,6 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
     REQUIRE(f.good());
 }
 
-/// The other meta slot.
-/// @param slot One slot.
-/// @return The one it alternates with.
-[[nodiscard]] constexpr CowTree::MetaSlot OtherSlot(CowTree::MetaSlot slot) noexcept
-{
-    return slot == CowTree::MetaSlot::A ? CowTree::MetaSlot::B : CowTree::MetaSlot::A;
-}
-
 /// Flip one byte inside meta slot `slot` of the closed store file at `path`.
 ///
 /// Both directions of the injection are asserted: the named slot must stop
@@ -319,7 +315,7 @@ void DamageMetaSlot(std::filesystem::path const& path, CowTree::MetaSlot slot)
     auto const damaged = DecodeSlot(after, slot);
     REQUIRE_FALSE(damaged.has_value());
     REQUIRE(damaged.error() == CowTree::CowTreeError::Corrupt);
-    REQUIRE(DecodeSlot(after, OtherSlot(slot)).has_value());
+    REQUIRE(DecodeSlot(after, CowTree::OtherSlot(slot)).has_value());
 }
 
 /// Open -- or reopen -- the meta-damage case's store at `path`.
@@ -483,7 +479,7 @@ TEST_CASE("Durability=Batched defers freed-page reuse until the flush boundary",
     for (std::uint64_t i = 1; i <= 64; ++i)
     {
         meta.txnId = i;
-        REQUIRE(pages.WriteMeta((i % 2 == 0) ? CowTree::MetaSlot::A : CowTree::MetaSlot::B, meta).has_value());
+        REQUIRE(pages.WriteMeta(meta).has_value());
     }
 
     // Now the previously-freed page is reusable.
@@ -941,7 +937,7 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
 
     /// One row of the table below.
     ///
-    /// The survivor is derived (`OtherSlot(damaged)`) while `secondKeyReadable`
+    /// The survivor is derived (`CowTree::OtherSlot(damaged)`) while `secondKeyReadable`
     /// is stated, and the two are not in tension even though the sibling fixture
     /// argues against deriving a column: what must not be derived from the
     /// discriminator is the EXPECTATION, or the assertion agrees with itself
@@ -959,7 +955,7 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
     // valid slot would pass, damage the stale one alone and one that always
     // took the newer would.
     auto const rows = std::vector<Row> {
-        { .damaged = OtherSlot(live),
+        { .damaged = CowTree::OtherSlot(live),
           .secondKeyReadable = true,
           .what = "the stale slot is damaged: the newest commit still serves" },
         { .damaged = live,
@@ -975,7 +971,7 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
         WriteWholeFile(tmp.path, seeded);
         DamageMetaSlot(tmp.path, row.damaged);
 
-        auto const survivorSlot = OtherSlot(row.damaged);
+        auto const survivorSlot = CowTree::OtherSlot(row.damaged);
         // The survivor's meta and page bytes are already in hand from the seed:
         // the file has just been restored from those very bytes and
         // `DamageMetaSlot` touched only the other slot, so there is nothing to

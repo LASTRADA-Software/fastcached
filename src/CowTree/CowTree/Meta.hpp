@@ -33,9 +33,20 @@ inline constexpr std::size_t MaxPageSize = 128 * 1024 * 1024;
 /// In-memory representation of a meta page.
 ///
 /// Two of these live at fixed offsets in the file (slot A at offset 0,
-/// slot B at offset PageSize). Commit alternates between them; the slot
-/// matching `txnId mod 2` always holds the most recent commit attempt.
-/// Recovery picks the slot with the higher `txnId` whose CRC validates.
+/// slot B at offset PageSize). Commit alternates between them, writing the slot
+/// that does NOT hold the last durable meta, and recovery picks the slot with
+/// the higher `txnId` whose CRC validates.
+///
+/// **There is no `txnId mod 2` parity, and this comment used to claim one.** It
+/// said the slot matching `txnId mod 2` always holds the most recent commit
+/// attempt. A batched flush writes the LAST commit's id into the alternating
+/// slot, so on any store a batched writer produced the parity is broken as a
+/// matter of course -- measured, an ordinary two-session store came back with
+/// txn 11 in A and txn 6 in B, both on the wrong side of it. Nothing depended on
+/// the claim except `CowTree::CommitTxn`, which derived its target slot from it
+/// and thereby spent the surviving meta page of a damaged store on the first
+/// strict-durability commit after recovery (#726). The alternation is now the
+/// page store's, which is the only layer that knows what is durable.
 struct Meta
 {
     /// Magic bytes (must equal `MetaMagic`).
