@@ -1220,8 +1220,13 @@ EOF
     return 1
 }
 
-timeout_allowed="tsan-gate.sh:not an e2e fixture, and it resolves timeout/gtimeout itself rather than assuming one. Its clang-tsan job is runs-on: ubuntu-24.04, so its macOS branch has never executed anywhere.
-check-e2e-helpers.sh:this file, which stages the scan's own canary invocations above. They are heredoc text and run nothing; the canary asserting all seven are caught is what covers them."
+# `tsan-gate.sh` was a row here, exempted because it resolved timeout/gtimeout for
+# itself. #488 deleted that resolver -- the second half of its reason was that the
+# macOS branch had never executed anywhere, which is an argument for removing the
+# branch and not for excusing it -- so the gate goes through `run_bounded` like
+# everything else and this scan now covers it. An exemption outlives the shape it
+# was granted for, so it is deleted with the shape rather than reworded.
+timeout_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary invocations above. They are heredoc text and run nothing; the canary asserting all seven are caught is what covers them."
 for script in "${source_dir}"/scripts/*.sh; do
     base="$(basename "$script")"
     _scan_exempt "$base" "$timeout_allowed" && continue

@@ -381,6 +381,12 @@ determinism rests on.
   that obeys it is how the file that does not obey it never learns about it** -- the same
   mechanism as `tsan-gate.sh` documenting that macOS has no `timeout(1)` while `cluster-e2e.sh`
   called it anyway. A rule with one instance is a comment; a rule with two needs a check.
+  That paragraph is gone (#488 replaced the resolver with `run_bounded`), and how it ended is
+  the sharper half: it also claimed the `clang-tsan` preset runs on macOS, which it never has,
+  so the fallback it justified had never executed anywhere. **What failed to travel was not a
+  fact but a plausible sentence** -- which is why the remedy was a shared implementation plus a
+  scan (`check-e2e-helpers.sh`), and not a better comment. A reader cannot tell a measured
+  sentence from a remembered one, and neither can a reviewer.
   - **Pinning the other two tools is the argument for REMOVING this one, not for versioning
     it.** `clang-format` and `clang-tidy` are pinned because their version changes the verdict
     and there is a canonical version to pin *to*. A compiler cache has neither: no canonical
@@ -571,10 +577,12 @@ determinism rests on.
     across the three targets. That is the empty-translation-unit state showing up in
     an *instrument* -- naming it rather than collapsing it into pass or fail is the
     four-states rule again.
-    **And the guard is exercised**: `ctest -R tsan-gate-selftest` drives every
-    verdict against staged object trees -- a suite binary with one uninstrumented
-    object first, since that is the half with no backstop -- through a stub `nm`, so
-    it needs no compiler and runs in the default set. A guard that has never been
+    **And the guard is exercised**: `ctest -R tsan-gate-selftest` drives the
+    instrumentation verdicts against staged object trees -- a suite binary with one
+    uninstrumented object first, since that is the half with no backstop -- through a
+    stub `nm`, and since #488 drives the BOUND's three outcomes against staged
+    executables, which need no object tree at all. Neither half needs a compiler, so
+    both run in the default set. A guard that has never been
     seen to fire is what this whole file is about, and this one could not fire at
     all.
   - **A filter that matches nothing is a suite that tested nothing**, and every
