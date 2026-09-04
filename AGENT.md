@@ -848,7 +848,7 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
   illegal in an SVG.
 - **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five times in four
-  instruments in one session, ten across seven once a later session's are counted, none of them a coding mistake, all of them a representation that could not tell
+  instruments in one session, twelve across eight once a later session's are counted, none of them a coding mistake, all of them a representation that could not tell
   two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
   true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs

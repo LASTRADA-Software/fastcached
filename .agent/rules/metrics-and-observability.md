@@ -444,8 +444,8 @@ fault.
 metrics. In one working session this project's own tooling collapsed at least two
 of these four states **five separate times, in four different instruments** — none
 of them a coding mistake, all of them a representation that could not tell two
-things apart. The last two rows are from a later session and are counted
-separately, so the table now stands at **ten collapses across seven instruments**:
+things apart. The last three rows are from a later session and are counted
+separately, so the table now stands at **twelve collapses across eight instruments**:
 
 | instrument | what it reported | what was true |
 |---|---|---|
@@ -454,11 +454,24 @@ separately, so the table now stands at **ten collapses across seven instruments*
 | the required-checks reading | a skipped required check passes | a skipped **matrix** job never reports at all |
 | `pr-labels.yml`'s gate | skipped, therefore green | the labeller had **failed** |
 | a CI watcher (twice) | "settled", then "25 of 26 green" | the list was still being built; the 26th was correctly skipped |
-| a merge watcher | stop watching, on **any** red | the red was an *unrequired* packaging leg; ten required contexts went unwatched |
+| a merge watcher (twice) | stop watching, on **any** red; then `RED`, from a `*)` | the red was an *unrequired* packaging leg, so ten required contexts went unwatched — and the repair's own default arm then swallowed `cancelled` |
 | a merge-readiness checker (three times) | `fail` | `SKIPPED`, then `CANCELLED`, then *pending* — the last inventing a red that did not exist |
+| a rule-vs-tripwire cross-check | `0`, read as *the two files disagree* | the phrase was present and **wrapped across a line** |
 
-**The last two rows are the sharpest, because in both the collapsed distinction is the
-one the instrument existed to report.** A watcher built to tell required from unrequired
+**An instrument answers the question it was given, and its author's confidence comes
+from the question they meant.** The last row is the smallest instance and the clearest
+statement of that: `grep -c` was asked whether a phrase occurs *on one line*, answered
+`0` correctly, and was read as *the two files disagree* — by the author of the rule
+about probes, minutes after writing it. No state was collapsed inside the tool at all;
+the collapse was between the question asked and the question meant.
+
+**Five of these were found in somebody else's tool; two were found by an author in their
+own, within an hour of writing the rule against them.** That second group is the whole
+argument for this being a check rather than better prose: the people who wrote it down
+were the next to do it.
+
+**Two rows are sharper still, because in them the collapsed distinction is the very one
+the instrument existed to report.** A watcher built to tell required from unrequired
 stopped at the first red without asking which it was; a checker built to keep `ABSENT`
 distinct from pending folded `SKIPPED`, then `CANCELLED`, into `fail`. Neither author was
 careless — a red is a red is the obvious reading, and it is wrong in exactly the domain
