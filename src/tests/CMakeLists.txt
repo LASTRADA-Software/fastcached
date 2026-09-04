@@ -639,6 +639,74 @@ set_tests_properties("net-boundary-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The startup diagnostics `docs/operations/corrupt-store.md` quotes VERBATIM are
+# still composable by the source that composes them (#633).
+#
+# That page exists so an operator meeting `Corrupt` does NOT delete a healthy
+# cache, and it only works if they recognise their own console output in it.
+# Measured when #633 was filed: of the diagnostics it quotes, exactly one was
+# asserted anywhere -- `CowTreeStorage_test.cpp` compares the `StorageError(...)`
+# rendering, and `grep -rn "failed to open" --include=*_test.cpp src/` returned
+# nothing at all.
+#
+# A unit test cannot reach the other two. The daemon's `StorageOpenFailure` is in
+# an ANONYMOUS NAMESPACE in `main.cpp`, behind `add_executable(fastcached
+# main.cpp)` with no test target; the node's sentence is composed in a third
+# file in a different binary. A check that READS BOTH SIDES needs no linkage,
+# which is the STORE lane's recommendation and the reason this is a check rather
+# than a test.
+#
+# It asserts PRESENCE in the composing source, never equality with a formatted
+# line -- #633 is explicit that a whole-line assertion is the change-detector it
+# exists to avoid. The one exception is the `StorageError(...)` rendering, where
+# the whole format string IS the page's verbatim quote, so a change-detector is
+# exactly what it needs.
+#
+# Labelled `docs-subject`, so `scripts/doc-subject-checks.sh` runs it on
+# documentation-only pull requests -- the change these exist to catch and the one
+# they used to be skipped on (#687). The runner derives its set from this label,
+# so adding this row is the whole wiring.
+add_test(
+    NAME "corrupt-store-diagnostics"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-corrupt-store-diagnostics.cmake"
+)
+set_tests_properties("corrupt-store-diagnostics" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# And the half that makes it a guard. Nine cases: a baseline, a false-positive
+# guard proving that rewording the prose AROUND a quote is free, five refusals on
+# the fields, one on a quoted diagnostic no fragment row covers, and one on a
+# page that quotes nothing at all.
+#
+# Each has been WATCHED to fail. Removing the uncovered-diagnostic refusal reddens
+# that case alone; disabling the vacuity refusal reddens its own; making the
+# per-fragment literal assertion a no-op reddens four -- and deliberately NOT the
+# `what`-argument case, which goes through a separate loop, so the two are shown
+# to be independent.
+#
+# Its harness distinguishes INCONCLUSIVE from a verdict: a spawn that produced no
+# output and a non-zero status could not run, and is reported as itself rather
+# than as a rule regression. That is #747's subject, and this harness is born with
+# the state rather than becoming a third instance of the defect.
+add_test(
+    NAME "corrupt-store-diagnostics-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/corrupt-store-diagnostics-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-corrupt-store-diagnostics-selftest.cmake"
+)
+set_tests_properties("corrupt-store-diagnostics-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # Test-name hygiene. Fails when a Catch2 case is named something the CTest
 # registration cannot hand back to the runner.
 #
