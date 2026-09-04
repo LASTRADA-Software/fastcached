@@ -253,6 +253,18 @@ configure time instead -- `-DFASTCACHE_ADDR=` (the deliberate form, which wins o
 environment) or `-DUSE_COMPILER_CACHE=OFF` -- both of which travel as command-line
 arguments rather than through an environment block.
 
+**The CMake integration honours the same opt-out, and until
+[#372](https://github.com/LASTRADA-Software/fastcached/issues/372) it did not.**
+`cmake/portable/CompileCache.cmake` decides whether the launcher is used at all, and
+it folded a set-but-empty `FASTCACHE_ADDR` into the default -- so on a POSIX shell,
+where the spelling above *does* travel, `export FASTCACHE_ADDR=` reached the launcher
+as an opt-out and reached the build integration as "say nothing", and the build went
+on being fronted. The two readings of one variable now agree: absent means the
+default, present-and-empty means no caching, in both. Note this is why the paragraph
+above still sends a PowerShell user to `-D`: that platform's problem is that the
+variable never reaches the child at all, which no predicate on the receiving side can
+repair.
+
 `FASTCACHE_ADDR` defaults to `127.0.0.1:6674` rather than to nothing, so the
 launcher caches with no configuration at all against whichever of `fastcached` or
 `fastcache-compile-node` is running on this machine — the node's `--listen-node`

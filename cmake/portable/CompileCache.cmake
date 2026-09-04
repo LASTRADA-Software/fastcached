@@ -118,6 +118,62 @@ function(_fc_debug_prefix_map_rules binaryDir sourceDir outRules outSourceMapped
     set(${outRules} "${rules}" PARENT_SCOPE)
 endfunction()
 
+# Resolve the compile-cache address from what the environment PRESENTED, keeping
+# "set but empty" distinct from "not set at all".
+#
+# **The two are different instructions and folding them together broke the
+# documented opt-out** (#372). `docs/tools/fastcache-cc.md` promises that a set
+# but empty `FASTCACHE_ADDR` means no caching, and the launcher honours that when
+# it reads its own environment at run time. This module decided whether the
+# launcher is used AT ALL from `if("$ENV{FASTCACHE_ADDR}" STREQUAL "")`, which is
+# true for both -- so `export FASTCACHE_ADDR=` was turned straight back into the
+# default and kept caching, on every shell and every platform.
+#
+# That is the same defect this codebase has now fixed three times in three places:
+# an explicitly emptied value is a PIN, and an empty default is not a licence to
+# drop it. `--storage=` is the recorded instance (#349) -- `ParseText` never fails,
+# so an empty one is a reachable operator instruction meaning "persist nowhere" --
+# and `OptionSpec::explicitBit` exists because a value comparison cannot see an
+# operator who typed the default. CMake can tell the two apart with
+# `DEFINED ENV{...}`; nothing but this predicate was in the way.
+#
+# The TOKEN is the second half and is easy to miss. The module notices an
+# environment change across configures by comparing what it last saw, and that
+# record held the VALUE alone -- so unset and set-empty were one state there too,
+# and honouring presence here while comparing values there would leave the
+# retarget unable to see somebody exporting an empty opt-out over a default. The
+# token carries presence and value together.
+#
+# Pure: it reads no environment and touches no cache, so
+# `check-fastcache-addr-opt-out.cmake` can drive the case a developer cannot
+# easily stage -- two runs differing only in whether the name was present.
+#
+# @param present  TRUE when the environment defines the name at all.
+# @param value    Its value; meaningful only when @p present.
+# @param outWanted  The address this module wants; empty means opt out.
+# @param outToken   An exact record of what the environment presented.
+function(_fc_resolve_addr present value outWanted outToken)
+    if(present)
+        # Whatever they set, empty INCLUDED. An empty one reaches
+        # `if(NOT FASTCACHE_ADDR)` below and opts out by name.
+        set(${outWanted} "${value}" PARENT_SCOPE)
+    else()
+        # Nobody said anything, so the compiled-in default: a stock `fastcached`
+        # listens there, and so does a `fastcache-compile-node` whose
+        # --listen-cache defaults to the same address for exactly this reason.
+        set(${outWanted} "127.0.0.1:6674" PARENT_SCOPE)
+    endif()
+
+    # Presence FIRST and a separator that cannot occur in a boolean, so no value
+    # can forge another presence state: "1:" (set to empty) and "0:" (unset) are
+    # different strings, which is the whole point.
+    if(present)
+        set(${outToken} "1:${value}" PARENT_SCOPE)
+    else()
+        set(${outToken} "0:" PARENT_SCOPE)
+    endif()
+endfunction()
+
 # Everything below needs a project: there is no compiler to probe, no target to
 # front and no build to cache without one. `cmake -P` therefore stops here and
 # takes the pure computations above -- which is how `check-debug-prefix-map.cmake`
@@ -167,13 +223,17 @@ endif()
 # port. That default reaches whichever of the two serves it -- a stock `fastcached`
 # (and the service the installers register) listens there, and so does a
 # `fastcache-compile-node`, whose --listen-cache defaults to the same address for
-# exactly this reason. An empty -DFASTCACHE_ADDR= opts out of fastcache-cc entirely.
-set(_fc_addr_env "$ENV{FASTCACHE_ADDR}")
-if(_fc_addr_env STREQUAL "")
-    set(_fc_addr_wanted "127.0.0.1:6674")
+# exactly this reason. An empty value opts out of fastcache-cc entirely -- either
+# spelling: `-DFASTCACHE_ADDR=` on this configure, or a set-but-empty
+# `FASTCACHE_ADDR` in the environment, which is what the operator documentation
+# promises and what #372 made true here.
+# `DEFINED ENV{}` rather than an emptiness test: see `_fc_resolve_addr`, and #372.
+if(DEFINED ENV{FASTCACHE_ADDR})
+    set(_fc_addr_env_present TRUE)
 else()
-    set(_fc_addr_wanted "${_fc_addr_env}")
+    set(_fc_addr_env_present FALSE)
 endif()
+_fc_resolve_addr("${_fc_addr_env_present}" "$ENV{FASTCACHE_ADDR}" _fc_addr_wanted _fc_addr_env_token)
 
 # Ordinary cache semantics would freeze the address at whatever the first
 # configure saw, so exporting FASTCACHE_ADDR to reach a remote daemon would do
@@ -189,15 +249,21 @@ if(NOT DEFINED CACHE{FASTCACHE_ADDR})
     set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
         "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)")
 elseif(DEFINED CACHE{_FASTCACHE_ADDR_APPLIED}
-       AND NOT _fc_addr_env STREQUAL "${_FASTCACHE_ADDR_ENV_SEEN}"
+       AND NOT _fc_addr_env_token STREQUAL "${_FASTCACHE_ADDR_ENV_SEEN}"
        AND FASTCACHE_ADDR STREQUAL "${_FASTCACHE_ADDR_APPLIED}")
     message(STATUS "[cache] FASTCACHE_ADDR changed in the environment; retargeting to ${_fc_addr_wanted}")
     set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
         "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)"
         FORCE)
 endif()
-set(_FASTCACHE_ADDR_ENV_SEEN "${_fc_addr_env}" CACHE INTERNAL
-    "FASTCACHE_ADDR as the environment last presented it, to notice a change on reconfigure")
+# The token, not the bare value: unset and set-to-empty must not record as one
+# state, or the retarget cannot see an opt-out exported over a default. An
+# existing build tree holds a pre-#372 record in the old format, so its first
+# reconfigure reads as a change and recomputes -- which lands on the same address
+# unless the environment now genuinely says otherwise, and is how a tree that was
+# silently ignoring an opt-out starts honouring it.
+set(_FASTCACHE_ADDR_ENV_SEEN "${_fc_addr_env_token}" CACHE INTERNAL
+    "FASTCACHE_ADDR as the environment last presented it -- presence and value, to notice a change on reconfigure")
 set(_FASTCACHE_ADDR_APPLIED "${FASTCACHE_ADDR}" CACHE INTERNAL
     "the address this module last applied, to tell its own value from one set externally")
 
