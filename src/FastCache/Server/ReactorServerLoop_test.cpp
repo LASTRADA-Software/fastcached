@@ -7,7 +7,6 @@
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
@@ -294,22 +293,6 @@ constexpr std::string_view ReadyMarker = "ready, accepting connections";
 /// Text every per-acceptor Debug record carries.
 constexpr std::string_view ArmedMarker = "acceptor armed";
 
-/// A free loopback TCP port, found by binding one and letting it go.
-///
-/// Only the multi-reactor case needs it: every reactor there binds the SAME
-/// `{address, port}` under `SO_REUSEPORT`, so port `0` would hand each of them a
-/// different port and the case would stop being about one shared endpoint.
-/// @return A port nothing held a moment ago.
-[[nodiscard]] std::uint16_t FreeLoopbackPort()
-{
-    auto probe = FastCache::BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(probe);
-    REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
-    probe.reset();
-    return port;
-}
-
 /// The `(armed/expected)` progress an `acceptor armed` record carries.
 struct ArmProgress
 {
@@ -373,34 +356,74 @@ struct ServerRun
     return found;
 }
 
-/// Assert that the readiness line came after every acceptor armed, and that the
-/// set of acceptors was complete when it did.
+/// Assert that the daemon announced readiness once, and that every acceptor it
+/// registered actually armed.
 ///
-/// Non-emptiness is asserted as well as the ordering, because an ordering over an
-/// empty set of arms holds vacuously -- which is what these cases would degenerate
-/// into if the arms stopped being logged. The SIZE is then checked against what the
-/// announcer reported rather than against a literal, so the property is "every
-/// participant that registered has armed" on any platform.
+/// ## Why there is no assertion on the ORDER of these records
+///
+/// Two attempts at one lived here and both were wrong, in ways only a counted
+/// stress run showed -- `ctest --repeat until-fail` reports the LAST iteration, so
+/// it said nothing; a loop counting outcomes found 2 failures in 200.
+///
+///   - `armed.back() < ready.front()` assumed log position is arm order. Arming is
+///     a `fetch_add` and a separate `Logf`, so a thread holding the second slot can
+///     reach the logger first. Measured: `1 == 2`.
+///   - Then "the record carrying `(m/m)` must precede the readiness line", on the
+///     reasoning that the thread completing the count logs its own line and then
+///     announces. Also wrong, and this is the interesting one: `MaybeAnnounce`
+///     reads the CURRENT count rather than the value its own call produced, so the
+///     announcer can be a thread that took an earlier slot -- it logs `(1/2)`, sees
+///     that the total has since been reached, and announces while its sibling's
+///     `(2/2)` line is still on its way to the logger. Measured: `3 < 1`.
+///
+/// **Readiness is not violated in either case**: the counter reached the total
+/// before anything was announced, which is exactly what #646 asks for. What is not
+/// witnessable from a log is the ORDER, because the arming and the reporting of it
+/// are two steps and only the first one is what readiness depends on.
+///
+/// So the ordering property is asserted where it can be asserted deterministically
+/// -- `ReadinessAnnouncer_test` drives it single-threaded and proves nothing is
+/// announced until the last arm -- and this checks the WIRING: that the loop
+/// registered every participant it created, that all of them armed, and that the
+/// daemon said so once. The single-reactor case below adds the strict ordering,
+/// which is sound there because that path arms on one thread.
 /// @param log The run's records, in order.
-/// @return Nothing; fails the active case on violation.
-void CheckArmedBeforeReady(std::vector<FastCache::CapturingLogger::Record> const& log)
+void CheckReadinessComplete(std::vector<FastCache::CapturingLogger::Record> const& log)
 {
     auto const ready = IndicesContaining(log, ReadyMarker);
     auto const armed = IndicesContaining(log, ArmedMarker);
 
     REQUIRE(ready.size() == 1);
+    // Non-emptiness as well as the rest, because every check below holds vacuously
+    // over an empty set of arms -- which is what this would degenerate into if the
+    // arm records stopped being logged.
     REQUIRE_FALSE(armed.empty());
-    // The property #646 is about.
-    CHECK(armed.back() < ready.front());
 
-    // And the set was closed and fully armed, taken from the announcer's own last
-    // progress line rather than from a count restated here.
-    auto const progress = ArmProgressOf(log[armed.back()].message);
-    REQUIRE(progress.has_value());
-    auto const& last = FastCache::Testing::Unwrap(progress);
-    CHECK(last.expected != 0);
-    CHECK(last.armed == last.expected);
-    CHECK(armed.size() == last.expected);
+    // The total is the largest `expected` any arm reported. Not simply the first
+    // record's: on the Windows path the acceptor threads are spawned before the set
+    // is closed, so an early arm can legitimately report a total that is still
+    // growing.
+    std::size_t expected = 0;
+    std::vector<std::size_t> positions;
+    for (auto const index: armed)
+    {
+        auto const progress = ArmProgressOf(log[index].message);
+        REQUIRE(progress.has_value());
+        auto const& parsed = FastCache::Testing::Unwrap(progress);
+        expected = std::max(expected, parsed.expected);
+        positions.push_back(parsed.armed);
+    }
+
+    CHECK(expected != 0);
+    CHECK(armed.size() == expected);
+
+    // Every slot from 1 to the total, exactly once. Order-independent by
+    // construction, which is the point: it catches a participant that never armed
+    // and one that armed twice without caring which thread reached the logger first.
+    std::ranges::sort(positions);
+    std::vector<std::size_t> want(expected);
+    std::ranges::copy(std::views::iota(std::size_t { 1 }, expected + 1), want.begin());
+    CHECK(positions == want);
 }
 
 /// Run `RunReactorServer` on a background thread until it announces readiness,
@@ -476,9 +499,16 @@ TEST_CASE("RunReactorServer announces readiness only after every accept loop is 
     REQUIRE(run.sawReady);
     CHECK(run.exitCode == EXIT_SUCCESS);
 
-    CheckArmedBeforeReady(run.log);
+    CheckReadinessComplete(run.log);
 
     auto const ready = IndicesContaining(run.log, ReadyMarker);
+    auto const armed = IndicesContaining(run.log, ArmedMarker);
+    // Strict ordering, and it is sound HERE and only here: the single-reactor path
+    // arms every accept loop from one thread, so log position is arm order. This is
+    // the closest thing in the suite to the original defect, which was a readiness
+    // line sitting literally above the loop that starts the acceptors.
+    REQUIRE_FALSE(armed.empty());
+    CHECK(armed.back() < ready.front());
     CHECK(run.log[ready.front()].level == FastCache::LogLevel::Info);
     // The single-reactor path arms one accept loop per bind on every platform, so
     // this figure is the same everywhere and is the endpoint summary rather than a
@@ -490,10 +520,27 @@ TEST_CASE("RunReactorServer waits for every reactor's accept loops before announ
           "[server][reactor-loop][readiness]")
 {
     // The multi-reactor path is where the pre-fix line was weakest: it was logged
-    // before a single reactor thread had been CREATED. Two reactors sharing one
-    // endpoint under SO_REUSEPORT, so the readiness line has to wait for both.
+    // before a single reactor thread had been CREATED, so the readiness line has to
+    // wait for both of them.
+    //
+    // Port 0, so the OS picks and nothing in this suite can contend for it. This
+    // case first asked for one shared port -- found by binding a probe and letting
+    // it go -- on the reasoning that production's reactors share one endpoint under
+    // `SO_REUSEPORT`. That reasoning was about production and not about the property
+    // here, and it bought an intermittent failure: `bind(0)` hands back a port
+    // INSIDE `ip_local_port_range` (32768+ on Linux), which any other test's
+    // outbound connection can take between the probe closing and the server binding.
+    // It did, once, in a `-j24` run -- the tell being a 0.13s failure, which is a
+    // bind error rather than the 15s readiness timeout. `Config.hpp` already carries
+    // that rule for the daemon's own default port.
+    //
+    // What this case asserts is that the readiness line waits for EVERY reactor's
+    // accept loops, and two reactors on two ports exercise that identically: each
+    // still arms its own loops on its own thread, and the last one still announces.
+    // Sharing one port is production's arrangement, not this property, and no
+    // assertion below reads the port at all.
     FastCache::ReactorServerOptions options;
-    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = FreeLoopbackPort(), .tls = false });
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 0, .tls = false });
     options.reactorThreads = 2;
 
     auto const run = RunUntilReady(options);
@@ -501,7 +548,7 @@ TEST_CASE("RunReactorServer waits for every reactor's accept loops before announ
     REQUIRE(run.sawReady);
     CHECK(run.exitCode == EXIT_SUCCESS);
 
-    CheckArmedBeforeReady(run.log);
+    CheckReadinessComplete(run.log);
 
     // The endpoint summary, which is what the operator reads. How many PARTICIPANTS
     // that took is platform-specific and is asserted against the announcer's own
@@ -649,7 +696,7 @@ TEST_CASE("The readiness ordering check holds for both platforms' participant sh
     SECTION("POSIX: one accept loop per (reactor, bind) pair")
     {
         // 2 reactors x 1 bind.
-        CheckArmedBeforeReady({
+        CheckReadinessComplete({
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 bind 0 (1/2)"),
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 bind 0 (2/2)"),
             record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
@@ -661,7 +708,7 @@ TEST_CASE("The readiness ordering check holds for both platforms' participant sh
         // 1 acceptor thread + 2 reactors = 3, which is the count that broke the
         // literal. The reactors arm last here because their `Run()` is entered after
         // the acceptor threads are spawned.
-        CheckArmedBeforeReady({
+        CheckReadinessComplete({
             record(FastCache::LogLevel::Debug, "acceptor armed: acceptor thread 0 (1/3)"),
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 (2/3)"),
             record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 (3/3)"),
