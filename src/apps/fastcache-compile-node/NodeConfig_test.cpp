@@ -64,6 +64,10 @@ constexpr std::string_view SchedulerEndpoint = "scheduler.internal:6675";
 /// A scheduler registering with itself over loopback is the documented shape
 /// (`--serve-scheduler ... --scheduler=127.0.0.1:6675`), and it is what makes
 /// `SchedulerIsRemote` false.
+///
+/// Found by giving the scheduler fixtures a REMOTE endpoint and watching the dashboard
+/// and fleet-policy cases go red on the advertise rows -- so the two constants are not
+/// a tidiness preference, and picking the wrong one does not fail where you are looking.
 constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
 
 [[nodiscard]] NodeConfig Installable()
