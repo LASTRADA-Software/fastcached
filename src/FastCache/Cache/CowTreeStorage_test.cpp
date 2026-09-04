@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <random>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -34,10 +36,12 @@
 #include <CowTree/Bytes.hpp>
 #include <CowTree/CowTree.hpp>
 #include <CowTree/Crc32c.hpp>
+#include <CowTree/Errors.hpp>
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/IPageStore.hpp>
 #include <CowTree/InMemoryPageStore.hpp>
 #include <CowTree/Meta.hpp>
+#include <CowTree/PageId.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
@@ -1429,6 +1433,362 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
     INFO("probed " << probed << " pages: " << refusedAtOpen << " refused at Open, " << openedWithNothingCorrupt
                    << " opened with no key corrupt, " << openedWithNothingReadable << " opened with no key readable");
     REQUIRE(partialLoss);
+}
+
+// ============================================================================
+// One damaged meta slot (issue #632)
+//
+// `docs/operations/corrupt-store.md` tells an operator that one damaged meta
+// page is survived SILENTLY: the store keeps two slots and alternates between
+// them, so `Corrupt` at open means BOTH failed. The cases above pin the
+// "both failed" half. This is the other one, and nothing reached it.
+//
+// It needs a real FILE, and that is not a preference. `WriteMeta` encodes and
+// CRCs whatever it is handed, so damaged meta bytes cannot be expressed through
+// the page-store API at all -- an `InMemoryPageStore` reaches them only behind
+// a `FaultPlan`, which is a torn write happening NOW rather than the bytes an
+// operator's file is already sitting on when the process starts. The two are
+// different events and only the second is what the page is about.
+//
+// The byte offsets these cases patch are `Meta.hpp`'s own documented layout
+// ("slot A at offset 0, slot B at offset PageSize"), not a private detail read
+// out of `FilePageStore.cpp` -- and `DamageMetaSlot` asserts the injection
+// landed, in both directions, so a layout that moved fails here rather than
+// quietly damaging nothing.
+//
+// Each of the three claims below was WATCHED refusing, because a guard nobody
+// has seen refuse is not a guard. Measured on `gcc-debug`, one break at a time:
+//
+//   * `RecoverExistingFile` reading its condition as "EITHER slot failed" --
+//     both cases red, at the first `Open`.
+//   * `RecoverExistingFile` recording the DAMAGED slot as the last durable one
+//     -- the first case stays GREEN and only the second goes red, which is the
+//     whole reason the second case exists separately.
+//   * a `std::cerr` line added to the one-surviving-slot recovery path -- only
+//     the silence assertion goes red; every assertion about the store itself
+//     still passes, which is what it is there to say.
+// ============================================================================
+
+namespace
+{
+
+/// Byte the meta damage flips, as an offset inside an encoded meta page.
+///
+/// Derived rather than chosen: it has to land in the CRC'd PAYLOAD -- the
+/// leading `MetaEncodedSize - sizeof(u32)` bytes -- and not in the trailing CRC
+/// itself, which would be damage the decoder recomputes agreement with. Half
+/// way into the encoded record is inside the payload for any layout the encoder
+/// can grow into, and `DamageMetaSlot` proves it for the layout in force.
+constexpr std::size_t MetaDamageOffset = CowTree::MetaEncodedSize / 2;
+
+/// Commit generations the meta-damage fixture writes, one per session.
+///
+/// Two, and not one: a single session leaves the OTHER slot holding the blank
+/// `txnId == 0` meta that `BootstrapNewFile` wrote, so damaging the live slot
+/// would fall back to an EMPTY store and "serves the previous commit" could not
+/// be told from "serves nothing".
+constexpr int MetaDamageGenerations = 2;
+
+/// Keys each generation writes.
+constexpr int MetaDamageKeysPerGeneration = 5;
+
+/// Key `i` of generation `gen`.
+/// @param gen Commit generation, 1-based.
+/// @param i   Key index within the generation.
+/// @return A fixed-width key naming both.
+[[nodiscard]] std::string GenerationKey(int gen, int i)
+{
+    return std::format("gen-{}-key-{:02}", gen, i);
+}
+
+/// The other meta slot.
+/// @param slot One slot.
+/// @return The one it alternates with.
+[[nodiscard]] constexpr CowTree::MetaSlot OtherSlot(CowTree::MetaSlot slot) noexcept
+{
+    return slot == CowTree::MetaSlot::A ? CowTree::MetaSlot::B : CowTree::MetaSlot::A;
+}
+
+/// Human-readable slot name for `INFO`/`CAPTURE`.
+/// @param slot The slot.
+/// @return "A" or "B".
+[[nodiscard]] constexpr std::string_view SlotName(CowTree::MetaSlot slot) noexcept
+{
+    return slot == CowTree::MetaSlot::A ? "A" : "B";
+}
+
+/// The bytes of one meta slot, out of a store file read whole.
+/// @param file  The whole store file.
+/// @param slot  Which slot.
+/// @return A view over that slot's page.
+[[nodiscard]] std::span<std::byte const> SlotBytes(std::span<std::byte const> file, CowTree::MetaSlot slot)
+{
+    REQUIRE(file.size() >= 2 * DamagePageSize);
+    return file.subspan(static_cast<std::size_t>(slot) * DamagePageSize, DamagePageSize);
+}
+
+/// Decode one meta slot out of a store file read whole.
+/// @param file  The whole store file.
+/// @param slot  Which slot.
+/// @return Whatever `DecodeMeta` answered for it.
+[[nodiscard]] std::expected<CowTree::Meta, CowTree::CowTreeError> DecodeSlot(std::span<std::byte const> file,
+                                                                             CowTree::MetaSlot slot)
+{
+    auto const page = SlotBytes(file, slot);
+    return CowTree::DecodeMeta(CowTree::BytesView { page.data(), page.size() });
+}
+
+/// Which slot holds the newest commit of a store file read whole.
+///
+/// The same tie-break `FilePageStore::RecoverExistingFile` and `CowTree::Open`
+/// both apply -- the higher `txnId` among the slots that decode. Derived from
+/// the file rather than assumed, because which slot the alternation lands on
+/// depends on how many flushes happened, and a fixture that hard-coded one
+/// would silently stop damaging the live slot the day that changed.
+/// @param file The whole store file. Both slots must decode.
+/// @return The slot holding the newest commit.
+[[nodiscard]] CowTree::MetaSlot LiveSlot(std::span<std::byte const> file)
+{
+    auto const a = DecodeSlot(file, CowTree::MetaSlot::A);
+    auto const b = DecodeSlot(file, CowTree::MetaSlot::B);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    return a->txnId >= b->txnId ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
+}
+
+/// Build a real store file at `path` carrying `MetaDamageGenerations` durable
+/// commit generations, one per session, and prove both meta slots ended up
+/// holding a real and DIFFERENT commit.
+///
+/// One session per generation because the default `Batched` durability buffers
+/// the meta until a flush boundary, and closing the store is the boundary this
+/// reaches: each session therefore contributes exactly one durable meta, to the
+/// slot the previous one did not use.
+/// @param path Where to build the store.
+void SeedTwoCommitGenerations(std::filesystem::path const& path)
+{
+    for (auto const gen: std::views::iota(1, MetaDamageGenerations + 1))
+    {
+        auto storage = OpenDamaged(path);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, MetaDamageKeysPerGeneration))
+            REQUIRE((*storage)->Set(GenerationKey(gen, i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    }
+
+    // The fixture's own precondition, asserted rather than assumed: two slots,
+    // both valid, holding different commits. Everything below reads "the live
+    // one" and "the previous one" off this, so a seed that produced one usable
+    // slot would make every case beneath it vacuous.
+    auto const file = ReadWholeFile(path);
+    auto const a = DecodeSlot(file, CowTree::MetaSlot::A);
+    auto const b = DecodeSlot(file, CowTree::MetaSlot::B);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(a->txnId != b->txnId);
+}
+
+/// Flip one byte inside meta slot `slot` of the closed store file at `path`.
+///
+/// The injection is ASSERTED, both ways: the named slot must stop decoding --
+/// as `Corrupt`, because `DecodeMeta` checks the CRC before magic and version,
+/// so damage never presents as a store of another vintage -- and the other slot
+/// must still decode. A fixture that damaged nothing, or damaged both, would
+/// otherwise pass every case below for the wrong reason.
+/// @param path Store file to damage in place.
+/// @param slot Which meta slot to damage.
+void DamageMetaSlot(std::filesystem::path const& path, CowTree::MetaSlot slot)
+{
+    auto bytes = ReadWholeFile(path);
+    REQUIRE(bytes.size() >= 2 * DamagePageSize);
+    bytes[(static_cast<std::size_t>(slot) * DamagePageSize) + MetaDamageOffset] ^= std::byte { 0xFF };
+    WriteWholeFile(path, bytes);
+
+    auto const after = ReadWholeFile(path);
+    auto const damaged = DecodeSlot(after, slot);
+    REQUIRE_FALSE(damaged.has_value());
+    REQUIRE(damaged.error() == CowTree::CowTreeError::Corrupt);
+    REQUIRE(DecodeSlot(after, OtherSlot(slot)).has_value());
+}
+
+/// Redirects `std::cout` and `std::cerr` into buffers of its own for its
+/// lifetime, so a caller can assert that a scope wrote NOTHING.
+///
+/// The operator page says one damaged meta page is survived *silently*, and a
+/// build that opened the store and then complained about it would satisfy every
+/// assertion about the store itself. Nothing in `Cache/` or `CowTree/` takes an
+/// `ILogger` -- a success carries no warning channel, which is the structural
+/// half of "silently" -- so a diagnostic added here would have to be a direct
+/// stream write, and this is what sees one.
+///
+/// What it cannot see, stated rather than left to be assumed: a write through
+/// `std::fprintf(stderr, ...)` or a platform console API. Neither is a spelling
+/// this tree uses -- `ConsoleLogger` takes an `std::ostream&` -- but a guard is
+/// worth exactly what it can observe.
+class CapturedStreams
+{
+  public:
+    CapturedStreams():
+        _outWas { std::cout.rdbuf(_out.rdbuf()) },
+        _errWas { std::cerr.rdbuf(_err.rdbuf()) }
+    {
+    }
+
+    ~CapturedStreams()
+    {
+        std::cout.rdbuf(_outWas);
+        std::cerr.rdbuf(_errWas);
+    }
+
+    CapturedStreams(CapturedStreams const&) = delete;
+    CapturedStreams& operator=(CapturedStreams const&) = delete;
+    CapturedStreams(CapturedStreams&&) = delete;
+    CapturedStreams& operator=(CapturedStreams&&) = delete;
+
+    /// @return Everything written to either stream so far.
+    [[nodiscard]] std::string Captured() const
+    {
+        return _out.str() + _err.str();
+    }
+
+  private:
+    // Declared before the saved buffers: the constructor's member-init list
+    // hands `_out.rdbuf()` to `std::cout` while initialising `_outWas`, and a
+    // half-constructed stream would be what it installed.
+    std::ostringstream _out;
+    std::ostringstream _err;
+    std::streambuf* _outWas;
+    std::streambuf* _errWas;
+};
+
+/// One row of the surviving-slot table below.
+struct MetaDamageRow
+{
+    /// Damage the slot holding the NEWEST commit, rather than the older one.
+    bool damageLive;
+
+    /// Generations 1..this stay readable; anything above it is gone.
+    int highestReadableGeneration;
+
+    /// What the row is about, for `INFO`.
+    std::string_view what;
+};
+
+} // namespace
+
+TEST_CASE("One damaged meta slot leaves the store open, silent, and on the surviving slot's commit",
+          "[cowstorage][open][corrupt][meta]")
+{
+    // Two rows rather than one, because they fail differently and only the pair
+    // says the SURVIVING slot was chosen. Damage the live slot alone and a build
+    // that always picked the older valid slot would pass; damage the stale slot
+    // alone and one that always picked the newer would. Neither is a strawman --
+    // both are one comparison operator away from what `RecoverExistingFile` and
+    // `CowTree::Open` each write out separately.
+    auto const rows = std::vector<MetaDamageRow> {
+        { .damageLive = false,
+          .highestReadableGeneration = MetaDamageGenerations,
+          .what = "the stale slot is damaged: the newest commit still serves, whole" },
+        { .damageLive = true,
+          .highestReadableGeneration = MetaDamageGenerations - 1,
+          .what = "the live slot is damaged: the store falls back to the previous commit" },
+    };
+
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        TempFile tmp;
+        SeedTwoCommitGenerations(tmp.path);
+
+        auto const live = LiveSlot(ReadWholeFile(tmp.path));
+        auto const target = row.damageLive ? live : OtherSlot(live);
+        CAPTURE(SlotName(target));
+        DamageMetaSlot(tmp.path, target);
+
+        // Only the open is inside the capture. A Catch2 assertion failing in
+        // here would write its own report into the buffers and lose it.
+        std::string said;
+        auto opened = [&] {
+            CapturedStreams const quiet;
+            auto result = OpenDamaged(tmp.path);
+            said = quiet.Captured();
+            return result;
+        }();
+
+        // The process starts. This is the whole claim: `Corrupt` at open means
+        // BOTH slots failed, and one is not both.
+        REQUIRE(opened.has_value());
+        REQUIRE(said.empty());
+
+        FastCache::ManualClock clock;
+        for (auto const gen: std::views::iota(1, MetaDamageGenerations + 1))
+        {
+            for (auto const i: std::views::iota(0, MetaDamageKeysPerGeneration))
+            {
+                CAPTURE(gen, i);
+                auto const got = (*opened)->Get(GenerationKey(gen, i), clock.Now());
+                // A key from a commit the surviving slot never saw is a MISS,
+                // not a failure: the store is internally consistent, it is just
+                // consistent with an earlier moment. Reporting `Corrupt` for it
+                // would tell an operator the bytes under that key are damaged
+                // when the key was simply never committed in this view -- and
+                // `Corrupt` is what makes somebody delete a healthy cache.
+                REQUIRE(got.has_value());
+                REQUIRE(got->found == (gen <= row.highestReadableGeneration));
+            }
+        }
+    }
+}
+
+TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstorage][open][corrupt][meta]")
+{
+    // A store opened on one surviving slot is one torn write from unopenable,
+    // and which slot the next commit lands on is what decides whether it stays
+    // that way or stops being recoverable altogether. The alternation has to
+    // move AWAY from the slot it recovered from -- which is the same invariant
+    // `FlushBatchLocked` maintains in normal running, asked of the one state
+    // where getting it wrong is unrecoverable rather than merely wasteful.
+    //
+    // Nothing else asks it: every case above stops at "the store opened", and a
+    // build that recovered correctly and then overwrote the good slot passes
+    // all of them.
+    for (auto const damageLive: { false, true })
+    {
+        INFO((damageLive ? "the live slot was the damaged one" : "the stale slot was the damaged one"));
+        TempFile tmp;
+        SeedTwoCommitGenerations(tmp.path);
+
+        auto const live = LiveSlot(ReadWholeFile(tmp.path));
+        auto const damaged = damageLive ? live : OtherSlot(live);
+        auto const survivor = OtherSlot(damaged);
+        CAPTURE(SlotName(damaged));
+        DamageMetaSlot(tmp.path, damaged);
+
+        auto const before = ReadWholeFile(tmp.path);
+        auto const survivorBefore = DecodeSlot(before, survivor);
+        REQUIRE(survivorBefore.has_value());
+        std::vector<std::byte> const survivorPage { SlotBytes(before, survivor).begin(), SlotBytes(before, survivor).end() };
+
+        {
+            auto storage = OpenDamaged(tmp.path);
+            REQUIRE(storage.has_value());
+            REQUIRE((*storage)->Set("after-recovery", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+        }
+
+        auto const after = ReadWholeFile(tmp.path);
+
+        // Byte-for-byte, not "still decodes": a slot rewritten with an equally
+        // valid meta would decode fine and would still have been the one spent.
+        auto const survivorAfter = SlotBytes(after, survivor);
+        REQUIRE(std::ranges::equal(survivorPage, survivorAfter));
+
+        // And the other half, which is what makes the first mean something: the
+        // commit did land somewhere, in the slot that was already damaged, and
+        // it is newer than what the store recovered from. Without this a build
+        // that wrote no meta at all would pass.
+        auto const repaired = DecodeSlot(after, damaged);
+        REQUIRE(repaired.has_value());
+        REQUIRE(repaired->txnId > survivorBefore->txnId);
+    }
 }
 
 // ============================================================================

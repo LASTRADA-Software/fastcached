@@ -98,6 +98,42 @@ operator answer rests on: partial loss is the normal shape, so deleting the stor
 is both the correct procedure and the end of any chance of finding the cause, and
 a page that says "copy it first" has to be describing something true.
 
+**ONE damaged meta slot is a THIRD state, not a weaker version of the first**
+(#632). `Corrupt` at open means both slots failed, so a fixture that only ever
+damages both cannot tell *the alternation saved us* from *the damage happened to
+land somewhere harmless*. It needs a real FILE, and that is not a preference:
+`WriteMeta` encodes and CRCs whatever it is handed, so damaged meta bytes have no
+API route at all, and an `InMemoryPageStore` `FaultPlan` reaches them only as a
+torn write happening NOW rather than as the bytes an operator's file is already
+sitting on when the process starts. Three separate things are pinned, each red
+under a different break:
+
+- The store **opens on the surviving slot's commit**, in BOTH directions. Damage
+  only the live slot and a build that always took the older valid slot passes;
+  damage only the stale one and a build that always took the newer passes. And
+  what the live slot's loss costs is a **miss**, never `Corrupt` — the store is
+  consistent, just with an earlier moment, and reporting damage for a key that
+  was merely never committed in that view is the "delete a healthy cache"
+  failure again.
+- It says **nothing** while doing it. "Survived silently" is a claim about the
+  log, and every assertion about the store itself holds under a build that
+  opened and then complained. Nothing here takes an `ILogger` or a metrics sink,
+  so a diagnostic would have to be a direct stream write and that is what the
+  capture sees; it cannot see `fprintf`, which is stated rather than left to be
+  assumed.
+- The next commit lands in the **damaged** slot. A build that recovered
+  correctly and then wrote over its one good slot passes everything above while
+  leaving the store one torn write from unopenable, and that is the only state
+  where getting the alternation wrong is unrecoverable rather than wasteful.
+
+It is pinned twice, in two suites, and not by accident: `CowTreeStorage_test`
+asks the operator's question (a daemon's store opens, serves, stays quiet, keeps
+its surviving slot) and `FilePageStore_test` asks the library's, because
+`src/CowTree/` is a standalone sibling and a guarantee held only by the FastCache
+suite does not travel with it. They cannot share a helper — `CowTreeTests` has
+only `src/CowTree` on its include path, which is the boundary that keeps the
+library standalone.
+
 **The signals are not the same on both binaries.** `WriteErrorReportingStorage` is
 constructed only by `fastcached`, so `fastcached_write_errors_total` and the
 `storage write failed` warning cannot move on a compile node — its tier is wrapped

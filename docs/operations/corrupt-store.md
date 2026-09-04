@@ -97,6 +97,23 @@ it".
     which is what makes hardware or the filesystem the leading hypothesis rather
     than the power cut.
 
+    **Silently means you are told nothing, not that nothing was lost.** Which of
+    the two slots was damaged decides what surviving costs, and neither outcome
+    writes a log line or moves a counter — the storage layer has no logger and no
+    metrics sink to reach for.
+
+    - The **older** slot damaged: the store comes up on the newest commit, whole.
+    - The **live** slot damaged: the store comes up on the previous durable
+      commit. Keys written after it are simply **not there** — they read as
+      ordinary misses, not as errors, because the store is internally
+      consistent, just consistent with an earlier moment.
+
+    The next commit then lands in the damaged slot rather than over the
+    surviving one, so ordinary use repairs the file instead of leaving it one
+    torn write away from `Corrupt`. A cache that has quietly lost its most
+    recent window refills; the reason it did is still worth the two minutes
+    below, because the damage that caused it has not gone anywhere.
+
 ## Can it be repaired?
 
 **No. Nothing ships that repairs or salvages a damaged store.** That is the
