@@ -119,15 +119,20 @@ it".
       lands in the damaged one and the surviving slot is preserved. Ordinary use
       does repair the file.
     - **`fsync`**: the commit after recovery derives its slot from the
-      transaction id and consults nothing the recovery recorded, so it
-      **overwrites the surviving slot** — spending the only good copy and
-      leaving every later commit hammering it. See
+      transaction id and consults nothing the recovery recorded, so the
+      **first** one overwrites the surviving slot rather than the damaged one.
+      For the length of that one commit the store's only good meta copy is the
+      one being rewritten, and a tear there leaves nothing to open. That write
+      restores the slot alternation, so the *second* commit repairs the damaged
+      slot and the file is back to two good copies. See
       [#726](https://github.com/LASTRADA-Software/fastcached/issues/726).
 
-    So on `fsync` a store that came up degraded is one torn write from `Corrupt`
-    and stays that way. A cache that has quietly lost its most recent window
-    refills either way; the reason it did is still worth the two minutes below,
-    because the damage that caused it has not gone anywhere.
+    So on `fsync` the dangerous moment is the **first write after a degraded
+    start**, not the indefinite future. If you are restarting a damaged store to
+    get service back, copy the file before you do. A cache that has quietly lost
+    its most recent window refills either way; the reason it did is still worth
+    the two minutes below, because the damage that caused it has not gone
+    anywhere.
 
 ## Can it be repaired?
 
