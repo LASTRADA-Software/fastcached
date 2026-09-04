@@ -1102,6 +1102,44 @@ what differs between compilers, standard libraries, hosts and tool versions.
   job that consults it. The matrix trap had been the only thing saving this (a skipped matrix job hangs rather
   than passing); it is no longer load-bearing, so do not reintroduce a job-level `if:` on `linux`/`windows`
   believing it will catch you. `ctest -R gated-jobs-fail-safe` asserts both rules, derived not tabulated.
+- A gate that does not REPORT reads as a gate that passed, and the *required* clause is not what makes it
+  so. Measured over every failing `merge_group` `Build` run the API still held: **five of six failed a job that
+  is not a required context, and all five pull requests merged with nobody told** — the pull request is green,
+  the queue reports success, and master is green afterwards because the same job passes on the merge commit
+  (#684). The unit is the CONTEXT, never the job key: `Windows-cl-debug` is unrequired while
+  `Windows-cl-release`, a leg of the same matrix job, is required, and two of the six rows are that case. Not a
+  JOB in `build.yml` (`check-release-gate` would drag the release behind a notifier that is skipped on every
+  tag) and not a STEP per job (ten copies, ten `issues: write`, and it cannot see the other legs) — so
+  `workflow_run`, after the queue has concluded, gating nothing. `workflow_run` runs only the DEFAULT branch's
+  copy, so the DECISION is a script driven against captured real records and the wiring is asserted statically:
+  `ctest -R merge-group-report`, `-R merge-group-report-selftest`. Its trigger carries **no `branches:` filter**
+  on purpose — that is what makes the one claim nobody could measure (that `workflow_run` fires for a
+  `merge_group` run at all) show itself on the first ordinary run instead of failing silently.
+- Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
+  `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
+  the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict
+  patterns — never restated — and every way of not being able to run one is a REFUSAL, never a skip: a label
+  matching nothing, a build-tree variable left unresolved, a missing script, an all-skipped run. It runs from an
+  UNGATED step of `check-clang-format`, whose `name:` is the required context `Check C++ style`, because
+  reporting without gating is #684 and fixing one ticket by reintroducing the other is not a fix. That `name:`
+  is a wire constant. `ctest -R doc-subject-checks-derivation`, `-R doc-subject-checks-selftest`, and
+  `gated-jobs-fail-safe` rule C.
+- Five ways an instrument reported on something other than its subject, all in one branch, all written by
+  someone who had just read the rulebook. A **COMMENT is not a call site** — two checks matched their own
+  headers, one reporting a step twice and one refusing a correct workflow — so strip full-line comments, and
+  self-test both directions. **`bash <path>`, never a bare path**, in a self-test AND in a workflow: a bare
+  `"$0"` in `check-gated-jobs.sh --self-test` exited **126** on a mode-644 script, so eight `want-fail` cases
+  passed because the SHELL refused — green, testing nothing, caught only by the one case expecting a PASS — and
+  a bare `run: scripts/doc-subject-checks.sh` took the REQUIRED `Check C++ style` context red the same way.
+  The mode is the smaller half (#720 covers it; #723 the rest): a call that fails to START fails for reasons a
+  chmod does not cover, and inside a `want-fail` assertion any of them is indistinguishable from the rule
+  firing. Name the interpreter regardless.
+  **`IFS=$'\t' read` does not read TSV**: tab is IFS whitespace, so an empty field collapses and shifts every
+  field after it. **A fixture built on `message(FATAL_ERROR)` cannot test that verdicts are read from OUTPUT** —
+  it exits 0 on 3.28 and 1 on 4.x, so the rule's own test passed with the rule deleted. And **a self-test that
+  stops early must not look like one that judged something**: `set -e` plus a generator ending in
+  `[[ ... ]] && echo` truncated a run at eight cases with no case named, so the self-tests print how many cases
+  they ran.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
