@@ -1264,15 +1264,19 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
 // The launchctl timeout verdict (#535)
 //
 // These run on EVERY platform, which is why the decision was split out of the
-// `__APPLE__` branch that acquires the readings. `RunLaunchctl` compiles on macOS
-// alone, so a verdict left inside it would be exercised by no test on any machine
-// this project builds on -- #682's blind spot, and exactly how a diagnostic that
-// names the wrong cause survives review.
+// `__APPLE__` branch that acquires the readings. The reason is the absence of a
+// SEAM rather than of a machine -- CI does build and `ctest` on macOS, so an
+// earlier draft's "no machine this project builds on" was false. What no test can
+// reach is a decision inside a file-local function that spawns a real process and
+// waits on it.
 //
 // The numbers below are MEASURED, by lifting the acquisition loop into a
 // standalone program and driving it over a parked process and a spinning one on
-// Linux (everything it uses -- `posix_spawn`, `waitpid`, `wait4`, `rusage` -- is
-// POSIX):
+// Linux. `posix_spawn` and `waitpid` are POSIX; `wait4` and `rusage` are 4.3BSD
+// and were never specified by POSIX, which is worth saying precisely because
+// `wait4` is the one call this comment separately flags as unverified on macOS --
+// a portability claim doing load-bearing work it cannot support is the defect
+// this whole change is about:
 //
 //     parked `sleep`   ->      665us of cpu against a 1012ms budget   (0.07%)
 //     busy loop        ->   846448us of cpu against a 1012ms budget   (83.6%)
@@ -1365,12 +1369,15 @@ TEST_CASE("The timeout message carries the measured elapsed, not the ceiling", "
     readings.budget = std::chrono::milliseconds { 60'000 };
 
     auto const text = FastCache::LaunchctlStatusText(readings);
-    CHECK(text.find("60123ms") != std::string::npos);
-    CHECK(text.find("60000ms budget") != std::string::npos);
+    CHECK(text.contains("60123ms"));
+    CHECK(text.contains("60000ms budget"));
     // A wait that ran out refused nothing, and calling it a failure sent an
     // operator looking for a rejection that never happened.
-    CHECK(text.find("timed out") != std::string::npos);
-    CHECK(text.find("refused") == std::string::npos);
+    // The verb lives at the call site now (`LaunchctlFailureVerb`), so this
+    // phrase carries the readings rather than the classification -- otherwise the
+    // two together read "kickstart timed out (timed out after ...)".
+    CHECK(text.contains("killed"));
+    CHECK_FALSE(text.contains("refused"));
 }
 
 TEST_CASE("The message never claims the job will start at the next boot", "[platform][service][launchctl]")
@@ -1383,12 +1390,92 @@ TEST_CASE("The message never claims the job will start at the next boot", "[plat
     // zero-cpu design was: there is no reading here that establishes the true
     // case. So the claim is gone rather than gated, which is the other half of
     // what the ticket allows.
+    //
+    // WHAT THIS CASE DOES NOT DO, stated because it would otherwise read as
+    // coverage of the removal: the sentence lived in `InstallService`'s format
+    // string inside the `__APPLE__` branch, never in `LaunchctlStatusText`. So
+    // this passes identically against the code before the change, and it is a
+    // FORWARD guard -- it stops the phrase being reintroduced here, where a
+    // future author would most naturally put it -- rather than a regression test
+    // for the deletion. The deletion itself is in the platform branch and is
+    // asserted by nothing, on any platform, like the acquisition half above it.
     for (auto const cpu:
          { std::chrono::microseconds { 0 }, std::chrono::microseconds { 300'000 }, std::chrono::microseconds { 900'000 } })
     {
         CAPTURE(cpu.count());
         auto const text = FastCache::LaunchctlStatusText(TimedOutWith(cpu));
-        CHECK(text.find("next login or boot") == std::string::npos);
+        CHECK_FALSE(text.contains("next login or boot"));
     }
-    CHECK(FastCache::LaunchctlStatusText(TimedOutWith(std::nullopt)).find("next login or boot") == std::string::npos);
+    CHECK_FALSE(FastCache::LaunchctlStatusText(TimedOutWith(std::nullopt)).contains("next login or boot"));
+}
+
+TEST_CASE("Only an exit status of zero is a launchctl success", "[platform][service][launchctl]")
+{
+    // `LaunchctlSucceeded` used to live inside the `__APPLE__` branch, which made
+    // it the one decision in this change that no test could reach -- against the
+    // change's own thesis. Its truth value has to match the `!= 0` the four call
+    // sites used before, and this is what says so rather than a reviewer's
+    // arithmetic: the old sentinels were -1 and -2, and `WEXITSTATUS` yields
+    // 0-255, so no collision was possible and every site is preserved exactly.
+    using FastCache::LaunchctlOutcome;
+    using FastCache::LaunchctlReadings;
+    using FastCache::LaunchctlSucceeded;
+
+    LaunchctlReadings ok;
+    ok.outcome = LaunchctlOutcome::Exited;
+    ok.exitStatus = 0;
+    CHECK(LaunchctlSucceeded(ok));
+
+    LaunchctlReadings nonZero;
+    nonZero.outcome = LaunchctlOutcome::Exited;
+    nonZero.exitStatus = 1;
+    CHECK_FALSE(LaunchctlSucceeded(nonZero));
+
+    for (auto const outcome: { LaunchctlOutcome::NotStarted, LaunchctlOutcome::Signalled, LaunchctlOutcome::TimedOut })
+    {
+        LaunchctlReadings failed;
+        failed.outcome = outcome;
+        failed.exitStatus = 0; // deliberately zero: the OUTCOME must decide, not this
+        CHECK_FALSE(LaunchctlSucceeded(failed));
+    }
+}
+
+TEST_CASE("A call that ran and was killed is not one that could not be started", "[platform][service][launchctl]")
+{
+    // `NotStarted` used to cover both "the spawn failed" and "it ran and died on
+    // a signal", so a `launchctl` that crashed was reported as one that never
+    // started -- a diagnostic naming the wrong cause, which is the class of
+    // defect this whole change is about.
+    FastCache::LaunchctlReadings signalled;
+    signalled.outcome = FastCache::LaunchctlOutcome::Signalled;
+    signalled.terminatingSignal = 9;
+
+    auto const text = FastCache::LaunchctlStatusText(signalled);
+    CHECK(text.contains("signal 9"));
+    CHECK_FALSE(text.contains("could not be started"));
+
+    FastCache::LaunchctlReadings unstarted;
+    unstarted.outcome = FastCache::LaunchctlOutcome::NotStarted;
+    CHECK(FastCache::LaunchctlStatusText(unstarted).contains("could not be started"));
+}
+
+TEST_CASE("Only a timeout is named a timeout, at every call site", "[platform][service][launchctl]")
+{
+    // One spelling for both failing call sites. `bootstrap` kept saying "failed"
+    // for a timeout after `kickstart` was fixed -- byte-identical defects, and the
+    // unobserved one is the one that survives a fix aimed at the observed one.
+    using FastCache::LaunchctlFailureVerb;
+    using FastCache::LaunchctlOutcome;
+    using FastCache::LaunchctlReadings;
+
+    LaunchctlReadings timedOut;
+    timedOut.outcome = LaunchctlOutcome::TimedOut;
+    CHECK(LaunchctlFailureVerb(timedOut) == "timed out");
+
+    for (auto const outcome: { LaunchctlOutcome::Exited, LaunchctlOutcome::NotStarted, LaunchctlOutcome::Signalled })
+    {
+        LaunchctlReadings other;
+        other.outcome = outcome;
+        CHECK(LaunchctlFailureVerb(other) == "failed");
+    }
 }
