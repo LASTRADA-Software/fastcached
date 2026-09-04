@@ -58,6 +58,37 @@
 # not restated. A second copy is not a cross-check, it is a second thing to be
 # wrong.
 #
+# ## And the fourth rule: a job that gates the release survives a tag run
+#
+# #559 trimmed six jobs off the master push, because a push run buys no merge
+# latency -- it happens after the merge -- and those six write no cache entry any
+# other run can read. That is the first condition in this workflow keyed on the
+# EVENT rather than on the scope classifier, and it introduces a failure the
+# three rules above cannot see.
+#
+# `release` needs every other job in this file, and `check-release-gate` asserts
+# that list stays complete. A `needs` job that is SKIPPED skips its dependent --
+# `release` carries `if: startsWith(github.ref, 'refs/tags/v')`, which has no
+# status function, so GitHub still ANDs `success()` onto it. So a condition that
+# excludes a tag run does not fail the release: it makes the release job vanish,
+# and a tag would be pushed, every check would be green, and no draft would ever
+# appear. The `changes` job already states the invariant this depends on in a
+# comment -- *"on a tag nothing below is ever skipped"* -- and nothing asserted
+# it.
+#
+# A shell check cannot evaluate a GitHub expression, so this asserts the SPELLING
+# instead: an event-keyed condition on a job that gates the release must contain
+# the exact clause `github.ref_type != 'branch'`, which is the one clause that
+# lets a tag through. Any other spelling is refused by name rather than analysed
+# -- the same answer rule A gives a classifier read in a shape it does not
+# recognise, and for the same reason: a check that cannot vouch for something
+# must say so rather than pass it.
+#
+# The gating set is READ from `release.needs`, never restated, and an empty read
+# is a refusal: with no gating jobs every condition would look unregulated and
+# this rule would vouch for all of them, which is rule C's empty-table failure
+# one file over.
+
 # ## What is asserted rather than demonstrated
 #
 # The `changes` job cannot be made to fail on demand, so this proves the SHAPE of
@@ -228,6 +259,64 @@ else
     done <<< "$docSubject"
 fi
 
+# ---------------------------------------------------------------------------
+# Rule D: an event-keyed condition on a job that gates the release names
+# `github.ref_type != 'branch'`, so a tag run is never the run it skips.
+releaseNeeds="$(awk '
+    /^jobs:[ \t]*$/             { inJobs = 1; next }
+    inJobs && /^[^ \t]/         { inJobs = 0 }
+    !inJobs                     { next }
+    /^[ \t]*#/                  { next }
+    /^  [A-Za-z0-9_-]+:[ \t]*$/ { jobKey = $0
+                                  sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
+                                  inNeeds = 0
+                                  next }
+    jobKey == "release" && /^    needs:[ \t]*$/ { inNeeds = 1; next }
+    inNeeds && /^      - [A-Za-z0-9_-]+[ \t]*$/ { need = $0
+                                  sub(/^      - /, "", need); sub(/[ \t]*$/, "", need)
+                                  print need
+                                  next }
+    inNeeds && /^    [A-Za-z]/  { inNeeds = 0 }
+' "$workflow")"
+
+if [[ -z "$releaseNeeds" ]]; then
+    Fail "read 0 jobs out of \`release.needs\` in $workflow; with an empty gating set every event-keyed condition looks unregulated and rule D would vouch for all of them."
+else
+    # Every job's own `if:`, one `key<TAB>condition` row per job that has one.
+    jobConditions="$(awk '
+        /^jobs:[ \t]*$/             { inJobs = 1; next }
+        inJobs && /^[^ \t]/         { inJobs = 0 }
+        !inJobs                     { next }
+        /^[ \t]*#/                  { next }
+        /^  [A-Za-z0-9_-]+:[ \t]*$/ { jobKey = $0
+                                      sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
+                                      next }
+        /^    if:/                  { cond = $0; sub(/^    if:[ \t]*/, "", cond)
+                                      print jobKey "\t" cond }
+    ' "$workflow")"
+
+    trimmed=0
+    while IFS=$'\t' read -r jobKey cond; do
+        [[ -n "$jobKey" ]] || continue
+        # Only jobs that gate the release, and only conditions keyed on the event.
+        printf '%s\n' "$releaseNeeds" | grep -Fxq -- "$jobKey" || continue
+        case "$cond" in
+            *github.event_name*|*github.ref*) ;;
+            *) continue ;;
+        esac
+        trimmed=$((trimmed + 1))
+        if [[ "$cond" != *"github.ref_type != 'branch'"* ]]; then
+            Fail "job '$jobKey' gates the release and carries an event-keyed condition that does not name \`github.ref_type != 'branch'\` -- if: $cond. A tag push IS a push: without that clause the job is skipped on the tag, a skipped \`needs\` skips \`release\`, and the draft release silently never appears while every check reports green."
+        fi
+    done <<< "$jobConditions"
+
+    if [[ "$trimmed" -eq 0 ]]; then
+        echo "ok: no job that gates the release keys its condition on the event (nothing for rule D to vouch for)"
+    else
+        echo "ok: all $trimmed release-gating job(s) with an event-keyed condition let a tag run through"
+    fi
+fi
+
 if [[ $problems -gt 0 ]]; then
     echo "check-gated-jobs: $problems problem(s); a failed scope classifier would go green" >&2
     return 1
@@ -244,7 +333,7 @@ return 0
 # trap `check-tidy-sweep-scope.sh` records, where a `sed` that BSD rejects left
 # the fragment empty and the case printed `ok` for a break it never staged.
 SelfTest() {
-    local scratch status=0
+    local scratch status=0 cases=0
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
@@ -264,8 +353,11 @@ REQ
     #   $3 = whether the linux job carries !cancelled(): yes | no
     #   $4 = the doc-subject step: ungated | gated | absent
     #   $5 = the name of the job carrying it: required | unrequired
+    #   $6 = the `coverage` job's push trim: none | canonical | tagless
+    #   $7 = what `release` gates on: all | nothing
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
+        local trim="${6:-none}" gate="${7:-all}"
         local compare="needs.changes.outputs.code != 'false'"
         [[ "$comparison" == "equality" ]] && compare="needs.changes.outputs.code == 'true'"
         [[ "$comparison" == "odd" ]] && compare="contains(needs.changes.outputs.code, 'true')"
@@ -296,6 +388,28 @@ REQ
             echo "      - name: \"Run clang-format\""
             echo "        if: \${{ ${compare} }}"
             echo "        run: clang-format --dry-run"
+
+            # A second gating job, so rule D has a subject that is not also
+            # rule C's. `tagless` is the defect: it reads "not a push", and a
+            # tag push IS a push.
+            local trimClause=""
+            [[ "$trim" == "canonical" ]] && trimClause=" && (github.event_name != 'push' || github.ref_type != 'branch')"
+            [[ "$trim" == "tagless" ]] && trimClause=" && github.event_name != 'push'"
+            echo "  coverage:"
+            echo "    name: \"Code coverage\""
+            echo "    if: \${{ !cancelled() && ${compare}${trimClause} }}"
+            echo "    steps:"
+            echo "      - run: ctest"
+
+            echo "  release:"
+            echo "    if: startsWith(github.ref, 'refs/tags/v')"
+            echo "    needs:"
+            if [[ "$gate" == "all" ]]; then
+                echo "      - style"
+                echo "      - coverage"
+            fi
+            echo "    steps:"
+            echo "      - run: gh release create"
         } > "$out"
     }
 
@@ -304,6 +418,7 @@ REQ
 
     Case() {
         local what="$1" want="$2" file="${scratch}/wf.yml" out got=0
+        cases=$((cases + 1))
         if [[ "$file" != "$correct" ]] && diff -q "$correct" "$file" >/dev/null 2>&1; then
             echo "  FAIL  '$what' generated a workflow identical to the correct one; the case stages nothing" >&2
             status=1
@@ -331,6 +446,7 @@ REQ
     # only by the one case that expects a PASS, which is the argument for having
     # a baseline case at all rather than only negative ones.
     cp "$correct" "${scratch}/wf.yml"
+    cases=$((cases + 1))
     if FASTCACHED_REQUIRED_CONTEXTS_FILE="$requiredFile" bash "$0" --workflow "${scratch}/wf.yml" >/dev/null 2>&1; then
         echo "  ok    (want-pass) the correct shape passes"
     else
@@ -371,11 +487,25 @@ REQ
         status=1
     fi
 
+    cases=$((cases + 1))
+
+    # Rule D. The correct workflow above carries `trim=none`, so the baseline
+    # already covers "nothing to vouch for"; these are the two states that
+    # differ.
+    Generate "${scratch}/wf.yml" safe yes ungated required canonical all
+    Case "rule D: a release-gating job trimmed off branch pushes, spelled canonically" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required tagless all
+    Case "rule D: a trim reading only \`event_name != 'push'\` -- a tag push IS a push, so the release job would silently never run" want-fail
+
+    Generate "${scratch}/wf.yml" safe yes ungated required canonical nothing
+    Case "rule D: an unreadable/empty \`release.needs\` is REFUSED, not read as 'no job gates the release'" want-fail
+
     if [[ "$status" -ne 0 ]]; then
-        echo "check-gated-jobs: self-test FAILED" >&2
+        echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2
         exit 1
     fi
-    echo "check-gated-jobs: self-test passed"
+    echo "check-gated-jobs: self-test passed ($cases cases)"
 }
 
 # ---------------------------------------------------------------------------
