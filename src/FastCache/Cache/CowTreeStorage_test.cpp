@@ -1262,12 +1262,23 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
 [[nodiscard]] std::expected<std::unique_ptr<FastCache::CowTreeStorage>, FastCache::StorageError> OpenDamaged(
     std::filesystem::path const& path)
 {
-    // `Batched` is STATED rather than defaulted, even though it is the default.
-    // The meta-slot cases below assert an invariant that holds under `Batched`
-    // and is FALSE under `Fsync` -- so which durability this fixture builds is
-    // part of what those cases claim, and a fixture that inherited it would stop
-    // describing its own store the day the default moved, silently and while
-    // staying green.
+    // `Batched` is STATED rather than defaulted, even though it is the default,
+    // because it decides the SHAPE of the store the meta-slot cases below are
+    // written against -- not merely a property they assert.
+    //
+    // Measured, seeding two sessions of five `Set`s at each durability:
+    //
+    //   Batched  A: txn=11  B: txn=6   -- one slot per generation, parity broken
+    //   Fsync    A: txn=10  B: txn=11  -- BOTH slots inside generation 2
+    //
+    // Every row below reads "the live commit" against "the previous commit", and
+    // an `Fsync` default collapses that into two commits from the same
+    // generation: the damaged-live row then finds four or five generation-2 keys
+    // where it expects none. So the honest reason is not that the fixture would
+    // "stay green" if the default moved -- it would go loudly RED, which an
+    // earlier draft of this comment had backwards. It is that it would be red for
+    // a store nobody meant to build, and stating the durability is what stops the
+    // seed drifting out from under the rows.
     return FastCache::CowTreeStorage::Open(
         { .path = path, .durability = CowTree::FilePageStore::Durability::Batched, .pageSize = DamagePageSize });
 }
@@ -1782,15 +1793,20 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
     // Every case above stops at "the store opened", and a build that recovered
     // correctly and then overwrote the good slot passes all of them.
     //
-    // Scoped to `Batched`, which `OpenDamaged` takes and which is the default,
-    // and the scope is ASSERTED rather than left implicit -- because the claim
-    // is FALSE under `Fsync`. There the slot comes from `CowTree::CommitTxn`'s
-    // `txnId % 2`, which consults nothing recovery recorded, and a store whose
-    // slot parity an ordinary Batched run has broken then overwrites the
-    // SURVIVOR. Measured, on a store seeded exactly the way this fixture seeds
-    // one and reopened with `Durability::Fsync`: one valid slot afterwards where
-    // Batched leaves two. `--storage-durability=fsync` is an operator-selectable
-    // flag, so that is reachable; the storage rulebook's Open work carries it.
+    // Scoped to `Batched`, which `OpenDamaged` STATES -- stated, not asserted:
+    // `CowTreeStorage` exposes no durability accessor, so there is nothing here
+    // to assert it against, and an earlier draft of this comment claimed
+    // otherwise.
+    //
+    // The scope matters because the claim is FALSE under `Fsync`. There the slot
+    // comes from `CowTree::CommitTxn`'s `txnId % 2`, which consults nothing
+    // recovery recorded, and a store whose slot parity an ordinary Batched run
+    // has broken then overwrites the SURVIVOR. Measured, on a store seeded
+    // exactly the way this fixture seeds one and reopened with
+    // `Durability::Fsync`: one valid slot afterwards where Batched leaves two,
+    // and two again from the SECOND commit, because that write restores the
+    // parity. `--storage-durability=fsync` is an operator-selectable flag, so it
+    // is reachable; #726 carries it.
     for (auto const damageLive: { false, true })
     {
         INFO((damageLive ? "the live slot was the damaged one" : "the stale slot was the damaged one"));
@@ -1804,7 +1820,11 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
         auto const before = ReadWholeFile(tmp.path);
         auto const survivorBefore = DecodeSlot(before, survivor);
         REQUIRE(survivorBefore.has_value());
-        std::vector<std::byte> const survivorPage { SlotBytes(before, survivor).begin(), SlotBytes(before, survivor).end() };
+        // One span, bound once: taking `begin()` from one temporary and `end()`
+        // from a second is well-defined here and is still a shape this file was
+        // just rewritten to stop containing.
+        auto const survivorView = SlotBytes(before, survivor);
+        std::vector<std::byte> const survivorPage { survivorView.begin(), survivorView.end() };
 
         {
             auto storage = OpenDamaged(tmp.path);

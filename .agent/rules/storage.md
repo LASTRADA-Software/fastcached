@@ -126,12 +126,19 @@ under a different break:
   over its one good slot passes everything above while leaving the store one
   torn write from unopenable, and that is the only state where getting the
   alternation wrong is unrecoverable rather than wasteful. `FlushBatchLocked`
-  writes `OtherSlot(_lastDurableSlot)` and so gets it right; `CowTree::CommitTxn`
-  derives the slot from `txnId % 2`, which `WriteMeta` honours verbatim under
-  `Fsync`/`None` and which consults nothing recovery recorded. Both fixtures
-  therefore STATE `Batched` rather than inheriting the default — a fixture that
-  inherited it would stop describing its own store the day the default moved,
-  silently and while staying green.
+  writes the slot that is **not** `_lastDurableSlot` and so gets it right (spelled
+  as an inline ternary there; `OtherSlot` is a test helper and exists in no
+  production file); `CowTree::CommitTxn` derives the slot from `txnId % 2`, which
+  `WriteMeta` honours verbatim under `Fsync`/`None` and which consults nothing
+  recovery recorded. Both fixtures therefore STATE `Batched` rather than
+  inheriting the default — and the reason is the store's SHAPE, not the property.
+  Measured, seeding two sessions of five `Set`s at each durability: `Batched`
+  gives A at txn 11 and B at txn 6, one slot per generation; `Fsync` gives A at 10
+  and B at 11, **both inside generation 2**, which collapses the "live commit
+  against previous commit" the rows are written on. A fixture that inherited the
+  default would then go loudly **red**, not quietly green — the opposite of what
+  an earlier draft of this entry claimed — but red for a store nobody meant to
+  build, which is why the seed is pinned rather than trusted.
 
 **There are THREE slot-selection rules in this tree, not two, and the third
 disagrees with recovery** (#726). `Meta.hpp` documents the `txnId mod 2` parity as
@@ -162,10 +169,13 @@ that did reproduce it committed ONCE, so "after" meant "after one commit" and a
 snapshot was read as a steady state.
 
 It is pinned twice, in two suites, and not by accident: `CowTreeStorage_test`
-asks the operator's question (a daemon's store opens, serves, stays quiet) and
-`FilePageStore_test` asks the library's — including the surviving-slot one, which
-is `_lastDurableSlot` and lives in `FilePageStore` and nowhere else, so pinning it
-only from the FastCache suite would have left the library's own guarantee behind.
+asks the operator's question — a daemon's store opens, serves, stays quiet, and
+does not spend its surviving slot — and `FilePageStore_test` asks the library's,
+which is the same three facts without FastCache present. The surviving-slot
+property is therefore pinned in **both**, for two different reasons rather than
+by duplication: `_lastDurableSlot` is a `FilePageStore` member, so the library's
+own guarantee has to be assertable from a suite that links only `CowTree`, while
+the other suite asserts what the same behaviour costs an operator.
 `src/CowTree/` is a standalone sibling that any project can pick up.
 
 What cannot be shared is a TEST helper: `src/tests/` and `src/FastCache/` are off
@@ -173,9 +183,17 @@ What cannot be shared is a TEST helper: `src/tests/` and `src/FastCache/` are of
 standalone. That is narrower than "nothing can be shared", and the wider claim was
 in this file first — `src/CowTree/CowTree/` is on **both** suites' paths under the
 same `<CowTree/...>` spelling, which is how `CowTreeStorage_test` reaches
-`Meta.hpp`. So a fact about the on-disk LAYOUT belongs there if it earns a helper;
-only the file I/O is honestly duplicated. A boundary stated too widely is what
-licenses the next copy.
+`Meta.hpp`. A boundary stated too widely is what licenses the next copy.
+
+And the duplication is wider than file I/O, which this entry claimed until it was
+counted: `MetaDamageOffset`, `OtherSlot`, `SlotBytes`, `DecodeSlot` and
+`DamageMetaSlot` all exist in both fixtures, and three of those encode the on-disk
+LAYOUT — the slot offset, and where the CRC'd payload ends — rather than test
+plumbing. By the sentence above they would belong in `src/CowTree/CowTree/` if
+they earned a public helper, and they have not: two call sites in two test
+binaries is not a public contract, and shipping a damage helper in the library to
+serve them would be worse than the copy. That is a decision, and it is recorded
+here so the third copy has to argue with it.
 
 **The signals are not the same on both binaries.** `WriteErrorReportingStorage` is
 constructed only by `fastcached`, so `fastcached_write_errors_total` and the
@@ -285,7 +303,11 @@ is what the conversion does.
   noun as a parameter) plus the node's `--cache-dir cannot open ...; refusing to
   start`.
 - [#726](https://github.com/LASTRADA-Software/fastcached/issues/726) — under
-  `Fsync`, the commit after a one-slot meta recovery can overwrite the slot that
-  survived, because `CommitTxn` picks the slot from `txnId % 2` and a Batched run
-  has normally broken that parity. The `Batched` behaviour is pinned; this is the
-  gap those fixtures name rather than cover.
+  `Fsync`, the **first** commit after a one-slot meta recovery overwrites the slot
+  that survived, because `CommitTxn` picks the slot from `txnId % 2` and a Batched
+  run has normally broken that parity. Bounded: that write restores the parity, so
+  the second commit repairs the damaged slot and the file is back to two good
+  copies — the exposure is one commit wide, at the one moment damage has just been
+  detected. The `Batched` behaviour is pinned; this is the gap those fixtures name
+  rather than cover, and the bound is stated here too so a reader who scans only
+  this list does not recover the unbounded reading.

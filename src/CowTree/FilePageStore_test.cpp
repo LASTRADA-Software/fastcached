@@ -180,19 +180,29 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
 // guarantee asserted only from the FastCache suite would not travel with it.
 //
 // `CowTreeStorage_test.cpp` asks the OPERATOR's version of this question -- a
-// daemon's store opens, serves the surviving commit and says nothing. This case
-// asks the LIBRARY's: `FilePageStore` recovers, `CowTree::Open` reads the
-// surviving slot's root, and the next commit does not spend the slot that
-// survived -- which lives in `FilePageStore` and nowhere else, so it is pinned
-// here rather than only from the FastCache suite.
+// daemon's store opens, serves the surviving commit and says nothing -- and it
+// pins the surviving-slot property too, in "Recovering onto the surviving meta
+// slot does not spend it". So that property is pinned in BOTH suites, for two
+// different reasons, and this case is not the only place it lives: `_lastDurableSlot`
+// is a `FilePageStore` member, so the LIBRARY's own guarantee has to be
+// assertable without FastCache present, while the other suite asserts what the
+// same behaviour costs an operator.
 //
 // The fixtures are separate because a TEST helper cannot be shared: `src/tests/`
 // and `src/FastCache/` are off `CowTreeTests`' include path, which is the
 // boundary that keeps this library standalone. That is narrower than "nothing
 // can be shared" -- `src/CowTree/CowTree/` is on BOTH suites' paths under the
-// same `<CowTree/...>` spelling, so a fact about the LAYOUT belongs there if it
-// ever earns a public helper. What is duplicated below is test I/O, which does
-// not.
+// same `<CowTree/...>` spelling.
+//
+// And what is duplicated is more than file I/O, which an earlier draft claimed:
+// `MetaDamageOffset`, `OtherSlot`, `SlotBytes`, `DecodeSlot` and `DamageMetaSlot`
+// all exist twice, and three of those encode the on-disk LAYOUT (the slot offset
+// and where the CRC'd payload is) rather than test plumbing. By the argument
+// above they would belong in `src/CowTree/CowTree/` if they earned a public
+// helper. They have not yet -- two call sites in two test binaries is not a
+// public contract, and putting a damage helper in the shipped library to serve
+// them would be worse. Stated so the third copy is a decision rather than a
+// habit.
 //
 // Damaged meta bytes have no API route -- `WriteMeta` encodes and CRCs whatever
 // it is handed -- so the file is patched directly, at `Meta.hpp`'s own
@@ -200,12 +210,16 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
 // injection is asserted rather than assumed, so a layout that moved fails here
 // instead of quietly damaging nothing.
 //
-// Watched refusing, one break at a time, measured on `gcc-debug`: reading the
-// `CorruptMetas` condition as "EITHER slot failed" turns this case red in
-// `FilePageStore::RecoverExistingFile` (at `Open`) and again in `CowTree::Open`
-// (at `tree.Open()`). Inverting the both-valid `txnId` tie-break does NOT --
-// correctly, since only one slot is valid here; eight existing cases cover that
-// comparison already.
+// Watched refusing, one break at a time, measured on `gcc-debug`:
+//
+//   * reading the `CorruptMetas` condition as "EITHER slot failed" turns this
+//     case red in `FilePageStore::RecoverExistingFile` (at `Open`) and again in
+//     `CowTree::Open` (at `tree.Open()`);
+//   * recording the DAMAGED slot as `_lastDurableSlot` turns it red at the
+//     byte comparison below -- and turned only the FastCache suite red before
+//     that assertion was moved in here, which is why it was moved;
+//   * inverting the both-valid `txnId` tie-break does NOT, correctly, since only
+//     one slot is valid here; eight existing cases cover that comparison.
 // ---------------------------------------------------------------------------
 
 /// Page size the meta-damage case builds its store with.
@@ -316,6 +330,14 @@ auto OpenMetaDamageStore(std::filesystem::path const& path)
     CowTree::FilePageStore::Options opts;
     opts.path = path;
     opts.pageSize = MetaDamagePageSize;
+    // `Batched` is STATED, though it is also the default, because the last
+    // assertion of the case below is about `FlushBatchLocked`'s alternation
+    // specifically -- under `Fsync` the slot comes from `CommitTxn`'s
+    // `txnId % 2` and a different code path is under test. Stating it keeps the
+    // fixture describing its own store if the default ever moves, which is
+    // cheaper than a runtime assertion that would fire for a precondition
+    // rather than for the property.
+    opts.durability = CowTree::FilePageStore::Durability::Batched;
     return CowTree::FilePageStore::Open(opts);
 }
 
@@ -918,6 +940,13 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
     auto const live = seededA->txnId >= seededB->txnId ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
 
     /// One row of the table below.
+    ///
+    /// The survivor is derived (`OtherSlot(damaged)`) while `secondKeyReadable`
+    /// is stated, and the two are not in tension even though the sibling fixture
+    /// argues against deriving a column: what must not be derived from the
+    /// discriminator is the EXPECTATION, or the assertion agrees with itself
+    /// whatever the code does. "Which slot is the other one" is a definition, not
+    /// an expectation -- deriving it cannot make a wrong build pass.
     struct Row
     {
         CowTree::MetaSlot damaged; ///< Which slot to damage; the survivor is `OtherSlot` of it.
@@ -989,12 +1018,17 @@ TEST_CASE("One damaged meta slot opens on the surviving slot's commit", "[filest
             // that recovered correctly and then wrote over the good slot passes
             // every assertion above it.
             //
-            // Scoped to `Batched`, asserted rather than assumed, because the
-            // claim is FALSE under `Fsync`: there the slot is `CommitTxn`'s
-            // `txnId % 2`, which consults nothing recovery recorded, and a store
-            // whose parity an earlier Batched run broke overwrites the survivor
-            // instead. Measured; see the storage rulebook's Open work.
-            REQUIRE((*store)->DurabilityMode() == CowTree::FilePageStore::Durability::Batched);
+            // What this does NOT say, because an earlier draft said it and it was
+            // false: it is not that `Fsync` would break this. THIS fixture's seed
+            // -- raw `CowTree`, one `Flush()` per commit -- leaves the `txnId`
+            // parity INTACT (measured: A at txn 2, B at txn 1), and under `Fsync`
+            // such a store preserves its survivor in both damage directions too.
+            // #726 needs a parity-BROKEN store, which only a `CowTreeStorage`-shaped
+            // seed produces, so it is pinned in `CowTreeStorage_test` and named in
+            // the storage rulebook -- not here. Citing that measurement here was a
+            // measurement of a different store shape read as one about this one,
+            // which is the defect `build-and-toolchain.md` gained a section for in
+            // the same change.
             auto txn = tree.BeginWrite();
             REQUIRE(txn.Put(B("after-recovery"), B("value")).has_value());
             REQUIRE(txn.Commit().has_value());

@@ -689,17 +689,24 @@ determinism rests on.
 
     And a third correction inside this one entry, which is the point rather than an
     embarrassment: the first two accounts of this said the paragraph was stranded "four
-    sections downstream". `git show c558e9b1` says **one** at the time of the insert and
-    two by the time it was noticed. Nobody had counted; four was repeated from the first
-    telling into a message and then into this file. **A number in a post-mortem is a
+    sections downstream". The commit that did it -- *a probe's result is only evidence
+    if the probe could have produced the other one*, cited by subject because a rebase
+    invalidated the hash this sentence first carried, which is the "name, not direction"
+    rule one line of scope up -- inserted **one** section, and there were two by the
+    time it was noticed. Nobody had counted; four was repeated from the first telling
+    into a message and then into this file. **A number in a post-mortem is a
     measurement and decays like one** -- the incident is over, so nothing will ever fail
     to make it wrong again, and a rulebook is exactly where such a number goes to be
     believed forever.
 
     **A prose diff cannot show you the sentence your insertion falsified.** The hunk
-    held the added lines and three untouched context lines, and the broken sentence sat
-    outside that window -- so the diff was clean, minimal and reviewable, and the defect
-    was invisible in it. Re-read the whole enclosing section afterwards, from its heading
+    was `@@ -898,6 +898,45 @@`: the added lines plus **six** untouched context lines,
+    three leading and three trailing. Only the trailing three matter to the argument,
+    and they held the first three lines of the paragraph that went false while the
+    broken sentence sat four lines further down -- outside the window. So the diff was
+    clean, minimal and reviewable, and the defect was invisible in it. (An earlier draft
+    said "three", counting one side of a symmetric default. The paragraph below about
+    post-mortem numbers was already written when that was found.) Re-read the whole enclosing section afterwards, from its heading
     to the next one, rather than the diff. In prose the specific hazard is a
     **back-reference**: "the section above", "both sections above", "the two entries
     below", "as stated earlier". Those are the sentences an insert silently redirects, so
@@ -968,8 +975,11 @@ nothing.
   slot. Two probes were built and both came back clean, and "the finding is wrong" was
   written down before the third existed. Both seeded the store through raw `CowTree`,
   one flush per commit — which *keeps* the `txnId` slot parity, and the broken parity
-  is the whole precondition. Only the `CowTreeStorage`-shaped seed, where `Open` itself
-  commits the format marker so the commit counts go uneven, reproduces it. The finding
+  is the whole precondition. Only the `CowTreeStorage`-shaped seed reproduces it, where
+  the FIRST `Open` commits the format marker -- `EnsureFormatVersion` stamps it on a
+  brand-new store only, so the two sessions total 6 commits then 5 and the parity ends
+  up broken. Written as "`Open` itself commits the marker" at first, which would make
+  the total even and the fault unreachable. The finding
   was true. **Before recording a negative, state what would have had to be true for
   the positive to appear, and check the probe had it** — a fixture that cannot exhibit
   the fault cannot vote on it. Same defect as a suite exercising the fallback path
