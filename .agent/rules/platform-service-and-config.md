@@ -374,6 +374,64 @@ readable and silently ignored. Every rule below has already been one of them.
   install time and a node that should follow a memory upgrade or a moved default
   silently does not.
 
+  **The paragraph above was written before the code it governs obeyed it**, and the
+  daemon did the opposite for as long as it existed
+  ([#349](https://github.com/LASTRADA-Software/fastcached/issues/349)): every one of
+  `BuildServiceArgv`'s thirty-one provenance-bearing flags was emitted by value
+  comparison, `--max-memory` following host RAM among them. A rule nothing checks
+  cannot make code fail, which is the general finding — and it is why the fix landed
+  the mechanical guard here too rather than the one line the ticket named.
+
+  Two things about the daemon's shape that the node's does not have to answer. Its
+  parse result is a `CliResult` **wrapping** a `Config`, so the bits are not on the
+  configuration at all — `BuildServiceArgv` and `MakeDaemonServiceSpec` therefore take
+  the **parse**. Moving the bits onto `Config` instead would have been worse than a
+  wider signature: `Config` is what the YAML merge fills and what `ConfigReloader`
+  compares, and `FileOptions` sets an `explicitBit` too, so a key in a file would have
+  become a flag baked into a registration — the precise thing "registers the
+  command-line-only parse" forbids. Taking the parse is also the guard, since a
+  function handed only the merge's output cannot obey a rule about the command line.
+
+  And the daemon's audit moved the whole table rather than the five settings that
+  could lose a pin. **Eighteen** of its rows were safe only because their default is a
+  **compile-time constant** — which is exactly what `logTimestamps` was until #496
+  made it platform-dependent, at which point `--no-log-timestamps` began registering
+  nothing on a host that defaults it off. "Safe because the default happens to be a
+  constant" is a property of this build, not of the flag; the two other safe shapes
+  (a sentinel `0` meaning *follow the host*, and a one-sided switch whose default is
+  the value it cannot express) are properties of the flag and stay safe. So on the
+  daemon `emitIfSet` is gone entirely, and one `emitSwitch` serves both kinds of
+  switch: the two were separate because a value comparison needs a platform default
+  for the two-sided one, and provenance consults no default at all.
+
+  **An explicitly EMPTIED value is a pin, and an empty default is not a licence to
+  drop it.** The first pass excused `--storage`, `--tls-cert` and `--tls-key` on the
+  grounds that empty is the flag's own way of saying "off" and there is therefore
+  nothing to lose. There is: `ParseText` never fails, so `--storage=` parses, and
+  under CLI-over-file precedence it means *no persistence whatever `--config`'s file
+  says*. Deciding by presence dropped it, let the file win at every start, and left
+  the daemon persisting to disk — #349's shape inside #349's own fix. What the empty
+  default really constrains is the **absolutizer**, not the decision:
+  `std::filesystem::absolute("")` is the installing shell's working directory, so an
+  explicitly empty value is emitted verbatim. `WithScopeDefaults` then leaves it
+  alone for the same reason it leaves a named `--config` alone.
+
+  Only `--config` and `--pidfile` keep a presence test, and now for an exact reason
+  rather than an approximate one: they carry **no explicit bit**, so they cannot be
+  asked. That is the one shape the node's `--cache-dir` bullet above describes.
+
+  **And a coverage sweep that asks only whether a flag APPEARED cannot see a line
+  naming the wrong field.** `emitIfExplicit("metrics-port", cfg.port,
+  cli.metricsPortExplicit)` emits a token under the right spelling forever, while
+  every registration pins the cache port as the metrics port. So the daemon's sweep
+  drives each value row a second time, with a value distinct from that row's default,
+  and requires the emitted token to **move**. Movement is a value row's question
+  only: a valueless flag's own `apply` may produce the platform default —
+  `--no-log-timestamps` on a host that already defaults off emits the same token
+  either way — so demanding it there would demand a contradiction on one platform,
+  and a wrong field on a switch is caught by the presence half instead, since the
+  emission follows the other field and no token under this spelling appears at all.
+
   A flag needs no bit when its default is **empty**. There is then no address to
   arrive at without asking, so every failure on it is unconditionally fatal —
   `--admin-listen` and `--cache-dir` are that shape, and the asymmetry with
@@ -699,22 +757,33 @@ boot, silently, because a registration replays its command line forever. So:
 
 - **A flag whose default is platform-dependent needs a negative spelling** and
   `SwitchSpellingFor`, which emits whichever of the pair PRODUCES the value.
-  `--log-source` and `--log-everything` default false everywhere, so *differs* still
-  means *on* for them and `emitSwitchIfSet` stays right — do not unify the two.
+  *This bullet used to end "`--log-source` and `--log-everything` default false
+  everywhere, so `emitSwitchIfSet` stays right — do not unify the two", and that
+  was correct exactly while the rule was a value comparison*: the two-sided switch
+  needed a platform default the one-sided ones did not. Provenance consults no
+  default at all (#349), so on the daemon the only thing left separating them is
+  **whether a negative spelling exists** — an argument, not a second emitter — and
+  one `emitSwitch` serves both. The node still has both helpers, and the sentence
+  stays true there.
 - **The negative spelling gets no `yamlKey`.** A file already says both things with
   `log_timestamps: true|false`; a second key for the same field would be two ways to
   spell one setting, with a precedence question nobody asked for. It is on
   `notFromFile` with that reason.
 - **The defect lives in a COMBINATION, so the test must drive one.** On a false
   default the old emitter is correct, and with one value driven the wrong spelling is
-  still A spelling. Both values against both platform defaults — which needs the
-  decision extracted as a pure function, since a host runs one default and cannot be
-  asked for the other.
-- **A coverage sweep cannot hold a mutually-exclusive pair.** "one configuration,
-  every flag appears in it" is a shape that demands a contradiction for two spellings
-  of one field; excluding just the negative one passed on Windows and silently dropped
-  `--log-timestamps` from the sweep on macOS. Exclude the pair, and name the case that
-  took the coverage over.
+  still A spelling. Both values against both axes — which needs the decision extracted
+  as a pure function, since a host runs one default and cannot be asked for the other.
+  The daemon's second axis is now provenance rather than the platform default, which
+  strictly widens it: a typed `--log-timestamps` on a true-defaulting host used to
+  register nothing, correct for that build and a pin the next one could move.
+- **A coverage sweep cannot hold a mutually-exclusive pair — unless it drives ONE ROW
+  at a time.** "one configuration, every flag appears in it" is a shape that demands a
+  contradiction for two spellings of one field; excluding just the negative one passed
+  on Windows and silently dropped `--log-timestamps` from the sweep on macOS. The
+  daemon's sweep no longer has that shape: per row, both spellings are ordinary cases
+  and neither needs excluding. Per row is stronger for a second reason — a whole-config
+  sweep cannot see a line naming the wrong field or the wrong bit, because a
+  neighbour's emission covers it.
 
 ## Open work
 

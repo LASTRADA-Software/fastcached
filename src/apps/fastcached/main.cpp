@@ -1276,7 +1276,11 @@ int main(int argc, char const* const* argv)
         // Turned into a ServiceSpec here because that is the seam the platform
         // registration speaks: `fastcache-compile-node` builds its own from its
         // own configuration type rather than reaching for the daemon's.
-        auto spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), parsed->config);
+        // The whole parse, not `parsed->config`: which flags get baked in is decided
+        // by what the operator NAMED, and only the parse records that (#349). It is
+        // still the command-line-only parse -- `effective` is the merged one and is
+        // deliberately never passed here.
+        auto spec = FastCache::MakeDaemonServiceSpec(FastCache::CurrentExecutablePath(), *parsed);
 
         // ...and here, deliberately, the MERGED one -- for a purpose the rule
         // above does not cover. Nothing from `effective` is registered: this adds

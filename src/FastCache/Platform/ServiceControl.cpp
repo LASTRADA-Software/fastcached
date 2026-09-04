@@ -232,23 +232,49 @@ namespace
     /// @}
 } // namespace
 
-std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, Config const& cfg, EmitDaemonFlag daemonFlag)
+std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath,
+                                          CliResult const& cli,
+                                          EmitDaemonFlag daemonFlag)
 {
-    Config const defaults {};
+    Config const& cfg = cli.config;
     std::vector<std::string> argv { exePath.string() };
 
-    // Emit `--flag=value` only when the field differs from its default, so the
-    // recorded launch arguments stay minimal and self-documenting. The rule is
-    // written once here; the table below is pure data.
-    auto const emitIfSet = [&argv](std::string_view flag, auto const& value, auto const& fallback) {
-        if (value != fallback)
+    // Emit `--flag=value` for every flag the operator NAMED, so the recorded
+    // launch arguments stay minimal and still say everything that was asked for.
+    // The rule is written once here; the table below is pure data.
+    //
+    // **Provenance, never value** (#349). Comparing against a default-constructed
+    // Config drops a pin that happens to equal the default, and a default derived
+    // from the host is not a constant: `--max-memory=8g` on a 32 GiB machine IS
+    // the default, so the flag vanished from the registration and the service
+    // re-derived a budget from RAM at every start. Nothing reported it.
+    auto const emitIfExplicit = [&argv](std::string_view flag, auto const& value, bool wasTyped) {
+        if (wasTyped)
             argv.push_back(std::format("--{}={}", flag, FlagValue(value)));
     };
 
-    // Path flags test the *captured* value for emptiness and absolutize only
-    // what survives. Absolutizing first would turn an unset path into the
-    // installing process's working directory, silently pinning the service to
-    // whatever shell happened to register it.
+    // A path is absolutized because a service does not inherit the installing
+    // shell's working directory -- but only a NON-EMPTY one, because
+    // `std::filesystem::absolute("")` IS that directory, and absolutizing first
+    // would silently pin the service to whatever shell happened to register it.
+    //
+    // That is a constraint on the absolutizer, and it is **not** a reason to decide
+    // by value. `ParseText` never fails, so `--storage=` is a reachable operator
+    // instruction and a real pin: `--install-service --config=f.yaml --storage=`
+    // against a file carrying `storage_path:` must not come back persisting to
+    // disk at every start. So a path row that records provenance asks it like every
+    // other row, and an explicitly empty value is emitted VERBATIM -- which
+    // round-trips through this project's own parser to the empty value the operator
+    // named.
+    auto const emitPathIfExplicit = [&argv](std::string_view flag, std::string const& value, bool wasTyped) {
+        if (!wasTyped)
+            return;
+        argv.push_back(value.empty() ? std::format("--{}=", flag) : std::format("--{}={}", flag, AbsolutePathArg(value)));
+    };
+
+    // `--config` and `--pidfile` carry no explicit bit at all and so cannot ask.
+    // They keep a presence test, and for them an empty value really does name
+    // nothing there is any way to register.
     auto const emitPathIfSet = [&argv](std::string_view flag, std::string const& value) {
         if (!value.empty())
             argv.push_back(std::format("--{}={}", flag, AbsolutePathArg(value)));
@@ -257,30 +283,12 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     // Valueless switches: present or absent, never `--flag=true`, because that
     // is not a spelling CliParser accepts.
     //
-    // Sound only while the DEFAULT is the same everywhere, which is what makes
-    // "differs from the default" mean "on". Its sibling below is for the one flag
-    // where that stopped being true.
-    auto const emitSwitchIfSet = [&argv](std::string_view flag, bool value, bool fallback) {
-        if (value != fallback)
-            argv.emplace_back(std::format("--{}", flag));
-    };
-
-    // The same thing for a flag whose default is PLATFORM-DEPENDENT, which needs both
-    // spellings because it must be able to say either word.
-    //
-    // `emitSwitchIfSet` inverts here and does it silently. With `logTimestamps`
-    // defaulting true under macOS (#496), an operator who asks for `--no-log-timestamps`
-    // and runs `--install-service` has a value that DIFFERS from the default -- so the
-    // old helper emitted `--log-timestamps`, and the registration turned back on the
-    // very thing they turned off. A registration replays its command line at every
-    // boot, so that is permanent and silent, and it is the same class as the defect
-    // #496 started from, pointed the other way.
-    //
-    // Only this flag needs it. `--log-source` and `--log-everything` default false on
-    // every platform, so "differs" still means "on" for them and they keep the helper
-    // above -- do not unify the two.
-    auto const emitSwitchEitherWay = [&argv](std::string_view onFlag, std::string_view offFlag, bool value, bool fallback) {
-        if (auto const spelling = SwitchSpellingFor(onFlag, offFlag, value, fallback); spelling.has_value())
+    // One helper for both kinds, because provenance consults no default and the
+    // only thing separating them is whether a negative spelling exists -- which is
+    // an argument. An empty @p offFlag says this switch has none; see
+    // `SwitchSpellingFor`, which carries why the two used to be separate.
+    auto const emitSwitch = [&argv](std::string_view onFlag, std::string_view offFlag, bool value, bool wasTyped) {
+        if (auto const spelling = SwitchSpellingFor(onFlag, offFlag, value, wasTyped); spelling.has_value())
             argv.emplace_back(std::format("--{}", *spelling));
     };
 
@@ -301,36 +309,36 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     // service must never re-install itself), --service-scope (install-time
     // only), --daemon (handled above) and --healthcheck / --help / --version.
     //
-    //        flag                    current value              emitted unless equal to
-    emitIfSet("bind", cfg.bindAddress, defaults.bindAddress);
-    emitIfSet("port", cfg.port, defaults.port);
-    emitIfSet("max-memory", cfg.maxMemoryBytes, defaults.maxMemoryBytes);
-    emitIfSet("log-level", cfg.logLevel, defaults.logLevel);
-    emitSwitchEitherWay("log-timestamps", "no-log-timestamps", cfg.logTimestamps, defaults.logTimestamps);
-    emitSwitchIfSet("log-source", cfg.logSource, defaults.logSource);
-    emitSwitchIfSet("log-everything", cfg.logEverything, defaults.logEverything);
-    emitPathIfSet("storage", cfg.storagePath);
-    emitIfSet("storage-durability", cfg.storageDurability, defaults.storageDurability);
-    emitIfSet("storage-max-value", cfg.storageMaxValueBytes, defaults.storageMaxValueBytes);
-    emitIfSet("storage-max-disk", cfg.storageMaxDiskBytes, defaults.storageMaxDiskBytes);
-    emitIfSet("storage-shards", cfg.storageShards, defaults.storageShards);
-    emitIfSet("expiry-interval", cfg.activeExpiryIntervalMs, defaults.activeExpiryIntervalMs);
-    emitIfSet("expiry-scan", cfg.activeExpiryScanBudget, defaults.activeExpiryScanBudget);
-    emitIfSet("threads", cfg.workerThreads, defaults.workerThreads);
-    emitIfSet("cpu-affinity", cfg.cpuAffinity, defaults.cpuAffinity);
-    emitIfSet("lru-mode", cfg.lruRecency, defaults.lruRecency);
-    emitIfSet("listen-backlog", cfg.listenBacklog, defaults.listenBacklog);
-    emitIfSet("compression", cfg.compression, defaults.compression);
-    emitIfSet("compression-level", cfg.compressionLevel, defaults.compressionLevel);
-    emitIfSet("compression-min-bytes", cfg.compressionMinBytes, defaults.compressionMinBytes);
-    emitIfSet("auth-username", cfg.authUsername, defaults.authUsername);
-    emitSwitchIfSet("tls", cfg.tlsEnabled, defaults.tlsEnabled);
-    emitPathIfSet("tls-cert", cfg.tlsCertPath);
-    emitPathIfSet("tls-key", cfg.tlsKeyPath);
-    emitSwitchIfSet("metrics", cfg.metricsEnabled, defaults.metricsEnabled);
-    emitIfSet("metrics-bind", cfg.metricsBindAddress, defaults.metricsBindAddress);
-    emitIfSet("metrics-port", cfg.metricsPort, defaults.metricsPort);
-    emitIfSet("notify-keyspace-events", cfg.notifyKeyspaceEvents, defaults.notifyKeyspaceEvents);
+    //             flag                    current value                  named by the operator
+    emitIfExplicit("bind", cfg.bindAddress, cli.bindAddressExplicit);
+    emitIfExplicit("port", cfg.port, cli.portExplicit);
+    emitIfExplicit("max-memory", cfg.maxMemoryBytes, cli.maxMemoryBytesExplicit);
+    emitIfExplicit("log-level", cfg.logLevel, cli.logLevelExplicit);
+    emitSwitch("log-timestamps", "no-log-timestamps", cfg.logTimestamps, cli.logTimestampsExplicit);
+    emitSwitch("log-source", {}, cfg.logSource, cli.logSourceExplicit);
+    emitSwitch("log-everything", {}, cfg.logEverything, cli.logEverythingExplicit);
+    emitPathIfExplicit("storage", cfg.storagePath, cli.storagePathExplicit);
+    emitIfExplicit("storage-durability", cfg.storageDurability, cli.storageDurabilityExplicit);
+    emitIfExplicit("storage-max-value", cfg.storageMaxValueBytes, cli.storageMaxValueBytesExplicit);
+    emitIfExplicit("storage-max-disk", cfg.storageMaxDiskBytes, cli.storageMaxDiskBytesExplicit);
+    emitIfExplicit("storage-shards", cfg.storageShards, cli.storageShardsExplicit);
+    emitIfExplicit("expiry-interval", cfg.activeExpiryIntervalMs, cli.activeExpiryIntervalMsExplicit);
+    emitIfExplicit("expiry-scan", cfg.activeExpiryScanBudget, cli.activeExpiryScanBudgetExplicit);
+    emitIfExplicit("threads", cfg.workerThreads, cli.workerThreadsExplicit);
+    emitIfExplicit("cpu-affinity", cfg.cpuAffinity, cli.cpuAffinityExplicit);
+    emitIfExplicit("lru-mode", cfg.lruRecency, cli.lruRecencyExplicit);
+    emitIfExplicit("listen-backlog", cfg.listenBacklog, cli.listenBacklogExplicit);
+    emitIfExplicit("compression", cfg.compression, cli.compressionExplicit);
+    emitIfExplicit("compression-level", cfg.compressionLevel, cli.compressionLevelExplicit);
+    emitIfExplicit("compression-min-bytes", cfg.compressionMinBytes, cli.compressionMinBytesExplicit);
+    emitIfExplicit("auth-username", cfg.authUsername, cli.authUsernameExplicit);
+    emitSwitch("tls", {}, cfg.tlsEnabled, cli.tlsEnabledExplicit);
+    emitPathIfExplicit("tls-cert", cfg.tlsCertPath, cli.tlsCertPathExplicit);
+    emitPathIfExplicit("tls-key", cfg.tlsKeyPath, cli.tlsKeyPathExplicit);
+    emitSwitch("metrics", {}, cfg.metricsEnabled, cli.metricsEnabledExplicit);
+    emitIfExplicit("metrics-bind", cfg.metricsBindAddress, cli.metricsBindAddressExplicit);
+    emitIfExplicit("metrics-port", cfg.metricsPort, cli.metricsPortExplicit);
+    emitIfExplicit("notify-keyspace-events", cfg.notifyKeyspaceEvents, cli.notifyKeyspaceEventsExplicit);
     emitPathIfSet("pidfile", cfg.pidfile);
     emitPathIfSet("config", cfg.configPath);
 
@@ -346,8 +354,10 @@ std::vector<std::string> BuildServiceArgv(std::filesystem::path const& exePath, 
     return argv;
 }
 
-ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config const& cfg)
+ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResult const& cli)
 {
+    Config const& cfg = cli.config;
+
     // The dedicated account a system-wide job runs as, created by the package's
     // postinstall. Mirrors the `fastcached` user in
     // packaging/linux/fastcached.sysusers. It lives here, with the daemon's own
@@ -358,7 +368,7 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, Config c
 
     // EmitDaemonFlag::No, and the flag carried separately: the spec has to be
     // able to answer both supervisors, and only the SCM wants backgrounding.
-    auto argv = BuildServiceArgv(exePath, cfg, EmitDaemonFlag::No);
+    auto argv = BuildServiceArgv(exePath, cli, EmitDaemonFlag::No);
 
     // argv[0] is the executable, which the spec holds in its own field.
     argv.erase(argv.begin());
@@ -714,9 +724,10 @@ namespace
     /// Whether @p spec already carries an argument introduced by @p flag.
     ///
     /// "The operator set this" is exactly "BuildServiceArgv emitted it", because
-    /// that function emits a flag only for a field differing from its default --
-    /// so asking the argument list is asking the same question the Config test
-    /// used to, one layer further along.
+    /// that function emits a flag only for one the operator NAMED -- so asking the
+    /// argument list is asking the same question the Config test used to, one layer
+    /// further along, and since #349 it is asking it of provenance rather than of a
+    /// value that might coincide with a default.
     /// @param spec Service being registered.
     /// @param flag Flag prefix including its `=`, e.g. `--config=`.
     /// @return True when the flag is already present.
@@ -769,11 +780,20 @@ std::filesystem::path DefaultLogDirectory(std::string_view label, ServiceScope s
 std::optional<std::string_view> SwitchSpellingFor(std::string_view onFlag,
                                                   std::string_view offFlag,
                                                   bool value,
-                                                  bool fallback) noexcept
+                                                  bool wasTyped) noexcept
 {
-    if (value == fallback)
+    if (!wasTyped)
         return std::nullopt;
-    return value ? onFlag : offFlag;
+
+    auto const spelling = value ? onFlag : offFlag;
+
+    // A one-sided switch asked to say "off" has nothing to say. Unreachable from
+    // argv -- `--metrics` and its siblings can only set true -- but it is the one
+    // shape this function cannot express, so it answers rather than emitting a
+    // bare `--`.
+    if (spelling.empty())
+        return std::nullopt;
+    return spelling;
 }
 
 ServiceSpec WithScopeDefaults(ServiceSpec spec,
