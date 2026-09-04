@@ -14,6 +14,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <span>
@@ -32,6 +33,21 @@ class NodeIoLoop;
 /// silently so, and `WorkerBody` is a function with a cognitive-complexity budget
 /// that two inline surfaces do not fit inside. Both being one object each is also
 /// what makes them read as the pair they are.
+/// Whether this node is the only scheduler there will ever be.
+///
+/// **An enum rather than a `bool`, because the two answers are opposite claims about
+/// the FUTURE rather than a setting**: `Yes` says nothing will ever publish a role, so
+/// standalone leadership at term 0 is the final answer; `No` says a consensus driver
+/// will publish one and this tier must not pretend to a leadership it has not been
+/// given (#613). A bare `true` at the call site reads as neither.
+enum class LeadsAlone : std::uint8_t
+{
+    /// A consensus driver will report a role and a real term; wait for it.
+    No,
+    /// Nothing will ever call `SetRole`, so lead now and at term 0.
+    Yes,
+};
+
 class SchedulerTier
 {
   public:
@@ -132,7 +148,8 @@ class SchedulerTier
                   ILogger& logger,
                   std::span<std::byte const> signingKey,
                   std::string_view clusterId,
-                  std::shared_ptr<AuthPolicy const> policy);
+                  std::shared_ptr<AuthPolicy const> policy,
+                  LeadsAlone leadsAlone);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.

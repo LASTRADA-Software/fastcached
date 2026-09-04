@@ -16,7 +16,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-
 using namespace FastCache;
 using namespace FastCache::Node;
 
