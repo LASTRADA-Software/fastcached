@@ -379,6 +379,12 @@ start_node() {
     local log="${workdir}/${id}.log"
     node_logs[index]="$log"
 
+    # `--advertise` names the port this node SERVES. It was `127.0.0.1:1` at both
+    # launch sites with no reason given -- a node telling every client to dial a port
+    # nothing on it listens on, which is #594's exact misconfiguration and is refused
+    # at startup since. It was harmless here only because these tests never dispatch a
+    # compile, so nothing ever tried the address; a fixture configuring a node no
+    # operator should configure is what #386 found nine of.
     "$node" \
         --node-id="$id" \
         --listen-raft="127.0.0.1:${raft_ports[$index]}" \
@@ -391,7 +397,7 @@ start_node() {
         --cache-memory=0 \
         --scheduler="127.0.0.1:${scheduler_ports[$index]}" \
         --toolchain="/bin/sh" \
-        --advertise="127.0.0.1:1" \
+        --advertise="127.0.0.1:${scheduler_ports[$index]}" \
         --log-level=info \
         > "$log" 2>&1 &
     pids+=("$!")
@@ -871,7 +877,7 @@ scheduler_ports+=("$(free_port)")
     --cache-memory=0 \
     --scheduler="127.0.0.1:${scheduler_ports[3]}" \
     --toolchain="/bin/sh" \
-    --advertise="127.0.0.1:1" \
+    --advertise="127.0.0.1:${scheduler_ports[3]}" \
     --log-level=info \
     > "${workdir}/n4.log" 2>&1 &
 pids+=("$!")
