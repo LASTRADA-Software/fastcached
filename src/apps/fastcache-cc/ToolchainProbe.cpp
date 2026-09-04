@@ -746,7 +746,58 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     // to: clang and gcc print it on stdout, while `cl` prints its banner on stderr.
     // Asking for both is what makes one call cover every driver instead of a
     // per-family rule that would need its own table row.
-    auto const run = runner.RunCaptureCombined(probe);
+    //
+    // And asked IN ENGLISH, because since issue #195 this line is the compiler's
+    // identity -- it is folded into `ComputeKey`, `ComputeManifestKey` and
+    // `ComputeToolchainFingerprint`. `cl` localizes it, so one MSVC toolset under two
+    // Visual Studio UI languages produced two identities: two machines holding the
+    // same compiler shared no cache entry and never matched each other in the fleet,
+    // and both symptoms are what a healthy estate looks like from outside -- a lower
+    // hit rate and a `NoWorker` (issue #200).
+    //
+    // `VSLANG` rather than parsing the banner. No rule over "the version-looking
+    // token and the last one" survives a locale nobody here has read, and the
+    // alternative to a rule is a per-language table that is wrong the moment a pack
+    // ships. Asking the compiler to speak English needs neither.
+    //
+    // Set for EVERY driver rather than only the MSVC family, and that is the
+    // deliberate choice: gcc and clang ignore a variable they do not know, so the
+    // cost is nothing -- while gating it on `ClassifyCompiler` would make a
+    // compiler's IDENTITY depend on a classification that can itself be wrong, and a
+    // misclassification would then silently move a cache key rather than merely
+    // pick the wrong probe flag.
+    //
+    // Best effort by nature: `cl` falls back to whatever language pack IS installed
+    // when 1033 is absent, so a machine can still answer in another language.
+    //
+    // What that leaves is stated rather than smoothed over, because the comfortable
+    // version of this sentence is wrong. It is NOT true that such a host is "as
+    // consistent with itself as before": before this, two hosts sharing a UI language
+    // matched each other. An estate whose machines differ only in which packs are
+    // INSTALLED -- German UI throughout, en-US present on some -- now splits into an
+    // English identity and a German one that share no cache entry and match nothing
+    // in the fleet. That is #200's own symptom, newly introduced for exactly that
+    // shape of estate, and it is the cost of collapsing the much commoner split
+    // between whole machines.
+    //
+    // And unlike the `/showIncludes` twin, this path has NO detector. There the
+    // launcher can see that a request did not take, because it parses the answer and
+    // `Cc::CarriesUnreadableIncludeNotes` reports notes it could not read. A banner
+    // is one opaque line: nothing here can tell "this is English" from "this is a
+    // language that happens to be shaped like the last one", short of a second probe
+    // spawn per compile to compare against. So the residual case is silent by
+    // construction, which is the half most likely to be rediscovered later and
+    // "fixed".
+    //
+    // Argued in full under `## Accepted trade-offs` in `.agent/rules/compile-cache.md`,
+    // and that is where it has to live rather than only here: nobody debugging a
+    // split estate is reading this file. They are reading the rulebook, because that
+    // is where this project keeps its arguments -- and a cost recorded only beside
+    // the code is one only somebody who already knows where to look will find.
+    std::array<EnvironmentAssignment, 1> const english { {
+        { .name = "VSLANG", .value = "1033" },
+    } };
+    auto const run = runner.RunCaptureCombined(probe, english);
     if (run.exitCode == 0 && !run.out.empty())
     {
         auto line = run.out.substr(0, run.out.find('\n'));

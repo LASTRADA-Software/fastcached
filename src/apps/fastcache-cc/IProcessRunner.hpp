@@ -71,6 +71,34 @@ class IProcessRunner
     /// @return Exit code and the combined output in `out` (`err` stays empty).
     [[nodiscard]] virtual CompileRun RunCaptureCombined(std::span<std::string const> argv) = 0;
 
+    /// The same, with variables ADDED to the environment the child inherits.
+    ///
+    /// The combined-capture twin of the split overload below, and everything that
+    /// one's note says about additivity, about never using this on a spawn whose
+    /// output a developer reads, and about honouring it being best effort applies
+    /// here unchanged. Read it there; it is not repeated so the two cannot drift.
+    ///
+    /// This one exists for the compiler's BANNER. `cl` localizes it, and #195 made
+    /// that banner the compiler's identity -- so one MSVC toolset under two Visual
+    /// Studio UI languages became two identities that share no cache entry and never
+    /// match each other in the fleet (issue #200). Asking for the banner in English
+    /// collapses them without parsing the banner, which is the part that could not be
+    /// done safely: no rule over "the version-looking token and the last one"
+    /// survives a locale nobody here has read.
+    ///
+    /// @param argv        Full invocation; argv[0] is the executable.
+    /// @param environment Variables to add to the inherited environment.
+    /// @return Exit code and the combined output in `out` (`err` stays empty).
+    [[nodiscard]] virtual CompileRun RunCaptureCombined(std::span<std::string const> argv,
+                                                        std::span<EnvironmentAssignment const> environment)
+    {
+        // Forwards for the same reason the split overload's default does: a runner
+        // with no process to spawn has no environment to set, and no caller may
+        // depend on the variable having taken effect in either case.
+        (void) environment;
+        return RunCaptureCombined(argv);
+    }
+
     /// Run `argv` capturing stdout and stderr SEPARATELY, so a later cache hit
     /// can replay each on its own channel.
     ///

@@ -562,6 +562,32 @@ set_tests_properties("byte-order-qualifier" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# `VSLANG` is set on a probe spawn and on nothing else.
+#
+# The launcher asks `cl` to speak English where it PARSES the answer: the
+# /showIncludes notes (#692) and the version banner, which is the compiler's
+# identity (#200). Both of those spawns are read by nobody but this process. The
+# real compile is different in kind -- its diagnostics belong to the developer,
+# and forcing English there repairs a parse by anglicizing every warning they see.
+#
+# The rule was written in `.agent/rules/compile-cache.md` and on both entry
+# points, and NOTHING READ IT: every test asserted that the variable reaches a
+# probe, which a change that also set it on the compile passes unchanged. That is
+# the #683 shape -- a plausible claim nothing can make fail -- so the census is
+# the reader.
+add_test(
+    NAME "vslang-probe-only"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vslang-probe-only.cmake"
+)
+set_tests_properties("vslang-probe-only" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The shared e2e helper library. Fails when `scripts/lib/e2e-common.sh` stops
 # drawing ports the way it says, stops distinguishing a dead process from a slow
 # one, stops keeping an HTTP body's last chunk, or stops ending the run from

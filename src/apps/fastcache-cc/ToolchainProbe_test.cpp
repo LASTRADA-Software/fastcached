@@ -2092,3 +2092,110 @@ TEST_CASE("A toolchain label says what the compiler is, where a fingerprint cann
     // Empty only when there is no compiler to name.
     CHECK(ToolchainLabel("", "Version 1.2.3").empty());
 }
+
+// --- the banner is asked for in English (issue #200) -------------------------
+
+namespace
+{
+/// A `cl` whose banner is in whatever language it was ASKED in.
+///
+/// The fake's answer depends on the environment it receives, which is the whole
+/// point: a fake that always returns English would pass whether or not the probe
+/// threads `VSLANG` through to the spawn, and a fake that always returns German
+/// would fail whether or not it did. Only one whose answer MOVES can tell the two
+/// apart, and this stands in for the machine an issue-#200 estate actually has --
+/// one Visual Studio carrying a language pack.
+///
+/// It answers on the environment-carrying overload and on the bare one alike, so a
+/// probe that quietly called the wrong entry point is not rescued by the fake
+/// defaulting to English.
+class LocalizedBannerRunner final: public IProcessRunner
+{
+  public:
+    /// @param localized The banner this host prints when it is not asked otherwise.
+    /// @param english   The banner it prints when asked for `VSLANG=1033`.
+    LocalizedBannerRunner(std::string localized, std::string english):
+        _localized { std::move(localized) },
+        _english { std::move(english) }
+    {
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        return RunCaptureCombined(argv, {});
+    }
+
+    CompileRun RunCaptureCombined(std::span<std::string const> argv,
+                                  std::span<EnvironmentAssignment const> environment) override
+    {
+        (void) argv;
+        _sawEnglishRequest = std::ranges::any_of(
+            environment, [](EnvironmentAssignment const& a) { return a.name == "VSLANG" && a.value == "1033"; });
+        return { .exitCode = 0, .out = (_sawEnglishRequest ? _english : _localized) + "\r\n", .err = {} };
+    }
+
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        (void) argv;
+        return { .exitCode = 0, .out = {}, .err = {} };
+    }
+
+    /// Whether the last spawn was asked for English.
+    [[nodiscard]] bool SawEnglishRequest() const noexcept
+    {
+        return _sawEnglishRequest;
+    }
+
+  private:
+    std::string _localized;
+    std::string _english;
+    bool _sawEnglishRequest { false };
+};
+
+/// The same toolset's banner, as two Visual Studio UI languages word it.
+///
+/// Only the version and target tokens are invariant, which is exactly why the fix
+/// cannot be token extraction: there is no rule over "the version-looking word and
+/// the last one" that survives a locale nobody here has read.
+constexpr std::string_view EnglishBanner = "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64";
+constexpr std::string_view GermanBanner = "Microsoft (R) C/C++-Optimierungscompiler Version 19.51.36252 f\xC3\xBCr x64";
+} // namespace
+
+TEST_CASE("One toolset under two VS languages derives one banner", "[toolchain-probe][vslang]")
+{
+    // Issue #200's acceptance, at the seam where it can be exercised: two hosts, the
+    // same toolset, different language packs. Neither answer was WRONG before -- each
+    // machine was consistent with itself -- but they shared no cache entry and never
+    // matched each other in the fleet, and both of those look exactly like a healthy
+    // estate from outside.
+    LocalizedBannerRunner german { std::string { GermanBanner }, std::string { EnglishBanner } };
+    LocalizedBannerRunner english { std::string { EnglishBanner }, std::string { EnglishBanner } };
+
+    auto const fromGermanHost = CompilerBanner(german, "cl.exe");
+    auto const fromEnglishHost = CompilerBanner(english, "cl.exe");
+
+    // The probe asked, rather than the fake having volunteered. Without this the
+    // case would still pass against a runner handed no environment at all, because
+    // the English host's two banners are the same string.
+    CHECK(german.SawEnglishRequest());
+
+    CHECK(fromGermanHost == fromEnglishHost);
+    CHECK(fromGermanHost == EnglishBanner);
+}
+
+TEST_CASE("A localized banner is what the two hosts would otherwise have disagreed on", "[toolchain-probe][vslang]")
+{
+    // The control, and it is not decoration: it is what shows the fixture can
+    // express the defect at all. If the German banner were somehow equal to the
+    // English one, the case above would pass for a reason having nothing to do with
+    // `VSLANG` -- two empty answers agreeing perfectly, one layer up.
+    CHECK(GermanBanner != EnglishBanner);
+
+    // And the fake really does move with what it is asked, which is the property the
+    // case above leans on. Asked with no environment, this host answers in German.
+    LocalizedBannerRunner german { std::string { GermanBanner }, std::string { EnglishBanner } };
+    auto const unasked = german.RunCaptureCombined(std::array<std::string, 1> { "cl.exe" });
+
+    CHECK_FALSE(german.SawEnglishRequest());
+    CHECK(unasked.out.starts_with(GermanBanner));
+}

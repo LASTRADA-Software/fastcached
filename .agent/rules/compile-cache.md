@@ -1691,6 +1691,26 @@ without reopening the argument:
   validator's current answer and say in-place that they must change if it is
   tightened; the `Observed({})` they build is a lie the fixture tells deliberately
   and says so, since no honest caller spells that state.
+- **`VSLANG=1033` on the banner probe collapses the common locale split and opens a
+  rarer one, and the rarer one has no detector.** Since #195 the banner IS the
+  compiler's identity, and `cl` localizes it, so one MSVC toolset under two Visual
+  Studio UI languages was two identities that shared no cache entry and matched
+  nothing in the fleet. Asking the probe for English
+  ([#200](https://github.com/LASTRADA-Software/fastcached/issues/200)) collapses that
+  — which is the commoner split, between whole machines, and the trade is a good one.
+  **What it costs is an estate whose machines differ only in WHICH PACKS ARE
+  INSTALLED**: German UI throughout, `en-US` present on some. Those machines matched
+  each other before and no longer do — the one that can honour `VSLANG` derives the
+  English identity and the one that cannot derives the German one. That is #200's own
+  symptom, newly introduced for exactly that shape of estate.
+  **And there is no detector, nor can there cheaply be one.** The `/showIncludes` twin
+  has `Cc::CarriesUnreadableIncludeNotes`, which can see that a request did not take
+  because it parses the answer. A banner is one opaque line: nothing distinguishes
+  "this is English" from "this is a language shaped like the last one" without a
+  second probe spawn per compile to compare against. So this case is silent by
+  construction, and that is the half most likely to be rediscovered as a bug and
+  "fixed". It is not a bug; it is this row. The argument is on `CompilerBanner` in
+  `apps/fastcache-cc/ToolchainProbe.cpp`, which points here.
 - MurmurHash3 is not collision-resistant against an adversary. Accepted because
   the key is not a security boundary: anyone who can STORE can already write a
   wrong object under a correct key. Closing it needs a keyed hash *and* a trust

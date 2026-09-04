@@ -200,6 +200,12 @@ namespace
             return Spawn(argv, Merge::Yes, {});
         }
 
+        [[nodiscard]] CompileRun RunCaptureCombined(std::span<std::string const> argv,
+                                                    std::span<EnvironmentAssignment const> environment) override
+        {
+            return Spawn(argv, Merge::Yes, environment);
+        }
+
         [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv) override
         {
             return Spawn(argv, Merge::No, {});
@@ -463,6 +469,12 @@ namespace
         [[nodiscard]] CompileRun RunCaptureCombined(std::span<std::string const> argv) override
         {
             return Spawn(argv, Merge::Yes, {});
+        }
+
+        [[nodiscard]] CompileRun RunCaptureCombined(std::span<std::string const> argv,
+                                                    std::span<EnvironmentAssignment const> environment) override
+        {
+            return Spawn(argv, Merge::Yes, environment);
         }
 
         [[nodiscard]] CompileRun RunCaptureSplit(std::span<std::string const> argv) override
