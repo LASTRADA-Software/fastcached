@@ -828,14 +828,31 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
         }
 
-        # Bound, then surveyed. The first is prompt by construction since #365; the
-        # second is the include-tree walk, and it is what the next node must not be
-        # started on top of. "serving <compiler> as <fingerprint>" is logged once the
-        # survey has an identity -- for a toolchain pinned with `<name>=<compiler>`
+        # SERVING, then surveyed -- and the first of those is not "bound" (#652).
+        # `compile node ready` is logged at main.cpp:1454; the accept loop starts at
+        # :1128, with the credential, the registrars, the startup toolchain count and
+        # the heartbeat thread in between. So the ordering is
+        #
+        #     bound  <  accepting  <  READY (serving)  <  surveyed
+        #
+        # and this wait sits at the third. `Core/ReadinessMarker.hpp` is where that is
+        # written down; `ReadinessFact` deliberately has no `Bound` enumerator, because
+        # naming this marker a bind is the mistake this fixture was making.
+        #
+        # It matters for the MESSAGE and not for the wait, which was always correct: a
+        # node that binds, accepts, and then stalls in heartbeat setup used to be
+        # reported as having failed to bind, sending whoever read it to check a port
+        # that is open and answering -- the one part that is working.
+        #
+        # The second wait is the include-tree walk, and it is what the next node must
+        # not be started on top of. "serving <compiler> as <fingerprint>" is logged once
+        # the survey has an identity -- for a toolchain pinned with `<name>=<compiler>`
         # that is immediate, since an override is never probed.
-        function Wait-ForNodeUp([string]$name, $proc, [int]$bindSeconds, [int]$surveySeconds) {
-            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $bindSeconds "$name to bind its compile port" $proc)) {
-                throw "$name did not bind its compile port"
+        function Wait-ForNodeUp([string]$name, $proc, [int]$readySeconds, [int]$surveySeconds) {
+            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $readySeconds "$name to report serving on its compile port" $proc)) {
+                # States what was and was not established, and stops. A bound port is
+                # NOT evidence this succeeded, so the message must not point at one.
+                throw "$name never reported serving. That marker is logged after the port is bound and accepting, so the port being open says nothing about this wait; the stage not reached is between the accept start and the ready line."
             }
             if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc)) {
                 throw "$name did not finish its toolchain survey"
@@ -868,8 +885,11 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # What that serialisation is asked OF matters, and #365 silently took it
         # away. It used to rest on "compile node ready", which then meant SURVEYED --
         # a node fingerprinted before it bound. Since #365 a node binds and serves
-        # first, so that same line means only "bound", every node reached it in about
-        # a second, and all three walked the same include tree AT ONCE. The rate
+        # first, so that same line means SERVING and no longer covers the survey at
+        # all; every node reached it in about a second, and all three walked the same
+        # include tree AT ONCE. (It means serving rather than merely "bound", which is
+        # #652 -- the distinction does not change this paragraph's conclusion, and
+        # getting it wrong here is what put a bind in the failure message below.) The rate
         # measured on the clangcl runner fell to 2-5 file/s against the ~30 file/s
         # #354 measured with one walker, the 600 s budget #428 had just moved here
         # was blown at 5136 files, and an unrelated PR was ejected from the merge
@@ -877,9 +897,9 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # meant; it now has to say so explicitly, because the line it used to rely
         # on no longer carries it.
         #
-        # Both waits are kept, and separately: bind and survey are different stages
-        # with different costs, and a fixture that folds them cannot say which one
-        # stalled.
+        # Both waits are kept, and separately: serving and surveying are different
+        # stages with different costs, and a fixture that folds them cannot say which
+        # one stalled.
         Wait-ForNodeUp "sched" $schedProc 180 120
 
         $workerAProc = Start-NodeIn "workerA" @(
@@ -898,9 +918,11 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         Wait-ForNodeUp "workerB" $workerBProc 120 600
 
         # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
-        # logging "compile node ready" says its own port is bound, not that the
-        # scheduler has heard from it -- dispatching on that races the first
-        # heartbeat and is refused NoWorker.
+        # logging "compile node ready" says that worker is serving -- its own surface
+        # is accepting and its heartbeat thread is running -- and NOT that the
+        # scheduler has heard from it. The heartbeat having STARTED is not a round
+        # having ARRIVED, so dispatching on that races the first heartbeat and is
+        # refused NoWorker.
         #
         # The toolchain walk is NOT in this wait. #428 moved a 600 s budget here on
         # the reasoning that the walk had moved with it, which was half right: the

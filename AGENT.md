@@ -1227,7 +1227,7 @@ and what they may assume.
   Split the DECISION out as a pure function over a record; leave acquisition alone. Branches that could not be staged
   become one line, every bound gets pinned on BOTH sides, and 53s + RUN_SERIAL becomes 0.3s.
 - A fixture waits on what a line MEANS. `node-scratch-isolation-e2e` serialised its three include-tree walks by waiting for
-  `compile node ready`, which meant *surveyed* until #365 made it mean *bound* — same wording, different fact, and the walks
+  `compile node ready`, which meant *surveyed* until #365 made it mean *serving* — same wording, different fact, and the walks
   then ran concurrently at 2–5 file/s against ~30 single. The budget was the symptom; raising it would have bought a fixture
   three times slower with the cause buried. Wait on the STAGE, keep bind and survey separate so a stall says which, and note
   that the paragraph explaining the serialisation was correct and three lines above the wait that had stopped implementing it.
