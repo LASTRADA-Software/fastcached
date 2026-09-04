@@ -884,6 +884,42 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
+TEST_CASE("NodeConfig: an empty --scheduler is refused at STARTUP and not only at install", "[node][policy]")
+{
+    // **The rule this ticket is about, asserted where it has to hold.** An empty
+    // `--scheduler` was refused by an inline `if` in `main()` and by row 1 of
+    // `NodeServiceRejection`. `main.cpp` is in no test target, so the copy that ran at
+    // startup was the one nothing could assert, and the two had already drifted on the
+    // sentence they say -- which is the observable half of a duplicate
+    // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+    auto headless = Installable();
+    headless.scheduler.clear();
+
+    // **The control FIRST, so one run shows the discrimination.** `NodeInstallRejection`
+    // composes `NodeServiceRejection`, which has always had this row -- so it refuses an
+    // empty `--scheduler` whether or not the startup table does. Asserting through it
+    // would pass under the exact bug this case exists to catch, which is why the ticket
+    // names it as the wrong target. Ordered ahead of the subject because a `REQUIRE`
+    // below aborts the case: read after the subject, this control would simply not run
+    // on the failing build and could not show what it is for.
+    CHECK(NodeInstallRejection(headless).has_value());
+
+    auto const refusal = StartupPolicyRejection(headless);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--scheduler"));
+
+    // **The message must be the STARTUP sentence, not the install-time one.** Both
+    // rules are about the same empty field and the install row says "to install a
+    // service" -- true when a registration is being written and false at every start,
+    // where the process is simply refusing to run. An operator told the wrong one goes
+    // looking for a service they never asked to install.
+    CHECK_FALSE(Unwrap(refusal).contains("to install a service"));
+
+    // And the ordinary configuration is untouched: a node that names its scheduler
+    // starts, so this is a refusal of the empty value and not of the flag.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
 TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused before it is installed", "[node][policy]")
 {
     // #186. Each of these grammars was checked inside the tier that binds it, and
