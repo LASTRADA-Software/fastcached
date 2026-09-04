@@ -670,6 +670,48 @@ determinism rests on.
     that the script finished; a run that reports `patched 0 of 3` is a run whose
     author notices, and `done` is not. The assertion earns itself the first time an
     anchor drifts under a rebase, which is not a rare event here.
+
+    **And `count == 1` is necessary, not sufficient.** It proves the anchor was found
+    and was unique. It says nothing about whether the insert was *correct*, because
+    what an insertion breaks is usually not the text it replaced -- it is the text on
+    the other side of it. **An anchored insert is checked against what FOLLOWS the
+    anchor, not only against what precedes it.**
+
+    Measured here, in this file, by the commit that added *A probe's result is only
+    evidence if the probe could have produced the other one*: the anchor was the last
+    bullet of a section, matched once, and the insert landed between that bullet and
+    that section's *closing* paragraph -- a paragraph reading
+    "Every finding in **both sections** is an instance of this" and listing five
+    findings. Pushed below the inserted section, "both sections above" now pointed at
+    that one instead, which contains none of the five. Nothing was misplaced and no rule
+    was wrong; **a neighbouring paragraph was made false**, which is worse, because it
+    now misinstructs a reader who never sees the edit.
+
+    And a third correction inside this one entry, which is the point rather than an
+    embarrassment: the first two accounts of this said the paragraph was stranded "four
+    sections downstream". `git show c558e9b1` says **one** at the time of the insert and
+    two by the time it was noticed. Nobody had counted; four was repeated from the first
+    telling into a message and then into this file. **A number in a post-mortem is a
+    measurement and decays like one** -- the incident is over, so nothing will ever fail
+    to make it wrong again, and a rulebook is exactly where such a number goes to be
+    believed forever.
+
+    **A prose diff cannot show you the sentence your insertion falsified.** The hunk
+    held the added lines and three untouched context lines, and the broken sentence sat
+    outside that window -- so the diff was clean, minimal and reviewable, and the defect
+    was invisible in it. Re-read the whole enclosing section afterwards, from its heading
+    to the next one, rather than the diff. In prose the specific hazard is a
+    **back-reference**: "the section above", "both sections above", "the two entries
+    below", "as stated earlier". Those are the sentences an insert silently redirects, so
+    grep the neighbourhood for positional words before inserting between two things that
+    refer to each other.
+
+    That grep caught this very paragraph one minute after it was written: the sentence
+    above said "the commit that added the two sections above", and those sections are
+    **below** it. Which is the real remedy rather than the grep -- **point at a NAME, not
+    at a direction.** A title survives an insertion, a rebase and a move; "above" is a
+    claim about layout that every later edit can silently invalidate, and it is the only
+    kind of claim in a rulebook that nothing in the tree can check.
   - **A tool given a path that does not exist reports nothing, which is what "absent"
     also looks like.** `nm` on a missing file prints no symbols, so a grep for one
     counts zero -- character-for-character identical to a binary that was built
