@@ -2481,7 +2481,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     // tabulated: it echoes what the operator wrote, which is the half a table row cannot
     // do.
     if (auto rejection = AdvertisedPortRejection(cfg); rejection.has_value())
-        return std::move(*rejection);
+        return rejection;
 
     return std::nullopt;
 }
