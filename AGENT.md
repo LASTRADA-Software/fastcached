@@ -1599,6 +1599,14 @@ moved out of the call site and into the type.
   agent preset is one compiler at `-O0`; CI is four more, and defects invisible below a
   release build or a second standard library are why the script exists. See
   [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
+  **It builds in `out/build/gate-clang-debug` and `out/build/gate-gcc-release`, which it
+  OWNS** — never the `out/build/clang-debug` and `out/build/gcc-release` this file tells
+  you to build in. A reference build turns the compiler cache off, a `-D` writes a cache
+  entry, and `option()` never overrides one, so while the two shared a directory a single
+  gate run left every ordinary build in the tree uncached for good — about 2.4x on a full
+  rebuild, in the repository whose product is a compile cache
+  ([#487](https://github.com/LASTRADA-Software/fastcached/issues/487)). The cost of the
+  split is disk and a first gate run that cannot start from your warm object tree.
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
   (`$CLANG_TOOLS_VERSION` in `.github/workflows/build.yml`). Successive LLVM
   releases disagree with each other, so a tree clean under whichever binary is on
