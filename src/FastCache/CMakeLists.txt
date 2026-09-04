@@ -109,6 +109,7 @@ target_sources(FastCache
         Server/AdminHttpServer.cpp
         Server/Connection.cpp
         Server/ReactorServerLoop.cpp
+        Server/ReadinessAnnouncer.cpp
         Server/Server.cpp
 )
 

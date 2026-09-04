@@ -8,11 +8,14 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAdmissionControl.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Server/ReadinessAnnouncer.hpp>
+#include <FastCache/Server/Server.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -139,6 +142,36 @@ namespace Detail
     /// @return The running cycle. Stops when destroyed.
     [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(
         IReactor& reactor, CacheEngine& engine, ILogger& logger, ReactorServerOptions const& options, IMetricsSink* metrics);
+
+    /// Start every accept loop in `servers` and report the ones that armed.
+    ///
+    /// This is where "the acceptors are running" stops being an assumption. Each
+    /// `Server::Run()` is driven by a detached coroutine whose first statement is
+    /// the listener's `Accept()`, so it is registered with the reactor by the time
+    /// the call returns -- and `Server::IsAccepting()` is what says so. A loop that
+    /// ended immediately instead (a listener already closed) is logged and is **not**
+    /// counted towards readiness, which is the point: the readiness line has to name
+    /// acceptors that exist.
+    ///
+    /// Exposed for the reason `StartExpiryCycle` is: the thing worth asserting is
+    /// that the daemon announces itself ready **after** doing this, and a helper
+    /// nothing outside the translation unit can reach cannot be asserted about.
+    /// @param servers Accept loops to start; every element must be non-null.
+    /// @param group Names this group of loops in the per-acceptor Debug line, e.g.
+    ///        `reactor 0`.
+    /// @param announcer Receives one `AcceptorArmed` per loop that armed, and emits
+    ///        the readiness line when the last one across every group does.
+    /// @param logger Where a loop that did not arm is reported.
+    ///
+    /// Returns nothing on purpose: how many armed is `ReadinessAnnouncer`'s
+    /// `ArmedCount()`, and a second answer to one question is a second thing to be
+    /// wrong. A count returned here would also be read by nobody, which is what
+    /// `NodeSurfaceRow`'s deleted `HostOrigin` column is recorded for -- it
+    /// documented rather than drove.
+    void ArmAcceptLoops(std::span<std::unique_ptr<Server> const> servers,
+                        std::string_view group,
+                        ReadinessAnnouncer& announcer,
+                        ILogger& logger);
 
 } // namespace Detail
 

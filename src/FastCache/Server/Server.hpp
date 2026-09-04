@@ -84,6 +84,22 @@ class Server
         return _accepted.load(std::memory_order_relaxed);
     }
 
+    /// @return True while `Run()` is parked in the listener's `Accept()`.
+    ///
+    /// This is what makes "the acceptors are armed" a fact somebody can state
+    /// rather than infer from having called `Run()`. `Run()` is a coroutine with a
+    /// `suspend_never` initial suspend whose first statement is `Accept()`, so a
+    /// caller that started it and then reads `true` here knows the accept is
+    /// registered with the reactor -- and one that reads `false` knows the loop
+    /// exited immediately (a closed or already-shut-down listener) rather than
+    /// having armed. `Detail::ArmAcceptLoops` uses exactly that distinction, and it
+    /// is what stops the daemon's readiness line naming an acceptor that is not
+    /// there ([#646](https://github.com/LASTRADA-Software/fastcached/issues/646)).
+    [[nodiscard]] bool IsAccepting() const noexcept
+    {
+        return _accepting.load(std::memory_order_acquire);
+    }
+
   private:
     IListener& _listener;
     CacheEngine& _engine;
@@ -95,6 +111,7 @@ class Server
     LogSource _logSource;
     std::atomic<std::uint64_t> _accepted { 0 };
     std::atomic<bool> _shuttingDown { false };
+    std::atomic<bool> _accepting { false };
 };
 
 } // namespace FastCache

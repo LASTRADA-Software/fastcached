@@ -15,11 +15,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
 #include <memory>
 #include <ranges>
+#include <span>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -117,14 +120,12 @@ namespace
                                                        perBindTls,
                                                        options.logSource ? LogSource::Yes : LogSource::No));
         }
-        logger.Logf(LogLevel::Info, "ready, accepting connections ({} bind(s))", options.binds.size());
-
-        auto runAccept = [](Server* s) -> DetachedTask {
-            co_await s->Run();
-            co_return;
-        };
-        for (auto& s: servers)
-            runAccept(s.get());
+        // Arm first, announce second. The readiness line used to be logged HERE,
+        // above the loop that starts the acceptors (#646) -- a marker naming a fact
+        // weaker than the bind a caller already had. `ReadinessAnnouncer` emits it,
+        // and it emits it only once every accept loop is parked in `Accept()`.
+        ReadinessAnnouncer announcer { logger, servers.size(), std::format("{} bind(s)", options.binds.size()) };
+        Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
 
         auto const expiry = Detail::StartExpiryCycle(reactor, engine, logger, options, metrics);
 
@@ -233,8 +234,19 @@ namespace
             listenSocks.push_back(bound->socket);
             bindTls.push_back(bind.tls);
         }
-        logger.Logf(
-            LogLevel::Info, "ready, accepting connections ({} bind(s) x {} reactors)", options.binds.size(), reactorCount);
+        // Readiness on this platform takes TWO kinds of acceptor, and both are
+        // load-bearing. An acceptor thread parked in `AcceptRaw` takes the socket;
+        // an IOCP reactor's `Run()` is what ever serves it, because every accepted
+        // handle is handed off. Counting only the acceptor threads would announce
+        // readiness while every handed-off connection sat on a completion port
+        // nobody was draining -- which is #646's own defect one layer in, so the
+        // total is `binds + reactors` and the last of either announces.
+        //
+        // Declared before `acceptors` and before the reactor threads, so it outlives
+        // every thread that calls `AcceptorArmed`.
+        ReadinessAnnouncer announcer { logger,
+                                       options.binds.size() + reactorCount,
+                                       std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount) };
 
         std::atomic<std::uint64_t> accepted { 0 };
         std::atomic<bool> stopping { false };
@@ -260,6 +272,8 @@ namespace
                 FC_THREAD_NAME(threadName.c_str());
                 auto const listenSock = listenSocks[bindIdx];
                 auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
+                // Armed the moment this thread is about to block in `AcceptRaw`.
+                announcer.AcceptorArmed(std::format("acceptor thread {}", bindIdx));
                 while (!stopping.load(std::memory_order_acquire) && !stopToken.stop_requested())
                 {
                     auto raw = Detail::AcceptRaw(listenSock);
@@ -334,12 +348,14 @@ namespace
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
         for (auto i = 1U; i < reactorCount; ++i)
-            threads.emplace_back([&reactors, i] {
+            threads.emplace_back([&reactors, &announcer, i] {
                 [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
                 FC_THREAD_NAME(threadName.c_str());
+                announcer.AcceptorArmed(std::format("reactor {}", i));
                 reactors[i]->Run();
             });
         FC_THREAD_NAME("fc-reactor-0");
+        announcer.AcceptorArmed("reactor 0");
         reactors[0]->Run();
         threads.clear();
 
@@ -422,7 +438,15 @@ namespace
                                                            options.logSource ? LogSource::Yes : LogSource::No));
             }
         }
-        logger.Logf(LogLevel::Info, "ready, accepting connections ({} bind(s) x {} reactors)", bindCount, reactorCount);
+        // One acceptor per (reactor, bind) pair, and the readiness line waits for all
+        // of them. It used to be logged HERE, before a single reactor thread had been
+        // created, let alone armed an accept loop (#646).
+        //
+        // Declared before the threads that arm it and before `watchdog`, so it
+        // outlives every caller of `AcceptorArmed`.
+        ReadinessAnnouncer announcer { logger,
+                                       reactorCount * bindCount,
+                                       std::format("{} bind(s) x {} reactors", bindCount, reactorCount) };
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
@@ -441,13 +465,16 @@ namespace
                 if (!PinCallingThreadToCpu(index % onlineCpus))
                     logger.Logf(LogLevel::Warn, "reactor {}: CPU affinity not applied", index);
             }
-            auto runAccept = [](Server* s) -> DetachedTask {
-                co_await s->Run();
-                co_return;
-            };
-            // Run one accept loop per bind on this reactor.
-            for (auto const b: std::views::iota(std::size_t { 0 }, bindCount))
-                runAccept(servers[(index * bindCount) + b].get());
+            // Run one accept loop per bind on this reactor, and report them armed.
+            // Arming happens on THIS thread and immediately before `Run()`, which is
+            // why the readiness line cannot be emitted from the calling thread: it
+            // would have to be emitted before the last reactor even started.
+            auto const group = std::format("reactor {}", index);
+            Detail::ArmAcceptLoops(
+                std::span<std::unique_ptr<Server> const> { servers }.subspan(index * bindCount, bindCount),
+                group,
+                announcer,
+                logger);
             reactors[index]->Run();
         };
 
@@ -509,6 +536,38 @@ namespace Detail
         auto reaper = std::make_unique<ExpiryReaper>(engine.Storage(), logger, options.expiry, metrics);
         reaper->Start(reactor);
         return reaper;
+    }
+
+    void ArmAcceptLoops(std::span<std::unique_ptr<Server> const> servers,
+                        std::string_view group,
+                        ReadinessAnnouncer& announcer,
+                        ILogger& logger)
+    {
+        // A DetachedTask has a `suspend_never` initial suspend, so calling this runs
+        // `Server::Run()` up to its first real suspension point -- which is the
+        // listener's `Accept()`. That is what turns "started" into "armed", and it
+        // is the whole reason the readiness line can be emitted below rather than
+        // above.
+        auto runAccept = [](Server* s) -> DetachedTask {
+            co_await s->Run();
+            co_return;
+        };
+
+        for (auto const index: std::views::iota(std::size_t { 0 }, servers.size()))
+        {
+            auto* const server = servers[index].get();
+            runAccept(server);
+            if (!server->IsAccepting())
+            {
+                // Not counted, deliberately. The loop ended before parking, so there
+                // is no acceptor here -- and a readiness line that counted it would
+                // be exactly the claim #646 is about, made one level deeper.
+                logger.Logf(
+                    LogLevel::Error, "{}: accept loop {} did not arm; this endpoint is not being served", group, index);
+                continue;
+            }
+            announcer.AcceptorArmed(std::format("{} bind {}", group, index));
+        }
     }
 
     int VerifyTlsContextForTlsBinds(ReactorServerOptions const& options, ILogger& logger)

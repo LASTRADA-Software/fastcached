@@ -37,6 +37,34 @@ namespace
         co_return;
     }
 
+    /// Holds an `accepting` flag true for as long as an accept loop is running.
+    ///
+    /// RAII rather than a store beside each `co_return`, because the loop can also
+    /// end by its coroutine frame being destroyed while suspended -- at which point
+    /// a flag set by hand would go on claiming the acceptor is armed, and the
+    /// readiness line it feeds would be a claim about a loop that no longer exists.
+    class AcceptingScope
+    {
+      public:
+        /// @param flag Set true now and false when this object dies.
+        explicit AcceptingScope(std::atomic<bool>& flag) noexcept:
+            _flag { flag }
+        {
+            _flag.store(true, std::memory_order_release);
+        }
+        AcceptingScope(AcceptingScope const&) = delete;
+        AcceptingScope(AcceptingScope&&) = delete;
+        AcceptingScope& operator=(AcceptingScope const&) = delete;
+        AcceptingScope& operator=(AcceptingScope&&) = delete;
+        ~AcceptingScope()
+        {
+            _flag.store(false, std::memory_order_release);
+        }
+
+      private:
+        std::atomic<bool>& _flag;
+    };
+
 } // namespace
 
 Server::Server(IListener& listener,
@@ -60,6 +88,11 @@ Server::Server(IListener& listener,
 
 Task<void> Server::Run()
 {
+    // Declared before the loop so it is already true at the first suspend: the
+    // caller that started this coroutine resumes the moment `Accept()` parks, and
+    // what it needs to know then is that the accept is registered rather than that
+    // `Run()` was called. See `IsAccepting()`.
+    AcceptingScope const accepting { _accepting };
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
         auto accepted = co_await _listener.Accept();
