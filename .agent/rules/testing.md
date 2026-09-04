@@ -734,17 +734,19 @@ those, it reports INCONCLUSIVE and names the reading it is missing.
 
 ## Assert what DISTINGUISHES, not what both sides produce
 
-In one evening four lanes each found a test that could not fail for the reason it
-existed ([#355](https://github.com/LASTRADA-Software/fastcached/issues/355)). Not
-the same mistake in the same place — the same mistake in five shapes, and every one
-of them green.
+In one evening four lanes found **five** tests that could not fail for the reason
+they existed ([#355](https://github.com/LASTRADA-Software/fastcached/issues/355)).
+Not the same mistake in the same place — the same mistake in five shapes, and every
+one of them green.
 
 Two, which are enough to see the shape:
 
-- **#348's acceptance did `REQUIRE(held)` on a bind.** `BlockingListener::Bind`
-  returns a **non-null pointer in an errored state**, so a failed bind passes it.
-  Both sections would then have passed on a `ParseTcpPort` refusal rather than on
-  the port conflict they existed to prove.
+- **[#286](https://github.com/LASTRADA-Software/fastcached/issues/286)'s acceptance
+  did `REQUIRE(held)` on a bind** (implemented by pull request #348).
+  `BlockingListener::Bind` returns a **non-null pointer in an errored state**, so a
+  failed bind passes it. Both sections — a named port that must refuse, a defaulted
+  one that must warn and continue — would then have passed on a `ParseTcpPort`
+  refusal rather than on the port conflict they existed to prove.
 - **#288's pinned raft test asserted that a refusal happened and that the message
   names `--listen-raft`.** *Both* the old cross-flag rule and the new grammar rule
   name that flag, so it pinned the flag rather than which rule answered — and a
@@ -768,8 +770,8 @@ The clearest demonstration of the technique is elsewhere — pull request #353, 
 **not** one of the five — where neutering made the two positive cases fail while three
 negative ones correctly still passed: **the asymmetry is the evidence**, since an
 all-red run would equally be a harness that had stopped working. A green test nobody
-has watched fail is an untested test, which is the sentence this file already applies
-to a guard, applied to the thing the guard is made of.
+has watched fail is an untested test — the sentence `compile-cache.md` applies to a
+guard, applied here to the thing the guard is made of.
 
 **Three of the five were acceptance criteria**, written by the person who understood
 the defect best, at the moment they understood it best. That is not carelessness.
@@ -778,17 +780,20 @@ questions, and only the second one tests anything — so an acceptance criterion
 hypothesis, and it is worth asking the second question separately before writing the
 test that satisfies it.
 
-Several entries in this file, before and after this one, are instances of this rule:
-a bounded wait that must say which KIND of failure it was, a fixture that states which
-PATH it exercised, and `SUCCEED` standing in for a skip — each asserting something the
-healthy and the broken state both produce, until it was fixed. Each was found on its
-own; none stated the general form, which is why the fifth still had to be found by
-whoever happened to be careful that day.
+Three entries in this file are instances of it: a bounded wait that must say which
+KIND of failure it was, a fixture that states which PATH it exercised, and `SUCCEED`
+standing in for a skip. **A harness earns its place by asserting something that can be
+shown red** above is a fourth, and it already cites this ticket — it is where the rule
+was applied before it was stated, including the asymmetry (four assertions failed while
+the straight case correctly stayed green). Each was found on its own; none stated the
+general form, which is why the fifth still had to be found by whoever happened to be
+careful that day.
 
 `Unwrap(x)` after `REQUIRE(x.has_value())` is deliberately **not** in that list. It
 looks like one and is not: it exists because clang-tidy cannot see the guard through
 `REQUIRE`, so a bare `*x` fails the build. That is a build-guard rule, and folding it
-in here would be the mis-classification this file warns about elsewhere.
+in would put one rule under two headings — which is what the census entry below means
+by an instance filed where nobody looking for it will read it.
 
 ## A query that FAILED is not an observation about the subject
 

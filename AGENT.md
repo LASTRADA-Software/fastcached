@@ -848,15 +848,26 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
   illegal in an SVG.
 - **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five times in four
-  instruments in one session, none of them a coding mistake, all of them a representation that could not tell
+  instruments in one session, ten across seven once a later session's are counted, none of them a coding mistake, all of them a representation that could not tell
   two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
   true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
   a separate assertion that the good things exist. **That reaches any probe you TYPE — a `grep`, a `find`, a
   `gh api --jq`, a throwaway script — which is where it is skipped**: ask it for something it must find before
-  believing what it did not find, and read its exit status (`grep -c -i -F` aborting at **134**, no stdout, read
-  as three dropped hunks in a merge just declared clean). Where the answer cannot be determined, report that as
+  believing what it did not find, and read its exit status — and note **134** is not `2`, so anything neither `0`
+  nor `1` is the instrument failing (`grep -c -i -F` aborted, no stdout, and read as dropped hunks in a merge
+  just declared clean). Where the answer cannot be determined, report that as
   its own outcome rather than the nearest neighbour.
+- **A state-collapsing bug is likeliest in the tool whose JOB is that state distinction** — a watcher that
+  exited on any red without asking whether it was a REQUIRED context, a checker that folded SKIPPED then
+  CANCELLED into `fail`. Its author is thinking about the subject's states, not the instrument's. And the repair
+  is not "stop exiting": it must report the unrequired red by name AND KEEP WATCHING, or it looks identical to
+  the broken one on every green run. **The repair for one collapse is the prime site for the next, and the
+  location is the `*)` arm** — splitting `pending` out of `fail` left a default that swallowed `cancelled` and
+  invented a red. Enumeration does not save you there; you enumerate the states you are thinking about. **A
+  `case` with a `*)` is an unguarded table** — the `EnumTable`/`RowsInEnumeratorOrder` argument, never yet made
+  for a shell script. And a verdict computed from a SUMMARY while the evidence sits in the same output is its own
+  defect, more durable because the output looks thorough.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - Its converse: an absence must not be counted as an event. `NoUpstream`'s honest
@@ -1242,8 +1253,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
-- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening each found a test that
-  could not fail for the reason it existed — five shapes, all green, three of them acceptance criteria written by
+- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found FIVE tests that
+  could not fail for the reason they existed — five shapes, all green, three of them acceptance criteria written by
   whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
   as coverage forever: `REQUIRE(held)` on a bind whose failure returns a non-null pointer in an ERRORED state, and
   a refusal test pinning a flag BOTH the old and the new rule name. A refusal test asserts WHICH refusal. **Prove
