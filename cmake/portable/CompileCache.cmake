@@ -137,12 +137,14 @@ endfunction()
 # operator who typed the default. CMake can tell the two apart with
 # `DEFINED ENV{...}`; nothing but this predicate was in the way.
 #
-# The TOKEN is the second half and is easy to miss. The module notices an
-# environment change across configures by comparing what it last saw, and that
-# record held the VALUE alone -- so unset and set-empty were one state there too,
-# and honouring presence here while comparing values there would leave the
-# retarget unable to see somebody exporting an empty opt-out over a default. The
-# token carries presence and value together.
+# **The resolved address is the whole answer, and the change-detection record
+# stores IT rather than a second encoding of the environment.** The record exists
+# so a reconfigure notices the environment moving; what it has to notice is the
+# address moving, and unset and set-empty already resolve to different addresses
+# -- `127.0.0.1:6674` against the empty opt-out. A separate presence-carrying
+# token would additionally separate *absent* from *explicitly set to the default*,
+# which differ in no way this module acts on: the retarget would fire, recompute
+# the same address, and print a line saying it had changed nothing.
 #
 # Pure: it reads no environment and touches no cache, so
 # `check-fastcache-addr-opt-out.cmake` can drive the case a developer cannot
@@ -151,8 +153,7 @@ endfunction()
 # @param present  TRUE when the environment defines the name at all.
 # @param value    Its value; meaningful only when @p present.
 # @param outWanted  The address this module wants; empty means opt out.
-# @param outToken   An exact record of what the environment presented.
-function(_fc_resolve_addr present value outWanted outToken)
+function(_fc_resolve_addr present value outWanted)
     if(present)
         # Whatever they set, empty INCLUDED. An empty one reaches
         # `if(NOT FASTCACHE_ADDR)` below and opts out by name.
@@ -163,18 +164,9 @@ function(_fc_resolve_addr present value outWanted outToken)
         # --listen-cache defaults to the same address for exactly this reason.
         set(${outWanted} "127.0.0.1:6674" PARENT_SCOPE)
     endif()
-
-    # Presence FIRST and a separator that cannot occur in a boolean, so no value
-    # can forge another presence state: "1:" (set to empty) and "0:" (unset) are
-    # different strings, which is the whole point.
-    if(present)
-        set(${outToken} "1:${value}" PARENT_SCOPE)
-    else()
-        set(${outToken} "0:" PARENT_SCOPE)
-    endif()
 endfunction()
 
-# Does a fastcache-cc rejection PREDICT the hazard the chosen launcher carries?
+# Does a launcher's REJECTION predict the hazard the winning launcher carries?
 #
 # **Two facts this file already prints, eighty lines apart, neither mentioning the
 # other** (#658). A `fastcache-cc` row rejected for a WIRE VERSION mismatch reports
@@ -190,47 +182,50 @@ endfunction()
 # produce a wrong object. Observed on a real machine with a service 591 commits
 # behind master answering on the port.
 #
-# Narrow on purpose, all three clauses:
-#   * the rejection is a VERSION mismatch, not "not installed" or "no answer" --
-#     those predict nothing and keep `STATUS`;
-#   * the winner is sccache, not ccache and not nothing;
-#   * that sccache carries its caveat, which is already gated on the MSVC family,
-#     so this inherits the same gate rather than testing the compiler again.
-#     Warning where the hazard cannot happen is how a warning becomes one people
-#     learn to skip, and that reasoning is already written out beside the caveat.
+# **Which reasons predict a hazard is a COLUMN of the candidate table, not a
+# condition in here.** The first version hardcoded `unsupported-version` and
+# `chosen STREQUAL "sccache"`, which is a special case layered on a file that is
+# otherwise strictly table-driven -- and the second clause was already implied by
+# the first guard below, so it could only ever matter by going SILENT if a caveat
+# ever moved to another row. A migration that quietly disables a warning while
+# nothing fails is this project's #447, and it is not worth re-earning.
+#
+# So the rule here is winner-agnostic: whoever won, if they carry a hazard and
+# somebody was rejected for a reason their own row says predicts it, say both in
+# one place.
 #
 # Not a refusal to configure: a stale daemon is a normal state during a rollout,
 # and refusing would be worse than caching through sccache.
 #
-# Pure, so `check-version-fallback-warning.cmake` can drive the combinations --
-# staging a genuinely version-mismatched daemon at configure time is not something
-# a test can arrange.
-#
-# @param ccReason   why the fastcache-cc row was rejected; empty when it was not.
-# @param chosen     the launcher id that won, empty when none did.
-# @param caveat     the chosen launcher's caveat, empty when it carries none.
-# @param addr       the daemon endpoint, for a message that names it.
+# @param reason     why the rejected row was rejected; empty when nothing was.
+# @param predicts   that row's `predicts` pattern; empty when it predicts nothing.
+# @param rejected   a human label for the rejected launcher.
+# @param winner     a human label for the launcher that won; empty when none did.
+# @param caveat     the winner's caveat; empty when it carries none.
+# @param detail     what to say about fixing the rejected one.
 # @param outVar     the warning text, or empty when this is not that situation.
-function(_fc_cache_version_fallback_warning ccReason chosen caveat addr outVar)
+function(_fc_cache_predicted_hazard reason predicts rejected winner caveat detail outVar)
     set(${outVar} "" PARENT_SCOPE)
 
-    # `unsupported-version` is the launcher's own spelling, from the wire error
-    # table (`CompileCacheWire.hpp`). Matched rather than compared, because the
-    # launcher wraps it in a lead-in this module already strips loosely.
-    if(NOT ccReason MATCHES "unsupported-version")
+    # Nothing rejected, or this row's rejection predicts nothing.
+    if(reason STREQUAL "" OR predicts STREQUAL "")
         return()
     endif()
-    if(NOT chosen STREQUAL "sccache")
+    if(NOT reason MATCHES "${predicts}")
         return()
     endif()
-    if(caveat STREQUAL "")
+
+    # "The winner carries a hazard" is the caveat being non-empty, and that is the
+    # WHOLE of it -- naming a launcher here would be a second copy of the identity
+    # the caveat already implies.
+    if(winner STREQUAL "" OR caveat STREQUAL "")
         return()
     endif()
 
     set(${outVar}
-"[cache] fastcache-cc was refused by the daemon at ${addr} for a WIRE VERSION mismatch, and this build has fallen through to sccache -- which carries the correctness hazard warned about below.
+"[cache] ${rejected} was refused, and this build has fallen through to ${winner} -- which carries the correctness hazard warned about below.
 
-A daemon IS running there and it is one you installed; it is simply out of step with this fastcache-cc. Rebuild or reinstall whichever is older and the safe launcher comes back. This is a normal state during a rollout, which is why it is a warning and not a refusal to configure.
+${detail}
 
 It is called out here because THIS rejection reason predicts that hazard, where the others -- not installed, no answer, an uncacheable probe -- do not."
         PARENT_SCOPE)
@@ -290,12 +285,11 @@ endif()
 # `FASTCACHE_ADDR` in the environment, which is what the operator documentation
 # promises and what #372 made true here.
 # `DEFINED ENV{}` rather than an emptiness test: see `_fc_resolve_addr`, and #372.
+set(_fc_addr_env_present FALSE)
 if(DEFINED ENV{FASTCACHE_ADDR})
     set(_fc_addr_env_present TRUE)
-else()
-    set(_fc_addr_env_present FALSE)
 endif()
-_fc_resolve_addr("${_fc_addr_env_present}" "$ENV{FASTCACHE_ADDR}" _fc_addr_wanted _fc_addr_env_token)
+_fc_resolve_addr("${_fc_addr_env_present}" "$ENV{FASTCACHE_ADDR}" _fc_addr_wanted)
 
 # Ordinary cache semantics would freeze the address at whatever the first
 # configure saw, so exporting FASTCACHE_ADDR to reach a remote daemon would do
@@ -311,21 +305,22 @@ if(NOT DEFINED CACHE{FASTCACHE_ADDR})
     set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
         "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)")
 elseif(DEFINED CACHE{_FASTCACHE_ADDR_APPLIED}
-       AND NOT _fc_addr_env_token STREQUAL "${_FASTCACHE_ADDR_ENV_SEEN}"
+       AND NOT _fc_addr_wanted STREQUAL "${_FASTCACHE_ADDR_ENV_SEEN}"
        AND FASTCACHE_ADDR STREQUAL "${_FASTCACHE_ADDR_APPLIED}")
     message(STATUS "[cache] FASTCACHE_ADDR changed in the environment; retargeting to ${_fc_addr_wanted}")
     set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
         "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)"
         FORCE)
 endif()
-# The token, not the bare value: unset and set-to-empty must not record as one
-# state, or the retarget cannot see an opt-out exported over a default. An
-# existing build tree holds a pre-#372 record in the old format, so its first
-# reconfigure reads as a change and recomputes -- which lands on the same address
-# unless the environment now genuinely says otherwise, and is how a tree that was
-# silently ignoring an opt-out starts honouring it.
-set(_FASTCACHE_ADDR_ENV_SEEN "${_fc_addr_env_token}" CACHE INTERNAL
-    "FASTCACHE_ADDR as the environment last presented it -- presence and value, to notice a change on reconfigure")
+# The RESOLVED address, not the raw environment value: unset and set-to-empty
+# resolve differently (the default against the empty opt-out), which is exactly the
+# distinction the record has to keep, and storing the resolution keeps one encoding
+# of it rather than two. An existing build tree holds a pre-#372 record in the old
+# format, so its first reconfigure reads as a change and recomputes -- which lands
+# on the same address unless the environment now genuinely says otherwise, and is
+# how a tree that was silently ignoring an opt-out starts honouring it.
+set(_FASTCACHE_ADDR_ENV_SEEN "${_fc_addr_wanted}" CACHE INTERNAL
+    "the address FASTCACHE_ADDR last resolved to, to notice a change on reconfigure")
 set(_FASTCACHE_ADDR_APPLIED "${FASTCACHE_ADDR}" CACHE INTERNAL
     "the address this module last applied, to tell its own value from one set externally")
 
@@ -1217,7 +1212,13 @@ endfunction()
 #   _fc_cache_<id>_detail    extra words for the status message (empty for none)
 #   _fc_cache_<id>_caveat    a correctness hazard this launcher carries, warned
 #                            about when it is the row that WINS (empty for none)
-# Supporting a fourth launcher is adding an id here plus its seven variables.
+#   _fc_cache_<id>_predicts  a regex over THIS row's rejection reason; when it
+#                            matches and the winner carries a caveat, the two are
+#                            reported together (empty when no reason predicts
+#                            anything) -- see `_fc_cache_predicted_hazard` (#658)
+#   _fc_cache_<id>_predicts_detail  what to tell the operator about fixing this
+#                            row, printed with that warning
+# Supporting a fourth launcher is adding an id here plus its nine variables.
 set(_fc_cache_candidates fastcache_cc sccache ccache)
 
 # Render "<label>[ <detail>]" for a row, so a launcher and where it points are
@@ -1238,6 +1239,17 @@ set(_fc_cache_fastcache_cc_program "${FASTCACHE_CC}")
 set(_fc_cache_fastcache_cc_requires "${FASTCACHE_ADDR}")
 set(_fc_cache_fastcache_cc_env ${_fc_fastcache_env})
 set(_fc_cache_fastcache_cc_check _fc_probe_fastcache_cc)
+# A WIRE VERSION mismatch, and only that. "not installed", "no answer" and "the
+# probe was uncacheable" predict nothing about the replacement, and warning on
+# them is how a warning becomes one people learn to skip.
+#
+# `unsupported-version` is the launcher's own spelling, from the wire error table
+# in `Protocol/CompileCacheWire.hpp`. Nothing connects the two, so a rename there
+# disarms this silently -- narrower than the display-sentence parsing it replaced,
+# and recorded rather than hidden.
+set(_fc_cache_fastcache_cc_predicts "unsupported-version")
+set(_fc_cache_fastcache_cc_predicts_detail
+    "A daemon IS running at ${FASTCACHE_ADDR} and it is one you installed; it is simply out of step with this fastcache-cc. Rebuild or reinstall whichever is older and the safe launcher comes back. This is a normal state during a rollout, which is why it is a warning and not a refusal to configure.")
 set(_fc_cache_fastcache_cc_detail "at ${FASTCACHE_ADDR}")
 set(_fc_cache_fastcache_cc_caveat "")
 
@@ -1246,6 +1258,8 @@ set(_fc_cache_sccache_program "${SCCACHE}")
 set(_fc_cache_sccache_requires ON)
 set(_fc_cache_sccache_env "")
 set(_fc_cache_sccache_check "")
+set(_fc_cache_sccache_predicts "")
+set(_fc_cache_sccache_predicts_detail "")
 set(_fc_cache_sccache_detail "")
 # Not a `check`, because the row stays usable: this is a hazard a developer has to
 # be able to weigh, not a condition this module can evaluate. Nothing here can
@@ -1291,6 +1305,8 @@ set(_fc_cache_ccache_program "${CCACHE}")
 set(_fc_cache_ccache_requires ON)
 set(_fc_cache_ccache_env "")
 set(_fc_cache_ccache_check "")
+set(_fc_cache_ccache_predicts "")
+set(_fc_cache_ccache_predicts_detail "")
 set(_fc_cache_ccache_detail "")
 # ccache's default `base_dir` is empty, which is documented to mean it does not
 # rewrite absolute paths and so does not share entries between checkouts -- the
@@ -1361,17 +1377,27 @@ if(_fc_cache_chosen)
     # BEFORE the caveat, and that ordering is the whole point: this line says why
     # the safe launcher is not being used, and the caveat immediately under it says
     # what the replacement costs. Two messages eighty lines apart were the defect.
-    if(DEFINED _fc_cache_fastcache_cc_rejected_why)
-        _fc_cache_version_fallback_warning(
-            "${_fc_cache_fastcache_cc_rejected_why}"
-            "${_fc_cache_chosen}"
-            "${_fc_cache_${_fc_cache_chosen}_caveat}"
-            "${FASTCACHE_ADDR}"
-            _fc_cache_version_warning)
-        if(_fc_cache_version_warning)
-            message(WARNING "${_fc_cache_version_warning}")
+    #
+    # Over the CANDIDATES rather than one named row, so a launcher that gains a
+    # `predicts` column is covered without editing this.
+    _fc_cache_describe("${_fc_cache_chosen}" _fc_cache_winner_desc)
+    foreach(_id IN LISTS _fc_cache_candidates)
+        if(NOT DEFINED _fc_cache_${_id}_rejected_why)
+            continue()
         endif()
-    endif()
+        _fc_cache_describe("${_id}" _fc_cache_rejected_desc)
+        _fc_cache_predicted_hazard(
+            "${_fc_cache_${_id}_rejected_why}"
+            "${_fc_cache_${_id}_predicts}"
+            "${_fc_cache_rejected_desc}"
+            "${_fc_cache_winner_desc}"
+            "${_fc_cache_${_fc_cache_chosen}_caveat}"
+            "${_fc_cache_${_id}_predicts_detail}"
+            _fc_cache_predicted_warning)
+        if(_fc_cache_predicted_warning)
+            message(WARNING "${_fc_cache_predicted_warning}")
+        endif()
+    endforeach()
 
     if(_fc_cache_${_fc_cache_chosen}_caveat)
         message(WARNING "[cache] ${_fc_cache_${_fc_cache_chosen}_caveat}")

@@ -49,46 +49,82 @@ if(NOT COMMAND _fc_resolve_addr)
         "renamed and this check now proves nothing.")
 endif()
 
+# Split a '|'-separated row into named fields.
+#
+# The house splitter, copied byte-for-byte rather than re-derived. It never builds
+# a CMake list, so a field containing ';', '\', '[' or ']' is harmless -- the
+# bracket-vulnerable-reader hazard the rulebook records -- and it carries the
+# malformed-row refusal itself, so a caller needs no field-count guard of its own.
+# The LAST field may contain '|', which is what lets a row end in prose.
+#
+# The row LIST is a separate hazard and this cannot help with it: `set(rows "a;b")`
+# splits at the list level before this is ever called. Keep ';' out of row text.
+#
+# Consolidating the copies is
+# [#495](https://github.com/LASTRADA-Software/fastcached/issues/495), deliberately
+# not pre-empted here. Keep this byte-for-byte with its siblings and count this
+# file in when #495 lands.
+#
+# @param row The '|'-separated row.
+# @param ARGN Output variable names, in field order.
+function(fastcached_row_fields row)
+    list(LENGTH ARGN fieldCount)
+    math(EXPR lastField "${fieldCount} - 1")
+    set(rest "${row}")
+    foreach(field RANGE 0 ${lastField})
+        list(GET ARGN ${field} outVar)
+        if(field EQUAL lastField)
+            set(value "${rest}")
+        else()
+            string(FIND "${rest}" "|" separator)
+            if(separator EQUAL -1)
+                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
+            endif()
+            string(SUBSTRING "${rest}" 0 ${separator} value)
+            math(EXPR restStart "${separator} + 1")
+            string(SUBSTRING "${rest}" ${restStart} -1 rest)
+        endif()
+        set(${outVar} "${value}" PARENT_SCOPE)
+    endforeach()
+endfunction()
+
 # ---------------------------------------------------------------------------
-# present | value | expected wanted | expected token
+# present | value | expected address | what this row is about
 #
 # The first two rows are the whole ticket: identical values, opposite answers,
-# told apart by presence alone.
+# told apart by presence alone. `_positives` and `_negatives` are tallied below
+# so a table that lost either of them cannot pass by having nothing to disagree.
 set(_rows
-    "OFF||127.0.0.1:6674|0:"
-    "ON|||1:"
-    "ON|10.0.0.5:6674|10.0.0.5:6674|1:10.0.0.5:6674"
-    "OFF|ignored-when-absent|127.0.0.1:6674|0:"
-    "ON|127.0.0.1:6674|127.0.0.1:6674|1:127.0.0.1:6674"
+    "OFF||127.0.0.1:6674|absent: the compiled-in default"
+    "ON|||set but EMPTY: the documented opt-out, and the whole ticket"
+    "ON|10.0.0.5:6674|10.0.0.5:6674|set to an address: taken verbatim"
+    "OFF|ignored-when-absent|127.0.0.1:6674|a value is meaningless when the name is absent"
+    "ON|127.0.0.1:6674|127.0.0.1:6674|set to the DEFAULT: a pin, and indistinguishable by value alone"
 )
 
 set(_failures 0)
 set(_checked 0)
+set(_optOuts 0)
+set(_defaults 0)
 foreach(_row IN LISTS _rows)
-    string(REPLACE "|" ";" _fields "${_row}")
-    list(LENGTH _fields _fieldCount)
-    if(NOT _fieldCount EQUAL 4)
-        message(FATAL_ERROR
-            "check-fastcache-addr-opt-out: row '${_row}' has ${_fieldCount} fields, expected 4. "
-            "A malformed row would otherwise read off the end and assert against an empty string.")
-    endif()
-    list(GET _fields 0 _present)
-    list(GET _fields 1 _value)
-    list(GET _fields 2 _expectWanted)
-    list(GET _fields 3 _expectToken)
+    fastcached_row_fields("${_row}" _present _value _expectWanted _about)
 
-    _fc_resolve_addr("${_present}" "${_value}" _gotWanted _gotToken)
+    _fc_resolve_addr("${_present}" "${_value}" _gotWanted)
     math(EXPR _checked "${_checked} + 1")
 
     if(NOT _gotWanted STREQUAL "${_expectWanted}")
         message(WARNING
-            "present=${_present} value='${_value}': wanted '${_gotWanted}', expected '${_expectWanted}'")
+            "present=${_present} value='${_value}': resolved '${_gotWanted}', expected '${_expectWanted}' -- ${_about}")
         math(EXPR _failures "${_failures} + 1")
     endif()
-    if(NOT _gotToken STREQUAL "${_expectToken}")
-        message(WARNING
-            "present=${_present} value='${_value}': token '${_gotToken}', expected '${_expectToken}'")
-        math(EXPR _failures "${_failures} + 1")
+
+    # Tallied here rather than re-derived after the loop: a post-loop pair that
+    # calls the function again with the same arguments restates two rows and
+    # asserts less than they do.
+    if(_expectWanted STREQUAL "")
+        math(EXPR _optOuts "${_optOuts} + 1")
+    else()
+        math(EXPR _defaults "${_defaults} + 1")
     endif()
 endforeach()
 
@@ -101,20 +137,13 @@ if(_checked EQUAL 0)
         "rather than passing.")
 endif()
 
-# And the two rows the ticket is ABOUT must both be present, by construction:
-# a table that lost the presence pair would still run and still pass.
-_fc_resolve_addr(ON "" _emptySet _emptySetToken)
-_fc_resolve_addr(OFF "" _absent _absentToken)
-if(_emptySet STREQUAL "${_absent}")
+# Both outcomes must be exercised. A table that lost every opt-out row would pass
+# a check that only ever sees the default, and one that lost every default row
+# would pass even more quietly -- neither is visible in a failure count.
+if(_optOuts EQUAL 0 OR _defaults EQUAL 0)
     message(FATAL_ERROR
-        "check-fastcache-addr-opt-out: a set-but-empty FASTCACHE_ADDR resolves to '${_emptySet}', "
-        "the same as an unset one. That is #372: the documented opt-out is folded into the default, "
-        "so `export FASTCACHE_ADDR=` keeps caching.")
-endif()
-if(_emptySetToken STREQUAL "${_absentToken}")
-    message(FATAL_ERROR
-        "check-fastcache-addr-opt-out: set-but-empty and unset record the same token "
-        "('${_emptySetToken}'), so a reconfigure cannot see an opt-out exported over a default.")
+        "check-fastcache-addr-opt-out: ${_optOuts} opt-out row(s) and ${_defaults} default row(s); "
+        "one outcome is unexercised, so the other is passing without anything to disagree with it.")
 endif()
 
 if(NOT _failures EQUAL 0)

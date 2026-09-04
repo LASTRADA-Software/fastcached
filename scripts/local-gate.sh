@@ -174,12 +174,33 @@ leg_summary() {
 # ordinary build in the tree uncached, permanently, in the repository whose
 # product is a compile cache.
 #
-# Hidden, because they are not something to run by hand: `--preset gate-clang-debug`
-# would build the gate's tree and report nothing.
+# NOT hidden, and they cannot be: `"hidden": true` makes `--preset` refuse a preset
+# outright, and this script selects them by name. They are undocumented rather than
+# hidden -- their displayName says whose directory they are and whose they are not,
+# which is the most a visible preset can do.
 gate_presets=(
     "gate-clang-debug|tidy"
     "gate-gcc-release|no-tidy"
 )
+
+# Every row must name a GATE-OWNED preset, checked rather than trusted. Reverting
+# the two rows above fails the self-test, which compares literals -- but ADDING a
+# third row naming an ordinary preset reopens #487 in full and passes every check
+# in this file. That is the direction a literal comparison is blind to: exact about
+# what it knows, silent about what arrives.
+for _gate_row in "${gate_presets[@]}"; do
+    case "${_gate_row%%|*}" in
+        gate-*) ;;
+        *)
+            echo "GATE BUG: gate_presets row '${_gate_row}' does not name a gate-owned preset." >&2
+            echo "  The gate must not configure a directory a developer builds in: a reference" >&2
+            echo "  build turns the compiler cache off, and that setting is permanent for the" >&2
+            echo "  directory. See issue #487." >&2
+            exit 1
+            ;;
+    esac
+done
+unset _gate_row
 
 # What each leg has done so far, by index into the table above. Declared empty and
 # never pre-filled: `leg_pairs` reads an absent entry as `not-run`, which is the
@@ -877,7 +898,7 @@ run_preset() {
             fail "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
             ;;
         *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
             ;;
     esac
 
