@@ -7,16 +7,30 @@
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <memory>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <vector>
+
+#include <tests/Unwrap.hpp>
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
           "[server][reactor-loop][tls-null-guard]")
@@ -265,4 +279,416 @@ TEST_CASE("ReactorServerOptions defaults the expiry cycle on", "[server][reactor
     CHECK(options.expiry.interval > FastCache::Duration::zero());
     CHECK(options.expiry.scanBudget != 0U);
     CHECK(options.expiry.purgeBudget != 0U);
+}
+
+namespace
+{
+
+/// The literal `bench/runner.py` and the packaged-service CI step both grep for.
+///
+/// Neither can be recompiled from this repository's build, so #646 made the line
+/// name a STRONGER fact without touching its wording. Pinned by its bytes here for
+/// the reason a wire constant is: a symbol both ends spell can only test the name.
+constexpr std::string_view ReadyMarker = "ready, accepting connections";
+
+/// Text every per-acceptor Debug record carries.
+constexpr std::string_view ArmedMarker = "acceptor armed";
+
+/// A free loopback TCP port, found by binding one and letting it go.
+///
+/// Only the multi-reactor case needs it: every reactor there binds the SAME
+/// `{address, port}` under `SO_REUSEPORT`, so port `0` would hand each of them a
+/// different port and the case would stop being about one shared endpoint.
+/// @return A port nothing held a moment ago.
+[[nodiscard]] std::uint16_t FreeLoopbackPort()
+{
+    auto probe = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+    return port;
+}
+
+/// The `(armed/expected)` progress an `acceptor armed` record carries.
+struct ArmProgress
+{
+    std::size_t armed { 0 };    ///< How many had armed when this line was written.
+    std::size_t expected { 0 }; ///< How many were registered to arm.
+};
+
+/// Read the trailing `(n/m)` off an `acceptor armed` record.
+///
+/// The point is to take the participant count FROM THE RUNNING PROCESS rather than
+/// restate it here. How many participants a startup has is platform-specific -- on
+/// POSIX the multi-reactor path arms one accept loop per (reactor, bind) pair, and
+/// on Windows it arms one per acceptor THREAD plus one per IOCP reactor, because
+/// there a handed-off connection is served by the reactor rather than by the
+/// acceptor. A test that hard-codes either number is a second place the arithmetic
+/// lives, and it was wrong: `armed.size() == 2` passed on Linux and failed on all
+/// three Windows legs with `3 == 2`, which is exactly the defect the production
+/// change had just been reworked to remove.
+/// @param message An `acceptor armed: X (n/m)` log message.
+/// @return The pair, or nullopt when the message does not carry one.
+[[nodiscard]] std::optional<ArmProgress> ArmProgressOf(std::string_view message)
+{
+    auto const open = message.rfind('(');
+    auto const slash = message.rfind('/');
+    auto const close = message.rfind(')');
+    if (open == std::string_view::npos || slash == std::string_view::npos || close == std::string_view::npos)
+        return std::nullopt;
+    if (!(open < slash && slash < close))
+        return std::nullopt;
+
+    ArmProgress progress;
+    auto const armed = message.substr(open + 1, slash - open - 1);
+    auto const expected = message.substr(slash + 1, close - slash - 1);
+    if (std::from_chars(armed.data(), armed.data() + armed.size(), progress.armed).ec != std::errc {})
+        return std::nullopt;
+    if (std::from_chars(expected.data(), expected.data() + expected.size(), progress.expected).ec != std::errc {})
+        return std::nullopt;
+    return progress;
+}
+
+/// Everything one end-to-end run of `RunReactorServer` observed.
+struct ServerRun
+{
+    std::vector<FastCache::CapturingLogger::Record> log; ///< Every record, in order.
+    std::chrono::milliseconds waited { 0 };              ///< Measured cost of the readiness wait.
+    int exitCode { EXIT_FAILURE };                       ///< What the loop returned.
+    bool sawReady { false };                             ///< Whether the readiness line ever arrived.
+};
+
+/// Positions of the records whose message contains `needle`.
+/// @param records Records in the order they were logged.
+/// @param needle Substring to look for.
+/// @return Ascending indices.
+[[nodiscard]] std::vector<std::size_t> IndicesContaining(std::vector<FastCache::CapturingLogger::Record> const& records,
+                                                         std::string_view needle)
+{
+    std::vector<std::size_t> found;
+    for (auto const index: std::views::iota(std::size_t { 0 }, records.size()))
+        if (records[index].message.contains(needle))
+            found.push_back(index);
+    return found;
+}
+
+/// Assert that the readiness line came after every acceptor armed, and that the
+/// set of acceptors was complete when it did.
+///
+/// Non-emptiness is asserted as well as the ordering, because an ordering over an
+/// empty set of arms holds vacuously -- which is what these cases would degenerate
+/// into if the arms stopped being logged. The SIZE is then checked against what the
+/// announcer reported rather than against a literal, so the property is "every
+/// participant that registered has armed" on any platform.
+/// @param log The run's records, in order.
+/// @return Nothing; fails the active case on violation.
+void CheckArmedBeforeReady(std::vector<FastCache::CapturingLogger::Record> const& log)
+{
+    auto const ready = IndicesContaining(log, ReadyMarker);
+    auto const armed = IndicesContaining(log, ArmedMarker);
+
+    REQUIRE(ready.size() == 1);
+    REQUIRE_FALSE(armed.empty());
+    // The property #646 is about.
+    CHECK(armed.back() < ready.front());
+
+    // And the set was closed and fully armed, taken from the announcer's own last
+    // progress line rather than from a count restated here.
+    auto const progress = ArmProgressOf(log[armed.back()].message);
+    REQUIRE(progress.has_value());
+    auto const& last = FastCache::Testing::Unwrap(progress);
+    CHECK(last.expected != 0);
+    CHECK(last.armed == last.expected);
+    CHECK(armed.size() == last.expected);
+}
+
+/// Run `RunReactorServer` on a background thread until it announces readiness,
+/// then stop it and hand back everything it logged.
+///
+/// The wait is bounded and reports the elapsed it MEASURED rather than the one it
+/// asked for, and the two failure shapes are kept apart: a run that never announced
+/// comes back with `sawReady == false` and its whole log, so a case can say which of
+/// "never got there" and "got there and said the wrong thing" happened.
+/// @param options Server options; `binds` must be reachable on this host.
+/// @param bound How long to wait for the readiness line.
+/// @return The run's exit code, its records and what the wait cost.
+[[nodiscard]] ServerRun RunUntilReady(FastCache::ReactorServerOptions const& options,
+                                      std::chrono::milliseconds bound = std::chrono::milliseconds { 15000 })
+{
+    using namespace std::chrono_literals;
+
+    // Process-wide, and reset rather than assumed clean: `catch_discover_tests`
+    // gives every case its own process, but a case that ran a server before this
+    // one would leave the flag set and this run would stop before arming.
+    FastCache::DaemonControls::Instance().Reset();
+
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+
+    ServerRun run;
+    std::thread server { [&] { run.exitCode = FastCache::RunReactorServer(options, engine, logger); } };
+
+    auto const startedAt = std::chrono::steady_clock::now();
+    auto elapsed = [startedAt] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+    };
+    while (elapsed() < bound)
+    {
+        if (!IndicesContaining(logger.Snapshot(), ReadyMarker).empty())
+        {
+            run.sawReady = true;
+            break;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    run.waited = elapsed();
+
+    FastCache::DaemonControls::Instance().RequestStop();
+    server.join();
+    run.log = logger.Snapshot();
+    FastCache::DaemonControls::Instance().Reset();
+    return run;
+}
+
+} // namespace
+
+TEST_CASE("RunReactorServer announces readiness only after every accept loop is armed", "[server][reactor-loop][readiness]")
+{
+    // #646, end to end and through the production entry point. The daemon used to
+    // log this line above the loop that starts the acceptors, so an assertion placed
+    // after it had been given something WEAKER than the bind -- and passed anyway,
+    // because the listen backlog covers the window. That is why the property under
+    // test is an ORDERING in the log rather than a successful connection: a
+    // connection succeeds under the bug too.
+    //
+    // Two binds on one reactor, each at port 0 so the OS picks and nothing in this
+    // suite can collide with them.
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 0, .tls = false });
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 0, .tls = false });
+    options.reactorThreads = 1;
+
+    auto const run = RunUntilReady(options);
+    INFO("waited " << run.waited.count() << "ms for the readiness line");
+    REQUIRE(run.sawReady);
+    CHECK(run.exitCode == EXIT_SUCCESS);
+
+    CheckArmedBeforeReady(run.log);
+
+    auto const ready = IndicesContaining(run.log, ReadyMarker);
+    CHECK(run.log[ready.front()].level == FastCache::LogLevel::Info);
+    // The single-reactor path arms one accept loop per bind on every platform, so
+    // this figure is the same everywhere and is the endpoint summary rather than a
+    // participant count.
+    CHECK(run.log[ready.front()].message.contains("2 bind(s)"));
+}
+
+TEST_CASE("RunReactorServer waits for every reactor's accept loops before announcing readiness",
+          "[server][reactor-loop][readiness]")
+{
+    // The multi-reactor path is where the pre-fix line was weakest: it was logged
+    // before a single reactor thread had been CREATED. Two reactors sharing one
+    // endpoint under SO_REUSEPORT, so the readiness line has to wait for both.
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = FreeLoopbackPort(), .tls = false });
+    options.reactorThreads = 2;
+
+    auto const run = RunUntilReady(options);
+    INFO("waited " << run.waited.count() << "ms for the readiness line");
+    REQUIRE(run.sawReady);
+    CHECK(run.exitCode == EXIT_SUCCESS);
+
+    CheckArmedBeforeReady(run.log);
+
+    // The endpoint summary, which is what the operator reads. How many PARTICIPANTS
+    // that took is platform-specific and is asserted against the announcer's own
+    // figure inside the helper above, never against a literal here.
+    auto const ready = IndicesContaining(run.log, ReadyMarker);
+    CHECK(run.log[ready.front()].message.contains("1 bind(s) x 2 reactors"));
+}
+
+TEST_CASE("The daemon's readiness marker keeps the exact bytes its out-of-tree waiters grep for",
+          "[server][reactor-loop][readiness]")
+{
+    // `bench/runner.py`'s READY_MARKER and `.github/workflows/build.yml`'s packaged-
+    // service step both match this substring and neither is rebuilt from this tree,
+    // so a reword here breaks two waiters silently -- one of them a CI step that
+    // would then report a missing startup banner for a daemon that started fine.
+    //
+    // #646 deliberately changed what the line MEANS while leaving what it SAYS
+    // alone, which is only safe as long as somebody is holding the bytes.
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 0, .tls = false });
+    options.reactorThreads = 1;
+
+    auto const run = RunUntilReady(options);
+    INFO("waited " << run.waited.count() << "ms for the readiness line");
+    REQUIRE(run.sawReady);
+
+    auto const ready = IndicesContaining(run.log, ReadyMarker);
+    REQUIRE(ready.size() == 1);
+    CHECK(run.log[ready.front()].message.starts_with("ready, accepting connections ("));
+}
+
+TEST_CASE("RunReactorServer reports a bind it cannot make at Error and refuses to start",
+          "[server][reactor-loop][bind-verdict]")
+{
+    // The FATAL half of #603's distinction, asserted so that "a tolerated bind
+    // failure is a Warn" cannot be applied to the sites where it would be wrong.
+    // These listener paths do NOT continue -- they return EXIT_FAILURE -- so Error
+    // is the level that matches the verdict, and the daemon's admin endpoint (which
+    // does continue) is the one that must not share it. See
+    // `DescribeToleratedAdminBindFailure`.
+    //
+    // Provoked with RFC 5737 `192.0.2.1`, an address no host holds: it is refused on
+    // every platform and needs no second listener kept alive, which is the technique
+    // `AdminHttpServer_test` already uses for the same reason.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger;
+
+    FastCache::ReactorServerOptions options;
+    options.binds.push_back(FastCache::BindConfig { .address = "192.0.2.1", .port = 9, .tls = false });
+    options.reactorThreads = 1;
+
+    CHECK(FastCache::RunReactorServer(options, engine, logger) == EXIT_FAILURE);
+
+    auto const records = logger.Snapshot();
+    auto const failures = IndicesContaining(records, "cannot bind");
+    REQUIRE(failures.size() == 1);
+    CHECK(records[failures.front()].level == FastCache::LogLevel::Error);
+    // And nothing claimed readiness for a daemon that never served anything.
+    CHECK(IndicesContaining(records, ReadyMarker).empty());
+}
+
+TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed", "[server][reactor-loop][readiness]")
+{
+    // The guard inside the helper, shown refusing. This is the one branch of the
+    // readiness path the end-to-end cases above cannot reach: they bind real
+    // listeners, so every accept loop arms and the refusal never fires.
+    //
+    // A closed `InMemoryListener` answers `Accept()` with a ready error instead of
+    // parking, so `Server::Run()` returns before suspending and `IsAccepting()` is
+    // false by the time the call returns. That is exactly "started but not armed",
+    // and counting it would put an acceptor that does not exist into the readiness
+    // line -- #646 one level deeper.
+    //
+    // The POSITIVE direction is asserted by the two end-to-end cases above, which
+    // count one arm per bind against real listeners and pin the ordering. It is
+    // deliberately not asserted here as well: a `Server` over a LIVE
+    // `InMemoryListener` ends parked on `Accept()`, and unparking it walks into a
+    // dangling-handle defect in that fake which is unrelated to this change and
+    // lives outside this lane -- see the note on the pull request. Saying which
+    // direction is covered where is the point; a case that quietly covered one and
+    // read as covering both would be the worse outcome.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+
+    FastCache::InMemoryListener first;
+    FastCache::InMemoryListener second;
+    first.Close();
+    second.Close();
+
+    std::vector<std::unique_ptr<FastCache::Server>> servers;
+    servers.push_back(std::make_unique<FastCache::Server>(first, engine, logger));
+    servers.push_back(std::make_unique<FastCache::Server>(second, engine, logger));
+
+    FastCache::ReadinessAnnouncer announcer { logger, "2 bind(s)" };
+    announcer.ExpectAcceptor();
+    announcer.ExpectAcceptor();
+    announcer.AcceptorsAllSpawned();
+    FastCache::Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
+
+    CHECK_FALSE(servers[0]->IsAccepting());
+    CHECK_FALSE(servers[1]->IsAccepting());
+
+    // Nothing armed, so nothing is counted and -- the assertion that matters -- the
+    // daemon does NOT claim to be ready.
+    CHECK(announcer.ArmedCount() == 0);
+    CHECK_FALSE(announcer.Announced());
+
+    auto const records = logger.Snapshot();
+    CHECK(IndicesContaining(records, ReadyMarker).empty());
+    CHECK(IndicesContaining(records, ArmedMarker).empty());
+
+    // And each loop that did not arm is REPORTED, at Error, naming the endpoint
+    // that is not being served. Refusing to count without saying so would leave a
+    // daemon that never announces readiness and never explains why.
+    auto const refused = IndicesContaining(records, "did not arm");
+    REQUIRE(refused.size() == 2);
+    for (auto const index: refused)
+    {
+        CHECK(records[index].level == FastCache::LogLevel::Error);
+        CHECK(records[index].message.contains("not being served"));
+    }
+}
+
+TEST_CASE("The readiness ordering check holds for both platforms' participant shapes", "[server][reactor-loop][readiness]")
+{
+    // The two end-to-end cases above can only ever run this machine's shape, and the
+    // shapes genuinely differ: POSIX arms one accept loop per (reactor, bind) pair,
+    // Windows arms one per acceptor THREAD plus one per IOCP reactor. A count written
+    // into the test therefore passes on the platform it was written on and fails on
+    // the other -- which is not hypothetical, it is what happened: `armed.size() == 2`
+    // was green on Linux and failed all three Windows legs with `3 == 2`.
+    //
+    // So the DECISION is exercised against a synthesised record set for each shape,
+    // the way `node-scratch-isolation-e2e`'s verdict was split out from its
+    // acquisition. Nothing here starts a server; what is under test is that the
+    // ordering check is blind to how many participants a platform has.
+    auto record = [](FastCache::LogLevel level, std::string message) {
+        return FastCache::CapturingLogger::Record { .level = level, .message = std::move(message) };
+    };
+
+    SECTION("POSIX: one accept loop per (reactor, bind) pair")
+    {
+        // 2 reactors x 1 bind.
+        CheckArmedBeforeReady({
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 bind 0 (1/2)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 bind 0 (2/2)"),
+            record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
+        });
+    }
+
+    SECTION("Windows: one per acceptor thread plus one per IOCP reactor")
+    {
+        // 1 acceptor thread + 2 reactors = 3, which is the count that broke the
+        // literal. The reactors arm last here because their `Run()` is entered after
+        // the acceptor threads are spawned.
+        CheckArmedBeforeReady({
+            record(FastCache::LogLevel::Debug, "acceptor armed: acceptor thread 0 (1/3)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 (2/3)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 (3/3)"),
+            record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
+        });
+    }
+}
+
+TEST_CASE("ArmProgressOf reads the announcer's own figures and refuses what it cannot", "[server][reactor-loop][readiness]")
+{
+    // The helper the check above leans on. It must not answer a number for a line it
+    // did not understand: a silent `0/0` would make the completeness assertion pass
+    // vacuously, which is the failure mode of concluding from a parse nobody checked.
+    auto const good = ArmProgressOf("acceptor armed: reactor 0 bind 1 (2/8)");
+    REQUIRE(good.has_value());
+    CHECK(FastCache::Testing::Unwrap(good).armed == 2);
+    CHECK(FastCache::Testing::Unwrap(good).expected == 8);
+
+    // A participant name containing parentheses must not shift the reading: the
+    // progress is the LAST parenthesised group, and that is what `rfind` gives.
+    auto const awkward = ArmProgressOf("acceptor armed: reactor (odd) bind 0 (1/1)");
+    REQUIRE(awkward.has_value());
+    CHECK(FastCache::Testing::Unwrap(awkward).armed == 1);
+    CHECK(FastCache::Testing::Unwrap(awkward).expected == 1);
+
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0").has_value());
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (2)").has_value());
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (x/y)").has_value());
+    CHECK_FALSE(ArmProgressOf("ready, accepting connections (2 bind(s))").has_value());
 }

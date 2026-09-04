@@ -21,9 +21,17 @@ target_link_libraries(FastCacheTest
 
 # Absolute path to checked-in test fixtures (e.g. the throwaway TLS cert/key),
 # so tests can open them regardless of the working directory.
+#
+# FASTCACHED_SOURCE_DIR is the repository root, for the cases that check a document
+# against the code it describes -- `MetricsDocumentation_test` reads the daemon's
+# per-series table off `docs/operations/deployment.md`. The node's test binary has
+# carried the same definition since `DocumentedCommandLines_test` arrived; nothing
+# else connects prose to a table, and a build in which they describe different
+# products is a build in which everything passes.
 target_compile_definitions(FastCacheTest
     PRIVATE
         FASTCACHED_TESTDATA_DIR="${CMAKE_SOURCE_DIR}/testdata"
+        FASTCACHED_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
 # Catch.cmake (catch_discover_tests) is placed on CMAKE_MODULE_PATH by the

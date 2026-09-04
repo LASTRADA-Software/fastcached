@@ -139,6 +139,54 @@ struct AdminRoute
     AdminRouteMatch match { AdminRouteMatch::Exact };
 };
 
+/// One log record: the level an operator alerts on, and the sentence they read.
+///
+/// Returned as a pair rather than logged in place because the level is the thing
+/// under test. A severity spelled at a call site inside `main.cpp` is reachable
+/// from no test in this tree, which is how `fastcached` came to report a
+/// deliberately-tolerated condition at `Error` for as long as it did.
+struct AdminBindFailureReport
+{
+    LogLevel level;      ///< Severity that matches the verdict, not the syscall.
+    std::string message; ///< What the operator reads, including what happens next.
+};
+
+/// Describe an admin endpoint (`/metrics`, `/healthz`) the DAEMON could not bind.
+///
+/// ## The severity follows the verdict, and the verdicts differ
+///
+/// `fastcached` **tolerates** this: the admin surface is a scrape and probe
+/// convenience rather than the service, so the daemon serves the cache on without
+/// one, permanently and by design. `fastcache-compile-node` answers the same
+/// failure by refusing to start, and is right to -- an operator who asked a *worker*
+/// for an endpoint is almost always wiring a probe to it, so a worker that started
+/// without one looks healthy to the very thing that would have reported it was not.
+///
+/// The level is where that decision reaches an operator, and it was contradicting
+/// it ([#603](https://github.com/LASTRADA-Software/fastcached/issues/603)). `Error`
+/// is what a site pages on and what a log scraper counts, and it costs in both
+/// directions at once: a site that alerts on `Error` gets paged for a working
+/// daemon, and a site that has learned to ignore this particular `Error` has been
+/// trained to ignore the level. A condition the process decided to continue past,
+/// forever, on purpose, is a `Warn`.
+///
+/// **This is not the rule for every bind in the daemon.** `RunReactorServer`'s three
+/// listener failures keep `Error`, because those paths return `EXIT_FAILURE`: the
+/// process stops, so the severity and the verdict already agree. Skipped, absent and
+/// failed are different states, and the log level is one of the few places an
+/// operator can tell them apart.
+///
+/// The message says the daemon is continuing **without** the endpoint rather than
+/// only that a bind failed, so a reader does not have to infer whether the process
+/// survived.
+/// @param address Address that was asked for.
+/// @param port Port that was asked for.
+/// @param error What the bind reported, or a stand-in when there is no listener.
+/// @return The level and the sentence to log.
+[[nodiscard]] AdminBindFailureReport DescribeToleratedAdminBindFailure(std::string_view address,
+                                                                       std::uint16_t port,
+                                                                       std::string_view error);
+
 /// Tiny read-only HTTP/1.1 admin surface, served on a dedicated port so it
 /// never collides with the cache wire protocols (a leading `GET` would
 /// otherwise be misrouted to the memcached text autodetector). Built-in routes:
