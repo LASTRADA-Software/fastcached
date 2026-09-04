@@ -195,18 +195,34 @@ determinism rests on.
   pass the second for the wrong reason. **An injection is evidence only if the thing it is
   meant to hide is there to be hidden** — the STORE lane's *a green probe of the wrong
   shape is not a refutation*, met from the other direction.
+- **A census states its PATTERN, not only its number.** Two independent audits of the
+  same file set differed by exactly one, and neither party had miscounted — they had
+  counted through different patterns:
+
+  | pattern | cac9bda, all | cac9bda, excl. selftests | HEAD |
+  |---|---|---|---|
+  | `scripts/check-*.cmake` (the glob a ticket names) | **20** | **18** | **34** |
+  | `grep 'check-.*\.cmake$'` (unanchored) | 21 | 19 | 36 |
+
+  The whole difference is `scripts/script-check-canary.cmake` — and at HEAD also
+  `script-check-warning-canary.cmake` — because *"script-**check-**canary.cmake"*
+  contains `check-`. The unanchored form matches them; the glob does not. That is the
+  `pkill -f` lesson arriving in a `grep`, twice in two days: **a pattern is broader than
+  its author reads it as**, and a bare number carries no way to tell which pattern
+  produced it.
+
+  Worth recording that the second instance was a MANAGER quoting a corrected number back
+  to a developer — the correction was wrong for the same reason as the thing it was
+  correcting. Nobody is outside this; the remedy is that the pattern travels with the
+  figure, not that people count more carefully.
 - **"Only 4 of 16 defend" was wrong when it was written, and no slicing recovers it.**
-  #510's denominator matches nothing on its own cited ref: `cac9bda` holds **20**
-  `scripts/check-*.cmake`, **18** excluding selftests, and **13** that read file content.
-  Today there are **34**, none of them added by the branch that audited them. Two readings
-  disagreed by exactly one until the cause was found: an unanchored `grep 'check-.*\.cmake$'`
-  also matches `script-check-canary.cmake`, which the glob `scripts/check-*.cmake` does
-  not — the `pkill -f` lesson arriving in a `grep`, and the reason a census states its
-  pattern and not only its number. **A ticket cannot be closed against a count that no
-  longer describes the tree**, so the acceptance became a per-reader audit and the
-  consolidation stayed with [#495](https://github.com/LASTRADA-Software/fastcached/issues/495),
-  which is where `check-glob-traversals.cmake`'s own comment already sent it. Absorbing it
-  would have closed one ticket by silently swallowing another.
+  #510's denominator matches nothing on its own cited ref: not 20, not 18, and not the
+  **13** that read file content. Today there are 34, none added by the branch that
+  audited them. **A ticket cannot be closed against a count that no longer describes the
+  tree**, so the acceptance became a per-reader audit and the consolidation stayed with
+  [#495](https://github.com/LASTRADA-Software/fastcached/issues/495), which is where
+  `check-glob-traversals.cmake`'s own comment already sent it. Absorbing it would have
+  closed one ticket by silently swallowing another.
 - **A count asserted in prose is a claim nothing verifies.** Two comments went stale in
   one session, both because the thing they counted changed underneath them and nothing
   was watching. "This is the fourth copy of this idiom" was counting the SPLITTER when

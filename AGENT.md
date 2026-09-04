@@ -1165,11 +1165,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   changes at all — which is how #518 classified `net-boundary` as merely PARTIAL. Three arms, and the third is
   not decoration: violation alone, violation behind a bracket, bracket alone. Without the last, a check that
   refused every bracket would pass the middle one for the wrong reason.
-- **A count in a ticket decays like any other measurement.** #510's "only 4 of 16" matches nothing on its own
-  cited ref — 20 files, 18 non-selftest, 13 content-readers — and two audits disagreed by exactly one until the
-  cause was found: an unanchored `grep 'check-.*\.cmake$'` also matches `script-check-canary.cmake`, which the
-  glob `scripts/check-*.cmake` does not. The `pkill -f` lesson in a `grep`. **A census states its pattern, not
-  only its number**, and a ticket cannot be closed against a count that no longer describes the tree.
+- **A census states its PATTERN, not only its number.** Two independent audits of one file set differed by
+  exactly one and neither had miscounted: `scripts/check-*.cmake` (the glob a ticket names) gives 20 / 18 /
+  34 for cac9bda-all / cac9bda-excl-selftests / HEAD, while an unanchored `grep 'check-.*\.cmake$'` gives
+  21 / 19 / 36. The whole difference is `script-check-canary.cmake`, because *"script-**check-**canary.cmake"*
+  contains `check-`. The `pkill -f` lesson in a `grep`, twice in two days — **a pattern is broader than its
+  author reads it as** — and the second instance was a manager quoting a corrected number back, wrong for the
+  same reason as the thing it corrected. Nobody is outside this: the remedy is that the pattern travels with
+  the figure, not that people count more carefully. And **a ticket cannot be closed against a count that no
+  longer describes the tree** — #510's "only 4 of 16" matches none of 20, 18 or the 13 content-readers.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
