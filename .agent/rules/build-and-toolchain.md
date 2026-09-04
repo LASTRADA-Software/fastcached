@@ -2711,6 +2711,27 @@ been built on the first.
 
 ## Open work
 
+- **[#723](https://github.com/LASTRADA-Software/fastcached/issues/723)** — nothing
+  checks that a workflow's script invocation agrees with that script's file mode.
+  The complement of [#720](https://github.com/LASTRADA-Software/fastcached/issues/720)
+  rather than a duplicate of it, and the more durable of the two: #720 makes the
+  mode consistent so a documented bare invocation works, which is what a HUMAN
+  hits; #723 is that a call site names its interpreter regardless, which is what a
+  HARNESS hits silently. A `chmod` does not close it, because a moved file, a
+  `noexec` mount or a later-lost mode bit each make a call fail to START, and
+  inside a `want-fail` assertion every one of those is indistinguishable from the
+  rule firing. Both instances are in the section above.
+- **[#724](https://github.com/LASTRADA-Software/fastcached/issues/724)** — a `gh`
+  listing that came back AT its `--limit` is a real answer about a set that is not
+  the whole set, and nothing distinguishes it, so the cap reads as the total.
+  Measured twice: `gh project item-list` truncating silently produced two wrong
+  board figures reported onward (300 and 121-with-44-Todo against 356 and
+  147-with-52), both wrong in the smaller and therefore unsuspicious direction;
+  and `build.yml`'s clang-tidy notifier stops de-duplicating past 500 open issues,
+  at 161 today. `scripts/ci-report-issue.sh` is the only caller that currently
+  warns at the cap rather than vouching for a set it did not see. Raising a limit
+  moves the cliff and hides that there is one, which is the timeout argument from
+  the top of this file wearing a different number.
 - **[#717](https://github.com/LASTRADA-Software/fastcached/issues/717)** — the
   open-or-update-an-issue decision exists twice: `scripts/ci-report-issue.sh`,
   which `merge-group-report-selftest` drives against a stub `gh`, and the inline
