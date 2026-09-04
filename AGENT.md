@@ -146,6 +146,15 @@ distributes anything and goes green anyway.
 tripwires, not summaries: they are there so a rule fires even in a session that
 never opens the file, and none of them carries the reasoning that makes it stick.
 
+**So a rule landed in `.agent/rules/` without a bullet here fires in no session that
+does not open its file** — which is the population the rule was written for. #355
+shipped that way: a rule stating that a test asserting what both sides produce is no
+test, with no tripwire, so it would have applied to nobody who had not already gone
+looking for it. Caught by a review, not by the author. It is not one of the
+state-collapse instances the observability rules catalogue — nothing failed to tell
+two things apart. It is a rule that did not apply itself, and the reason it is easy
+is that writing the rule feels like the work.
+
 > Link these as plain markdown, never as an `@`-prefixed path. Claude Code resolves
 > `@` imports recursively out of `CLAUDE.md`, so `@`-importing a rule file would
 > pull every one of them back into every session and put the context cost straight
