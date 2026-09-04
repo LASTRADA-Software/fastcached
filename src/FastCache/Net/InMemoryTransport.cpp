@@ -83,6 +83,23 @@ void InMemorySocket::Close() noexcept
         _outbound->CloseWrite();
     if (_inbound)
         _inbound->SetProgressCallback(nullptr, nullptr);
+
+    // **A parked Read is retrieved here or it is never retrieved at all.** Clearing
+    // the progress callback above is what makes that final: nothing else can complete
+    // this awaitable, so the awaiting coroutine is never resumed and its frame is
+    // never freed. `EpollSocket::Close` has always done this; the fake every test's
+    // socket runs on did not, and a fake nothing exercises does not report its own
+    // bugs -- it went unseen because the in-memory `Read` only parks when the peer
+    // has neither written nor closed, which most fixtures avoid by construction.
+    //
+    // Detached FIRST and completed LAST, with no member touched afterwards, for the
+    // reason `EpollSocket::Close` records: completing resumes the awaiting coroutine,
+    // and a coroutine that OWNS this socket runs to its end and destroys it before
+    // `Complete` returns.
+    auto* const parked = std::exchange(_pendingRead, nullptr);
+    _pendingReadBuffer = {};
+    if (parked != nullptr)
+        parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
 }
 
 void InMemorySocket::ShutdownWrite() noexcept

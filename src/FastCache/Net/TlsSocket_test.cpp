@@ -424,6 +424,36 @@ TEST_CASE("TlsSocket: WaitReadable reports data pending and consumes none of it"
     CHECK(got.text == "PING\r\n");
 }
 
+TEST_CASE("TlsSocket: a WaitReadable parked at teardown is retrieved, not leaked", "[tls][net][waitreadable]")
+{
+    // **The lifetime half, and the one this fix newly makes reachable.** Before #712
+    // a TLS `WaitReadable` delegated to the raw socket, and over the in-memory wire
+    // that answers synchronously -- so nothing ever parked and there was no frame to
+    // lose. Now it parks a detached pump on a raw `Read`, and the only thing that can
+    // retrieve a parked wait is `Close()`.
+    //
+    // What this asserts is that the wait RESOLVES, because a wait that never resolves
+    // is a coroutine frame nobody frees. The leak itself is caught by the sanitizer
+    // rather than by an assertion: a parked frame is a live unreachable allocation at
+    // exit, which LeakSanitizer reports as a direct leak naming the coroutine. So this
+    // case is red two ways under the defect -- the `resolved` check fails here, and
+    // the ASan legs fail the whole binary.
+    auto context = TlsContext::Create(TlsFixture("server.crt"), TlsFixture("server.key"));
+    REQUIRE(context.has_value());
+
+    ReadableOutcome observed;
+    {
+        TlsConversation talk { **context };
+        ObserveReadable(talk.server.get(), &observed);
+        REQUIRE_FALSE(observed.resolved); // parked, with nothing on the wire
+    }
+    // The conversation -- and with it the TlsSocket and its raw transport -- is gone.
+    // The peer did nothing: no data, no `close_notify`, no FIN. The only reason the
+    // pump can come back is teardown retrieving it.
+    CHECK(observed.resolved);
+    CHECK_FALSE(observed.hasValue); // a cancelled wait is an error, not an EOF count
+}
+
 TEST_CASE("TlsSocket: WaitReadable reports EOF for a truncated stream", "[tls][net][waitreadable]")
 {
     // A FIN with no `close_notify` at all. This one the delegation already answered

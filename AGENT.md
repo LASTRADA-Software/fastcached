@@ -632,6 +632,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   not the decorator's own buffering. A raw EOF before a full record is EOF too.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
+- And it is the ONLY thing that retrieves a parked read, so the shared FAKE owes that
+  too: `InMemorySocket::Close` cleared its progress callback and walked away, which
+  made the abandonment final and leaked the awaiting coroutine's frame. Detach first,
+  complete last with `Cancelled`. Prove the leak instrument before believing a green
+  ASan run — a parked frame is a live unreachable allocation, which LSan reports
+  exactly; the size-dependent caveat belongs to use-after-free, not to leaks.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
