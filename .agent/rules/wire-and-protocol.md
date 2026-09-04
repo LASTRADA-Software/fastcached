@@ -1031,6 +1031,37 @@ Every rule below has already been a bug.
     how many of those peers were told why, moved by the connection when the write
     SUCCEEDS. The gap between them is a real quantity — swept peers left to infer it —
     rather than an error term, and a peer that had already hung up belongs in it.
+- **A parked read is retrieved by `Close()` and by nothing else, so the FAKE has to
+  do it too.** `EpollSocket::Close` has always detached its parked awaitables and
+  completed them with `Cancelled`; `InMemorySocket::Close` -- the socket every test in
+  this tree runs on -- cleared its pipe's progress callback and walked away, which
+  makes the abandonment final: nothing left can complete that awaitable, so the
+  awaiting coroutine is never resumed and its frame is never freed. Found by asking
+  what happens to #712's new detached pump when a `TlsSocket` is destroyed mid-wait,
+  and it is the shared-fake rule from [`testing.md`](testing.md) arriving from the
+  other direction: a fake nothing exercises does not report its own bugs. It went
+  unseen because the in-memory `Read` only parks when the peer has neither written nor
+  closed, which most fixtures avoid by construction -- and because before #712 a TLS
+  `WaitReadable` delegated to that fake, which answers synchronously, so nothing ever
+  parked there at all.
+  - **The instrument was proved before the result was believed.** LeakSanitizer
+    reports an abandoned coroutine frame as a DIRECT leak naming the coroutine
+    function and exits non-zero; a control that parks and then RESUMES is clean.
+    Measured on clang 22.1.8 / Linux x86-64 with a two-armed standalone program,
+    because "the suite is green under ASan" is not evidence about a leaked frame until
+    something has been watched leaking one. This is not the size-dependent case the
+    `*View` rule records: that one is use-after-free, where a freed block nothing
+    disturbs reads back correctly, while a leak is a live unreachable allocation and
+    LSan is exact about it.
+  - **The case is red TWO ways, and only one of them is an assertion.** `CHECK(resolved)`
+    fails because the wait never comes back, and LSan fails the whole binary with
+    1320 bytes in 4 allocations naming `PumpWaitReadable`, `DriveWaitReadable` and the
+    observing task. Either alone would have been enough to notice; neither existed
+    before, which is why the hole was reachable.
+  - **Detach FIRST, complete LAST, touch no member after** -- `EpollSocket::Close`'s
+    own rule, copied deliberately rather than re-derived, because completing resumes a
+    coroutine that may own the socket and destroy it before `Complete` returns.
+
 - **A socket has ONE read operation, `Read` and `WaitReadable` share it, and the
   rule lived nowhere it could be obeyed.** Both verbs begin by claiming the same
   per-direction `awaitable` pointer, so arming either while the other is parked
