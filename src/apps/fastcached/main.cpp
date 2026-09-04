@@ -891,9 +891,14 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop
-    // itself, only once its listener is actually bound and listening — see
-    // RunReactorServer. Logging it here (before bind) would race a client
-    // that connects on the strength of the message.
+    // itself, only once every accept loop is armed — see `ReadinessAnnouncer`.
+    // Logging it here (before bind) would race a client that connects on the
+    // strength of the message.
+    //
+    // "Bound and listening" is what it used to mean, and that was WEAKER than it
+    // reads (#646): a marker naming the bind a waiter already had, on a line that
+    // looks like a readiness contract. It now names every acceptor being parked in
+    // `accept()`, so it is safe for a fixture to wait on.
 
     // Shared daemon-lifetime objects MUST be declared BEFORE reloaderThread
     // below: the jthread joins in its destructor during stack unwind, which
@@ -1035,11 +1040,17 @@ int DaemonBody(FastCache::Config const& effective, std::span<FastCache::Rejected
         adminListener = FastCache::BlockingListener::Bind(effective.metricsBindAddress, effective.metricsPort);
         if (!adminListener || !adminListener->IsBound())
         {
-            logger.Logf(FastCache::LogLevel::Error,
-                        "fastcached: cannot bind metrics endpoint {}:{} ({})",
-                        effective.metricsBindAddress,
-                        effective.metricsPort,
-                        adminListener ? adminListener->BindError() : std::string_view { "null listener" });
+            // The `else` below is the whole of the success path, so this branch is
+            // the daemon deciding to serve on WITHOUT an admin endpoint -- forever,
+            // by design. The verdict and the severity that matches it are the
+            // endpoint's own (#603), not this call site's: an `Error` here pages an
+            // operator for a working daemon, and a level nothing in this tree can
+            // reach is a level nothing can hold to its policy.
+            auto const report = FastCache::DescribeToleratedAdminBindFailure(
+                effective.metricsBindAddress,
+                effective.metricsPort,
+                adminListener ? adminListener->BindError() : std::string_view { "null listener" });
+            logger.Log(report.level, report.message);
         }
         else
         {

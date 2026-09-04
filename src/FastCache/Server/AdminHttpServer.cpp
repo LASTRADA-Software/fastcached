@@ -23,6 +23,20 @@
 namespace FastCache
 {
 
+AdminBindFailureReport DescribeToleratedAdminBindFailure(std::string_view address,
+                                                         std::uint16_t port,
+                                                         std::string_view error)
+{
+    return AdminBindFailureReport {
+        .level = LogLevel::Warn,
+        .message =
+            std::format("fastcached: cannot bind metrics endpoint {}:{} ({}); continuing without /metrics and /healthz",
+                        address,
+                        port,
+                        error),
+    };
+}
+
 namespace
 {
 

@@ -388,3 +388,49 @@ TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact
     // reaches the 404, so a typo is refused rather than quietly served.
     CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
+
+TEST_CASE("A tolerated admin bind failure is reported at Warn and says the daemon carries on",
+          "[server][admin][bind-verdict]")
+{
+    // #603. `fastcached` serves the cache on without an admin endpoint -- that is a
+    // policy, not an accident -- and it reported the condition at `Error`, which is
+    // what a site pages on. Two costs pointing opposite ways: a page for a working
+    // daemon, and an operator trained to ignore the level.
+    //
+    // The message is asserted alongside the level because half of the acceptance is
+    // that a reader should not have to INFER whether the process survived.
+    auto const report = FastCache::DescribeToleratedAdminBindFailure("0.0.0.0", 9259, "address already in use");
+
+    CHECK(report.level == FastCache::LogLevel::Warn);
+    CHECK(report.level != FastCache::LogLevel::Error);
+    CHECK(report.message.contains("0.0.0.0:9259"));
+    CHECK(report.message.contains("address already in use"));
+    CHECK(report.message.contains("continuing without"));
+    // Naming the surfaces, because "the metrics endpoint" is not what an operator
+    // has a probe pointed at -- `/healthz` is, and it goes away too.
+    CHECK(report.message.contains("/metrics"));
+    CHECK(report.message.contains("/healthz"));
+}
+
+TEST_CASE("The tolerated admin verdict is not the verdict for a bind that stops the process",
+          "[server][admin][bind-verdict]")
+{
+    // The half #603 explicitly asks for: whatever asserts the severity has to
+    // DISTINGUISH the tolerated site from the fatal ones, or somebody "fixes" all
+    // four to one level and the information is gone.
+    //
+    // The fatal side is asserted where it lives, against the real listener paths, by
+    // `ReactorServerLoop_test`'s "reports a bind it cannot make at Error and refuses
+    // to start" -- those return EXIT_FAILURE, so `Error` is correct there and this
+    // function must never be reached for them. What is left to pin here is that the
+    // two verdicts do not collapse into one level.
+    auto const tolerated =
+        FastCache::DescribeToleratedAdminBindFailure("192.0.2.1", 9259, "cannot assign requested address");
+
+    CHECK(tolerated.level == FastCache::LogLevel::Warn);
+    // A tolerated failure must not describe itself as the process stopping. Refusal
+    // vocabulary here would read as fatal whatever the level said, which is the same
+    // defect one layer up.
+    CHECK_FALSE(tolerated.message.contains("refusing to start"));
+    CHECK_FALSE(tolerated.message.contains("exiting"));
+}
