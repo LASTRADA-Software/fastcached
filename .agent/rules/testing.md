@@ -732,6 +732,57 @@ status from the **process**, never from a pipe; and confirms the failure is the
 fails for another reason proves nothing about the guard. Where it cannot establish
 those, it reports INCONCLUSIVE and names the reading it is missing.
 
+## Assert what DISTINGUISHES, not what both sides produce
+
+In one evening four lanes each found a test that could not fail for the reason it
+existed ([#355](https://github.com/LASTRADA-Software/fastcached/issues/355)). Not
+the same mistake in the same place — the same mistake in five shapes, and every one
+of them green.
+
+Two, which are enough to see the shape:
+
+- **#348's acceptance did `REQUIRE(held)` on a bind.** `BlockingListener::Bind`
+  returns a **non-null pointer in an errored state**, so a failed bind passes it.
+  Both sections would then have passed on a `ParseTcpPort` refusal rather than on
+  the port conflict they existed to prove.
+- **#288's pinned raft test asserted that a refusal happened and that the message
+  names `--listen-raft`.** *Both* the old cross-flag rule and the new grammar rule
+  name that flag, so it pinned the flag rather than which rule answered — and a
+  relocation could land, or be reversed, in silence.
+
+The other three: a reproduction whose fixture **supplied its own refusal** and so
+never drove the production validator; an acceptance that passes under a digest taken
+at the **wrong layer**, so it would have blessed a fix that catches nothing; and a
+progress check using **log growth**, where the include-tree walk logs nothing while
+it runs and a slow walk is character-for-character identical to a wedge.
+
+**The shared shape: each asserts something both the healthy and the broken state
+produce.** The test is not weak — it is measuring a quantity that does not vary with
+the defect. And because it passes in both states nothing ever draws attention to it,
+so it reads as coverage forever. A refusal test asserts *which* refusal; a
+relocation test asserts the message only the new site emits.
+
+**Prove the test can fail.** Neuter the fix, run it, and check that the failures are
+the ones you expect *and only those*. Two of the five were caught exactly that way,
+and the asymmetry is the evidence: on #353 the two positive cases failed while three
+negative ones correctly still passed, which is what showed the positive ones were
+doing the work. A green test nobody has watched fail is an untested test — the same
+sentence this file already applies to a guard, applied to the thing the guard is
+made of.
+
+**Three of the five were acceptance criteria**, written by the person who understood
+the defect best, at the moment they understood it best. That is not carelessness.
+*What would prove this fixed* and *what would fail if it were not* are different
+questions, and only the second one tests anything — so an acceptance criterion is a
+hypothesis, and it is worth asking the second question separately before writing the
+test that satisfies it.
+
+The rest of this file is instances of this rule: a bounded wait that must say which
+KIND of failure it was, `Unwrap(x)` after `REQUIRE(x.has_value())`, a fixture that
+states which PATH it exercised, `SUCCEED` standing in for a skip. Each was found on
+its own; none of them stated the general form, which is why the fifth one still had
+to be found by whoever happened to be careful that day.
+
 ## A query that FAILED is not an observation about the subject
 
 A required-context checker was written for the shape
