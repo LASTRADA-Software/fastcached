@@ -300,7 +300,29 @@ foreach(dir IN LISTS standaloneDirs)
     # A directory that contributes nothing is a renamed or mistyped row, and the
     # whole check would then pass by scanning nothing at all -- which is the one
     # failure mode a boundary test must not be allowed to have.
-    if(unitSources STREQUAL "")
+    #
+    # `"${unitSources}"` is QUOTED, and that is the whole guard. Unquoted, this
+    # condition never fired in the one case it exists for. `file(GLOB_RECURSE)`
+    # over an empty directory yields an empty list, `set(unitSources ${unitAll})`
+    # with an empty argument UNSETS the variable, and CMake's `if(VAR STREQUAL
+    # "")` treats an UNDEFINED left operand as the literal string `unitSources` --
+    # which is not equal to `""`, so the check walked on and reported success.
+    #
+    # Measured, on 3.28 semantics and on the 4.3 here:
+    #
+    #     set(empty_list)
+    #     if(empty_list STREQUAL "")      did NOT fire
+    #     if("${empty_list}" STREQUAL "") FIRED
+    #     if(NOT empty_list)              FIRED
+    #
+    # The sibling accumulators in this file are safe only because
+    # `set(missingUnits "")` above DEFINES them as the empty string; this one is
+    # assigned inside the loop from a glob that can come back empty, so it is the
+    # single instance where the idiom breaks. `check-net-boundary-selftest`'s
+    # `vacuous` case is what caught it -- the check reported
+    # "0 source(s) across 2 directory/directories reach only themselves" and
+    # exited 0 over a tree with no sources in it at all.
+    if("${unitSources}" STREQUAL "")
         list(APPEND missingUnits "  ${dir}/\n      exists but holds no source this check knows how to read")
     endif()
     foreach(unitSource IN LISTS unitSources)
