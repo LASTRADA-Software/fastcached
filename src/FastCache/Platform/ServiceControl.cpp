@@ -24,6 +24,7 @@
     #include <aclapi.h>
     #include <windows.h>
 #elif defined(__APPLE__)
+    #include <sys/resource.h>
     #include <sys/stat.h>
     #include <sys/wait.h>
 
@@ -943,6 +944,89 @@ ServiceSpec WithScopeDefaults(ServiceSpec spec,
     return spec;
 }
 
+// ---------------------------------------------------------------------------
+// The launchctl verdict (#535). Deliberately outside the `__APPLE__` branch:
+// see the block comment in the header for why a decision left inside it would be
+// testable on no machine this project builds on.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    /// Duty cycle at or below which a timed-out call counts as WAITING.
+    ///
+    /// Measured, not chosen: a parked `sleep` driven through this loop came back
+    /// at 665us of cpu against a 1012ms budget -- 0.07%. Five percent is two
+    /// orders above that and two orders below the spinner, so it separates the
+    /// anchors without pretending to resolve what lies between them.
+    constexpr double LaunchctlWaitingDutyCycle = 0.05;
+
+    /// Duty cycle at or above which a timed-out call counts as BURNING CPU.
+    ///
+    /// The same run put a busy loop at 846448us against 1012ms -- 83.6%. Fifty
+    /// percent is well below that and well above anything a waiting process
+    /// reached, and the deliberate GAP between the two constants is where
+    /// `Inconclusive` lives.
+    constexpr double LaunchctlBurningDutyCycle = 0.50;
+} // namespace
+
+LaunchctlFinding LaunchctlFindingOf(LaunchctlReadings const& readings) noexcept
+{
+    if (readings.outcome != LaunchctlOutcome::TimedOut)
+        return LaunchctlFinding::NotATimeout;
+    if (!readings.cpu.has_value() || readings.elapsed.count() <= 0)
+        return LaunchctlFinding::Inconclusive;
+
+    auto const elapsedMicros = static_cast<double>(readings.elapsed.count()) * 1000.0;
+    auto const duty = static_cast<double>(readings.cpu->count()) / elapsedMicros;
+    if (duty <= LaunchctlWaitingDutyCycle)
+        return LaunchctlFinding::Waiting;
+    if (duty >= LaunchctlBurningDutyCycle)
+        return LaunchctlFinding::BurningCpu;
+    // The band between the two anchors. Assigning it to the nearer edge would be
+    // inventing a reading nobody took.
+    return LaunchctlFinding::Inconclusive;
+}
+
+std::string LaunchctlStatusText(LaunchctlReadings const& readings)
+{
+    switch (readings.outcome)
+    {
+        case LaunchctlOutcome::NotStarted:
+            return "could not be started";
+        case LaunchctlOutcome::Exited:
+            return std::format("status {}", readings.exitStatus);
+        case LaunchctlOutcome::TimedOut:
+            break;
+    }
+
+    // Both numbers, because they answer different questions: the budget says what
+    // was allowed, the elapsed what it cost. A polled wait overshoots, so these
+    // differ in the ordinary case and the difference is itself a reading about
+    // how loaded the host was.
+    auto const text = std::format(
+        "timed out after {}ms of a {}ms budget and was killed", readings.elapsed.count(), readings.budget.count());
+
+    switch (LaunchctlFindingOf(readings))
+    {
+        case LaunchctlFinding::BurningCpu:
+            return std::format("{}; it was burning cpu ({}ms of it), so it was not merely waiting on a busy host",
+                               text,
+                               std::chrono::duration_cast<std::chrono::milliseconds>(*readings.cpu).count());
+        case LaunchctlFinding::Waiting:
+            // Deliberately does NOT say which. A loaded host and a lock it will
+            // never get produce the same reading, and #535 exists because a
+            // sentence chose between them and chose wrong.
+            return text
+                   + "; it consumed almost no cpu, so it was waiting on something -- this does not say whether that "
+                     "was a busy host or a stall";
+        case LaunchctlFinding::Inconclusive:
+            return text + "; the cpu reading does not separate a busy host from a stall";
+        case LaunchctlFinding::NotATimeout:
+            break;
+    }
+    return text;
+}
+
 #if defined(_WIN32)
 
 namespace
@@ -1351,12 +1435,6 @@ namespace
         Silence, ///< Discard: this call is expected to fail in normal operation.
     };
 
-    /// Returned by RunLaunchctl when the call had to be killed at its deadline.
-    constexpr int LaunchctlTimedOut = -2;
-
-    /// Returned by RunLaunchctl when launchctl could not be started at all.
-    constexpr int LaunchctlNotStarted = -1;
-
     /// How long any single launchctl call may take before it is killed.
     ///
     /// An installer must never be able to hang. A launchctl subcommand that
@@ -1365,6 +1443,18 @@ namespace
     /// names no command, no argument and no reason. Bounding each call trades
     /// an unfalsifiable stall for a message that says which one stopped.
     constexpr int LaunchctlTimeoutSeconds = 60;
+
+    /// Whether a launchctl call did what was asked.
+    ///
+    /// One spelling, because "exited zero" is the only success and three call
+    /// sites comparing fields for themselves is three places for a timeout to be
+    /// read as a status of -2 again.
+    /// @param readings What the call cost.
+    /// @return True when it exited with status zero.
+    [[nodiscard]] bool LaunchctlSucceeded(LaunchctlReadings const& readings) noexcept
+    {
+        return readings.outcome == LaunchctlOutcome::Exited && readings.exitStatus == 0;
+    }
 
     /// Run `launchctl` with @p args, waiting up to LaunchctlTimeoutSeconds.
     ///
@@ -1375,8 +1465,16 @@ namespace
     /// @param args Arguments after argv[0].
     /// @param output Whether to let launchctl write to stdout/stderr.
     /// @return The exit status, or -1 if launchctl could not be started.
-    [[nodiscard]] int RunLaunchctl(std::vector<std::string> const& args, LaunchctlOutput output = LaunchctlOutput::Show)
+    [[nodiscard]] LaunchctlReadings RunLaunchctl(std::vector<std::string> const& args,
+                                                 LaunchctlOutput output = LaunchctlOutput::Show)
     {
+        LaunchctlReadings readings;
+        readings.budget = std::chrono::seconds { LaunchctlTimeoutSeconds };
+        auto const startedAt = std::chrono::steady_clock::now();
+        auto const measured = [startedAt] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
+        };
+
         std::vector<char*> argv;
         argv.reserve(args.size() + 2);
         std::string program = "launchctl";
@@ -1402,47 +1500,64 @@ namespace
             ::posix_spawn_file_actions_destroy(actionsPtr);
 
         if (spawned != 0)
-            return LaunchctlNotStarted;
+        {
+            readings.outcome = LaunchctlOutcome::NotStarted;
+            readings.elapsed = measured();
+            return readings;
+        }
 
         // Polled rather than a blocking waitpid, so the deadline is enforceable.
-        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds { LaunchctlTimeoutSeconds };
+        auto const deadline = startedAt + std::chrono::seconds { LaunchctlTimeoutSeconds };
         while (true)
         {
             int status = 0;
             auto const reaped = ::waitpid(pid, &status, WNOHANG);
             if (reaped == pid)
-                return WIFEXITED(status) ? WEXITSTATUS(status) : LaunchctlNotStarted;
+            {
+                readings.elapsed = measured();
+                if (WIFEXITED(status))
+                {
+                    readings.outcome = LaunchctlOutcome::Exited;
+                    readings.exitStatus = WEXITSTATUS(status);
+                }
+                else
+                    readings.outcome = LaunchctlOutcome::NotStarted;
+                return readings;
+            }
             if (reaped < 0)
-                return LaunchctlNotStarted;
+            {
+                readings.outcome = LaunchctlOutcome::NotStarted;
+                readings.elapsed = measured();
+                return readings;
+            }
 
             if (std::chrono::steady_clock::now() >= deadline)
             {
                 (void) ::kill(pid, SIGKILL);
+                // `wait4` rather than `waitpid`, for the rusage: it is the only
+                // reading that separates a job which never ran from one that was
+                // running and ran out of budget, and it is available only from the
+                // reap of the process just killed. Asked AFTER the kill for that
+                // reason -- there is no portable way to sample a LIVE child's cpu,
+                // and the corpse carries the total.
                 int discarded = 0;
-                (void) ::waitpid(pid, &discarded, 0);
-                return LaunchctlTimedOut;
+                ::rusage usage {};
+                auto const reapedAfterKill = ::wait4(pid, &discarded, 0, &usage);
+                readings.outcome = LaunchctlOutcome::TimedOut;
+                readings.elapsed = measured();
+                if (reapedAfterKill == pid)
+                {
+                    auto const micros = [](::timeval const& tv) {
+                        return std::chrono::microseconds { (static_cast<std::int64_t>(tv.tv_sec) * 1'000'000)
+                                                           + static_cast<std::int64_t>(tv.tv_usec) };
+                    };
+                    readings.cpu = micros(usage.ru_utime) + micros(usage.ru_stime);
+                }
+                // Left disengaged when the reap failed: no reading is not a reading
+                // of zero, and zero is the one value that would be acted on.
+                return readings;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds { 20 });
-        }
-    }
-
-    /// Human-readable form of a RunLaunchctl status.
-    ///
-    /// A killed or unstartable call must not surface as a bare negative number
-    /// in an operator-facing message; the whole point of bounding the call is
-    /// that the failure says what happened.
-    /// @param status Value returned by RunLaunchctl.
-    /// @return A phrase that reads correctly after "failed (".
-    [[nodiscard]] std::string LaunchctlStatusText(int status)
-    {
-        switch (status)
-        {
-            case LaunchctlTimedOut:
-                return std::format("killed after {}s with no result", LaunchctlTimeoutSeconds);
-            case LaunchctlNotStarted:
-                return "could not be started";
-            default:
-                return std::format("status {}", status);
         }
     }
 
@@ -1487,7 +1602,7 @@ namespace
     {
         auto const candidates = DomainTargets(scope);
         for (auto const& candidate: candidates)
-            if (RunLaunchctl({ "print", candidate }, LaunchctlOutput::Silence) == 0)
+            if (LaunchctlSucceeded(RunLaunchctl({ "print", candidate }, LaunchctlOutput::Silence)))
                 return candidate;
         return candidates.empty() ? std::string {} : candidates.front();
     }
@@ -1517,7 +1632,7 @@ namespace
         constexpr auto Interval = std::chrono::milliseconds { 50 };
 
         return std::ranges::any_of(std::views::iota(0, Attempts), [&](int) {
-            if (RunLaunchctl({ "print", serviceTarget }, LaunchctlOutput::Silence) != 0)
+            if (!LaunchctlSucceeded(RunLaunchctl({ "print", serviceTarget }, LaunchctlOutput::Silence)))
                 return true;
             std::this_thread::sleep_for(Interval);
             return false;
@@ -1755,7 +1870,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     if (auto const stillRegistered = BootOutEverywhere(scope, label))
         return { .exitCode = 1, .message = *stillRegistered };
 
-    if (auto const rc = RunLaunchctl({ "bootstrap", domain, plistPath.string() }); rc != 0)
+    if (auto const rc = RunLaunchctl({ "bootstrap", domain, plistPath.string() }); !LaunchctlSucceeded(rc))
         return { .exitCode = 1,
                  .message = std::format("wrote {} but `launchctl bootstrap {}` failed ({})",
                                         plistPath.string(),
@@ -1767,12 +1882,16 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
     // indefinitely — this command reported success while `launchctl print` said
     // "state = not running" and nothing was listening on the port. kickstart
     // forces the spawn, so the service really is up when this returns.
-    if (auto const rc = RunLaunchctl({ "kickstart", "-k", serviceTarget }); rc != 0)
+    if (auto const rc = RunLaunchctl({ "kickstart", "-k", serviceTarget }); !LaunchctlSucceeded(rc))
+    {
+        // "failed" only where something actually refused. A wait that ran out
+        // refused nothing, and calling it a failure sent an operator looking for a
+        // rejection that never happened (#535).
+        auto const what = rc.outcome == LaunchctlOutcome::TimedOut ? "timed out" : "failed";
         return { .exitCode = 1,
-                 .message = std::format("registered '{}' but `launchctl kickstart` failed ({}); "
-                                        "it will start at the next login or boot",
-                                        label,
-                                        LaunchctlStatusText(rc)) };
+                 .message = std::format(
+                     "registered '{}' but `launchctl kickstart` {} ({})", label, what, LaunchctlStatusText(rc)) };
+    }
 
     return { .exitCode = 0,
              .message = std::format("installed and started launchd job '{}' ({} scope, {}){}",
