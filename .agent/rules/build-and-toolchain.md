@@ -2465,6 +2465,180 @@ cross-check, it is a second thing to be wrong — and the only copied datum is t
 required-context list itself, whose provenance and the `gh api` call that reads
 the live one are in the script header.
 
+## A gate that does not report reads as a gate that passed
+
+The three doors above are all about a required context that never arrives. These
+two are the same disease with the *required* clause removed, and they were found
+together because they are one shape: **a failure nobody is shown is
+indistinguishable from a success.**
+
+### A non-required job failing in a merge group is reported nowhere (#684)
+
+The queue holds on the eleven required contexts and on nothing else, which is
+correct — the packaging and coverage jobs are deliberately unrequired because
+they are slow and because a packaging failure should not block ordinary work.
+What is *not* correct is that such a failure reaches no surface at all: the pull
+request page is green (its own run passed on the head), the queue reports success
+(every required context passed), master is green afterwards (the same job passes
+on the merge commit), and the only trace is an `event=merge_group` run that no
+part of the normal flow ever lists.
+
+**Measured, over every failing `merge_group` `Build` run the API still held on
+2026-09-04 — six of them:**
+
+| run | failing job | required? | pull request |
+|---|---|---|---|
+| 33783939363 | `Code coverage` | no | #689 merged |
+| 33782559943 | `macOS-clang-release` | **yes** | #686 ejected, fixed, merged |
+| 33760836218 | `Windows-cl-debug` | no | #667 merged |
+| 33749317968 | `Package (macOS .pkg)` | no | #669 merged |
+| 33665118078 | `Package (macOS .pkg)` | no | #546 merged |
+| 33650121718 | `Windows-cl-debug` | no | #539 merged |
+
+Five of six, four distinct jobs, five pull requests merged with nobody told. The
+one required failure behaved exactly as designed, and that contrast is the whole
+argument: this is a **reporting** gap, not a gating one, and closing it must not
+turn those jobs into gates by the back door.
+
+- **The unit is the CONTEXT, never the job key.** `Windows-cl-debug` is a leg of
+  the same matrix job as `Windows-cl-release`, which is required. Two of the six
+  rows are that case, so a per-job classification would have been wrong a third of
+  the time on the very data it was derived from.
+- **Not a job in `build.yml`**, because `check-release-gate` requires every job
+  there to appear in `release.needs` and a notifier job is *skipped on a tag push,
+  always* — which skips the release with it. That is the never-arrives failure
+  aimed at the release, and it is why the clang-tidy job reports through a step.
+  **Not a step in each unrequired job** either: a step sees only its own job, so
+  it is ten copies of one decision, ten grants of `issues: write`, and it still
+  cannot express the per-leg distinction above. So `workflow_run` — one workflow,
+  every job's conclusion at once, running *after* the queue concluded, producing
+  no status anything waits on.
+- **`workflow_run` only ever runs the copy on the DEFAULT branch**, so nothing on
+  a pull request exercises it and its first run anywhere is after it merges. The
+  answer is the standing one: split the DECISION out
+  (`scripts/ci-merge-group-report.sh`), drive it exhaustively against **captured
+  real records** (`ctest -R merge-group-report-selftest`), keep acquisition thin,
+  and assert the wiring statically (`ctest -R merge-group-report`).
+- **The one claim that could not be measured is made self-revealing rather than
+  quietly bet on.** That `workflow_run` fires for a run whose own event was
+  `merge_group` is *reasoned* from GitHub's documentation, not measured, and it
+  cannot be measured from a branch. So the trigger carries **no `branches:`
+  filter**: the notifier fires on ordinary pull-request runs too and prints
+  `event is 'pull_request', not merge_group`. From the first run after it merges,
+  *it never fires* and *it fires and has nothing to say* are two visible states
+  instead of one silence. A `gh-readonly-queue/**` filter would save a runner
+  start and buy back exactly that ambiguity, so `check-merge-group-report` refuses
+  one.
+- The required-context list is READ out of `check-merge-queue-contexts.sh`. With
+  an empty list every failure looks unrequired, so an empty read is refused rather
+  than treated as *nothing is required*.
+
+### Doc-subject checks were skipped on doc-only changes (#687)
+
+`ci-scope.sh` answers `code=false` for a `docs/**`, `.agent/**` or `*.md` change
+and every heavy job is gated on it — right for a compiler, and backwards for the
+handful of checks whose SUBJECT is prose. **Prose drifts by being edited, so a
+prose-only edit is precisely the change those checks never saw.** Both live
+findings #462 fixed came from doc-side hand edits.
+
+Reproduced end to end on one commit: a four-line addition to `docs/how-it-works.md`
+recommending the sccache-over-fastcached setup — naming one of the two backend
+environment variables `check-sccache-backend-caveat.cmake` scans for — with no
+caveat after it. `ci-scope.sh` classifies that commit `code=false`, so on master
+today no `ctest` runs at all; `doc-subject-checks.sh` on the same tree exits **1**
+and names `sccache-backend-caveat`.
+
+**And then the same guard caught this very paragraph.** Written with the variable
+spelled out, it *was* a page naming the marker with no caveat within forty lines,
+so `ctest -L hygiene` went red on an edit that touched only `.agent/**` and
+`AGENT.md` — which is the ticket's whole thesis arriving unprompted, in the commit
+that fixes it, on the one class of change that used to run no check at all. The
+fix is to describe the marker rather than spell it: this paragraph reports a
+reproduction, it does not recommend a configuration, and `check-sccache-backend-caveat.cmake`
+cannot tell those apart from a text scan — which is exactly why its exemption
+table takes a per-row reason. Adding a row for the rulebook would have been the
+wrong move: the caveat rule is right and the prose was wrong.
+
+- **Reporting is not gating, and this needs the second.** A doc check in an
+  unrequired job is #684 one file over. So the step lives in `check-clang-format`
+  — whose `name:` is the required context `Check C++ style` — restructured to the
+  shape `linux`/`windows`/`macos` already use: job-level `if: ${{ !cancelled() }}`,
+  the scope gate moved onto the clang-format steps, the doc-subject step ungated.
+  What changes for a docs-only pull request is that this context now reports
+  success or FAILURE where it used to report `skipped`, and a skipped required
+  context is read as passing. The `name:` is a wire constant; renaming it renames
+  a required context.
+- **No new job**, for `check-release-gate`'s reason above.
+- **The set is the `docs-subject` ctest LABEL**, read out of
+  `src/tests/CMakeLists.txt` along with each check's `-D` arguments, its
+  `SKIP_REGULAR_EXPRESSION` and the one `FASTCACHED_SCRIPT_CHECK_FAILED` spelling.
+  Nothing is restated, so a check that grows an argument cannot silently start
+  running with the wrong one.
+- **Every way of not being able to run is a REFUSAL, never a skip**: a label
+  matching nothing (#687's own acceptance clause), a command still holding a
+  build-tree variable, a missing script, a missing fail-regex, and a run in which
+  every check skipped. That last one is *absence of the negative is not the
+  positive* — nothing failed because nothing ran.
+  It has been watched refuse on the real tree: `sccache-backend-caveat` was
+  labelled while `-DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSccacheCaveatBudgetSeconds}`
+  could not be resolved, and it was named rather than skipped. Resolving
+  file-local `set()` variables is what fixed it, and it keeps that budget one
+  value serving both the argument and the ctest `TIMEOUT`.
+- **`compile-cache-caveat` is deliberately NOT labelled** and the gap is stated:
+  it takes five build-tree facts and configures a throwaway project (600 s
+  timeout). The refusal above is what stops somebody closing the gap by labelling
+  it and getting a silent skip.
+- `ctest -R gated-jobs-fail-safe` gained a third rule over both halves — the step
+  is ungated, and its job produces a required context — and, for the first time,
+  a `--self-test` that drives all three rules against generated workflows. They
+  had only ever been seen to pass.
+
+### Five ways an instrument reported on something other than its subject, in one branch
+
+Every one of these was written by somebody who had just read this file, and every
+one produced a green or a red that was about the tool rather than the tree. They
+are recorded together because the shape is one shape.
+
+- **A COMMENT is not a call site — twice, in two different checks.**
+  `check-gated-jobs.sh` matched its own explanatory comment naming
+  `doc-subject-checks.sh` and attributed it to whichever step block was open,
+  reporting the same step twice; `check-merge-group-report.sh`'s header explains
+  that it refuses `always()` and `cancel-in-progress`, and both rules fired
+  against a correct workflow. **A rule satisfied — or refused — by prose is a rule
+  that passes with the code deleted.** Strip full-line comments (`^[[:space:]]*#`)
+  and never a trailing `#`, which in YAML needs preceding whitespace to start a
+  comment. Both directions are self-tested: the baseline workflow deliberately
+  carries a comment naming every forbidden spelling, and a second baseline carries
+  no comments at all.
+- **`bash "$0"`, never a bare `"$0"`, when a self-test re-invokes its own script.**
+  These check scripts are mode **644** in git — ctest runs them as `bash <path>`
+  and nothing needs the executable bit — so a bare `"$0"` exits **126, Permission
+  denied**, having run no check at all. Every `want-fail` case then passes because
+  the SHELL refused rather than because the rule fired: eight cases, entirely
+  green, testing nothing. It was caught by the one case that expects a PASS, which
+  is the argument for a baseline case rather than only negative ones.
+- **`IFS=$'\t' read -r a b c d` does not read tab-separated fields.** Tab is one
+  of bash's three IFS *whitespace* characters, so a run of tabs collapses to one
+  delimiter and leading ones are dropped — a record with an empty field silently
+  SHIFTS every field after it. The empty field is exactly the case that matters
+  here, since `gh` renders an unfinished job's conclusion as the empty string.
+  Split by hand (`${line%%$'\t'*}`) and count the delimiters first.
+- **A fixture built on `message(FATAL_ERROR)` cannot test the rule that verdicts
+  are read from OUTPUT.** It exits **0** on CMake 3.28, this project's declared
+  minimum, and **1** on the 4.3 this was written against — so on a modern host the
+  exit status alone is sufficient and deleting the output half of the verdict left
+  the self-test GREEN. The mode under test was not the mode in use. There is now a
+  fixture per arm: one that prints the failure text and exits 0, one that exits
+  non-zero with clean output.
+- **A self-test that stops early must not look like one that judged something.**
+  A generator ending in `[[ ... ]] && echo` returns 1 when the condition is false;
+  under `set -e` a plain call to it took the whole self-test down after eight
+  cases — exit 1, no case named, indistinguishable from a real failure. The
+  self-tests now print the number of cases they ran, so a truncated run is
+  visibly truncated. The count is printed rather than compared against a number
+  restated in the file: a second copy of the expected total is a second thing to
+  be wrong.
+
 ## A branch behind master is unverified, and only a build says otherwise
 
 A pull request's CI ran against the master it was branched from. Every green check
@@ -2513,6 +2687,22 @@ been built on the first.
 
 ## Open work
 
+- **[#717](https://github.com/LASTRADA-Software/fastcached/issues/717)** — the
+  open-or-update-an-issue decision exists twice: `scripts/ci-report-issue.sh`,
+  which `merge-group-report-selftest` drives against a stub `gh`, and the inline
+  copy in `build.yml`'s clang-tidy job. Deliberately not folded together as part
+  of #684: that step is inside a REQUIRED context and is reachable only on a
+  master push whose sweep has already failed, so editing its YAML to remove a
+  duplication risks every lane's pull request for no gain #684 needs.
+- **[#682](https://github.com/LASTRADA-Software/fastcached/issues/682)** — nothing
+  runs clang-tidy over a `_WIN32` branch, and three `Net`/`Async` translation units
+  are analysed on no platform. Untouched by the #684/#687 work and deliberately so,
+  stated here rather than left to look like an omission: the ticket's own
+  acceptance clause makes fixing `IocpSocket.cpp`'s fifteen pre-existing
+  diagnostics part of turning the leg on, and a Windows analyser leg landed without
+  them is a permanently RED context — a worse instrument than the blind spot. It
+  also cannot be developed from a Linux host, so it would be a leg that has never
+  completed anywhere.
 - **[#589](https://github.com/LASTRADA-Software/fastcached/issues/589)** — the sweep
   now reports which files produced no code (#466), and that is the half that only
   *reports*: a green job's log is not read. Nothing asserts that a file guarded out
