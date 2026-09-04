@@ -1132,6 +1132,27 @@ Every rule below has already been a bug.
     own rule, copied deliberately rather than re-derived, because completing resumes a
     coroutine that may own the socket and destroy it before `Complete` returns.
 
+- **A read-slot fixture with a byte in flight tests nothing**, because both arm sites
+  take a SYNCHRONOUS path first. `EpollSocket::Read` tries `recv` and
+  `EpollSocket::WaitReadable` tries `recv(MSG_PEEK)` before either reaches
+  `ClaimReadSlot`, so whichever call would have claimed an occupied slot returns early
+  the moment there is anything to read. Measured while reproducing
+  [#755](https://github.com/LASTRADA-Software/fastcached/issues/755): a fixture that
+  sent one more command after `UNSUBSCRIBE` PASSED against the unfixed tree, and the
+  same fixture with the wire left quiet aborted in `ClaimReadSlot` every time. **Keep
+  the wire silent and let the parks happen**, or the case is green for the same reason
+  the defect is invisible in production traffic.
+  - And the ordering that produced it is worth naming on its own: `RearmReadable` ran
+    immediately after `ReadOneCommand`, which is BEFORE the command is dispatched -- so
+    `UNSUBSCRIBE` re-armed the watcher and only then dropped the subscription count.
+    Settling a watcher belongs after the dispatch that can change what it is watching
+    for, which is the top of the next iteration, where the count is final and the
+    watcher is still parked on its rearm LATCH. That last clause is what lets it be
+    retired by tripping a latch rather than by a socket cancellation primitive this
+    tree does not have (#710) -- and it is why the re-arm now waits for the reader to
+    drain, since a watcher re-armed over buffered bytes goes back into `WaitReadable`
+    and out of the latch's reach.
+
 - **A socket has ONE read operation, `Read` and `WaitReadable` share it, and the
   rule lived nowhere it could be obeyed.** Both verbs begin by claiming the same
   per-direction `awaitable` pointer, so arming either while the other is parked
