@@ -107,22 +107,80 @@ env:
   FASTCACHED_REQUIRE_EXACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
 
 jobs:
+  # Two jobs in one, and deliberately so. The clang-format sweep is scope-gated
+  # like every other compiler job; the doc-subject checks below are NOT, and that
+  # is #687.
+  #
+  # `name:` is `Check C++ style`, which is one of the eleven contexts the
+  # `default-master` ruleset requires. It is a wire constant in every sense that
+  # matters: renaming it renames a required context, the ruleset then waits on a
+  # name nothing produces, and every branch becomes unmergeable. Do not touch it.
+  #
+  # ## Why a documentation check lives in a job named for C++ style
+  #
+  # It has to run where all four of these hold at once, and this is the only job
+  # in the file where they do.
+  #
+  #   * It must not be a NEW job. `check-release-gate` asserts that every job
+  #     here appears in `release.needs`, so a new one gates the release too --
+  #     which is the constraint `merge-queue-contexts` documents and the reason
+  #     the clang-tidy job reports through a STEP rather than a sibling job.
+  #   * It must report on `pull_request` AND on `merge_group`, or it is the
+  #     never-arrives failure this file already records three times.
+  #   * It must actually GATE. A doc check in an unrequired job is #684 -- a
+  #     failure reported nowhere, on a pull request that merges green -- and
+  #     fixing #687 by reintroducing #684 one file over is not a fix. Reporting
+  #     and gating are different properties and this needs the second.
+  #   * And it must run when `code=false`, because a docs-only change is the one
+  #     change these checks exist to catch and the one they were never run on.
+  #
+  # So the job's own condition is now just `!cancelled()` and the scope gate moved
+  # onto the clang-format steps -- exactly the shape `linux`, `windows` and
+  # `macos` already use, for the same reason: the job must report under its real
+  # name whatever the classifier said, and the steps decide whether any work
+  # happens. What changes for a docs-only pull request is that this context now
+  # reports success or FAILURE where it used to report `skipped`, and a skipped
+  # required context is read by the ruleset as passing.
+  #
+  # Measured on this tree: the three doc-subject checks cost 0.94 s wall clock
+  # together, so what a docs-only run now pays is one runner start.
   check-clang-format:
     name: "Check C++ style"
     runs-on: ubuntu-24.04
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    # `!cancelled()` alone, so a FAILED `changes` cannot skip this job before its
+    # steps are consulted -- and so the doc-subject step below runs on the
+    # docs-only pull requests the classifier answers `code=false` for.
+    if: ${{ !cancelled() }}
     steps:
+      # Ungated: both halves of this job need the tree.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # The doc-subject checks run FIRST and unconditionally. First because they
+      # cost under a second and installing clang-format costs a minute, so on a
+      # docs-only run the job answers without ever reaching the download.
+      #
+      # `scripts/doc-subject-checks.sh` derives what to run from the `docs-subject`
+      # ctest label in `src/tests/CMakeLists.txt` and refuses when that scan
+      # matches nothing -- a doc-check step that runs zero checks reports green,
+      # which is #687 one level up. Its verdicts are driven by
+      # `ctest -R doc-subject-checks-selftest`; that this step is UNGATED is
+      # asserted by `ctest -R gated-jobs-fail-safe`, because gating it is the
+      # whole defect.
+      - name: "Doc-subject checks (#687: these run on docs-only changes too)"
+        run: scripts/doc-subject-checks.sh
+
       - name: "Install clang-format"
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
           sudo apt-get install -y clang-format-${{ env.CLANG_TOOLS_VERSION }}
       - name: "Run clang-format"
+        if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
           git ls-files '*.h' '*.hpp' '*.cpp' \
             | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file

@@ -900,7 +900,7 @@ add_test(
 )
 set_tests_properties("node-config-reference" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
+    LABELS "hygiene;docs-subject"
     TIMEOUT 60
 )
 
@@ -950,7 +950,7 @@ add_test(
 )
 set_tests_properties("node-surface-docs" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
+    LABELS "hygiene;docs-subject"
     TIMEOUT 60
 )
 
@@ -1111,6 +1111,26 @@ if(NOT WIN32)
         LABELS "hygiene"
         TIMEOUT 60
     )
+
+    # And the half that had never existed: for two years those rules had only
+    # ever been seen to PASS, which is the state this whole area is about one
+    # level up. `--self-test` drives each of them against GENERATED workflows in
+    # both directions.
+    #
+    # It earned itself immediately. Written with a bare `"$0"` to re-invoke, and
+    # this file is mode 644 -- ctest runs it as `bash <path>` -- so every
+    # negative case exited **126, Permission denied** and passed because the
+    # SHELL refused rather than because the rule fired. Entirely green, testing
+    # nothing. Caught only by the one case that expects a PASS, which is the
+    # argument for a baseline case rather than only negative ones.
+    add_test(
+        NAME "gated-jobs-fail-safe-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh" --self-test
+    )
+    set_tests_properties("gated-jobs-fail-safe-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1175,62 @@ if(NOT WIN32)
     )
 endif()
 
+# ---------------------------------------------------------------------------
+# The checks whose SUBJECT is documentation are still runnable from a bare
+# checkout, and there is still at least one of them (#687).
+#
+# Those checks were skipped on exactly the pull requests that change
+# documentation: `scripts/ci-scope.sh` answers `code=false` for a `docs/**`,
+# `.agent/**` or `*.md` change, every heavy job is gated on it, and so a
+# docs-only pull request ran no `ctest` at all. Right for a compiler, backwards
+# for a check that reads prose -- prose drifts by being EDITED, and a prose-only
+# edit is the change they never saw.
+#
+# `.github/workflows/build.yml` now runs `scripts/doc-subject-checks.sh` from an
+# UNGATED step of the `Check C++ style` job, which is a required context, so a
+# doc check that fails on a docs-only pull request blocks the merge rather than
+# merely reporting -- reporting without gating is #684, and fixing one ticket by
+# reintroducing the other is not a fix. `gated-jobs-fail-safe` asserts both
+# halves of that wiring.
+#
+# What this registration adds is the third leg. The runner derives its set from
+# the `docs-subject` LABEL above rather than from a list of its own, and this
+# drives that derivation against the REAL tree: every labelled check resolves to
+# a script that exists and to a command with no build-tree variable left in it.
+# The runner itself is NOT registered to run for real here -- it would be a
+# second execution of the three checks this file already registers.
+#
+# It has been seen to refuse: `sccache-backend-caveat` was labelled while its
+# `-DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSccacheCaveatBudgetSeconds}`
+# could not be resolved, and this reported it BY NAME rather than skipping it.
+if(NOT WIN32)
+    add_test(
+        NAME "doc-subject-checks-derivation"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --list
+    )
+    set_tests_properties("doc-subject-checks-derivation" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against generated trees. Every refusal this runner makes
+    # is a refusal that has been WATCHED: the empty scan, the build-tree
+    # argument, the missing script, the missing fail-regex, the all-skipped run.
+    #
+    # Two of its cases exist because a mutation exposed them. `message(FATAL_ERROR)`
+    # exits **0** on CMake 3.28, this project's declared minimum, and **1** on the
+    # 4.3 this was written against -- so a fixture built on `FATAL_ERROR` cannot
+    # test the rule that verdicts are read from OUTPUT, and deleting that half
+    # left the self-test green. There is now a fixture for each arm.
+    add_test(
+        NAME "doc-subject-checks-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --self-test
+    )
+    set_tests_properties("doc-subject-checks-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 180
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # A full clang-tidy sweep still happens somewhere, and it still reaches a person.
@@ -1487,7 +1563,7 @@ add_test(
 )
 set_tests_properties("sccache-backend-caveat" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
+    LABELS "hygiene;docs-subject"
     TIMEOUT ${FastCachedSccacheCaveatBudgetSeconds}
 )
 
