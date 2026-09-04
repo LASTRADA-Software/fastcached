@@ -341,6 +341,14 @@ Two more things follow.
 organises the file by merge history instead of by subject, and the next reader inherits
 both the odd placement and no explanation for it. Take the rebase.
 
+And **price the conflict before you pay to avoid it**, because "avoid the collision"
+reasoning tends to price one it has never looked at. A rulebook entry was placed on
+subject in a file an open PR was also editing, expecting to owe a rebase for it; the two
+sets of hunks turned out to be 1500 lines apart (`@@ -898` against `@@ -2465`), so the
+cost was **zero** and the same `gh pr diff <n>` that would have shown that had not been
+run. A cost avoided without being measured is not a cost saved — and where the avoidance
+is a *relocation*, the saving is imaginary and the misfiling is permanent.
+
 **Do not cancel a running job to pre-empt it either.** The conflict is *scheduled*: it
 cannot bite before the first PR merges, and when it does it announces itself as a blocked
 queue entry rather than as a surprise. A conflict with a known arrival time and a

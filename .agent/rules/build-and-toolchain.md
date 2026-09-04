@@ -670,6 +670,55 @@ determinism rests on.
     that the script finished; a run that reports `patched 0 of 3` is a run whose
     author notices, and `done` is not. The assertion earns itself the first time an
     anchor drifts under a rebase, which is not a rare event here.
+
+    **And `count == 1` is necessary, not sufficient.** It proves the anchor was found
+    and was unique. It says nothing about whether the insert was *correct*, because
+    what an insertion breaks is usually not the text it replaced -- it is the text on
+    the other side of it. **An anchored insert is checked against what FOLLOWS the
+    anchor, not only against what precedes it.**
+
+    Measured here, in this file, by the commit that added *A probe's result is only
+    evidence if the probe could have produced the other one*: the anchor was the last
+    bullet of a section, matched once, and the insert landed between that bullet and
+    that section's *closing* paragraph -- a paragraph reading
+    "Every finding in **both sections** is an instance of this" and listing five
+    findings. Pushed below the inserted section, "both sections above" now pointed at
+    that one instead, which contains none of the five. Nothing was misplaced and no rule
+    was wrong; **a neighbouring paragraph was made false**, which is worse, because it
+    now misinstructs a reader who never sees the edit.
+
+    And a third correction inside this one entry, which is the point rather than an
+    embarrassment: the first two accounts of this said the paragraph was stranded "four
+    sections downstream". The commit that did it -- *a probe's result is only evidence
+    if the probe could have produced the other one*, cited by subject because a rebase
+    invalidated the hash this sentence first carried, which is the "name, not direction"
+    rule one line of scope up -- inserted **one** section, and there were two by the
+    time it was noticed. Nobody had counted; four was repeated from the first telling
+    into a message and then into this file. **A number in a post-mortem is a
+    measurement and decays like one** -- the incident is over, so nothing will ever fail
+    to make it wrong again, and a rulebook is exactly where such a number goes to be
+    believed forever.
+
+    **A prose diff cannot show you the sentence your insertion falsified.** The hunk
+    was `@@ -898,6 +898,45 @@`: the added lines plus **six** untouched context lines,
+    three leading and three trailing. Only the trailing three matter to the argument,
+    and they held the first three lines of the paragraph that went false while the
+    broken sentence sat four lines further down -- outside the window. So the diff was
+    clean, minimal and reviewable, and the defect was invisible in it. (An earlier draft
+    said "three", counting one side of a symmetric default. The paragraph below about
+    post-mortem numbers was already written when that was found.) Re-read the whole enclosing section afterwards, from its heading
+    to the next one, rather than the diff. In prose the specific hazard is a
+    **back-reference**: "the section above", "both sections above", "the two entries
+    below", "as stated earlier". Those are the sentences an insert silently redirects, so
+    grep the neighbourhood for positional words before inserting between two things that
+    refer to each other.
+
+    That grep caught this very paragraph one minute after it was written: the sentence
+    above said "the commit that added the two sections above", and those sections are
+    **below** it. Which is the real remedy rather than the grep -- **point at a NAME, not
+    at a direction.** A title survives an insertion, a rebase and a move; "above" is a
+    claim about layout that every later edit can silently invalidate, and it is the only
+    kind of claim in a rulebook that nothing in the tree can check.
   - **A tool given a path that does not exist reports nothing, which is what "absent"
     also looks like.** `nm` on a missing file prints no symbols, so a grep for one
     counts zero -- character-for-character identical to a binary that was built
@@ -910,6 +959,78 @@ against how tools of that kind behave.** Every finding in both sections is an in
 of this: a pipeline's exit code, a `.` in a pattern, a `cwd`, an unset git timeout, a
 signal disposition — each one a fact somebody knew generally and did not verify
 locally.
+
+## A probe's result is only evidence if the probe could have produced the other one
+
+The two sections above are about an instrument reporting on the wrong tree, and about
+reasoning where reading was called for. This is the third: **a measurement that was
+honestly taken, of the wrong thing, and read as an answer about the right one.** Both
+halves below came out of one investigation (#726) in a single session, they point in
+opposite directions, and neither was a wrong answer — each was a **non-answer wearing
+an answer's colour**. One was a red that meant nothing; the other a green that meant
+nothing.
+
+- **A green probe of the wrong shape is not a refutation.** A review reported that
+  under `Fsync` the commit after a one-slot meta recovery overwrites the surviving
+  slot. Two probes were built and both came back clean, and "the finding is wrong" was
+  written down before the third existed. Both seeded the store through raw `CowTree`,
+  one flush per commit — which *keeps* the `txnId` slot parity, and the broken parity
+  is the whole precondition. Only the `CowTreeStorage`-shaped seed reproduces it, where
+  the FIRST `Open` commits the format marker -- `EnsureFormatVersion` stamps it on a
+  brand-new store only, so the two sessions total 6 commits then 5 and the parity ends
+  up broken. Written as "`Open` itself commits the marker" at first, which would make
+  the total even and the fault unreachable. The finding
+  was true. **Before recording a negative, state what would have had to be true for
+  the positive to appear, and check the probe had it** — a fixture that cannot exhibit
+  the fault cannot vote on it. Same defect as a suite exercising the fallback path
+  while CI exercises the git path, and as a `want-fail` case satisfied by the shell
+  refusing to start.
+- **A single observation is a snapshot, not a trend, and cannot tell a transient from
+  a fixed point.** The probe that finally did reproduce it committed **once**, so
+  "after" meant "after one commit" — and that was published as "every subsequent
+  commit hammers the same slot, so the store stays permanently one torn write from
+  unopenable". Measured over five consecutive commits: `valid: 1` after the first,
+  `valid: 2` from the second on, because the offending write restores the parity and
+  the next commit repairs the damaged slot. A real defect, overstated into a different
+  false claim, which then shipped in an operator page. **Iterate the operation, do not
+  merely perform it.** The tell was available and unread: the same filing already noted
+  the parity being restored, two sentences from the claim that contradicts it.
+
+The pair is worth more than either alone, because the mistake is symmetric and the
+instinct is not: a green probe invites you to close the question, and a red one invites
+you to describe it — and the second is where a bounded fault becomes an unbounded
+sentence. The storage-side instance is in
+[`storage.md`](storage.md); the general form is here.
+
+## A correction is a search, not a recollection
+
+The section above is about acquiring evidence. This one is about **repairing a claim
+after you have it**, which fails its own way: a wrong statement is rarely written down
+once, and the copies you can list are not the copies that exist.
+
+**A claim corrected in the places you remember writing it is not corrected.** One false
+sentence about the `fsync` exposure above went into an issue body, a pull request that
+another session then merged, and a rulebook paragraph. Two were fixed from memory; the
+third survived, and survived a rebase, because it was never re-read — `grep -n "hammer"`
+found it in four seconds after recollection had already failed twice. So the fix is a
+search over the tree and the tracker, not a list of the places you think you touched.
+
+**And a search is only as good as its pattern.** The follow-up search for surviving
+copies came back clean, correctly — but the same session's check for the **corrected**
+text also came back empty, which was impossible, since it had merged that text itself.
+The content was there and the pattern could not reach it: the prose is line-wrapped and
+carries markdown emphasis *inside* the phrase, so no phrase-grep matches it.
+
+```
+So on `fsync` the dangerous moment is the **first write after a degraded
+start**, not the indefinite future.
+```
+
+That is the census rule from [`testing.md`](testing.md) — a zero that was expected, and
+therefore never questioned — arriving in prose rather than in a test count. **Give a
+search that returns nothing a positive control**: find one instance by other means and
+check the pattern sees it. On wrapped markdown, match a single distinctive word, or
+strip the wrapping first; never a phrase that spans a newline or a `**`.
 
 ## A comment can be true in its premise and false in its conclusion
 
