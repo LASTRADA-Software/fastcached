@@ -24,7 +24,9 @@ the `CowTree` target.
 1. Write all new data pages.
 2. SyncData()             — flush data.
 3. Encode new Meta (txnId = previous + 1, new root, new freeRoot).
-4. WriteMeta(slot = txnId % 2, ...)   — single-page atomic write.
+4. WriteMeta(...)                     — single-page atomic write; the
+                                        store picks the slot it did not
+                                        last make durable.
 ```
 
 Recovery on `Open()` picks the meta slot with the higher `txnId` whose

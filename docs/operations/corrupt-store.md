@@ -111,28 +111,19 @@ it".
       ordinary misses, not as errors, because the store is internally
       consistent, just consistent with an earlier moment.
 
-    **Whether ordinary use then repairs the file depends on
-    `--storage-durability`, and under `fsync` it does the opposite.** Measured,
-    on a store seeded through the cache's own open path:
+    **Ordinary use then repairs the file**, on every `--storage-durability`
+    setting. The next commit writes the slot that is *not* the one the store
+    recovered on — so it lands in the damaged one, the surviving slot is left
+    untouched, and the file is back to two good copies. Measured, on a store
+    seeded through the cache's own open path and then committed to four times:
+    two valid meta slots after the first commit, on `batched` and on `fsync`
+    alike.
 
-    - **`batched`** (the default): the next flush writes the *other* slot, so it
-      lands in the damaged one and the surviving slot is preserved. Ordinary use
-      does repair the file.
-    - **`fsync`**: the commit after recovery derives its slot from the
-      transaction id and consults nothing the recovery recorded, so the
-      **first** one overwrites the surviving slot rather than the damaged one.
-      For the length of that one commit the store's only good meta copy is the
-      one being rewritten, and a tear there leaves nothing to open. That write
-      restores the slot alternation, so the *second* commit repairs the damaged
-      slot and the file is back to two good copies. See
-      [#726](https://github.com/LASTRADA-Software/fastcached/issues/726).
-
-    So on `fsync` the dangerous moment is the **first write after a degraded
-    start**, not the indefinite future. If you are restarting a damaged store to
-    get service back, copy the file before you do. A cache that has quietly lost
-    its most recent window refills either way; the reason it did is still worth
-    the two minutes below, because the damage that caused it has not gone
-    anywhere.
+    Copying the file first is still the right move, and the reason is the two
+    minutes below rather than the durability setting: the damage that cost you a
+    slot has not gone anywhere, and a repaired file no longer shows what
+    happened. A cache that has quietly lost its most recent window refills
+    either way.
 
 ## Can it be repaired?
 

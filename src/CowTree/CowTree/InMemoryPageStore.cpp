@@ -150,9 +150,15 @@ auto InMemoryPageStore::ReadMeta(MetaSlot slot) const -> std::expected<Meta, Cow
     return DecodeMeta(BytesView { raw.data(), raw.size() });
 }
 
-auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
+auto InMemoryPageStore::WriteMeta(Meta const& meta) -> std::expected<void, CowTreeError>
 {
     ++_writeMetaCount;
+    // The slot the last write did NOT take, exactly as `FilePageStore` chooses
+    // it. This store used to write whichever slot the caller named, which made
+    // it a model of an alternation the file store does not implement -- and the
+    // crash-consistency suite runs against THIS store, so the model is what
+    // those cases actually verify (#726).
+    auto const slot = OtherSlot(_lastDurableSlot);
     auto& raw = _meta[static_cast<std::size_t>(slot)];
 
     auto effective = meta;
@@ -164,6 +170,11 @@ auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expec
         // Zero the destination slot to simulate the "wrote a corrupted
         // page then crashed" scenario. The other slot remains intact so
         // recovery can fall back to it.
+        //
+        // `_lastDurableSlot` is deliberately NOT advanced: this write did not
+        // land, so the next one must target this same slot again rather than
+        // stepping over the intact one. That is also what a real store does --
+        // `FilePageStore` advances only after the write returns.
         std::ranges::fill(raw, std::byte { 0 });
         return std::unexpected(CowTreeError::InjectedFault);
     }
@@ -176,7 +187,13 @@ auto InMemoryPageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expec
     auto const encoded = EncodeMeta(BytesSpan { raw.data(), raw.size() }, effective);
     if (!encoded.has_value())
         return std::unexpected(encoded.error());
+    _lastDurableSlot = slot;
     return {};
+}
+
+auto InMemoryPageStore::LastDurableSlot() const noexcept -> MetaSlot
+{
+    return _lastDurableSlot;
 }
 
 std::size_t InMemoryPageStore::PageSize() const noexcept

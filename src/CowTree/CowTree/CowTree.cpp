@@ -840,9 +840,11 @@ auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
             return std::unexpected(r.error());
     }
 
-    // 2. Write the new meta page. The slot here is the alternating choice for
-    //    Fsync/None; in Batched mode FilePageStore overrides it to the
-    //    non-durable slot when it actually flushes (see FilePageStore::WriteMeta).
+    // 2. Write the new meta page. WHICH slot is the page store's decision and
+    //    not this layer's -- see IPageStore::WriteMeta. This used to compute
+    //    `txnId mod 2` and pass it, which is the parity `Meta` documents; the
+    //    store's own alternation is what actually keeps the previous meta
+    //    standing, and the two agree only until a batched flush moves one (#726).
     Meta next;
     next.pageSize = static_cast<std::uint32_t>(_store.PageSize());
     next.txnId = txn._newTxnId;
@@ -851,8 +853,7 @@ auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
     auto const newItemCount = static_cast<std::int64_t>(_liveItemCount) + txn._itemDelta;
     next.itemCount = static_cast<std::uint64_t>(std::max<std::int64_t>(0, newItemCount));
 
-    auto const slot = (next.txnId % 2 == 0) ? MetaSlot::A : MetaSlot::B;
-    if (auto const r = _store.WriteMeta(slot, next); !r.has_value())
+    if (auto const r = _store.WriteMeta(next); !r.has_value())
         return std::unexpected(r.error());
 
     // 3. Freed pages can now be reused.

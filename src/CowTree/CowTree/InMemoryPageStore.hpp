@@ -103,7 +103,9 @@ class InMemoryPageStore final: public IPageStore
 
     [[nodiscard]] auto ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError> override;
 
-    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto WriteMeta(Meta const& meta) -> std::expected<void, CowTreeError> override;
+
+    [[nodiscard]] auto LastDurableSlot() const noexcept -> MetaSlot override;
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 
@@ -125,6 +127,15 @@ class InMemoryPageStore final: public IPageStore
     /// Set of page indices that are currently allocated (i.e. valid for
     /// Read). Used to reject reads of freed pages.
     std::unordered_set<std::size_t> _live;
+
+    /// The slot the last `WriteMeta` wrote, so the next one takes the other.
+    ///
+    /// `A` initially, matching `FilePageStore::BootstrapNewFile`, which writes
+    /// both slots blank and names A the durable one so the first real commit
+    /// lands in B. The two stores have to agree on this or the crash-consistency
+    /// suite -- which runs against THIS one -- would be modelling an alternation
+    /// the file store does not implement.
+    MetaSlot _lastDurableSlot { MetaSlot::A };
 
     /// The two meta-page raw byte buffers. Each is exactly _pageSize
     /// long; zero-initialised until first write.

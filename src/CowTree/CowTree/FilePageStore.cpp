@@ -597,7 +597,7 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
     // and loses only this unflushed window — never a corrupt/unopenable store.
     if (auto const r = Fsync(); !r.has_value())
         return std::unexpected(r.error());
-    auto const target = (_lastDurableSlot == MetaSlot::A) ? MetaSlot::B : MetaSlot::A;
+    auto const target = OtherSlot(_lastDurableSlot);
     if (auto const r = WriteSlotLocked(target, pending); !r.has_value())
         return std::unexpected(r.error());
     if (auto const r = Fsync(); !r.has_value())
@@ -641,7 +641,7 @@ auto FilePageStore::WriteSlotLocked(MetaSlot slot, Meta const& meta) -> std::exp
     return WriteAt(MetaSlotOffset(slot), BytesView { buf.data(), buf.size() });
 }
 
-auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError>
+auto FilePageStore::WriteMeta(Meta const& meta) -> std::expected<void, CowTreeError>
 {
     std::scoped_lock const lock { _ioMutex };
 
@@ -655,21 +655,48 @@ auto FilePageStore::WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<
         // torn and the store unopenable. Deferring the write — and flushing it
         // to the slot that does not hold the last durable meta (see
         // FlushBatchLocked) — guarantees one durable, self-consistent meta is
-        // always on disk. The caller-chosen `slot` is recomputed at flush time.
+        // always on disk. The slot is chosen at flush time.
         _pendingMeta = meta;
         if (++_commitsSinceFlush >= BatchedFlushInterval)
             return FlushBatchLocked();
         return {};
     }
 
-    // Fsync / None: write the caller's alternating slot immediately. In Fsync
-    // mode every commit is fsynced and the other slot still holds the prior
-    // durable meta, so a torn write never loses both. None never fsyncs.
-    if (auto const r = WriteSlotLocked(slot, meta); !r.has_value())
+    // Fsync / None: write immediately, to the slot that does NOT hold the last
+    // one we made durable -- the same choice `FlushBatchLocked` makes, and for
+    // the same reason. That is what leaves the previous meta standing, so a torn
+    // write here never loses both.
+    //
+    // This used to write a slot the CALLER passed, derived in
+    // `CowTree::CommitTxn` from `txnId mod 2`, and `_lastDurableSlot` was
+    // neither read nor updated on this path (#726). The parity agrees with the
+    // alternation only while nothing has disturbed it -- and a batched flush
+    // disturbs it as a matter of course, writing the last commit's id into the
+    // alternating slot. So on a store an ordinary batched daemon wrote, the
+    // first commit here after a one-slot recovery targeted the surviving slot
+    // and overwrote the only good meta page in the file. Measured before the
+    // fix: one valid slot after that commit where batched leaves two.
+    auto const target = OtherSlot(_lastDurableSlot);
+    if (auto const r = WriteSlotLocked(target, meta); !r.has_value())
         return std::unexpected(r.error());
     if (_options.durability == Durability::Fsync)
-        return Fsync(); // strict: every commit is durable
+    {
+        if (auto const r = Fsync(); !r.has_value()) // strict: every commit is durable
+            return std::unexpected(r.error());
+    }
+    // Only now, and on both paths: the write landed, so the next one must go to
+    // the other slot. Advancing it before the write would point recovery at a
+    // slot that may be half-written; not advancing it at all is the bug above,
+    // and under `None` it would additionally make every commit hammer one slot
+    // while the other kept a meta from before the process started.
+    _lastDurableSlot = target;
     return {};
+}
+
+auto FilePageStore::LastDurableSlot() const noexcept -> MetaSlot
+{
+    std::scoped_lock const lock { _ioMutex };
+    return _lastDurableSlot;
 }
 
 std::size_t FilePageStore::PageSize() const noexcept

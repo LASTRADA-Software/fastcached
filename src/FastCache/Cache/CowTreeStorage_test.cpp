@@ -1260,11 +1260,14 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
 /// @param path The store file.
 /// @return The opened store, or why it would not open.
 [[nodiscard]] std::expected<std::unique_ptr<FastCache::CowTreeStorage>, FastCache::StorageError> OpenDamaged(
-    std::filesystem::path const& path)
+    std::filesystem::path const& path,
+    CowTree::FilePageStore::Durability durability = CowTree::FilePageStore::Durability::Batched)
 {
-    // `Batched` is STATED rather than defaulted, even though it is the default,
+    // `Batched` is the DEFAULT here rather than a value each caller repeats,
     // because it decides the SHAPE of the store the meta-slot cases below are
-    // written against -- not merely a property they assert.
+    // written against -- not merely a property they assert. A case that reopens
+    // a seeded store under another durability passes one explicitly; the seed
+    // always uses this.
     //
     // Measured, seeding two sessions of five `Set`s at each durability:
     //
@@ -1279,8 +1282,7 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
     // earlier draft of this comment had backwards. It is that it would be red for
     // a store nobody meant to build, and stating the durability is what stops the
     // seed drifting out from under the rows.
-    return FastCache::CowTreeStorage::Open(
-        { .path = path, .durability = CowTree::FilePageStore::Durability::Batched, .pageSize = DamagePageSize });
+    return FastCache::CowTreeStorage::Open({ .path = path, .durability = durability, .pageSize = DamagePageSize });
 }
 
 /// Overwrite data page `id` of `store` with `page`.
@@ -1549,14 +1551,6 @@ constexpr int MetaDamageKeysPerGeneration = 5;
     return std::format("gen-{}-key-{:02}", gen, i);
 }
 
-/// The other meta slot.
-/// @param slot One slot.
-/// @return The one it alternates with.
-[[nodiscard]] constexpr CowTree::MetaSlot OtherSlot(CowTree::MetaSlot slot) noexcept
-{
-    return slot == CowTree::MetaSlot::A ? CowTree::MetaSlot::B : CowTree::MetaSlot::A;
-}
-
 /// Human-readable slot name for `INFO`/`CAPTURE`.
 /// @param slot The slot.
 /// @return "A" or "B".
@@ -1651,7 +1645,7 @@ void DamageMetaSlot(std::filesystem::path const& path, CowTree::MetaSlot slot)
     auto const damaged = DecodeSlot(after, slot);
     REQUIRE_FALSE(damaged.has_value());
     REQUIRE(damaged.error() == CowTree::CowTreeError::Corrupt);
-    REQUIRE(DecodeSlot(after, OtherSlot(slot)).has_value());
+    REQUIRE(DecodeSlot(after, CowTree::OtherSlot(slot)).has_value());
 }
 
 /// Redirects `std::cout` and `std::cerr` into buffers of its own for its
@@ -1742,7 +1736,7 @@ TEST_CASE("One damaged meta slot leaves the store open, silent, and on the survi
         INFO(row.what);
         TempFile tmp;
         auto const live = SeedTwoCommitGenerations(tmp.path);
-        auto const damaged = row.damageLive ? live : OtherSlot(live);
+        auto const damaged = row.damageLive ? live : CowTree::OtherSlot(live);
         CAPTURE(SlotName(damaged));
         DamageMetaSlot(tmp.path, damaged);
 
@@ -1793,59 +1787,80 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
     // Every case above stops at "the store opened", and a build that recovered
     // correctly and then overwrote the good slot passes all of them.
     //
-    // Scoped to `Batched`, which `OpenDamaged` STATES -- stated, not asserted:
-    // `CowTreeStorage` exposes no durability accessor, so there is nothing here
-    // to assert it against, and an earlier draft of this comment claimed
-    // otherwise.
+    // NOT scoped to a durability any more, and the un-scoping IS the #726
+    // regression test. It used to be `Batched`-only for a reason that turned out
+    // to be a defect rather than a design: under `Fsync` the slot came from
+    // `CowTree::CommitTxn`'s `txnId % 2`, which consulted nothing recovery had
+    // recorded, so a store whose parity an ordinary `Batched` run had broken --
+    // which is every store a daemon writes -- had its SURVIVING slot overwritten
+    // by the first commit after a degraded start. Measured then: one valid slot
+    // where `Batched` left two.
     //
-    // The scope matters because the claim is FALSE under `Fsync`. There the slot
-    // comes from `CowTree::CommitTxn`'s `txnId % 2`, which consults nothing
-    // recovery recorded, and a store whose slot parity an ordinary Batched run
-    // has broken then overwrites the SURVIVOR. Measured, on a store seeded
-    // exactly the way this fixture seeds one and reopened with
-    // `Durability::Fsync`: one valid slot afterwards where Batched leaves two,
-    // and two again from the SECOND commit, because that write restores the
-    // parity. `--storage-durability=fsync` is an operator-selectable flag, so it
-    // is reachable; #726 carries it.
-    for (auto const damageLive: { false, true })
+    // The alternation now belongs to the page store on every path, so both
+    // durabilities are asserted here. A regression re-scopes the property by
+    // turning a row RED rather than by quietly narrowing a comment, which is
+    // what the `Batched`-only version had already done once.
+    // `--storage-durability=fsync` is operator-selectable, which is what made
+    // this reachable in production rather than only in a fixture.
+    /// One row: what the REOPEN uses. The seed is always `Batched`, because that
+    /// is what leaves the one-slot-per-generation shape -- and what an ordinary
+    /// daemon leaves behind.
+    struct DurabilityRow
     {
-        INFO((damageLive ? "the live slot was the damaged one" : "the stale slot was the damaged one"));
-        TempFile tmp;
-        auto const live = SeedTwoCommitGenerations(tmp.path);
-        auto const damaged = damageLive ? live : OtherSlot(live);
-        auto const survivor = OtherSlot(damaged);
-        CAPTURE(SlotName(damaged));
-        DamageMetaSlot(tmp.path, damaged);
+        CowTree::FilePageStore::Durability durability; ///< What the reopen uses.
+        std::string_view what;                         ///< Which one, for `INFO`.
+    };
+    auto const durabilities = std::vector<DurabilityRow> {
+        { .durability = CowTree::FilePageStore::Durability::Batched, .what = "reopened Batched" },
+        { .durability = CowTree::FilePageStore::Durability::Fsync, .what = "reopened Fsync (#726)" },
+    };
 
-        auto const before = ReadWholeFile(tmp.path);
-        auto const survivorBefore = DecodeSlot(before, survivor);
-        REQUIRE(survivorBefore.has_value());
-        // One span, bound once: taking `begin()` from one temporary and `end()`
-        // from a second is well-defined here and is still a shape this file was
-        // just rewritten to stop containing.
-        auto const survivorView = SlotBytes(before, survivor);
-        std::vector<std::byte> const survivorPage { survivorView.begin(), survivorView.end() };
-
+    for (auto const& durabilityRow: durabilities)
+    {
+        for (auto const damageLive: { false, true })
         {
-            auto storage = OpenDamaged(tmp.path);
-            REQUIRE(storage.has_value());
-            REQUIRE((*storage)->Set("after-recovery", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            INFO(durabilityRow.what);
+            INFO((damageLive ? "the live slot was the damaged one" : "the stale slot was the damaged one"));
+            TempFile tmp;
+            auto const live = SeedTwoCommitGenerations(tmp.path);
+            auto const damaged = damageLive ? live : CowTree::OtherSlot(live);
+            auto const survivor = CowTree::OtherSlot(damaged);
+            CAPTURE(SlotName(damaged));
+            DamageMetaSlot(tmp.path, damaged);
+
+            auto const before = ReadWholeFile(tmp.path);
+            auto const survivorBefore = DecodeSlot(before, survivor);
+            REQUIRE(survivorBefore.has_value());
+            // One span, bound once: taking `begin()` from one temporary and `end()`
+            // from a second is well-defined here and is still a shape this file was
+            // just rewritten to stop containing.
+            auto const survivorView = SlotBytes(before, survivor);
+            std::vector<std::byte> const survivorPage { survivorView.begin(), survivorView.end() };
+
+            {
+                // Seeded `Batched` above -- so under the `Fsync` row this is exactly
+                // the mixed sequence #726 was about: a store an ordinary daemon
+                // wrote, reopened with the durability an operator picks for safety.
+                auto storage = OpenDamaged(tmp.path, durabilityRow.durability);
+                REQUIRE(storage.has_value());
+                REQUIRE((*storage)->Set("after-recovery", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            }
+
+            auto const after = ReadWholeFile(tmp.path);
+
+            // Byte-for-byte, not "still decodes": a slot rewritten with an equally
+            // valid meta would decode fine and would still have been the one spent.
+            auto const survivorAfter = SlotBytes(after, survivor);
+            REQUIRE(std::ranges::equal(survivorPage, survivorAfter));
+
+            // And the other half, which is what makes the first mean something: the
+            // commit did land somewhere, in the slot that was already damaged, and
+            // it is newer than what the store recovered from. Without this a build
+            // that wrote no meta at all would pass.
+            auto const repaired = DecodeSlot(after, damaged);
+            REQUIRE(repaired.has_value());
+            REQUIRE(repaired->txnId > survivorBefore->txnId);
         }
-
-        auto const after = ReadWholeFile(tmp.path);
-
-        // Byte-for-byte, not "still decodes": a slot rewritten with an equally
-        // valid meta would decode fine and would still have been the one spent.
-        auto const survivorAfter = SlotBytes(after, survivor);
-        REQUIRE(std::ranges::equal(survivorPage, survivorAfter));
-
-        // And the other half, which is what makes the first mean something: the
-        // commit did land somewhere, in the slot that was already damaged, and
-        // it is newer than what the store recovered from. Without this a build
-        // that wrote no meta at all would pass.
-        auto const repaired = DecodeSlot(after, damaged);
-        REQUIRE(repaired.has_value());
-        REQUIRE(repaired->txnId > survivorBefore->txnId);
     }
 }
 

@@ -131,7 +131,9 @@ class FilePageStore final: public IPageStore
 
     [[nodiscard]] auto ReadMeta(MetaSlot slot) const -> std::expected<Meta, CowTreeError> override;
 
-    [[nodiscard]] auto WriteMeta(MetaSlot slot, Meta const& meta) -> std::expected<void, CowTreeError> override;
+    [[nodiscard]] auto WriteMeta(Meta const& meta) -> std::expected<void, CowTreeError> override;
+
+    [[nodiscard]] auto LastDurableSlot() const noexcept -> MetaSlot override;
 
     [[nodiscard]] auto PageSize() const noexcept -> std::size_t override;
 

@@ -105,12 +105,27 @@ TEST_CASE("WriteMeta+ReadMeta round-trip", "[pagestore][meta]")
     m.pageSize = static_cast<std::uint32_t>(store.PageSize());
     m.txnId = 17;
     m.root = CowTree::PageId { 3 };
-    REQUIRE(store.WriteMeta(CowTree::MetaSlot::B, m).has_value());
+    REQUIRE(store.WriteMeta(m).has_value());
 
-    auto loaded = store.ReadMeta(CowTree::MetaSlot::B);
+    // Read back from the slot the STORE says it wrote, rather than from one this
+    // case picked: since #726 the alternation is the store's and `WriteMeta`
+    // takes no slot, so a hard-coded `B` here would be asserting a choice the
+    // caller no longer makes. `A` is the seeded durable slot, so this lands in B
+    // -- but that is derived, not assumed.
+    REQUIRE(store.LastDurableSlot() == CowTree::MetaSlot::B);
+    auto loaded = store.ReadMeta(store.LastDurableSlot());
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->txnId == 17U);
     REQUIRE(loaded->root.value == 3U);
+
+    // And the alternation itself, which nothing asserted before: a second write
+    // must not land on the one just made durable.
+    m.txnId = 18;
+    REQUIRE(store.WriteMeta(m).has_value());
+    REQUIRE(store.LastDurableSlot() == CowTree::MetaSlot::A);
+    auto const kept = store.ReadMeta(CowTree::MetaSlot::B);
+    REQUIRE(kept.has_value());
+    REQUIRE(kept->txnId == 17U);
 }
 
 TEST_CASE("FailNthWrite injects exactly once", "[pagestore][fault]")
@@ -141,7 +156,11 @@ TEST_CASE("TornOnNthWriteMeta zeroes the slot, then fails", "[pagestore][fault]"
     CowTree::Meta m;
     m.pageSize = static_cast<std::uint32_t>(store.PageSize());
     m.txnId = 1;
-    REQUIRE(store.WriteMeta(CowTree::MetaSlot::A, m).has_value());
+    REQUIRE(store.WriteMeta(m).has_value());
+    // Lands in B, the store having been seeded with A durable. Read back rather
+    // than assumed, because everything below is about which slot the torn write
+    // then takes.
+    REQUIRE(store.LastDurableSlot() == CowTree::MetaSlot::B);
 
     // The 1st WriteMeta succeeded already; arm a torn-write on the next one.
     CowTree::InMemoryPageStore::FaultPlan plan;
@@ -149,15 +168,23 @@ TEST_CASE("TornOnNthWriteMeta zeroes the slot, then fails", "[pagestore][fault]"
     store.SetFaultPlan(plan);
 
     m.txnId = 2;
-    auto torn = store.WriteMeta(CowTree::MetaSlot::B, m);
+    auto torn = store.WriteMeta(m);
     REQUIRE_FALSE(torn.has_value());
 
     // The torn slot is unreadable (CRC failure) while the other survives.
     auto a = store.ReadMeta(CowTree::MetaSlot::A);
     auto b = store.ReadMeta(CowTree::MetaSlot::B);
-    REQUIRE(a.has_value());
-    REQUIRE(a->txnId == 1U);
-    REQUIRE_FALSE(b.has_value());
+    REQUIRE_FALSE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(b->txnId == 1U);
+
+    // And a failed write does not advance the alternation, so the NEXT attempt
+    // retries the slot that was torn instead of stepping over the intact one --
+    // which is the whole reason the previous meta is still there to fall back to.
+    REQUIRE(store.LastDurableSlot() == CowTree::MetaSlot::B);
+    m.txnId = 3;
+    REQUIRE(store.WriteMeta(m).has_value());
+    REQUIRE(store.LastDurableSlot() == CowTree::MetaSlot::A);
 }
 
 TEST_CASE("SyncData fault injection", "[pagestore][fault]")
