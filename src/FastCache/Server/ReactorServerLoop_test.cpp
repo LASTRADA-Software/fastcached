@@ -16,16 +16,21 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
+
+#include <tests/Unwrap.hpp>
 
 TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is configured",
           "[server][reactor-loop][tls-null-guard]")
@@ -305,6 +310,46 @@ constexpr std::string_view ArmedMarker = "acceptor armed";
     return port;
 }
 
+/// The `(armed/expected)` progress an `acceptor armed` record carries.
+struct ArmProgress
+{
+    std::size_t armed { 0 };    ///< How many had armed when this line was written.
+    std::size_t expected { 0 }; ///< How many were registered to arm.
+};
+
+/// Read the trailing `(n/m)` off an `acceptor armed` record.
+///
+/// The point is to take the participant count FROM THE RUNNING PROCESS rather than
+/// restate it here. How many participants a startup has is platform-specific -- on
+/// POSIX the multi-reactor path arms one accept loop per (reactor, bind) pair, and
+/// on Windows it arms one per acceptor THREAD plus one per IOCP reactor, because
+/// there a handed-off connection is served by the reactor rather than by the
+/// acceptor. A test that hard-codes either number is a second place the arithmetic
+/// lives, and it was wrong: `armed.size() == 2` passed on Linux and failed on all
+/// three Windows legs with `3 == 2`, which is exactly the defect the production
+/// change had just been reworked to remove.
+/// @param message An `acceptor armed: X (n/m)` log message.
+/// @return The pair, or nullopt when the message does not carry one.
+[[nodiscard]] std::optional<ArmProgress> ArmProgressOf(std::string_view message)
+{
+    auto const open = message.rfind('(');
+    auto const slash = message.rfind('/');
+    auto const close = message.rfind(')');
+    if (open == std::string_view::npos || slash == std::string_view::npos || close == std::string_view::npos)
+        return std::nullopt;
+    if (!(open < slash && slash < close))
+        return std::nullopt;
+
+    ArmProgress progress;
+    auto const armed = message.substr(open + 1, slash - open - 1);
+    auto const expected = message.substr(slash + 1, close - slash - 1);
+    if (std::from_chars(armed.data(), armed.data() + armed.size(), progress.armed).ec != std::errc {})
+        return std::nullopt;
+    if (std::from_chars(expected.data(), expected.data() + expected.size(), progress.expected).ec != std::errc {})
+        return std::nullopt;
+    return progress;
+}
+
 /// Everything one end-to-end run of `RunReactorServer` observed.
 struct ServerRun
 {
@@ -326,6 +371,36 @@ struct ServerRun
         if (records[index].message.contains(needle))
             found.push_back(index);
     return found;
+}
+
+/// Assert that the readiness line came after every acceptor armed, and that the
+/// set of acceptors was complete when it did.
+///
+/// Non-emptiness is asserted as well as the ordering, because an ordering over an
+/// empty set of arms holds vacuously -- which is what these cases would degenerate
+/// into if the arms stopped being logged. The SIZE is then checked against what the
+/// announcer reported rather than against a literal, so the property is "every
+/// participant that registered has armed" on any platform.
+/// @param log The run's records, in order.
+/// @return Nothing; fails the active case on violation.
+void CheckArmedBeforeReady(std::vector<FastCache::CapturingLogger::Record> const& log)
+{
+    auto const ready = IndicesContaining(log, ReadyMarker);
+    auto const armed = IndicesContaining(log, ArmedMarker);
+
+    REQUIRE(ready.size() == 1);
+    REQUIRE_FALSE(armed.empty());
+    // The property #646 is about.
+    CHECK(armed.back() < ready.front());
+
+    // And the set was closed and fully armed, taken from the announcer's own last
+    // progress line rather than from a count restated here.
+    auto const progress = ArmProgressOf(log[armed.back()].message);
+    REQUIRE(progress.has_value());
+    auto const& last = FastCache::Testing::Unwrap(progress);
+    CHECK(last.expected != 0);
+    CHECK(last.armed == last.expected);
+    CHECK(armed.size() == last.expected);
 }
 
 /// Run `RunReactorServer` on a background thread until it announces readiness,
@@ -401,15 +476,13 @@ TEST_CASE("RunReactorServer announces readiness only after every accept loop is 
     REQUIRE(run.sawReady);
     CHECK(run.exitCode == EXIT_SUCCESS);
 
+    CheckArmedBeforeReady(run.log);
+
     auto const ready = IndicesContaining(run.log, ReadyMarker);
-    auto const armed = IndicesContaining(run.log, ArmedMarker);
-    REQUIRE(ready.size() == 1);
-    // One per bind. A count is asserted as well as the order, because an ordering
-    // over an empty set of arms holds vacuously -- which is what this test would
-    // have degenerated into had the arms stopped being logged.
-    REQUIRE(armed.size() == 2);
-    CHECK(armed.back() < ready.front());
     CHECK(run.log[ready.front()].level == FastCache::LogLevel::Info);
+    // The single-reactor path arms one accept loop per bind on every platform, so
+    // this figure is the same everywhere and is the endpoint summary rather than a
+    // participant count.
     CHECK(run.log[ready.front()].message.contains("2 bind(s)"));
 }
 
@@ -428,11 +501,12 @@ TEST_CASE("RunReactorServer waits for every reactor's accept loops before announ
     REQUIRE(run.sawReady);
     CHECK(run.exitCode == EXIT_SUCCESS);
 
+    CheckArmedBeforeReady(run.log);
+
+    // The endpoint summary, which is what the operator reads. How many PARTICIPANTS
+    // that took is platform-specific and is asserted against the announcer's own
+    // figure inside the helper above, never against a literal here.
     auto const ready = IndicesContaining(run.log, ReadyMarker);
-    auto const armed = IndicesContaining(run.log, ArmedMarker);
-    REQUIRE(ready.size() == 1);
-    REQUIRE(armed.size() == 2);
-    CHECK(armed.back() < ready.front());
     CHECK(run.log[ready.front()].message.contains("1 bind(s) x 2 reactors"));
 }
 
@@ -491,8 +565,7 @@ TEST_CASE("RunReactorServer reports a bind it cannot make at Error and refuses t
     CHECK(IndicesContaining(records, ReadyMarker).empty());
 }
 
-TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed",
-          "[server][reactor-loop][readiness]")
+TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed", "[server][reactor-loop][readiness]")
 {
     // The guard inside the helper, shown refusing. This is the one branch of the
     // readiness path the end-to-end cases above cannot reach: they bind real
@@ -554,4 +627,68 @@ TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed
         CHECK(records[index].level == FastCache::LogLevel::Error);
         CHECK(records[index].message.contains("not being served"));
     }
+}
+
+TEST_CASE("The readiness ordering check holds for both platforms' participant shapes", "[server][reactor-loop][readiness]")
+{
+    // The two end-to-end cases above can only ever run this machine's shape, and the
+    // shapes genuinely differ: POSIX arms one accept loop per (reactor, bind) pair,
+    // Windows arms one per acceptor THREAD plus one per IOCP reactor. A count written
+    // into the test therefore passes on the platform it was written on and fails on
+    // the other -- which is not hypothetical, it is what happened: `armed.size() == 2`
+    // was green on Linux and failed all three Windows legs with `3 == 2`.
+    //
+    // So the DECISION is exercised against a synthesised record set for each shape,
+    // the way `node-scratch-isolation-e2e`'s verdict was split out from its
+    // acquisition. Nothing here starts a server; what is under test is that the
+    // ordering check is blind to how many participants a platform has.
+    auto record = [](FastCache::LogLevel level, std::string message) {
+        return FastCache::CapturingLogger::Record { .level = level, .message = std::move(message) };
+    };
+
+    SECTION("POSIX: one accept loop per (reactor, bind) pair")
+    {
+        // 2 reactors x 1 bind.
+        CheckArmedBeforeReady({
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 bind 0 (1/2)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 bind 0 (2/2)"),
+            record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
+        });
+    }
+
+    SECTION("Windows: one per acceptor thread plus one per IOCP reactor")
+    {
+        // 1 acceptor thread + 2 reactors = 3, which is the count that broke the
+        // literal. The reactors arm last here because their `Run()` is entered after
+        // the acceptor threads are spawned.
+        CheckArmedBeforeReady({
+            record(FastCache::LogLevel::Debug, "acceptor armed: acceptor thread 0 (1/3)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 1 (2/3)"),
+            record(FastCache::LogLevel::Debug, "acceptor armed: reactor 0 (3/3)"),
+            record(FastCache::LogLevel::Info, "ready, accepting connections (1 bind(s) x 2 reactors)"),
+        });
+    }
+}
+
+TEST_CASE("ArmProgressOf reads the announcer's own figures and refuses what it cannot", "[server][reactor-loop][readiness]")
+{
+    // The helper the check above leans on. It must not answer a number for a line it
+    // did not understand: a silent `0/0` would make the completeness assertion pass
+    // vacuously, which is the failure mode of concluding from a parse nobody checked.
+    auto const good = ArmProgressOf("acceptor armed: reactor 0 bind 1 (2/8)");
+    REQUIRE(good.has_value());
+    CHECK(FastCache::Testing::Unwrap(good).armed == 2);
+    CHECK(FastCache::Testing::Unwrap(good).expected == 8);
+
+    // A participant name containing parentheses must not shift the reading: the
+    // progress is the LAST parenthesised group, and that is what `rfind` gives.
+    auto const awkward = ArmProgressOf("acceptor armed: reactor (odd) bind 0 (1/1)");
+    REQUIRE(awkward.has_value());
+    CHECK(FastCache::Testing::Unwrap(awkward).armed == 1);
+    CHECK(FastCache::Testing::Unwrap(awkward).expected == 1);
+
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0").has_value());
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (2)").has_value());
+    CHECK_FALSE(ArmProgressOf("acceptor armed: reactor 0 bind 0 (x/y)").has_value());
+    CHECK_FALSE(ArmProgressOf("ready, accepting connections (2 bind(s))").has_value());
 }
