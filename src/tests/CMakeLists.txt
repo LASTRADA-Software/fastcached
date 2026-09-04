@@ -670,9 +670,23 @@ if(NOT WIN32)
     )
     # It stages several deliberate timeouts of a couple of seconds each and one
     # four-second wait that must really take four seconds -- the check that the
-    # bound comes from a clock rather than from an iteration count. Well inside
-    # 120s, and bounded so a helper that stops being bounded reports here rather
-    # than as a suite timeout naming nothing.
+    # bound comes from a clock rather than from an iteration count. Bounded so a
+    # helper that stops being bounded reports here rather than as a suite timeout
+    # naming nothing.
+    #
+    # MEASURED, so that a timeout here is diagnosable rather than a guess (#678
+    # was reported as one failure in four runs with no output captured, and a
+    # ctest timeout and a failed assertion are indistinguishable from the count
+    # alone). On a 32-core Linux host, local ext4:
+    #
+    #     idle                       34s
+    #     load average ~44, 20 runs  35s worst
+    #
+    # So the cost is almost entirely the deliberate SLEEPS, which is why CPU
+    # contention barely moves it: 3.5x headroom against this bound, and a run
+    # that approaches 120s means something other than a busy machine. A figure
+    # here rather than "well inside": #665 is the same shape, a registration's
+    # stated cost against its measured one.
     set_tests_properties("e2e-helpers-selftest" PROPERTIES
         LABELS "hygiene"
         TIMEOUT 120
