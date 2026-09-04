@@ -898,6 +898,19 @@ error one level up — a general claim standing in for a specific one.
   `git rev-parse HEAD` in the directory you searched — before reporting a contradiction
   as a fact. It happened twice in one night, both times in the same direction.
 
+**The general form, and it is the one worth carrying away.** "A SIGTERM does not take
+55 seconds to arrive" was offered as evidence in an incident review. It is true of
+`local-gate.sh` — and *only* because that script traps `EXIT` and not `TERM`. bash
+defers a **trapped** signal until the running foreground command returns, so a signal
+trap on the same line would have made a TERM at second four produce a death at second
+sixty-nine, and `143` is what bash reports either way. The general claim and the
+specific one point opposite directions, and nothing about the general one advertises
+that it does not apply. **Check the claim against the tool in front of you, not
+against how tools of that kind behave.** Every finding in both sections is an instance
+of this: a pipeline's exit code, a `.` in a pattern, a `cwd`, an unset git timeout, a
+signal disposition — each one a fact somebody knew generally and did not verify
+locally.
+
 ## A probe's result is only evidence if the probe could have produced the other one
 
 The two sections above are about an instrument reporting on the wrong tree, and about
@@ -937,18 +950,35 @@ you to describe it — and the second is where a bounded fault becomes an unboun
 sentence. The storage-side instance is in
 [`storage.md`](storage.md); the general form is here.
 
-**The general form, and it is the one worth carrying away.** "A SIGTERM does not take
-55 seconds to arrive" was offered as evidence in an incident review. It is true of
-`local-gate.sh` — and *only* because that script traps `EXIT` and not `TERM`. bash
-defers a **trapped** signal until the running foreground command returns, so a signal
-trap on the same line would have made a TERM at second four produce a death at second
-sixty-nine, and `143` is what bash reports either way. The general claim and the
-specific one point opposite directions, and nothing about the general one advertises
-that it does not apply. **Check the claim against the tool in front of you, not
-against how tools of that kind behave.** Every finding in both sections is an instance
-of this: a pipeline's exit code, a `.` in a pattern, a `cwd`, an unset git timeout, a
-signal disposition — each one a fact somebody knew generally and did not verify
-locally.
+## A correction is a search, not a recollection
+
+The section above is about acquiring evidence. This one is about **repairing a claim
+after you have it**, which fails its own way: a wrong statement is rarely written down
+once, and the copies you can list are not the copies that exist.
+
+**A claim corrected in the places you remember writing it is not corrected.** One false
+sentence about the `fsync` exposure above went into an issue body, a pull request that
+another session then merged, and a rulebook paragraph. Two were fixed from memory; the
+third survived, and survived a rebase, because it was never re-read — `grep -n "hammer"`
+found it in four seconds after recollection had already failed twice. So the fix is a
+search over the tree and the tracker, not a list of the places you think you touched.
+
+**And a search is only as good as its pattern.** The follow-up search for surviving
+copies came back clean, correctly — but the same session's check for the **corrected**
+text also came back empty, which was impossible, since it had merged that text itself.
+The content was there and the pattern could not reach it: the prose is line-wrapped and
+carries markdown emphasis *inside* the phrase, so no phrase-grep matches it.
+
+```
+So on `fsync` the dangerous moment is the **first write after a degraded
+start**, not the indefinite future.
+```
+
+That is the census rule from [`testing.md`](testing.md) — a zero that was expected, and
+therefore never questioned — arriving in prose rather than in a test count. **Give a
+search that returns nothing a positive control**: find one instance by other means and
+check the pattern sees it. On wrapped markdown, match a single distinctive word, or
+strip the wrapping first; never a phrase that spans a newline or a `**`.
 
 ## A comment can be true in its premise and false in its conclusion
 
