@@ -1140,6 +1140,36 @@ what differs between compilers, standard libraries, hosts and tool versions.
   stops early must not look like one that judged something**: `set -e` plus a generator ending in
   `[[ ... ]] && echo` truncated a run at eight cases with no case named, so the self-tests print how many cases
   they ran.
+- A bracket-vulnerable `cmake -P` reader is judged per **(reader, file, surviving lines)** and never per
+  script, because the verdict flips on the corpus alone. Measured over the six remaining `file(STRINGS)`
+  readers by injecting one `]` into a comment on a line the reader KEEPS: `tsan-scope` and
+  `node-config-reference` refuse (LOUD), `net-boundary` passed over a REAL cross-boundary include and
+  `psk-signing-seam` counted 15 `HmacSha256` calls as 14 and still passed (both SILENT), `vslang-probe-only`
+  is unchanged **by coincidence** — every file it reads holds exactly one matching line, so there is no second
+  element to merge with — and only `script-check-signals`'s `LIMIT_COUNT 1` is safe for a reason. A reader left
+  alone because today's files happen to be safe is a defect scheduled for later.
+- **And the usual remedy is wrong where the brackets are the DATA.** Blanking `[`/`]` before splitting made
+  `check-tsan-scope` report its table as naming no Catch2 tags at all — a tag IS `[async]` — and refuse on a
+  good tree; measured, because it was the first attempt. That reader is a list-free `FIND`/`SUBSTRING` walk
+  instead, immune by construction. Consolidating the five-plus copies of the splitting idiom is **#495**, not
+  the ticket in front of you: `check-glob-traversals.cmake` says so in its own comment, and absorbing it closes
+  one ticket by swallowing another.
+- **`if(VAR STREQUAL "")` does not fire when VAR is UNSET**, and the one place that matters is a glob that came
+  back empty: `set(x ${empty})` unsets `x`, and CMake then reads the left operand as the literal string `x`.
+  `check-net-boundary`'s empty-directory guard — its own comment calls it *"the one failure mode a boundary test
+  must not be allowed to have"* — could therefore never fire, and it reported "0 source(s) … reach only
+  themselves" over a tree with no sources. Quote the variable. Siblings assigned by `set(x "")` are fine, which
+  is why only one instance broke.
+- **A clean-tree injection understates a check that only reports violations**, so plant the violation. On a
+  clean tree everything a merged element swallows is something the check had nothing to say about, and nothing
+  changes at all — which is how #518 classified `net-boundary` as merely PARTIAL. Three arms, and the third is
+  not decoration: violation alone, violation behind a bracket, bracket alone. Without the last, a check that
+  refused every bracket would pass the middle one for the wrong reason.
+- **A count in a ticket decays like any other measurement.** #510's "only 4 of 16" matches nothing on its own
+  cited ref — 20 files, 18 non-selftest, 13 content-readers — and two audits disagreed by exactly one until the
+  cause was found: an unanchored `grep 'check-.*\.cmake$'` also matches `script-check-canary.cmake`, which the
+  glob `scripts/check-*.cmake` does not. The `pkill -f` lesson in a `grep`. **A census states its pattern, not
+  only its number**, and a ticket cannot be closed against a count that no longer describes the tree.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
