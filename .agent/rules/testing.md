@@ -833,6 +833,34 @@ This is the third shape of one family, and the other two are recorded in
 pipe's status so a failed build reads as a passing one. There the query ran and its
 status was misread; here **the query never ran at all**.
 
+**And a failed query does not only MISS a finding — it can invent one, which is the
+worse direction and the one that gets acted on.** Measured on `gh issue view`, which a
+rulebook-staleness checker would resolve entries with:
+
+```
+number resolves to nothing   exit=1  stdout=0B   stderr: Could not resolve to an issue ...
+repository does not exist    exit=1  stdout=0B   stderr: Could not resolve to a Repository ...
+not a number at all          exit=1  stdout=0B   stderr: invalid issue format: "not-a-number"
+a real issue (control)       exit=0  stdout=29B  stderr: —
+```
+
+Three faults, one exit status, one empty stdout — and **two of the three are faults in
+the checker's own invocation**: a wrong `--repo`, a network failure, an expired
+credential. A checker reading `exit != 0` as *this entry names a dead issue* therefore
+reports a stale rulebook entry when its own argument was wrong, and somebody then
+**edits a correct entry to satisfy a broken check**. Missing a finding costs a defect;
+inventing one costs a correct file.
+
+So such a checker has **four** outcomes, not two — pass, stale, bad reference, and
+*could not run* — which is *skipped, absent, unstarted and failed* arriving inside the
+tool written to enforce this rulebook. Prefer a route whose transport separates them:
+`gh api repos/{owner}/{repo}/issues/N` answers with an HTTP status and hands back the
+`pull_request` key in the same call, which also settles *is this number an issue or a
+pull request* without a second request. And the suite needs a case for it: **a
+deliberately broken invocation that must report `could not run` and must NOT report a
+stale entry.** Nothing else proves the checker does not blame its subject for its own
+faults.
+
 The same rule reaches a measurement, where its direction is worth stating because it
 is not symmetric. A counted loop that reports *N failures out of N* may be measuring
 a subject that was never invoked — a stale binary, a mistyped filter, a case that no
