@@ -346,6 +346,161 @@ curl http://host:9259/metrics    # Prometheus text exposition
 curl http://host:9259/healthz    # 200 OK
 ```
 
+If the endpoint cannot be bound the daemon **carries on serving the cache without
+it**, and says so at `Warn`. That is deliberate: the admin surface is a scrape and
+probe convenience rather than the service. `fastcache-compile-node` answers the same
+failure by refusing to start, because an operator who asked a *worker* for an
+endpoint is almost always wiring a probe to it.
+
+### The series `fastcached` exports
+
+Every counter in the build is exported by every process that serves this endpoint,
+without exception — a per-counter "does this apply?" predicate is exactly the
+mechanism that once left seven of nine live counters unexported. So a `fastcached`
+scrape also carries the `fastcache_worker_*`, `fastcache_node_*` and
+`fastcache_scheduler_*` series, and on a daemon they are **flat at zero**: nothing
+in this binary moves them. They belong to
+[`fastcache-compile-node`](../tools/fastcache-compile-node.md), which documents
+them. Read a zero there as *this process produces no such events*, never as *this
+process has no such subsystem* — a cumulative counter cannot tell you which, which
+is why the things that genuinely can be absent (`fastcached_items` and the whole
+storage block on a process with no cache, a `tier` a cache does not have) are
+omitted from the exposition instead of reported as `0`.
+
+The same reading applies inside the daemon's own namespace: the
+`fastcached_dispatch_*` block below is the fleet scheduler's, and the scheduler is
+`fastcache-compile-node --serve-scheduler`. The `fastcached_` prefix on it is
+historical.
+
+#### Command traffic
+
+Present only when the process has a cache, which for `fastcached` is always.
+
+| Series | Says |
+|---|---|
+| `fastcached_cmd_get_total` | GET commands processed. |
+| `fastcached_cmd_set_total` | SET-family commands processed. |
+| `fastcached_cmd_touch_total` | TOUCH commands processed. |
+| `fastcached_cmd_flush_total` | FLUSH commands processed. |
+| `fastcached_get_hits_total` | GETs that found a live entry. With the misses below, this is the hit ratio. |
+| `fastcached_get_misses_total` | GETs that found nothing. |
+| `fastcached_delete_hits_total` | DELETEs that removed an entry. |
+| `fastcached_delete_misses_total` | DELETEs with no matching key. |
+| `fastcached_incr_hits_total` | INCRs against a present key. |
+| `fastcached_incr_misses_total` | INCRs with no matching key. |
+| `fastcached_decr_hits_total` | DECRs against a present key. |
+| `fastcached_decr_misses_total` | DECRs with no matching key. |
+| `fastcached_touch_hits_total` | TOUCHes against a present key. |
+| `fastcached_touch_misses_total` | TOUCHes with no matching key. |
+| `fastcached_cas_hits_total` | CAS requests that matched and stored. |
+| `fastcached_cas_misses_total` | CAS requests with no matching key. |
+| `fastcached_cas_badval_total` | CAS requests refused on a token mismatch — a real write conflict, not a missing key. |
+
+#### Capacity and what the cache is holding
+
+| Series | Says |
+|---|---|
+| `fastcached_items` | Live entries currently stored. A gauge. |
+| `fastcached_bytes_used` | Bytes currently stored. A gauge. |
+| `fastcached_bytes_limit` | The configured byte budget; `0` means unbounded. A gauge. |
+| `fastcached_evictions_total` | Entries dropped to stay inside that budget. Sustained evictions with a falling hit ratio mean the working set no longer fits. |
+| `fastcached_evicted_unfetched_total` | Entries evicted before ever being read — capacity spent on values nobody wanted. |
+| `fastcached_expired_unfetched_total` | Entries that lapsed before ever being read. |
+| `fastcached_write_errors_total` | Value writes that failed to persist: a full disk, an I/O error, a read-only mount, a damaged store. **This one is about the disk.** See [When a store reports Corrupt](corrupt-store.md). |
+
+#### Per tier
+
+Emitted once per tier the cache actually has, each sample carrying a
+`tier="memory"` or `tier="disk"` label. A tier this cache does not have contributes
+**no line at all** rather than a zero: `fastcached_tier_items{tier="disk"} 0` says a
+disk tier is standing empty, and a memory-only daemon has no such tier to be empty.
+
+Nothing here is a total waiting to be summed. The memory tier mirrors what it reads
+out of the disk tier, so adding the item counts double-counts; the disk tier is
+consulted only when memory missed, so the hit/miss split is deliberately *not*
+published per tier and stays on the unlabelled series above.
+
+| Series | Says |
+|---|---|
+| `fastcached_tier_items` | Live entries this tier holds. |
+| `fastcached_tier_bytes_used` | Bytes this tier holds. |
+| `fastcached_tier_bytes_limit` | This tier's own byte budget; `0` means unbounded. |
+| `fastcached_tier_evictions_total` | Entries this tier dropped to stay within its budget. |
+| `fastcached_tier_index_bytes` | Resident memory this tier spends on its key index — always RAM, even for a disk tier. |
+
+#### Expiry
+
+| Series | Says |
+|---|---|
+| `fastcached_expiry_cycles_total` | Sweeps the active expiry cycle has run. Flat on a daemon serving traffic means the cycle is disabled (`--expiry-interval=0`) or wedged, which otherwise looks exactly like nothing having expired. |
+| `fastcached_expiry_keys_reclaimed_total` | Entries that cycle reclaimed — keys that lapsed and that nothing would have touched again, so no other path would ever have freed them. |
+| `fastcached_keyspace_reclaim_events_dropped_total` | Reclaimed keys whose `expired`/`evicted` keyspace event was never published, because one call reclaimed more at once than the notification buffer holds. Any rise means a subscriber's view is incomplete. |
+
+#### Connections
+
+| Series | Says |
+|---|---|
+| `fastcached_connections_total` | Connections accepted since start. |
+| `fastcached_connections_rejected_total` | Connections refused by admission control (`--max-connections`). |
+| `fastcached_connections_total_tls` | The subset of `fastcached_connections_total` that arrived on a TLS-flagged bind. Plaintext traffic is the difference between the two. |
+| `fastcached_connections_rejected_tls` | The TLS subset of the rejections. |
+
+#### The compile-cache (`0xFC`) surface
+
+What `fastcache-cc` and `fastcache-compile-node` talk to this daemon with. These are
+the daemon's own counters, and they are **not** the node's identically-shaped
+`fastcache_node_cache_*` series: a mixed fleet moves both, and watching only the
+node's reads a fleet mid-upgrade as one that has converged.
+
+| Series | Says |
+|---|---|
+| `fastcached_cache_stores_refused_foreign_generation_total` | A `STORE` whose value names a canonicalization generation this build does not implement. A rise names a rolling upgrade in progress; it stopping names one that finished. Flat at zero unless the fleet spans a `CompileValueVersion` bump, so any rise is a real event. The node's twin is `fastcache_node_cache_requests_refused_foreign_generation_total` — watch **both**. |
+| `fastcached_cache_stores_refused_not_a_compile_value_total` | A `STORE` whose value is not a compile value at all. Distinct from `fastcached_cache_malformed_values_total`, which is the memcached and Redis path's answer for a set or stream contradicting its own flags. |
+| `fastcached_cache_stores_failed_total` | A `STORE` that reached the engine and could not be written: a full disk, a read-only mount, a backend refusing writes. The only arm of this surface that is about **this machine** rather than its clients. |
+| `fastcached_cache_malformed_values_total` | A stored value that did not decode as the type its flags claim. **Not** a disk signal — the store is intact and every record still verifies. |
+| `fastcached_cache_frames_refused_unsupported_version_total` | A frame naming a protocol version this build does not serve. During a rollout this tracks the rollout; afterwards it names a machine nobody upgraded. |
+| `fastcached_cache_frames_refused_unknown_opcode_total` | A frame naming an opcode this build has no row for. A scanner, or a client speaking something else entirely at this port. |
+| `fastcached_cache_frames_refused_payload_too_large_total` | A frame refused before its payload was read, for declaring more than the session cap or the verb's own ceiling allows. The cheapest probe there is. |
+| `fastcached_cache_frames_refused_malformed_payload_total` | A payload that did not decode as the verb it named — two ends that agree on the framing and disagree about what goes inside it. |
+| `fastcached_cache_frames_refused_unauthenticated_total` | A verb attempted on a connection that never authenticated: a client that has not learned it needs a credential, rather than one presenting a wrong credential. |
+| `fastcached_cache_frames_refused_malformed_credential_total` | An `AUTH` payload that did not decode. Counted apart from ordinary malformed payloads because garbage aimed at the credential verb is what a scanner produces. |
+| `fastcached_cache_credentials_rejected_total` | A credential presented and **refused**. Any sustained rise names somebody guessing. |
+
+#### Fleet dispatch
+
+The fleet scheduler's series. `fastcached` runs no scheduler, so **on a daemon these
+are flat at zero**; they move on `fastcache-compile-node --serve-scheduler`, and
+[Distributed compilation](../getting-started/distributed-compilation.md#confirming-it-works)
+is where they are explained one by one.
+
+| Series | Says |
+|---|---|
+| `fastcached_dispatch_leases_granted_total` | Work is being distributed. |
+| `fastcached_dispatch_leases_released_total` | Clients are reporting their jobs done. |
+| `fastcached_dispatch_leases_no_worker_total` | The fleet is misconfigured — workers are up but nobody matches. |
+| `fastcached_dispatch_leases_no_capacity_total` | The fleet is too small. |
+| `fastcached_dispatch_leases_withdrawn_total` | The fleet is unavailable — slots free on paper, machines busy elsewhere. |
+| `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. |
+| `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job and the keys it was building were freed. |
+| `fastcached_dispatch_leases_unauthorized_total` | A lease token this cluster never signed was handed back. |
+| `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
+| `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. |
+| `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was admitted while advertising an endpoint whose host is not the address it connected from. |
+| `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. |
+| `fastcached_dispatch_frames_refused_unsupported_version_total` | A peer built against another release of the wire. |
+| `fastcached_dispatch_frames_refused_unknown_opcode_total` | A frame naming a verb no build has. |
+| `fastcached_dispatch_frames_refused_not_permitted_total` | A verb that exists and is served on a different port. |
+| `fastcached_dispatch_frames_refused_truncated_total` | A frame whose header disagreed with what arrived. Never sum it with a malformed-payload series. |
+
+#### Process
+
+| Series | Says |
+|---|---|
+| `fastcached_uptime_seconds` | Seconds since this process started. A gauge; a reset is a restart. |
+
+This table is checked against the exposition the daemon actually renders — see
+`MetricsDocumentation_test.cpp`, which fails in both directions.
+
 ## Kubernetes
 
 A minimal Deployment with probes and a Prometheus scrape annotation:
