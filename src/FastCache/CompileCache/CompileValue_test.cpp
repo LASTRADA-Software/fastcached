@@ -261,6 +261,139 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
     }
 }
 
+TEST_CASE("A generation that moved the framing is refused, not stored verbatim")
+{
+    // #552, the residual #483 left behind. #483 refuses a foreign generation whose
+    // frame still HOLDS TOGETHER, because a parseable layout is positive evidence
+    // that these bytes are a stored value. A future generation that moves the
+    // FRAMING as well leaves no such evidence: it parses as junk, comes back
+    // `NotACompileValue`, and a node's cache tier stores what it cannot decode
+    // VERBATIM -- so the producing checkout's absolute paths land under a key every
+    // machine computes, which is #229 arriving through the door #483 closed.
+    //
+    // The tests here could not reach this, and that is why it survived #483: every
+    // foreign-generation case above re-stamps a frame THIS build encoded, so the
+    // layout always holds and the evidence path always fires. The value below is
+    // synthesised instead.
+    //
+    // The framing bump modelled is the cheapest realistic one -- the frame gains a
+    // field, a `u16` flags word directly after the generation byte -- which is
+    // squarely what `CompileValueVersion` is allowed to mean. Nothing couples it to
+    // an `objkey-v*` bump, so this is an ordinary future event, not a hypothetical.
+    auto const futureFramed = [](std::uint8_t generation) {
+        std::vector<std::byte> v;
+        v.push_back(static_cast<std::byte>(generation));
+        v.push_back(std::byte { 0x00 }); // the new field, high byte
+        v.push_back(std::byte { 0x07 }); // the new field, low byte
+        constexpr std::string_view obj = "OBJECT";
+        auto const len = static_cast<std::uint32_t>(obj.size());
+        for (int shift = 24; shift >= 0; shift -= 8)
+            v.push_back(static_cast<std::byte>((len >> shift) & 0xFFU));
+        for (char const c: obj)
+            v.push_back(static_cast<std::byte>(c));
+        for (int i = 0; i < 4; ++i)
+            v.push_back(std::byte { 0x00 }); // region count 0
+        return v;
+    };
+
+    SECTION("the frame does not parse here, which is the whole point")
+    {
+        // Asserted rather than assumed: if this ever started parsing, the case would
+        // be exercising #483's evidence-from-layout path and would say nothing about
+        // #552 while staying green.
+        auto const decoded = DecodeCompileValue(futureFramed(CompileValueVersion + 1));
+        REQUIRE_FALSE(decoded.has_value());
+    }
+
+    SECTION("and it is still named as a foreign generation")
+    {
+        for (auto const bump: { 1, 2, 3 })
+        {
+            auto const generation = static_cast<std::uint8_t>(CompileValueVersion + bump);
+            CAPTURE(generation);
+            auto const canonical = CanonicalStoredValue(futureFramed(generation), "/home/dev/proj", "/home/dev/proj/build");
+            CHECK(canonical.outcome == CanonicalizationOutcome::ForeignGeneration);
+            CHECK(canonical.generation == generation);
+            // Nothing to store is what makes "store it verbatim" unavailable to a
+            // caller rather than merely discouraged -- the same property #483 relies
+            // on, now reached without a parseable layout.
+            CHECK(canonical.bytes.empty());
+        }
+    }
+}
+
+TEST_CASE("The reserved generation range is the boundary between a stored value and an opaque blob")
+{
+    // The contract `MaxCompileValueGeneration` states, tested at both edges rather
+    // than in the middle: an off-by-one either way is the difference between
+    // reopening #552 and re-committing the defect the node's tests caught, where
+    // classifying on the leading byte alone refused EVERY opaque value.
+    //
+    // These frames deliberately do not parse, so the leading byte is the only thing
+    // that can decide the answer.
+    auto const unparseable = [](std::uint8_t leading) {
+        std::vector<std::byte> v { static_cast<std::byte>(leading) };
+        for (int i = 0; i < 6; ++i)
+            v.push_back(std::byte { 0xFF }); // a length no frame this short can supply
+        return v;
+    };
+
+    SECTION("the last reserved byte is a generation")
+    {
+        auto const canonical =
+            CanonicalStoredValue(unparseable(MaxCompileValueGeneration), "/home/dev/proj", "/home/dev/proj/build");
+        CHECK(canonical.outcome == CanonicalizationOutcome::ForeignGeneration);
+        CHECK(canonical.generation == MaxCompileValueGeneration);
+    }
+
+    SECTION("the first byte past it is not")
+    {
+        auto const canonical =
+            CanonicalStoredValue(unparseable(MaxCompileValueGeneration + 1), "/home/dev/proj", "/home/dev/proj/build");
+        CHECK(canonical.outcome == CanonicalizationOutcome::NotACompileValue);
+        CHECK(canonical.generation == 0);
+    }
+
+    SECTION("and neither is any real object file, which is what the range costs")
+    {
+        // The cost of the range is that an opaque value starting inside it is
+        // refused. These are the leading bytes of the formats this cache actually
+        // stores, and none is inside it -- so the cost is a fact rather than a hope,
+        // and a future widening of the range has to argue with this list.
+        struct Row
+        {
+            std::uint8_t leading;  ///< First byte of the format.
+            std::string_view what; ///< Which format, for `INFO`.
+        };
+        auto const rows = std::vector<Row> {
+            { .leading = 0x7F, .what = "ELF" },
+            { .leading = 0x4D, .what = "PE/COFF, 'MZ'" },
+            { .leading = 0x64, .what = "COFF, x86-64 machine type" },
+            { .leading = 0xCE, .what = "Mach-O 32-bit" },
+            { .leading = 0xCF, .what = "Mach-O 64-bit" },
+            { .leading = 0xFE, .what = "Mach-O universal" },
+            { .leading = 0x21, .what = "ar archive, '!'" },
+        };
+        for (auto const& row: rows)
+        {
+            INFO(row.what);
+            CHECK(row.leading > MaxCompileValueGeneration);
+            auto const canonical = CanonicalStoredValue(unparseable(row.leading), "/home/dev/proj", "/home/dev/proj/build");
+            CHECK(canonical.outcome == CanonicalizationOutcome::NotACompileValue);
+        }
+    }
+
+    SECTION("a zero leading byte is not a generation either")
+    {
+        // Generations are allocated from 1, so 0 names none -- and reporting one
+        // would name a generation nobody wrote, which is the argument the
+        // empty-value case above makes for the same reason.
+        auto const canonical = CanonicalStoredValue(unparseable(0), "/home/dev/proj", "/home/dev/proj/build");
+        CHECK(canonical.outcome == CanonicalizationOutcome::NotACompileValue);
+        CHECK(canonical.generation == 0);
+    }
+}
+
 TEST_CASE("Canonicalizing a stored value twice is not a second rewrite")
 {
     // A node with an upstream relies on this: it stores canonically and forwards,
