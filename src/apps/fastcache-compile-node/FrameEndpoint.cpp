@@ -1056,13 +1056,6 @@ namespace
         /// `Write`, and arming a second write over that is the shared-slot defect this
         /// endpoint already carries a watch for on the read side.
         bool finished { false };
-
-        /// True when a pulse could not be written, which means the peer has gone.
-        ///
-        /// Not counted here: the connection already has one question about a peer that
-        /// left (`AbandonIfPeerGone`) and one counter for it, and a second row raised
-        /// from a different observation of the same departure would double-count it.
-        bool peerGone { false };
     };
 
     /// Write `Status::Progress` to the peer every `interval` until told to stop.
@@ -1115,13 +1108,16 @@ namespace
             if (pulse->stopped)
                 break;
 
+            // **A failed write ends the pulse and reports nothing**, and that boundary is
+            // the point: the pulse WRITES, `WatchPeer` READS, and detecting a peer that
+            // left belongs to the reader. It is parked on this same socket for the whole
+            // answer, a departure makes that socket readable, and `AbandonIfPeerGone` is
+            // what counts it -- so a second verdict raised from the write side would be a
+            // second observation of one departure, reached by a path with no counter of
+            // its own. Stopping is all this has to do; the connection learns it from the
+            // mechanism that already knows.
             if (!co_await WriteAll(socket.get(), Wire::EncodeProgressReply()))
-            {
-                // A five-byte write that fails is a peer that has gone, not a slow one:
-                // nothing this small waits on a receive window a live client is draining.
-                pulse->peerGone = true;
                 break;
-            }
         }
         pulse->finished = true;
         co_return;
@@ -1193,6 +1189,88 @@ namespace
             co_await SleepUntil { .reactor = reactor,
                                   .deadline = NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
         co_return pulse->finished;
+    }
+
+    /// Take the socket back from the pulse, and clear the responder mark if it will not
+    /// let go.
+    ///
+    /// `SettlePulse` plus the one thing the connection owes on its way out, in one place
+    /// rather than as two statements and a `break` inside a loop that is already at its
+    /// cognitive-complexity ceiling -- which is why `AnswerAuth`, `DeadlineRefusalReply`,
+    /// `AbandonIfPeerGone` and `SettleWatch` were each lifted out of it in turn. Adding
+    /// two arms there put it at **65 against a threshold of 60**, which is a build
+    /// failure and was the right one: that ceiling is what keeps the loop readable, and
+    /// the fix is to lift an arm out rather than to raise the number.
+    ///
+    /// The mark is cleared rather than left for the way out because this path `break`s,
+    /// and the sweeper shares this reactor thread: `Untrack` erases the entry the bit
+    /// lives on, but a sweep landing between the two must go on deferring rather than
+    /// closing a socket somebody may still be writing.
+    /// @param state The server state, for the reactor and the responder mark.
+    /// @param socket The connection whose mark is cleared; not owned.
+    /// @param pulse The pulse, shared so it cannot die under the wait; may be null.
+    /// @return True when the connection may write its reply; false when it must end.
+    Task<bool> ReclaimFromPulse(FrameServer::State* state, ISocket* socket, std::shared_ptr<ProgressPulse> pulse)
+    {
+        if (co_await SettlePulse(&state->io.Reactor(), pulse))
+            co_return true;
+        (void) state->LeaveResponder(socket);
+        co_return false;
+    }
+
+    /// Leave the responder, and when a sweep was deferred while inside it, tell the peer
+    /// so and say the connection is over.
+    ///
+    /// **The one place a deferred sweep is observed, and deliberately one.** The loop
+    /// holds seven `WriteAll` calls; a "check whether you were swept first" rule spread
+    /// over them would be a rule to remember six times and to forget at the eighth
+    /// somebody adds. It is instead a consequence of where the mark can be SET at all,
+    /// and the refusal leaves by the same statement sequence every other reply does --
+    /// so "exactly one writer" stays structural rather than agreed.
+    ///
+    /// Lifted out of `ServeConnection` for the reason `AnswerAuth`, `DeadlineRefusalReply`,
+    /// `AbandonIfPeerGone` and `SettleWatch` were: that loop sits at its
+    /// cognitive-complexity ceiling, and an arm needing a write, a counter and a bounded
+    /// wait reads better without the framing around it. #245's pulse is what finally
+    /// pushed it over -- 65 against a threshold of 60 -- and lifting an arm is the answer
+    /// to that rather than raising the number.
+    ///
+    /// **It leaves the responder unconditionally**, which is the half a reader must not
+    /// lose to the rename: the mark has to be cleared on the ordinary path too, and it is
+    /// this call that does it.
+    /// @param state The server state, for the mark, the writer and the counter.
+    /// @param socket The connection; not owned.
+    /// @param opRaw The verb, as received, for the refusal's own wording.
+    /// @param window The verb's answer window, as the responder named it.
+    /// @param watch The peer watch, shared so it cannot die under the wait; may be null.
+    /// @return True when this connection was swept and must end.
+    Task<bool> ExplainIfSwept(FrameServer::State* state,
+                              ISocket* socket,
+                              std::uint8_t opRaw,
+                              std::chrono::milliseconds window,
+                              std::shared_ptr<PeerWatch const> watch)
+    {
+        if (!state->LeaveResponder(socket))
+            co_return false;
+
+        if (co_await WriteAll(socket, DeadlineRefusalReply(*state, opRaw, window)))
+            // Counted only when it went OUT. A peer that had already hung up was told
+            // nothing, and a row saying otherwise would make the gap between this and the
+            // sweep row mean something else.
+            state->metrics.Increment(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
+
+        // The same abortive-close hazard the ordinary reply path has, on the one surface
+        // that arms a watch: this explanation is written and then the caller's `break`
+        // closes, and a close over a parked wait discards what was just buffered. #523 is
+        // specifically about this explanation REACHING the peer, so it gets the same wait
+        // -- which is why that wait is a function rather than a loop written twice.
+        co_await AwaitWatchQuiet(&state->io.Reactor(), watch);
+
+        // And then it ends, whether or not the refusal landed. This connection has been
+        // swept; the answer it was holding is not owed to anybody any more, and continuing
+        // the loop would serve a second request on a connection the sweeper has written
+        // off.
+        co_return true;
     }
 
     DetachedTask ServeConnection(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
@@ -1503,7 +1581,7 @@ namespace
 
                 // The write-side mirror of the watch above: while the responder answers,
                 // this connection writes nothing, so the pulse is the only writer and
-                // `SettlePulse` below is what hands the socket back before the reply.
+                // `ReclaimFromPulse` below is what hands the socket back before the reply.
                 // Null when this surface does not pulse this verb -- see
                 // `ArmProgressPulse` and `IFrameResponder::ProgressInterval` (#245).
                 auto pulse = ArmProgressPulse(state->responder, decoded->opRaw, &state->io.Reactor(), socket);
@@ -1532,44 +1610,19 @@ namespace
                 // Placed while `inResponder` is still SET, deliberately: this suspends,
                 // and a sweep landing in that gap must go on deferring rather than
                 // closing the socket the refusal has to leave by. `LeaveResponder` below
-                // is what ends that window, and it must not run before this does.
-                if (!co_await SettlePulse(&state->io.Reactor(), pulse))
-                {
-                    (void) state->LeaveResponder(socket.get());
+                // is what ends that window, and it must not run before this does -- which
+                // is why the failing path clears the mark itself, inside
+                // `ReclaimFromPulse`, rather than leaving a second statement here.
+                if (!co_await ReclaimFromPulse(state, socket.get(), pulse))
                     break;
-                }
 
-                // **The one place a deferred sweep is observed, and deliberately one.**
-                // This loop held six `WriteAll` calls before this line and holds seven
-                // with it; a "check whether you were swept first" rule spread over them
-                // would be a rule to remember six times and to forget at the eighth
-                // somebody adds. Here it is instead a consequence of where the mark can
-                // be set at all, and the refusal leaves by the same statement sequence
-                // every other reply does -- so "exactly one writer" is structural
-                // rather than agreed.
-                if (state->LeaveResponder(socket.get()))
-                {
-                    if (co_await WriteAll(socket.get(), DeadlineRefusalReply(*state, decoded->opRaw, answerWindow)))
-                        // Counted only when it went OUT. A peer that had already hung
-                        // up was told nothing, and a row saying otherwise would make
-                        // the gap between this and the sweep row mean something else.
-                        state->metrics.Increment(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
-
-                    // The same abortive-close hazard the ordinary reply path has, on
-                    // the one surface that arms a watch: this explanation is written
-                    // and then the `break` below closes, and a close over a parked
-                    // wait discards what was just buffered. #523 is specifically about
-                    // this explanation REACHING the peer, so it gets the same wait --
-                    // which is why that wait is a function rather than a loop written
-                    // twice.
-                    co_await AwaitWatchQuiet(&state->io.Reactor(), watch);
-
-                    // And then it ends, whether or not the refusal landed. This
-                    // connection has been swept; the answer it was holding is not
-                    // owed to anybody any more, and continuing the loop would serve
-                    // a second request on a connection the sweeper has written off.
+                // Leaves the responder, ALWAYS, and answers whether a sweep was deferred
+                // while this connection was inside it -- see `ExplainIfSwept`, which
+                // carries why that question is asked in exactly one place and why the
+                // refusal has to leave by the same statement sequence every other reply
+                // does.
+                if (co_await ExplainIfSwept(state, socket.get(), decoded->opRaw, answerWindow, watch))
                     break;
-                }
 
                 // Is anybody still there to receive it -- see `PeerAlreadyGone`, which
                 // carries why that is the only question asked before the write.
@@ -1588,12 +1641,6 @@ namespace
                 // documented as a client-side story.
                 // Nothing to deliver, or nobody left to deliver it to -- see
                 // `AbandonIfPeerGone`, which carries both arms and counts them apart.
-                // A pulse that could not be written saw the peer leave too, and the two
-                // observations are one departure: it is folded into the same question
-                // rather than counted again, so the abandoned-delivery row goes on
-                // meaning one client rather than one client per way of noticing.
-                if (pulse != nullptr && pulse->peerGone)
-                    break;
 
                 if (co_await AbandonIfPeerGone(state, socket.get(), watch, !reply.empty()))
                     break;
