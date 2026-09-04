@@ -416,6 +416,142 @@ TEST_CASE("ServiceControl: scope defaults are filled in for a file-configured se
     }
 }
 
+TEST_CASE("ServiceControl: each scope default is accepted on its own", "[platform][service][launchd]")
+{
+    // **The mechanical guard for [#396](https://github.com/LASTRADA-Software/fastcached/issues/396),
+    // and it is mechanical for one reason: naming the two flags by hand passes
+    // under the very defect.** `applicationName` used to decide both defaults, so
+    // a spec that had files got `--config` AND `--storage`. A case asserting "the
+    // daemon receives both" is true before and after; a case asserting "a spec
+    // accepting only `--config` receives no `--storage`" cannot even be WRITTEN
+    // against one bit, because there was no way to say it.
+    //
+    // So the walk is over `ScopeDefaultTable()` and the assertion is per row: the
+    // row's own flag arrives, and **no other row's does**. A third default is
+    // covered with no edit here, which is the property this repository keeps
+    // finding it lacks -- the same argument as `RowsInEnumeratorOrder`.
+    REQUIRE(!FastCache::ScopeDefaultTable().empty());
+    // Two rows minimum, or "no other row's flag" is vacuous and the whole case
+    // passes by having nothing to compare against.
+    REQUIRE(FastCache::ScopeDefaultTable().size() >= 2);
+
+    // **Both scopes, and that is not thoroughness -- it is what makes the walk
+    // mean anything.** The first version of this case had the right SHAPE -- it
+    // walked the table rather than naming two flags -- and drove each row at its
+    // OWN scope only. It PASSED against the one-bit shape: the two defaults apply
+    // in opposite scopes, so the other row's flag could not have appeared there
+    // whatever decided it.
+    //
+    // So **deriving a guard is necessary and not sufficient, and only the
+    // counterfactual establishes which one you have.** The same sentence as
+    // `assert count == 1` being necessary and not sufficient. Nothing about the
+    // first version looked wrong; running it against the defect is what said so.
+    for (auto const& row: FastCache::ScopeDefaultTable())
+    {
+        INFO("accepted default: " << row.flag);
+
+        // Accepting exactly ONE default. Everything else about the spec is what a
+        // file-configured service looks like, because that is the shape the old
+        // bit could not distinguish.
+        FastCache::ServiceSpec spec {};
+        spec.serviceName = "OneDefault";
+        spec.applicationName = "one-default";
+        spec.acceptedScopeDefaults = FastCache::ScopeDefaults({ row.which });
+
+        for (auto const scope: { ServiceScope::User, ServiceScope::System })
+        {
+            auto const filled = WithScopeDefaults(spec, scope, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+            auto const carries = [&filled](std::string_view flag) {
+                return std::ranges::any_of(filled.arguments,
+                                           [flag](std::string const& arg) { return arg.starts_with(flag); });
+            };
+
+            // The accepted one arrives, in its own scope and only there.
+            CHECK(carries(row.flag) == (scope == row.scope));
+
+            // And a default this spec did not accept is filled in nowhere. This is
+            // the half the one-bit shape fails, and it fails it at the OTHER row's
+            // scope -- which is why the scope loop is here rather than in a section
+            // of its own.
+            for (auto const& other: FastCache::ScopeDefaultTable())
+            {
+                if (other.which == row.which)
+                    continue;
+                INFO("must never carry: " << other.flag);
+                CHECK_FALSE(carries(other.flag));
+            }
+        }
+    }
+
+    SECTION("a default this service does not accept is never filled in, at either scope")
+    {
+        // The converse of the walk above, and the clause that keeps a registration
+        // survivable by the binary it registers: a flag the parser rejects turns
+        // into "unrecognised argument" at every start.
+        for (auto const& row: FastCache::ScopeDefaultTable())
+        {
+            INFO("refused default: " << row.flag);
+            FastCache::ServiceSpec spec {};
+            spec.serviceName = "RefusesOne";
+            spec.applicationName = "refuses-one";
+            // Every default EXCEPT this row's, so the spec is otherwise as
+            // permissive as it can be -- a spec accepting nothing would pass this
+            // for the wrong reason.
+            auto accepted = FastCache::ScopeDefaults({});
+            for (auto const& other: FastCache::ScopeDefaultTable())
+                if (other.which != row.which)
+                    accepted[static_cast<std::size_t>(other.which)] = true;
+            spec.acceptedScopeDefaults = accepted;
+
+            for (auto const scope: { ServiceScope::User, ServiceScope::System })
+            {
+                auto const filled = WithScopeDefaults(spec, scope, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+                CHECK(std::ranges::none_of(filled.arguments,
+                                           [&row](std::string const& arg) { return arg.starts_with(row.flag); }));
+            }
+        }
+    }
+
+    SECTION("a service naming no application derives nothing, whatever it accepts")
+    {
+        // The one thing `applicationName` still decides, and it is a property of
+        // the VALUE rather than of the parser: both defaults are looked up UNDER
+        // that name, so there is nothing to derive without one. Accepting
+        // everything here is the point -- if the set alone decided, a
+        // `--storage=<home>/Library/Caches//cache` would be appended, which is a
+        // path nobody asked for rather than a refusal.
+        FastCache::ServiceSpec spec {};
+        spec.serviceName = "NoApplication";
+        spec.applicationName = {};
+        auto accepted = FastCache::ScopeDefaults({});
+        for (auto const& row: FastCache::ScopeDefaultTable())
+            accepted[static_cast<std::size_t>(row.which)] = true;
+        spec.acceptedScopeDefaults = accepted;
+
+        for (auto const scope: { ServiceScope::User, ServiceScope::System })
+        {
+            auto const filled = WithScopeDefaults(spec, scope, "/Users/jo", "/opt/fastcached/etc/fastcached.yaml");
+            CHECK(filled.arguments.empty());
+            CHECK(filled.configPath.empty());
+            CHECK(filled.ownedPaths.empty());
+        }
+    }
+
+    SECTION("the daemon is the service that accepts both")
+    {
+        // Named rather than inferred: the daemon accepting both is what made one
+        // bit look sufficient, so it is worth pinning that it still does -- and
+        // that the guard above is not passing because nothing accepts more than
+        // one default.
+        auto const daemon = SpecFor("fastcached", FastCache::CliResult {});
+        for (auto const& row: FastCache::ScopeDefaultTable())
+        {
+            INFO("default: " << row.flag);
+            CHECK(FastCache::AcceptsScopeDefault(daemon.acceptedScopeDefaults, row.which));
+        }
+    }
+}
+
 TEST_CASE("ServiceControl: a service that keeps no files is given no path flags", "[platform][service][launchd]")
 {
     // The registration has to survive the registered binary's OWN parser.

@@ -3,12 +3,16 @@
 
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,6 +82,98 @@ enum class WindowsLogonAccount : std::uint8_t
 /// `BuildServiceArgv` stays hand-written per binary and is guarded by a test that
 /// walks the option table and requires every non-excluded flag to be emitted.
 ///
+/// One installer-supplied default `WithScopeDefaults` may fill in.
+///
+/// **An enumerator each, because the two are independent questions and one bit
+/// could not say so.** `ServiceSpec::applicationName` used to decide both at once:
+/// a service that named an application was handed a `--config` *and* a
+/// `--storage`, and one that named none got neither. That was exactly right while
+/// `fastcached` was the only file-configured service, and it left
+/// `fastcache-compile-node` -- which reads a configuration file and has no
+/// `--storage` flag at all -- with no way to say so
+/// ([#396](https://github.com/LASTRADA-Software/fastcached/issues/396)). Its spec
+/// had to name no application, which is the SAFE direction (a registration
+/// carrying `--storage=` produces a job that answers its own command line with
+/// "unrecognised argument" at every start, reported installed and dead at every
+/// boot) and costs it both the system-scope `--config` default and the
+/// install-time `ServiceAccountReadDenial` on that path.
+enum class ScopeDefault : std::uint8_t
+{
+    /// `--config=<the packaged machine-wide file>`. System scope only: that file
+    /// describes the machine-wide service, so handing it to a per-user agent
+    /// points the agent at a directory it cannot write.
+    ConfigPath,
+
+    /// `--storage=<the per-user cache directory>`. User scope only: a system
+    /// job's cache lives under the package prefix, named by its config file, so
+    /// there is nothing to default.
+    StoragePath,
+
+    Last
+};
+
+/// Which installer-supplied defaults a service accepts, indexed by the default.
+///
+/// A table indexed by the enumerator rather than one `bool` per default, so a
+/// third default is a new enumerator plus a new row -- and every guard that walks
+/// the table covers it without anybody remembering to widen a struct.
+using ScopeDefaultSet = EnumTable<ScopeDefault, bool>;
+
+/// The set naming exactly @p accepted.
+///
+/// Spelled as a call at each spec (`ScopeDefaults({ ScopeDefault::ConfigPath })`)
+/// rather than as an aggregate of bools, because a positional `{ true, false }`
+/// says which default it means only by counting.
+/// @param accepted The defaults this service's parser will take.
+/// @return The set; every default not named is refused.
+[[nodiscard]] constexpr ScopeDefaultSet ScopeDefaults(std::initializer_list<ScopeDefault> accepted) noexcept
+{
+    ScopeDefaultSet set {};
+    for (auto const which: accepted)
+        set[static_cast<std::size_t>(which)] = true;
+    return set;
+}
+
+/// Whether @p set names @p which.
+/// @param set The service's accepted set.
+/// @param which The default in question.
+/// @return True when this service's parser takes that flag.
+[[nodiscard]] constexpr bool AcceptsScopeDefault(ScopeDefaultSet const& set, ScopeDefault which) noexcept
+{
+    return set[static_cast<std::size_t>(which)];
+}
+
+/// What one installer-supplied default is called, and where it applies.
+struct ScopeDefaultRow
+{
+    /// The default this row describes. Its position in the table, guarded by
+    /// `RowsInEnumeratorOrder`.
+    ScopeDefault which {};
+
+    /// The flag prefix, `=` included, e.g. `--config=`. Both tested against the
+    /// arguments already present and emitted, so the spelling exists once.
+    std::string_view flag {};
+
+    /// The one scope this default applies in.
+    ServiceScope scope {};
+};
+
+/// Every installer-supplied default, one row per enumerator, in enumerator order.
+///
+/// Published so a guard can walk it. That is the point rather than a convenience:
+/// a test naming the two flags by hand passes under the very defect #396 was --
+/// two defaults decided together still yield both flags for the spec that accepts
+/// both -- while a walk that requires a spec accepting ONE row to receive that
+/// row's flag and **no other row's** does not, and covers a third default with no
+/// edit.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<ScopeDefaultRow const> ScopeDefaultTable() noexcept;
+
+/// The flag prefix @p which fills in, `=` included.
+/// @param which The default in question.
+/// @return Its flag prefix, e.g. `--storage=`.
+[[nodiscard]] std::string_view ScopeDefaultFlag(ScopeDefault which) noexcept;
+
 /// **That obstacle is a missing column, not an impossibility**, and the honest
 /// version of this paragraph says so: `OptionSpec::same` already carries a
 /// member-pointer column that reads a field back out (`FieldEq<&Config::x>()`),
@@ -155,6 +251,22 @@ struct ServiceSpec
     /// Whether a secret was typed on the installing command line.
     InlineCredential inlineCredential { InlineCredential::Absent };
 
+    /// Which installer-supplied defaults this service's parser will accept.
+    ///
+    /// The other half of the split described on `ScopeDefault`, and it answers a
+    /// question about the **parser**: which flags this binary would understand if
+    /// the installer filled one in. `applicationName` below answers the other, a
+    /// question about the **value**. Empty -- the default -- means every default is
+    /// refused, which is what a service configured entirely from argv wants and
+    /// what `fastcache-compile-node` had to get by naming no application at all.
+    ///
+    /// Declared here, immediately after the other byte-wide member, rather than
+    /// beside `applicationName` where it reads better: every `bool` and byte-wide
+    /// enum in a struct belongs in one run, and this run had seven bytes of padding
+    /// after it, so the field costs nothing where it is and eight bytes where it
+    /// reads best. The two are cross-referenced instead.
+    ScopeDefaultSet acceptedScopeDefaults {};
+
     /// The `--config` path the operator named, or empty.
     ///
     /// Used only to make the credential refusal say where the secret should go
@@ -166,16 +278,23 @@ struct ServiceSpec
     /// machine-wide configuration and its per-user cache -- or **empty** when the
     /// service keeps neither.
     ///
-    /// Empty is a real answer, not a missing one, and `WithScopeDefaults` turns on
-    /// it: a service named here is file-configured, so the installer may fill in a
-    /// `--config` or `--storage` the operator left unset. One that names nothing
-    /// is configured entirely from argv, and must be given neither.
+    /// Empty is a real answer, not a missing one. It is also **only** this question
+    /// since #396: which defaults the installer may fill in is
+    /// `acceptedScopeDefaults` above, and the two are independent.
     ///
-    /// `fastcache-compile-node` is the second kind. Its parser rejects both flags,
-    /// so a registration carrying either produced a job that refused its own
-    /// command line at every start -- reported installed, dead at every boot,
-    /// which is exactly the shape this file refuses at install time. The name was
-    /// hardcoded to the daemon's before, so every spec got the daemon's defaults.
+    /// **What this still decides, and why one bit looked sufficient for as long as
+    /// it did.** Both defaults are *values looked up under this name* -- where the
+    /// packaged machine-wide config lives, and where a per-user cache goes -- so a
+    /// service naming none has nothing to derive either default from, whatever its
+    /// parser accepts. That is a property of the VALUE, not of the parser, and it
+    /// is exactly the overlap that made a single bit read as adequate: for the one
+    /// service that existed, "has files" and "takes both flags" happened to
+    /// coincide. They are not the same fact, and the day a second service arrived
+    /// the bit could only answer one of them.
+    ///
+    /// So the name still gates both defaults -- `ScopeDefaultApplies` asks it
+    /// first -- and it no longer says anything about which flags a parser takes.
+    /// `fastcache-compile-node` names one and accepts only `ConfigPath`.
     std::string applicationName;
 
     /// Which identity the Windows SCM should log this service on as.
@@ -454,12 +573,37 @@ struct ServiceSpec
 /// @param home The invoking user's home directory.
 /// @param packagedConfig The machine-wide config file, empty when it is absent,
 ///        unreadable or untrusted.
-/// @return @p spec with the storage and config arguments filled in where this
-///         service has such files at all -- see `ServiceSpec::applicationName`.
+/// @return @p spec with each default filled in where `ScopeDefaultApplies` says
+///         it may be -- per default, never both from one answer.
 [[nodiscard]] ServiceSpec WithScopeDefaults(ServiceSpec spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& home,
                                             std::filesystem::path const& packagedConfig);
+
+/// Whether @p which may be filled in for @p spec at @p scope.
+///
+/// The clauses that are the same for **every** default, asked once here rather
+/// than re-spelled per block: this service has files to derive a value from at
+/// all, its parser accepts this particular flag, this is the scope the default
+/// applies in, and the operator did not name the flag themselves.
+///
+/// Exposed so the guard can drive it directly. A per-default question that only
+/// existed inside `WithScopeDefaults` could be asserted only through the whole
+/// registration, which is how "two decided from one bit" survived: the spec that
+/// accepted both was the only one anybody drove.
+///
+/// What is deliberately NOT here is each default's own extra condition, because
+/// they are not the same condition and folding them in would need a column that
+/// means "and whatever else that one wants". `StoragePath` additionally requires
+/// that no `--config` was named (whoever passes a config file owns the storage
+/// path in it); `ConfigPath` additionally requires that a packaged config was
+/// actually found. Both stay at their block, with their reasons.
+///
+/// @param spec Service as described from the command line.
+/// @param scope Domain being installed into.
+/// @param which The default in question.
+/// @return True when the shared clauses all hold.
+[[nodiscard]] bool ScopeDefaultApplies(ServiceSpec const& spec, ServiceScope scope, ScopeDefault which);
 
 /// Outcome of a service-control operation.
 struct ServiceControlResult

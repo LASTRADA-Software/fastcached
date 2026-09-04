@@ -7,6 +7,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
@@ -632,16 +633,26 @@ TEST_CASE("NodeConfig: the worker's registration survives its own parser", "[nod
 {
     // Every flag baked into a registration is re-read by this binary at the next
     // start, so one it cannot parse is a service that registers cleanly and then
-    // fails forever. The worker takes NO config file and NO storage directory --
-    // NodeOptions() has neither flag -- and the installer used to fill both in
-    // from the daemon's defaults, because the application name was hardcoded.
+    // fails forever. The worker takes a config file and NO storage directory --
+    // `NodeOptions()` has `--config` and no `--storage` at all -- and the
+    // installer used to fill both in from the daemon's defaults, because the
+    // application name was hardcoded.
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, Installable());
-    CHECK(spec.applicationName.empty());
 
-    // The assertion that matters is not "the field is empty" but what the field
-    // makes the installer do, so drive the installer's own function -- on every
-    // platform, which is the half that was missing while it lived inside the
-    // macOS block.
+    // Since [#396](https://github.com/LASTRADA-Software/fastcached/issues/396) the
+    // worker NAMES an application and accepts one default rather than none. Those
+    // used to be a single answer, so the only safe thing it could say was nothing
+    // -- at the cost of the system-scope `--config=` default and the install-time
+    // `ServiceAccountReadDenial` on it. Both halves are asserted, because naming
+    // the application again while accepting everything is precisely the
+    // registration that dies at every boot.
+    CHECK(spec.applicationName == NodeApplicationName);
+    CHECK(AcceptsScopeDefault(spec.acceptedScopeDefaults, ScopeDefault::ConfigPath));
+    CHECK_FALSE(AcceptsScopeDefault(spec.acceptedScopeDefaults, ScopeDefault::StoragePath));
+
+    // The assertion that matters is not what the fields say but what they make the
+    // installer do, so drive the installer's own function -- on every platform,
+    // which is the half that was missing while it lived inside the macOS block.
     for (auto const scope: { ServiceScope::User, ServiceScope::System })
     {
         auto const filled = WithScopeDefaults(spec,
