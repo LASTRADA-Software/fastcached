@@ -2309,6 +2309,50 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "map of every member's hostname, endpoint and capacity, and an operator who bound it to "
                      "the network is publishing that to whoever asks. A bare port binds loopback and needs no "
                      "credential." },
+        // **LAST, and the position is a decision rather than an appending.** An empty
+        // `--scheduler` is the least specific rule in this table: it says a required
+        // field is missing, where every row above says something about the particular
+        // combination somebody typed. This table's own convention is stated fifty
+        // lines up -- *"the more specific diagnosis: first match"* -- and following it
+        // puts this at the end ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+        //
+        // It used to be an inline `if` in `main()`, positioned AHEAD of the call to
+        // this function, so for a configuration broken two ways the operator saw this
+        // sentence rather than the specific one. That precedence was an artifact of
+        // where the `if` happened to sit in a file no test can reach: nothing in this
+        // tree asserted it, no document stated it, and it was never chosen. Moving the
+        // rule here changes it, deliberately, to what the table already says it should
+        // be.
+        //
+        // **Last also keeps every row above independently testable**, which is what
+        // this ticket is about. Several cases isolate a row by building a config that
+        // trips nothing else, and "no scheduler" is the cheapest way to do that -- so
+        // a row in FIRST position intercepts them and a suite that could once name
+        // which rule fired can only report that something did. Measured: first
+        // position turned nine test cases red, two of them fixtures whose entire
+        // purpose is to prove a row does NOT depend on a scheduler.
+        //
+        // A row rather than a check in the tier, for the reason the toolchain pair
+        // above is one: it reads nothing but the parsed configuration, which is what
+        // this table is for -- and the copy in `main()` was in no test target, so the
+        // rule that ran at startup was the one nothing could assert, while what the
+        // tests asserted was `NodeServiceRejection`'s install-time twin. The two had
+        // already drifted on the sentence they say, which is the observable half.
+        //
+        // NOT deleted in favour of that twin, which is what the ticket first asked
+        // for: its rows are install-time and its messages say so, so relying on it
+        // would let a hand-started node run with no scheduler at all -- the refusal
+        // removed by the change meant to protect it.
+        //
+        // Required of every shape, a pure `--serve-scheduler` included: a scheduler
+        // registers with itself, which is what the documented command line does
+        // (`--serve-scheduler ... --scheduler=127.0.0.1:6675`). So this is not scoped
+        // the way the advertise rows are.
+        { .refuses = [](NodeConfig const& c) { return c.scheduler.empty(); },
+          .message = "--scheduler is required: a worker nothing knows about serves nobody. This node would start, "
+                     "bind its ports and sit there -- never registering, never leased, and never sent a job, with "
+                     "nothing anywhere reporting a fault. Name the scheduler's --listen-node endpoint; a node that "
+                     "schedules names itself." },
     });
 
     for (auto const& rule: Rules)

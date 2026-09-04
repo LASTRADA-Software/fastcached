@@ -1779,20 +1779,18 @@ int main(int argc, char** argv)
     auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
     ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(*consoleLogger);
 
-    // Both are refused at startup rather than at the first job. A worker missing
-    // either would register (or fail to) and then refuse everything, which presents
-    // to an operator as "distribution does not work" rather than as a misconfigured
-    // node.
-    if (cfg.scheduler.empty())
-    {
-        logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
-        return ExitUsage;
-    }
-    // "no --toolchain and no discovery" used to be refused HERE, and is now a
-    // `StartupPolicyRejection` row. It depends on nothing but the parsed
-    // configuration, which is what that table is for -- and leaving it in the tier
-    // meant a reload could reach the state a start refuses, since #403 made both of
-    // its flags reloadable and `ValidateNodeReloadable` composes the startup rules.
+    // An empty `--scheduler` and "no --toolchain and no discovery" were both refused
+    // HERE, as inline `if`s, and both are now `StartupPolicyRejection` rows -- the
+    // toolchain pair by #403, the scheduler by #386. Neither reads anything but the
+    // parsed configuration, which is what that table is for, and a rule in this tier
+    // is one that a RELOAD cannot consult and that no test can reach: this file is in
+    // no test target, so the copy that ran at startup was the untested one while the
+    // tests asserted `NodeServiceRejection`'s install-time twin. They had already
+    // drifted on the sentence they say.
+    //
+    // Nothing replaces them here. The table is consulted a few lines below, on the
+    // same logger and with the same exit code, and there is no `return` in between --
+    // so this is a deletion rather than a move of the refusal's timing.
 
     // Checked here rather than inside WorkerBody, for the reason the two above are:
     // the POSIX host has already redirected stdout to /dev/null by the time the body
