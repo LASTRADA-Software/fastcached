@@ -143,7 +143,7 @@ class RespClient
             if (chunk.empty())
                 break;
             out += chunk;
-            if (out.find(marker) != std::string::npos)
+            if (out.contains(marker))
                 break;
         }
         return out;
@@ -286,7 +286,7 @@ TEST_CASE("RESP over a real socket: a subscriber is still woken by a published m
             return;
         if (!c.Send("*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n"))
             return;
-        if (c.ReadUntil("subscribe").find("subscribe") == std::string::npos)
+        if (!c.ReadUntil("subscribe").contains("subscribe"))
             return;
         subscribed.store(true, std::memory_order_release);
 
@@ -295,7 +295,7 @@ TEST_CASE("RESP over a real socket: a subscriber is still woken by a published m
         // so the only thing that can wake the session is the push arm.
         static_cast<void>(fix.pubsub.Publish("ch", "hello"));
 
-        if (c.ReadUntil("hello").find("hello") != std::string::npos)
+        if (c.ReadUntil("hello").contains("hello"))
             gotMessage.store(true, std::memory_order_relaxed);
         c.Close();
     } };
