@@ -624,8 +624,22 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   control that must survive an open write side, or *detect a graceful close* and
   *abandon every blocking read* are the same passing test. The signal is that the
   handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
+- And a TLS peer says it with a RECORD, so the raw socket answers the OPPOSITE:
+  `close_notify` then FIN means bytes are on the wire, the raw peek reports `>0`, and
+  #673's EOF arm declined for every TLS client on the one transport where the graceful
+  close is the ORDINARY one (#712). `TlsSocket::WaitReadable` decrypts with `SSL_peek`,
+  which removes nothing — "consumes nothing" is about bytes the CALLER could have read,
+  not the decorator's own buffering. A raw EOF before a full record is EOF too.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
+- A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
+  either while the other is parked drops the parked coroutine — never resumed, never
+  freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
+  `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression so no
+  arm site has a bare `awaitable = nullptr` to forget it on, and
+  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal and
+  not a completion: the first breaks a live caller (#710), the second turns a leak into
+  a use-after-free.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
 - A missing keyspace event has two ends — the tier that never named the victim and

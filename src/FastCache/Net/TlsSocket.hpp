@@ -40,6 +40,13 @@ namespace FastCache
 /// request/response protocol loops already guarantee this (a connection reads a
 /// command, then writes its reply); the class is not safe for a concurrent
 /// read and write. Per-direction scratch buffers are reused across ops.
+///
+/// `WaitReadable` counts as an operation for that rule and always did -- it used
+/// to park the raw socket's single read-op slot by delegation, and now parks a
+/// raw `Read` of its own into the same `_inScratch`. `ISocket::Read` states the
+/// shared-slot rule for every transport; here it additionally means a `Read`
+/// issued over a parked `WaitReadable` would have two pumps writing one staging
+/// buffer.
 class TlsSocket final: public ISocket
 {
   public:
@@ -60,6 +67,36 @@ class TlsSocket final: public ISocket
     [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
+
+    /// @copydoc ISocket::WaitReadable
+    ///
+    /// **A TLS peer closes by sending a RECORD, so the raw socket cannot answer
+    /// this.** A well-behaved peer emits a `close_notify` alert and only then the
+    /// transport FIN. At the instant it goes away there are therefore bytes on the
+    /// wire, so the raw socket's peek reports `>0` -- *data pending* -- for a peer
+    /// that has in fact finished sending. Delegating to `_raw->WaitReadable()` is
+    /// what this used to do, and it made #673's EOF arm unreachable on the one
+    /// transport where the graceful close is the ORDINARY close rather than a
+    /// corner ([#712](https://github.com/LASTRADA-Software/fastcached/issues/712)).
+    ///
+    /// So the record is decrypted, by `SSL_peek`, which leaves every plaintext byte
+    /// it decoded in OpenSSL's read buffer -- the caller's next `Read` returns all
+    /// of it. Raw ciphertext IS consumed (into this decorator's own incoming BIO),
+    /// and that is not what the interface's "consumes nothing" forbids: no byte the
+    /// caller could have read is lost.
+    ///
+    /// Three answers, and they are the same three `PumpRead` already distinguishes:
+    /// a decrypted byte is `>0`; a `close_notify` (`SSL_ERROR_ZERO_RETURN`) is `0`;
+    /// and a raw EOF arriving before a full record is `0` too -- a truncated stream
+    /// is still a peer that has stopped sending.
+    ///
+    /// **It writes, like every other TLS read**, for the reason `ShutdownWrite`
+    /// below records: `SSL_peek`'s `WANT_READ` path flushes whatever OpenSSL has
+    /// queued outbound, so a failure there surfaces here as a `NetError` where a
+    /// plaintext socket would have answered a count.
+    ///
+    /// It occupies the single in-flight operation slot (see the class note above)
+    /// for as long as it is parked, because it parks on a raw `Read`.
     [[nodiscard]] IoAwaitable WaitReadable() override;
     [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
     void Close() noexcept override;
@@ -113,9 +150,20 @@ class TlsSocket final: public ISocket
     /// Resolves with the byte count, 0 on EOF, or a NetError.
     Task<IoResult> FeedIncoming();
 
+    /// Report whether the peer has finished sending, decrypting whatever records
+    /// that takes and consuming no plaintext. Resolves with `1` for a decrypted
+    /// byte waiting, `0` for `close_notify` or a raw EOF, or a NetError.
+    /// @return Awaitable task carrying the readability answer.
+    Task<IoResult> PumpWaitReadable();
+
     /// Launch the read/write pump as a detached task that completes `awaitable`.
     DetachedTask DriveRead(IoAwaitable* awaitable, std::span<std::byte> out);
     DetachedTask DriveWrite(IoAwaitable* awaitable, std::span<std::byte const> in);
+
+    /// Launch the readability probe as a detached task that completes `awaitable`.
+    /// @param awaitable The caller's awaitable, completed with the probe's answer.
+    /// @return The detached task driving it.
+    DetachedTask DriveWaitReadable(IoAwaitable* awaitable);
 
     std::unique_ptr<ISocket> _raw;
     ssl_st* _ssl { nullptr };

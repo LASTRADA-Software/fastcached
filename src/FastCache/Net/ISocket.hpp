@@ -151,6 +151,29 @@ class ISocket
 
     /// Read up to buffer.size() bytes into buffer. Resolves with the byte
     /// count written, 0 on clean EOF, or a NetError on failure.
+    ///
+    /// **A socket has ONE read operation, and this shares it with
+    /// `WaitReadable`.** Every reactor socket keeps a single `awaitable` pointer per
+    /// direction, and both read verbs begin by claiming it. So arming either while
+    /// the other is parked drops the parked awaitable's pointer: that coroutine is
+    /// never resumed and never freed -- one leaked frame plus everything it
+    /// captured, per occurrence, with no assertion, no error and no log
+    /// ([#663](https://github.com/LASTRADA-Software/fastcached/issues/663)).
+    ///
+    /// The rule was stated only in `RedisResp.cpp`, about that file's own watcher,
+    /// so somebody writing the next `WaitReadable` user read this interface and got
+    /// no warning at all. It is stated here because here is where it has to be
+    /// obeyed, and it is enforced by `Detail::ClaimReadSlot`
+    /// (`FastCache/Net/ReadSlot.hpp`) in Debug builds, watched refusing by
+    /// `ctest -R read-slot-guard-canary`.
+    ///
+    /// What a caller must therefore do: hold at most one outstanding read per
+    /// socket, and resolve or abandon a parked `WaitReadable` before issuing a
+    /// `Read`. A parked wait can only be retrieved by `Close()`, which is what makes
+    /// this a caller-side discipline rather than something a socket can fix
+    /// ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710) is one
+    /// caller that does not).
+    ///
     /// @param buffer Destination span; must outlive the awaitable.
     /// @return Awaitable resolving to IoResult.
     [[nodiscard]] virtual IoAwaitable Read(std::span<std::byte> buffer) = 0;
@@ -226,6 +249,21 @@ class ISocket
     /// discovers the truth, while a false `0` tells a caller its peer is gone. For
     /// blocking and in-memory transports the subsequent `Read` either returns data or
     /// sees EOF inline, so always-ready remains correct for them.
+    ///
+    /// **This shares the socket's single read-op slot with `Read`**, and arming one
+    /// over the other silently drops the parked coroutine. The rule, the enforcement
+    /// and what a caller has to do about it are on `Read` above
+    /// ([#663](https://github.com/LASTRADA-Software/fastcached/issues/663)); it is
+    /// repeated here only as a pointer, because a second copy of the reasoning is a
+    /// second thing to be wrong.
+    ///
+    /// **"Consumes nothing" is about bytes the CALLER could have read**, not about
+    /// the transport's own buffering. A decorator may have to consume and decode raw
+    /// bytes to answer at all -- `TlsSocket` decrypts a record, because a TLS peer's
+    /// close is a record and a raw peek reads it as pending data
+    /// ([#712](https://github.com/LASTRADA-Software/fastcached/issues/712)) -- and
+    /// what the contract forbids is losing a byte the next `Read` would have
+    /// returned.
     /// @return Awaitable resolving when readable; `0` means EOF, `>0` means data.
     [[nodiscard]] virtual IoAwaitable WaitReadable()
     {

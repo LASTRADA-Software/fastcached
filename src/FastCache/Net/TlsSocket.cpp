@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Net/TlsSocket.hpp>
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <span>
@@ -234,15 +235,84 @@ IoAwaitable TlsSocket::Read(std::span<std::byte> buffer)
     return awaitable;
 }
 
+Task<IoResult> TlsSocket::PumpWaitReadable()
+{
+    // One byte, and it is never taken: SSL_peek decrypts the whole record into
+    // OpenSSL's read buffer and removes nothing, so SSL_pending() reports the full
+    // record afterwards and the caller's next Read returns every byte of it. That is
+    // what makes this a probe. The buffer lives in this coroutine's frame, so its
+    // address is stable across every suspension below.
+    std::array<std::byte, 1> probe {};
+
+    while (true)
+    {
+        ERR_clear_error(); // accurate SSL_get_error classification, as in PumpRead
+        int const n = SSL_peek(_ssl, probe.data(), ClampInt(probe.size()));
+        if (n > 0)
+            co_return IoResult { std::size_t { 1 } };
+
+        switch (SSL_get_error(_ssl, n))
+        {
+            case SSL_ERROR_ZERO_RETURN:
+                // close_notify: the peer has finished sending. This is the answer the
+                // raw socket could not give -- it saw the alert as bytes.
+                co_return IoResult { std::size_t { 0 } };
+            case SSL_ERROR_WANT_READ: {
+                if (auto const flushed = co_await FlushOutgoing(); !flushed.has_value())
+                    co_return std::unexpected(flushed.error());
+                auto const fed = co_await FeedIncoming();
+                if (!fed.has_value())
+                    co_return std::unexpected(fed.error());
+                if (*fed == 0)
+                    // Raw EOF with no close_notify: a truncated stream, and still a
+                    // peer that has stopped sending. Reported as EOF for the same
+                    // reason PumpRead reports it as a zero-byte read.
+                    co_return IoResult { std::size_t { 0 } };
+                break;
+            }
+            case SSL_ERROR_WANT_WRITE: {
+                if (auto const flushed = co_await FlushOutgoing(); !flushed.has_value())
+                    co_return std::unexpected(flushed.error());
+                break;
+            }
+            default:
+                co_return std::unexpected(SslFailure(NetErrorCode::ConnReset, "SSL_peek failed"));
+        }
+    }
+}
+
+DetachedTask TlsSocket::DriveWaitReadable(IoAwaitable* awaitable)
+{
+    auto const result = co_await PumpWaitReadable();
+    awaitable->Complete(result);
+    co_return;
+}
+
 IoAwaitable TlsSocket::WaitReadable()
 {
+    // A dead instance (partial allocation in the constructor) has no SSL to ask, and
+    // every Read on it fails anyway; delegating keeps that case exactly as it was.
+    if (_ssl == nullptr)
+        return _raw->WaitReadable();
+
     // If OpenSSL already has decoded plaintext buffered (a previous record was
     // larger than the application's last read), report ready synchronously so
-    // the caller's Read returns immediately. Otherwise the next readable edge
-    // is at the raw transport — defer to it.
-    if (_ssl != nullptr && SSL_pending(_ssl) > 0)
+    // the caller's Read returns immediately, without a pump or a raw syscall.
+    if (SSL_pending(_ssl) > 0)
         return IoAwaitable { IoResult { std::size_t { 1 } } };
-    return _raw->WaitReadable();
+
+    // Otherwise the answer is a TLS-level one and the raw transport cannot give it:
+    // a peer's close_notify is a RECORD, so a raw peek sees bytes and reports data
+    // pending for a peer that has finished sending (#712). Decrypt instead, on the
+    // same detached-pump shape Read uses.
+    IoAwaitable awaitable;
+    awaitable.SetSuspendCallback(
+        [](IoAwaitable* self, std::coroutine_handle<>) {
+            auto* const tls = static_cast<TlsSocket*>(self->CallbackState());
+            tls->DriveWaitReadable(self);
+        },
+        this);
+    return awaitable;
 }
 
 IoAwaitable TlsSocket::Write(std::span<std::byte const> buffer)

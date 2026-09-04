@@ -775,6 +775,39 @@ Every rule below has already been a bug.
   minutes against any `redis-server`. A rule people can re-run is one they stop
   re-litigating.
 
+- **A TLS peer says "I have finished sending" with a RECORD, so the raw socket
+  cannot answer that question, and delegating to it was reporting the opposite.**
+  A well-behaved peer emits `close_notify` and only THEN the transport FIN, so at
+  the instant it goes away there are bytes on the wire: `TlsSocket::WaitReadable`
+  deferred to `_raw->WaitReadable()`, which peeked, saw the alert as data and
+  answered `>0`. #673's EOF arm therefore declined for every TLS client, on the one
+  transport where the graceful close is the ORDINARY close rather than a corner
+  ([#712](https://github.com/LASTRADA-Software/fastcached/issues/712)). The record
+  is decrypted now, by `SSL_peek`, which removes nothing OpenSSL decoded -- so
+  `SSL_pending()` reports the whole record afterwards and the caller's next `Read`
+  returns every byte of it. Four things travel with it:
+  - **"Consumes nothing" is about bytes the CALLER could have read.** The probe does
+    consume raw ciphertext into the decorator's own incoming BIO, and must: that is
+    the only way to have an answer. What the contract forbids is losing a byte the
+    next `Read` would have returned, which is why the control case reads the
+    plaintext back after the probe rather than merely checking a count.
+  - **Three answers, and the third is the one nobody writes down.** A decrypted byte
+    is `>0`; `SSL_ERROR_ZERO_RETURN` is `0`; and a raw EOF arriving BEFORE a full
+    record is `0` too -- a truncated stream is still a peer that has stopped
+    sending, and it is also the case the old delegation got right, so a fix pinned
+    only on `close_notify` can silently break it.
+  - **It writes, like every other TLS read**, which `ShutdownWrite`'s own comment
+    already recorded for `Read`: the `WANT_READ` path flushes whatever OpenSSL has
+    queued outbound, so a failure there surfaces as a `NetError` from a call a
+    plaintext socket answers with a count.
+  - **The case that reproduces it is the one that looks redundant.** Over an
+    in-memory wire the pre-fix version answers `1` *synchronously* when the wire is
+    idle, so a case that arms the wait, closes, and only then checks the count is
+    red for the right reason by accident. The assertion that the wait had NOT
+    resolved before the peer acted is what separates "parked, then told EOF" from
+    "never parked at all". Measured on Linux x86-64 (GCC 15 / libstdc++, OpenSSL
+    3.5): 3 of 5 cases fail on the parent commit, `1 == 0`.
+
 ## Dialing, and the reactor underneath it
 
 - **A synchronous dial spends a thread the caller does not own, and the argument
@@ -998,6 +1031,48 @@ Every rule below has already been a bug.
     how many of those peers were told why, moved by the connection when the write
     SUCCEEDS. The gap between them is a real quantity — swept peers left to infer it —
     rather than an error term, and a peer that had already hung up belongs in it.
+- **A socket has ONE read operation, `Read` and `WaitReadable` share it, and the
+  rule lived nowhere it could be obeyed.** Both verbs begin by claiming the same
+  per-direction `awaitable` pointer, so arming either while the other is parked
+  drops the parked awaitable: that coroutine is never resumed and never freed, with
+  no assertion, no error and no log, and the leak is proportional to traffic on
+  whatever path did it
+  ([#663](https://github.com/LASTRADA-Software/fastcached/issues/663)). The one
+  correct statement of the discipline in this tree was a comment in `RedisResp.cpp`
+  about that file's own watcher -- so somebody writing the next `WaitReadable` user
+  read `ISocket::WaitReadable`, which documented what the call does and said nothing
+  about exclusivity, and got a leaked frame per occurrence with no signal of any
+  kind. Four things are load-bearing:
+  - **The rule is on `ISocket`, because that is where it must be obeyed.** A
+    constraint stated by one consumer about itself is a constraint the next consumer
+    never meets.
+  - **The claim and the check are ONE expression.** `Detail::ClaimReadSlot`
+    (`Net/ReadSlot.hpp`) asserts the slot is free and then clears it, and the six
+    arm sites across `EpollSocket`, `KqueueSocket` and `IocpSocket` have no bare
+    `awaitable = nullptr` left. There is no line to forget the guard on, at the
+    seventh site as at the first -- the same shape as `SigningDomain` leaving no
+    argument to pass a bare label to. `IocpSocket`'s destructor still assigns
+    directly, and that is a teardown rather than a claim.
+  - **Debug-only, and the two louder options are both worse.** Refusing the new
+    operation would turn today's silent leak into a broken connection on a path that
+    is live right now (#710 arms a fresh wait per iteration and cancels none), and
+    completing the dropped awaitable would resume a coroutine that may already have
+    lost the socket it holds -- a use-after-free where there is currently a leak. So
+    the fix for a caller that does this belongs at the caller; what belongs in `Net/`
+    is the tripwire that names it.
+  - **It is watched refusing, and the hazard has no other coverage at all.** Measured
+    while landing the guard: a probe at all six arm sites reported ZERO double-arms
+    across `FastCacheTest` (2073 cases) and `fastcache-compile-node-tests`, and no
+    script fixture drives a blocking RESP verb or a subscription over a real socket
+    -- so nothing in the suite can see this, which is the ticket's own point.
+    `read-slot-guard-canary` double-arms a REAL socket through the real reactor, so
+    what it drives is the call site rather than the guard function, and
+    `scripts/read-slot-guard-gate.cmake` requires the assertion's OWN words: a bare
+    `WILL_FAIL` passes for a segfault, a missing library and a refused bind alike,
+    which is the same argument `iterator-debug-gate.ps1` makes about the same shape.
+    Shown red by removing the guard from one arm site, where it reports `the canary
+    SURVIVED` rather than a bare failure.
+
 - **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
   grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
   way to take it back, which is why `DeadlineTimer` and `InterruptibleSleepUntil`
@@ -1262,20 +1337,16 @@ consequence rather than a precaution.
 
 ## Open work
 
-- **[#712](https://github.com/LASTRADA-Software/fastcached/issues/712)** —
-  `TlsSocket::WaitReadable` cannot report EOF, so the EOF arm above never fires for a
-  TLS client. It defers to the raw socket, and a well-behaved TLS peer closes with a
-  `close_notify` RECORD and then FIN: the raw peek sees bytes, answers `>0`, and a
-  cleanly-closing `BLOCK 0` client still parks. Over TLS that is the ORDINARY close,
-  not a corner, so #673's fix does not reach TLS clients at all. Code-read, not
-  measured. It is the gap #677 deferred when it wrote "TlsSocket delegates".
 - **[#710](https://github.com/LASTRADA-Software/fastcached/issues/710)** —
   `RunBlockingRead` arms a fresh `ArmDisconnect` per loop iteration and cancels none,
   so a wait resolved by the data or timeout arm leaves the previous trampoline parked
   in `WaitReadable`, against the socket's single read-op slot. Predates #673 and is
   unchanged by it. Same family as
   [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) and deliberately
-  not folded into it: #663 is the shared slot, this is one caller misusing it.
+  not folded into it: #663 is the shared slot, this is one caller misusing it. Since
+  #663 landed the misuse is no longer silent — `Detail::ClaimReadSlot` asserts, so a
+  Debug build reaching this path dies naming it, which is what a fixture for this
+  ticket should expect to see before it sees a leak.
 - **[#711](https://github.com/LASTRADA-Software/fastcached/issues/711)** — three
   comment blocks in `src/apps/fastcache-compile-node/` still state the pre-#671
   doctrine and the pre-#677 socket behaviour. Listed here rather than only with the

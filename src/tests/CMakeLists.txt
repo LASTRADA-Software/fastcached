@@ -237,6 +237,52 @@ set_tests_properties("script-check-signals" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The read-slot canary: the third program in this file that MUST die.
+#
+# `Detail::ClaimReadSlot` (`src/FastCache/Net/ReadSlot.hpp`) is the tripwire for
+# #663 -- a socket has ONE read operation, `Read` and `WaitReadable` share it, and
+# arming either while the other is parked drops the parked coroutine, which is then
+# never resumed and never freed. No assertion, no error, no log, and a leak
+# proportional to traffic on whatever path did it.
+#
+# Nothing in this tree observes that: measured while landing the guard, a probe at
+# the six arm sites reported ZERO double-arms across `FastCacheTest` (2073 cases) and
+# `fastcache-compile-node-tests`, and no script fixture drives a blocking RESP verb
+# or a subscription over a real socket at all. So the hazard has no coverage
+# whatsoever -- which is the ticket's own point, and the reason the guard cannot be
+# left unwatched.
+#
+# It double-arms a REAL socket through the real reactor, so what it drives is the
+# CALL SITE and not the guard function. Asserting `ClaimReadSlot` in isolation would
+# prove the `assert` fires and say nothing about whether `EpollSocket::Read` reaches
+# it -- which is the half that rots when a seventh arm site is added.
+#
+# `scripts/read-slot-guard-gate.cmake` and not a bare `WILL_FAIL`, for the reason
+# the iterator-debug block above gives: an inversion cannot say WHY a green result
+# is meaningless, and a non-zero exit is not proof on its own. The gate requires the
+# assertion's own words, and keeps "never got that far", "survived" and "died of
+# something else" apart from "the guard refused".
+#
+# Guarded to Debug because `assert` compiles out everywhere else. Every preset this
+# project ships is single-config Ninja with an explicit `CMAKE_BUILD_TYPE`, so this
+# is a real condition rather than one that is silently always false.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(read-slot-guard-canary ReadSlotGuardCanary.cpp)
+    target_link_libraries(read-slot-guard-canary PRIVATE FastCache)
+    add_test(
+        NAME "read-slot-guard-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_CANARY=$<TARGET_FILE:read-slot-guard-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/read-slot-guard-gate.cmake"
+    )
+    set_tests_properties("read-slot-guard-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # A hygiene check traverses each directory once, not once per file pattern.
 #
 # `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN, and the call site
