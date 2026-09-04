@@ -1160,7 +1160,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   refutation, and in mixed output the unwrapped copy hides the wrapped one. It is the DIAGNOSTIC types
   that wrap — and that is a property of every verdict this repository reads rather than a trap somebody
   might hit: a `-P` script cannot fail by exit code, so **37 of 37** `scripts/check-*.cmake` report through
-  `message(FATAL_ERROR)`. There are also TWO ways to write the negative test wrong — use `STATUS`, or emit
+  `message(FATAL_ERROR)` (35 of 35 on the master this branched from — same pattern, different tree, so say
+  which). There are also TWO ways to write the negative test wrong — use `STATUS`, or emit
   both and let the unwrapped copy mask the wrapped one — and both read as a refutation. Flatten
   (`tr '\n' ' ' | tr -s ' '`) before matching, or match a phrase that cannot straddle 74 columns. Distinct
   from every other entry here: **the text does not exist in the form you are matching it in, and the tool

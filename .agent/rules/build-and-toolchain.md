@@ -2996,8 +2996,13 @@ are recorded together because the shape is one shape.
   might hit.** A `cmake -P` script cannot fail by exit code — `message(FATAL_ERROR)`
   prints and exits 0 on 3.28 — so the verdict travels through the diagnostic channel by
   construction. Measured: **37 of 37** `scripts/check-*.cmake` report through
-  `message(FATAL_ERROR)`. Every one of them is a check whose verdict cannot be read by
-  a substring match that crosses column 74. So flatten (`tr '\n' ' ' | tr -s ' '`)
+  `message(FATAL_ERROR)` — on the branch that added this entry; **35 of 35** on the
+  master it branched from, the two extra being that change's own. Both figures are
+  right for the tree they were taken on, which is the census rule arriving a third
+  time: not a different pattern here, the *same* pattern on a different tree. State
+  which tree, or the next person measures 35 and concludes the rule overstates itself.
+  Every one of them is a check whose verdict cannot be read by a substring match that
+  crosses column 74. So flatten (`tr '\n' ' ' | tr -s ' '`)
   before matching any verdict text, or match a phrase short enough that it cannot
   straddle the wrap.
 
