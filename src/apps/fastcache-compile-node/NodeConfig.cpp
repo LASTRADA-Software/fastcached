@@ -1700,6 +1700,46 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     if (advertised.empty())
         return std::nullopt; // Nothing is advertised, so there is nothing to be wrong.
 
+    // **Only when the operator NAMED the port this is compared against**
+    // ([#770](https://github.com/LASTRADA-Software/fastcached/issues/770)). This rule
+    // says "you advertise a port on this machine that is not the one this node serves",
+    // and with `--listen-node` unset the second half is a DEFAULT nobody typed --
+    // so refusing on it is refusing on an assumption.
+    //
+    // Under socket activation that assumption is not merely unstated, it is FALSE: the
+    // unit owns the address, so `--listen-node` "still holds a value that describes
+    // nothing" -- the rulebook's own words, recorded against `--bind` and inherited by
+    // this flag. The packaged worker is configured exactly that way, with an
+    // `advertise:` naming the socket unit's port and no `listen_node:` at all, and this
+    // rule refused it at startup: `fastcache-compile-node.socket` accepted the
+    // activating connection, the service exited 2, and the job failed on "a connection
+    // did not bring the worker up". It took the packaging jobs red on master, and it
+    // was invisible to every local suite because none of them is socket-activated.
+    //
+    // **`StartupPolicyRejection` cannot ask whether this node is activated**, which is
+    // why the fix is here rather than a condition on the environment: this table is a
+    // pure function of the parsed configuration and runs in `main()`, while activation
+    // is discovered inside `WorkerBody` long afterwards -- and at INSTALL time nobody
+    // knows either, since whether the unit is socket-activated is the unit's business.
+    // So the rule states its own premise instead: it judges a port an operator wrote
+    // against a port an operator wrote.
+    //
+    // Asked of `nodeListenExplicit` and NOT of the value, because `nodeListen` carries
+    // a non-empty default (`127.0.0.1:6674`) and `--listen-node=127.0.0.1:6674` is a
+    // promise whose value equals it. Provenance is recorded by the parse and cannot be
+    // recovered by comparing against the default -- that bit exists for exactly this
+    // question (#286), and reaching for `.empty()` here would have been the same defect
+    // one flag along. Measured: `.empty()` left the packaged worker still refused,
+    // because the default it was testing is never empty.
+    //
+    // What that gives up is stated rather than hidden: a node that names only
+    // `--advertise`, is not activated, and serves the default port is no longer
+    // refused for advertising some other port. That case is now unreachable from the
+    // configuration alone, and it is the narrower miss -- the alternative refuses the
+    // packaged worker, which is a deployment that works.
+    if (!cfg.nodeListenExplicit)
+        return std::nullopt;
+
     // Only an endpoint naming this machine is judged; see the note above.
     if (!IsLoopbackHost(HostOfEndpoint(advertised)))
         return std::nullopt;
