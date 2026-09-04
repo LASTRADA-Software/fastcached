@@ -211,20 +211,23 @@
 # Multiple listeners in one process, e.g. plaintext on a private interface and
 # TLS on a public one. When `listeners` is set it supersedes bind/port above.
 # TLS listeners share the tls_cert/tls_key pair (no per-listener SNI).
+#
+# This is also how to keep serving clients you cannot re-point: adding
+# memcached's 11211 (or redis's 6379) serves them alongside 6674 from the one
+# process — and because the protocol is auto-detected, each of those ports still
+# speaks every protocol, not just its namesake.
+#
+# ONE `listeners:` key, with every endpoint under it. Both uses above are entries
+# in this one list rather than a block each, because uncommenting two blocks that
+# both say `listeners:` is a duplicate YAML mapping key — which the parser
+# resolves by silently keeping one, so you would get some of the ports you wrote
+# and no error at all. `ctest -R daemon-config-reference` refuses that shape.
 #listeners:
 #  - address: 127.0.0.1
 #    port: 6674
 #  - address: "::"
 #    port: 6675
 #    tls: true
-
-# This is also how to keep serving clients you cannot re-point. Adding
-# memcached's 11211 (or redis's 6379) here serves them alongside 6674 from the
-# one process — and because the protocol is auto-detected, each of those ports
-# still speaks every protocol, not just its namesake:
-#listeners:
-#  - address: 127.0.0.1
-#    port: 6674
 #  - address: 127.0.0.1
 #    port: 11211
 
