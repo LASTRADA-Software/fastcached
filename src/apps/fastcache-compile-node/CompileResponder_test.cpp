@@ -626,6 +626,14 @@ class ShortWindowResponder final: public IFrameResponder
         return _inner.PeerWatchCounter(opRaw);
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Forwarded, like every other question this decorator does not itself answer.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept override
+    {
+        return _inner.ProgressInterval(opRaw);
+    }
+
   private:
     IFrameResponder& _inner;
     std::chrono::milliseconds _window;
@@ -677,36 +685,59 @@ class IdleListener final: public IListener
 /// @param port Where the endpoint listens.
 /// @param frame The request.
 /// @return The reply, or empty when the peer closed without answering.
-[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::vector<std::byte> frame)
+[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
+                                              std::vector<std::byte> frame,
+                                              std::size_t* progressSeen = nullptr)
 {
     BlockingConnector connector;
     auto socket =
         SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(socket.has_value());
 
-    auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
+    std::size_t pulses = 0;
+    auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request, std::size_t* seen) -> Task<std::vector<std::byte>> {
         auto const written = co_await peer->Write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
 
+        // **A COMPILE reply is a STREAM, not a frame** (#245): zero or more
+        // `Status::Progress` pulses precede exactly one terminal status. This helper
+        // steps over them the way `Cc::RecvReply` does, so a case reading it goes on
+        // asserting about the ANSWER -- which is the property every one of them is
+        // about -- while the count is available to the one case that is about the
+        // pulses themselves.
         std::vector<std::byte> received;
-        auto want = Wire::ReplyHeaderSize;
-        while (received.size() < want)
+        while (true)
         {
-            std::array<std::byte, 4096> chunk {};
-            auto const read = co_await peer->Read(std::span<std::byte> { chunk });
-            if (!read.has_value() || *read == 0)
-                co_return std::vector<std::byte> {};
-            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            auto want = Wire::ReplyHeaderSize;
+            while (received.size() < want)
+            {
+                std::array<std::byte, 4096> chunk {};
+                auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+                if (!read.has_value() || *read == 0)
+                    co_return std::vector<std::byte> {};
+                received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
 
-            if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
-                if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
-                    want = Wire::ReplyHeaderSize + header->payloadLength;
+                if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
+                    if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
+                        want = Wire::ReplyHeaderSize + header->payloadLength;
+            }
+
+            auto const header = Wire::DecodeReplyHeader(received);
+            if (!header.has_value() || Wire::IsTerminalStatus(Unwrap(header).status))
+                co_return received;
+
+            if (seen != nullptr)
+                ++*seen;
+            // Drained by the DECLARED length, exactly as a real reader does, so anything
+            // a later version puts in this payload cannot desynchronise the stream.
+            received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
         }
-        co_return received;
-    }((*socket).get(), std::move(frame)));
+    }((*socket).get(), std::move(frame), &pulses));
 
     (*socket)->Close();
+    if (progressSeen != nullptr)
+        *progressSeen = pulses;
     return reply;
 }
 

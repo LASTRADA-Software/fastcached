@@ -42,6 +42,25 @@ namespace
         return outcome;
     }
 
+    /// Report that the request is out, so an idle bound is measured from there.
+    ///
+    /// **A request fully written is forward motion, and leaving it out would make the
+    /// idle bound wrong in exactly the case it is armed for.** A dispatched COMPILE
+    /// carries a preprocessed translation unit -- megabytes -- and a slow link can
+    /// take longer to push it out than the idle budget allows, with the peer entirely
+    /// healthy and not yet owing anybody a word. Measured from the dial, such an
+    /// exchange would be abandoned while this side was still talking.
+    ///
+    /// It is not a claim that the PEER has read anything: the bytes may be sitting in
+    /// a kernel buffer. It is a claim that this side has nothing left to do, which is
+    /// the moment from which silence starts meaning something.
+    /// @param liveness Who to tell; null for nobody.
+    void NoteRequestSent(IExchangeLiveness* liveness) noexcept
+    {
+        if (liveness != nullptr)
+            liveness->MovedForward();
+    }
+
     /// Read exactly one reply frame, header first and then precisely the number
     /// of bytes the header declared.
     ///
@@ -51,43 +70,77 @@ namespace
     /// fresh connection was opened per operation, and a latent desynchronisation
     /// the moment one was ever reused. Here it cannot be forgotten: there is one
     /// reader, and it always consumes a whole frame.
+    /// **A progress frame is stepped over rather than returned**, which is what makes
+    /// `Status::Progress` a liveness signal instead of a second kind of answer
+    /// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)). Zero or
+    /// more of them precede exactly one terminal status, so this still consumes
+    /// precisely one answer per request and the pipelining rule above is untouched.
+    ///
+    /// **Nothing here bounds how many arrive, deliberately.** A worker that pulses
+    /// forever is a worker that is alive and never finishing, which is what
+    /// `ExchangeBudget::total` has always been for; counting them here would be a
+    /// second ceiling on the same thing, expressed in frames rather than in time, and
+    /// the two would have to agree forever about a number neither can convert into the
+    /// other.
+    ///
+    /// Its payload is DRAINED by the declared length rather than asserted empty, for
+    /// the reason every frame on this wire is: the declared length is what keeps the
+    /// link synchronised, and a reader that refuses a payload it does not understand
+    /// closes a connection the framing was built to keep.
     /// @param client Connected transport.
+    /// @param liveness Told about each progress frame; may be null.
     /// @return The outcome, with the payload attached.
-    [[nodiscard]] Task<CacheOutcome> RecvReply(ISocket* client)
+    [[nodiscard]] Task<CacheOutcome> RecvReply(ISocket* client, IExchangeLiveness* liveness)
     {
-        auto const headerBytes = co_await FastCache::RecvExactly(client, Wire::ReplyHeaderSize);
-        if (!headerBytes.has_value())
-            co_return Plain(CacheOutcomeKind::Transport);
-
-        auto const header = Wire::DecodeReplyHeader(*headerBytes);
-        if (!header.has_value())
-            co_return Plain(CacheOutcomeKind::Transport);
-
-        std::vector<std::byte> payload;
-        if (header->payloadLength > 0)
+        while (true)
         {
-            auto received = co_await FastCache::RecvExactly(client, header->payloadLength);
-            if (!received.has_value())
+            auto const headerBytes = co_await FastCache::RecvExactly(client, Wire::ReplyHeaderSize);
+            if (!headerBytes.has_value())
                 co_return Plain(CacheOutcomeKind::Transport);
-            payload = std::move(*received);
-        }
 
-        switch (header->status)
-        {
-            case Wire::Status::Ok:
-                co_return Hit(std::move(payload));
+            auto const header = Wire::DecodeReplyHeader(*headerBytes);
+            if (!header.has_value())
+                co_return Plain(CacheOutcomeKind::Transport);
 
-            case Wire::Status::Miss:
-                co_return Plain(CacheOutcomeKind::Miss);
-
-            case Wire::Status::Error: {
-                auto const decoded = Wire::DecodeErrorPayload(payload);
-                if (!decoded.has_value())
+            std::vector<std::byte> payload;
+            if (header->payloadLength > 0)
+            {
+                auto received = co_await FastCache::RecvExactly(client, header->payloadLength);
+                if (!received.has_value())
                     co_return Plain(CacheOutcomeKind::Transport);
-                co_return Rejected(decoded->first, std::string { decoded->second });
+                payload = std::move(*received);
             }
+
+            switch (header->status)
+            {
+                case Wire::Status::Ok:
+                    co_return Hit(std::move(payload));
+
+                case Wire::Status::Miss:
+                    co_return Plain(CacheOutcomeKind::Miss);
+
+                case Wire::Status::Error: {
+                    auto const decoded = Wire::DecodeErrorPayload(payload);
+                    if (!decoded.has_value())
+                        co_return Plain(CacheOutcomeKind::Transport);
+                    co_return Rejected(decoded->first, std::string { decoded->second });
+                }
+
+                case Wire::Status::Progress:
+                    // Reported BEFORE looping round, so the idle deadline is pushed out
+                    // before this coroutine parks on the next header rather than after
+                    // it comes back -- which is never, on the path this exists for.
+                    if (liveness != nullptr)
+                        liveness->MovedForward();
+                    break;
+            }
+
+            // Only `Progress` reaches here; every other arm returned. Asserted by the
+            // switch having no `default`, so a fifth status is a build failure at this
+            // reader rather than a frame silently treated as a pulse.
+            if (Wire::IsTerminalStatus(header->status))
+                co_return Plain(CacheOutcomeKind::Transport);
         }
-        co_return Plain(CacheOutcomeKind::Transport);
     }
 
     /// Send a framed request — optionally preceded by an AUTH frame in the SAME
@@ -116,6 +169,7 @@ namespace
     /// @param client Connected transport.
     /// @param frame The framed request.
     /// @param credential Credential to present ahead of it; none when unconfigured.
+    /// @param liveness Told each time the exchange moves forward; null for none.
     /// @return The command's outcome, or the AUTH refusal when the credential was
     ///         rejected (the command's own reply is still drained first).
     /// Parameters by VALUE, not by reference. clang-tidy enforces this on
@@ -127,24 +181,27 @@ namespace
     [[nodiscard]] Task<CacheOutcome> Exchange(ISocket* client,
                                               CredentialNotice* notice,
                                               std::vector<std::byte> frame,
-                                              Credential credential)
+                                              Credential credential,
+                                              IExchangeLiveness* liveness)
     {
         if (!credential.Configured())
         {
             if (!co_await FastCache::SendAll(client, frame))
                 co_return Plain(CacheOutcomeKind::Transport);
-            co_return co_await RecvReply(client);
+            NoteRequestSent(liveness);
+            co_return co_await RecvReply(client, liveness);
         }
 
         auto const authFrame =
             Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
         if (!co_await FastCache::SendAll(client, authFrame) || !co_await FastCache::SendAll(client, frame))
             co_return Plain(CacheOutcomeKind::Transport);
+        NoteRequestSent(liveness);
 
         // Non-const so the returns below can move rather than copy: an outcome
         // can carry a whole cached object, and `performance-no-automatic-move`
         // rejects the const spelling outright.
-        auto authOutcome = co_await RecvReply(client);
+        auto authOutcome = co_await RecvReply(client, liveness);
         if (authOutcome.kind == CacheOutcomeKind::Transport)
             co_return authOutcome;
 
@@ -152,7 +209,7 @@ namespace
         // answers every request it read, so leaving it in the socket would strand
         // a frame and the next command on this connection would read this one's
         // answer.
-        auto commandOutcome = co_await RecvReply(client);
+        auto commandOutcome = co_await RecvReply(client, liveness);
 
         // A daemon that predates the AUTH verb answers it `unknown-opcode` and —
         // because the framing was built to let a receiver step over a verb it does
@@ -196,9 +253,10 @@ namespace
 Task<CacheOutcome> ExchangeFramed(ISocket* client,
                                   CredentialNotice* notice,
                                   std::vector<std::byte> frame,
-                                  Credential credential)
+                                  Credential credential,
+                                  IExchangeLiveness* liveness)
 {
-    co_return co_await Exchange(client, notice, std::move(frame), std::move(credential));
+    co_return co_await Exchange(client, notice, std::move(frame), std::move(credential), liveness);
 }
 
 std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
@@ -242,12 +300,12 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
 
 Task<CacheOutcome> CacheFetch(ISocket* client, CredentialNotice* notice, std::string_view key, Credential credential)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential));
+    co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential), nullptr);
 }
 
 Task<CacheOutcome> CacheStore(ISocket* client, CredentialNotice* notice, Wire::StoreRequest request, Credential credential)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential));
+    co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential), nullptr);
 }
 
 } // namespace FastCache::Cc

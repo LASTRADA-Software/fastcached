@@ -168,6 +168,23 @@ class NamedResponder final: public IFrameResponder
         _watchPeer = counter;
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Settable per fake, for the reason `PeerWatchCounter` above is: what
+    /// `MergedResponder` must do with this is ROUTE it, and a routing test needs the
+    /// fakes to answer differently from each other.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _progress;
+    }
+
+    /// Say how often this fake pulses, or that it does not.
+    /// @param interval What `ProgressInterval` should answer.
+    void SetProgressInterval(std::optional<std::chrono::milliseconds> interval) noexcept
+    {
+        _progress = interval;
+    }
+
     /// Claim, or stop claiming, that this fake accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -219,6 +236,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxInFlight { 4096 };
     bool _ownBudget { false };
     std::optional<IMetricsSink::Counter> _watchPeer {};
+    std::optional<std::chrono::milliseconds> _progress {};
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like

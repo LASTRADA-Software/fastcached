@@ -178,6 +178,14 @@ struct Config
     /// `ioTimeout` because the two are different shapes of conversation and one
     /// number served neither (#223).
     std::chrono::milliseconds dispatchTimeout { Cc::DefaultDispatchTotal };
+
+    /// How long a dispatched compile may go SILENT before this client gives up.
+    ///
+    /// Separate from `dispatchTimeout` because they bound different things: that one
+    /// is how slow a compile may legitimately be, this one is how long a worker may
+    /// say nothing. Only the second can be short, and only since the worker pulses
+    /// (#245).
+    std::chrono::milliseconds dispatchIdle { Cc::DefaultDispatchIdle };
     std::chrono::milliseconds connectTimeout { DefaultConnectTimeout };
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
@@ -283,6 +291,7 @@ struct Config
     c.verifyRate = Cc::ParseVerificationRate(EnvOr(Cc::EnvName::Verify, ""));
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
     c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
+    c.dispatchIdle = EnvMillis(Cc::EnvName::DispatchIdleMs, Cc::DefaultDispatchIdle);
     c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
@@ -972,7 +981,10 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
     return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs {
-        .connect = cfg.connectTimeout, .controlTotal = cfg.ioTimeout, .compileTotal = cfg.dispatchTimeout });
+        .connect = cfg.connectTimeout,
+        .controlTotal = cfg.ioTimeout,
+        .compileTotal = cfg.dispatchTimeout,
+        .compileIdle = cfg.dispatchIdle });
 }
 
 /// The deadlines this invocation runs every cache exchange under.

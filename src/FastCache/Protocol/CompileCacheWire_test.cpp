@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -45,8 +46,8 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
-    CHECK(CurrentVersion == 2);
-    CHECK(MinSupportedVersion == 2);
+    CHECK(CurrentVersion == 3);
+    CHECK(MinSupportedVersion == 3);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -56,6 +57,7 @@ TEST_CASE("The wire constants have their specified byte values")
     CHECK(static_cast<std::uint8_t>(Status::Miss) == 0x00);
     CHECK(static_cast<std::uint8_t>(Status::Ok) == 0x01);
     CHECK(static_cast<std::uint8_t>(Status::Error) == 0x02);
+    CHECK(static_cast<std::uint8_t>(Status::Progress) == 0x03);
 
     // The BYTE, not the symbol. A constant on this wire carries two facts -- its
     // name and its value -- and a peer built from another revision of this header
@@ -85,7 +87,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x02,                   // version
+        0x03,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -104,7 +106,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x02,                               // version
+        0x03,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -196,6 +198,79 @@ TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status")
 
     reply[0] = std::byte { 0x7F };
     CHECK_FALSE(DecodeReplyHeader(std::span<std::byte const> { reply }.first(ReplyHeaderSize)).has_value());
+}
+
+TEST_CASE("EncodeProgressReply emits the specified bytes exactly")
+{
+    // clang-format off: the grid IS the specification -- one wire field per row.
+    auto const expected = Bytes({
+        0x03,                   // status = Progress
+        0x00, 0x00, 0x00, 0x00, // payloadLength = 0
+    });
+    // clang-format on
+
+    CHECK(EncodeProgressReply() == expected);
+
+    // The EMPTY payload is the contract, not an argument somebody chose (#245): a
+    // liveness pulse that carried partial diagnostics would be a second, racy channel
+    // for output the result frame already carries whole. Asserted here as well as
+    // enforced by the encoder taking no argument, because the assertion is what states
+    // it and the signature is only what makes it hard to break.
+    auto const header = DecodeReplyHeader(EncodeProgressReply());
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).payloadLength == 0);
+}
+
+TEST_CASE("A progress frame is a known status and is never a terminal one")
+{
+    // Two facts a client reads separately, and collapsing them is the whole defect a
+    // pre-#245 launcher has: `DecodeReplyHeader` refused `0x03` outright, so a
+    // progress frame arrived as a decode failure and the compile was abandoned several
+    // minutes in, as a transport failure naming nothing.
+    auto const pulse = EncodeProgressReply();
+    auto const header = DecodeReplyHeader(pulse);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).status == Status::Progress);
+    CHECK_FALSE(IsTerminalStatus(Unwrap(header).status));
+
+    CHECK(IsTerminalStatus(Status::Ok));
+    CHECK(IsTerminalStatus(Status::Miss));
+    CHECK(IsTerminalStatus(Status::Error));
+
+    // And the byte after it is still unknown, so the enum is a closed set rather than
+    // "anything small is a status".
+    CHECK(IsKnownStatus(0x03));
+    CHECK_FALSE(IsKnownStatus(0x04));
+}
+
+TEST_CASE("Only COMPILE may be answered with a progress pulse")
+{
+    // A pulse turns one verb's reply into a STREAM, and every client reading that verb
+    // then has to loop for its answer. That is a decision per verb, so the table says
+    // which -- and `ProgressIsCompileOnly` asserts it at compile time. This is the
+    // runtime half, which is what fails when a row's mask is widened by hand.
+    for (auto const& row: OpTable)
+    {
+        INFO("verb " << row.name);
+        auto const pulses = (row.legalStatuses & StatusBit(Status::Progress)) != 0;
+        CHECK(pulses == (row.code == Op::Compile));
+    }
+}
+
+TEST_CASE("The pulse cadence and the client's patience are one pair of numbers")
+{
+    // They bound ONE silence from opposite sides: the worker's cadence is how often it
+    // says something, the client's bound is how long it waits without hearing. Neither
+    // end can pick its own without describing a fleet the other is not running, which
+    // is why both live here -- the only header both binaries include -- exactly as
+    // `DefaultCompileLeaseTimeout` does.
+    //
+    // The RELATION is the load-bearing part: a client that gives up on the first missed
+    // pulse refuses a perfectly healthy worker over the ordinary jitter of its own
+    // reactor, which reads as a fleet that has stopped working.
+    CHECK(DefaultCompileIdleTimeout >= 3 * DefaultProgressInterval);
+    CHECK(DefaultCompileIdleTimeout < DefaultCompileLeaseTimeout);
+    CHECK(DefaultProgressInterval > std::chrono::milliseconds::zero());
 }
 
 // --- payload splitting -----------------------------------------------------
@@ -371,7 +446,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x02, 0x03,       // magic, version, op=Auth
+        0xFC, 0x03, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });

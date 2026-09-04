@@ -86,20 +86,34 @@ class CompileResponder final: public IFrameResponder
     ///        guessed. Must outlive this.
     /// @param metrics Where the refusals and the byte counters land; must outlive this.
     /// @param logger Where a compile that threw is reported; must outlive this.
+    /// @param progressInterval How often a running compile pulses `Status::Progress`
+    ///        at its client. Defaults to the value both ends of this wire derive from
+    ///        (`CompileCacheWire::DefaultProgressInterval`), which is where the
+    ///        production number belongs -- the client's own idle bound has to agree
+    ///        with it and there is no handshake on this wire to agree it at run time.
+    ///
+    ///        It is a PARAMETER rather than that constant read at the point of use for
+    ///        the reason every other ambient value here is injected: a case proving the
+    ///        pulse reaches a real client end-to-end would otherwise have to hold a
+    ///        compile for five seconds to see one frame, and a suite that costs seconds
+    ///        per liveness assertion is a suite that stops being run. Nothing in
+    ///        production passes it.
     CompileResponder(Cc::WorkerProtocol& protocol,
                      CompileCapacity& capacity,
                      Distributed::IMembershipOracle const& membership,
                      IExecutor& jobs,
                      IExecutor& home,
                      IMetricsSink& metrics,
-                     ILogger& logger) noexcept:
+                     ILogger& logger,
+                     std::chrono::milliseconds progressInterval = CompileCacheWire::DefaultProgressInterval) noexcept:
         _protocol { protocol },
         _capacity { capacity },
         _membership { membership },
         _jobs { jobs },
         _home { home },
         _metrics { metrics },
-        _logger { logger }
+        _logger { logger },
+        _progressInterval { progressInterval }
     {
     }
 
@@ -282,6 +296,29 @@ class CompileResponder final: public IFrameResponder
         return IMetricsSink::Counter::WorkerJobsAbandonedClientGone;
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// **Yes, and this is the only surface where the question has an answer.** It is the
+    /// exact converse of `PeerWatchCounter` above and they are two halves of one
+    /// problem: a compile runs for seconds to minutes with nothing said in either
+    /// direction, so each end has to be given a way to notice that the other has
+    /// stopped. The watch above is this node noticing a client that left; this is the
+    /// client noticing a worker that has stopped making progress, which before #245 cost
+    /// it the whole ten-minute dispatch budget.
+    ///
+    /// The interval comes from the shared wire header rather than from a flag here,
+    /// because it has to agree with the bound the CLIENT measures silence against and
+    /// there is no negotiation on this wire to agree it at run time. `CompileCacheWire`
+    /// holds both numbers and asserts the relation between them.
+    ///
+    /// Verb-blind, exactly as the two answers above it: `MergedResponder` routes by verb
+    /// FAMILY, so every verb arriving here is a compile verb, and answering per-verb
+    /// would restate the family table somewhere it can disagree with itself.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _progressInterval;
+    }
+
   private:
     Cc::WorkerProtocol& _protocol;
     CompileCapacity& _capacity;
@@ -290,6 +327,8 @@ class CompileResponder final: public IFrameResponder
     IExecutor& _home;
     IMetricsSink& _metrics;
     ILogger& _logger;
+    /// How often a running compile says it is still there; see the constructor.
+    std::chrono::milliseconds _progressInterval;
 };
 
 } // namespace FastCache::Node

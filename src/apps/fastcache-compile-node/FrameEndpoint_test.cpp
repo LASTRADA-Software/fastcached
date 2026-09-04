@@ -778,6 +778,25 @@ class HoldableResponder final: public IFrameResponder
         _watchPeer.store(watch, std::memory_order_release);
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Off by default, so every case written before #245 keeps asserting what it did:
+    /// a pulse puts extra frames in front of the reply, and a reader expecting exactly
+    /// one would see them. A case that turns it on is standing in for
+    /// `CompileResponder`, the one surface that pulses in production.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        auto const millis = _progressMs.load(std::memory_order_acquire);
+        return millis > 0 ? std::optional { std::chrono::milliseconds { millis } } : std::nullopt;
+    }
+
+    /// Pulse, or stop pulsing, while answering.
+    /// @param interval What `ProgressInterval` should answer; zero for nothing.
+    void PulseWhileAnswering(std::chrono::milliseconds interval) noexcept
+    {
+        _progressMs.store(interval.count(), std::memory_order_release);
+    }
+
     /// Claim, or stop claiming, that this surface accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -940,6 +959,11 @@ class HoldableResponder final: public IFrameResponder
     std::size_t _budget { 0 };
     std::atomic<bool> _ownBudget { false };
     std::atomic<bool> _watchPeer { false };
+
+    /// How often to pulse, in milliseconds; 0 means never. Stored as the count rather
+    /// than as a `milliseconds` because `std::atomic` wants a trivially copyable
+    /// arithmetic type to be lock-free on every platform this builds for.
+    std::atomic<std::chrono::milliseconds::rep> _progressMs { 0 };
     FrameEndpoint const* _endpoint { nullptr };
     std::atomic<std::size_t> _inFlightAtEntry { 0 };
     /// Separate from the figure, because zero is a legitimate reading and "never
