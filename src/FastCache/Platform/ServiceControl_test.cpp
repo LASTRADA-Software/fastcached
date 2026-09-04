@@ -1278,8 +1278,8 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
 // a portability claim doing load-bearing work it cannot support is the defect
 // this whole change is about:
 //
-//     parked `sleep`   ->      665us of cpu against a 1012ms budget   (0.07%)
-//     busy loop        ->   846448us of cpu against a 1012ms budget   (83.6%)
+//     parked `sleep`   ->      665us of cpu against 1012ms of elapsed   (0.07%)
+//     busy loop        ->   846448us of cpu against 1012ms of elapsed   (83.6%)
 //
 // That measurement REFUTED this code's first design, which read zero cpu as "it
 // never ran". Nothing reads zero: exec and dynamic linking are not free, so a
@@ -1295,7 +1295,7 @@ TEST_CASE("ServiceControl: every flag that can reach a registration does, one ro
 namespace
 {
 
-/// A timed-out call with a given duty cycle over a 1000ms budget.
+/// A timed-out call with a given duty cycle over 1000ms of elapsed.
 /// @param cpu The cpu reading, or nullopt when none could be taken.
 /// @return The readings.
 [[nodiscard]] FastCache::LaunchctlReadings TimedOutWith(std::optional<std::chrono::microseconds> cpu)
@@ -1304,6 +1304,24 @@ namespace
              .exitStatus = 0,
              .elapsed = std::chrono::milliseconds { 1'000 },
              .budget = std::chrono::milliseconds { 1'000 },
+             .cpu = cpu };
+}
+
+/// A timed-out call whose elapsed and budget DIFFER, so a case can tell which
+/// one the duty cycle divides by.
+///
+/// The fixture above deliberately cannot: it sets both to 1000ms, which is fine
+/// for the band arithmetic and useless for the denominator. And the denominator
+/// is the whole subject of this change -- a polled wait overshoots, so a
+/// classifier reading `budget` would be measuring time the process did not have.
+/// @param cpu The cpu reading.
+/// @return Readings with a 1000ms elapsed inside a 60000ms budget.
+[[nodiscard]] FastCache::LaunchctlReadings OvershotWith(std::chrono::microseconds cpu)
+{
+    return { .outcome = FastCache::LaunchctlOutcome::TimedOut,
+             .exitStatus = 0,
+             .elapsed = std::chrono::milliseconds { 1'000 },
+             .budget = std::chrono::milliseconds { 60'000 },
              .cpu = cpu };
 }
 
@@ -1317,7 +1335,7 @@ TEST_CASE("A launchctl timeout is read as a duty cycle, with the band between re
 
     SECTION("the measured anchors land where they should")
     {
-        // The two real readings, scaled to this fixture's 1000ms budget. If either
+        // The two real readings, scaled to this fixture's 1000ms elapsed. If either
         // stopped classifying, the bands would no longer separate the only two
         // behaviours anyone has actually observed.
         CHECK(LaunchctlFindingOf(TimedOutWith(std::chrono::microseconds { 657 })) == LaunchctlFinding::Waiting);
@@ -1371,13 +1389,73 @@ TEST_CASE("The timeout message carries the measured elapsed, not the ceiling", "
     auto const text = FastCache::LaunchctlStatusText(readings);
     CHECK(text.contains("60123ms"));
     CHECK(text.contains("60000ms budget"));
-    // A wait that ran out refused nothing, and calling it a failure sent an
-    // operator looking for a rejection that never happened.
     // The verb lives at the call site now (`LaunchctlFailureVerb`), so this
     // phrase carries the readings rather than the classification -- otherwise the
     // two together read "kickstart timed out (timed out after ...)".
     CHECK(text.contains("killed"));
-    CHECK_FALSE(text.contains("refused"));
+
+    // And NOT the configured ceiling. The pre-change message was
+    // `killed after {}s with no result`, interpolating `LaunchctlTimeoutSeconds`,
+    // so it read "60s" whatever the call actually cost -- this is the assertion
+    // that would have failed against it, which makes this case a regression test
+    // for #535 rather than a description of it.
+    //
+    // It replaces a `CHECK_FALSE(contains("refused"))` that could not fail:
+    // "refused" never appeared in this message in any version, so it read as a
+    // guard and guarded nothing.
+    CHECK_FALSE(text.contains("60s"));
+}
+
+TEST_CASE("The duty cycle is taken over elapsed, not over the budget", "[platform][service][launchctl]")
+{
+    using FastCache::LaunchctlFinding;
+    using FastCache::LaunchctlFindingOf;
+
+    // Nothing else here can tell the two apart: every other case sets elapsed
+    // equal to budget, so swapping the denominator in the classifier leaves them
+    // all green. Measured that way -- the substitution passes six CHECKs.
+    //
+    // 836ms of cpu inside 1000ms of ELAPSED is 83.6%, which is BurningCpu. The
+    // same reading against the 60000ms BUDGET is 1.4%, which would be Waiting.
+    // So this one case is the only thing standing between the classifier and a
+    // denominator that measures time the process never had.
+    CHECK(LaunchctlFindingOf(OvershotWith(std::chrono::microseconds { 836'000 })) == LaunchctlFinding::BurningCpu);
+}
+
+TEST_CASE("An elapsed of zero cannot be divided by, and says so", "[platform][service][launchctl]")
+{
+    // The guard exists; nothing drove it. A duty cycle over zero elapsed is not a
+    // small number, it is no number.
+    auto readings = TimedOutWith(std::chrono::microseconds { 5 });
+    readings.elapsed = std::chrono::milliseconds { 0 };
+    CHECK(FastCache::LaunchctlFindingOf(readings) == FastCache::LaunchctlFinding::Inconclusive);
+}
+
+TEST_CASE("The message says which finding it reached", "[platform][service][launchctl]")
+{
+    // THE OPERATOR-FACING PAYOFF OF THE WHOLE TICKET, and nothing asserted it.
+    // Measured: deleting `LaunchctlStatusText`'s entire `switch` over the finding
+    // and returning the bare `text` left all 27 assertions green -- so every
+    // sentence an operator would actually read, including the microseconds ->
+    // milliseconds conversion, shipped unverified.
+    using FastCache::LaunchctlStatusText;
+
+    // Burning cpu: the reading is rendered, and in MILLISECONDS. 836000us is the
+    // spinner anchor, and 836ms is the only correct way to show it.
+    auto const burning = LaunchctlStatusText(TimedOutWith(std::chrono::microseconds { 836'000 }));
+    CHECK(burning.contains("burning cpu"));
+    CHECK(burning.contains("836ms"));
+
+    // Waiting: says what was seen and explicitly refuses to say which cause.
+    auto const waiting = LaunchctlStatusText(TimedOutWith(std::chrono::microseconds { 657 }));
+    CHECK(waiting.contains("almost no cpu"));
+    CHECK(waiting.contains("does not say whether"));
+
+    // Inconclusive, from a reading inside the band.
+    CHECK(LaunchctlStatusText(TimedOutWith(std::chrono::microseconds { 300'000 })).contains("does not separate"));
+
+    // And from no reading at all, which is a different reason for the same word.
+    CHECK(LaunchctlStatusText(TimedOutWith(std::nullopt)).contains("does not separate"));
 }
 
 TEST_CASE("The message never claims the job will start at the next boot", "[platform][service][launchctl]")
@@ -1413,8 +1491,8 @@ TEST_CASE("Only an exit status of zero is a launchctl success", "[platform][serv
 {
     // `LaunchctlSucceeded` used to live inside the `__APPLE__` branch, which made
     // it the one decision in this change that no test could reach -- against the
-    // change's own thesis. Its truth value has to match the `!= 0` the four call
-    // sites used before, and this is what says so rather than a reviewer's
+    // change's own thesis. Its truth value has to match what the four call sites
+    // compared before (`== 0` at one, `!= 0` at the others), and this is what says so rather than a reviewer's
     // arithmetic: the old sentinels were -1 and -2, and `WEXITSTATUS` yields
     // 0-255, so no collision was possible and every site is preserved exactly.
     using FastCache::LaunchctlOutcome;

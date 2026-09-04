@@ -981,7 +981,21 @@ bool LaunchctlSucceeded(LaunchctlReadings const& readings) noexcept
 
 std::string_view LaunchctlFailureVerb(LaunchctlReadings const& readings) noexcept
 {
-    return readings.outcome == LaunchctlOutcome::TimedOut ? "timed out" : "failed";
+    // A switch and not a ternary, and not because it reads better: a ternary has
+    // no arm for an enumerator nobody has added yet, so a new outcome would
+    // quietly become "failed". This change ADDED `Signalled`, so the enum is
+    // demonstrably open, and `-Wswitch -Werror` is what makes the next one a
+    // build failure rather than a silent mislabel.
+    switch (readings.outcome)
+    {
+        case LaunchctlOutcome::TimedOut:
+            return "timed out";
+        case LaunchctlOutcome::Exited:
+        case LaunchctlOutcome::NotStarted:
+        case LaunchctlOutcome::Signalled:
+            break;
+    }
+    return "failed";
 }
 
 LaunchctlFinding LaunchctlFindingOf(LaunchctlReadings const& readings) noexcept
@@ -1024,7 +1038,10 @@ std::string LaunchctlStatusText(LaunchctlReadings const& readings)
     // `LaunchctlFailureVerb` immediately before this, and the two together read
     // "kickstart timed out (timed out after ...)".
     //
-    // Not `const`: it is returned by value below, and constness blocks the move.
+    // Non-const so the concatenating arms below can append in place rather than
+    // build a second string. NOT because "constness blocks the move" -- an
+    // earlier comment here said that and it is false: the bare `return text` is
+    // NRVO, which applies to a const local equally.
     auto text = std::format("after {}ms of a {}ms budget, killed", readings.elapsed.count(), readings.budget.count());
 
     switch (LaunchctlFindingOf(readings))
@@ -1044,11 +1061,11 @@ std::string LaunchctlStatusText(LaunchctlReadings const& readings)
             // Deliberately does NOT say which. A loaded host and a lock it will
             // never get produce the same reading, and #535 exists because a
             // sentence chose between them and chose wrong.
-            return text
+            return std::move(text)
                    + "; it consumed almost no cpu, so it was waiting on something -- this does not say whether that "
                      "was a busy host or a stall";
         case LaunchctlFinding::Inconclusive:
-            return text + "; the cpu reading does not separate a busy host from a stall";
+            return std::move(text) + "; the cpu reading does not separate a busy host from a stall";
         case LaunchctlFinding::NotATimeout:
             break;
     }
@@ -1565,6 +1582,18 @@ namespace
                 // reap of the process just killed. Asked AFTER the kill for that
                 // reason -- there is no portable way to sample a LIVE child's cpu,
                 // and the corpse carries the total.
+                //
+                // This reap BLOCKS, and that is a hole in the bound above rather
+                // than a detail: a child wedged in an uninterruptible kernel wait
+                // does not die on SIGKILL, and this would then wait forever --
+                // defeating the "an installer must never be able to hang"
+                // contract this whole function exists for. Pre-existing (the old
+                // code blocked in `waitpid` here identically) and left alone
+                // rather than fixed silently inside a diagnostics change, but
+                // named so the next reader does not have to rediscover it. The
+                // shape that closes it is a bounded `WNOHANG` poll leaving `cpu`
+                // disengaged on expiry, which the nullopt-means-no-reading design
+                // already handles.
                 int discarded = 0;
                 ::rusage usage {};
                 auto const reapedAfterKill = ::wait4(pid, &discarded, 0, &usage);
