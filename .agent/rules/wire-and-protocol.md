@@ -745,13 +745,31 @@ Every rule below has already been a bug.
     express is a rule nothing can be held to. The default is a no-op for fakes; every
     transport this library hands out overrides it.
 
-  - **The error-only reading detects neither way a client leaves.**
+  - **The error-only reading detected neither way a client leaves**, and
+    `ArmDisconnect` now reads the COUNT
+    ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)).
     `RedisResp.cpp`'s *"a full peer close surfaces as the error case"* is false on
     IOCP — a full close arrives as readable, measured while landing #662 — and the
     table above adds that a **half**-close is acted on too, which an error-only rule
-    cannot see at all. Fixing that is
-    [#673](https://github.com/LASTRADA-Software/fastcached/issues/673); this rule is
-    what it is fixed *against*.
+    cannot see at all. Two arms, and they answer different questions: an ERROR is an
+    abortive close (RST), a count of **`0`** is EOF, and EOF is the ordinary way a
+    client goes away. A count `>0` is still not a disconnect — it is a pipelined
+    command — so this is not "readable means gone", which would abandon every
+    blocking read the instant it parked.
+
+    **A watch is proved by DELETING an arm, never by a passing suite**, because both
+    arms set one flag and either alone makes every test green. That is how #673 was
+    found (delete the error arm on IOCP: 7 cases, 61 assertions, all still pass — so
+    it had never fired) and it is how its fix is checked: delete the EOF arm and
+    exactly one case fails, `RESP: XREAD BLOCK 0 is abandoned when the peer closes
+    gracefully`, while its control stays green. The control is not optional — without
+    a case that must survive an open write side, "detect a graceful close" and
+    "abandon everything" are the same passing test.
+
+    And the signal is that the HANDLER RETURNED, not that a reply was empty: a reader
+    still parked and one that unwound having written nothing produce identical bytes,
+    which is why the in-memory suite could not see this even after
+    `InMemorySocket::WaitReadable` made the condition expressible (#677).
 
   The probes are `scripts/probes/redis-eof-semantics.py`, runnable in about two
   minutes against any `redis-server`. A rule people can re-run is one they stop
@@ -1243,4 +1261,25 @@ consequence rather than a precaution.
   again. The erase is what makes the event true exactly once.
 
 ## Open work
+
+- **[#712](https://github.com/LASTRADA-Software/fastcached/issues/712)** —
+  `TlsSocket::WaitReadable` cannot report EOF, so the EOF arm above never fires for a
+  TLS client. It defers to the raw socket, and a well-behaved TLS peer closes with a
+  `close_notify` RECORD and then FIN: the raw peek sees bytes, answers `>0`, and a
+  cleanly-closing `BLOCK 0` client still parks. Over TLS that is the ORDINARY close,
+  not a corner, so #673's fix does not reach TLS clients at all. Code-read, not
+  measured. It is the gap #677 deferred when it wrote "TlsSocket delegates".
+- **[#710](https://github.com/LASTRADA-Software/fastcached/issues/710)** —
+  `RunBlockingRead` arms a fresh `ArmDisconnect` per loop iteration and cancels none,
+  so a wait resolved by the data or timeout arm leaves the previous trampoline parked
+  in `WaitReadable`, against the socket's single read-op slot. Predates #673 and is
+  unchanged by it. Same family as
+  [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) and deliberately
+  not folded into it: #663 is the shared slot, this is one caller misusing it.
+- **[#711](https://github.com/LASTRADA-Software/fastcached/issues/711)** — three
+  comment blocks in `src/apps/fastcache-compile-node/` still state the pre-#671
+  doctrine and the pre-#677 socket behaviour. Listed here rather than only with the
+  compile surface because what they contradict is the EOF rule above, and because one
+  of them is the stated reason that surface takes "the opposite rule" — a contrast
+  that no longer exists.
 

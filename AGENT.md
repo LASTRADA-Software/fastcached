@@ -616,7 +616,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   consumer was a test by construction, and a rule nothing can express is a rule
   nothing can be held to. The answer does not transfer between wires — the compile surface reads
   a mid-compile EOF as *gone* under the SAME rule, because a compile's reply is not
-  yet determined — so state which surface any measurement covers.
+  yet determined — so state which surface any measurement covers. A watcher for it
+  reads the COUNT: an ERROR is an abortive close and `0` is EOF, which is the
+  ORDINARY way a client leaves, so `ArmDisconnect`'s error-only arm never once fired
+  and leaked the socket it exists to free (#673). Both arms set one flag, so a green
+  suite proves nothing — **DELETE an arm and see which case fails**, and keep a
+  control that must survive an open write side, or *detect a graceful close* and
+  *abandon every blocking read* are the same passing test. The signal is that the
+  handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through

@@ -508,10 +508,10 @@ namespace
             return _timedOut;
         }
 
-        /// Whether the wait resolved because the client disconnected (the socket
-        /// became readable/closed while parked) rather than data or timeout. Lets
-        /// the handler abandon the read so the connection coroutine can unwind and
-        /// release its socket/admission slot instead of parking forever.
+        /// Whether the wait resolved because the peer finished sending while parked
+        /// -- EOF or a socket error, never mere readability -- rather than data or
+        /// timeout. Lets the handler abandon the read so the connection coroutine can
+        /// unwind and release its socket/admission slot instead of parking forever.
         [[nodiscard]] bool Disconnected() const noexcept
         {
             std::scoped_lock const lock { _mu };
@@ -520,7 +520,8 @@ namespace
 
         /// Disconnect arm: resolve the wait because the client went away
         /// (idempotent). The handler treats this like a timeout but skips the
-        /// nil reply, since there is no live peer to receive it.
+        /// nil reply, since the peer has stated it is done and a blocking read is
+        /// pending work rather than an answer it is owed (#671).
         void WakeDisconnect() noexcept
         {
             WakeOnce(/*timedOut*/ false, /*disconnected*/ true);
@@ -614,25 +615,60 @@ namespace
     }
 
     /// Detached trampoline arming the disconnect arm of a blocking read: park on
-    /// the socket's readability and, when it fires (incoming bytes or EOF while
-    /// the client is supposedly idle on a BLOCK), resolve the waiter as a
-    /// disconnect so the handler can abandon the wait and let the connection
-    /// coroutine unwind — otherwise a `BLOCK 0` reader whose peer vanished would
-    /// stay parked forever, leaking its socket and admission slot. Holds a
-    /// shared_ptr so the waiter outlives this task.
+    /// the socket's readability and, when the peer turns out to have finished
+    /// sending, resolve the waiter as a disconnect so the handler can abandon the
+    /// wait and let the connection coroutine unwind — otherwise a `BLOCK 0` reader
+    /// whose peer went away would stay parked forever, leaking its socket and
+    /// admission slot. Holds a shared_ptr so the waiter outlives this task.
     ///
-    /// Only an ERROR from `WaitReadable` (the reactor reporting the socket
-    /// closed/hung-up) counts as a disconnect. Mere readability does NOT: it can
-    /// mean pipelined bytes for the next command, or a half-close where the
-    /// client shut its write side but still awaits this reply — abandoning the
-    /// read there would be wrong, and reading to disambiguate would consume bytes
-    /// meant for the next command. A full peer close surfaces as the error case.
+    /// **Two arms, answering different questions.** An ERROR from `WaitReadable` is
+    /// an ABORTIVE close — an RST, surfacing as `ECONNRESET`/`WSAECONNRESET`. A
+    /// count of **`0`** is EOF, which is how a GRACEFUL close arrives: a FIN makes
+    /// the socket readable, and the count is what distinguishes it from pending data
+    /// (`ISocket::WaitReadable`, #677). Watching for the error alone therefore missed
+    /// the ordinary way a client goes away, and leaked the socket on every graceful
+    /// close ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)).
+    /// That arm was measured never to fire, by deleting it; the figures and the
+    /// method are in `.agent/rules/wire-and-protocol.md` under the EOF rule, which is
+    /// also where a passing suite is shown to prove nothing about either arm.
+    ///
+    /// **EOF abandons the read because that is what this wire decided EOF means**,
+    /// measured against a running `redis-server` rather than argued
+    /// ([#671](https://github.com/LASTRADA-Software/fastcached/issues/671),
+    /// `scripts/probes/redis-eof-semantics.py`): *"this peer has finished sending"* —
+    /// a server answers what is already DETERMINED and abandons what is still
+    /// PENDING, and a blocked read is a pending future. Replies the peer is already
+    /// owed are unaffected: they are determined, and the surrounding handler has
+    /// written them by the time this arms.
+    ///
+    /// **A non-zero count is NOT a disconnect.** `>0` is data pending — a pipelined
+    /// command for after this one — and consuming it here to disambiguate would eat
+    /// bytes the next command owns. So the trampoline ends, leaving the wait to the
+    /// data and timeout arms. It does not loop: `WaitReadable` would keep answering
+    /// with the same pending byte immediately, which is a spin, not a watch.
+    /// `RunBlockingRead` arms a fresh one per iteration, so a wait that resumes and
+    /// re-registers is watched again; a wait that stays parked with bytes pending is
+    /// not. That per-iteration arming cancels nothing and predates this arm, which is
+    /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710).
+    ///
+    /// **Two cases it therefore does not cover**, both stated rather than left to be
+    /// discovered:
+    ///
+    ///  - A peer that pipelines and *then* closes, until the next re-arm or read.
+    ///  - **TLS, where that is the ORDINARY close**, not a corner: a well-behaved
+    ///    peer sends a `close_notify` RECORD and then FIN, and
+    ///    `TlsSocket::WaitReadable` defers to the raw socket, which sees that record
+    ///    as bytes and answers `>0`. So the arm declines and a TLS `BLOCK 0` client
+    ///    closing cleanly still parks. Code-read, not measured. Reporting EOF through
+    ///    a TLS socket needs the record decrypted, which is a decision for that
+    ///    layer, not something to soften here —
+    ///    [#712](https://github.com/LASTRADA-Software/fastcached/issues/712).
     /// @param waiter The waiter to resolve on disconnect (kept alive here).
     /// @param socket The connection socket to watch for closure.
     DetachedTask ArmDisconnect(std::shared_ptr<StreamWaiter> waiter, ISocket* socket)
     {
         auto const readable = co_await socket->WaitReadable();
-        if (!readable.has_value())
+        if (!readable.has_value() || *readable == 0)
             waiter->WakeDisconnect();
     }
 
