@@ -453,6 +453,17 @@ things apart:
 | the required-checks reading | a skipped required check passes | a skipped **matrix** job never reports at all |
 | `pr-labels.yml`'s gate | skipped, therefore green | the labeller had **failed** |
 | a CI watcher (twice) | "settled", then "25 of 26 green" | the list was still being built; the 26th was correctly skipped |
+| a merge watcher | stop watching, on **any** red | the red was an *unrequired* packaging leg; ten required contexts went unwatched |
+| a merge-readiness checker (three times) | `fail` | `SKIPPED`, then `CANCELLED`, then *pending* — the last inventing a red that did not exist |
+
+**The last two rows are the sharpest, because in both the collapsed distinction is the
+one the instrument existed to report.** A watcher built to tell required from unrequired
+stopped at the first red without asking which it was; a checker built to keep `ABSENT`
+distinct from pending folded `SKIPPED`, then `CANCELLED`, into `fail`. Neither author was
+careless — a red is a red is the obvious reading, and it is wrong in exactly the domain
+each tool was written for. That is this section's closing observation arriving early: the
+collapsed state is the one you were not thinking about when you chose the representation,
+and building the instrument does not exempt you from it.
 
 The four states, and why each pair is dangerous:
 
