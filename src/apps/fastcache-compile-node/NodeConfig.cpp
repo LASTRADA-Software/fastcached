@@ -7,6 +7,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -1519,28 +1520,31 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // may not go here. Absolute for the same reason the flag
                          // above is: an install run from a shell resolves a relative
                          // path somewhere the service never will.
+                         // `ConfigPath` and NOT `StoragePath`, which is the whole of
+                         // #396: this worker reads a configuration file and has no
+                         // `--storage` flag at all, so it is the first service for
+                         // which "keeps files" and "takes both flags" are different
+                         // answers. While `applicationName` decided both, the only
+                         // safe thing to say was nothing -- naming an application
+                         // baked a `--storage=` into every user-scope registration
+                         // and the job answered its own command line with
+                         // "unrecognised argument" at every start, reported installed
+                         // and dead at every boot.
+                         .acceptedScopeDefaults = ScopeDefaults({ ScopeDefault::ConfigPath }),
                          .configPath = absoluteOrAsWritten(cfg.configPath),
-                         // Still empty, and the reason has CHANGED with #291 -- so
-                         // it is restated rather than left to read as before.
+                         // Named since #396, and what that buys is the two things the
+                         // empty name silently cost: the system-scope `--config=`
+                         // default (so the registration STATES which file the service
+                         // reads, rather than relying on the worker re-running the
+                         // machine-wide lookup and finding the same one), and the
+                         // install-time `ServiceAccountReadDenial` on that path --
+                         // an install-time error that was demoted to a silent
+                         // fall-through to built-in defaults.
                          //
-                         // This worker now has a config file, so "configured
-                         // entirely from argv" is no longer why. What is still true
-                         // is that it has no `--storage`, and `applicationName` is
-                         // the one bit `WithScopeDefaults` reads before appending
-                         // BOTH defaults: naming an application here would bake a
-                         // `--storage=` into every user-scope registration, and the
-                         // job would answer its own command line with "unrecognised
-                         // argument" at every start -- reported installed, dead at
-                         // every boot.
-                         //
-                         // What that costs is the system-scope `--config=` default,
-                         // which this spec therefore emits itself above from what the
-                         // operator typed, and the install-time readability check
-                         // `ServiceAccountReadDenial` performs on a configPath the
-                         // installer chose. Both are gaps rather than decisions:
-                         // #396, which is `WithScopeDefaults` learning to decide
-                         // the two defaults separately.
-                         .applicationName = {},
+                         // It is also what makes the packaged config findable at all:
+                         // `InstallService` looks a spec's machine-wide candidate up
+                         // under THIS name, so an empty one looked nothing up.
+                         .applicationName = std::string { NodeApplicationName },
                          // The Windows half of the same decision `serviceAccount`
                          // makes for launchd. Told nothing, the SCM logs a service
                          // on as LocalSystem -- the whole machine -- and this one

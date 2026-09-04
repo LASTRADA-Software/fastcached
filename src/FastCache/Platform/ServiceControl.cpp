@@ -9,10 +9,12 @@
 #include <cctype>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -389,12 +391,17 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResul
                          .serviceAccount = std::string { DaemonServiceAccount },
                          .ownedPaths = std::move(owned),
                          .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
+                         // The daemon takes BOTH, and it is the only service that
+                         // does -- which is why one bit describing "has files" got
+                         // this right for as long as it was the only file-configured
+                         // service (#396). Named per default now, so the coincidence
+                         // is written down rather than relied on.
+                         .acceptedScopeDefaults = ScopeDefaults({ ScopeDefault::ConfigPath, ScopeDefault::StoragePath }),
                          .configPath = cfg.configPath,
-                         // The daemon IS the file-configured service: it probes a
-                         // machine-wide fastcached.yaml at every start and keeps a
-                         // per-user cache under this name. WithScopeDefaults may
-                         // therefore fill in a --config or --storage the operator
-                         // left unset; a service naming nothing gets neither.
+                         // Where the daemon's own files are looked up: a machine-wide
+                         // fastcached.yaml it probes at every start, and a per-user
+                         // cache under this name. It no longer says anything about
+                         // which flags the parser takes -- that is the set above.
                          .applicationName = std::string { DaemonApplicationName },
                          // Named rather than left to the SCM's default, which is
                          // LocalSystem: unrestricted access to every local resource
@@ -799,23 +806,81 @@ std::optional<std::string_view> SwitchSpellingFor(std::string_view onFlag,
     return spelling;
 }
 
+namespace
+{
+    /// Every installer-supplied default, one row per enumerator.
+    ///
+    /// The flag spelling lives here and nowhere else, which is what stops the
+    /// storage default's "was a --config named?" clause and the config default's
+    /// own flag from drifting apart -- they were two string literals eleven lines
+    /// apart before.
+    constexpr auto ScopeDefaultRows = EnumTable<ScopeDefault, ScopeDefaultRow> { {
+        { .which = ScopeDefault::ConfigPath, .flag = "--config=", .scope = ServiceScope::System },
+        { .which = ScopeDefault::StoragePath, .flag = "--storage=", .scope = ServiceScope::User },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(ScopeDefaultRows, [](ScopeDefaultRow const& row) { return row.which; }),
+                  "every ScopeDefault needs a row, at its own index");
+} // namespace
+
+std::span<ScopeDefaultRow const> ScopeDefaultTable() noexcept
+{
+    return ScopeDefaultRows;
+}
+
+std::string_view ScopeDefaultFlag(ScopeDefault which) noexcept
+{
+    return ScopeDefaultRows[static_cast<std::size_t>(which)].flag;
+}
+
+bool ScopeDefaultApplies(ServiceSpec const& spec, ServiceScope scope, ScopeDefault which)
+{
+    auto const& row = ScopeDefaultRows[static_cast<std::size_t>(which)];
+
+    // **The one thing an application name still decides, and the reason a single
+    // bit looked sufficient for as long as it did.** Both defaults are values
+    // looked up UNDER this name -- where the packaged machine-wide config lives,
+    // and where a per-user cache goes -- so a service that names none has nothing
+    // to derive either default from, whatever its parser would accept. That is a
+    // property of the VALUE and not of the parser, and for the one service that
+    // existed the two questions happened to coincide: `fastcached` has files AND
+    // takes both flags. They were never the same fact, and the day
+    // `fastcache-compile-node` arrived -- a config file, no `--storage` -- the bit
+    // could answer only one of them (#396). Do not fold this back into the set:
+    // a spec accepting `StoragePath` and naming no application would render
+    // `<home>/Library/Caches//cache`, which is a path nobody asked for rather than
+    // a refusal.
+    if (spec.applicationName.empty())
+        return false;
+
+    // The parser's half: would this binary understand the flag if we filled it in?
+    // Appending one it rejects registers a job that answers its own command line
+    // with "unrecognised argument" at every start -- reported installed, dead at
+    // every boot, which is the failure this file refuses at install time, produced
+    // BY the installer.
+    if (!AcceptsScopeDefault(spec.acceptedScopeDefaults, which))
+        return false;
+
+    if (scope != row.scope)
+        return false;
+
+    // Never over something the operator typed.
+    return !HasArgument(spec, row.flag);
+}
+
 ServiceSpec WithScopeDefaults(ServiceSpec spec,
                               ServiceScope scope,
                               std::filesystem::path const& home,
                               std::filesystem::path const& packagedConfig)
 {
-    // A service that names no application keeps no files, and must be given no
-    // flags about them. This is the whole gate, and it is checked before either
-    // default rather than inside them, because both defaults exist only because
-    // the daemon has a config file and a cache to default.
+    // Per default, never both from one answer -- see `ScopeDefault`. The shared
+    // clauses are in `ScopeDefaultApplies`; what is left at each block is that
+    // default's own extra condition and the value only this function can build.
     //
-    // `fastcache-compile-node` is that service: it is configured entirely from
-    // argv and its parser rejects both `--storage=` and `--config=`. Appending
-    // either registered a job that refused its own command line at every start --
-    // reported installed, and dead at every boot. That is the failure this
-    // codebase refuses at install time, produced BY the installer.
-    if (spec.applicationName.empty())
-        return spec;
+    // Storage first, and the order cannot matter: the two defaults apply in
+    // opposite scopes, so at most one block ever runs. Kept anyway, because the
+    // registration this produces is compared byte-for-byte against the previous
+    // release's.
 
     // A LaunchAgent that kept the in-memory default would lose the whole cache
     // on every logout, which for a compile cache is most of the value. launchd
@@ -831,8 +896,15 @@ ServiceSpec WithScopeDefaults(ServiceSpec spec,
     //
     // System scope gets no storage default at all: its config file is always
     // the package's `<prefix>/etc/fastcached.yaml`, so there is nothing to
-    // default.
-    if (scope == ServiceScope::User && !HasArgument(spec, "--storage=") && !HasArgument(spec, "--config="))
+    // default. That clause is the row's `scope` column now.
+    //
+    // The `--config` spelling is read off the CONFIG default's own row rather
+    // than written out again: these were two literals eleven lines apart, and a
+    // flag renamed in one of them would have left this clause quietly matching
+    // nothing -- the storage default appended alongside a config file, overriding
+    // its `storage_path` for the life of the registration with no error anywhere.
+    if (ScopeDefaultApplies(spec, scope, ScopeDefault::StoragePath)
+        && !HasArgument(spec, ScopeDefaultFlag(ScopeDefault::ConfigPath)))
     {
         // One appended component, not three. `home / "Library/Caches" / app /
         // "cache"` renders with the platform's separator between each, so the
@@ -860,8 +932,9 @@ ServiceSpec WithScopeDefaults(ServiceSpec spec,
     // directory it cannot write.
     //
     // An empty packagedConfig means it is not actually there, so a
-    // build-from-source install does not point launchd at a missing path.
-    if (scope == ServiceScope::System && !HasArgument(spec, "--config=") && !packagedConfig.empty())
+    // build-from-source install does not point launchd at a missing path. That is
+    // this default's own extra condition; the rest are the row's.
+    if (ScopeDefaultApplies(spec, scope, ScopeDefault::ConfigPath) && !packagedConfig.empty())
     {
         spec.arguments.push_back(std::format("--config={}", packagedConfig.string()));
         spec.configPath = packagedConfig.string();
