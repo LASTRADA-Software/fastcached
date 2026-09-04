@@ -732,6 +732,54 @@ status from the **process**, never from a pipe; and confirms the failure is the
 fails for another reason proves nothing about the guard. Where it cannot establish
 those, it reports INCONCLUSIVE and names the reading it is missing.
 
+## A query that FAILED is not an observation about the subject
+
+A required-context checker was written for the shape
+[#542](https://github.com/LASTRADA-Software/fastcached/issues/542) names: read the
+eleven names, report each one's state, and keep ABSENT distinct from pending so a
+context that was never created cannot hide. Its first version captured
+`gh pr checks ... 2>/dev/null`. `gh` was not on `PATH` in that environment, so
+`command not found` went to the null device, the capture was empty, and the checker
+printed **ABSENT for all eleven required contexts** — while the data sat there,
+retrievable, one working invocation away
+([#557](https://github.com/LASTRADA-Software/fastcached/issues/557)).
+
+Keep the output, because the rule is easy to nod at and the failure is what makes it
+stick: **eleven absent required contexts is catastrophic, plausible and
+actionable-looking.** Nothing in it resembles a tool error. A reader would have gone
+hunting for a workflow that had stopped dispatching. The instrument reproduced, one
+level up, the exact defect it was built to prevent.
+
+**A tool invocation's own failure is a state of the instrument, never a reading of
+the subject.** An instrument that cannot express *I could not tell* will express it
+as whatever its empty case means — and the empty case is usually the alarming one,
+because instruments are written to make absence visible.
+
+So a checker that can report *absent* must be able to report *I could not tell*, and
+must refuse to say anything about the subject while that state is set. Zero rows is
+not a verdict; it is the absence of one, and the **shape** of a response is checked
+before any conclusion is drawn from it.
+
+**The aggravating pattern to grep for is `2>/dev/null` on a command whose absence is
+plausible** — a tool missing from `PATH`, which this repository hits routinely. That
+redirection converts a missing binary into a confident finding.
+
+This is the third shape of one family, and the other two are recorded in
+[`build-and-toolchain.md`](build-and-toolchain.md): `producer | grep -q` under
+`pipefail` reports absence *because* the symbol is present, and `| tail` returns the
+pipe's status so a failed build reads as a passing one. There the query ran and its
+status was misread; here **the query never ran at all**.
+
+The same rule reaches a measurement, where its direction is worth stating because it
+is not symmetric. A counted loop that reports *N failures out of N* may be measuring
+a subject that was never invoked — a stale binary, a mistyped filter, a case that no
+longer exists — and Catch2 exits non-zero for `No tests ran` exactly as it does for a
+failure. **A result containing at least one success is self-controlled against that**,
+since a subject that was never reached cannot produce a pass. An all-failing result
+therefore proves nothing until a positive control says the subject exists — and an
+all-*passing* one needs the same control for the mirror reason, because a filter that
+silently matched nothing also passes everything.
+
 ## A path-scoped revert is scoped to the FILE, not to the mistake
 
 `git checkout -- <path>` took two completed review fixes with it — a `static_assert`

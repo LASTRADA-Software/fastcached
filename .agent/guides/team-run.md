@@ -194,6 +194,56 @@ causes below is not a cancellation at all:
   this is your cause and there is nothing further to diagnose.
 - Never `gh run rerun` — it races the concurrency group and makes it worse.
 
+### "No pending checks" is not "CI ran"
+
+A watcher whose settle condition is *no `IN_PROGRESS` and no `QUEUED`* fires **before
+the matrix exists**. On #334 it reported `SETTLED` with 4 checks, 3 SUCCESS, 1 SKIPPED;
+the live state at that moment was 15 `IN_PROGRESS`, 1 `QUEUED`, 22 checks and climbing
+([#337](https://github.com/LASTRADA-Software/fastcached/issues/337)). Zero pending was
+true, and meaningless — there was nothing yet to be pending *about*.
+
+`Decide what this change can affect` is what widens the window, and it is working as
+designed: the heavy jobs `needs:` it, so between the fast checks finishing and the
+gated jobs being created there is a period with no pending work and no matrix. The
+hazard is entirely in what reads that state.
+
+**This is the worst shape available**, because it does not hide a subtle defect — it
+hides *CI did not run*, and reports success while doing it. Anything that merges on
+such a reading merges a branch with no evidence at all.
+
+Settled needs three parts, not one:
+
+1. nothing pending;
+2. a **total count above a floor** (~20 here), so the matrix is demonstrably present
+   rather than merely un-pending;
+3. the count **stable across two consecutive polls**, so a batch appearing between
+   polls cannot be missed.
+
+The third part is not belt-and-braces, and this sprint measured it twice. On #733 the
+total went **21 → 25** while it was being watched, with the pending count *rising* as a
+check passed, because four contexts are only created once their dependencies go green;
+it was then read as stable at 25 across three consecutive polls and **grew again to 26**.
+So a floor alone would have passed at 21, and two stable polls nearly passed at 25.
+
+**Quote the required fraction, never the total.** The eleven required contexts come from
+the ruleset, so a newly created non-required leg cannot move that denominator, while the
+total moves under you as jobs are created. Print the total beside the verdict as context
+— it is what says whether the matrix has appeared — but never as a denominator.
+
+And distinguish the two ways a required context can be missing, because they read
+identically in a count and mean opposite things: **absent-because-not-created-yet** (the
+`sccache smoke` legs `needs: [changes, linux]`, so they appear only after their
+dependencies pass) and **absent-because-never-coming**. The first is *not done yet* and
+resolves itself; the second is #542's never-arrives failure.
+
+The general form: **an absence of negative signals is not a positive signal.** No
+pending checks, no findings, no diff — each is the correct answer to a narrower
+question than the one being asked. #337 records it as the third instance in the
+session that found it; the rulebook carries the same shape for a *measurement*
+(`producer | grep -q`, and a counted loop whose subject was never invoked) in
+[`../rules/testing.md`](../rules/testing.md). Its companion for reading a *failure*
+is the section above; this one is how to know the run happened at all.
+
 ### Pairwise clean is not serially clean
 
 **Before sequencing two PRs that touch the same file, merge-tree the second onto a

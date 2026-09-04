@@ -215,6 +215,39 @@ determinism rests on.
   to a developer — the correction was wrong for the same reason as the thing it was
   correcting. Nobody is outside this; the remedy is that the pattern travels with the
   figure, not that people count more carefully.
+- **A scan whose needle can appear in its own source, or in the text it reports, will
+  match itself.** The guard added for
+  [#678](https://github.com/LASTRADA-Software/fastcached/issues/678) scans
+  `check-e2e-helpers.sh` for direct increments of its failure counter, because the
+  property it protects — that `note_failure` is the only thing that touches the counter,
+  so a failure cannot be counted without being named — holds only while that is true.
+  It scans its own file. Its first run reported **three** increments where there is one,
+  and it was right: the needle appeared verbatim in the needle, in the `grep` argument
+  and again in the `grep -n` that prints the offending lines.
+
+  It failed in the safe direction — it refused rather than reporting a wrong verdict
+  about the subject — and it was still wrong, which is the half worth keeping.
+  **Failing closed is not the same as being correct, and a guard that refuses valid
+  input is a guard somebody deletes.**
+
+  **The remedy is construction, not exclusion.** Spell the needle so it cannot be its
+  own match — a regex with `[+]` where the literal has a `+`, an anchor, a character
+  class — rather than subtracting the known self-hit. **An exclusion list grows and a
+  construction cannot**: the next site that happens to contain the needle is a defect
+  the list has to learn about, while a needle that cannot match itself is finished.
+
+  Distinct from the pattern-breadth entry above, and the two are easy to confuse
+  because both end in a count that is too high. There the needle matched something
+  **else** that legitimately contained it (`script-check-canary.cmake` contains
+  `check-`); here it matched the **scan's own text**. The tell is whether removing the
+  scan changes the count.
+
+  A second instance was reported in the same session and is **not verifiable from this
+  tree** — a settle check written as `grep -q "tests failed"`, which matches inside
+  `0 tests failed out of 57` and so reads a clean run as a failing one. Recorded as
+  reported rather than measured, because the code was never committed; it belongs here
+  because it is the *other* half of the rule, where the needle appears in the text the
+  instrument **reports** rather than in the text it is written in.
 - **"Only 4 of 16 defend" was wrong when it was written, and no slicing recovers it.**
   #510's denominator matches nothing on its own cited ref: not 20, not 18, and not the
   **13** that read file content. Today there are 34, none added by the branch that
