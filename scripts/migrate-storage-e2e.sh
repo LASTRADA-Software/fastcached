@@ -33,7 +33,16 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-fail() { echo "migrate-storage E2E FAILED: $*" >&2; exit 1; }
+# The shared helpers, for `fail` and for `free_port`. The whole argument for the
+# port range -- why a connect probe cannot see a port held as an OUTBOUND
+# connection's local endpoint, why the issued-port ledger is a FILE, and why the
+# range stops below the kernel's ephemeral range -- is above `free_port` in
+# `lib/e2e-common.sh`, in full rather than in this fixture's abbreviation of it.
+#
+# `e2e_begin` also installs the TERM trap that turns a `fail` raised inside a
+# subshell into an ordinary exit, so the EXIT trap above still runs.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "migrate-storage E2E" "$WORK"
 
 # EVERY invocation names this file. Without it the daemon would find whatever
 # machine-wide config the host has, and on a developer box with a real
@@ -45,21 +54,6 @@ EMPTY_CONFIG="$WORK/empty.yaml"
 
 fc() { "$FASTCACHED" --config "$EMPTY_CONFIG" "$@"; }
 
-# A free TCP port, in bash: the repo's own idiom, so the fixture needs no
-# interpreter beyond the shell it is already written in.
-port() {
-    local p
-    for _ in $(seq 1 50); do
-        p=$(( (RANDOM % 20000) + 40000 ))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-            echo "$p"
-            return 0
-        fi
-        exec 3<&- 2>/dev/null
-    done
-    return 1
-}
-
 # Start the daemon just long enough for it to create its store(s), then stop it.
 # The conversion must run against a store nobody has open.
 # $1: the directory the store files appear in.
@@ -69,7 +63,7 @@ create_store() {
     local watch="$1"; shift
     local expected="$1"; shift
     local p
-    p="$(port)" || fail "could not allocate a port"
+    p="$(free_port)"
 
     # The binary directly, never the `fc` wrapper: backgrounding a shell
     # FUNCTION makes $! the subshell rather than the daemon, so the kill below
