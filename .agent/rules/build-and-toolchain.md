@@ -2983,14 +2983,23 @@ are recorded together because the shape is one shape.
   | `message(FATAL_ERROR)` | **0** |
   | any of them, whitespace flattened first | **1** |
 
-  **The `STATUS` row is the trap inside the trap.** It does not wrap, so a negative
-  test written with `STATUS` reproduces nothing and reads as a refutation of the whole
-  claim — and in a file emitting BOTH, the unwrapped `STATUS` copy satisfies the grep
-  and hides the wrapped one. It is the *diagnostic* types that wrap, which is exactly
-  the set every check here reports its verdict through: `FATAL_ERROR` is what every
-  `cmake -P` check in this tree uses, because a `-P` script cannot fail by exit code.
-  So flatten (`tr '\n' ' ' | tr -s ' '`) before matching any verdict text, or match a
-  short phrase that cannot straddle 74 columns.
+  **The `STATUS` row is the trap inside the trap, and there are TWO ways to write the
+  negative test wrong.** It does not wrap, so a test written with `STATUS` reproduces
+  nothing and reads as a refutation of the whole claim; and in a file emitting BOTH, the
+  unwrapped `STATUS` copy satisfies the grep and masks the wrapped one — which is what
+  the first attempt here did, returning 1 match. Both failure modes read as a
+  refutation, so a reader who tests only the first still concludes the rule is false.
+  Same structure as *a green probe of the wrong shape is not a refutation*, in a
+  different tool.
+
+  **And this is a property of every verdict this repository reads, not a trap somebody
+  might hit.** A `cmake -P` script cannot fail by exit code — `message(FATAL_ERROR)`
+  prints and exits 0 on 3.28 — so the verdict travels through the diagnostic channel by
+  construction. Measured: **37 of 37** `scripts/check-*.cmake` report through
+  `message(FATAL_ERROR)`. Every one of them is a check whose verdict cannot be read by
+  a substring match that crosses column 74. So flatten (`tr '\n' ' ' | tr -s ' '`)
+  before matching any verdict text, or match a phrase short enough that it cannot
+  straddle the wrap.
 
   This is not any of the six above. Those are wrong buckets, wrong populations, a
   substring of a count, a comment matching itself. **This one is: the text you are
