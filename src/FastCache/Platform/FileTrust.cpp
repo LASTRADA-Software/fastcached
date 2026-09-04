@@ -10,6 +10,7 @@
     #include <array>
     #include <cstddef>
     #include <memory>
+    #include <optional>
     #include <ranges>
     #include <span>
 
@@ -124,6 +125,15 @@ namespace
         return false;
     }
 
+    /// The rights that let a principal READ a file's contents.
+    ///
+    /// `FILE_READ_DATA` is the one that matters; the two generic masks include it
+    /// and are what an inherited entry is usually spelled with -- the packaged
+    /// `%ProgramData%\fastcached` list grants `BUILTIN\Users` `0x1200a9`, which
+    /// is `FILE_GENERIC_READ|FILE_GENERIC_EXECUTE`, so a scan for the bare bit
+    /// alone would miss the very entry this exists to find.
+    constexpr DWORD ReadingRights = FILE_READ_DATA | GENERIC_READ | GENERIC_ALL;
+
     /// @param sid Security identifier from an access-allowed entry.
     /// @return true when it names one of BroadPrincipals.
     [[nodiscard]] bool IsBroadPrincipal(PSID sid)
@@ -158,33 +168,54 @@ namespace
         return ::EqualSid(owner, trustedInstaller) == TRUE;
     }
 
+    /// Is nothing in BroadPrincipals granted any of @p rights on @p path?
+    ///
+    /// **The rights are a parameter and not a constant**, because integrity and
+    /// secrecy are the same walk over a different mask: `PlantingRights` answers
+    /// "could an unprivileged account have replaced this file", `ReadingRights`
+    /// answers "can an unprivileged account read what is in it"
+    /// ([#384](https://github.com/LASTRADA-Software/fastcached/issues/384)). Two
+    /// scans differing only in a constant is the repetition a parameter exists to
+    /// remove -- and a copy is the one that would never have learned about
+    /// `GENERIC_ALL`.
+    ///
+    /// `std::optional` rather than `bool`, because the two callers want opposite
+    /// things from "I could not tell". Writability must treat it as unsafe -- an
+    /// unreadable security descriptor is exactly what a planted config would
+    /// present -- while secrecy must report it as its own outcome rather than
+    /// claim an exposure nobody established. Folding the two into `false` is what
+    /// made this a `bool` in the first place, and it is only right for one of them.
+    ///
     /// @param path Entry to inspect.
-    /// @return true when nothing in BroadPrincipals is granted any of
-    ///         PlantingRights on it.
-    [[nodiscard]] bool NoBroadPrincipalMayWrite(std::filesystem::path const& path)
+    /// @param rights The mask an entry must grant to count.
+    /// @return true when no broad principal is granted any of them, false when
+    ///         one is, nullopt when the access list would not say.
+    [[nodiscard]] std::optional<bool> NoBroadPrincipalMay(std::filesystem::path const& path, DWORD rights)
     {
         PACL dacl = nullptr;
         PSECURITY_DESCRIPTOR descriptor = nullptr;
         if (::GetNamedSecurityInfoW(
                 path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor)
             != ERROR_SUCCESS)
-            return false;
+            return std::nullopt;
 
         auto const owned = LocalBlock { descriptor };
 
-        // An absent DACL is not an empty one: it grants everyone everything.
+        // An absent DACL is not an empty one: it grants everyone everything. So
+        // this is a determinate answer -- everybody may -- and not a failure to
+        // read one.
         if (dacl == nullptr)
             return false;
 
         ACL_SIZE_INFORMATION size {};
         if (::GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) == FALSE)
-            return false;
+            return std::nullopt;
 
         for (auto const index: std::views::iota(DWORD { 0 }, DWORD { size.AceCount }))
         {
             void* entry = nullptr;
             if (::GetAce(dacl, index, &entry) == FALSE)
-                return false;
+                return std::nullopt;
 
             // Only allow entries carry a grant; deny entries and the auditing
             // types can subtract from one but never add.
@@ -192,7 +223,7 @@ namespace
                 continue;
 
             auto* const allowed = static_cast<ACCESS_ALLOWED_ACE*>(entry);
-            if ((allowed->Mask & PlantingRights) == 0)
+            if ((allowed->Mask & rights) == 0)
                 continue;
 
             // The SID begins at SidStart and runs past it; the member is the
@@ -202,6 +233,16 @@ namespace
         }
 
         return true;
+    }
+
+    /// @param path Entry to inspect.
+    /// @return true when nothing in BroadPrincipals is granted any of
+    ///         PlantingRights on it. An undeterminable list answers false, for
+    ///         the reason `NoBroadPrincipalMay` gives: "I cannot tell" and "it is
+    ///         not safe" have to lead to the same place here.
+    [[nodiscard]] bool NoBroadPrincipalMayWrite(std::filesystem::path const& path)
+    {
+        return NoBroadPrincipalMay(path, PlantingRights).value_or(false);
     }
 
 #else
@@ -218,6 +259,29 @@ namespace
             return false;
 
         return info.st_uid == 0 && (info.st_mode & static_cast<::mode_t>(S_IWGRP | S_IWOTH)) == 0;
+    }
+
+    /// The readability facts, from the same `stat` the writability half reads.
+    ///
+    /// Reports what the mode bits SAY and decides nothing: the rule is
+    /// `ClassifySecretFile`, which is where the delegation clause lives and where
+    /// both platforms' records meet one implementation.
+    ///
+    /// @param path Entry to inspect.
+    /// @return What POSIX reports about who may read it.
+    [[nodiscard]] SecretFileFacts PosixSecretFileFacts(std::filesystem::path const& path)
+    {
+        struct ::stat info {};
+
+        if (::stat(path.c_str(), &info) != 0)
+            return SecretFileFacts {};
+
+        return SecretFileFacts {
+            .determined = true,
+            .readableByAnyAccount = (info.st_mode & static_cast<::mode_t>(S_IROTH)) != 0,
+            .readableByGroup = (info.st_mode & static_cast<::mode_t>(S_IRGRP)) != 0,
+            .administrativelyOwned = info.st_uid == 0,
+        };
     }
 
 #endif
@@ -281,6 +345,72 @@ bool IsAdministratorOnlyWritable(std::filesystem::path const& path)
 #else
     return RootOwnedAndUnwritableByOthers(path);
 #endif
+}
+
+SecretFileFacts ObserveSecretFile(std::filesystem::path const& path)
+{
+#if defined(_WIN32)
+    // The same access-list walk the writability half does, over a different
+    // rights mask -- which is why `NoBroadPrincipalMayWrite` became
+    // `NoBroadPrincipalMay(path, rights)` rather than being copied. Two scans
+    // differing only in a constant is the repetition a parameter exists to
+    // remove, and a copy would have been the one that never learned about
+    // `GENERIC_ALL`.
+    //
+    // No owner test and no parent test, unlike the writability half. An owner can
+    // always read their own file, which is not an exposure; and a directory
+    // nobody else may TRAVERSE cannot hide a file whose own list grants read,
+    // because the check that matters is on the file the daemon opens.
+    //
+    // `readableByGroup` stays false and `administrativelyOwned` with it: a DACL
+    // does not separate a narrow group grant from a broad one in the way the
+    // delegation clause needs, so there is nothing here to report against it. See
+    // `SecretFileFacts`.
+    auto const answer = NoBroadPrincipalMay(path, ReadingRights);
+    if (!answer.has_value())
+        return SecretFileFacts {};
+    return SecretFileFacts { .determined = true, .readableByAnyAccount = !*answer };
+#else
+    return PosixSecretFileFacts(path);
+#endif
+}
+
+SecretExposure SecretFileExposure(std::filesystem::path const& path)
+{
+    return ClassifySecretFile(ObserveSecretFile(path));
+}
+
+std::string SecretExposureHint(std::filesystem::path const& path, SecretExposure exposure)
+{
+    switch (exposure)
+    {
+        case SecretExposure::None:
+        case SecretExposure::Last:
+            return {};
+        case SecretExposure::Undetermined:
+            return std::format("could not determine who may read {}, so whether the secret in it is protected is "
+                               "unknown",
+                               path.string());
+        case SecretExposure::AnyLocalAccount:
+#if defined(_WIN32)
+            return std::format("{} is readable by every account on this machine, so the secret in it is not protected; "
+                               "restrict it with: icacls \"{}\" /inheritance:r /grant *S-1-5-18:R /grant "
+                               "\"NT SERVICE\\fastcached\":R",
+                               path.string(),
+                               path.string());
+#else
+            return std::format("{} is readable by every account on this machine, so the secret in it is not protected; "
+                               "restrict it with: chmod o-r {}",
+                               path.string(),
+                               path.string());
+#endif
+        case SecretExposure::OwnersOwnGroup:
+            return std::format("{} is readable by its group and is not owned by root, so the secret in it is exposed to "
+                               "accounts its owner does not answer for; restrict it with: chmod g-r {}",
+                               path.string(),
+                               path.string());
+    }
+    return {};
 }
 
 bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)

@@ -25,6 +25,7 @@
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -657,6 +658,31 @@ int DaemonBody(FastCache::Config const& effective,
     // operator edits a file it has declined to read.
     for (auto const& [path, reason]: rejected)
         logger.Logf(FastCache::LogLevel::Error, "{}: {}", path.string(), reason);
+
+    // A secret that came out of a configuration file is only as private as that
+    // file. The whole reason to put `requirepass:` there is that a command line
+    // is visible in `ps`, so an operator who took that step and landed on a
+    // mode-0644 file has undone the point of the exercise -- and had no signal at
+    // all until #384.
+    //
+    // **Here rather than at the install, and that is not a preference.** The
+    // installer cannot know whether the file it is handed carries a secret:
+    // `InlineCredentialRejection` says so in its own comment, and a refusal that
+    // had to condemn every broadly-readable `--config` regardless of contents is
+    // not one anybody could ship. Provenance is known only after the parse.
+    //
+    // **A warning and not a refusal.** A refusal breaks a deployment that is
+    // running today, on upgrade, over a file the operator may not be able to
+    // re-permission that minute. The usual objection -- a warning scrolls past --
+    // is answered by WHERE this one goes: through the logger, which on every
+    // supported deployment is journald, the Windows event log, or launchd's log
+    // file. A durable record, not a console line. (Contrast the dashboard
+    // credential, which IS a startup refusal: refusing a MISSING credential fails
+    // closed and breaks nothing that worked, while refusing an EXPOSED one breaks
+    // something that did.)
+    if (auto const warning = FastCache::SecretFileWarning(effective, sources.cli); !warning.empty())
+        logger.Logf(FastCache::LogLevel::Warn, "{}", warning);
+
     FastCache::ConfigReloader reloader { effective, effective.configPath, sources };
     FastCache::SteadyClock steadyClock;
     // The engine reads the clock once per command, and on Windows that is a
