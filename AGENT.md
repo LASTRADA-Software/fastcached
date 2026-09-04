@@ -1158,6 +1158,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   reporting without gating is #684 and fixing one ticket by reintroducing the other is not a fix. That `name:`
   is a wire constant. `ctest -R doc-subject-checks-derivation`, `-R doc-subject-checks-selftest`, and
   `gated-jobs-fail-safe` rule C.
+- **A flag combination that cannot express the question still returns an answer.** Same species as
+  `pkill -f`, `grep -c` read as a position, and `grep -q` under `pipefail`: the shell obliges regardless
+  and **none of them errors**. Cleanest specimen `grep -Lq`, where the contradiction is internal — `-L`
+  lists files WITHOUT a match, `-q` exits at the first match — so it picks one and names files as lacking
+  a symbol they contain. Worst of the family for three reasons, and the middle one generalises past
+  shells: it was a **positive control**, and *a control is the one instrument nobody checks, because
+  checking it is what it was for*; its error pointed at **refuting** a claim, which is the direction that
+  gets acted on because refuting feels like diligence; and nothing about the output looked wrong. Re-derive
+  a control by a different construction before trusting it.
+- **An intermediate reading is BIASED, not noisy.** A tree sampled mid-build can only be MISSING artefacts,
+  never carrying extra ones, so the error is one-sided by construction — always toward failure. Measured:
+  `ctest -L hygiene` at 235/429 edges reported 2 failures where the settled tree reports 60/60. So the
+  natural response to a mid-build failure, investigating it, is the wasted motion, and no care in
+  *interpreting* the reading helps. **Do not take the reading** — wait for the completion signal.
 - **CMake WRAPS its diagnostic messages**, so a phrase you grep for can exist in the output and in no
   single LINE of it. A mutation harness called all three of its arms `SELFTEST STAYED GREEN` while the
   self-test was RED with four cases named. Measured, for a phrase crossing column 74: `message(STATUS)`
