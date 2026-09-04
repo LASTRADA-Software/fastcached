@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Merge-group failure report
+
+# A merge group whose only failing job is NOT one of the eleven required
+# contexts is invisible to every surface anybody looks at: the pull request page
+# is green (its own run passed on the head), the queue reports success (every
+# required context passed), master is green afterwards (the same job passes on
+# the merge commit), and the only trace is an `event=merge_group` run that no
+# part of the normal flow ever lists. The pull request merges, and nobody is told
+# (#684).
+#
+# Measured over every failing `merge_group` `Build` run the API still held on
+# 2026-09-04: five of six failed a job that is not a required context, five pull
+# requests merged, nothing reported any of them. The table and the run ids are in
+# `scripts/ci-merge-group-report.sh`, which is where they belong -- a figure
+# others will cite lives in ONE place they point at.
+#
+# ## Why this is a separate workflow rather than a job or a step
+#
+# Not a JOB in `build.yml`: `check-release-gate` asserts that every job there
+# appears in `release.needs`, so a notifier job -- which is skipped on a tag push,
+# always -- would skip the release with it. That is the never-arrives failure
+# `build.yml` records three ways, aimed at the release instead of at a required
+# context. The clang-tidy job's own report step carries the same reasoning.
+#
+# Not a STEP in each unrequired job either, which was the other shape considered.
+# A step can only see the job it is in, so it would be ten copies of one decision
+# across ten jobs, each needing `issues: write` -- and the unit that is required
+# or not is the CONTEXT, not the job: `Windows-cl-debug` is unrequired while
+# `Windows-cl-release`, a leg of the same matrix job, is required. Both of the
+# `Windows-cl-debug` failures in the measurement above are that case.
+#
+# So: `workflow_run`, which fires once per finished `Build` run, sees every job's
+# conclusion at once, and -- the property #684 asks for first -- runs AFTER the
+# queue has concluded and produces no status anything waits on. It cannot fail
+# the merge group because it is not in it.
+#
+# ## Two things about `workflow_run` that decide the shape of this file
+#
+# It only ever runs the copy of this file on the DEFAULT branch. So nothing on a
+# pull request exercises it, and the first run anywhere is after it merges --
+# which is why every decision it makes lives in `scripts/ci-merge-group-report.sh`
+# and is driven by `ctest -R merge-group-report-selftest` against real captured
+# job records, and why this file holds acquisition and nothing else. "A fixture
+# that has never completed has told you nothing" applies to workflows too, and
+# the answer is to make the untestable part as thin as it can be.
+#
+# And there is deliberately NO `branches:` filter narrowing this to
+# `gh-readonly-queue/**`. It would save a runner start per pull request, at the
+# price of a filter that silently stops matching if GitHub ever renames the
+# queue's temporary branches -- and a notifier that stops firing is exactly the
+# silence this exists to remove. The event is asked about instead, which is a
+# fact rather than a naming convention, and a run this reporter has nothing to
+# say about says so out loud rather than being absent.
+#
+# That unfiltered trigger is also the only thing that makes the ONE claim here
+# nobody could test before merging observable at all. Whether `workflow_run`
+# fires for a run whose own event was `merge_group` is stated by GitHub's
+# documentation and was NOT measured -- there is no way to measure it from a
+# branch, since the file has to be on master first. Unfiltered, this workflow
+# runs on every ordinary pull-request `Build` too and narrates "event is
+# 'pull_request', not merge_group", so "it never fires at all" and "it fires and
+# has nothing to report" are two visible states from the first run after this
+# merges, instead of one silence indistinguishable from working.
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+# Keyed on the run being reported on, and `cancel-in-progress` is deliberately
+# absent: two Build runs finishing together are two independent reports, and
+# cancelling one to make room for the other is losing the finding this workflow
+# exists to deliver.
+concurrency:
+  group: merge-group-report-${{ github.event.workflow_run.id }}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    name: "Report a failure the merge queue did not gate on"
+    runs-on: ubuntu-24.04
+    # `!cancelled()` and not `always()`, which runs even while the run is being
+    # cancelled. There is no dependency to fail here, so this is belt-and-braces
+    # -- but a status function is what keeps a later `needs:` from turning this
+    # into a silently skipped notifier, which is #684 one level up.
+    if: ${{ !cancelled() }}
+    steps:
+      # No history needed: this job reads two scripts and calls an API.
+      - uses: actions/checkout@v4
+
+      # The listing is taken into a FILE and its status checked, rather than
+      # piped into the decision. `gh ... --jq` prints a parse error and returns
+      # nothing when its program is mangled, and a `${res:-...}` or a `|| true`
+      # around that turns "I could not see" into a statement about the subject --
+      # measured in this repository, identically for all four runs queried
+      # (`.agent/rules/build-and-toolchain.md`). The decision script refuses an
+      # empty or missing file for the same reason, so the guard is on both sides.
+      - name: "List the jobs of the run that just finished"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+            --jq '.jobs[] | [.name, .status, .conclusion, .html_url] | @tsv' \
+            > "$RUNNER_TEMP/jobs.tsv"
+          echo "listed $(grep -c '' "$RUNNER_TEMP/jobs.tsv") job(s) for run ${RUN_ID}"
+
+      - id: decide
+        name: "Decide which failures nobody was told about"
+        env:
+          EVENT: ${{ github.event.workflow_run.event }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" \
+            > "$RUNNER_TEMP/reportable.tsv"
+          echo "reportable=$(grep -c '' "$RUNNER_TEMP/reportable.tsv")" | tee -a "$GITHUB_OUTPUT"
+
+      # One issue per CONTEXT, de-duplicated by exact title, so a job that fails
+      # in queue after queue accumulates comments on one report rather than a
+      # pile of issues. `status/needs-triage` is applied here rather than left to
+      # `issue-triage.yml`, which cannot see this issue at all: an issue opened
+      # with `GITHUB_TOKEN` triggers no workflow, so the repository's one
+      # reader-attachment mechanism does not fire and the report would land
+      # outside every triage query.
+      - name: "Open or update one report per unreported failure"
+        if: ${{ steps.decide.outputs.reportable != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r context conclusion jobUrl; do
+            [[ -n "$context" ]] || continue
+            # The queue branch is `gh-readonly-queue/master/pr-<n>-<sha>` and is
+            # printed RAW rather than parsed for the pull request number: a
+            # reader can see the number in it, and a parser that stops matching
+            # would print a confident wrong link instead of an honest string.
+            cat > "$RUNNER_TEMP/body.md" <<BODY
+          \`${context}\` concluded **${conclusion}** in a merge-group run, and nothing gated on it.
+
+          - job: ${jobUrl}
+          - run: ${RUN_URL}
+          - queue branch: \`${HEAD_BRANCH}\` (commit \`${HEAD_SHA}\`)
+
+          That context is not one of the eleven the \`default-master\` ruleset requires, so the
+          queue was never going to hold on it and the pull request merged. Nothing here proposes
+          changing that: the packaging and coverage jobs are unrequired because they are slow and
+          because a packaging failure should not block ordinary work.
+
+          What #684 is about is that the failure was reported **nowhere** — the pull request page
+          is green, the queue reports success, and master is green afterwards, because the same
+          job passes on the merge commit. An intermittent is the benign case; a deterministic
+          break would land on master exactly as silently and be discovered at release time.
+
+          Triage is: decide whether this is an intermittent worth its own issue or a real break,
+          and close this report either way. Repeat failures of the same context comment here
+          rather than opening a second issue.
+          BODY
+            scripts/ci-report-issue.sh \
+              "merge queue: \"${context}\" failed and nothing gated on it" \
+              "$RUNNER_TEMP/body.md" \
+              type/bug area/build status/needs-triage
+          done < "$RUNNER_TEMP/reportable.tsv"

@@ -1114,6 +1114,49 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# A non-required job failing inside a merge group reaches somebody (#684).
+#
+# Measured over every failing `merge_group` `Build` run the API still held on
+# 2026-09-04: five of six failed a job that is NOT one of the eleven required
+# contexts -- `Code coverage`, `Windows-cl-debug` twice, `Package (macOS .pkg)`
+# twice -- and all five pull requests merged with nothing anywhere reporting it.
+# The pull request page is green, the queue reports success, and master is green
+# afterwards because the same job passes on the merge commit. The one required
+# failure in that set behaved correctly, which is what makes this a REPORTING gap
+# rather than a gating one; nothing here changes which contexts are required.
+#
+# The notifier cannot be exercised before it merges: `workflow_run` only ever
+# runs the copy of a workflow file on the DEFAULT branch. So the decision is a
+# script and this drives it, while the wiring is asserted statically -- the same
+# split `local-gate.sh`'s pure renderer and `node-scratch-isolation-e2e`'s
+# readings record are examples of.
+#
+# `if(NOT WIN32)` for the reason `ci-scope` carries the same guard: the script is
+# POSIX and a Windows counterpart would be a translation rather than new
+# coverage. It starts no daemon, opens no socket and needs no compiler; the
+# self-test stubs `gh` on PATH the way `tsan-gate-selftest` stubs `nm`.
+if(NOT WIN32)
+    add_test(
+        NAME "merge-group-report"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh"
+    )
+    set_tests_properties("merge-group-report" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    add_test(
+        NAME "merge-group-report-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh" --self-test
+    )
+    set_tests_properties("merge-group-report-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+
+# ---------------------------------------------------------------------------
 # A full clang-tidy sweep still happens somewhere, and it still reaches a person.
 #
 # Since #554 a pull request and a merge-queue entry both diff-scope, and the
