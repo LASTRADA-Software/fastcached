@@ -13,8 +13,40 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::Unwrap;
+
+namespace
+{
+
+/// The documented scheduler command line, minus `--cluster-key-file`.
+///
+/// **The configuration #582 was found on**, and it is the documented one on purpose:
+/// a scheduler signs the grants its workers check, so it cannot work without the key,
+/// and that is a `StartupPolicyRejection` row. Every other field is present so that
+/// row is the ONLY thing wrong -- a fixture broken two ways would assert nothing about
+/// which rule answered.
+///
+/// `--scheduler` names 127.0.0.1 because a node running `--serve-scheduler` registers
+/// with ITSELF, which is what the docs show. A remote endpoint here would trip the
+/// advertise rows instead, and the case would pass for the wrong reason.
+/// @return The config.
+[[nodiscard]] NodeConfig SchedulerWithoutKey()
+{
+    NodeConfig cfg;
+    cfg.serveScheduler = true;
+    cfg.nodeListen = "0.0.0.0:6675";
+    cfg.scheduler = "127.0.0.1:6675";
+    cfg.advertise = "scheduler.internal:6675";
+    cfg.fleetMembers = { "worker-01.internal" };
+    cfg.toolchains = { "/usr/bin/g++" };
+    return cfg;
+}
+
+} // namespace
 
 TEST_CASE("Every surface names flags the parser accepts", "[node][surfaces]")
 {
@@ -325,6 +357,69 @@ TEST_CASE("The worksheet never prints an announce address as a bind address", "[
     // node that hears every beacon and completes no handshake.
     CHECK(sheet.contains("0.0.0.0:6682"));
     CHECK(sheet.contains("UDP"));
+}
+
+TEST_CASE("The surface worksheet carries a verdict and prints either way", "[node][surfaces]")
+{
+    // **`--print-surfaces` printed the map and exited 0 for a configuration the node
+    // then refuses to run** (#582). The flag prints the RESOLVED configuration, so an
+    // operator reaches for it before writing a unit file -- and it answered "fine" to
+    // a command line with no chance of starting.
+    //
+    // Both halves are asserted, and the second is not decoration: a fix that made the
+    // flag refuse everything would satisfy the first on its own.
+
+    SECTION("a configuration that would not start is printed AND refused")
+    {
+        // The documented scheduler line, minus `--cluster-key-file`. A scheduler signs
+        // the grants its workers check, so it cannot work without the key -- which is a
+        // `StartupPolicyRejection` row, and exactly the shape the ticket was found on.
+        auto cfg = SchedulerWithoutKey();
+
+        auto const report = ReportSurfaces(cfg);
+
+        // Printed in FULL, which is the feature rather than a concession: an operator
+        // reaches for this BECAUSE something is wrong, and withholding the worksheet
+        // until the configuration is valid withholds it when it is wanted.
+        CHECK(report.text.contains("0.0.0.0:6675")); // the RESOLVED endpoint, which is what the flag exists to print
+        CHECK_FALSE(report.text.empty());
+
+        // And refused, which is what the exit code follows from.
+        REQUIRE(report.refusal.has_value());
+        CHECK(Unwrap(report.refusal).contains("--cluster-key-file"));
+
+        // **The table's own words, byte for byte.** A second phrasing here would be a
+        // second thing to be wrong, and an operator who met one sentence from this flag
+        // and a different one at boot would be matching two messages instead of reading
+        // one. This is the assertion that fails if somebody later reformats it.
+        CHECK(Unwrap(report.refusal) == Unwrap(StartupPolicyRejection(cfg)));
+    }
+
+    SECTION("a configuration that would start is printed and NOT refused")
+    {
+        // The control, and the ticket names it explicitly: without it, a flag that
+        // always fails satisfies the section above.
+        auto cfg = SchedulerWithoutKey();
+        cfg.clusterKeyFile = "cluster.key";
+
+        auto const report = ReportSurfaces(cfg);
+        CHECK(report.text.contains("0.0.0.0:6675")); // the RESOLVED endpoint, which is what the flag exists to print
+        CHECK_FALSE(report.refusal.has_value());
+    }
+
+    SECTION("the worksheet is identical either way")
+    {
+        // The map does not change shape according to the verdict: judging and rendering
+        // are two answers about one configuration, and a reader comparing a broken run
+        // with a fixed one should see the map differ only where the configuration does.
+        auto broken = SchedulerWithoutKey();
+        auto fixed = broken;
+        fixed.clusterKeyFile = "cluster.key";
+
+        // `--cluster-key-file` opens no port, so it appears in no surface row -- which
+        // is what makes this comparison exact rather than approximate.
+        CHECK(ReportSurfaces(broken).text == ReportSurfaces(fixed).text);
+    }
 }
 
 TEST_CASE("A surface that is off is named, with what would turn it on", "[node][surfaces]")

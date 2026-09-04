@@ -41,6 +41,36 @@ namespace
 {
 /// A configuration a supervisor could actually be handed.
 /// @return A worker that would start.
+/// A scheduler endpoint for fixtures that need one to be startable at all.
+///
+/// **`--scheduler` is required of EVERY node**, a pure `--serve-scheduler` included --
+/// it names itself. Until #386 that rule was an inline `if` in `main.cpp`, which is in
+/// no test target, so a fixture could describe a configuration the binary refuses to
+/// start and nothing here could tell. Several did.
+///
+/// Where a reload fixture uses it, it has to appear in BOTH the file and the live
+/// configuration and with the SAME value: present in only one, it reads as a change to
+/// an unreloadable field and is refused for that instead -- a green test for the wrong
+/// reason.
+constexpr std::string_view SchedulerEndpoint = "scheduler.internal:6675";
+
+/// What a node running `--serve-scheduler` names as its own scheduler: itself.
+///
+/// **Not `SchedulerEndpoint`, and the difference decides which rows fire.** A REMOTE
+/// scheduler plus a membership policy is what the three advertise rows are about -- such
+/// a node has told peers to dial it, so its `--advertise` has to be an address they can
+/// reach -- and handing a scheduler-node fixture a remote endpoint trips those rows
+/// instead of whatever it was written to test.
+///
+/// A scheduler registering with itself over loopback is the documented shape
+/// (`--serve-scheduler ... --scheduler=127.0.0.1:6675`), and it is what makes
+/// `SchedulerIsRemote` false.
+///
+/// Found by giving the scheduler fixtures a REMOTE endpoint and watching the dashboard
+/// and fleet-policy cases go red on the advertise rows -- so the two constants are not
+/// a tidiness preference, and picking the wrong one does not fail where you are looking.
+constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
+
 [[nodiscard]] NodeConfig Installable()
 {
     NodeConfig cfg;
@@ -895,6 +925,42 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
+TEST_CASE("NodeConfig: an empty --scheduler is refused at STARTUP and not only at install", "[node][policy]")
+{
+    // **The rule this ticket is about, asserted where it has to hold.** An empty
+    // `--scheduler` was refused by an inline `if` in `main()` and by row 1 of
+    // `NodeServiceRejection`. `main.cpp` is in no test target, so the copy that ran at
+    // startup was the one nothing could assert, and the two had already drifted on the
+    // sentence they say -- which is the observable half of a duplicate
+    // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+    auto headless = Installable();
+    headless.scheduler.clear();
+
+    // **The control FIRST, so one run shows the discrimination.** `NodeInstallRejection`
+    // composes `NodeServiceRejection`, which has always had this row -- so it refuses an
+    // empty `--scheduler` whether or not the startup table does. Asserting through it
+    // would pass under the exact bug this case exists to catch, which is why the ticket
+    // names it as the wrong target. Ordered ahead of the subject because a `REQUIRE`
+    // below aborts the case: read after the subject, this control would simply not run
+    // on the failing build and could not show what it is for.
+    CHECK(NodeInstallRejection(headless).has_value());
+
+    auto const refusal = StartupPolicyRejection(headless);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).contains("--scheduler"));
+
+    // **The message must be the STARTUP sentence, not the install-time one.** Both
+    // rules are about the same empty field and the install row says "to install a
+    // service" -- true when a registration is being written and false at every start,
+    // where the process is simply refusing to run. An operator told the wrong one goes
+    // looking for a service they never asked to install.
+    CHECK_FALSE(Unwrap(refusal).contains("to install a service"));
+
+    // And the ordinary configuration is untouched: a node that names its scheduler
+    // starts, so this is a refusal of the empty value and not of the flag.
+    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
 TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused before it is installed", "[node][policy]")
 {
     // #186. Each of these grammars was checked inside the tier that binds it, and
@@ -1396,13 +1462,30 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         alone.scheduler = "127.0.0.1:6675";
         CHECK_FALSE(StartupPolicyRejection(alone).has_value());
 
-        // A node sharing its CACHE tier with listed peers and registering nowhere.
+        // A node sharing its CACHE tier with listed peers and REGISTERING NOWHERE.
         // That surface is reached at `--listen-node`, so its advertise is never
-        // sent to anybody and the wildcard costs it nothing.
+        // sent to anybody and the wildcard costs it nothing -- which is why the three
+        // advertise rows are scoped to `!c.scheduler.empty()`.
+        //
+        // **But "registering nowhere" is not a node that starts**, and that is worth
+        // knowing rather than asserting past: `--scheduler` is required of every node,
+        // so the exemption those rows carry describes a configuration the binary
+        // refuses. This case could assert otherwise only because the scheduler rule
+        // lived in `main.cpp`, which no test target compiles
+        // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+        //
+        // So the property is asserted the way it is actually observable: such a config
+        // IS refused, and refused for the scheduler rather than for the advertise. The
+        // scope clause therefore still does what it says -- it just cannot decide
+        // anything at startup, which is recorded here rather than changed, being
+        // nobody's ticket yet.
         NodeConfig cacheOnly;
         cacheOnly.fleetMembers = { "10.0.0.1:6676" };
         cacheOnly.clusterKeyFile = "cluster.key"; // it admits another machine (#282)
-        CHECK_FALSE(StartupPolicyRejection(cacheOnly).has_value());
+        auto const cacheOnlyRefusal = StartupPolicyRejection(cacheOnly);
+        REQUIRE(cacheOnlyRefusal.has_value());
+        CHECK(Unwrap(cacheOnlyRefusal).contains("--scheduler"));
+        CHECK_FALSE(Unwrap(cacheOnlyRefusal).contains("--advertise"));
 
         // And the worker the getting-started page documents, which names both.
         NodeConfig worker;
@@ -1537,14 +1620,20 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // Each carries `--cluster-key-file`, which every shape admitting another
         // machine now needs: the scheduler signs a grant and the worker checks it,
         // and neither is possible without the key (#282).
+        // Each also names `--scheduler`, which every node needs to start at all -- a
+        // scheduler included, and it names itself. These fixtures did not, so the
+        // shapes they called "accepted" were shapes the binary refuses; the rule was an
+        // inline `if` in `main.cpp` and no test could see it (#386).
         NodeConfig listed;
         listed.serveScheduler = true;
+        listed.scheduler = std::string { SelfScheduler };
         listed.fleetMembers = { "10.0.0.1:6676" };
         listed.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
         open.serveScheduler = true;
+        open.scheduler = std::string { SelfScheduler };
         open.fleetOpen = true;
         open.clusterKeyFile = "cluster.key";
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
@@ -1557,11 +1646,34 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         joiner.raftListen = "6680";
         joiner.raftPeers = { Peer("n4=10.0.0.4:6680"), Peer("n1=10.0.0.1:6680"), Peer("n2=10.0.0.2:6680") };
         joiner.clusterKeyFile = "cluster.key";
+        joiner.scheduler = std::string { SchedulerEndpoint };
         CHECK_FALSE(StartupPolicyRejection(joiner).has_value());
 
-        // And a worker running no scheduler at all -- by far the common case -- is
-        // untouched by any of this.
-        CHECK_FALSE(StartupPolicyRejection(NodeConfig {}).has_value());
+        // And the minimum startable worker -- a scheduler and nothing else -- is
+        // untouched by any of this. That is the claim this line always meant to make.
+        //
+        // **It used to be `StartupPolicyRejection(NodeConfig {})`, asserted to be
+        // ACCEPTED, under a comment calling a worker with no scheduler "by far the
+        // common case".** The binary has never agreed: `main()` refused an empty
+        // `--scheduler` outright, and every documented command line names one,
+        // including the scheduler's own and the cache-tier node's. A default
+        // `NodeConfig` is not a deployment -- it is a struct -- and while the rule
+        // lived in a file no test target compiles, this suite could hold a belief
+        // about which nodes exist that production had been contradicting all along
+        // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+        NodeConfig minimal;
+        minimal.scheduler = std::string { SchedulerEndpoint };
+        CHECK_FALSE(StartupPolicyRejection(minimal).has_value());
+
+        // And the section's real claim, now stated rather than implied: none of the
+        // rows above depends on `--scheduler`. A bare config is refused, and refused
+        // for the scheduler ALONE -- so a row here that started answering in its place
+        // would fail this rather than hide behind it.
+        auto const bare = StartupPolicyRejection(NodeConfig {});
+        REQUIRE(bare.has_value());
+        CHECK(Unwrap(bare).contains("--scheduler"));
+        CHECK_FALSE(Unwrap(bare).contains("--fleet-member"));
+        CHECK_FALSE(Unwrap(bare).contains("--raft-peer"));
 
         // Including one that names a membership policy, which is the whole of #235.
         // A mirror row used to refuse exactly this, reasoning that "a policy nothing
@@ -1871,9 +1983,17 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
 
     /// A node whose scheduler and admin surface are both configured, so only the
     /// dashboard rule under test can fire.
+    ///
+    /// `--serve-scheduler` says this node RUNS a scheduler; `--scheduler` says where it
+    /// registers, and is required of every node including one that schedules -- it names
+    /// itself. This lambda set only the first, so the configurations it built could not
+    /// have started, and nothing here could tell while that rule lived as an inline `if`
+    /// in `main.cpp` ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+    /// The comment above already claimed both; now it is true.
     auto const servingNode = [] {
         NodeConfig cfg;
         cfg.serveScheduler = true;
+        cfg.scheduler = std::string { SelfScheduler };
         cfg.fleetOpen = true;
         // `--fleet-open` admits other machines, and a node that admits them has to
         // be able to check the grants they present (#282). Present here so that only
@@ -2815,6 +2935,30 @@ namespace
     return candidate;
 }
 
+/// Write a configuration file for a node that could actually be running.
+///
+/// `WriteNodeConfigFile` plus the `scheduler:` line, so a fixture about reload MECHANICS
+/// does not have to restate a startup precondition it is not testing. Named rather than
+/// folded into `WriteNodeConfigFile`, because several cases assert on a file's exact
+/// contents and a writer that silently added a key would break them for a reason none of
+/// them is about.
+/// @param dir Where to write it.
+/// @param body The keys this case is about.
+/// @return The path.
+[[nodiscard]] std::filesystem::path WriteRunnableNodeConfigFile(std::filesystem::path const& dir, std::string_view body)
+{
+    return WriteNodeConfigFile(dir, std::format("scheduler: {}\n{}", SchedulerEndpoint, body));
+}
+
+/// The live configuration of a node that could actually be running.
+/// @return A config naming a scheduler and nothing else.
+[[nodiscard]] NodeConfig RunningNode()
+{
+    NodeConfig cfg;
+    cfg.scheduler = std::string { SchedulerEndpoint };
+    return cfg;
+}
+
 /// A reloader over @p initial reading @p path, wired as `main` wires one.
 /// @param initial What the worker is running with.
 /// @param path The configuration file.
@@ -2842,9 +2986,9 @@ TEST_CASE("A reloadable setting reaches the SUBSYSTEM, not just the snapshot", "
     // nothing at all, which is the whole defect.
     Testing::ScratchDirectory const scratch { "node-reload-live" };
     auto const& dir = scratch.Path();
-    auto const path = WriteNodeConfigFile(dir, "log_level: error\n");
+    auto const path = WriteRunnableNodeConfigFile(dir, "log_level: error\n");
 
-    NodeConfig initial;
+    auto initial = RunningNode();
     initial.logLevel = LogLevel::Info;
 
     std::ostringstream sink;
@@ -2880,9 +3024,9 @@ TEST_CASE("An unreloadable setting that changed is reported, and nothing is appl
     // all, restated as the reason this row is not marked.
     Testing::ScratchDirectory const scratch { "node-reload-refused" };
     auto const& dir = scratch.Path();
-    auto const path = WriteNodeConfigFile(dir, "slots: 9\n");
+    auto const path = WriteRunnableNodeConfigFile(dir, "slots: 9\n");
 
-    NodeConfig initial;
+    auto initial = RunningNode();
     initial.slots = 4;
 
     auto reloader = MakeNodeReloader(initial, path);
@@ -2999,9 +3143,9 @@ TEST_CASE("A toolchain change is reloadable, and says the fleet must be told", "
     // what the heartbeat thread reads to decide whether to re-derive and re-register.
     Testing::ScratchDirectory const scratch { "node-reload-toolchain" };
     auto const& dir = scratch.Path();
-    auto const path = WriteNodeConfigFile(dir, "toolchain:\n  - /usr/bin/g++\n");
+    auto const path = WriteRunnableNodeConfigFile(dir, "toolchain:\n  - /usr/bin/g++\n");
 
-    NodeConfig initial;
+    auto initial = RunningNode();
     initial.toolchains = { "/usr/bin/clang++" };
 
     auto reloader = MakeNodeReloader(initial, path);
@@ -3024,9 +3168,9 @@ TEST_CASE("Turning discovery off is reloadable, and also a claim", "[node][confi
     // and telling the node to stop searching the machine.
     Testing::ScratchDirectory const scratch { "node-reload-discovery" };
     auto const& dir = scratch.Path();
-    auto const path = WriteNodeConfigFile(dir, "no_toolchain_discovery: true\ntoolchain:\n  - /usr/bin/g++\n");
+    auto const path = WriteRunnableNodeConfigFile(dir, "no_toolchain_discovery: true\ntoolchain:\n  - /usr/bin/g++\n");
 
-    NodeConfig initial;
+    auto initial = RunningNode();
     REQUIRE(initial.toolchainDiscovery);
 
     auto reloader = MakeNodeReloader(initial, path);
@@ -3054,9 +3198,9 @@ TEST_CASE("A log-level reload does not re-derive what this worker serves", "[nod
     // returns this worker to discovery -- a real change, correctly reported as one.
     // Written the other way round, this case asserted that reverting to discovery is
     // NOT a change, which is the opposite of true and would have hidden it.
-    auto const path = WriteNodeConfigFile(dir, "log_level: error\ntoolchain:\n  - /usr/bin/g++\n");
+    auto const path = WriteRunnableNodeConfigFile(dir, "log_level: error\ntoolchain:\n  - /usr/bin/g++\n");
 
-    NodeConfig initial;
+    auto initial = RunningNode();
     initial.logLevel = LogLevel::Info;
     initial.toolchains = { "/usr/bin/g++" };
 

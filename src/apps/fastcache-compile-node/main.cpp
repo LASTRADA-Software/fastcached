@@ -1671,16 +1671,6 @@ int main(int argc, char** argv)
         // also the ordinary no-file case, where `cliOnly` is already the answer.
         cfg = cliOnly;
 
-    if (cfg.printSurfaces)
-    {
-        // Before the startup rules below, deliberately. An operator reaches for this
-        // BECAUSE a port is wrong, and refusing to show the map until the
-        // configuration is already valid would withhold it exactly when it is wanted.
-        // It opens nothing and changes nothing, so there is no state to protect.
-        std::cout << RenderSurfaces(cfg);
-        return 0;
-    }
-
     // The admin verbs below answer an operator at a terminal, so they report to one
     // -- even under `--daemon`, which the registered command line carries and which
     // is therefore exactly what somebody copies out of `sc qc` to try by hand. Their
@@ -1692,6 +1682,41 @@ int main(int argc, char** argv)
     // with no default -- and the factory is what carries the CONFIGURATION to it,
     // which is the half a signature cannot check.
     auto const consoleLogger = MakeNodeConsoleLogger(std::cerr, cfg);
+
+    // **Moved BELOW the logger and still above the startup table** (#582). It is one of
+    // the terminal-facing verbs the comment above is about, and its refusal has to
+    // reach the same terminal, rendered the same way as the one a start prints -- an
+    // operator who meets this sentence here and again at boot should be reading one
+    // message, not matching two. The ordering that matters is unchanged: this is still
+    // ahead of `StartupPolicyRejection`, so the worksheet is printed for a broken
+    // configuration exactly as before, and only the exit code moved.
+    if (cfg.printSurfaces)
+    {
+        // Before the startup rules below, deliberately. An operator reaches for this
+        // BECAUSE a port is wrong, and refusing to show the map until the
+        // configuration is already valid would withhold it exactly when it is wanted.
+        // It opens nothing and changes nothing, so there is no state to protect.
+        //
+        // **The ordering is right; the exit code was the defect** (#582). This printed
+        // the map and returned 0 for a configuration the node then refuses to run --
+        // measured: the documented scheduler line without `--cluster-key-file` exits 2
+        // on its own and exited 0 through this flag. Since the flag prints the RESOLVED
+        // configuration, an operator reaches for it before writing a unit file, and it
+        // answered "fine" to a command line with no chance of starting.
+        //
+        // Printing the map for a broken configuration is the feature; reporting SUCCESS
+        // for it is not. `ReportSurfaces` renders and judges in one call so this site
+        // decides nothing: the verdict is `StartupPolicyRejection`'s own sentence, and
+        // the exit code follows from whether there is one. See that function for why it
+        // is a function rather than four lines here -- five verbs answer and exit ahead
+        // of the startup table, and they do not all want the same answer.
+        auto const report = ReportSurfaces(cfg);
+        std::cout << report.text;
+        if (!report.refusal.has_value())
+            return ExitOk;
+        consoleLogger->Logf(LogLevel::Error, "{}", *report.refusal);
+        return ExitUsage;
+    }
 
     // Service registration, before anything that costs time. A misconfiguration is
     // decided in microseconds while a toolchain fingerprint takes seconds, which is
@@ -1785,20 +1810,18 @@ int main(int argc, char** argv)
     auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
     ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(*consoleLogger);
 
-    // Both are refused at startup rather than at the first job. A worker missing
-    // either would register (or fail to) and then refuse everything, which presents
-    // to an operator as "distribution does not work" rather than as a misconfigured
-    // node.
-    if (cfg.scheduler.empty())
-    {
-        logger.Logf(LogLevel::Error, "--scheduler is required; a worker nothing knows about serves nobody");
-        return ExitUsage;
-    }
-    // "no --toolchain and no discovery" used to be refused HERE, and is now a
-    // `StartupPolicyRejection` row. It depends on nothing but the parsed
-    // configuration, which is what that table is for -- and leaving it in the tier
-    // meant a reload could reach the state a start refuses, since #403 made both of
-    // its flags reloadable and `ValidateNodeReloadable` composes the startup rules.
+    // An empty `--scheduler` and "no --toolchain and no discovery" were both refused
+    // HERE, as inline `if`s, and both are now `StartupPolicyRejection` rows -- the
+    // toolchain pair by #403, the scheduler by #386. Neither reads anything but the
+    // parsed configuration, which is what that table is for, and a rule in this tier
+    // is one that a RELOAD cannot consult and that no test can reach: this file is in
+    // no test target, so the copy that ran at startup was the untested one while the
+    // tests asserted `NodeServiceRejection`'s install-time twin. They had already
+    // drifted on the sentence they say.
+    //
+    // Nothing replaces them here. The table is consulted a few lines below, on the
+    // same logger and with the same exit code, and there is no `return` in between --
+    // so this is a deletion rather than a move of the refusal's timing.
 
     // Checked here rather than inside WorkerBody, for the reason the two above are:
     // the POSIX host has already redirected stdout to /dev/null by the time the body

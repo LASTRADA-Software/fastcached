@@ -521,4 +521,19 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     return out;
 }
 
+SurfaceReport ReportSurfaces(NodeConfig const& cfg)
+{
+    // Rendered FIRST and unconditionally, which is the whole shape of the fix: the
+    // worksheet is what the operator asked for and they get it whatever the verdict
+    // (#582). `RenderSurfaces` is untouched -- a case in `NodeSurfaces_test.cpp`
+    // renders the sheet for a default `NodeConfig`, which is an invalid configuration,
+    // and it must go on passing.
+    //
+    // The verdict comes from `StartupPolicyRejection` and is passed through
+    // unaltered. Not reworded, not prefixed, not summarised: it is the same sentence
+    // the node prints when it refuses to start, so an operator who sees it here and
+    // then sees it at boot is reading one message rather than matching two.
+    return SurfaceReport { .text = RenderSurfaces(cfg), .refusal = StartupPolicyRejection(cfg) };
+}
+
 } // namespace FastCache::Node
