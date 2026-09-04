@@ -793,6 +793,22 @@ determinism rests on.
     to make it wrong again, and a rulebook is exactly where such a number goes to be
     believed forever.
 
+    **And its mirror image, which that rule does not cover: a VERSION in a bug report
+    is a measurement of the ENVIRONMENT, and the environment can change under it
+    without anybody editing the report.** In the post-mortem case the claim decays
+    while the world holds still; here the world moves and the claim is left describing
+    a machine that no longer exists. #715 was filed against `g++ 16.1.1 20260515`; the
+    host updated to `16.2.1 20260819` mid-session -- confirmed with `rpm -q gcc-c++`
+    rather than inferred from the discrepancy, since "I misread it earlier" and "the
+    package changed" look identical at a glance. The version was the only thing in that
+    report saying WHICH compiler it was about, so it was load-bearing and had gone
+    stale silently. Re-measured rather than assumed: it reproduces identically, same two
+    files, same two `-Werror` categories, which is the answer that makes an update
+    reportable rather than alarming -- and had it NOT reproduced, the report would have
+    been describing a fixed bug while reading as an open one. **A reproduction is a
+    claim about a machine as well as about a tree.** Name the version, and re-take it
+    when the tool under it moves.
+
     **A prose diff cannot show you the sentence your insertion falsified.** The hunk
     was `@@ -898,6 +898,45 @@`: the added lines plus **six** untouched context lines,
     three leading and three trailing. Only the trailing three matter to the argument,
