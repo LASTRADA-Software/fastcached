@@ -98,9 +98,12 @@ it".
     than the power cut.
 
     **Silently means you are told nothing, not that nothing was lost.** Which of
-    the two slots was damaged decides what surviving costs, and neither outcome
-    writes a log line or moves a counter — the storage layer has no logger and no
-    metrics sink to reach for.
+    the two slots was damaged decides what surviving costs. Neither outcome
+    writes a log line — the storage layer has no logger to reach for — and the
+    recovery itself moves no counter. But do not read that as *no trace at all*:
+    when the **live** slot was the damaged one, the keys written after the
+    surviving commit become ordinary **misses**, and misses are counted. That
+    step is the only signal the event leaves, so it is the one to look at.
 
     - The **older** slot damaged: the store comes up on the newest commit, whole.
     - The **live** slot damaged: the store comes up on the previous durable
@@ -108,11 +111,23 @@ it".
       ordinary misses, not as errors, because the store is internally
       consistent, just consistent with an earlier moment.
 
-    The next commit then lands in the damaged slot rather than over the
-    surviving one, so ordinary use repairs the file instead of leaving it one
-    torn write away from `Corrupt`. A cache that has quietly lost its most
-    recent window refills; the reason it did is still worth the two minutes
-    below, because the damage that caused it has not gone anywhere.
+    **Whether ordinary use then repairs the file depends on
+    `--storage-durability`, and under `fsync` it does the opposite.** Measured,
+    on a store seeded through the cache's own open path:
+
+    - **`batched`** (the default): the next flush writes the *other* slot, so it
+      lands in the damaged one and the surviving slot is preserved. Ordinary use
+      does repair the file.
+    - **`fsync`**: the commit after recovery derives its slot from the
+      transaction id and consults nothing the recovery recorded, so it
+      **overwrites the surviving slot** — spending the only good copy and
+      leaving every later commit hammering it. See
+      [#726](https://github.com/LASTRADA-Software/fastcached/issues/726).
+
+    So on `fsync` a store that came up degraded is one torn write from `Corrupt`
+    and stays that way. A cache that has quietly lost its most recent window
+    refills either way; the reason it did is still worth the two minutes below,
+    because the damage that caused it has not gone anywhere.
 
 ## Can it be repaired?
 
