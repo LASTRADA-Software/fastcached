@@ -31,6 +31,12 @@
 //                        worker (default 600000; 0 = unbounded). Separate from the
 //                        one above because a compile is bounded by how long a
 //                        compiler runs, not by a round trip (#223).
+//   FASTCACHE_DISPATCH_IDLE_MS
+//                        deadline in ms on SILENCE during that exchange (default
+//                        30000; 0 = unbounded). A running compile pulses at its
+//                        client every few seconds, so this bounds how long the
+//                        worker may say NOTHING -- the one failure keepalive
+//                        cannot see (#245).
 //
 // The statistics log is located from the usual per-user state variables rather
 // than one of our own: LOCALAPPDATA on Windows, else XDG_STATE_HOME or HOME.
@@ -980,11 +986,10 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs {
-        .connect = cfg.connectTimeout,
-        .controlTotal = cfg.ioTimeout,
-        .compileTotal = cfg.dispatchTimeout,
-        .compileIdle = cfg.dispatchIdle });
+    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs { .connect = cfg.connectTimeout,
+                                                            .controlTotal = cfg.ioTimeout,
+                                                            .compileTotal = cfg.dispatchTimeout,
+                                                            .compileIdle = cfg.dispatchIdle });
 }
 
 /// The deadlines this invocation runs every cache exchange under.

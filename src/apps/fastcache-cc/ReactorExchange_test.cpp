@@ -521,6 +521,148 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     CHECK(clock.Now() - start < PerByte * Turns);
 }
 
+TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the total")
+{
+    // **The whole of #245, from the client side.** A dispatched compile's total budget
+    // has to be as long as the slowest translation unit anybody compiles -- ten minutes
+    // here, derived from the scheduler's lease timeout -- so before this the same number
+    // was also how long a worker that had stopped making progress went unnoticed. Its
+    // host answers every keepalive probe, so nothing below the protocol can see it.
+    //
+    // The two bounds are set an order of magnitude apart and the clock is moved past the
+    // SMALLER one only, so the case can only pass if the idle deadline is the one that
+    // fired. Under a build with no idle bound the total never elapses, nothing closes
+    // the socket, and the seeded outcome comes back naming nothing.
+    ManualClock clock;
+    TestReactor reactor { clock };
+    ScriptedConnector connector;
+    connector.Reply({}); // accepts, answers nothing -- not even a pulse
+
+    constexpr Cc::ExchangeBudget Budget { .connect = 1s, .total = 600s, .idle = 30s };
+    static_assert(Budget.idle * 4 < Budget.total,
+                  "the advance below must stay well inside the total, or this case cannot tell the two bounds apart");
+
+    // ONE jump past the idle deadline, for the reason the quiet-peer case above gives:
+    // the deadline is a bounded poll, so a run of small advances only makes a step of
+    // progress each and how far the clock must move would depend on a poll interval this
+    // case has no business knowing.
+    auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
+        co_await ResumeOn { *loop };
+        c->Advance(past);
+        co_return;
+    };
+
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+    auto const start = clock.Now();
+    advance(&reactor, &clock, Budget.idle * 4);
+
+    auto const outcome = exchange.Run("127.0.0.1:6676", Wire::EncodeFetch("k"), {}, Budget);
+
+    auto const& log = connector.Log();
+    INFO("sent=" << log.sent << " reads=" << log.reads << " closed=" << log.closed << " destroyed=" << log.destroyed
+                 << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count()
+                 << "ms");
+    CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
+
+    // **Named, and that is half the point.** `Expired` says "this compile was slower
+    // than we were prepared to wait" and sends an operator to raise a timeout;
+    // `PeerLost` says "that machine is gone". Neither is true here, and either would
+    // send somebody to fix something that was never wrong.
+    CHECK(outcome.transportFailure == Cc::TransportFailure::Silent);
+
+    // Closed and the owning frame finished, for the reason the total's own case gives: a
+    // bound that only stopped WAITING leaves a coroutine parked on a read nobody
+    // completes, which is a leaked frame and a leaked descriptor per translation unit.
+    CHECK(log.closed);
+    CHECK(log.destroyed);
+
+    // And it happened well inside the total, which is the improvement stated as a
+    // measurement rather than as a claim.
+    CHECK(clock.Now() - start < Budget.total);
+}
+
+TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting is not abandoned")
+{
+    // The other direction, and the one that fails if the deadline is armed once instead
+    // of being re-armed: the exchange runs LONGER than the idle bound in total, and is
+    // abandoned only if a pulse does not reset it.
+    //
+    // Dribbled, and that is what makes this case mean anything -- the same reasoning the
+    // zero-budget case below states. A peer whose reads resolve inline finishes the whole
+    // exchange before `Run()` is ever entered, so the reactor never takes a turn and no
+    // deadline of any kind gets to fire; such a case would pass against the very code it
+    // exists to reject.
+    ManualClock clock;
+    TestReactor reactor { clock };
+    ScriptedConnector connector;
+
+    // A pulse, then the answer. Five bytes each, handed over one byte per reactor turn.
+    auto stream = Wire::EncodeProgressReply();
+    auto const answer = Wire::EncodeReply(Wire::Status::Ok, {});
+    stream.insert(stream.end(), answer.begin(), answer.end());
+    REQUIRE(stream.size() == 2 * Wire::ReplyHeaderSize);
+    connector.Reply(stream);
+    connector.DribbleReplies();
+
+    constexpr auto PerByte = 1s;
+    constexpr Cc::ExchangeBudget Budget { .connect = 1s, .total = 600s, .idle = 8s };
+
+    // The arithmetic, spelled out because it is the whole case. The pulse completes at
+    // byte 5, so at 5s; the answer's header completes at byte 10, so at 10s.
+    //
+    //   armed once  -> the window opened at 0s expires at 8s, before byte 10 arrives.
+    //   re-armed    -> the pulse at 5s opens a window to 13s, and byte 10 lands at 10s.
+    //
+    // Both margins are checked by the static_asserts rather than left to a reader.
+    static_assert(PerByte * Wire::ReplyHeaderSize < Budget.idle, "the pulse must arrive INSIDE the first window");
+    static_assert(PerByte * 2 * Wire::ReplyHeaderSize > Budget.idle,
+                  "the answer must arrive OUTSIDE it, or a build that never re-arms would pass");
+    static_assert(PerByte * 2 * Wire::ReplyHeaderSize < PerByte * Wire::ReplyHeaderSize + Budget.idle,
+                  "and inside the window the pulse opens, or the fixed build would fail too");
+
+    constexpr int Turns = 32; // comfortably more than the stream is long
+    auto dribble =
+        [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
+        for (int turn = 0; turn < turns; ++turn)
+        {
+            co_await ResumeOn { *loop };
+            c->Advance(perByte);
+            if (log->live == nullptr || !log->live->DeliverOneByte())
+                co_return;
+        }
+    };
+
+    Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
+    auto const start = clock.Now();
+    dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
+
+    auto const outcome = exchange.Run("127.0.0.1:6676", Wire::EncodeFetch("k"), {}, Budget);
+
+    // Drained after the exchange stopped the reactor, so the driver reaches its own
+    // `co_return` and frees its frame -- the same reason the dribble case above drains.
+    (void) reactor.Drain();
+
+    auto const& log = connector.Log();
+    INFO("reads=" << log.reads << " closed=" << log.closed << " failure=" << static_cast<int>(outcome.transportFailure)
+                  << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count()
+                  << "ms");
+
+    // The answer arrived, which it cannot have if the idle deadline fired at 8s.
+    CHECK(outcome.kind == Cc::CacheOutcomeKind::Hit);
+
+    // Asserted as "not the silence bound" rather than as `None`, and that is a
+    // statement about the existing type rather than a hedge: `CacheOutcome` seeds
+    // `transportFailure` to `Unreached` so that an exchange which never ran cannot read
+    // as a hit, and the successful paths do not clear it -- the field is only ever
+    // written on the `Transport` arm. So `None` is not what a hit carries today, while
+    // `Silent` is exactly what a wrongly-fired idle bound would leave here.
+    CHECK(outcome.transportFailure != Cc::TransportFailure::Silent);
+
+    // And it really did outlive the bound rather than arriving early: without this the
+    // case would also pass against a peer that answered in one byte.
+    CHECK(clock.Now() - start > Budget.idle);
+}
+
 TEST_CASE("A budget of zero arms no deadline at all")
 {
     // What `FASTCACHE_TIMEOUT_MS=0` has always been documented to mean, and what the
@@ -683,7 +825,8 @@ TEST_CASE("Every transport failure has words of its own")
     constexpr auto All = std::to_array({ Cc::TransportFailure::None,
                                          Cc::TransportFailure::Unreached,
                                          Cc::TransportFailure::PeerLost,
-                                         Cc::TransportFailure::Expired });
+                                         Cc::TransportFailure::Expired,
+                                         Cc::TransportFailure::Silent });
 
     std::vector<std::string_view> phrases;
     for (auto const failure: All)

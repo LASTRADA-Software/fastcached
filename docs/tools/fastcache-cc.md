@@ -210,6 +210,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_CONNECT_TIMEOUT_MS` | Deadline, in milliseconds, for *opening* a connection — name resolution included. `0` leaves the platform's own, which runs to minutes. Short on purpose: a cache that has not accepted within a second is one the build is better off without, and a wedged resolver would otherwise stall every translation unit. | `1000` |
 | `FASTCACHE_TIMEOUT_MS` | Deadline, in milliseconds, for one **whole** exchange with the daemon — or with a scheduler's `LEASE`/`RELEASE` — from the request to the last byte of the reply. `0` removes the bound. A daemon that accepts and then stalls, or dribbles one byte at a time, would otherwise block the compile forever. Bounds one exchange, not the whole invocation — see below — and **not** a remote compile. | `10000` |
 | `FASTCACHE_DISPATCH_TIMEOUT_MS` | Deadline, in milliseconds, for one whole **`COMPILE`** exchange with a worker. `0` removes the bound. Far larger than `FASTCACHE_TIMEOUT_MS` because it bounds a different shape of conversation: a worker writes nothing until the compiler has finished, so the client waits out the entire remote compile in one read. Ten minutes because that is the scheduler's own lease timeout — waiting longer means waiting on a lease it has already reclaimed. See [Distributed compilation](../getting-started/distributed-compilation.md). | `600000` (10 min) |
+| `FASTCACHE_DISPATCH_IDLE_MS` | Deadline, in milliseconds, on **silence** during a `COMPILE` exchange. `0` removes the bound. A worker writes a five-byte progress frame every few seconds while it is compiling, so this bounds how long it may say *nothing* rather than how long the compile may take — which is what lets it be seconds while `FASTCACHE_DISPATCH_TIMEOUT_MS` stays minutes. It is the only thing that sees a worker whose machine answers every keepalive probe while the process makes no progress. On expiry the launcher compiles locally and hands the lease back, and its fall-back line (with `FASTCACHE_VERBOSE`) reads *stopped reporting progress* rather than *ran out of budget*. See [Distributed compilation](../getting-started/distributed-compilation.md). | `30000` (30 s) |
 | `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
 | `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` running `--serve-scheduler`. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** member of the cluster, not the current leader — no launcher needs re-pointing after an election. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
@@ -738,10 +739,20 @@ Two things this is **not**:
   Linux and macOS and about 30 seconds on Windows, whatever the deadline is set to.
   Raising `FASTCACHE_DISPATCH_TIMEOUT_MS` for a slow translation unit therefore does
   not make hard-failure detection slower.
-- What keepalive cannot see is a worker whose machine answers while the process
-  makes no progress: the kernel replies to the probes, so only the flat deadline
-  bounds it. Closing that needs a periodic liveness frame from the worker
-  ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+- **Nor is it how long a WEDGED worker goes unnoticed.** Keepalive cannot see a
+  machine whose kernel answers every probe while the process above it makes no
+  progress, so the worker says so itself: a running compile writes a `Status::Progress`
+  frame every five seconds, carrying nothing, and `FASTCACHE_DISPATCH_IDLE_MS` bounds
+  the silence between them at thirty seconds
+  ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)). The launcher's fall-back
+  line reports it as *stopped reporting progress*, which is a different remedy from *ran
+  out of budget*.
+- Those pulses are why the `0xFC` protocol version is **3**, and why version 3 is also
+  the oldest a server accepts: a reply carries a status byte and no kind, so a client
+  built before this cannot step over a frame it does not know the way it can step over
+  an unknown *request* verb. An older launcher meeting a pulse would abandon the compile
+  minutes in, as a transport failure naming nothing; refused at the request instead, it
+  is told `unsupported-version` and which range would have worked.
 
 ## Measured behaviour
 

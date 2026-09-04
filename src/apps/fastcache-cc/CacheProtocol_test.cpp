@@ -45,7 +45,137 @@ namespace
 // a case here prove the client consumed exactly one reply frame and no more, and
 // what make the pipelining assertion state a round trip rather than a write count.
 
+/// Counts what an exchange reported as forward motion.
+///
+/// A counter rather than a bool, because what a real implementation does with these
+/// is push a deadline out ONCE PER EVENT: an observer told half the pulses bounds a
+/// worker's silence at twice what the operator asked for, and a bool cannot see that.
+class CountingLiveness final: public IExchangeLiveness
+{
+  public:
+    /// @copydoc IExchangeLiveness::MovedForward
+    void MovedForward() noexcept override
+    {
+        _moves += 1;
+    }
+
+    /// @return How many times the exchange said it had moved forward.
+    [[nodiscard]] int Moves() const noexcept
+    {
+        return _moves;
+    }
+
+  private:
+    int _moves { 0 };
+};
+
+/// Concatenate framed replies into one scripted stream.
+/// @param frames The replies, in the order the peer sends them.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> Stream(std::initializer_list<std::vector<std::byte>> frames)
+{
+    std::vector<std::byte> out;
+    for (auto const& frame: frames)
+        out.insert(out.end(), frame.begin(), frame.end());
+    return out;
+}
+
 } // namespace
+
+TEST_CASE("A progress frame is stepped over, and the answer behind it is the outcome")
+{
+    // **The client half of #245.** A pre-#245 launcher refused `Status::Progress` at
+    // `DecodeReplyHeader` and reported the whole exchange as a transport failure --
+    // several minutes into a translation unit, naming nothing. So this is not "the
+    // loop is nicer": without it a worker that reports progress is a worker no client
+    // can talk to at all.
+    auto const object = std::vector<std::byte> { std::byte { 0xDE }, std::byte { 0xAD } };
+    Testing::ScriptedSocket client { Stream({ Wire::EncodeProgressReply(),
+                                              Wire::EncodeProgressReply(),
+                                              Wire::EncodeProgressReply(),
+                                              Wire::EncodeReply(Wire::Status::Ok, object) }) };
+    CountingLiveness liveness;
+
+    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Hit);
+    CHECK(outcome.value == object);
+
+    // ONE per pulse plus one for the request going out. Asserted as an exact figure
+    // rather than "more than zero": an observer told about the first pulse and no
+    // others would leave a re-armed deadline expiring on a worker that had been
+    // talking the whole time, and every claim above would still hold.
+    CHECK(liveness.Moves() == 4);
+}
+
+TEST_CASE("A refusal behind a progress frame is still the refusal")
+{
+    // The pulse says nothing about the OUTCOME, so it must not colour it: a worker
+    // that reported progress and then refused is refusing, and a client that read the
+    // pulse as encouragement would report a hit for a compile that never happened.
+    Testing::ScriptedSocket client { Stream(
+        { Wire::EncodeProgressReply(), Wire::EncodeErrorReply(Wire::ErrorCode::WorkerSpawnFailed, "no compiler") }) };
+    CountingLiveness liveness;
+
+    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Rejected);
+    CHECK(outcome.code == Wire::ErrorCode::WorkerSpawnFailed);
+    CHECK(liveness.Moves() == 2);
+}
+
+TEST_CASE("A peer that pulses and then breaks is a transport failure, not a hit")
+{
+    // A pulse is not an answer, so a stream of them that STOPS has answered nothing.
+    // The seeded outcome is what has to survive here: a reader that returned the last
+    // frame it managed to decode would hand a caller an empty object under a correct
+    // key.
+    Testing::ScriptedSocket client { Stream({ Wire::EncodeProgressReply(), Wire::EncodeProgressReply() }) };
+    CountingLiveness liveness;
+
+    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Transport);
+    CHECK(outcome.value.empty());
+    CHECK(liveness.Moves() == 3);
+}
+
+TEST_CASE("An exchange with nobody listening for liveness behaves exactly as it did")
+{
+    // Null is what every exchange but the compile passes, and it is the shape of this
+    // change that must cost the cache legs nothing: the reader still consumes one
+    // whole frame, and the outcome is what it always was.
+    Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
+
+    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), Credential {}, nullptr));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Miss);
+}
+
+TEST_CASE("A pulse ahead of a credentialled command does not strand the AUTH reply")
+{
+    // The two rules meet here, and they are the two that a hand-written reader gets
+    // wrong together: AUTH's reply is consumed first and unconditionally, and a pulse
+    // is stepped over wherever it lands. A reader that counted frames instead of
+    // reading statuses would hand the command the AUTH answer.
+    //
+    // The pulse is placed between the two replies deliberately -- that is the position
+    // a real worker produces, since it starts pulsing only once it is answering the
+    // COMPILE.
+    auto const object = std::vector<std::byte> { std::byte { 0x2A } };
+    Testing::ScriptedSocket client { Stream({ Wire::EncodeReply(Wire::Status::Ok, {}),
+                                              Wire::EncodeProgressReply(),
+                                              Wire::EncodeReply(Wire::Status::Ok, object) }) };
+    CountingLiveness liveness;
+
+    auto const outcome = SyncRun(ExchangeFramed(
+        &client, &Unwatched(), Wire::EncodeFetch("k"), Credential { .username = "", .secret = "s3cret" }, &liveness));
+
+    CHECK(outcome.kind == CacheOutcomeKind::Hit);
+    CHECK(outcome.value == object);
+    CHECK_FALSE(outcome.credentialIgnored);
+    CHECK(liveness.Moves() == 2);
+}
 
 TEST_CASE("CacheFetch sends exactly what the wire module specifies")
 {

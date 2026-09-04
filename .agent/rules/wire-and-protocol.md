@@ -29,6 +29,43 @@ Every rule below has already been a bug.
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
+- **A reply is one frame per request, and `Status::Progress` is the one exception --
+  bounded to exactly one verb, carrying nothing, and paid for with a version step.**
+  A dispatched compile is bounded by how long a COMPILER runs, so its client's total
+  deadline is minutes by construction and was therefore also how long a worker whose
+  process had stopped making progress went unnoticed. Keepalive (#247) answers a dead
+  HOST and is blind to a kernel that answers every probe while nothing above it does;
+  only a periodic *I am still here* separates those, and only the party doing the work
+  can send it ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+  Four consequences, each load-bearing:
+  - **A reply carries a status byte and a length and NO KIND, so the extensibility the
+    request framing has does not exist on the way back.** `DecodeReplyHeader` refuses
+    an unknown status outright, and the launcher maps that refusal to a transport
+    failure -- so a client built before this meets a pulse by abandoning the compile
+    several minutes in, naming nothing. `MinSupportedVersion` therefore moved WITH
+    `CurrentVersion` to 3: the older request is refused `UnsupportedVersion`, which
+    names the range that would have worked and arrives before a byte of source is
+    sent, and the capability becomes implied by the version rather than negotiated.
+    "The framing already lets a receiver step over what it does not know" is the
+    tempting reason not to bump, and it is a fact about REQUESTS.
+  - **Which verbs may be answered with it is a column of `OpTable`**, and
+    `ProgressIsCompileOnly()` is `static_assert`ed. Every other verb on this wire is
+    answered from a table in microseconds, so a pulse on one would be a frame no client
+    could observe and a second reply shape every reader would have to handle for
+    nothing -- and a mask widened by hand would give it to them by omission.
+  - **It says nothing about the work, and `EncodeProgressReply()` takes no argument so
+    there is nothing to pass.** Partial diagnostics here would be a second, racy channel
+    for output the result frame already carries whole. A receiver still drains the
+    declared length rather than asserting it is zero, for the same reason every frame
+    here is drained by its declared length.
+  - **A reader loops until a TERMINAL status, so one answer per request survives.**
+    `IsTerminalStatus` is in the wire header rather than at each reader, because there
+    are four of them in this tree -- the launcher's cache and worker exchanges, the
+    admin CLI and the protocol test client -- and a reader that does not ask treats the
+    first pulse as the answer. Nothing bounds how MANY arrive: a worker that pulses
+    forever is alive and never finishing, which is what the exchange's total budget has
+    always been for, and a frame count beside it would be two ceilings on one thing
+    that could never be converted into each other.
 - **The wire's two grammars are shared, and both live in `Core/` for the same
   reason.** `Core/WireFields` is the payload — a run of `[u32 length][bytes]` —
   and `Core/WireFrame` is the seven bytes in front of it:
@@ -556,9 +593,9 @@ Every rule below has already been a bug.
     are under the bar the values were chosen for; the asymmetry is stated in
     `KeepAliveSettings` rather than papered over by accepting a count and dropping it.
   - **It answers "is this connection dead", never "is this peer working".** A worker
-    that is alive and simply not writing is #245's progress frames, and this does not
-    retire them. Collapsing the two is how a slow peer gets killed and a dead one gets
-    waited on.
+    that is alive and simply not writing is `Status::Progress` (#245), and keepalive
+    does not retire it. Collapsing the two is how a slow peer gets killed and a dead
+    one gets waited on.
   - **A per-call option must stay per-call.** Fixing it on the connector would be
     per-socket today only by accident of `Cc::RunOneExchange` building one connector
     per exchange, and would become per-many-sockets, silently, the first time anyone

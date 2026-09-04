@@ -350,6 +350,36 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     CHECK(scheduler.Answered().size() == 4);
 }
 
+TEST_CASE("A progress cadence is routed to the surface that does the slow work", "[node][merged-responder][progress]")
+{
+    // Assert the wiring, for the reason the peer-watch case below states. Whether a verb
+    // is slow enough to owe its client a liveness signal is a property of the VERB and
+    // of the surface doing its work -- and a merged listener that folded or hard-coded
+    // the answer would either pulse at a client reading a cache reply, which is a frame
+    // that verb's status table does not even admit, or pulse at nobody on the one
+    // surface that needs it (#245).
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    NamedResponder compile { "compile" };
+    compile.SetProgressInterval(std::chrono::milliseconds { 250 });
+
+    MergedResponder responder { &cache, &scheduler, &compile };
+
+    CHECK(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Compile))
+          == std::optional { std::chrono::milliseconds { 250 } });
+
+    // And nowhere else. Both directions, because a router that answered the compile
+    // surface's cadence for every verb would pass an assertion about `Op::Compile`
+    // alone.
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Store)).has_value());
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+
+    // A verb nobody owns is not pulsed. Unreachable -- `RefusePeer` has already refused
+    // it -- and not-pulsing is the answer that changes nothing.
+    CHECK_FALSE(responder.ProgressInterval(0xEE).has_value());
+}
+
 TEST_CASE("A peer watch is routed to the surface whose work it would abandon", "[node][merged-responder][peerwatch]")
 {
     // Assert the wiring. The counter a watch raises belongs to the surface whose work

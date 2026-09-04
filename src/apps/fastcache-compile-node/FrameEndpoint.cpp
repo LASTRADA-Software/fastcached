@@ -1143,9 +1143,9 @@ namespace
     /// @param socket The connection, shared with the pulse for its lifetime.
     /// @return The pulse, or null when this request is not pulsed.
     [[nodiscard]] std::shared_ptr<ProgressPulse> ArmProgressPulse(IFrameResponder const& responder,
-                                                                 std::uint8_t opRaw,
-                                                                 IReactor* reactor,
-                                                                 std::shared_ptr<ISocket> socket)
+                                                                  std::uint8_t opRaw,
+                                                                  IReactor* reactor,
+                                                                  std::shared_ptr<ISocket> socket)
     {
         auto const interval = responder.ProgressInterval(opRaw);
         if (!interval.has_value() || *interval <= std::chrono::milliseconds::zero())

@@ -147,9 +147,7 @@ struct DispatchBudgets
     /// keepalive is what answers that in seconds without shortening the deadline back
     /// into #223. The control exchanges above leave it off: a lease or a release that
     /// stalls is already bounded by a round trip.
-    ExchangeBudget compile { .total = DefaultDispatchTotal,
-                             .idle = DefaultDispatchIdle,
-                             .keepAlive = KeepAlive::Yes };
+    ExchangeBudget compile { .total = DefaultDispatchTotal, .idle = DefaultDispatchIdle, .keepAlive = KeepAlive::Yes };
 
     /// Ceiling on the object a worker may declare its reply expands to.
     ///

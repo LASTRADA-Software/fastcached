@@ -347,6 +347,13 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              // name does not match the longer one, so dropping
                              // either row is caught here.
                              "FASTCACHE_DISPATCH_TIMEOUT_MS",
+                             // Nor is THIS one a variant of the row above it, and the
+                             // same `contains` argument applies in the other direction:
+                             // the total bounds how long a compile may take and this
+                             // bounds how long the worker may say nothing, which is the
+                             // split #245 exists for. A build that documented one and
+                             // read the other would read exactly like a working one.
+                             "FASTCACHE_DISPATCH_IDLE_MS",
                              "FASTCACHE_MAX_STORE_BYTES",
                              "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",

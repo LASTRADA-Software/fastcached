@@ -405,31 +405,53 @@ worth distributing ([#223](https://github.com/LASTRADA-Software/fastcached/issue
 Ten minutes because that is `LeaseTable`'s own lease timeout: waiting longer
 means waiting on a lease the scheduler has already reclaimed.
 
-The launcher is one process per translation unit, so this is a **runtime**
-setting — export a new value and the next compile uses it. Nothing reloads and
-nothing restarts. Raise it if a single translation unit legitimately compiles for
-longer than ten minutes. Lowering it buys you nothing against a dead worker, for
-the reason in the next box.
+`FASTCACHE_DISPATCH_IDLE_MS` is the companion knob and the one that answers the
+other question: how long the worker may say **nothing**. It defaults to **30000**
+(thirty seconds). A worker writes a five-byte progress frame every few seconds
+while a compile is running, so the client measures *silence* rather than
+*duration* — which is what lets this be seconds while the total above stays
+minutes ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+Setting it to `0` turns it off and restores one flat deadline.
 
-!!! note "A vanished worker is noticed in seconds, not at the deadline"
+Both are **runtime** settings: the launcher is one process per translation unit,
+so exporting a new value is all it takes and the next compile uses it. Nothing
+reloads and nothing restarts. Raise the total if a single translation unit
+legitimately compiles for longer than ten minutes; lowering it buys you nothing
+against a worker that has stopped, for the reason in the next box.
 
-    A flat deadline cannot tell a worker that is *still compiling* from one that is
-    *gone*, so it is not asked to. The compile exchange dials with TCP keepalive
-    armed: if a worker's machine vanishes mid-job — powered off, cable pulled, VPN
-    dropped, laptop suspended — the connection is declared dead after about
-    **16 seconds** on Linux and macOS and about **30 seconds** on Windows,
-    regardless of `FASTCACHE_DISPATCH_TIMEOUT_MS`. The client then hands the lease
-    back and compiles locally, so nothing is lost and the key is **not** pinned for
-    the scheduler's lease timeout.
+!!! note "A worker that stops is noticed in seconds, not at the deadline"
 
-    The Windows figure is not a typo: the OS fixes the probe count at 10 and offers
-    no way to set it.
+    A flat deadline cannot tell a worker that is *still compiling* from one that has
+    *stopped*, so it is not asked to. Two mechanisms answer the second question
+    instead, and they cover different failures:
 
-    What keepalive cannot see is a machine that is *up* while the worker process
-    makes no progress — the kernel answers the probes, so only the flat deadline
-    bounds that case. Separating it from a slow compile needs the worker to say
-    periodically that it is still there, which is a wire change tracked as
-    [#245](https://github.com/LASTRADA-Software/fastcached/issues/245).
+    | the worker | detected by | when |
+    |---|---|---|
+    | process exits, crashes, is killed | the client's own parked read — FIN or RST | immediately |
+    | host vanishes: powered off, unplugged, suspended, VPN dropped | TCP keepalive on the compile dial | ~16 s on Linux and macOS, ~30 s on Windows |
+    | host answers while the process makes no progress | the missing progress frames — `FASTCACHE_DISPATCH_IDLE_MS` | ~30 s |
+    | compiler runs longer than anybody is prepared to wait | `FASTCACHE_DISPATCH_TIMEOUT_MS` | at the deadline |
+
+    In every one of them the client hands the lease back and compiles locally, so
+    nothing is lost and the key is **not** pinned for the scheduler's lease timeout.
+
+    The Windows keepalive figure is not a typo: the OS fixes the probe count at 10
+    and offers no way to set it.
+
+    Row 3 is the one keepalive cannot see — the kernel answers every probe, so
+    nothing below the protocol knows anything is wrong. The worker therefore says so
+    itself: while a compile is running it writes a `Status::Progress` frame every
+    five seconds, carrying nothing at all, and the client gives up after thirty
+    seconds of silence. The launcher's own fall-back line (`FASTCACHE_VERBOSE`) then
+    reads *stopped reporting progress* rather than *ran out of budget*, because
+    "that machine has wedged" and "that compile was slow" are fixed in different
+    places by different people. On the `--show-stats` axis both are tallied as
+    `unavailable`, which is deliberate: that tally is bounded by cause and does not
+    grow a row per socket condition.
+
+    This is a **wire** feature, not a client-side heuristic: it is why the `0xFC`
+    protocol version is 3, and a launcher or node from before it is refused with
+    `unsupported-version` rather than being left to meet a frame it cannot parse.
 
 !!! warning "What a client that runs out of budget costs the fleet"
 

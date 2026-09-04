@@ -254,6 +254,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A cache exchange is bounded by a round trip, a dispatched compile by how long a
   COMPILER runs; sharing one deadline abandoned every TU worth distributing while the
   worker finished the job anyway. And a per-call `SO_RCVTIMEO` is not a bound at all.
+- That total therefore cannot also answer *how fast is a stopped worker noticed*.
+  Keepalive answers a dead HOST; the row it cannot reach — a kernel answering every
+  probe while the process makes no progress — is the worker's own `Status::Progress`
+  pulse, against a SLIDING idle deadline the client re-arms on each pulse. Its own
+  `SocketDeadlineTarget`, so `Silent` is distinguishable from `Expired`: those are
+  opposite diagnoses fixed by different people.
 - That language is stated by the flags dispatch APPENDS, so a build that named one
   itself (`/TP`, which CMake emits for every MSVC C++ source) is folded into the
   language and dropped — never refused, which made the whole fleet cache and
@@ -531,6 +537,22 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 `Protocol/`, `Net/`, `Async/`.
 - A frame declares its own length, so a rejection is a **reply** and a
   resynchronization — never a close.
+- A reply carries a status byte and NO kind, so the step-over-what-you-do-not-know
+  property is REQUEST-side only. `Status::Progress` (the compile pulse, #245) therefore
+  moved `MinSupportedVersion` with `CurrentVersion`: an old client meeting a pulse
+  abandons the compile minutes in, where a refused request is `UnsupportedVersion` and
+  names the range. Which verbs admit it is a table column, `static_assert`ed to
+  `Op::Compile` alone; the payload is empty and the encoder takes no argument; a reader
+  loops to a TERMINAL status, and the exchange's total is what bounds how many arrive.
+- Silence is only measurable against something that would otherwise be said, so the
+  worker's cadence and the client's idle bound are ONE pair of numbers in
+  `CompileCacheWire`, with the relation between them `static_assert`ed — an idle bound
+  at or below the cadence refuses healthy workers on their own reactor's jitter.
+- A pulse is a SECOND writer for the length of the answer, so the endpoint settles it
+  before it writes anything, and a pulse still parked past the bound ends the
+  connection — `SettleWatch`'s rule on the write side. A test that reads one framed
+  reply cannot see a frame emitted AFTER it, and "every frame but the last is a pulse"
+  passes vacuously on a build that pulses none.
 - Which verbs are reachable before authentication is a *column of the table*, and
   the gate runs before the payload is buffered.
 - A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one
