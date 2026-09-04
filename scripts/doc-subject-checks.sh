@@ -346,8 +346,30 @@ SelfTest() {
         printf '%s\n' "$3" > "$1/scripts/$2"
     }
 
+    # $1 = "skip" to give both labelled checks a SKIP_REGULAR_EXPRESSION.
+    #
+    # A PARAMETER rather than a `sed` injection, for two reasons of very
+    # different strength -- stated separately, because a reader cannot recover
+    # which was measured and which was not.
+    #
+    # REASONED, not measured: `\n` in a sed REPLACEMENT is a GNU extension and
+    # POSIX leaves it undefined, so BSD sed -- macOS, where this runs in the
+    # default ctest set -- is not obliged to produce a newline. This host has
+    # only GNU sed, which honours it even under `--posix` (checked), so the
+    # failure could NOT be reproduced here and no claim is made that it happens.
+    # The same family as the `sed` range trap `check-tidy-sweep-scope.sh`
+    # records, met at the replacement side.
+    #
+    # MEASURED, and the durable half either way: generating beats editing,
+    # because an edit that matches no anchor changes nothing and reports
+    # success. `AssertStagedDiffers` now refuses any staged tree identical to
+    # the baseline, so a case that stages nothing fails instead of reporting on
+    # the baseline while claiming to report on a break. That guard holds however
+    # the host's sed behaves, which is why it is the part worth keeping.
     GoodCMakeLists() {
-        cat <<'CML'
+        local skipLine=""
+        [[ "${1:-}" == "skip" ]] && skipLine='    SKIP_REGULAR_EXPRESSION "SKIP: "'
+        SKIPLINE="$skipLine" awk '{ if ($0 == "@SKIP@") { if (length(ENVIRON["SKIPLINE"])) print ENVIRON["SKIPLINE"] } else print }' <<'CML'
 set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 add_test(
     NAME "alpha-docs"
@@ -358,6 +380,7 @@ add_test(
 set_tests_properties("alpha-docs" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene;docs-subject"
+@SKIP@
     TIMEOUT 60
 )
 add_test(
@@ -369,6 +392,7 @@ add_test(
 set_tests_properties("beta-docs" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene;docs-subject"
+@SKIP@
     TIMEOUT 60
 )
 add_test(
@@ -415,6 +439,19 @@ message(STATUS "CMake Error: the prose and the table disagree")'
     local quietlyBad='cmake_minimum_required(VERSION 3.28)
 message(STATUS "nothing to see")
 cmake_language(EXIT 3)'
+
+    # A staged tree that is byte-identical to the baseline stages NOTHING, and
+    # the case then reports on the baseline while claiming to report on a break.
+    # Asserted for every tree that is supposed to differ, because a generator or
+    # an editor that quietly did nothing is the failure mode all of these share.
+    AssertStagedDiffers() {
+        local tree="$1" what="$2"
+        if diff -q "${scratch}/t-baseline/src/tests/CMakeLists.txt" \
+                   "${tree}/src/tests/CMakeLists.txt" >/dev/null 2>&1; then
+            echo "  FAIL  '$what' staged a CMakeLists identical to the baseline; the case stages nothing" >&2
+            status=1
+        fi
+    }
 
     Case() {
         # $1 = description, $2 = want-pass|want-fail, $3 = tree
@@ -493,16 +530,14 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    if diff -q "${scratch}/t-baseline/src/tests/CMakeLists.txt" "$tree/src/tests/CMakeLists.txt" >/dev/null; then
-        echo "  FAIL  the no-label tree is identical to the baseline; the case stages nothing" >&2
-        status=1
-    fi
+    AssertStagedDiffers "$tree" "no labelled checks"
     Case "a label matching nothing is REFUSED, not reported clean" want-fail "$tree" | grep -q "ran NOTHING" \
         || { echo "  FAIL  the empty-scan refusal did not say so" >&2; status=1; }
 
     # 4. A labelled check whose command needs a build tree.
     tree="${scratch}/t-buildtree"
     StageTree "$tree" "$(GoodCMakeLists | sed 's|"-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"|"-DW=${CMAKE_CURRENT_BINARY_DIR}"|')"
+    AssertStagedDiffers "$tree" "a build-tree argument"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
@@ -523,6 +558,7 @@ cmake_language(EXIT 3)'
     #    one where a wrong answer looks exactly like a right one.
     tree="${scratch}/t-noregex"
     StageTree "$tree" "$(GoodCMakeLists | grep -v FASTCACHED_SCRIPT_CHECK_FAILED)"
+    AssertStagedDiffers "$tree" "no fail regex"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$noisy"
     WriteCheck "$tree" gamma.cmake "$quiet"
@@ -532,7 +568,8 @@ cmake_language(EXIT 3)'
     # 7. Skipped is its own state, distinct from passed -- and a run in which
     #    EVERY check skipped is refused, because nothing ran.
     tree="${scratch}/t-oneskip"
-    StageTree "$tree" "$(GoodCMakeLists | sed 's|    TIMEOUT 60|    SKIP_REGULAR_EXPRESSION "SKIP: "\n    TIMEOUT 60|')"
+    StageTree "$tree" "$(GoodCMakeLists skip)"
+    AssertStagedDiffers "$tree" "a check with a skip regex"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$skipper"
     WriteCheck "$tree" gamma.cmake "$quiet"
@@ -541,7 +578,8 @@ cmake_language(EXIT 3)'
         || { echo "  FAIL  the skip was not counted separately" >&2; status=1; }
 
     tree="${scratch}/t-allskip"
-    StageTree "$tree" "$(GoodCMakeLists | sed 's|    TIMEOUT 60|    SKIP_REGULAR_EXPRESSION "SKIP: "\n    TIMEOUT 60|')"
+    StageTree "$tree" "$(GoodCMakeLists skip)"
+    AssertStagedDiffers "$tree" "every check with a skip regex"
     WriteCheck "$tree" alpha.cmake "$skipper"
     WriteCheck "$tree" beta.cmake "$skipper"
     WriteCheck "$tree" gamma.cmake "$quiet"
@@ -552,6 +590,7 @@ cmake_language(EXIT 3)'
     # 8. A label that merely starts with the right text must not select.
     tree="${scratch}/t-prefix"
     StageTree "$tree" "$(GoodCMakeLists | sed 's/;docs-subject/;docs-subject-later/')"
+    AssertStagedDiffers "$tree" "a neighbouring label"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
