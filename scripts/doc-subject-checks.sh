@@ -453,6 +453,41 @@ cmake_language(EXIT 3)'
         fi
     }
 
+    # Capture, THEN match -- never `Case ... | grep -q`.
+    #
+    # `grep -q` exits at its FIRST match, which closes the pipe; the producer dies
+    # of SIGPIPE; `set -o pipefail` then takes the PRODUCER's status and the
+    # pipeline reports failure -- **on the success path**, and only when the
+    # producer has not already finished writing. That makes it RACY rather than
+    # deterministic: it passes on a quiet box (0 failures in 40 runs, measured
+    # here) and fails under load, which is how it survived review and reached CI.
+    #
+    # Measured in this very file: run 33919403106's `clang-asan-ubsan` leg printed
+    #
+    #     ok    (want-fail) a check printing the failure text and exiting 0 is FAILED
+    #     FAIL  a 3.28-shaped failure was read as a pass
+    #
+    # -- the case's own verdict says the exit status was RIGHT and the message
+    # assertion on the next line is what broke. That contradiction is the
+    # signature, and it is worth knowing because the two lines look like they
+    # disagree about the same thing and do not.
+    #
+    # The trap is written out in this file's own header for a different construct,
+    # and ten call sites below it committed it anyway. A rule stated in the file
+    # that obeys it is not learned by the file that does not -- including when
+    # they are the same file.
+    Expect() {
+        # $1 = needle, $2 = failure message, $3.. = Case arguments
+        local needle="$1" failMessage="$2"
+        shift 2
+        local captured
+        captured="$(Case "$@")"
+        case "$captured" in
+            *"$needle"*) ;;
+            *) echo "  FAIL  ${failMessage}" >&2; status=1 ;;
+        esac
+    }
+
     Case() {
         # $1 = description, $2 = want-pass|want-fail, $3 = tree
         local what="$1" want="$2" tree="$3" out got=0
@@ -498,8 +533,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$noisy"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a labelled check emitting CMake Error is FAILED" want-fail "$tree" | grep -q "FAILED   beta-docs" \
-        || { echo "  FAIL  the failing check was not named" >&2; status=1; }
+    Expect "FAILED   beta-docs" "the failing check was not named" "a labelled check emitting CMake Error is FAILED" want-fail "$tree"
 
     # 2b. The same failure the way CMake 3.28 -- this project's declared minimum
     #     -- delivers it: the text printed, the status 0. This is the case the
@@ -510,9 +544,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$silentlyBad"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a check printing the failure text and exiting 0 is FAILED (the CMake 3.28 shape)" want-fail "$tree" \
-        | grep -q "FAILED   beta-docs" \
-        || { echo "  FAIL  a 3.28-shaped failure was read as a pass" >&2; status=1; }
+    Expect "FAILED   beta-docs" "a 3.28-shaped failure was read as a pass" "a check printing the failure text and exiting 0 is FAILED (the CMake 3.28 shape)" want-fail "$tree"
 
     # 2c. And the other arm: a non-zero exit with clean output.
     tree="${scratch}/t-quietly-bad"
@@ -520,9 +552,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quietlyBad"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a check exiting non-zero with clean output is FAILED" want-fail "$tree" \
-        | grep -q "FAILED   beta-docs (exit 3)" \
-        || { echo "  FAIL  a non-zero exit was read as a pass" >&2; status=1; }
+    Expect "FAILED   beta-docs (exit 3)" "a non-zero exit was read as a pass" "a check exiting non-zero with clean output is FAILED" want-fail "$tree"
 
     # 3. No labelled checks at all. #687's own acceptance clause.
     tree="${scratch}/t-nolabel"
@@ -531,8 +561,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
     AssertStagedDiffers "$tree" "no labelled checks"
-    Case "a label matching nothing is REFUSED, not reported clean" want-fail "$tree" | grep -q "ran NOTHING" \
-        || { echo "  FAIL  the empty-scan refusal did not say so" >&2; status=1; }
+    Expect "ran NOTHING" "the empty-scan refusal did not say so" "a label matching nothing is REFUSED, not reported clean" want-fail "$tree"
 
     # 4. A labelled check whose command needs a build tree.
     tree="${scratch}/t-buildtree"
@@ -541,17 +570,14 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "an unsubstitutable build-tree argument is REFUSED BY NAME, not skipped" want-fail "$tree" \
-        | grep -q "CMAKE_CURRENT_BINARY_DIR" \
-        || { echo "  FAIL  the refusal did not name the argument" >&2; status=1; }
+    Expect "CMAKE_CURRENT_BINARY_DIR" "the refusal did not name the argument" "an unsubstitutable build-tree argument is REFUSED BY NAME, not skipped" want-fail "$tree"
 
     # 5. A labelled check whose script is missing.
     tree="${scratch}/t-missing"
     StageTree "$tree" "$(GoodCMakeLists)"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a labelled check whose script does not exist is REFUSED" want-fail "$tree" | grep -q "beta.cmake" \
-        || { echo "  FAIL  the refusal did not name the missing script" >&2; status=1; }
+    Expect "beta.cmake" "the refusal did not name the missing script" "a labelled check whose script does not exist is REFUSED" want-fail "$tree"
 
     # 6. The fail-regex spelling gone. Without it every verdict would be the exit
     #    status, which is 0 for a failing 3.28 `-P` script -- so this case is the
@@ -562,8 +588,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$noisy"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a CMakeLists defining no fail regex is REFUSED" want-fail "$tree" | grep -q "defines no FASTCACHED_SCRIPT_CHECK_FAILED" \
-        || { echo "  FAIL  the missing-regex refusal did not say so" >&2; status=1; }
+    Expect "defines no FASTCACHED_SCRIPT_CHECK_FAILED" "the missing-regex refusal did not say so" "a CMakeLists defining no fail regex is REFUSED" want-fail "$tree"
 
     # 7. Skipped is its own state, distinct from passed -- and a run in which
     #    EVERY check skipped is refused, because nothing ran.
@@ -573,9 +598,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$skipper"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "a check matching its SKIP_REGULAR_EXPRESSION is SKIPPED, not passed and not failed" want-pass "$tree" \
-        | grep -q "passed=1 failed=0 skipped=1" \
-        || { echo "  FAIL  the skip was not counted separately" >&2; status=1; }
+    Expect "passed=1 failed=0 skipped=1" "the skip was not counted separately" "a check matching its SKIP_REGULAR_EXPRESSION is SKIPPED, not passed and not failed" want-pass "$tree"
 
     tree="${scratch}/t-allskip"
     StageTree "$tree" "$(GoodCMakeLists skip)"
@@ -583,9 +606,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$skipper"
     WriteCheck "$tree" beta.cmake "$skipper"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "every check skipping is REFUSED: nothing failed because nothing ran" want-fail "$tree" \
-        | grep -q "not a clean result" \
-        || { echo "  FAIL  the all-skipped refusal did not say so" >&2; status=1; }
+    Expect "not a clean result" "the all-skipped refusal did not say so" "every check skipping is REFUSED: nothing failed because nothing ran" want-fail "$tree"
 
     # 8. A label that merely starts with the right text must not select.
     tree="${scratch}/t-prefix"
@@ -594,8 +615,7 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Case "'docs-subject-later' is not 'docs-subject'" want-fail "$tree" | grep -q "ran NOTHING" \
-        || { echo "  FAIL  a neighbouring label was matched" >&2; status=1; }
+    Expect "ran NOTHING" "a neighbouring label was matched" "'docs-subject-later' is not 'docs-subject'" want-fail "$tree"
 
     if [[ "$status" -ne 0 ]]; then
         echo "${SelfName}: self-test FAILED" >&2
