@@ -8,6 +8,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -487,4 +489,69 @@ TEST_CASE("RunReactorServer reports a bind it cannot make at Error and refuses t
     CHECK(records[failures.front()].level == FastCache::LogLevel::Error);
     // And nothing claimed readiness for a daemon that never served anything.
     CHECK(IndicesContaining(records, ReadyMarker).empty());
+}
+
+TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed",
+          "[server][reactor-loop][readiness]")
+{
+    // The guard inside the helper, shown refusing. This is the one branch of the
+    // readiness path the end-to-end cases above cannot reach: they bind real
+    // listeners, so every accept loop arms and the refusal never fires.
+    //
+    // A closed `InMemoryListener` answers `Accept()` with a ready error instead of
+    // parking, so `Server::Run()` returns before suspending and `IsAccepting()` is
+    // false by the time the call returns. That is exactly "started but not armed",
+    // and counting it would put an acceptor that does not exist into the readiness
+    // line -- #646 one level deeper.
+    //
+    // The POSITIVE direction is asserted by the two end-to-end cases above, which
+    // count one arm per bind against real listeners and pin the ordering. It is
+    // deliberately not asserted here as well: a `Server` over a LIVE
+    // `InMemoryListener` ends parked on `Accept()`, and unparking it walks into a
+    // dangling-handle defect in that fake which is unrelated to this change and
+    // lives outside this lane -- see the note on the pull request. Saying which
+    // direction is covered where is the point; a case that quietly covered one and
+    // read as covering both would be the worse outcome.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+
+    FastCache::InMemoryListener first;
+    FastCache::InMemoryListener second;
+    first.Close();
+    second.Close();
+
+    std::vector<std::unique_ptr<FastCache::Server>> servers;
+    servers.push_back(std::make_unique<FastCache::Server>(first, engine, logger));
+    servers.push_back(std::make_unique<FastCache::Server>(second, engine, logger));
+
+    FastCache::ReadinessAnnouncer announcer { logger, "2 bind(s)" };
+    announcer.ExpectAcceptor();
+    announcer.ExpectAcceptor();
+    announcer.AcceptorsAllSpawned();
+    FastCache::Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
+
+    CHECK_FALSE(servers[0]->IsAccepting());
+    CHECK_FALSE(servers[1]->IsAccepting());
+
+    // Nothing armed, so nothing is counted and -- the assertion that matters -- the
+    // daemon does NOT claim to be ready.
+    CHECK(announcer.ArmedCount() == 0);
+    CHECK_FALSE(announcer.Announced());
+
+    auto const records = logger.Snapshot();
+    CHECK(IndicesContaining(records, ReadyMarker).empty());
+    CHECK(IndicesContaining(records, ArmedMarker).empty());
+
+    // And each loop that did not arm is REPORTED, at Error, naming the endpoint
+    // that is not being served. Refusing to count without saying so would leave a
+    // daemon that never announces readiness and never explains why.
+    auto const refused = IndicesContaining(records, "did not arm");
+    REQUIRE(refused.size() == 2);
+    for (auto const index: refused)
+    {
+        CHECK(records[index].level == FastCache::LogLevel::Error);
+        CHECK(records[index].message.contains("not being served"));
+    }
 }

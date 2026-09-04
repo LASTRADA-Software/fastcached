@@ -160,7 +160,11 @@ namespace Detail
     /// @param group Names this group of loops in the per-acceptor Debug line, e.g.
     ///        `reactor 0`.
     /// @param announcer Receives one `AcceptorArmed` per loop that armed, and emits
-    ///        the readiness line when the last one across every group does.
+    ///        the readiness line when the last one across every group does. The
+    ///        matching `ExpectAcceptor()` calls belong to whoever CREATED the
+    ///        servers, not here -- on the multi-reactor path this is called once per
+    ///        reactor thread, so registering from inside it would count each group
+    ///        only as its own thread reached it and seal nothing.
     /// @param logger Where a loop that did not arm is reported.
     ///
     /// Returns nothing on purpose: how many armed is `ReadinessAnnouncer`'s

@@ -32,6 +32,29 @@ namespace FastCache
 /// So the line is emitted by the thing that knows every acceptor armed, and there is
 /// no `Logf` at a call site for somebody to move back above the acceptors.
 ///
+/// ## The expected count is REGISTERED, never computed
+///
+/// `ExpectAcceptor()` is called by the code that creates each participant, in the
+/// same loop that creates it, and `AcceptorsAllSpawned()` closes the set. There is
+/// deliberately no count parameter, because the two failure directions are not
+/// symmetric and the arithmetic can only get the dangerous one wrong:
+///
+///   - A total too **low** announces early. That is #646 again, mild, and visible.
+///   - A total too **high** means the announcement **never fires at all**. The line
+///     never appears, and two out-of-tree waiters plus a CI step block on it -- a
+///     hang, behind a line a green suite says nothing about.
+///
+/// A number derived by hand from two other numbers (`binds.size() + reactorCount`,
+/// say) can disagree with what actually started; a count incremented where the
+/// participant is created cannot. So the type offers no way to state a total.
+///
+/// ## And it cannot end silently
+///
+/// If this object is destroyed having never announced, it says so, naming how many
+/// of how many armed. A readiness contract that can quietly never fire is worse than
+/// one that fires early, because early is at least observable -- so the one state
+/// with no log line of its own is the one state this must not be able to reach.
+///
 /// ## Why it counts rather than being called once at the end
 ///
 /// Only one of the three server loops has a place where "the acceptors have started"
@@ -53,40 +76,69 @@ class ReadinessAnnouncer
   public:
     /// Construct over the logger the line is emitted to.
     /// @param logger Sink for the per-acceptor Debug lines and the readiness line.
-    /// @param acceptorCount How many acceptors must arm before the daemon is ready.
-    ///        Zero means nothing will ever arm, so nothing is ever announced -- the
-    ///        truthful answer for a server with no listener, which `RunReactorServer`
-    ///        refuses one step earlier.
+    ///        Must outlive this object, which is why every call site declares it
+    ///        after the logger and before the threads that arm it.
     /// @param endpointSummary What the readiness line says it is ready on, e.g.
-    ///        `2 bind(s) x 4 reactors`. Copied; the announcer outlives no caller's
-    ///        temporary.
-    ReadinessAnnouncer(ILogger& logger, std::size_t acceptorCount, std::string endpointSummary) noexcept;
+    ///        `2 bind(s) x 4 reactors`. Copied.
+    ReadinessAnnouncer(ILogger& logger, std::string endpointSummary) noexcept;
 
-    /// Record one acceptor as armed, announcing readiness when it is the last.
+    ReadinessAnnouncer(ReadinessAnnouncer const&) = delete;
+    ReadinessAnnouncer(ReadinessAnnouncer&&) = delete;
+    ReadinessAnnouncer& operator=(ReadinessAnnouncer const&) = delete;
+    ReadinessAnnouncer& operator=(ReadinessAnnouncer&&) = delete;
+
+    /// Report readiness as never reached, when that is how this object ends.
     ///
-    /// Safe from any thread: the count is atomic and exactly one caller observes the
-    /// transition to `acceptorCount`, so the readiness line is emitted once however
-    /// many threads arm concurrently.
-    /// @param what Names the acceptor for the Debug line, e.g. `127.0.0.1:6674`.
+    /// The whole point of the type is that a waiter may rely on the line, so the
+    /// case where it never came has to be explained rather than left as an absence
+    /// somebody has to infer. Silent on the ordinary path, because announcing and
+    /// then shutting down cleanly is not an event.
+    ~ReadinessAnnouncer();
+
+    /// Register one participant that will arm, called where it is created.
+    ///
+    /// One call per `ExpectAcceptor()` per `AcceptorArmed()`, and both live next to
+    /// the construct they describe -- that correspondence is the guard, and it is
+    /// why no caller is handed a total to compute. Has no effect once
+    /// `AcceptorsAllSpawned()` has been called, which is reported rather than
+    /// ignored.
+    void ExpectAcceptor();
+
+    /// Close the set of participants, announcing if they have all already armed.
+    ///
+    /// Called once, by the loop that did the spawning, after its last
+    /// `ExpectAcceptor()`. Until it is called nothing can announce, so a participant
+    /// that arms while others are still being created cannot announce on their
+    /// behalf.
+    void AcceptorsAllSpawned();
+
+    /// Record one participant as armed, announcing when it is the last.
+    ///
+    /// Safe from any thread: exactly one caller observes the transition, so the
+    /// readiness line is emitted once however many threads arm concurrently.
+    /// @param what Names the participant for the Debug line, e.g. `reactor 0 bind 1`.
     void AcceptorArmed(std::string_view what);
 
     /// @return True once the readiness line has been emitted.
     [[nodiscard]] bool Announced() const noexcept;
 
-    /// @return How many acceptors have reported themselves armed.
+    /// @return How many participants have reported themselves armed.
     [[nodiscard]] std::size_t ArmedCount() const noexcept;
 
-    /// @return How many must arm before readiness is announced.
-    [[nodiscard]] std::size_t AcceptorCount() const noexcept
-    {
-        return _acceptorCount;
-    }
+    /// @return How many participants were registered by `ExpectAcceptor()`.
+    [[nodiscard]] std::size_t ExpectedCount() const noexcept;
 
   private:
+    /// Emit the readiness line if the set is closed and every participant armed.
+    /// Idempotent; exactly one caller ever wins.
+    void MaybeAnnounce();
+
     ILogger& _logger;
-    std::size_t _acceptorCount;
     std::string _endpointSummary;
+    std::atomic<std::size_t> _expected { 0 };
     std::atomic<std::size_t> _armed { 0 };
+    std::atomic<bool> _sealed { false };
+    std::atomic_flag _announced = ATOMIC_FLAG_INIT;
 };
 
 } // namespace FastCache

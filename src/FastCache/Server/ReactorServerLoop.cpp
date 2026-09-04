@@ -81,6 +81,12 @@ namespace
         IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
         PlatformReactor reactor { clock };
 
+        // Declared before the servers it counts and before anything that arms one,
+        // so it outlives every caller and is destroyed last -- which is also what
+        // makes its "readiness was never announced" line reachable on the bind-failure
+        // path below.
+        ReadinessAnnouncer announcer { logger, std::format("{} bind(s)", options.binds.size()) };
+
         std::vector<std::unique_ptr<PlatformListener>> listeners;
         std::vector<std::unique_ptr<Server>> servers;
         listeners.reserve(options.binds.size());
@@ -119,12 +125,16 @@ namespace
                                                        session,
                                                        perBindTls,
                                                        options.logSource ? LogSource::Yes : LogSource::No));
+            // Registered where the participant is created, so the readiness count
+            // and the thing being counted cannot disagree. See `ExpectAcceptor`.
+            announcer.ExpectAcceptor();
         }
+        announcer.AcceptorsAllSpawned();
+
         // Arm first, announce second. The readiness line used to be logged HERE,
         // above the loop that starts the acceptors (#646) -- a marker naming a fact
         // weaker than the bind a caller already had. `ReadinessAnnouncer` emits it,
         // and it emits it only once every accept loop is parked in `Accept()`.
-        ReadinessAnnouncer announcer { logger, servers.size(), std::format("{} bind(s)", options.binds.size()) };
         Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
 
         auto const expiry = Detail::StartExpiryCycle(reactor, engine, logger, options, metrics);
@@ -210,10 +220,26 @@ namespace
             return r;
         SteadyClock ownClock;
         IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
+        // Readiness on this platform takes TWO kinds of participant, and both are
+        // load-bearing. An acceptor thread parked in `AcceptRaw` takes the socket; an
+        // IOCP reactor's `Run()` is what ever serves it, because every accepted handle
+        // is handed off. Counting only the acceptor threads would announce readiness
+        // while every handed-off connection sat on a completion port nobody was
+        // draining -- #646's own defect one layer in.
+        //
+        // Both are registered where they are CREATED rather than added up, because a
+        // total stated as `binds + reactors` that came out too high would stop the
+        // line ever being emitted, on the platform this cannot be executed on. See
+        // `ExpectAcceptor`.
+        ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount) };
+
         std::vector<std::unique_ptr<IocpReactor>> reactors;
         reactors.reserve(reactorCount);
         for (auto i = 0U; i < reactorCount; ++i)
+        {
             reactors.push_back(std::make_unique<IocpReactor>(clock));
+            announcer.ExpectAcceptor();
+        }
 
         // One listening socket per BindConfig; each acceptor thread owns one.
         std::vector<Detail::NativeSocket> listenSocks;
@@ -234,20 +260,6 @@ namespace
             listenSocks.push_back(bound->socket);
             bindTls.push_back(bind.tls);
         }
-        // Readiness on this platform takes TWO kinds of acceptor, and both are
-        // load-bearing. An acceptor thread parked in `AcceptRaw` takes the socket;
-        // an IOCP reactor's `Run()` is what ever serves it, because every accepted
-        // handle is handed off. Counting only the acceptor threads would announce
-        // readiness while every handed-off connection sat on a completion port
-        // nobody was draining -- which is #646's own defect one layer in, so the
-        // total is `binds + reactors` and the last of either announces.
-        //
-        // Declared before `acceptors` and before the reactor threads, so it outlives
-        // every thread that calls `AcceptorArmed`.
-        ReadinessAnnouncer announcer { logger,
-                                       options.binds.size() + reactorCount,
-                                       std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount) };
-
         std::atomic<std::uint64_t> accepted { 0 };
         std::atomic<bool> stopping { false };
         // ONE round-robin counter shared across all acceptor threads. The
@@ -263,6 +275,7 @@ namespace
         acceptors.reserve(options.binds.size());
         for (auto const bindIdx: std::views::iota(std::size_t { 0 }, options.binds.size()))
         {
+            announcer.ExpectAcceptor();
             acceptors.emplace_back([&, bindIdx](std::stop_token stopToken) {
                 // Hoist the formatted thread name into a stack local: Tracy's
                 // SetThreadName stores the const char* and reads it on later
@@ -321,6 +334,10 @@ namespace
                 }
             });
         }
+
+        // Both spawn loops have run, so the set is complete. The reactor arms land
+        // later, on their own threads, and the last of them announces.
+        announcer.AcceptorsAllSpawned();
 
         std::atomic<bool> watchdogQuit { false };
         // Single-shot guard: stopAll is invoked both by the watchdog (on
@@ -403,6 +420,10 @@ namespace
         listeners.reserve(reactorCount * bindCount);
         servers.reserve(reactorCount * bindCount);
 
+        // Declared before the servers it counts and before any reactor thread, so it
+        // outlives every caller of `AcceptorArmed`.
+        ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", bindCount, reactorCount) };
+
         for (auto i = 0U; i < reactorCount; ++i)
         {
             reactors.push_back(std::make_unique<PlatformReactor>(clock));
@@ -436,17 +457,15 @@ namespace
                                                            session,
                                                            perBindTls,
                                                            options.logSource ? LogSource::Yes : LogSource::No));
+                // One participant per (reactor, bind) pair, registered where the
+                // pair is created rather than multiplied out afterwards.
+                announcer.ExpectAcceptor();
             }
         }
-        // One acceptor per (reactor, bind) pair, and the readiness line waits for all
-        // of them. It used to be logged HERE, before a single reactor thread had been
-        // created, let alone armed an accept loop (#646).
-        //
-        // Declared before the threads that arm it and before `watchdog`, so it
-        // outlives every caller of `AcceptorArmed`.
-        ReadinessAnnouncer announcer { logger,
-                                       reactorCount * bindCount,
-                                       std::format("{} bind(s) x {} reactors", bindCount, reactorCount) };
+        // The set is complete before any reactor thread exists. The arms land later,
+        // each on its own reactor's thread, and the last one announces -- which used
+        // to be logged HERE, before a single reactor thread had been created (#646).
+        announcer.AcceptorsAllSpawned();
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
