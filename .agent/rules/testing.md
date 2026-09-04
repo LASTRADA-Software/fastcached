@@ -211,10 +211,31 @@ for; a budget that accommodated that would have made every later run three times
 slower and left the next reader with no way to see why.
 
 **Wait on the stage, not on a line that currently coincides with it.** The two
-stages now have two waits -- `compile node ready` for the bind, `serving <compiler>
+stages now have two waits -- `compile node ready` for **serving**, `serving <compiler>
 as <fingerprint>` for the survey -- and they are kept separate rather than folded,
-because bind-stalled and survey-stalled have different costs and different fixes,
-and a fixture that folds them cannot say which one happened.
+because a stall in one has different costs and different fixes from a stall in the
+other, and a fixture that folds them cannot say which one happened.
+
+**And `compile node ready` is not the bind.** This file said "for the bind" and
+`AGENT.md` said #365 made the line mean *bound*; both were a shorthand and both were
+wrong in the same direction
+([#652](https://github.com/LASTRADA-Software/fastcached/issues/652)). Measured: the
+accept loop starts at `main.cpp:1128` and the line is logged at `:1454`, with the
+credential, the registrars, the startup toolchain count and the heartbeat thread in
+between --
+
+```
+bound  <  accepting  <  READY (serving)  <  surveyed
+```
+
+Relative to the survey the marker is early; relative to the bind it is **late**. The
+cost of the shorthand was not theoretical: `node-scratch-isolation-e2e.ps1` waited on
+this marker and reported *"did not bind its compile port"*, so a node that bound,
+accepted and then stalled in heartbeat setup sent its reader to check a port that was
+open and answering -- the one part that was working. The marker and the fact it names
+are now a row of `Core/ReadinessMarker.hpp`, whose `ReadinessFact` has **no `Bound`
+enumerator**, so the mistake cannot be spelled there
+([#654](https://github.com/LASTRADA-Software/fastcached/issues/654)).
 
 **A comment stating the intent did not protect it.** The serialisation paragraph was
 correct, prominent and three lines above the wait that stopped implementing it. What
