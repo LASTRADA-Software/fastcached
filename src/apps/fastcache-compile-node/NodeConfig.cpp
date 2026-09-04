@@ -1639,6 +1639,111 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return IsLoopbackHost(HostOfEndpoint(AdvertisedEndpoint(cfg)));
 }
 
+/// Why this node must not advertise the PORT it would advertise, or nullopt.
+///
+/// **The startup reachability rules judged the advertised HOST and never its port**, so
+/// a node could tell every client to dial a port nothing on it listens on and start
+/// cleanly ([#594](https://github.com/LASTRADA-Software/fastcached/issues/594)). In the
+/// documented layout that is worse than a wrong number: `--advertise=host:6674` beside
+/// `--listen-node=6675` sends every dispatched compile to 6674, which is the shared
+/// `fastcached` cache daemon. The registration succeeds, the scheduler hands the
+/// endpoint out verbatim, and every counter reads normally.
+///
+/// `AdvertisedEndpoint`'s own comment already described this failure, about the flag
+/// pair it replaced -- *"telling clients to dial one would be silent at both ends,
+/// because the registration still succeeds"* -- and the guard was never extended to the
+/// flag that inherited it.
+///
+/// **NOT "the advertised port must equal `--listen-node`".** That would refuse
+/// legitimate deployments -- NAT, port forwarding, a proxy, a container publishing a
+/// different external port -- and `--advertise` exists precisely so a node can name an
+/// address only clients can reach. `AdvertisesPastALoopbackBind`'s earlier draft refused
+/// a loopback advertise outright and was wrong for exactly this reason.
+///
+/// **The provable case is an advertised host that names THIS machine.** Then the port is
+/// this machine's port, and it can be compared: it must be the one the `0xFC` surface
+/// serves. A mismatch there is wrong by construction, on every machine and forever --
+/// the same standard `AdvertisesWildcard` uses to justify refusing only the wildcard.
+///
+/// **Scoped to LOOPBACK, deliberately, and narrower than the ticket's wording.** It also
+/// offers "or one of this machine's own addresses", which cannot be asked here: this
+/// table is a pure function of the parsed configuration, and enumerating the host's
+/// addresses is I/O behind `Platform/ILocalityOracle`. A rule that cannot state its
+/// premise without reaching for the machine has no business in this table -- the same
+/// argument the retired `--cluster-key-file` row records one screen down. Loopback is
+/// decidable from the text, so that is what is judged.
+///
+/// The wider form the ticket calls unambiguous -- refuse whenever the advertised port
+/// matches a DIFFERENT surface this node serves, whatever the host -- is deliberately
+/// not taken. A NAT external port may legitimately coincide with this node's admin port,
+/// and a wrong refusal of a working deployment is worse than the silent failure it
+/// replaces. What that observation is good for is the MESSAGE, which names the surface
+/// when it recognises the port.
+///
+/// Judged through `AdvertisedEndpoint`, never by re-reading `cfg.advertise`: a copy of
+/// the derivation would judge a different endpoint from the one the lease MAC is taken
+/// over, which is the defect that function was extracted to delete.
+/// @param cfg The parsed configuration.
+/// @return The refusal, naming the port this node actually serves.
+[[nodiscard]] std::optional<std::string> AdvertisedPortRejection(NodeConfig const& cfg)
+{
+    auto const advertised = AdvertisedEndpoint(cfg);
+    if (advertised.empty())
+        return std::nullopt; // Nothing is advertised, so there is nothing to be wrong.
+
+    // Only an endpoint naming this machine is judged; see the note above.
+    if (!IsLoopbackHost(HostOfEndpoint(advertised)))
+        return std::nullopt;
+
+    auto const split = SplitHostPort(advertised);
+    if (!split.has_value())
+        return std::nullopt;
+    auto const advertisedPort = ParseTcpPort(split->second);
+    if (!advertisedPort.has_value())
+        // Not an endpoint at all. `--advertise` carries no grammar row, so this is a
+        // different defect from this one and is left to whoever gives it one -- saying
+        // "wrong port" about text that names no port would describe the wrong problem.
+        return std::nullopt;
+
+    auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
+    if (node.empty())
+        return std::nullopt; // No compile surface, so no port to disagree with.
+    if (node.front().port == *advertisedPort)
+        return std::nullopt;
+
+    // Which of this node's OWN surfaces serves the port the operator typed, when one
+    // does. Walked off `NodeSurfaceTable()` rather than listed here, so a surface added
+    // later is recognised without a second author -- and the `Node` row is skipped
+    // because reaching this line means it is not the match.
+    for (auto const& surface: NodeSurfaceTable())
+    {
+        if (surface.surface == NodeSurface::Node)
+            continue;
+        auto const endpoints = surface.Resolve(cfg);
+        if (std::ranges::none_of(endpoints, [&](auto const& e) { return e.port == *advertisedPort; }))
+            continue;
+
+        return std::format("--advertise={} names this machine at port {}, which is this node's own {} surface "
+                           "({}) and not the port it serves compiles on. A client told to dial it reaches the "
+                           "wrong service on the right host, the registration succeeds, and every counter reads "
+                           "normally. This node serves compiles on {}.",
+                           advertised,
+                           *advertisedPort,
+                           surface.name,
+                           PrimaryFlag(surface),
+                           FormatHostPort(node.front().host, node.front().port));
+    }
+
+    return std::format("--advertise={} names this machine at port {}, and this node serves compiles on {}. A client "
+                       "told to dial a port nothing here listens on gets no compile, while the registration "
+                       "succeeds and every counter reads normally -- so nothing at either end reports a fault. "
+                       "Name the port {} serves, or an address only clients can reach if this is a forwarded port.",
+                       advertised,
+                       *advertisedPort,
+                       FormatHostPort(node.front().host, node.front().port),
+                       PrimaryFlag(RowFor(NodeSurface::Node)));
+}
+
 /// Whether a machine that is not this one could reach this node's COMPILE verbs.
 ///
 /// **ONE port answers them now**, and this function is what is left of a rule that
@@ -2362,6 +2467,21 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     for (auto const& rule: Rules)
         if (rule.refuses(cfg))
             return std::string { rule.message };
+
+    // **After the rows above, and that ordering is the decision** (#594). Those judge
+    // the advertised HOST -- a wildcard, a loopback address peers cannot reach -- and
+    // this judges its PORT. Where both apply the host is the larger problem: an endpoint
+    // no peer can reach at all is worse than one they reach at the wrong port, so their
+    // sentence is the one to give.
+    //
+    // Not a row in the table because it has to NAME the port this node actually serves.
+    // An operator who typed the wrong one of their own ports needs the right one, not a
+    // restatement -- and a `Rule`'s message is static prose. That is the same reason the
+    // surface-grammar walk at the top of this function is written out rather than
+    // tabulated: it echoes what the operator wrote, which is the half a table row cannot
+    // do.
+    if (auto rejection = AdvertisedPortRejection(cfg); rejection.has_value())
+        return std::move(*rejection);
 
     return std::nullopt;
 }
