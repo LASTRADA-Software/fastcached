@@ -461,9 +461,15 @@ one the instrument existed to report.** A watcher built to tell required from un
 stopped at the first red without asking which it was; a checker built to keep `ABSENT`
 distinct from pending folded `SKIPPED`, then `CANCELLED`, into `fail`. Neither author was
 careless — a red is a red is the obvious reading, and it is wrong in exactly the domain
-each tool was written for. That is this section's closing observation arriving early: the
-collapsed state is the one you were not thinking about when you chose the representation,
-and building the instrument does not exempt you from it.
+each tool was written for. So the sharper form of the observation that closes this
+section: **a state-collapsing bug is likeliest in the tool whose job is that state
+distinction**, because its author is thinking about the subject's states and not about the
+instrument's. Five instances across three authors in one session support it, and every one
+was written by somebody who had the distinction fully in mind.
+
+The fixed watcher also shows what the repair has to include, and it is the half usually
+left out: it reports an unrequired red by name **and keeps watching**. One that had merely
+stopped exiting would be indistinguishable from the broken one on any green run.
 
 The four states, and why each pair is dangerous:
 
@@ -494,10 +500,16 @@ well as safe ones.
 example above is a committed script, so the assertion it prescribes is a line of
 code a reviewer sees; nothing carries the rule to a one-off `grep` at a terminal,
 where there is no code and no reviewer. **Ask an ad-hoc probe for something it MUST
-find before believing what it did not find, and read its exit status — a crash and
-a non-match produce the same empty output.** `grep` already separates the three
-(`0` found, `1` not found, `2` error), so a probe whose status is unread has
-collapsed *found nothing* into *died* for free.
+find before believing what it did not find, and read its exit status.** `grep`
+separates the three (`0` found, `1` not found, `2` error), so a probe whose status
+goes unread has collapsed *found nothing* into *died* for free.
+
+Be exact about which signal collapses, because it depends on the invocation and
+getting it wrong argues for discarding the cheap one. A bare `grep` prints nothing
+in both cases, so its **stdout** genuinely cannot tell them apart. `grep -c` prints
+`0` on a non-match and printed **nothing** when it aborted — so in the occurrence
+below *two* independent signals were available, stdout and status, and neither was
+read.
 
 Both halves are needed and the cheaper one is the one that gets skipped. A content
 probe once returned empty for **every** string, including ones visible in the output
@@ -509,10 +521,10 @@ repository talks about. The control is stronger — it survives a tool that lies
 its status as well as one that crashes — but it is not a substitute for reading
 the number the tool already handed you.
 
-This is the same file's closing observation arriving on its own author: *the pattern
-is easy to recognise in someone else's code and nearly invisible in your own.* The
-empty probe was read as *absent* by somebody whose whole task at that moment was
-looking for absences.
+This is the observation that closes the four-states section below, arriving on its
+own author: *the pattern is easy to recognise in someone else's code and nearly
+invisible in your own.* The empty probe was read as *absent* by somebody whose whole
+task at that moment was looking for absences.
 
 **Ask which state a silent tool is in, and make it say so.** Where the answer
 genuinely cannot be determined, report that as its own outcome rather than picking

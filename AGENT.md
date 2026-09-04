@@ -852,10 +852,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
   true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
-  a separate assertion that the good things exist. **That reaches a probe you TYPE, which is where it is
-  skipped**: ask an ad-hoc `grep` for something it must find before believing what it did not find, and read its
-  exit status, because a crash and a non-match produce the same empty output (`grep -c -i -F` aborting at exit
-  **134** read as three dropped hunks in a clean merge). Where the answer cannot be determined, report that as
+  a separate assertion that the good things exist. **That reaches any probe you TYPE — a `grep`, a `find`, a
+  `gh api --jq`, a throwaway script — which is where it is skipped**: ask it for something it must find before
+  believing what it did not find, and read its exit status (`grep -c -i -F` aborting at **134**, no stdout, read
+  as three dropped hunks in a merge just declared clean). Where the answer cannot be determined, report that as
   its own outcome rather than the nearest neighbour.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
@@ -1242,6 +1242,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
+- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening each found a test that
+  could not fail for the reason it existed — five shapes, all green, three of them acceptance criteria written by
+  whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
+  as coverage forever: `REQUIRE(held)` on a bind whose failure returns a non-null pointer in an ERRORED state, and
+  a refusal test pinning a flag BOTH the old and the new rule name. A refusal test asserts WHICH refusal. **Prove
+  the test can fail** — neuter the fix and check the failures are the ones you expect AND ONLY THOSE; the
+  asymmetry is the evidence. "What would prove this fixed" and "what would fail if it were not" are different
+  questions, and only the second one tests anything.
 - Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
