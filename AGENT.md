@@ -852,8 +852,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
   true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
-  a separate assertion that the good things exist. Where the answer cannot be determined, report that as its own
-  outcome rather than the nearest neighbour.
+  a separate assertion that the good things exist. **That reaches a probe you TYPE, which is where it is
+  skipped**: ask an ad-hoc `grep` for something it must find before believing what it did not find, and read its
+  exit status, because a crash and a non-match produce the same empty output (`grep -c -i -F` aborting at exit
+  **134** read as three dropped hunks in a clean merge). Where the answer cannot be determined, report that as
+  its own outcome rather than the nearest neighbour.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - Its converse: an absence must not be counted as an event. `NoUpstream`'s honest

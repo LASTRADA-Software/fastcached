@@ -479,6 +479,30 @@ things exist — which is why `tsan-gate.sh` proves the sanitizer is live before
 believes a clean run, and why `merge-queue-contexts` counts total references as
 well as safe ones.
 
+**And that applies to a probe somebody types, which is where it is skipped.** Every
+example above is a committed script, so the assertion it prescribes is a line of
+code a reviewer sees; nothing carries the rule to a one-off `grep` at a terminal,
+where there is no code and no reviewer. **Ask an ad-hoc probe for something it MUST
+find before believing what it did not find, and read its exit status — a crash and
+a non-match produce the same empty output.** `grep` already separates the three
+(`0` found, `1` not found, `2` error), so a probe whose status is unread has
+collapsed *found nothing* into *died* for free.
+
+Both halves are needed and the cheaper one is the one that gets skipped. A content
+probe once returned empty for **every** string, including ones visible in the output
+two lines earlier, and read exactly like dropped hunks in a merge that had just been
+declared clean — it would have sent an author hunting a defect that did not exist.
+`grep -c -i -F` had aborted: **exit 134, SIGABRT, no stdout**. The status was
+available and free and went unread, because the must-find control is the half this
+repository talks about. The control is stronger — it survives a tool that lies about
+its status as well as one that crashes — but it is not a substitute for reading
+the number the tool already handed you.
+
+This is the same file's closing observation arriving on its own author: *the pattern
+is easy to recognise in someone else's code and nearly invisible in your own.* The
+empty probe was read as *absent* by somebody whose whole task at that moment was
+looking for absences.
+
 **Ask which state a silent tool is in, and make it say so.** Where the answer
 genuinely cannot be determined, report that as its own outcome rather than picking
 the nearest neighbour: `Get-WaitVerdict` reports `INCONCLUSIVE` and names which
