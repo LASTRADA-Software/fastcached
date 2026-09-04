@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/ReadinessMarker.hpp>
 #include <FastCache/Server/ReadinessAnnouncer.hpp>
 
 #include <utility>
@@ -76,7 +77,13 @@ void ReadinessAnnouncer::MaybeAnnounce()
     // daemon had come up.
     if (_announced.test_and_set(std::memory_order_acq_rel))
         return;
-    _logger.Logf(LogLevel::Info, "ready, accepting connections ({})", _endpointSummary);
+    // The marker text comes from `ReadinessMarkerTable`, not from a literal here.
+    // Four fixtures in two languages wait on the node's equivalent and none of them
+    // is recompiled by this build (#654); the daemon's has two such waiters of its
+    // own. A copy in this file would be a second source of truth for a published
+    // interface -- the very defect the table exists to close.
+    _logger.Logf(
+        LogLevel::Info, "{} ({})", ReadinessMarkerText(ReadinessMarker::Daemon), _endpointSummary);
 }
 
 bool ReadinessAnnouncer::Announced() const noexcept

@@ -40,6 +40,7 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/ReadinessMarker.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
@@ -1451,7 +1452,12 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // The scheduler tier prints the same phrase from the same function, so a node
     // running both says one thing rather than two.
     logger.Logf(LogLevel::Info,
-                "compile node ready on {}, advertising {}, {} slot(s) as a {} node, identifying {} toolchain(s), {}",
+                // The marker text is a row of `ReadinessMarkerTable`, never a literal here.
+                // Four fixtures in two languages wait on these bytes and this build recompiles
+                // none of them, so a reword breaks them by TIMEOUT rather than by a failed
+                // build (#654). Referencing the row is what makes a rename a compile error.
+                "{} on {}, advertising {}, {} slot(s) as a {} node, identifying {} toolchain(s), {}",
+                ReadinessMarkerText(ReadinessMarker::CompileNode),
                 listeningOn,
                 advertise,
                 slots,
