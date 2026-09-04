@@ -775,6 +775,31 @@ determinism rests on.
     and both rows stand. Attach the interval, and say what it is an interval on --
     "P is small" without naming the hypothesis it is small under is the same
     omission wearing a number.
+  - **A flag combination that cannot express the question still returns an answer.**
+    The species `pkill -f`, `grep -c` read as a position and `grep -q` under
+    `pipefail` all belong to: **the shell obliges regardless, and none of them
+    errors.** The cleanest specimen is `grep -Lq`, where the contradiction is
+    INTERNAL — `-L` lists files WITHOUT a match, `-q` suppresses output and exits at
+    the first match, and the two cannot both be honoured. Instead of complaining it
+    picks one, and it named two files as lacking a symbol they contain.
+
+    Three things make that the worst of the family, and the second is the one to lead
+    with.
+
+    **It was a POSITIVE CONTROL** — the instrument added specifically to stop a wrong
+    conclusion. A broken control is worse than no control, because its presence is
+    what licenses the confidence. And it generalises past shells: **a control is the
+    one instrument nobody checks, because checking it is what it was for.** Anybody
+    instructing a team to add positive controls owes them that caveat.
+
+    **Its error pointed at refuting a claim**, which is the direction that gets acted
+    on — *because refuting feels like diligence*. It was one step from a correct rule
+    being reported as overstated.
+
+    **And nothing about the output looked wrong.** Two files is a plausible answer;
+    unlike a wrapped message or an empty capture there is no tell. The only defence is
+    re-deriving the control by a different construction — here an explicit loop, which
+    gave **0 files lacking it** and turned "consistent with" into "confirmed".
   - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
     on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
     pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
@@ -943,6 +968,20 @@ The specific traps are examples. The rule is the mechanism.
   phases can judge different trees. An accurate verdict about something nobody asked
   about. Name the commit before starting, re-check it at the end, and refuse when the
   tree is dirty.
+  - **An intermediate reading is BIASED, not noisy, and that is why the remedy cannot
+    be "read it carefully".** A tree sampled mid-build can only be MISSING artefacts —
+    never carrying extra ones — so its error is one-sided by construction: always
+    toward failure, never toward success. Measured twice in one task: `ctest -L hygiene`
+    at 235 of 429 build edges reported 2 failures where the settled tree reports
+    **60/60**, and an earlier sample at 330 of 429 reported 1.
+    The consequence is the part that changes behaviour. A mid-build failure is exactly
+    what a real regression looks like, so the natural response — investigate it — is
+    the wasted motion, and no amount of care in INTERPRETING the reading recovers
+    anything, because the reading contains no information about the finished tree. So
+    the discipline is **do not take the reading**: wait for the build's completion
+    signal rather than sampling a tree that is still being written. Both hits above
+    were caught only by re-measuring afterwards, and in both the alarming number came
+    first.
 - **The log under `/tmp`.** `wsl -e bash` detaches, so a build outlives the wrapper
   that reports on it — and the wrapper is what keeps the WSL session alive, so
   *killing it to tidy up* starts an idle countdown that takes the VM, the orphaned
