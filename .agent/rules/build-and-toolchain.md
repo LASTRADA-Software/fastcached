@@ -2911,6 +2911,42 @@ are recorded together because the shape is one shape.
   restated in the file: a second copy of the expected total is a second thing to
   be wrong.
 
+### A counterfactual must fail through the rule, not merely fail
+
+Its own section rather than a sixth bullet above, and the reason is the section
+above's own heading: those are **six ways in ONE branch**, written by people who
+had just read this file. This one is from a different branch and a different
+ticket, so filing it there would have made a counted, scoped claim false --
+silently, because the heading sits outside any diff window that shows the
+insertion. A clean textual merge cannot see that, which is the same failure this
+file records against the store lane's insert.
+
+**A counterfactual must fail THROUGH the rule, not merely fail — and a deletion
+is the easiest one to write and the likeliest to be invalid.** Removing the branch
+under test is the obvious way to show a guard bites, and it changes two things at
+once: the behaviour, and whether the tree still compiles. `SecretCameFromConfigFile`'s
+provenance branch is the whole use of its `cli` parameter, so deleting it left the
+parameter unused, `-Werror` refused the build, and the arm went red for a
+COMPILATION reason while claiming to demonstrate the rule
+([#384](https://github.com/LASTRADA-Software/fastcached/issues/384)). Nothing in the
+red output says which of the two it was.
+
+**This is the mirror of the `want-fail`-satisfied-by-exit-126 rule above**, and both
+polarities are now on record: there an arm PASSED for the wrong reason (the shell
+refused to start the script), here an arm FAILED for the wrong reason. One missing
+state underneath both — a run that did not happen is neither a pass nor a failure —
+which is why the harness that caught this one is the harness that reports
+**INCONCLUSIVE** rather than scoring a build failure as red
+([#747](https://github.com/LASTRADA-Software/fastcached/issues/747) is that state
+generally; this is it existing in one script and earning its keep).
+
+So a counterfactual is a **plausible WEAKENING** rather than an amputation: for the
+provenance gate, one that still consults the bit and only excuses an already-empty
+secret — a mistake somebody would actually make, which compiles, and which can fail
+only through the rule. Where an amputation genuinely is the right shape, the harness
+has to be able to say the build broke; a script that reports "red" for both is an
+instrument that cannot tell you what it measured.
+
 ## A branch behind master is unverified, and only a build says otherwise
 
 A pull request's CI ran against the master it was branched from. Every green check
