@@ -855,6 +855,31 @@ fi
 failures=0
 ran=0
 skipped=0
+# The NAMES of the checks that failed, so the summary can say which.
+failed_cases=""
+
+# Record one failed check by name.
+#
+# The count and the name used to live in different places: every site echoed
+# `FAIL <case>: ...` to stderr and then incremented `failures` by hand, and the
+# summary printed the counter alone. So the LAST line of a failing run -- the line
+# that survives a truncated capture, the line a reader sees first, and the only one
+# left once later runs have overwritten ctest's single `LastTest.log` -- said
+# `1 failed` and named nothing (#678). Recovering the case then meant reproducing a
+# rare failure and hoping.
+#
+# That is this repository's own rule about counts, broken inside the check that
+# guards the rulebook: a count cannot say which of 119 things happened, exactly as
+# `25 of 26 green` is arithmetic that is true and useless.
+#
+# One function rather than a convention, for the reason `Refuse` takes a row: there
+# is no way to increment the counter without also naming the case, so a
+# twenty-fifth site cannot reopen this by omission.
+# @param 1 The case name, matching the `FAIL <name>:` line beside the call.
+note_failure() {
+    failures=$(( failures + 1 ))
+    failed_cases="${failed_cases}${failed_cases:+ }$1"
+}
 
 # What each case must exit with and what its combined output must and must not
 # say. A table rather than a function per case, so adding a branch to
@@ -953,7 +978,7 @@ for row in "${verdicts[@]}"; do
     out="$( . "$library"
             _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" 2>&1 )"
     ran=$(( ran + 1 ))
-    expect "${vname}|0|${vrest}" "$out" 0 || failures=$(( failures + 1 ))
+    expect "${vname}|0|${vrest}" "$out" 0 || note_failure "${vname}"
 done
 
 # A verdict that never says BLOCKED cannot report a hang, and a table of rows
@@ -972,7 +997,7 @@ distinct="$(
 )"
 if [ "$distinct" -ne 6 ]; then
     echo "FAIL verdict-branches: the records produced ${distinct} distinct findings, not 6" >&2
-    failures=$(( failures + 1 ))
+    note_failure "verdict-branches"
 fi
 ran=$(( ran + 1 ))
 
@@ -1029,7 +1054,7 @@ for record in "${cases[@]}"; do
     out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
     status=$?
     ran=$(( ran + 1 ))
-    expect "$record" "$out" "$status" || failures=$(( failures + 1 ))
+    expect "$record" "$out" "$status" || note_failure "${record%%|*}"
 done
 
 # --- the bound is a duration, not an iteration count -----------------------
@@ -1055,12 +1080,12 @@ clock_took=$(( SECONDS - clock_started ))
 ran=$(( ran + 1 ))
 if [ "$status" != "1" ]; then
     echo "FAIL wait-clock-bound: exited ${status}, expected 1" >&2
-    failures=$(( failures + 1 ))
+    note_failure "wait-clock-bound"
 elif [ "$clock_took" -lt 3 ]; then
     echo "FAIL wait-clock-bound: a 4s bound came back after ${clock_took}s of wall clock;" >&2
     echo "     the loop is counting iterations rather than reading a clock" >&2
     printf '%s\n' "$out" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "wait-clock-bound"
 else
     # And the number it PRINTS is the measured one. A loop could be bounded
     # correctly and still report the budget, which is the half with teeth --
@@ -1070,7 +1095,7 @@ else
     if [ -z "$reported" ] || [ "$reported" -lt 3 ]; then
         echo "FAIL wait-clock-bound: it waited ${clock_took}s and reported '${reported:-nothing}'" >&2
         printf '%s\n' "$out" | sed 's/^/     | /' >&2
-        failures=$(( failures + 1 ))
+        note_failure "wait-clock-bound"
     fi
 fi
 
@@ -1091,16 +1116,16 @@ ran=$(( ran + 1 ))
 if [ "$status" != "0" ]; then
     echo "FAIL bounded-clock: exited ${status}, expected 0" >&2
     printf '%s\n' "$out" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "bounded-clock"
 elif [ "$bounded_took" -lt 1 ]; then
     echo "FAIL bounded-clock: a 1s bound over a 30s child returned in ${bounded_took}s;" >&2
     echo "     the command cannot have been run" >&2
-    failures=$(( failures + 1 ))
+    note_failure "bounded-clock"
 elif [ "$bounded_took" -gt 10 ]; then
     echo "FAIL bounded-clock: a 1s bound over a TERM-ignoring child took ${bounded_took}s;" >&2
     echo "     the bound is waiting for a child that will not die, which is an" >&2
     echo "     unbounded wait inside the thing that exists to bound one" >&2
-    failures=$(( failures + 1 ))
+    note_failure "bounded-clock"
 fi
 
 # --- `run_bounded` is not slower than what it bounds ------------------------
@@ -1119,11 +1144,11 @@ ran=$(( ran + 1 ))
 if [ "$status" != "0" ]; then
     echo "FAIL bounded-fast-path: exited ${status}, expected 0" >&2
     printf '%s\n' "$out" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "bounded-fast-path"
 elif [ "$fast_took" -gt 2 ]; then
     echo "FAIL bounded-fast-path: twenty immediate commands took ${fast_took}s;" >&2
     echo "     the bound is sleeping through commands that have already finished" >&2
-    failures=$(( failures + 1 ))
+    note_failure "bounded-fast-path"
 fi
 
 # --- no fixture spells `timeout` again -------------------------------------
@@ -1186,14 +1211,14 @@ if [ "$caught" -ne 7 ]; then
     echo "FAIL timeout-scan-canary: the scan caught ${caught} of 7 staged invocations," >&2
     echo "     so it cannot be trusted to have found none in the real scripts" >&2
     _timeout_invocations "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "timeout-scan-canary"
 fi
 ran=$(( ran + 1 ))
 spurious="$(_timeout_invocations "${canary_dir}/must-not-catch.sh" || true)"
 if [ -n "$spurious" ]; then
     echo "FAIL timeout-scan-canary: the scan fired on text that runs nothing" >&2
     printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "timeout-scan-canary"
 fi
 rm -rf "$canary_dir"
 
@@ -1236,7 +1261,7 @@ for script in "${source_dir}"/scripts/*.sh; do
         echo "FAIL timeout-scan: ${base} invokes timeout(1), which macOS does not have." >&2
         echo "     Use run_bounded from scripts/lib/e2e-common.sh." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
-        failures=$(( failures + 1 ))
+        note_failure "timeout-scan"
     fi
 done
 
@@ -1312,7 +1337,7 @@ helper_name_count="$(printf '%s\n' "$helper_names" | grep -c . || true)"
 if [ "$helper_name_count" -lt 1 ]; then
     echo "FAIL helper-scan: read ${helper_name_count} function names out of ${library}." >&2
     echo "     With no names there is nothing to scan for and every script reads clean." >&2
-    failures=$(( failures + 1 ))
+    note_failure "helper-scan"
 fi
 
 # The canary, both directions. A scan that has never been seen to fire is a scan
@@ -1346,14 +1371,14 @@ if [ "$caught" -ne 2 ]; then
     echo "FAIL helper-scan-canary: the scan caught ${caught} of 2 staged copies," >&2
     echo "     so it cannot be trusted to have found none in the real scripts" >&2
     _helper_redefinitions "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "helper-scan-canary"
 fi
 ran=$(( ran + 1 ))
 spurious="$(_helper_redefinitions "${canary_dir}/must-not-catch.sh")"
 if [ -n "$spurious" ]; then
     echo "FAIL helper-scan-canary: the scan fired on a script that defines no copy" >&2
     printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
-    failures=$(( failures + 1 ))
+    note_failure "helper-scan-canary"
 fi
 rm -rf "$canary_dir"
 
@@ -1374,13 +1399,13 @@ for script in "${source_dir}"/scripts/*.sh; do
         echo "FAIL helper-scan: ${base} defines its own copy of a shared helper." >&2
         echo "     Source scripts/lib/e2e-common.sh and delete the copy (#449, #451)." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
-        failures=$(( failures + 1 ))
+        note_failure "helper-scan"
     fi
 done
 ran=$(( ran + 1 ))
 if [ "$scanned" -lt 1 ]; then
     echo "FAIL helper-scan: the glob matched no scripts, so every one of them 'passed'." >&2
-    failures=$(( failures + 1 ))
+    note_failure "helper-scan"
 fi
 
 if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then
@@ -1390,7 +1415,7 @@ if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&
         out="$( bash "${BASH_SOURCE[0]}" --case "$name" 2>&1 )"
         status=$?
         ran=$(( ran + 1 ))
-        expect "$record" "$out" "$status" || failures=$(( failures + 1 ))
+        expect "$record" "$out" "$status" || note_failure "${record%%|*}"
     done
 else
     for record in "${socket_cases[@]}"; do
@@ -1441,9 +1466,41 @@ for entry in "${banned[@]}"; do
     if [ -n "$hits" ]; then
         echo "FAIL bash32: ${library} uses '${token}' (${why})" >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
-        failures=$(( failures + 1 ))
+        note_failure "bash32"
     fi
 done
+
+# --- every failure is recorded BY NAME ------------------------------------
+#
+# `note_failure` exists so the count and the name cannot be recorded in different
+# places, and that only holds while it is the ONLY thing that touches the counter.
+# Nineteen sites incremented `failures` by hand before #678; a twentieth written the
+# old way would compile, run, pass, and go back to reporting `1 failed` with no name
+# -- which is the omission the function was introduced to make impossible.
+#
+# So this scans its own source, the way the bash-3.2 check above scans the library.
+# One increment is expected: the one inside `note_failure` itself.
+#
+# The pattern is written as a regex with `[+]` rather than as the literal text, so
+# this scan cannot COUNT ITSELF -- which it did on the first run, reporting three
+# increments where there is one, because the needle appeared verbatim in the needle.
+#
+# It fails in BOTH directions. An extra increment names a site that bypassed the
+# helper; ZERO increments means the scan has stopped seeing what it thinks it is
+# reading -- a rename of the counter would otherwise leave this passing forever
+# while guarding nothing.
+ran=$(( ran + 1 ))
+own_increments="$(grep -cE 'failures=\$\(\( failures [+] 1 \)\)' "${BASH_SOURCE[0]}" | tr -d ' ')"
+if [ "$own_increments" = "0" ]; then
+    echo "FAIL failure-recording: found no direct increment of the counter in ${BASH_SOURCE[0]} at all;" >&2
+    echo "     the counter has been renamed and this scan is now guarding nothing" >&2
+    note_failure "failure-recording"
+elif [ "$own_increments" != "1" ]; then
+    echo "FAIL failure-recording: ${own_increments} sites increment the failure counter directly;" >&2
+    echo "     only note_failure may, or a failure is counted without being named (#678)" >&2
+    grep -nE 'failures=\$\(\( failures [+] 1 \)\)' "${BASH_SOURCE[0]}" | sed 's/^/     | /' >&2
+    note_failure "failure-recording"
+fi
 
 # And the library must not be executable or carry a `#!`: it is sourced, and a
 # copy that looks runnable invites someone to run it, which does nothing and
@@ -1453,7 +1510,7 @@ first_line="$(head -1 "$library")"
 case "$first_line" in
     '#!'*)
         echo "FAIL shebang: ${library} is sourced, not executed, and must carry no '#!' line" >&2
-        failures=$(( failures + 1 ))
+        note_failure "shebang"
         ;;
 esac
 
@@ -1463,6 +1520,34 @@ echo
 echo "e2e-helpers-selftest: ${ran} checks ran, ${failures} failed, ${skipped} skipped"
 if [ "$skipped" -gt 0 ]; then
     echo "  (a skip is not a pass: the ${skipped} skipped checks were not run at all)"
+fi
+if [ "$failures" -gt 0 ]; then
+    # Named on the LAST lines, which are what survive a truncated capture and what
+    # somebody reads first.
+    echo "  failed: ${failed_cases}"
+    echo "  re-run one alone with: bash ${BASH_SOURCE[0]} --case <name>"
+
+    # And a copy the NEXT run cannot overwrite. ctest keeps one
+    # `Testing/Temporary/LastTest.log`, so #678's evidence was destroyed by the
+    # three clean runs that followed the failure; all that survived was
+    # `LastTestsFailed.log`, which names the TEST and not the case. A
+    # process-unique path accumulates instead of clobbering, which is what makes a
+    # rare failure diagnosable at all.
+    #
+    # Best effort by design: a selftest that has already FAILED must not also fail
+    # to report because a directory was unwritable, so this tolerates an error and
+    # the names above are printed either way.
+    durable="${TMPDIR:-/tmp}/e2e-helpers-selftest-failed-$(date +%Y%m%d-%H%M%S)-$$.log"
+    if {
+        echo "e2e-helpers-selftest: ${ran} checks ran, ${failures} failed, ${skipped} skipped"
+        echo "failed: ${failed_cases}"
+        echo "host: $(uname -srm 2>/dev/null || echo unknown)"
+        echo "note: per-case detail went to stderr. Re-run under"
+        echo "      ctest --output-on-failure, or one case alone as"
+        echo "      bash ${BASH_SOURCE[0]} --case <name>"
+    } > "$durable" 2>/dev/null; then
+        echo "  a copy the next run will not overwrite: ${durable}"
+    fi
 fi
 [ "$failures" -eq 0 ] || exit 1
 exit 0
