@@ -396,6 +396,58 @@ TEST_CASE("Two nodes that name no cluster still agree", "[distributed][lease][to
     CHECK(VerifyLeaseToken(key, grant, Worker("10.0.0.7:6675", "clang-19-x86_64", ""), Noon()).has_value());
 }
 
+TEST_CASE("A scheduler reset is refused permanently and the refusal says so", "[distributed][lease][token]")
+{
+    // **What a legitimate reset looks like from a worker**
+    // ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Wiping the
+    // Raft directory, re-bootstrapping, or turning consensus off drops a scheduler's
+    // term back to 0. The term-0 answer is then genuine, signed and from the right
+    // scheduler -- authenticity is not the issue -- but a monotonic maximum has no way
+    // to express it, so every worker that has learned a higher term refuses every
+    // grant until its process is restarted.
+    //
+    // This case pins the two halves separately, because the ticket is right about one
+    // and out of date about the other.
+    auto const key = Key();
+
+    KnownSchedulerTerm term;
+    term.Learn(7);
+
+    // A scheduler that has genuinely reset mints at term 0. `StandaloneSchedulerTerm`
+    // is literally 0, so this is also exactly what turning consensus OFF produces.
+    auto const afterReset = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
+    auto const refusal =
+        VerifyLeaseToken(key, afterReset, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, term.Check()), Noon());
+
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::EpochMismatch);
+
+    // **The diagnostic the ticket says is missing is already here**, and it names both
+    // numbers -- which is what turns "the fleet stopped distributing" into "the
+    // scheduler was reset and these workers need restarting". It reaches the operator
+    // through the client: `WorkerProtocol` returns the refusal whole, deliberately, and
+    // the launcher renders it in the decline line. Asserted so a later edit cannot
+    // quietly drop it back to the bare reason.
+    CHECK(refusal.error().detail.contains("term 0"));
+    CHECK(refusal.error().detail.contains("term 7"));
+
+    // **And there is no downward path, which is the half that stands.** Learning the
+    // reset term changes nothing: `Learn` takes the maximum, so the worker goes on
+    // expecting 7 and refusing every honest grant. This is monotonicity working as
+    // designed -- it is what stops a captured token talking a worker backwards -- and
+    // it is also why a legitimate reset has no expression. Pinned rather than
+    // corrected: which shape closes it is a design decision the ticket declines to
+    // make, and a test that quietly permitted a lower term would make that decision by
+    // accident.
+    term.Learn(0);
+    CHECK(term.Check().Expected() == 7);
+
+    auto const stillRefused =
+        VerifyLeaseToken(key, afterReset, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, term.Check()), Noon());
+    REQUIRE_FALSE(stillRefused.has_value());
+    CHECK(stillRefused.error().reason == LeaseRefusalReason::EpochMismatch);
+}
+
 TEST_CASE("A grant from a superseded scheduler term is refused where the term is known", "[distributed][lease][token]")
 {
     // The second half of #322: the cluster id closes the door between two FLEETS, the

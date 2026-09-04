@@ -21,7 +21,8 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              ILogger& logger,
                              std::span<std::byte const> signingKey,
                              std::string_view clusterId,
-                             std::shared_ptr<AuthPolicy const> policy):
+                             std::shared_ptr<AuthPolicy const> policy,
+                             LeadsAlone leadsAlone):
     _service { clock, wallClock, metrics, logger, signingKey, clusterId },
     _protocol { _service, metrics },
     // The oracle is the NODE's, not this tier's: the cache surface consults the same
@@ -31,21 +32,39 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // cache with no scheduler at all.
     _responder { _protocol, membership, metrics, std::move(policy) }
 {
-    // Standalone leadership, which is now a DEFAULT rather than a placeholder. A node
-    // with no `--node-id` runs no consensus and is the only scheduler there is: it
-    // hands out its own machine's slots and nobody else's, which is exactly right for
-    // the one-machine deployment and is what most people run.
+    // **Standalone leadership, and ONLY for a node that leads alone** (#613).
     //
-    // With consensus configured, `ConsensusTier` calls `SetRole` the moment the
-    // driver decides anything, and this initial value is superseded before the first
-    // lease. It is deliberately not `Undecided`: a node that refused every verb until
-    // an election completed would be strictly worse than what it replaces at exactly
-    // the moment somebody is watching it start.
-    // Term ZERO, and it is an answer rather than a placeholder: a node with no
-    // `--node-id` runs no consensus and there is no term to be in. Every grant it
-    // mints names 0, and the only verifier that could compare terms is one told what
-    // is current -- which nothing tells a lone node, because nothing elects it (#322).
-    _service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    // A node with no `--node-id` runs no consensus and is the only scheduler there is:
+    // it hands out its own machine's slots and nobody else's, which is exactly right
+    // for the one-machine deployment and is what most people run. Nothing will ever
+    // call `SetRole` on it, so leaving it `Undecided` would refuse every verb forever
+    // -- and the argument that a node refusing until an election completes is "worse
+    // than what it replaces at exactly the moment somebody is watching it start" is
+    // right for THIS node, where no election is coming.
+    //
+    // Term ZERO is an answer rather than a placeholder here: there is no term to be
+    // in. Every grant it mints names 0, and the only verifier that could compare terms
+    // is one told what is current -- which nothing tells a lone node, because nothing
+    // elects it (#322).
+    //
+    // **It used to be published unconditionally, and that is the defect.** With
+    // consensus configured the comment claimed this value "is superseded before the
+    // first lease", and it is not: `ConsensusTier` publishes a role from the driver's
+    // callback, which cannot run until the reactor starts and then only once an
+    // election completes. Until then the surface answered `Lease` as a leader nobody
+    // had elected, minting grants at term 0 that any worker which has learned a higher
+    // term refuses. "Leader at term 0" is not a weaker answer than "leader at term N";
+    // it is a different and wrong one, and a surface must not answer a question whose
+    // input it does not have -- the same rule the node already follows between bound
+    // and surveyed (#365).
+    //
+    // A clustered node therefore keeps the service's own `Undecided` default, which
+    // `Gate()` already answers with `NotLeader` and the leader's endpoint. That is not
+    // a new refusal path: it is the one an election in progress has always produced,
+    // and a client answers it by compiling locally. One local compile during a startup
+    // election is the cost; the alternative is a grant the fleet will refuse.
+    if (leadsAlone == LeadsAlone::Yes)
+        _service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 }
 
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
@@ -88,8 +107,12 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
         policy = std::make_shared<AuthPolicy const>(std::string {}, std::move(*secret));
     }
 
+    // Asked of the SHARED predicate, so this tier and `StartConsensusOrExplain` cannot
+    // disagree about whether a role is coming (#613).
+    auto const leadsAlone = RunsConsensus(cfg) ? LeadsAlone::No : LeadsAlone::Yes;
+
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
-        membership, clock, wallClock, metrics, logger, signingKey, cfg.clusterId, std::move(policy) } };
+        membership, clock, wallClock, metrics, logger, signingKey, cfg.clusterId, std::move(policy), leadsAlone } };
 
     // No address in this line since #290: the scheduler verbs are answered on the
     // node's one 0xFC listener, and that listener names itself when it binds.

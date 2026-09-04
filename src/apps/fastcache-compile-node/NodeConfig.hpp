@@ -926,6 +926,30 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
 [[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
 
+/// Whether this node runs consensus, and therefore whether anything will ever tell
+/// its scheduler what term it is in.
+///
+/// **A named predicate because two tiers have to agree about it, and they are built
+/// apart** ([#613](https://github.com/LASTRADA-Software/fastcached/issues/613)).
+/// `StartConsensusOrExplain` answers "is there a cluster to start" and
+/// `SchedulerTier` answers "will somebody publish my role"; those are the same
+/// question, and while each spelled `cfg.nodeId.empty()` for itself they were two
+/// authors of one rule -- the shape `ClusterSelfMember` above exists to prevent, one
+/// flag along.
+///
+/// The disagreement is not hypothetical: the scheduler assumed nobody would, published
+/// standalone leadership at term 0, and then consensus published a real term over the
+/// top of it -- leaving a window in which the surface answered `Lease` as a leader that
+/// had not been elected.
+///
+/// It reads `--node-id` alone, which is exactly what `StartConsensusOrExplain` reads:
+/// a node with no id runs no consensus, which is the one-machine deployment and by far
+/// the common one. Whether the rest of the cluster flags make SENSE is
+/// `StartupPolicyRejection`'s question and is asked before any tier is built.
+/// @param cfg The parsed configuration.
+/// @return True when a consensus driver will run and report a role.
+[[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
 /// Who this node admits, as one line an operator reads at startup.
 ///
 /// One spelling for two callers -- the scheduler tier's ready line and the worker's

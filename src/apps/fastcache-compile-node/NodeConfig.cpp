@@ -1562,6 +1562,15 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
     return self != cfg.raftPeers.end() ? std::to_address(self) : nullptr;
 }
 
+bool RunsConsensus(NodeConfig const& cfg) noexcept
+{
+    // `--node-id` alone, and it must stay the same expression
+    // `StartConsensusOrExplain` uses to decide whether to start a driver at all: the
+    // scheduler asks this to know whether a role is COMING, and if the two ever
+    // disagreed one of them would be wrong about the other (#613).
+    return !cfg.nodeId.empty();
+}
+
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
 {
     // The flag wins whenever it was given. Written ONCE -- `main` hands the result to

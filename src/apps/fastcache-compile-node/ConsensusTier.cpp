@@ -877,7 +877,11 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     // No cluster configured, which is the common deployment: one machine, leading
     // itself. Requiring an operator to configure a one-member cluster to get that
     // would be ceremony for the ordinary case.
-    if (cfg.nodeId.empty())
+    //
+    // Asked through `RunsConsensus` rather than spelled here, because `SchedulerTier`
+    // asks the same question to decide whether a role is COMING -- and while both
+    // spelled it for themselves they were two authors of one rule (#613).
+    if (!RunsConsensus(cfg))
         return std::unique_ptr<ConsensusTier> {};
 
     auto tier = ConsensusTier::Start(
