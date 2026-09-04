@@ -97,6 +97,7 @@ if(FASTCACHED_BUILD_TESTS)
         SchedulerLink.cpp
         SchedulerLink_test.cpp
         SchedulerTier.cpp
+        SchedulerTier_test.cpp
         ScratchClaim.cpp
         ScratchClaim_test.cpp
         LocalCache.cpp
