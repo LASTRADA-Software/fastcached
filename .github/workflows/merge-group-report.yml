@@ -62,6 +62,21 @@ name: Merge-group failure report
 # 'pull_request', not merge_group", so "it never fires at all" and "it fires and
 # has nothing to report" are two visible states from the first run after this
 # merges, instead of one silence indistinguishable from working.
+# ## The event check is also a trust boundary, not only a scope filter
+#
+# A `workflow_run` job runs with this repository's token and `issues: write`, and
+# it fires for the completion of ANY `Build` run -- including one on a fork's pull
+# request, whose `build.yml` is the FORK's copy and whose job names are therefore
+# attacker-chosen text. The decision script answers nothing for any event but
+# `merge_group`, and a merge-queue entry only exists for a branch a maintainer
+# already put in the queue, so no name a stranger controls ever reaches the issue
+# body. That is a second reason the event is asked about rather than inferred from
+# a branch name.
+#
+# Belt and braces on the way that text is handled anyway: the context reaches the
+# body through parameter expansion inside a heredoc, whose result is not
+# re-scanned, and reaches the title as a single quoted argv element. Neither is a
+# place a `$(...)` could run.
 on:
   workflow_run:
     workflows: ["Build"]
