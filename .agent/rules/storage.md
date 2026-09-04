@@ -140,12 +140,26 @@ commit's id into the alternating slot rather than into the slot that id's parity
 names. So a store an ordinary Batched daemon wrote is normally parity-broken, and
 reopening it with `Fsync` after one-slot damage sends the next commit to whichever
 slot the parity names, which may be the survivor: measured, one valid meta slot
-afterwards where Batched leaves two, and every commit after it hammers the same
-one. Either the comment is wrong or the flush is, and that question sits upstream
-of the fix. **A raw-`CowTree` seed keeps parity and does not reproduce it**, which
-is why the first probe of this came back green and the finding read as false — it
-takes the `CowTreeStorage`-shaped seed, where `Open` itself commits the format
-marker, to break parity. A green probe of the wrong shape is not a refutation.
+afterwards where Batched leaves two. Either the comment is wrong or the flush is,
+and that question sits upstream of the fix.
+
+**The exposure is ONE commit wide**, and getting that wrong shipped twice before
+it was measured. The write that spends the survivor also RESTORES the parity, so
+the second commit lands on the damaged slot and repairs it — measured over five
+consecutive `Fsync` commits, `valid: 1` after the first and `valid: 2` from the
+second on. The defect stands, because it removes the redundancy at the one moment
+damage has just been detected; what it is not is permanent, and an operator told
+otherwise stops believing the page the moment their store recovers on the second
+write.
+
+Both of this entry's own mistakes were **instrument** mistakes rather than wrong
+answers, running in opposite directions, and the pair is on the record in
+[`build-and-toolchain.md`](build-and-toolchain.md): a raw-`CowTree` seed keeps the
+parity and does not reproduce the fault at all, so the first two probes came back
+green and the finding read as false — it takes the `CowTreeStorage`-shaped seed,
+where `Open` itself commits the format marker, to break parity. Then the probe
+that did reproduce it committed ONCE, so "after" meant "after one commit" and a
+snapshot was read as a steady state.
 
 It is pinned twice, in two suites, and not by accident: `CowTreeStorage_test`
 asks the operator's question (a daemon's store opens, serves, stays quiet) and

@@ -898,6 +898,45 @@ error one level up — a general claim standing in for a specific one.
   `git rev-parse HEAD` in the directory you searched — before reporting a contradiction
   as a fact. It happened twice in one night, both times in the same direction.
 
+## A probe's result is only evidence if the probe could have produced the other one
+
+The two sections above are about an instrument reporting on the wrong tree, and about
+reasoning where reading was called for. This is the third: **a measurement that was
+honestly taken, of the wrong thing, and read as an answer about the right one.** Both
+halves below came out of one investigation (#726) in a single session, they point in
+opposite directions, and neither was a wrong answer — each was a **non-answer wearing
+an answer's colour**. One was a red that meant nothing; the other a green that meant
+nothing.
+
+- **A green probe of the wrong shape is not a refutation.** A review reported that
+  under `Fsync` the commit after a one-slot meta recovery overwrites the surviving
+  slot. Two probes were built and both came back clean, and "the finding is wrong" was
+  written down before the third existed. Both seeded the store through raw `CowTree`,
+  one flush per commit — which *keeps* the `txnId` slot parity, and the broken parity
+  is the whole precondition. Only the `CowTreeStorage`-shaped seed, where `Open` itself
+  commits the format marker so the commit counts go uneven, reproduces it. The finding
+  was true. **Before recording a negative, state what would have had to be true for
+  the positive to appear, and check the probe had it** — a fixture that cannot exhibit
+  the fault cannot vote on it. Same defect as a suite exercising the fallback path
+  while CI exercises the git path, and as a `want-fail` case satisfied by the shell
+  refusing to start.
+- **A single observation is a snapshot, not a trend, and cannot tell a transient from
+  a fixed point.** The probe that finally did reproduce it committed **once**, so
+  "after" meant "after one commit" — and that was published as "every subsequent
+  commit hammers the same slot, so the store stays permanently one torn write from
+  unopenable". Measured over five consecutive commits: `valid: 1` after the first,
+  `valid: 2` from the second on, because the offending write restores the parity and
+  the next commit repairs the damaged slot. A real defect, overstated into a different
+  false claim, which then shipped in an operator page. **Iterate the operation, do not
+  merely perform it.** The tell was available and unread: the same filing already noted
+  the parity being restored, two sentences from the claim that contradicts it.
+
+The pair is worth more than either alone, because the mistake is symmetric and the
+instinct is not: a green probe invites you to close the question, and a red one invites
+you to describe it — and the second is where a bounded fault becomes an unbounded
+sentence. The storage-side instance is in
+[`storage.md`](storage.md); the general form is here.
+
 **The general form, and it is the one worth carrying away.** "A SIGTERM does not take
 55 seconds to arrive" was offered as evidence in an incident review. It is true of
 `local-gate.sh` — and *only* because that script traps `EXIT` and not `TERM`. bash
