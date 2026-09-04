@@ -1158,6 +1158,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
   reporting without gating is #684 and fixing one ticket by reintroducing the other is not a fix. That `name:`
   is a wire constant. `ctest -R doc-subject-checks-derivation`, `-R doc-subject-checks-selftest`, and
   `gated-jobs-fail-safe` rule C.
+- **CMake WRAPS its diagnostic messages**, so a phrase you grep for can exist in the output and in no
+  single LINE of it. A mutation harness called all three of its arms `SELFTEST STAYED GREEN` while the
+  self-test was RED with four cases named. Measured, for a phrase crossing column 74: `message(STATUS)`
+  **1 match — does not wrap**; `WARNING` **0**; `FATAL_ERROR` **0**; flattened first, **1**. The `STATUS`
+  row is the trap inside the trap — a negative test written with it reproduces nothing and reads as a
+  refutation, and in mixed output the unwrapped copy hides the wrapped one. It is the DIAGNOSTIC types
+  that wrap, which is what every `cmake -P` check reports its verdict through. Flatten
+  (`tr '\n' ' ' | tr -s ' '`) before matching, or match a phrase that cannot straddle 74 columns. Distinct
+  from every other entry here: **the text does not exist in the form you are matching it in, and the tool
+  that printed it changed the form.** The tell: three arms agreeing perfectly is what a broken instrument
+  looks like as well as what a real pattern looks like.
 - Five ways an instrument reported on something other than its subject, all in one branch, all written by
   someone who had just read the rulebook. A **COMMENT is not a call site** — two checks matched their own
   headers, one reporting a step twice and one refusing a correct workflow — so strip full-line comments, and

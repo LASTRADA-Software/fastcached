@@ -2909,7 +2909,7 @@ wrong move: the caveat rule is right and the prose was wrong.
   a `--self-test` that drives all three rules against generated workflows. They
   had only ever been seen to pass.
 
-### Six ways an instrument reported on something other than its subject, in one branch
+### Seven ways an instrument reported on something other than its subject
 
 Every one of these was written by somebody who had just read this file, and every
 one produced a green or a red that was about the tool rather than the tree. They
@@ -2970,6 +2970,39 @@ are recorded together because the shape is one shape.
   the self-test GREEN. The mode under test was not the mode in use. There is now a
   fixture per arm: one that prints the failure text and exits 0, one that exits
   non-zero with clean output.
+- **CMake WRAPS its diagnostic messages, so a phrase you grep for may exist in the
+  output and in no single LINE of it.** A mutation harness reported all three of its
+  arms as `SELFTEST STAYED GREEN -- this mutation is NOT covered` while the self-test
+  was in fact RED with four cases named. The phrase it matched on,
+  `did not behave as claimed`, straddled the wrap point. Measured:
+
+  | message type | matches for a phrase crossing column 74 |
+  |---|---|
+  | `message(STATUS)` | **1** — does not wrap |
+  | `message(WARNING)` | **0** |
+  | `message(FATAL_ERROR)` | **0** |
+  | any of them, whitespace flattened first | **1** |
+
+  **The `STATUS` row is the trap inside the trap.** It does not wrap, so a negative
+  test written with `STATUS` reproduces nothing and reads as a refutation of the whole
+  claim — and in a file emitting BOTH, the unwrapped `STATUS` copy satisfies the grep
+  and hides the wrapped one. It is the *diagnostic* types that wrap, which is exactly
+  the set every check here reports its verdict through: `FATAL_ERROR` is what every
+  `cmake -P` check in this tree uses, because a `-P` script cannot fail by exit code.
+  So flatten (`tr '\n' ' ' | tr -s ' '`) before matching any verdict text, or match a
+  short phrase that cannot straddle 74 columns.
+
+  This is not any of the six above. Those are wrong buckets, wrong populations, a
+  substring of a count, a comment matching itself. **This one is: the text you are
+  matching does not exist in the form you are matching it in, and the tool that
+  printed it is what changed the form.** The subject was fine and the reading was
+  fabricated by the formatter in between.
+
+  The tell is the one worth keeping: **three arms agreeing perfectly is what a broken
+  instrument looks like as well as what a real pattern looks like.** Refusing "all
+  three uncovered" and printing the raw output is what found it — the same move as
+  treating two legs disagreeing at 3220/3216 as evidence about the instrument rather
+  than about the tree.
 - **A self-test that stops early must not look like one that judged something.**
   A generator ending in `[[ ... ]] && echo` returns 1 when the condition is false;
   under `set -e` a plain call to it took the whole self-test down after eight
