@@ -82,8 +82,7 @@ void ReadinessAnnouncer::MaybeAnnounce()
     // is recompiled by this build (#654); the daemon's has two such waiters of its
     // own. A copy in this file would be a second source of truth for a published
     // interface -- the very defect the table exists to close.
-    _logger.Logf(
-        LogLevel::Info, "{} ({})", ReadinessMarkerText(ReadinessMarker::Daemon), _endpointSummary);
+    _logger.Logf(LogLevel::Info, "{} ({})", ReadinessMarkerText(ReadinessMarker::Daemon), _endpointSummary);
 }
 
 bool ReadinessAnnouncer::Announced() const noexcept

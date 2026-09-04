@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/EnumTable.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -115,12 +116,9 @@ inline constexpr EnumTable<ReadinessMarker, ReadinessMarkerRow> ReadinessMarkerT
 static_assert(RowsInEnumeratorOrder(ReadinessMarkerTable, &ReadinessMarkerRow::marker));
 
 /// No row may leave its verdict or its explanation unstated.
-static_assert([] {
-    for (auto const& row: ReadinessMarkerTable)
-        if (row.fact == ReadinessFact::Unstated || row.text.empty() || row.meaning.empty())
-            return false;
-    return true;
-}());
+static_assert(std::ranges::all_of(ReadinessMarkerTable, [](ReadinessMarkerRow const& row) {
+    return row.fact != ReadinessFact::Unstated && !row.text.empty() && !row.meaning.empty();
+}));
 
 /// The literal a waiter greps for.
 /// @param marker Which binary's line.
