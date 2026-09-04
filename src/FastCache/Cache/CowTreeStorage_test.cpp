@@ -1307,6 +1307,22 @@ TEST_CASE("Damage to both meta pages refuses the store at Open, and refuses it a
     // the other side are the vintage tests below.
     REQUIRE_FALSE(opened.has_value());
     REQUIRE(opened.error().code == FastCache::StorageErrorCode::Corrupt);
+
+    // And the `context`, which is the other half of what an operator matches
+    // their console against (#633). `docs/operations/corrupt-store.md` quotes
+    // the whole sentence verbatim -- twice, once per binary -- and until now no
+    // test read this field at all, so a refactor that renamed the context or
+    // dropped it would have left the page confidently describing output nobody
+    // gets, with every test green.
+    REQUIRE(opened.error().context == "FilePageStore::Open");
+
+    // The rendering too, and deliberately as a whole string. Asserting the
+    // fields alone would leave `StorageError::ToString`'s wording free to move
+    // under a page that quotes it, and an operator comparing a console line
+    // against a doc is matching the RENDERING, not the struct. It is a
+    // change-detector, which is what a documented verbatim quote needs: the
+    // page and this literal move together or the change does not land.
+    REQUIRE(opened.error().ToString() == "StorageError(code=Corrupt system=0 context=FilePageStore::Open)");
 }
 
 TEST_CASE("Damage below the meta pages still opens, and costs keys rather than the process", "[cowstorage][open][corrupt]")
