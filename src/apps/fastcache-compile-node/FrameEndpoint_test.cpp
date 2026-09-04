@@ -29,6 +29,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -2177,15 +2178,48 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     client.CloseNow();
     responder.Hold(false);
 
+    // **TWO waits, because they are two diagnoses**, and one `REQUIRE` over the
+    // counter alone could not tell them apart. This case failed once on a loaded
+    // macOS runner inside a merge group and dequeued an unrelated documentation pull
+    // request ([#691](https://github.com/LASTRADA-Software/fastcached/issues/691)),
+    // and all its CI output could say was `WaitFor(...)` expanding to `false` --
+    // which is consistent with the answer never finishing, with the watch never
+    // arming, and with the watch not having concluded by the time the loop read its
+    // flags. Those are three different repairs.
+    //
+    // **The elapsed cost is recorded because it is what refutes the tempting fix.**
+    // `WaitFor` is bounded by a CLOCK (`DrainWithin`, `WatchWait` = 15 s), not by an
+    // iteration count, so a run that spends the whole ceiling did not run out of
+    // patience -- the event never happened. The #691 failure took 16.28 s of a 15 s
+    // bound, which is how "widen the bound" was ruled out before it was tried. A
+    // wait that reports only true/false throws that reading away.
+    auto const timedWait = [](auto ready) {
+        auto const start = std::chrono::steady_clock::now();
+        auto const ok = WaitFor(ready);
+        return std::pair { ok,
+                           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start) };
+    };
+
+    // The compile finishing is the cheaper fact and the one that must hold first: if
+    // it does not, nothing below is about the peer watch at all.
+    auto const [answered, answeredMs] = timedWait([&responder] { return responder.Answered() == 1; });
+
     // Waited for: the abandoned delivery to be recorded. A failure here IS the bug --
     // the reply went into a dead socket and nothing anywhere said so.
-    REQUIRE(WaitFor([&fleet, before] {
-        return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1;
-    }));
+    auto const [recorded, recordedMs] = timedWait(
+        [&fleet, before] { return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1; });
+
+    INFO("answered=" << answered << " after " << answeredMs.count() << "ms"
+                     << ", recorded=" << recorded << " after " << recordedMs.count() << "ms"
+                     << "; responder entered=" << responder.Entered() << " answered=" << responder.Answered()
+                     << "; abandoned-counter delta="
+                     << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - before));
 
     // **And the compile still completed.** Two facts, two rows, on purpose: the
     // compiler ran and this machine paid for it, and only the handover found nobody
     // there. Folded, an abandoned delivery would read as a compile that never happened.
+    REQUIRE(answered);
+    REQUIRE(recorded);
     CHECK(responder.Answered() == 1);
 }
 
