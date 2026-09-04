@@ -626,6 +626,14 @@ class ShortWindowResponder final: public IFrameResponder
         return _inner.PeerWatchCounter(opRaw);
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Forwarded, like every other question this decorator does not itself answer.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept override
+    {
+        return _inner.ProgressInterval(opRaw);
+    }
+
   private:
     IFrameResponder& _inner;
     std::chrono::milliseconds _window;
@@ -677,37 +685,127 @@ class IdleListener final: public IListener
 /// @param port Where the endpoint listens.
 /// @param frame The request.
 /// @return The reply, or empty when the peer closed without answering.
-[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::vector<std::byte> frame)
+[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
+                                              std::vector<std::byte> frame,
+                                              std::size_t* progressSeen = nullptr)
 {
     BlockingConnector connector;
     auto socket =
         SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(socket.has_value());
 
-    auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
+    std::size_t pulses = 0;
+    auto reply =
+        SyncRun([](ISocket* peer, std::vector<std::byte> request, std::size_t* seen) -> Task<std::vector<std::byte>> {
+            auto const written = co_await peer->Write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
+
+            // **A COMPILE reply is a STREAM, not a frame** (#245): zero or more
+            // `Status::Progress` pulses precede exactly one terminal status. This helper
+            // steps over them the way `Cc::RecvReply` does, so a case reading it goes on
+            // asserting about the ANSWER -- which is the property every one of them is
+            // about -- while the count is available to the one case that is about the
+            // pulses themselves.
+            std::vector<std::byte> received;
+            while (true)
+            {
+                auto want = Wire::ReplyHeaderSize;
+                while (received.size() < want)
+                {
+                    std::array<std::byte, 4096> chunk {};
+                    auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+                    if (!read.has_value() || *read == 0)
+                        co_return std::vector<std::byte> {};
+                    received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+
+                    if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
+                        if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
+                            want = Wire::ReplyHeaderSize + header->payloadLength;
+                }
+
+                auto const header = Wire::DecodeReplyHeader(received);
+                if (!header.has_value() || Wire::IsTerminalStatus(Unwrap(header).status))
+                    co_return received;
+
+                if (seen != nullptr)
+                    ++*seen;
+                // Drained by the DECLARED length, exactly as a real reader does, so anything
+                // a later version puts in this payload cannot desynchronise the stream.
+                received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
+            }
+        }((*socket).get(), std::move(frame), &pulses));
+
+    (*socket)->Close();
+    if (progressSeen != nullptr)
+        *progressSeen = pulses;
+    return reply;
+}
+
+/// Send @p frame and read the whole reply stream, right up to the peer's EOF.
+///
+/// **The half `Exchange` cannot answer.** That helper stops at the first terminal
+/// status, which is what every case asserting about the ANSWER wants -- and it is
+/// therefore blind to a frame that arrives AFTER the answer, which is exactly what a
+/// missing `SettlePulse` produces. Reading to EOF is what makes the ordering
+/// observable.
+///
+/// The write side is shut before reading, so the node sees the request is complete and
+/// this side is not the reason the connection stays open. The node closes after the
+/// reply, which is what ends the read loop.
+/// @param port The loopback port to dial.
+/// @param frame A complete request.
+/// @return Every byte the node wrote, in order.
+[[nodiscard]] std::vector<std::byte> ExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
+{
+    BlockingConnector connector;
+    auto socket =
+        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+
+    auto stream = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
         auto const written = co_await peer->Write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
 
         std::vector<std::byte> received;
-        auto want = Wire::ReplyHeaderSize;
-        while (received.size() < want)
+        while (true)
         {
             std::array<std::byte, 4096> chunk {};
             auto const read = co_await peer->Read(std::span<std::byte> { chunk });
             if (!read.has_value() || *read == 0)
-                co_return std::vector<std::byte> {};
+                co_return received;
             received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
-
-            if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
-                if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
-                    want = Wire::ReplyHeaderSize + header->payloadLength;
         }
-        co_return received;
     }((*socket).get(), std::move(frame)));
 
     (*socket)->Close();
-    return reply;
+    return stream;
+}
+
+/// The status of every whole frame in @p stream, in order.
+///
+/// Walks by the DECLARED length, so it is the same traversal a real reader does and a
+/// frame whose payload it does not understand cannot desynchronise it. A trailing
+/// partial frame is dropped rather than guessed at -- an incomplete frame is not a
+/// status, and inventing one would let a truncated stream assert an ordering.
+/// @param stream Bytes the node wrote.
+/// @return One status per complete frame.
+[[nodiscard]] std::vector<Wire::Status> StatusSequence(std::span<std::byte const> stream)
+{
+    std::vector<Wire::Status> statuses;
+    while (stream.size() >= Wire::ReplyHeaderSize)
+    {
+        auto const header = Wire::DecodeReplyHeader(stream);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::ReplyHeaderSize + std::size_t { header->payloadLength };
+        if (stream.size() < whole)
+            break;
+        statuses.push_back(header->status);
+        stream = stream.subspan(whole);
+    }
+    return statuses;
 }
 
 /// A config naming @p port for the node surface.
@@ -829,7 +927,13 @@ struct MergedWorker
 
     /// @param fix Supplies the scratch directory, metrics, logger and membership.
     /// @param io The loop the responder returns its answers on.
-    MergedWorker(Fixture& fix, NodeIoLoop& io):
+    /// @param progressInterval How often a running compile pulses at its client.
+    ///        Defaults to the production value, so every case written before #245 keeps
+    ///        the behaviour it asserted -- five seconds, which for a case that releases
+    ///        its compile immediately means no pulse at all. A case ABOUT the pulse
+    ///        passes a short one, because the alternative is holding a compile for five
+    ///        seconds to observe one frame.
+    MergedWorker(Fixture& fix, NodeIoLoop& io, std::chrono::milliseconds progressInterval = Wire::DefaultProgressInterval):
         jobs { runner, fix.scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
         protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, fix.metrics },
         // **Five seconds rather than the thirty-second default: the NET, not the
@@ -854,7 +958,7 @@ struct MergedWorker
         //
         // It is NOT what makes these cases correct -- see the destructor.
         capacity { 2, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, fix.logger },
-        responder { protocol, capacity, fix.membership, pool, io.Reactor(), fix.metrics, fix.logger }
+        responder { protocol, capacity, fix.membership, pool, io.Reactor(), fix.metrics, fix.logger, progressInterval }
     {
     }
 
@@ -1026,6 +1130,140 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // abandons. Measured: the assertion text survived, the exit code was still 75 and
     // Catch2 never printed a summary. Continuing instead keeps the cleanup in the case
     // BODY, where the endpoint is alive and the reactor still turning.
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
+}
+
+TEST_CASE("A held compile pulses at its client, and the object still arrives behind the pulses", "[node][compile-responder]")
+{
+    // **The serving half of #245, end to end over a real socket.** A dispatched compile
+    // says nothing between the request and the object, so the client's only bound was
+    // the total -- ten minutes, sized for the slowest legitimate translation unit, and
+    // therefore also how long a worker that had stopped making progress went unnoticed.
+    //
+    // Two claims, and the second is what stops the first from being a regression: the
+    // pulses arrive WHILE the compile runs, and the object behind them is unchanged.
+    Fixture fix;
+    NodeIoLoop io;
+    constexpr auto Interval = std::chrono::milliseconds { 40 };
+    MergedWorker worker { fix, io, Interval };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    std::size_t pulses = 0;
+    auto pending = std::async(std::launch::async, [port, &pulses] { return Exchange(port, CompileFrame(), &pulses); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+
+    // Long enough for several intervals, so the assertion below is about a CADENCE and
+    // not about one frame that might have been a coincidence of scheduling. Derived from
+    // the interval this case configured rather than written as a number, so it cannot
+    // stop covering it if that moves.
+    std::this_thread::sleep_for(Interval * 6);
+    worker.runner.Release();
+
+    auto const reply = pending.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(StatusOf(reply) == Wire::Status::Ok);
+
+    // At least two, not merely one. A single frame is what a worker that pulsed once and
+    // stopped would produce, and a client measuring SILENCE would abandon that worker
+    // exactly as it abandons a mute one -- so one pulse is indistinguishable from none
+    // for the purpose this exists to serve.
+    INFO("pulses observed: " << pulses);
+    CHECK(pulses >= 2);
+
+    // And the answer really is the answer: a compile that ran, with the object the
+    // client asked for behind however many pulses preceded it.
+    auto const result = Wire::DecodeCompileResult(std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize));
+    REQUIRE(result.has_value());
+    CHECK(Unwrap(result).exitCode == 0);
+
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
+}
+
+TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][compile-responder]")
+{
+    // The control, and it is not optional: without it "pulses while it runs" and "writes
+    // extra frames unconditionally" are the same passing test. The cadence has to cost
+    // an ordinary fast compile nothing -- most translation units are shorter than one
+    // interval, and every frame in front of the object is a frame the client has to read
+    // and the worker has to write.
+    Fixture fix;
+    NodeIoLoop io;
+    MergedWorker worker { fix, io, std::chrono::seconds { 30 } };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    std::size_t pulses = 0;
+    auto pending = std::async(std::launch::async, [port, &pulses] { return Exchange(port, CompileFrame(), &pulses); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+    worker.runner.Release();
+
+    auto const reply = pending.get();
+    REQUIRE_FALSE(reply.empty());
+    CHECK(StatusOf(reply) == Wire::Status::Ok);
+    CHECK(pulses == 0);
+
+    CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
+    worker.capacity.Drain();
+}
+
+TEST_CASE("The pulse stops before the reply, so the answer is the last thing on the wire", "[node][compile-responder]")
+{
+    // **The property `SettlePulse` exists for, and the only place it is observable.**
+    // While the responder answers, the pulse is the only writer on this socket; when
+    // `Answer` returns, the connection has to become the only writer again. A reply
+    // written over a pulse still suspended inside `Write` is two writes sharing one
+    // write-op slot -- and it does not fail loudly, it interleaves five bytes into the
+    // middle of an object file.
+    //
+    // Read to EOF rather than to the first terminal frame, which is what makes this
+    // different from the case above: a pulse emitted AFTER the reply would be invisible
+    // to a reader that stopped at the answer, and it is exactly what a missing settle
+    // produces.
+    Fixture fix;
+    NodeIoLoop io;
+    constexpr auto Interval = std::chrono::milliseconds { 20 };
+    MergedWorker worker { fix, io, Interval };
+    MergedResponder merged { nullptr, nullptr, &worker.responder };
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
+    REQUIRE(endpoint.has_value());
+    io.Start();
+
+    auto pending = std::async(std::launch::async, [port] { return ExchangeUntilEof(port, CompileFrame()); });
+    REQUIRE(worker.runner.WaitForStarted(1));
+    std::this_thread::sleep_for(Interval * 6);
+    worker.runner.Release();
+
+    auto const stream = pending.get();
+    auto const statuses = StatusSequence(stream);
+    INFO("statuses: " << statuses.size());
+
+    // At least one pulse AND the answer, or the two claims below are vacuous: with a
+    // single frame `statuses.back()` is the answer and the `all_of` runs over nothing,
+    // so a build that pulses not at all would pass an ordering test about pulses. That
+    // is the empty-range trap this project keeps a rule about, and it was observed here
+    // -- a counterfactual that stopped the pulse left this case green.
+    REQUIRE(statuses.size() >= 2);
+
+    // Every frame but the last is a pulse, and the last is the answer. Stated as two
+    // claims about the SEQUENCE rather than as a count, because the count is timing and
+    // the ordering is the contract.
+    CHECK(statuses.back() == Wire::Status::Ok);
+    CHECK(std::ranges::all_of(std::span { statuses }.first(statuses.size() - 1),
+                              [](Wire::Status status) { return status == Wire::Status::Progress; }));
+
     CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
     worker.capacity.Drain();
 }

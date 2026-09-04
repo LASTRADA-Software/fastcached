@@ -220,16 +220,28 @@ void SendOrDie(ISocket& socket, std::span<std::byte const> bytes)
 /// Read one whole reply frame: the fixed header, then exactly the payload it
 /// declares. Every status is drained the same way, so a refusal leaves the
 /// connection in the same state a hit does.
+///
+/// A `Status::Progress` pulse is stepped over rather than returned, exactly as the
+/// launcher's own reader does it (#245): zero or more of them precede exactly one
+/// terminal status, so this still consumes precisely one ANSWER per request. A probe
+/// that returned the first pulse would report every dispatched compile as an
+/// unparseable reply, which is the failure a pre-#245 client actually has.
 /// @param client Connected client.
-/// @return The decoded status and its payload.
+/// @return The decoded terminal status and its payload.
 [[nodiscard]] std::pair<Wire::Status, std::vector<std::byte>> RecvReply(ISocket& client)
 {
-    auto const headerBytes = RecvOrDie(client, Wire::ReplyHeaderSize);
-    auto const header = Wire::DecodeReplyHeader(headerBytes);
-    if (!header.has_value())
-        Die("server sent a reply this build cannot parse");
-    auto payload = header->payloadLength > 0 ? RecvOrDie(client, header->payloadLength) : std::vector<std::byte> {};
-    return { header->status, std::move(payload) };
+    while (true)
+    {
+        auto const headerBytes = RecvOrDie(client, Wire::ReplyHeaderSize);
+        auto const header = Wire::DecodeReplyHeader(headerBytes);
+        if (!header.has_value())
+            Die("server sent a reply this build cannot parse");
+        auto payload = header->payloadLength > 0 ? RecvOrDie(client, header->payloadLength) : std::vector<std::byte> {};
+        if (Wire::IsTerminalStatus(header->status))
+            return { header->status, std::move(payload) };
+        // Drained by the declared length above, so anything a later version puts in a
+        // pulse's payload cannot desynchronise this reader.
+    }
 }
 
 /// Turn a refusal into a diagnosable message naming the server's own code.

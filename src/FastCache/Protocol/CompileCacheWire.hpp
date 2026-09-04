@@ -104,12 +104,36 @@ using WireVersion = std::uint8_t;
 /// Bump this whenever the framing changes shape. It is deliberately **not**
 /// derived from the release version: the wire format changes far more rarely than
 /// the product does, and tying them would force a flag day on every release.
-inline constexpr WireVersion CurrentVersion = 2;
+///
+/// **3 added `Status::Progress`**, the liveness pulse a worker writes while a
+/// dispatched compile runs
+/// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+inline constexpr WireVersion CurrentVersion = 3;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
 /// build can still decode the older shape.
-inline constexpr WireVersion MinSupportedVersion = 2;
+///
+/// **It moved with `CurrentVersion` for version 3, and that is the whole
+/// negotiation.** `Status::Progress` is a change to the REPLY, which carries a
+/// status byte and a length and no kind — so the "step over what you do not know"
+/// property the request framing has does not exist on the way back:
+/// `DecodeReplyHeader` refuses a status outside its own set, and a launcher built
+/// before this meets a progress frame by abandoning the compile. Keeping the range
+/// open would therefore not buy a mixed fleet anything; it would buy a mixed fleet
+/// that fails at the worst possible moment, several minutes into a translation unit,
+/// as a transport failure naming nothing. Refusing the older request outright is
+/// `UnsupportedVersion`, which names the supported range and is answered before a
+/// byte of source is sent.
+///
+/// The second thing it buys is that the capability needs no negotiation at all:
+/// every accepted request is version 3, so every client a worker answers understands
+/// a progress frame, and nothing has to remember a per-connection flag. Backwards
+/// compatibility on this wire is not owed
+/// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)) — one
+/// installation, major version 0 — and a loud, named, immediate refusal is what that
+/// budget is best spent on.
+inline constexpr WireVersion MinSupportedVersion = 3;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -214,7 +238,66 @@ enum class Status : std::uint8_t
     Miss = 0x00,  ///< FETCH found nothing. Payload is empty.
     Ok = 0x01,    ///< Command succeeded. Payload is the result, if any.
     Error = 0x02, ///< Command refused. Payload is `[u8 ErrorCode][message]`.
+
+    /// The server is still working on this request. Payload is empty. **Not** an
+    /// outcome: zero or more of these precede exactly one of the three above, and
+    /// the request is answered only by that one.
+    ///
+    /// **The one thing on this wire that is not one-reply-per-request**, and the
+    /// exception is bounded to exactly this: a progress frame is never the last frame
+    /// of an exchange, so a reader that loops until it sees a terminal status still
+    /// consumes precisely one answer per request and pipelining stays well defined.
+    ///
+    /// **It says nothing about the compile, deliberately**
+    /// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)). A
+    /// liveness signal that carried partial diagnostics would be a second, racy
+    /// channel for output the result frame already carries in full — two sources for
+    /// one fact, differing by however much of the compile had happened when each was
+    /// written. So the payload is empty, and this enumerator's whole meaning is *the
+    /// process answering you is still there*.
+    ///
+    /// A receiver still DRAINS `payloadLength` rather than asserting it is zero, for
+    /// the reason every other frame here is drained by its declared length: the
+    /// framing is what keeps the link synchronised, and a version that one day says
+    /// something in this payload must not desynchronise a reader that ignores it.
+    ///
+    /// **Why it exists at all.** A dispatched compile is bounded by one flat
+    /// deadline, and a flat deadline cannot tell *"still working"* from *"gone"*: it
+    /// must be as long as the slowest translation unit anybody compiles (ten minutes
+    /// here, derived from `DefaultCompileLeaseTimeout`), which is then also how long
+    /// a worker whose process has stopped making progress goes unnoticed. Keepalive
+    /// (#247) closes the case where the HOST vanishes — no FIN, no RST, a kernel that
+    /// has stopped answering — and cannot reach the case where the kernel answers the
+    /// probes perfectly while nothing above it does. Silence is what separates those,
+    /// and silence is only measurable against something that would otherwise be said.
+    Progress = 0x03,
 };
+
+/// Whether @p raw is a status byte this build understands.
+///
+/// A table walk rather than a chain of `!=` comparisons: the chain is what a fourth
+/// status is forgotten from, and it was — the shape it had before this one was added
+/// named its three members inline, so nothing but a reader could notice an omission.
+/// @param raw The first reply byte, as received.
+/// @return True when it names a `Status`.
+[[nodiscard]] constexpr bool IsKnownStatus(std::uint8_t raw) noexcept
+{
+    constexpr std::array Known { Status::Miss, Status::Ok, Status::Error, Status::Progress };
+    return std::ranges::any_of(Known, [raw](Status status) { return static_cast<std::uint8_t>(status) == raw; });
+}
+
+/// Whether @p status ends an exchange, as against reporting on one still running.
+///
+/// **The question every reply reader actually asks**, and it is here rather than at
+/// each of them because there are four such readers in this tree — the launcher's
+/// cache and worker exchanges, the admin CLI, and the protocol test client — and a
+/// reader that does not ask it treats the first progress frame as the answer.
+/// @param status The reply status.
+/// @return True for `Miss`, `Ok` and `Error`; false for `Progress`.
+[[nodiscard]] constexpr bool IsTerminalStatus(Status status) noexcept
+{
+    return status != Status::Progress;
+}
 
 /// Why a command was refused. Travels as the first payload byte of an `Error`
 /// reply, ahead of a human-readable message.
@@ -807,6 +890,49 @@ inline constexpr std::size_t MaxControlPayload = 64 * 1024;
 /// on `DefaultDispatchTotal`.
 inline constexpr std::chrono::milliseconds DefaultCompileLeaseTimeout { 600'000 };
 
+/// How often a worker writes `Status::Progress` while a dispatched compile runs.
+///
+/// **One number, for `DefaultCompileLeaseTimeout`'s reason**: the worker's cadence
+/// and the client's patience bound the same silence from opposite sides, and neither
+/// end can pick its own without describing a fleet the other end is not running. It
+/// lives here because this header is the only thing both ends include.
+///
+/// Five seconds, chosen from what it costs in each direction rather than as a round
+/// number. Too fast is five bytes plus a wake-up per interval per in-flight compile,
+/// on a machine whose job is to run compilers; too slow is the floor on how quickly a
+/// silent worker can be noticed, since detection cannot beat the cadence it measures.
+/// Against a compile measured in tens of seconds to minutes, five seconds is
+/// negligible on the first count and two orders of magnitude better than the ten
+/// minutes it replaces on the second.
+inline constexpr std::chrono::milliseconds DefaultProgressInterval { 5'000 };
+
+/// How long a client waits in SILENCE on a dispatched compile before giving up.
+///
+/// The other half of `DefaultProgressInterval`, and the number #245 exists to make
+/// expressible: with a pulse on the wire the client stops measuring *how long this
+/// compile has taken* — which must stay minutes, and does
+/// (`DefaultCompileLeaseTimeout`) — and starts measuring *how long since the worker
+/// last said anything*, which can be seconds.
+///
+/// Thirty seconds is deliberately several missed pulses rather than one. A single
+/// missed pulse is not evidence: the worker is a machine running as many compilers as
+/// it has slots, its reactor thread is shared with every other connection, and a
+/// scheduling hiccup that delays a five-byte write past one interval is ordinary. Two
+/// consecutive ones are not, so tolerating five and refusing the sixth is a bound that
+/// costs a legitimate build nothing while still answering in seconds where the flat
+/// deadline answered in minutes.
+inline constexpr std::chrono::milliseconds DefaultCompileIdleTimeout { 30'000 };
+
+// The relation is what makes either number safe, so it is asserted rather than left
+// to whoever next retunes one of them: an idle bound at or below the cadence refuses
+// a perfectly healthy worker on the ordinary jitter of its own reactor, which reads
+// as a fleet that has stopped working. Stated as a multiple, so tightening the bound
+// past the point where it stops tolerating a missed pulse is a build failure.
+static_assert(DefaultCompileIdleTimeout >= 3 * DefaultProgressInterval,
+              "a client must tolerate at least two missed pulses; below that, jitter reads as a dead worker");
+static_assert(DefaultCompileIdleTimeout < DefaultCompileLeaseTimeout,
+              "an idle bound at or above the total budget bounds nothing that the total did not already bound");
+
 /// Every opcode this build understands.
 ///
 /// `fieldCount` is the single source of the request arity — parsers take it from
@@ -904,11 +1030,34 @@ inline constexpr std::array OpTable {
                    // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName,
                    // compileDir, compileDirReplacement
                    .fieldCount = 8,
-                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   // `Progress` is legal HERE and on no other verb, which is the whole
+                   // scope of the version-3 change: every other verb on this wire is
+                   // answered from a table in microseconds, so a liveness pulse on one
+                   // would be a frame nobody could ever observe and a second shape every
+                   // reply reader would have to handle for nothing.
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)
+                                                              | StatusBit(Status::Progress)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
                    .family = VerbFamily::Compile },
 };
+
+/// Whether `Status::Progress` is confined to the one verb that can be slow enough to
+/// need it.
+///
+/// A `static_assert`ed invariant rather than a comment, the same shape as
+/// `PreAuthVerbsAreBounded` above and for the same kind of reason: a verb that
+/// acquires this status acquires a reply stream, and every client reading that verb
+/// then has to loop. That is a decision, not something to inherit by editing a mask.
+/// @return True when `Op::Compile` is the only row admitting `Progress`.
+[[nodiscard]] constexpr bool ProgressIsCompileOnly() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
+        return row.code == Op::Compile || (row.legalStatuses & StatusBit(Status::Progress)) == 0;
+    });
+}
+
+static_assert(ProgressIsCompileOnly(), "a progress pulse turns a reply into a stream; only COMPILE is long enough to");
 
 /// Whether every verb reachable before authentication declares a payload bound.
 ///
@@ -1431,6 +1580,19 @@ namespace Detail
     return frame;
 }
 
+/// Frame a progress pulse: five bytes, and nothing else.
+///
+/// A named encoder rather than `EncodeReply(Status::Progress, {})` written at the one
+/// site that sends it, because the empty payload is a CONTRACT
+/// (`Status::Progress` says why) and not an argument a caller chose. With no parameter
+/// there is nothing to pass, so the frame cannot acquire a payload by somebody
+/// deciding a diagnostic would be useful here.
+/// @return The framed pulse.
+[[nodiscard]] inline std::vector<std::byte> EncodeProgressReply()
+{
+    return EncodeReply(Status::Progress, {});
+}
+
 /// Frame an `Error` reply carrying a code and a message.
 /// @param code The refusal reason.
 /// @param message Detail for a human; falls back to the table's default when empty.
@@ -1481,8 +1643,7 @@ namespace Detail
     if (bytes.size() < ReplyHeaderSize)
         return std::nullopt;
     auto const raw = static_cast<std::uint8_t>(bytes[0]);
-    if (raw != static_cast<std::uint8_t>(Status::Miss) && raw != static_cast<std::uint8_t>(Status::Ok)
-        && raw != static_cast<std::uint8_t>(Status::Error))
+    if (!IsKnownStatus(raw))
         return std::nullopt;
     return ReplyHeader { .status = static_cast<Status>(raw),
                          .payloadLength = ReadBigEndian<std::uint32_t>(bytes.subspan(1, sizeof(std::uint32_t))) };

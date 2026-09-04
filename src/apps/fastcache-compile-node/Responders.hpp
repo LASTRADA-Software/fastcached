@@ -492,6 +492,17 @@ class SchedulerResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// None, and for the mirror of the reason above: a scheduler verb is answered from
+    /// memory in microseconds, so there is no interval in which a client could wonder
+    /// whether this node is still there. A pulse would be a frame that cannot arrive
+    /// before the reply it precedes, on a verb whose client is not looping for one.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
   private:
     /// Who is asking, as both the gate and the early refusal need it.
     ///
@@ -766,6 +777,17 @@ class CacheResponder final: public IFrameResponder
         return std::nullopt;
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// None. A cache answer is a lookup or one bounded upstream round trip, and its
+    /// client bounds the exchange by a round trip to match -- so there is no silence
+    /// here long enough to be worth reporting on, and `Status::Progress` is not even
+    /// legal on these verbs (`CompileCacheWire::OpTable`, which asserts it).
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return std::nullopt;
+    }
+
   private:
     CacheProxy& _proxy;
     ILocalityOracle const& _locality;
@@ -1033,6 +1055,20 @@ class MergedResponder final: public IFrameResponder
     {
         auto const* const owner = OwnerOf(opRaw);
         return owner != nullptr ? owner->PeerWatchCounter(opRaw) : std::nullopt;
+    }
+
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// **Routed to the owner**, for the reason every line above it is: whether a verb is
+    /// slow enough to owe its client a liveness signal is a property of the VERB and of
+    /// the surface that does its work, never of the listener they happen to share.
+    ///
+    /// A verb nobody owns is not pulsed. It is unreachable, `RefusePeer` having already
+    /// refused it, and not-pulsing is the answer that changes nothing.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept override
+    {
+        auto const* const owner = OwnerOf(opRaw);
+        return owner != nullptr ? owner->ProgressInterval(opRaw) : std::nullopt;
     }
 
   private:

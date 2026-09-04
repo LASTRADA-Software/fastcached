@@ -68,6 +68,23 @@ enum class TransportFailure : std::uint8_t
     /// closed the socket. The peer may be entirely healthy and merely slow -- which
     /// is the reading a `PeerLost` must never be given.
     Expired,
+
+    /// The peer went QUIET: connected, its host still answering at the TCP level, and
+    /// nothing said for the idle budget.
+    ///
+    /// **Its own name rather than an `Expired`, because it is the one diagnosis the
+    /// other three cannot express** and the reason #245 was built. `Unreached` is a
+    /// machine that is not there, `PeerLost` is a connection that broke, `Expired` is
+    /// a compile that took longer than we were prepared to wait — and this is a worker
+    /// process that stopped making progress while its kernel went on acknowledging
+    /// everything, which is the exact state keepalive is blind to. Reported as
+    /// `Expired` it would send an operator to raise a timeout that was never the
+    /// problem.
+    ///
+    /// It can only ever be reported on an exchange whose peer had agreed to pulse, so
+    /// its appearance is itself information: this worker said it would keep talking and
+    /// then did not.
+    Silent,
 };
 
 /// A phrase naming @p failure, for the sentence a fall-back is recorded under.
@@ -89,6 +106,8 @@ enum class TransportFailure : std::uint8_t
             return "went away mid-exchange";
         case TransportFailure::Expired:
             return "ran out of budget";
+        case TransportFailure::Silent:
+            return "stopped reporting progress";
     }
     return "could not be reached";
 }
@@ -255,6 +274,49 @@ struct Credential
     }
 };
 
+/// Told, on the exchange's own thread, each time the exchange demonstrably moved
+/// forward.
+///
+/// **The seam a bound on SILENCE needs, and the reason it is a seam at all.** A total
+/// deadline is armed once and can be enforced from outside the protocol; an idle
+/// deadline has to be pushed out by something only the protocol can see — a request
+/// fully written, a `Status::Progress` frame read — and the thing that owns the timer
+/// is `ReactorExchange`, which knows nothing about statuses. So the protocol reports
+/// the events and the exchange decides what they are worth, which is the same split
+/// `IFrameResponder` makes on the serving side: the endpoint owns *when*, the surface
+/// owns *what*.
+///
+/// **Not a clock, and deliberately no arithmetic here.** An implementation is free to
+/// re-arm a timer, count, or do nothing; this reports facts. That is what keeps
+/// `CacheProtocol` free of both a reactor and a clock, and what lets a test assert the
+/// pulses were seen without a timer anywhere in the case.
+///
+/// Reached through a POINTER for the reason `CredentialNotice` is: the exchange is a
+/// coroutine, whose frame outlives the expression that created it, so a reference
+/// parameter would bind to storage the caller may already have destroyed
+/// (`cppcoreguidelines-avoid-reference-coroutine-parameters`). Null means nobody is
+/// listening, which is every exchange but the compile.
+class IExchangeLiveness
+{
+  public:
+    IExchangeLiveness() = default;
+    virtual ~IExchangeLiveness() = default;
+    IExchangeLiveness(IExchangeLiveness const&) = delete;
+    IExchangeLiveness& operator=(IExchangeLiveness const&) = delete;
+    IExchangeLiveness(IExchangeLiveness&&) = delete;
+    IExchangeLiveness& operator=(IExchangeLiveness&&) = delete;
+
+    /// The exchange moved forward: a request went out in full, or the peer said it is
+    /// still working.
+    ///
+    /// **It does not say WHICH**, and that is the contract rather than a shortcut. An
+    /// idle bound asks one question — has anything happened — and an implementation
+    /// handed the distinction would eventually treat two kinds of forward motion
+    /// differently, which is a second policy nobody asked for in the place least able
+    /// to explain itself.
+    virtual void MovedForward() noexcept = 0;
+};
+
 /// What one exchange runs under: its two deadlines, and how a dead peer is noticed.
 ///
 /// Two rather than one, because they bound different things and neither implies the
@@ -293,6 +355,36 @@ struct ExchangeBudget
         return total > std::chrono::milliseconds::zero();
     }
 
+    /// Ceiling on SILENCE, once the connection is open; non-positive means unbounded.
+    ///
+    /// **The third deadline, and the one that finally splits the question `total`
+    /// could never answer alone** ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
+    /// `total` asks *how slow may this exchange legitimately be*, and on a dispatched
+    /// compile the honest answer is "as slow as the slowest translation unit anybody
+    /// compiles" — minutes, which is then also how long a worker making no progress
+    /// goes unnoticed. This asks *how long since anything happened*, which has a much
+    /// tighter honest answer, and it is only askable because the worker now says
+    /// something: `CompileCacheWire::Status::Progress`.
+    ///
+    /// It is reset by forward motion (`IExchangeLiveness::MovedForward`) and by nothing
+    /// else, so a peer cannot buy time by being slow — only by being alive.
+    ///
+    /// Left off for every exchange that is bounded by a round trip anyway: a cache
+    /// FETCH answered from memory has nothing to pulse, and arming an idle bound there
+    /// would be a second name for the total.
+    std::chrono::milliseconds idle { 0 };
+
+    /// @return True when `idle` bounds this exchange's silence.
+    ///
+    /// The rule lives on the type for the reason `BoundsTotal` gives, and the value is
+    /// spelled the same way `ArmSocketDeadline` spells it: non-positive is *no bound*,
+    /// never *a bound of zero*, which would expire on the reactor's next turn and turn
+    /// the cache off while reading as a knob that turns a ceiling off.
+    [[nodiscard]] bool BoundsIdle() const noexcept
+    {
+        return idle > std::chrono::milliseconds::zero();
+    }
+
     /// Whether the connection probes a peer that has stopped answering.
     ///
     /// **The third thing, and it is here because `total` alone cannot answer both
@@ -311,7 +403,7 @@ struct ExchangeBudget
     /// build.
     ///
     /// It detects a dead connection or host, never a peer that is alive and merely
-    /// silent -- that is #245's progress frames. See `Net/KeepAlive.hpp`.
+    /// silent -- that is what `idle` below now measures. See `Net/KeepAlive.hpp`.
     KeepAlive keepAlive { KeepAlive::No };
 
     /// Field-by-field equality, so a `static_assert` can hold two independently
@@ -336,11 +428,13 @@ struct ExchangeBudget
 /// @param client Connected transport; not owned.
 /// @param frame A complete framed request.
 /// @param credential Credential to present; default-constructed sends none.
+/// @param liveness Told each time the exchange moves forward; null for none.
 /// @return The outcome.
 [[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client,
                                                 CredentialNotice* notice,
                                                 std::vector<std::byte> frame,
-                                                Credential credential = {});
+                                                Credential credential = {},
+                                                IExchangeLiveness* liveness = nullptr);
 
 /// Where a refusal says to ask instead, when it says so.
 ///

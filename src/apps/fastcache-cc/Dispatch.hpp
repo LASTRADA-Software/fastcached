@@ -107,6 +107,27 @@ class IEndpointExchange
 /// compile reads it. Nothing has to be reloaded, and nothing has to be restarted.
 constexpr std::chrono::milliseconds DefaultDispatchTotal = CompileCacheWire::DefaultCompileLeaseTimeout;
 
+/// How long a dispatched compile may go SILENT before the client gives up on it.
+///
+/// The other half of `DefaultDispatchTotal`, and what finally splits the two questions
+/// a flat deadline could not answer at once
+/// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)): the total goes
+/// on being sized for the slowest legitimate translation unit, while *how fast is a
+/// worker that has stopped making progress noticed* drops from ten minutes to thirty
+/// seconds.
+///
+/// DERIVED, for the reason `DefaultDispatchTotal` is: the worker's pulse cadence and
+/// this bound describe one silence from opposite sides, and only the shared wire header
+/// can hold a value both binaries agree on. `CompileCacheWire` also carries the
+/// `static_assert` that keeps this comfortably above the cadence, so retuning either
+/// one into a fleet that refuses healthy workers is a build failure rather than a
+/// support ticket.
+///
+/// It is `FASTCACHE_DISPATCH_IDLE_MS` at run time, and zero turns it off -- which
+/// restores exactly the pre-#245 behaviour, one flat deadline, for an operator who
+/// would rather have that than a fleet whose workers they do not trust to pulse.
+constexpr std::chrono::milliseconds DefaultDispatchIdle = CompileCacheWire::DefaultCompileIdleTimeout;
+
 /// The deadlines a dispatch's exchanges run under.
 ///
 /// Two, because a dispatch is two shapes of conversation and one number cannot
@@ -126,7 +147,7 @@ struct DispatchBudgets
     /// keepalive is what answers that in seconds without shortening the deadline back
     /// into #223. The control exchanges above leave it off: a lease or a release that
     /// stalls is already bounded by a round trip.
-    ExchangeBudget compile { .total = DefaultDispatchTotal, .keepAlive = KeepAlive::Yes };
+    ExchangeBudget compile { .total = DefaultDispatchTotal, .idle = DefaultDispatchIdle, .keepAlive = KeepAlive::Yes };
 
     /// Ceiling on the object a worker may declare its reply expands to.
     ///
@@ -159,6 +180,15 @@ struct DispatchBudgetKnobs
 
     /// Ceiling on the whole COMPILE exchange.
     std::chrono::milliseconds compileTotal { DefaultDispatchTotal };
+
+    /// Ceiling on SILENCE during the COMPILE exchange.
+    ///
+    /// A fourth knob rather than a derivation of `compileTotal`, because it answers a
+    /// different question and a ratio between them would be a number nobody could
+    /// defend: the total is sized by the slowest translation unit in the build, and
+    /// the idle bound by how long a worker's reactor may plausibly be late with a
+    /// five-byte write. Those two move for entirely unrelated reasons.
+    std::chrono::milliseconds compileIdle { DefaultDispatchIdle };
 };
 
 /// The budgets a dispatch runs under, built from the launcher's three knobs.
@@ -186,7 +216,10 @@ struct DispatchBudgetKnobs
 {
     return DispatchBudgets {
         .control = ExchangeBudget { .connect = knobs.connect, .total = knobs.controlTotal, .keepAlive = KeepAlive::No },
-        .compile = ExchangeBudget { .connect = knobs.connect, .total = knobs.compileTotal, .keepAlive = KeepAlive::Yes },
+        .compile = ExchangeBudget { .connect = knobs.connect,
+                                    .total = knobs.compileTotal,
+                                    .idle = knobs.compileIdle,
+                                    .keepAlive = KeepAlive::Yes },
     };
 }
 

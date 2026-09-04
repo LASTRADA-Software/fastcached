@@ -617,6 +617,40 @@ class IFrameResponder
     /// @return The counter to raise when the peer is found gone, or nullopt not to
     ///         watch @p opRaw at all.
     [[nodiscard]] virtual std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t opRaw) const noexcept = 0;
+
+    /// How often this surface pulses `Status::Progress` while answering @p opRaw, or
+    /// nullopt not to pulse it at all.
+    ///
+    /// **The liveness signal a long verb owes its client**
+    /// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)). A client
+    /// bounds a dispatched compile with one flat deadline, which has to be as long as
+    /// the slowest translation unit anybody compiles -- so that same number is how long
+    /// a worker whose process has stopped making progress goes unnoticed. TCP keepalive
+    /// answers the case where the HOST goes away and cannot see the case where the
+    /// kernel answers every probe while nothing above it does. Only a periodic *I am
+    /// still here* separates the two, and only the party doing the work can send it.
+    ///
+    /// **Per verb, and answered by the SURFACE, for `PeerWatchCounter`'s reason**: the
+    /// endpoint owns *when* -- it holds the socket and it is the only writer on it --
+    /// and the surface owns *whether this verb is the kind of work worth reporting on*.
+    /// Every verb here but `Compile` is answered from a table in microseconds, so a
+    /// pulse on one would be a frame no client could ever observe and a second reply
+    /// shape every reader would have to handle for nothing.
+    ///
+    /// **An interval, not a bool**, because the number has to agree with the client's
+    /// idle bound: they measure one silence from opposite sides. Neither end can pick
+    /// its own without describing a fleet the other is not running, which is why both
+    /// values sit in `CompileCacheWire` with the relation between them asserted there.
+    ///
+    /// Pure virtual for the reason every question above it is: a surface that says
+    /// nothing would inherit an answer, and inheriting *pulse* would put a frame on a
+    /// wire whose client has no reason to expect one.
+    ///
+    /// @param opRaw The third header byte, as received; not necessarily a known verb.
+    /// @return How long between pulses, or nullopt not to pulse @p opRaw at all. A
+    ///         non-positive interval is treated as nullopt, the same way every ceiling
+    ///         in this tree spells *no bound*.
+    [[nodiscard]] virtual std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t opRaw) const noexcept = 0;
 };
 
 /// Accepts connections and answers framed requests on each until the peer stops.

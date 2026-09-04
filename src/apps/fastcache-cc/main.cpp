@@ -31,6 +31,12 @@
 //                        worker (default 600000; 0 = unbounded). Separate from the
 //                        one above because a compile is bounded by how long a
 //                        compiler runs, not by a round trip (#223).
+//   FASTCACHE_DISPATCH_IDLE_MS
+//                        deadline in ms on SILENCE during that exchange (default
+//                        30000; 0 = unbounded). A running compile pulses at its
+//                        client every few seconds, so this bounds how long the
+//                        worker may say NOTHING -- the one failure keepalive
+//                        cannot see (#245).
 //
 // The statistics log is located from the usual per-user state variables rather
 // than one of our own: LOCALAPPDATA on Windows, else XDG_STATE_HOME or HOME.
@@ -178,6 +184,14 @@ struct Config
     /// `ioTimeout` because the two are different shapes of conversation and one
     /// number served neither (#223).
     std::chrono::milliseconds dispatchTimeout { Cc::DefaultDispatchTotal };
+
+    /// How long a dispatched compile may go SILENT before this client gives up.
+    ///
+    /// Separate from `dispatchTimeout` because they bound different things: that one
+    /// is how slow a compile may legitimately be, this one is how long a worker may
+    /// say nothing. Only the second can be short, and only since the worker pulses
+    /// (#245).
+    std::chrono::milliseconds dispatchIdle { Cc::DefaultDispatchIdle };
     std::chrono::milliseconds connectTimeout { DefaultConnectTimeout };
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
@@ -283,6 +297,7 @@ struct Config
     c.verifyRate = Cc::ParseVerificationRate(EnvOr(Cc::EnvName::Verify, ""));
     c.ioTimeout = EnvMillis(Cc::EnvName::TimeoutMs, DefaultIoTimeout);
     c.dispatchTimeout = EnvMillis(Cc::EnvName::DispatchTimeoutMs, Cc::DefaultDispatchTotal);
+    c.dispatchIdle = EnvMillis(Cc::EnvName::DispatchIdleMs, Cc::DefaultDispatchIdle);
     c.connectTimeout = EnvMillis(Cc::EnvName::ConnectTimeoutMs, DefaultConnectTimeout);
     // A username without a token is not a credential, and `Credential::Configured`
     // keys on the secret alone — so an operator who sets only FASTCACHE_USER gets
@@ -971,8 +986,10 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// @return The budgets.
 [[nodiscard]] Cc::DispatchBudgets DispatchBudgetsOf(Config const& cfg)
 {
-    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs {
-        .connect = cfg.connectTimeout, .controlTotal = cfg.ioTimeout, .compileTotal = cfg.dispatchTimeout });
+    return Cc::DispatchBudgetsFor(Cc::DispatchBudgetKnobs { .connect = cfg.connectTimeout,
+                                                            .controlTotal = cfg.ioTimeout,
+                                                            .compileTotal = cfg.dispatchTimeout,
+                                                            .compileIdle = cfg.dispatchIdle });
 }
 
 /// The deadlines this invocation runs every cache exchange under.

@@ -168,6 +168,23 @@ class NamedResponder final: public IFrameResponder
         _watchPeer = counter;
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Settable per fake, for the reason `PeerWatchCounter` above is: what
+    /// `MergedResponder` must do with this is ROUTE it, and a routing test needs the
+    /// fakes to answer differently from each other.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        return _progress;
+    }
+
+    /// Say how often this fake pulses, or that it does not.
+    /// @param interval What `ProgressInterval` should answer.
+    void SetProgressInterval(std::optional<std::chrono::milliseconds> interval) noexcept
+    {
+        _progress = interval;
+    }
+
     /// Claim, or stop claiming, that this fake accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -219,6 +236,7 @@ class NamedResponder final: public IFrameResponder
     std::size_t _maxInFlight { 4096 };
     bool _ownBudget { false };
     std::optional<IMetricsSink::Counter> _watchPeer {};
+    std::optional<std::chrono::milliseconds> _progress {};
     std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
     // Mutable because the three predicates recording into them are `const`: a
     // predicate that counted how often it was asked would otherwise have to look like
@@ -330,6 +348,36 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
 
     CHECK(cache.Answered().size() == 2);
     CHECK(scheduler.Answered().size() == 4);
+}
+
+TEST_CASE("A progress cadence is routed to the surface that does the slow work", "[node][merged-responder][progress]")
+{
+    // Assert the wiring, for the reason the peer-watch case below states. Whether a verb
+    // is slow enough to owe its client a liveness signal is a property of the VERB and
+    // of the surface doing its work -- and a merged listener that folded or hard-coded
+    // the answer would either pulse at a client reading a cache reply, which is a frame
+    // that verb's status table does not even admit, or pulse at nobody on the one
+    // surface that needs it (#245).
+    NamedResponder cache { "cache" };
+    NamedResponder scheduler { "scheduler" };
+    NamedResponder compile { "compile" };
+    compile.SetProgressInterval(std::chrono::milliseconds { 250 });
+
+    MergedResponder responder { &cache, &scheduler, &compile };
+
+    CHECK(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Compile))
+          == std::optional { std::chrono::milliseconds { 250 } });
+
+    // And nowhere else. Both directions, because a router that answered the compile
+    // surface's cadence for every verb would pass an assertion about `Op::Compile`
+    // alone.
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Fetch)).has_value());
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Store)).has_value());
+    CHECK_FALSE(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
+
+    // A verb nobody owns is not pulsed. Unreachable -- `RefusePeer` has already refused
+    // it -- and not-pulsing is the answer that changes nothing.
+    CHECK_FALSE(responder.ProgressInterval(0xEE).has_value());
 }
 
 TEST_CASE("A peer watch is routed to the surface whose work it would abandon", "[node][merged-responder][peerwatch]")

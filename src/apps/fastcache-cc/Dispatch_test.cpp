@@ -449,10 +449,12 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     constexpr std::chrono::milliseconds Connect { 1'000 };
     constexpr std::chrono::milliseconds ControlTotal { 10'000 };
     constexpr std::chrono::milliseconds CompileTotal { 600'000 };
+    constexpr std::chrono::milliseconds CompileIdle { 30'000 };
     static_assert(ControlTotal != CompileTotal, "the totals must differ, or a swap passes on symmetry");
+    static_assert(CompileIdle != CompileTotal, "and the idle bound must differ from the total, for the same reason");
 
-    auto const budgets = DispatchBudgetsFor(
-        DispatchBudgetKnobs { .connect = Connect, .controlTotal = ControlTotal, .compileTotal = CompileTotal });
+    auto const budgets = DispatchBudgetsFor(DispatchBudgetKnobs {
+        .connect = Connect, .controlTotal = ControlTotal, .compileTotal = CompileTotal, .compileIdle = CompileIdle });
 
     CHECK(budgets.compile.keepAlive == KeepAlive::Yes);
     CHECK(budgets.control.keepAlive == KeepAlive::No);
@@ -463,6 +465,18 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     CHECK(budgets.compile.total == CompileTotal);
     CHECK(budgets.control.connect == Connect);
     CHECK(budgets.compile.connect == Connect);
+
+    // **The idle bound is the compile leg's alone, and that is a third field on which
+    // the two legs differ** (#245). A cache round trip and a scheduler round trip are
+    // bounded by a round trip, so there is nothing for them to pulse and an idle bound
+    // there would be a second name for the total. A dispatched compile is bounded by how
+    // long a compiler runs, and its worker says `Status::Progress` while it works -- so
+    // silence is what the client can measure, and it can measure it in seconds against
+    // a total that has to stay minutes.
+    CHECK(budgets.compile.idle == CompileIdle);
+    CHECK(budgets.compile.BoundsIdle());
+    CHECK(budgets.control.idle == std::chrono::milliseconds::zero());
+    CHECK_FALSE(budgets.control.BoundsIdle());
 
     // And it survives the trip to the exchange. Asserting the struct alone would let
     // a dispatch that hands the control budget to the worker pass, which is #223 in
@@ -479,6 +493,14 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     CHECK(fleet.Budgets()[0].keepAlive == KeepAlive::No);
     CHECK(fleet.Budgets()[1].keepAlive == KeepAlive::Yes);
     CHECK(fleet.Budgets()[2].keepAlive == KeepAlive::No);
+
+    // And so does the idle bound, for the reason keepalive is checked here as well as
+    // on the struct: a derivation that fills the field correctly and hands the control
+    // budget to the worker is the same function getting the same job wrong, and #247
+    // is exactly what a budget that never reached its exchange looked like.
+    CHECK(fleet.Budgets()[0].idle == std::chrono::milliseconds::zero());
+    CHECK(fleet.Budgets()[1].idle == CompileIdle);
+    CHECK(fleet.Budgets()[2].idle == std::chrono::milliseconds::zero());
 }
 
 TEST_CASE("A failing remote compile is a successful dispatch", "[dispatch]")

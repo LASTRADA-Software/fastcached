@@ -219,6 +219,31 @@ struct Fleet
     return reply;
 }
 
+/// The status of every whole frame in @p stream, in order.
+///
+/// Walks by the DECLARED length, which is the same traversal a real reader does, so a
+/// frame whose payload this does not understand cannot desynchronise it. A trailing
+/// partial frame is dropped rather than guessed at: an incomplete frame is not a status,
+/// and inventing one would let a truncated stream assert an ordering.
+/// @param stream Bytes the server wrote.
+/// @return One status per complete frame.
+[[nodiscard]] std::vector<Wire::Status> StatusSequence(std::span<std::byte const> stream)
+{
+    std::vector<Wire::Status> statuses;
+    while (stream.size() >= Wire::ReplyHeaderSize)
+    {
+        auto const header = Wire::DecodeReplyHeader(stream);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::ReplyHeaderSize + std::size_t { header->payloadLength };
+        if (stream.size() < whole)
+            break;
+        statuses.push_back(header->status);
+        stream = stream.subspan(whole);
+    }
+    return statuses;
+}
+
 /// How long a case waits for something the reactor still owes it.
 ///
 /// Bounded, and every use says what it waited for -- `.agent/rules/testing.md`.
@@ -778,6 +803,25 @@ class HoldableResponder final: public IFrameResponder
         _watchPeer.store(watch, std::memory_order_release);
     }
 
+    /// @copydoc IFrameResponder::ProgressInterval
+    ///
+    /// Off by default, so every case written before #245 keeps asserting what it did:
+    /// a pulse puts extra frames in front of the reply, and a reader expecting exactly
+    /// one would see them. A case that turns it on is standing in for
+    /// `CompileResponder`, the one surface that pulses in production.
+    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
+    {
+        auto const millis = _progressMs.load(std::memory_order_acquire);
+        return millis > 0 ? std::optional { std::chrono::milliseconds { millis } } : std::nullopt;
+    }
+
+    /// Pulse, or stop pulsing, while answering.
+    /// @param interval What `ProgressInterval` should answer; zero for nothing.
+    void PulseWhileAnswering(std::chrono::milliseconds interval) noexcept
+    {
+        _progressMs.store(interval.count(), std::memory_order_release);
+    }
+
     /// Claim, or stop claiming, that this surface accounts for its own request bytes.
     /// @param own What `HoldsOwnByteBudget` should answer.
     void ClaimOwnByteBudget(bool own) noexcept
@@ -940,6 +984,11 @@ class HoldableResponder final: public IFrameResponder
     std::size_t _budget { 0 };
     std::atomic<bool> _ownBudget { false };
     std::atomic<bool> _watchPeer { false };
+
+    /// How often to pulse, in milliseconds; 0 means never. Stored as the count rather
+    /// than as a `milliseconds` because `std::atomic` wants a trivially copyable
+    /// arithmetic type to be lock-free on every platform this builds for.
+    std::atomic<std::chrono::milliseconds::rep> _progressMs { 0 };
     FrameEndpoint const* _endpoint { nullptr };
     std::atomic<std::size_t> _inFlightAtEntry { 0 };
     /// Separate from the figure, because zero is a legitimate reading and "never
@@ -2217,6 +2266,95 @@ TEST_CASE("A watched answer to a client that simply waits is delivered whole", "
     REQUIRE_FALSE(reply.empty());
     CHECK(Unwrap(Wire::DecodeReplyHeader(reply)).status == Wire::Status::Miss);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+TEST_CASE("A pulsed answer is preceded by pulses and ends with the reply", "[node][frame][progress]")
+{
+    // **The endpoint's half of #245, with no compiler and no worker in the case.** The
+    // pulse and the peer watch are mirror images: the watch reads while the responder
+    // answers, this writes, and both exist because `ServeConnection` is suspended inside
+    // `Answer` and can do neither itself.
+    //
+    // The whole byte stream is accounted for rather than one framed reply, for the
+    // reason `ReadUntilPeerCloses` states: reading one reply cannot see a frame spliced
+    // in behind it, and "the reply parsed" is exactly what an interleaved write passes.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    constexpr auto Interval = 20ms;
+    responder.PulseWhileAnswering(Interval);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-while-the-pulse-runs")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // Several intervals, so what is asserted is a CADENCE rather than one frame that
+    // could have been an accident of scheduling.
+    std::this_thread::sleep_for(Interval * 8);
+    responder.Hold(false);
+
+    auto const stream = client.ReadRest();
+    REQUIRE_FALSE(stream.empty());
+    auto const statuses = StatusSequence(stream);
+    INFO("frames: " << statuses.size());
+
+    // At least one pulse AND the reply, or the two claims below say nothing: with one
+    // frame the last IS the reply and the run before it is empty, so a build that never
+    // pulsed would pass an ordering test about pulses.
+    REQUIRE(statuses.size() >= 2);
+    CHECK(statuses.back() == Wire::Status::Miss);
+    CHECK(std::ranges::all_of(std::span { statuses }.first(statuses.size() - 1),
+                              [](Wire::Status status) { return status == Wire::Status::Progress; }));
+
+    // **And every byte is accounted for.** A pulse is five bytes and a `Miss` is five
+    // bytes, so an exact tiling is the claim that nothing was spliced between the frames
+    // -- which is what two writers on one socket produces and what "the reply parsed"
+    // cannot see. `StatusSequence` drops a trailing partial frame, so a stream with
+    // stray bytes on the end is longer than its frames and this is where that shows.
+    CHECK(stream.size() == statuses.size() * Wire::ReplyHeaderSize);
+}
+
+TEST_CASE("A surface that asks for no pulse writes exactly one frame", "[node][frame][progress]")
+{
+    // The control, and it is not decoration: without it "pulses while answering" and
+    // "writes extra frames unconditionally" are the same passing test. Every surface but
+    // the compile one answers `ProgressInterval` with nothing, and `Status::Progress` is
+    // not even legal on their verbs -- so a frame here would be one their clients would
+    // refuse.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    // Left off, which is what `ProgressInterval` answers for every surface but the
+    // compile one.
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-and-never-pulsed")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // The same wall-clock hold the case above uses, so the difference between them is
+    // the cadence and not the timing.
+    std::this_thread::sleep_for(160ms);
+    responder.Hold(false);
+
+    auto const stream = client.ReadRest();
+    auto const statuses = StatusSequence(stream);
+    INFO("frames: " << statuses.size());
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses.front() == Wire::Status::Miss);
 }
 
 TEST_CASE("A surface that asks for no peer watch keeps its connection across requests", "[node][frame][peerwatch]")

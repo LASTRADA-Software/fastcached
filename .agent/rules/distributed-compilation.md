@@ -550,9 +550,68 @@ Consequences that are each load-bearing:
     slow compile is nonetheless the only choice the *number* has: sizing for the dead
     worker is the defect above, reintroduced. TCP keepalive with real intervals on
     the dispatch socket answers the dead HOST in ~16 s (Linux, macOS) or ~30 s
-    (Windows) with the total untouched (#247), and what is left for a periodic
-    progress frame (#245) is the one row keepalive cannot reach: a kernel that
-    answers the probes while the process makes no progress.
+    (Windows) with the total untouched (#247), and the one row keepalive cannot reach
+    -- a kernel that answers the probes while the process makes no progress -- is now
+    the worker's own `Status::Progress` pulse (#245).
+  - **Silence is only measurable against something that would otherwise be said, so
+    the fix is a WIRE change and not a client-side heuristic.** A worker writes a
+    five-byte pulse every `DefaultProgressInterval` while a compile runs, and the
+    client stops measuring *how long this compile has taken* -- which must stay
+    minutes -- and starts measuring *how long since the worker last said anything*,
+    which is `DefaultCompileIdleTimeout` and is thirty seconds. Four things about it
+    are load-bearing:
+    - **Both numbers live in `CompileCacheWire`, and the RELATION between them is
+      `static_assert`ed.** They bound one silence from opposite sides, exactly as
+      `DefaultCompileLeaseTimeout` does, so neither end can pick its own without
+      describing a fleet the other end is not running -- and the launcher links none
+      of the library, so that header is the only place both can look. An idle bound at
+      or below the cadence refuses a healthy worker on the ordinary jitter of its own
+      reactor, which reads as a fleet that has stopped working; the assertion is what
+      stops the next retune from spelling that.
+    - **The pulse says NOTHING about the compile, and the encoder takes no argument
+      so there is nothing to put in it.** A liveness signal carrying partial
+      diagnostics would be a second, racy channel for output the result frame already
+      carries whole -- two sources for one fact, differing by however much of the
+      compile had happened when each was written. A receiver still DRAINS the declared
+      length rather than asserting it is zero, so a later version that says something
+      there cannot desynchronise a reader that ignores it.
+    - **`MinSupportedVersion` moved WITH `CurrentVersion`, and that is the negotiation.**
+      The issue's premise -- that the framing already lets a receiver step over what it
+      does not know -- is **request-side only**: a reply carries a status byte and a
+      length and no kind, so `DecodeReplyHeader` refuses an unknown status outright and
+      the launcher turns that into a transport failure. Leaving the range open would buy
+      a mixed fleet that fails several minutes into a translation unit, naming nothing;
+      refusing the older request is `UnsupportedVersion`, which names the range that
+      would have worked and arrives before a byte of source is sent. It also makes the
+      capability implied by the version, so nothing has to remember a per-connection
+      flag. Compatibility on this wire is not owed (#332).
+    - **A pulse is a SECOND writer on the socket for the length of the answer, and the
+      endpoint hands the socket back before it writes anything.** `ServeConnection` is
+      the only writer by construction; while the responder answers it writes nothing, so
+      the pulse takes over, and `SettlePulse` is where that stops being true. A reply
+      written over a pulse still suspended inside `Write` is two writes sharing one
+      write-op slot -- the same family as the READ slot's #663, reached from the other
+      direction -- and it does not fail loudly, it splices five bytes into an object
+      file. A pulse still parked past the bound therefore ENDS the connection, which is
+      `SettleWatch`'s rule applied to the write side, and the `break` falling through to
+      `Close()` is the only cancellation a parked write has. It is bounded and ordinarily
+      costs one step, because the pulse wakes on a clock this side owns rather than on
+      the peer.
+      - **And nothing asserts it, which is the asymmetry to know about.** #663 put
+        `Detail::ClaimReadSlot` on the READ slot, so double-arming that one dies in a
+        Debug build naming itself; there is no `ClaimWriteSlot`, so the write slot is
+        exactly as shared and entirely silent. A reader arriving from #663 would
+        reasonably assume symmetry and there is none: `ReclaimFromPulse` is the whole
+        guarantee here, and the ordering test is the only thing that would notice it
+        going away.
+    - **A test that only watches the answer cannot see any of it.** Reading one framed
+      reply stops at the first terminal status, so a pulse emitted AFTER the reply -- what
+      a missing settle produces -- is invisible, and a case asserting "every frame but the
+      last is a pulse" passes VACUOUSLY on a build that pulses not at all, because with
+      one frame the run before the last is empty. So the ordering case reads to EOF,
+      requires at least two frames, and there is a control on a surface that pulses
+      nothing. Both were observed: a counterfactual that stopped the pulse left the
+      ordering case green until the size guard was added.
     - **A budget derived by copying another budget drops the field that made them
       different, and nothing here could see it.** `DispatchBudgetsOf` built the
       compile budget as `auto compile = control; compile.total = ...`, reasoning in a
@@ -2325,22 +2384,6 @@ only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
 
-- **[#245](https://github.com/LASTRADA-Software/fastcached/issues/245)** — a periodic
-  liveness frame from the worker, so an IDLE bound of seconds can sit under a TOTAL
-  that stays long. Its scope is now much smaller than the issue text, and two of its
-  own premises no longer hold. The wasted-object half is #662/#669's, taken with no
-  wire change; the dead-HOST half is #247's keepalive, once the launcher actually
-  arms it. What remains is one row — a machine whose kernel answers the probes while
-  the worker process makes no progress toward a reply — and it is worth measuring
-  against the alternative before a frame is designed, since a wedged *compiler* is
-  #239's deadline and a healthy reactor would pulse straight through it. The issue
-  also asserts that "`CompileCacheWire`'s framing already lets a receiver step over a
-  frame it does not know", which makes it shippable into a mixed fleet; that property
-  is **request-side only**. A reply carries a status byte and a length and no kind,
-  `DecodeReplyHeader` hard-rejects a status outside `{Miss, Ok, Error}`, and the
-  launcher turns that rejection into a transport failure — so a deployed launcher
-  meeting a progress frame abandons the compile rather than degrading. Any design
-  starts by costing the negotiation that premise assumed away.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was
