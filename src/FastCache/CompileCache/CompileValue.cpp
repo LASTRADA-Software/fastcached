@@ -278,29 +278,37 @@ std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byt
     // So a foreign generation is reported only for a frame that HOLDS TOGETHER behind
     // the byte: positive evidence, rather than the absence of ours.
     //
-    // The residual is real and its first description here was BACKWARDS. A future
-    // generation that moves the FRAMING as well parses as junk and comes back
-    // `NotACompileValue` -- and a node's tier handles that by storing the bytes
-    // VERBATIM, so the residual re-enters through the exact door this closes, for the
-    // class of bump most likely to cause it. `CompileValueVersion` names the framing
-    // too, and nothing couples it to an `objkey-v*` bump, so two such generations do
-    // meet over one key by design. Nothing in this build can separate an unknown
-    // layout from junk, so it is bounded rather than closed, and the bounds are worth
-    // naming because they are what makes it survivable: the daemon refuses
-    // `NotACompileValue` outright, so `RemoteUpstream::Store` cannot carry it to the
-    // SHARED cache, and a node's tier is loopback-only -- one machine's own build
-    // output, not the fleet's. Tracked rather than left in prose.
+    // A frame that HOLDS TOGETHER behind a foreign byte is one kind of positive
+    // evidence. `MaxCompileValueGeneration` is the other, and it is what closed the
+    // residual this comment used to describe (#552): a future generation that moves
+    // the FRAMING as well parses as junk, so evidence-from-layout cannot see it, and
+    // a node's tier stores what it cannot decode VERBATIM -- putting the producing
+    // checkout's absolute paths under a key every machine computes, which is #229
+    // arriving through the very door #483 closed. The class of bump most likely to
+    // cause it, too, since `CompileValueVersion` names the framing and nothing
+    // couples it to an `objkey-v*` bump.
     //
-    // The generation that keeps the framing and moves the canonicalization -- the
-    // shape #547 will have -- is caught exactly.
+    // So the reserved leading-byte range decides that case, and the ORDER of the two
+    // tests below is the whole of it: a byte inside the range is a stored value of
+    // some generation whether or not this build can parse the rest, and only a byte
+    // OUTSIDE it is the opaque blob the tier's verbatim policy is for. The contract
+    // and what it costs are on `MaxCompileValueGeneration`.
+    //
+    // Our OWN generation byte is answered first and separately. A frame stamped with
+    // it that does not parse is either damage or an opaque blob that happens to start
+    // with this number -- never a foreign generation, and reporting one would be a
+    // lie about which build wrote it.
     auto decoded = DecodeAfterGeneration(cursor);
     if (version == CompileValueVersion)
         return decoded;
     if (decoded.has_value())
         return ForeignGenerationRefusal(version);
-    return Malformed(std::format("leading byte {} is not this build's generation and the layout behind it does not "
-                                 "hold, so these bytes are not a stored value",
-                                 version));
+    if (version >= 1 && version <= MaxCompileValueGeneration)
+        return ForeignGenerationRefusal(version);
+    return Malformed(std::format("leading byte {} is outside the reserved compile-value generation range 1-{}, so "
+                                 "these bytes are not a stored value",
+                                 version,
+                                 MaxCompileValueGeneration));
 }
 
 StoredValueCanonicalization CanonicalStoredValue(std::span<std::byte const> value,

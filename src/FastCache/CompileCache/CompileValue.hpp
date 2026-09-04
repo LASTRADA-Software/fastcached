@@ -62,6 +62,51 @@ namespace FastCache
 /// and only the localization moved.
 inline constexpr std::uint8_t CompileValueVersion = 2;
 
+/// The highest leading byte that will ever name a compile-value generation.
+///
+/// **A contract on the byte space, and it is what makes an unimplemented FRAMING
+/// distinguishable from bytes that are not a compile value at all** (#552).
+///
+/// #483 refuses a value from a generation this build does not implement instead of
+/// storing it verbatim -- but only when the frame behind the leading byte still
+/// HOLDS TOGETHER, because that is the only positive evidence a build has that it is
+/// looking at a stored value. `CompileValueVersion` names the framing as well as the
+/// canonicalization spec, and nothing couples it to an `objkey-v*` bump, so "a future
+/// generation moved the framing too" is an ordinary future event. Such a value parses
+/// as junk, and a node's cache tier stores what it cannot decode VERBATIM -- so the
+/// value's producing checkout's absolute paths land under a key every machine
+/// computes, which is #229 arriving through the door #483 closed.
+///
+/// A bounded reserved range breaks the tie without guessing. A leading byte inside it
+/// is a compile value of SOME generation whether or not this build can parse the rest;
+/// a leading byte outside it is not a compile value, and the tier's verbatim policy --
+/// which this layer has no business overturning -- still applies.
+///
+/// **What it costs, stated rather than discovered.** An opaque value whose first byte
+/// falls in `[1, 15]` is now refused where it used to be stored. That is deliberate
+/// and it is the safe direction: a wrong refusal costs a miss and a recompile, while a
+/// wrong verbatim store is a silent wrong answer served under a correct-looking key --
+/// the asymmetry `AGENT.md` states for caching generally. The range is kept small
+/// because the opposite mistake has already shipped once: reading "not our leading
+/// byte" as evidence of another generation refused EVERY opaque value, since almost
+/// none begins with `0x01`.
+///
+/// Measured, so the cost is a fact and not a hope. No object-file format this cache
+/// stores begins in the reserved range: ELF `0x7F`, PE/COFF `0x4D`, COFF x86-64
+/// `0x64`, Mach-O `0xCE`/`0xCF`/`0xFE`, `ar` `0x21`. Nor does the opaque value the
+/// node tier's own verbatim test uses, which begins `'n'` (`0x6E`).
+///
+/// 15 rather than a larger bound because generations are allocated sequentially by
+/// this project and thirteen unused numbers is more headroom than the format has
+/// consumed in its whole life. The `static_assert` below is what stops a future bump
+/// leaving the range silently: growing past it is a decision about the byte space,
+/// not a version increment.
+inline constexpr std::uint8_t MaxCompileValueGeneration = 15;
+
+static_assert(CompileValueVersion >= 1 && CompileValueVersion <= MaxCompileValueGeneration,
+              "a compile-value generation must sit inside the reserved leading-byte range, or a build one "
+              "generation older cannot tell this value from an opaque blob and will store it verbatim (#552)");
+
 /// One captured compiler text stream (e.g. stdout carrying `/showIncludes`, or
 /// stderr carrying diagnostics), tagged with the grammar that locates path
 /// spans within it. The server canonicalizes each region's `bytes`; the object
