@@ -17,6 +17,7 @@
 // it can be observed.
 
 #include <FastCache/Async/PlatformReactor.hpp>
+#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -77,6 +78,18 @@ DetachedTask ServeOneRespSession(
     co_await handler.Run(socket.get(), engine, /*primer*/ {}, session);
 
     socket->Close();
+
+    // **Drain before stopping, the way a real server does by simply continuing to
+    // run.** `Run`'s cleanup calls `ShutdownWatcher`, which wakes the readable
+    // watcher through `IReactor::Submit` -- and a submitted handle on a reactor that
+    // has already stopped is never resumed, so the watcher's coroutine frame leaks.
+    // LeakSanitizer reported exactly that (1120 bytes in 6 allocations) the first
+    // time this fixture ran under the ASan gate, and it is the FIXTURE's defect
+    // rather than the session's: a daemon's reactor keeps running, so the same
+    // resumption lands. One hop puts this continuation behind whatever cleanup
+    // queued, so those run first.
+    co_await ResumeOn { *reactor };
+
     ended->store(true, std::memory_order_release);
     reactor->Stop();
 }
