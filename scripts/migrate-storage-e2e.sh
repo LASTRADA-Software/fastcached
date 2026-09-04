@@ -33,7 +33,16 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-fail() { echo "migrate-storage E2E FAILED: $*" >&2; exit 1; }
+# The shared helpers, for `fail` and for `free_port`. The whole argument for the
+# port range -- why a connect probe cannot see a port held as an OUTBOUND
+# connection's local endpoint, why the issued-port ledger is a FILE, and why the
+# range stops below the kernel's ephemeral range -- is above `free_port` in
+# `lib/e2e-common.sh`, in full rather than in this fixture's abbreviation of it.
+#
+# `e2e_begin` also installs the TERM trap that turns a `fail` raised inside a
+# subshell into an ordinary exit, so the EXIT trap above still runs.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+e2e_begin "migrate-storage E2E" "$WORK"
 
 # EVERY invocation names this file. Without it the daemon would find whatever
 # machine-wide config the host has, and on a developer box with a real
@@ -45,19 +54,19 @@ EMPTY_CONFIG="$WORK/empty.yaml"
 
 fc() { "$FASTCACHED" --config "$EMPTY_CONFIG" "$@"; }
 
-# A free TCP port, in bash: the repo's own idiom, so the fixture needs no
-# interpreter beyond the shell it is already written in.
-port() {
-    local p
-    for _ in $(seq 1 50); do
-        p=$(( (RANDOM % 20000) + 40000 ))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-            echo "$p"
-            return 0
-        fi
-        exec 3<&- 2>/dev/null
-    done
-    return 1
+# The condition `create_store` waits on, as a predicate rather than a loop body.
+#
+# `wait_until` calls this by NAME and passes nothing, so the two things it needs
+# arrive in variables the caller sets. `_stores_seen` is written here and read
+# afterwards, which works only because `wait_until` runs the predicate in THIS
+# shell; a command substitution would put it in a subshell and the count would be
+# gone the moment it returned -- the same reason the shared port ledger is a FILE.
+_stores_watch=""
+_stores_expected=0
+_stores_seen=0
+_stores_ready() {
+    _stores_seen="$(find "$_stores_watch" -name '*.cow' 2>/dev/null | wc -l)"
+    [[ "$_stores_seen" -ge "$_stores_expected" ]]
 }
 
 # Start the daemon just long enough for it to create its store(s), then stop it.
@@ -69,7 +78,7 @@ create_store() {
     local watch="$1"; shift
     local expected="$1"; shift
     local p
-    p="$(port)" || fail "could not allocate a port"
+    p="$(free_port)"
 
     # The binary directly, never the `fc` wrapper: backgrounding a shell
     # FUNCTION makes $! the subshell rather than the daemon, so the kill below
@@ -92,29 +101,34 @@ create_store() {
     # caller asserts. A guard may wait for a condition STRONGER than the
     # assertion, never a weaker one.
     #
-    # Bounded at 10 s still, and the daemon's own liveness is checked each pass:
-    # one that dies at startup would otherwise present as a ten-second wait for a
-    # file, which names the wrong problem entirely.
-    local waited=0
-    local seen=0
-    while [[ $waited -lt 100 ]]; do
-        seen="$(find "$watch" -name '*.cow' 2>/dev/null | wc -l)"
-        [[ "$seen" -ge "$expected" ]] && break
-        kill -0 "$pid" 2>/dev/null \
-            || fail "the daemon exited after creating $seen of $expected store(s) under $watch"
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-
-    # Re-counted rather than trusting the loop to have exited for the right
-    # reason: running out of iterations and reaching the count are the same exit
-    # from the `while`, so without this a timeout would return quietly and hand
-    # the caller a half-built store to assert against -- a fixture timing out
-    # INTO a pass, which is the shape this file exists to not have.
-    seen="$(find "$watch" -name '*.cow' 2>/dev/null | wc -l)"
-    [[ "$seen" -ge "$expected" ]] \
-        || { kill "$pid" 2>/dev/null
-             fail "waited 10s for $expected store file(s) under $watch and saw $seen"; }
+    # `wait_until` rather than a fourth hand-rolled poll (#628). What that buys
+    # here, beyond one copy fewer:
+    #
+    #   * The bound is 10 SECONDS rather than 100 iterations. The loop this
+    #     replaces asked for 100 x `sleep 0.1` and called it 10 s, which it never
+    #     was -- each pass also ran a `find` and a `kill -0`, so the real budget
+    #     was 10 s plus whatever those cost, on that machine, that time. A budget
+    #     nobody can state is one nobody can tune.
+    #   * Expiry FAILS rather than falling out of the loop. The re-count that
+    #     used to follow this existed only because running out of iterations and
+    #     reaching the count were the same exit from a `while` -- a fixture
+    #     timing out INTO a pass. It is gone because the shape that needed it is.
+    #   * A death is reported when it is NOTICED and says the process died, with
+    #     its exit status, rather than reading as a slow machine.
+    #   * The cost of a successful wait is printed, so this budget can be set
+    #     from data rather than guessed at generously. Measured: 0s and 1s for
+    #     the one-file and four-shard callers, against the 10 s budget.
+    #
+    # The log argument is `-`, and that is a decision rather than an omission: it
+    # means an expiry here can only ever report INCONCLUSIVE, since log growth is
+    # the signal that separates slow from stuck. The daemon's output goes to this
+    # fixture's own stdout, where CI already shows it -- capturing it to a file to
+    # feed the verdict would take it out of the visible run to put it in a dump
+    # that only prints on failure. A death is still reported exactly, because the
+    # pid IS passed.
+    _stores_watch="$watch"
+    _stores_expected="$expected"
+    wait_until _stores_ready "$expected store file(s) under $watch" "$pid" - 10
 
     # The store file exists before the daemon has finished writing it, and this
     # is still a fixed sleep because it stands for a different condition than the
