@@ -2858,6 +2858,33 @@ wrong move: the caveat rule is right and the prose was wrong.
   context is read as passing. The `name:` is a wire constant; renaming it renames
   a required context.
 - **No new job**, for `check-release-gate`'s reason above.
+- **A check that reads BOTH SIDES is the answer when a diagnostic is unreachable
+  by unit test.** `docs/operations/corrupt-store.md` quotes startup diagnostics
+  verbatim and exactly one of them was asserted anywhere (#633) — because the
+  daemon's `StorageOpenFailure` sits in an ANONYMOUS NAMESPACE in `main.cpp`,
+  behind `add_executable(fastcached main.cpp)` with no test target, and the node's
+  sentence is composed in a third file in a different binary. Asserting them by
+  unit test needs the app restructured; a `docs-subject` check reading the page
+  AND the composing sources needs no linkage at all, and covers both binaries.
+  The page's usefulness *is* that an operator recognises their own console output
+  in it, so the thing to pin is that the source can still compose what the page
+  shows.
+  - **Assert PRESENCE in the composing source, never equality with a formatted
+    line** — the latter is a change-detector that fails on every wording tweak,
+    which is what #633 exists to avoid. The shard sentence's field-level
+    assertion is the `'{}'` that carries the path.
+  - **The exception proves it rather than breaking it**: for the
+    `StorageError(code={} system={} context={})` rendering the WHOLE format string
+    is pinned, because that rendering *is* the verbatim quote. A change-detector
+    is exactly right where the literal is what moved onto the page.
+  - **A sentence composed in three places needs a per-FRAGMENT table, not a
+    per-sentence one.** The node's refusal is `--cache-dir {}` and
+    `cannot open {}` in `CacheTier.cpp` plus `refusing to start` in its own
+    `main.cpp`; a check reading only the tier misses the suffix and reports clean.
+  - And the set is derived from the PAGE, so **a quoted diagnostic no row covers
+    is REFUSED**, never passed over. An uncovered quote is precisely the silent
+    gap the check exists to close, and a table that quietly ignores one is the
+    check vouching for something it never read.
 - **The set is the `docs-subject` ctest LABEL**, read out of
   `src/tests/CMakeLists.txt` along with each check's `-D` arguments, its
   `SKIP_REGULAR_EXPRESSION` and the one `FASTCACHED_SCRIPT_CHECK_FAILED` spelling.
