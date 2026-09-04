@@ -1262,7 +1262,14 @@ void WriteWholeFile(std::filesystem::path const& path, std::span<std::byte const
 [[nodiscard]] std::expected<std::unique_ptr<FastCache::CowTreeStorage>, FastCache::StorageError> OpenDamaged(
     std::filesystem::path const& path)
 {
-    return FastCache::CowTreeStorage::Open({ .path = path, .pageSize = DamagePageSize });
+    // `Batched` is STATED rather than defaulted, even though it is the default.
+    // The meta-slot cases below assert an invariant that holds under `Batched`
+    // and is FALSE under `Fsync` -- so which durability this fixture builds is
+    // part of what those cases claim, and a fixture that inherited it would stop
+    // describing its own store the day the default moved, silently and while
+    // staying green.
+    return FastCache::CowTreeStorage::Open(
+        { .path = path, .durability = CowTree::FilePageStore::Durability::Batched, .pageSize = DamagePageSize });
 }
 
 /// Overwrite data page `id` of `store` with `page`.
@@ -1490,11 +1497,19 @@ namespace
 
 /// Byte the meta damage flips, as an offset inside an encoded meta page.
 ///
-/// Derived rather than chosen: it has to land in the CRC'd PAYLOAD -- the
-/// leading `MetaEncodedSize - sizeof(u32)` bytes -- and not in the trailing CRC
-/// itself, which would be damage the decoder recomputes agreement with. Half
-/// way into the encoded record is inside the payload for any layout the encoder
-/// can grow into, and `DamageMetaSlot` proves it for the layout in force.
+/// Derived rather than chosen: it has to land in the CRC'd PAYLOAD, the leading
+/// `MetaEncodedSize - sizeof(u32)` bytes. Half way into the encoded record is
+/// inside the payload for any layout the encoder can grow into, and
+/// `DamageMetaSlot` proves detection for the layout in force rather than
+/// trusting that arithmetic.
+///
+/// It is NOT chosen to avoid the trailing CRC word, which is the tempting
+/// reading and is wrong: `DecodeMeta` recomputes the CRC over the payload and
+/// compares it against the stored word, so flipping the STORED word leaves the
+/// recomputed one unchanged and the mismatch always fires -- measured `Corrupt`
+/// at both ends of it. The region nothing reads is the zero PADDING past
+/// `MetaEncodedSize`, where a flip decodes clean. Said out loud because the next
+/// fixture wanting damage a decoder cannot see would otherwise aim at the CRC.
 constexpr std::size_t MetaDamageOffset = CowTree::MetaEncodedSize / 2;
 
 /// Commit generations the meta-damage fixture writes, one per session.
@@ -1506,6 +1521,12 @@ constexpr std::size_t MetaDamageOffset = CowTree::MetaEncodedSize / 2;
 constexpr int MetaDamageGenerations = 2;
 
 /// Keys each generation writes.
+///
+/// More than one so a generation is not represented by a single record: at
+/// `MinPageSize` these are a leaf or two, and a lone key per generation would
+/// make every assertion below rest on which page that one key happened to land
+/// on. Five rather than fifty because the tree shape is not what is under test
+/// here -- the per-page damage sweep above is where that matters.
 constexpr int MetaDamageKeysPerGeneration = 5;
 
 /// Key `i` of generation `gen`.
@@ -1554,34 +1575,29 @@ constexpr int MetaDamageKeysPerGeneration = 5;
     return CowTree::DecodeMeta(CowTree::BytesView { page.data(), page.size() });
 }
 
-/// Which slot holds the newest commit of a store file read whole.
-///
-/// The same tie-break `FilePageStore::RecoverExistingFile` and `CowTree::Open`
-/// both apply -- the higher `txnId` among the slots that decode. Derived from
-/// the file rather than assumed, because which slot the alternation lands on
-/// depends on how many flushes happened, and a fixture that hard-coded one
-/// would silently stop damaging the live slot the day that changed.
-/// @param file The whole store file. Both slots must decode.
-/// @return The slot holding the newest commit.
-[[nodiscard]] CowTree::MetaSlot LiveSlot(std::span<std::byte const> file)
-{
-    auto const a = DecodeSlot(file, CowTree::MetaSlot::A);
-    auto const b = DecodeSlot(file, CowTree::MetaSlot::B);
-    REQUIRE(a.has_value());
-    REQUIRE(b.has_value());
-    return a->txnId >= b->txnId ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
-}
-
 /// Build a real store file at `path` carrying `MetaDamageGenerations` durable
-/// commit generations, one per session, and prove both meta slots ended up
-/// holding a real and DIFFERENT commit.
+/// commit generations, one per session, prove both meta slots ended up holding
+/// a real and DIFFERENT commit, and say which of them holds the newest.
 ///
 /// One session per generation because the default `Batched` durability buffers
 /// the meta until a flush boundary, and closing the store is the boundary this
 /// reaches: each session therefore contributes exactly one durable meta, to the
 /// slot the previous one did not use.
+///
+/// It RETURNS the live slot rather than leaving the caller to work it out. Both
+/// callers want it immediately, and the precondition check below has already
+/// read the file and decoded both slots -- so handing the answer back costs
+/// nothing, where returning `void` had every caller re-read the same bytes and
+/// re-run the same two decodes. That is the shape AGENT.md names under #259: a
+/// function that derived the answer, returned none of it, and left its caller
+/// deriving it again.
+///
+/// The tie-break is `>=`, which is what `RecoverExistingFile` and
+/// `CowTree::Open` both spell; the tie itself is unreachable, the two ids being
+/// asserted different immediately above it.
 /// @param path Where to build the store.
-void SeedTwoCommitGenerations(std::filesystem::path const& path)
+/// @return The slot holding the newest commit.
+[[nodiscard]] CowTree::MetaSlot SeedTwoCommitGenerations(std::filesystem::path const& path)
 {
     for (auto const gen: std::views::iota(1, MetaDamageGenerations + 1))
     {
@@ -1601,6 +1617,7 @@ void SeedTwoCommitGenerations(std::filesystem::path const& path)
     REQUIRE(a.has_value());
     REQUIRE(b.has_value());
     REQUIRE(a->txnId != b->txnId);
+    return a->txnId >= b->txnId ? CowTree::MetaSlot::A : CowTree::MetaSlot::B;
 }
 
 /// Flip one byte inside meta slot `slot` of the closed store file at `path`.
@@ -1676,30 +1693,30 @@ class CapturedStreams
     std::streambuf* _errWas;
 };
 
-/// One row of the surviving-slot table below.
-struct MetaDamageRow
-{
-    /// Damage the slot holding the NEWEST commit, rather than the older one.
-    bool damageLive;
-
-    /// Generations 1..this stay readable; anything above it is gone.
-    int highestReadableGeneration;
-
-    /// What the row is about, for `INFO`.
-    std::string_view what;
-};
-
 } // namespace
 
 TEST_CASE("One damaged meta slot leaves the store open, silent, and on the surviving slot's commit",
           "[cowstorage][open][corrupt][meta]")
 {
+    /// One row of the table below.
+    struct MetaDamageRow
+    {
+        bool damageLive;               ///< Damage the slot holding the NEWEST commit, not the older one.
+        int highestReadableGeneration; ///< Generations 1..this stay readable; anything above is gone.
+        std::string_view what;         ///< What the row is about, for `INFO`.
+    };
+
     // Two rows rather than one, because they fail differently and only the pair
     // says the SURVIVING slot was chosen. Damage the live slot alone and a build
     // that always picked the older valid slot would pass; damage the stale slot
     // alone and one that always picked the newer would. Neither is a strawman --
     // both are one comparison operator away from what `RecoverExistingFile` and
     // `CowTree::Open` each write out separately.
+    //
+    // `highestReadableGeneration` is stated rather than derived from
+    // `damageLive`. The formula is trivial, and that is the problem: deriving
+    // the expectation from the discriminator makes the assertion agree with
+    // itself whatever the code does.
     auto const rows = std::vector<MetaDamageRow> {
         { .damageLive = false,
           .highestReadableGeneration = MetaDamageGenerations,
@@ -1713,12 +1730,10 @@ TEST_CASE("One damaged meta slot leaves the store open, silent, and on the survi
     {
         INFO(row.what);
         TempFile tmp;
-        SeedTwoCommitGenerations(tmp.path);
-
-        auto const live = LiveSlot(ReadWholeFile(tmp.path));
-        auto const target = row.damageLive ? live : OtherSlot(live);
-        CAPTURE(SlotName(target));
-        DamageMetaSlot(tmp.path, target);
+        auto const live = SeedTwoCommitGenerations(tmp.path);
+        auto const damaged = row.damageLive ? live : OtherSlot(live);
+        CAPTURE(SlotName(damaged));
+        DamageMetaSlot(tmp.path, damaged);
 
         // Only the open is inside the capture. A Catch2 assertion failing in
         // here would write its own report into the buffers and lose it.
@@ -1764,16 +1779,23 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
     // `FlushBatchLocked` maintains in normal running, asked of the one state
     // where getting it wrong is unrecoverable rather than merely wasteful.
     //
-    // Nothing else asks it: every case above stops at "the store opened", and a
-    // build that recovered correctly and then overwrote the good slot passes
-    // all of them.
+    // Every case above stops at "the store opened", and a build that recovered
+    // correctly and then overwrote the good slot passes all of them.
+    //
+    // Scoped to `Batched`, which `OpenDamaged` takes and which is the default,
+    // and the scope is ASSERTED rather than left implicit -- because the claim
+    // is FALSE under `Fsync`. There the slot comes from `CowTree::CommitTxn`'s
+    // `txnId % 2`, which consults nothing recovery recorded, and a store whose
+    // slot parity an ordinary Batched run has broken then overwrites the
+    // SURVIVOR. Measured, on a store seeded exactly the way this fixture seeds
+    // one and reopened with `Durability::Fsync`: one valid slot afterwards where
+    // Batched leaves two. `--storage-durability=fsync` is an operator-selectable
+    // flag, so that is reachable; the storage rulebook's Open work carries it.
     for (auto const damageLive: { false, true })
     {
         INFO((damageLive ? "the live slot was the damaged one" : "the stale slot was the damaged one"));
         TempFile tmp;
-        SeedTwoCommitGenerations(tmp.path);
-
-        auto const live = LiveSlot(ReadWholeFile(tmp.path));
+        auto const live = SeedTwoCommitGenerations(tmp.path);
         auto const damaged = damageLive ? live : OtherSlot(live);
         auto const survivor = OtherSlot(damaged);
         CAPTURE(SlotName(damaged));
