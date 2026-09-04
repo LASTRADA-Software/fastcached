@@ -1184,6 +1184,30 @@ So:
 - **Before concluding "nothing there", state what was searched and whether that
   search could have found it.** "I grepped the log for the ctest block" and "CI
   produces no test output" are different claims, and only the first one was made.
+- **A tool that will not GIVE you the answer says so in a sentence that reads like
+  "there is no answer".** Retrieving a failing CI job's log, both of these are
+  false negatives and neither is an error:
+
+  ```
+  gh run view --job <id> --log
+      -> "run is still in progress; logs will be available when it is complete"
+         ... while the log is retrievable RIGHT NOW by another route
+
+  gh api repos/<owner>/<repo>/actions/jobs/<id>/logs
+      -> a 99-byte refusal about terminal escape sequences, which looks like an
+         empty result
+  ```
+
+  The log was available the whole time. What works is
+  `gh api repos/<owner>/<repo>/actions/jobs/<id>/logs --allow-escape-sequences`,
+  and the job need only be *finished itself* — the surrounding RUN may still be
+  in progress, which is exactly when somebody is trying to read it.
+
+  Cost of not knowing this: an hour treating a retrievable log as gated, and an
+  intermittent attributed to three successive wrong hypotheses while the answer
+  sat one flag away. **Two different messages, both of which say "nothing here",
+  neither of which means it** — which is this rule's own subject arriving in the
+  tool you reach for to apply it.
 
 This is the `producer | grep -q` false negative's family, recorded in
 [`build-and-toolchain.md`](build-and-toolchain.md) -- same outcome, different
