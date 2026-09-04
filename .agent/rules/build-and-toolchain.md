@@ -2593,7 +2593,7 @@ wrong move: the caveat rule is right and the prose was wrong.
   a `--self-test` that drives all three rules against generated workflows. They
   had only ever been seen to pass.
 
-### Five ways an instrument reported on something other than its subject, in one branch
+### Six ways an instrument reported on something other than its subject, in one branch
 
 Every one of these was written by somebody who had just read this file, and every
 one produced a green or a red that was about the tool rather than the tree. They
@@ -2610,13 +2610,37 @@ are recorded together because the shape is one shape.
   comment. Both directions are self-tested: the baseline workflow deliberately
   carries a comment naming every forbidden spelling, and a second baseline carries
   no comments at all.
-- **`bash "$0"`, never a bare `"$0"`, when a self-test re-invokes its own script.**
-  These check scripts are mode **644** in git — ctest runs them as `bash <path>`
-  and nothing needs the executable bit — so a bare `"$0"` exits **126, Permission
-  denied**, having run no check at all. Every `want-fail` case then passes because
-  the SHELL refused rather than because the rule fired: eight cases, entirely
-  green, testing nothing. It was caught by the one case that expects a PASS, which
-  is the argument for a baseline case rather than only negative ones.
+- **`bash <path>`, never a bare path — in a self-test AND in a workflow, and the
+  file mode is not the whole reason.** It fired twice in one branch, in the two
+  places whose failures look nothing alike.
+
+  In a self-test, `check-gated-jobs.sh --self-test` re-invoked itself as a bare
+  `"$0"`. These check scripts were mode **644** — ctest runs them as `bash <path>`
+  and nothing needed the executable bit — so it exited **126, Permission denied**,
+  having run no check at all, and every `want-fail` case passed because the SHELL
+  refused rather than because the rule fired: **eight cases, entirely green,
+  testing nothing.** Caught by the one case that expects a PASS, which is the
+  argument for a baseline case rather than only negative ones.
+  [#720](https://github.com/LASTRADA-Software/fastcached/issues/720) is the mode
+  across fourteen scripts;
+  [#723](https://github.com/LASTRADA-Software/fastcached/issues/723) is the rule
+  that survives a chmod.
+
+  In a workflow it is louder and reaches further. `build.yml`'s new doc-subject
+  step shipped as a bare `run: scripts/doc-subject-checks.sh` and CI reported
+  **`Check C++ style` — a REQUIRED context — as FAILED**, on step 3 of 5 with both
+  clang-format steps skipped behind it. Reproduced locally against the same mode
+  and the same invocation: exit **126**. It was found by reading `git ls-files -s`
+  against the call site before the run finished, not by the run — which is the
+  only way to find it, since a local run types `bash` in front of the script by
+  habit and can never reproduce it.
+
+  **The mode is the smaller half.** Both scripts are 755 now, so the bare form
+  would work — and every call site names its interpreter anyway, because a call
+  that fails to START fails for reasons a chmod does not cover: a moved file, a
+  `noexec` mount, a lost mode bit. Inside a `want-fail` assertion any of those is
+  indistinguishable from the rule firing, which is the eight-green-cases failure
+  again with a different cause. Name the interpreter regardless.
 - **`IFS=$'\t' read -r a b c d` does not read tab-separated fields.** Tab is one
   of bash's three IFS *whitespace* characters, so a run of tabs collapses to one
   delimiter and leading ones are dropped — a record with an empty field silently

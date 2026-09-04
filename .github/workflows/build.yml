@@ -170,7 +170,22 @@ jobs:
       # asserted by `ctest -R gated-jobs-fail-safe`, because gating it is the
       # whole defect.
       - name: "Doc-subject checks (#687: these run on docs-only changes too)"
-        run: scripts/doc-subject-checks.sh
+        # `bash <path>`, never a bare path, and the reason is not only the file
+        # mode. This step SHIPPED bare and CI reported `Check C++ style` --  a
+        # required context -- as FAILED, on step 3 of 5, with the two
+        # clang-format steps skipped behind it: `Permission denied`, exit **126**,
+        # reproduced locally against the same mode and the same invocation
+        # ([#723](https://github.com/LASTRADA-Software/fastcached/issues/723),
+        # and [#720](https://github.com/LASTRADA-Software/fastcached/issues/720)
+        # for the mode across fourteen scripts).
+        #
+        # The mode is now 755, so the bare form would work -- and naming the
+        # interpreter anyway is the part that keeps holding. A call that fails to
+        # START fails for reasons a chmod does not cover: a moved file, a `noexec`
+        # mount, a lost mode bit. In a `want-fail` assertion that error is
+        # indistinguishable from the rule firing, which is how eight cases in this
+        # branch's own self-test passed while the check never ran once.
+        run: bash scripts/doc-subject-checks.sh
 
       - name: "Install clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}

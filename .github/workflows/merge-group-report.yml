@@ -117,7 +117,12 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
-          scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" \
+          # `bash <path>` and never a bare path. The mode is 755, so the bare
+          # form would work; naming the interpreter is what survives a lost mode
+          # bit, a moved file or a `noexec` mount. The sibling step in
+          # `build.yml` shipped bare and took a REQUIRED context red with exit
+          # 126 (#723, and #720 for the mode across fourteen scripts).
+          bash scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" \
             > "$RUNNER_TEMP/reportable.tsv"
           echo "reportable=$(grep -c '' "$RUNNER_TEMP/reportable.tsv")" | tee -a "$GITHUB_OUTPUT"
 
@@ -165,7 +170,7 @@ jobs:
           and close this report either way. Repeat failures of the same context comment here
           rather than opening a second issue.
           BODY
-            scripts/ci-report-issue.sh \
+            bash scripts/ci-report-issue.sh \
               "merge queue: \"${context}\" failed and nothing gated on it" \
               "$RUNNER_TEMP/body.md" \
               type/bug area/build status/needs-triage

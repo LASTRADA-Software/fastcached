@@ -1099,9 +1099,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Five ways an instrument reported on something other than its subject, all in one branch, all written by
   someone who had just read the rulebook. A **COMMENT is not a call site** — two checks matched their own
   headers, one reporting a step twice and one refusing a correct workflow — so strip full-line comments, and
-  self-test both directions. **`bash "$0"`, never a bare `"$0"`**: these scripts are mode 644 and ctest runs
-  them as `bash <path>`, so a bare `"$0"` exits **126** and every `want-fail` case passes because the SHELL
-  refused — eight green cases testing nothing, caught only by the one case that expects a PASS.
+  self-test both directions. **`bash <path>`, never a bare path**, in a self-test AND in a workflow: a bare
+  `"$0"` in `check-gated-jobs.sh --self-test` exited **126** on a mode-644 script, so eight `want-fail` cases
+  passed because the SHELL refused — green, testing nothing, caught only by the one case expecting a PASS — and
+  a bare `run: scripts/doc-subject-checks.sh` took the REQUIRED `Check C++ style` context red the same way.
+  The mode is the smaller half (#720 covers it; #723 the rest): a call that fails to START fails for reasons a
+  chmod does not cover, and inside a `want-fail` assertion any of them is indistinguishable from the rule
+  firing. Name the interpreter regardless.
   **`IFS=$'\t' read` does not read TSV**: tab is IFS whitespace, so an empty field collapses and shifts every
   field after it. **A fixture built on `message(FATAL_ERROR)` cannot test that verdicts are read from OUTPUT** —
   it exits 0 on 3.28 and 1 on 4.x, so the rule's own test passed with the rule deleted. And **a self-test that
