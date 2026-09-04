@@ -106,6 +106,49 @@ env:
   # spelled once so they cannot drift apart.
   FASTCACHED_REQUIRE_EXACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && 'ON' || 'OFF' }}
 
+# Six jobs below carry, in addition to whatever else gates them,
+#
+#     (github.event_name != 'push' || github.ref_type != 'branch')
+#
+# which is spelled once here and repeated per job because YAML cannot factor a
+# condition out — the same reason `fetch-depth: 0` is repeated above.
+#
+# ## What it is for (#559)
+#
+# A push run on master happens AFTER the merge, so nobody waits on it: cutting a
+# job from it is runner-minutes and NOT merge latency, and those are different
+# quantities that get quoted for each other. Measured over the six successful
+# master push runs of 2026-09-04, a push costs 126.6 raw runner-minutes with a
+# 25.1-minute critical path (`clang-tidy`); the six jobs below are 20.8 of those
+# minutes and none of them is anywhere near the critical path, so the wall clock
+# is unchanged and the saving is 16% of the runner time.
+#
+# What they have in common is that they write no cache entry any other run can
+# read. Master's ccache entries are what every pull request restores from, so a
+# job holding one is worth running on push whatever else it does; these six hold
+# none. `clang-tidy` is deliberately NOT among them, and not because of its
+# cache: after #554 the queue's sweep is diff-scoped, and the soundness argument
+# for that is precisely that the master push still sweeps everything.
+#
+# `check-clang-format` is also deliberately not among them, and it was on the
+# ticket's list. It is 0.7 of the 126.6 minutes — half a percent — and it is the
+# job carrying the ungated `doc-subject-checks.sh` step, whose whole point (#687)
+# is that it runs when other gates say not to. `check-gated-jobs.sh` rule C tests
+# that step for a condition naming the scope classifier and would not see one
+# naming the event, so the trade is half a percent against a gate the guard
+# cannot vouch for. Declined.
+#
+# ## Why `ref_type` and not `event_name` alone
+#
+# A tag push IS a push. `release` needs every job in this file, a skipped `needs`
+# skips its dependent, and `release`'s `if:` carries no status function — so
+# `github.event_name != 'push'` alone would make the draft release silently never
+# appear on a tag, with every check green. `scripts/check-gated-jobs.sh` rule D
+# asserts this clause is present rather than leaving it to be re-derived.
+#
+# The `fix-ci` branch is a push to a branch and is trimmed too, deliberately: it
+# exists to iterate on CI, and a pull request from it runs everything.
+
 jobs:
   # Two jobs in one, and deliberately so. The clang-format sweep is scope-gated
   # like every other compiler job; the doc-subject checks below are NOT, and that
@@ -969,7 +1012,7 @@ jobs:
     name: "Code coverage"
     runs-on: ubuntu-24.04
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     # Read here rather than in each step's `if`, because the `secrets` context is
     # not available in a step-level condition while `env` is. Empty on a pull
     # request from a fork, where GitHub withholds secrets — which is exactly the
@@ -1162,7 +1205,7 @@ jobs:
     name: "Docker image"
     runs-on: ubuntu-24.04
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1200,7 +1243,7 @@ jobs:
     name: "sccache smoke (memcached text)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1223,7 +1266,7 @@ jobs:
     name: "sccache smoke (memcached binary)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1256,7 +1299,7 @@ jobs:
     name: "sccache smoke (redis RESP2)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1286,7 +1329,7 @@ jobs:
     name: "fastcache-cc smoke (compile-cache 0xFC)"
     runs-on: ubuntu-24.04
     needs: [changes, linux]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && (github.event_name != 'push' || github.ref_type != 'branch') }}
     steps:
       - uses: actions/checkout@v4
         with:
