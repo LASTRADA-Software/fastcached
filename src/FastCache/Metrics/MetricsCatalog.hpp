@@ -365,12 +365,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "machine and nowhere else is that machine's clock, not the fleet's "
               "leases.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerSchedulerTermResets,
-      .prometheusName = "fastcache_worker_scheduler_term_resets_total",
-      .help = "Times this worker adopted a scheduler term that went backwards -- a "
-              "scheduler whose Raft directory was wiped, whose cluster was "
-              "re-bootstrapped, or which had consensus turned off. Zero except on the "
-              "day somebody resets a cluster.",
+    { .counter = IMetricsSink::Counter::WorkerSchedulerTermRegressions,
+      .prometheusName = "fastcache_worker_scheduler_term_regressions_total",
+      .help = "Times this worker adopted a scheduler term that went backwards. Two causes "
+              "look identical here: a grant minted before a leadership change and "
+              "delivered after one, which is ordinary; or a scheduler that was reset. The "
+              "rate tells them apart -- occasional counts tracking elections are the "
+              "first, a sustained rise against no election is the second.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerScratchRootsReclaimed,
       .prometheusName = "fastcache_worker_scratch_roots_reclaimed_total",

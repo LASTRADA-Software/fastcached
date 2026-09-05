@@ -153,11 +153,18 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // path of every dispatched compile.
         auto const now = clock.Now();
 
+        // ONE slack, passed to BOTH, rather than each site taking the same default. The
+        // shared predicate makes them agree on the COMPARISON; only passing one value
+        // makes them agree on the WINDOW, and it is the window a future caller with a
+        // non-default slack would split.
+        constexpr auto slack = Distributed::LeaseTokenClockSkewSlack;
+
         auto verified = Distributed::VerifyLeaseToken(
             key,
             token,
             Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster },
-            now);
+            now,
+            slack);
         if (verified.has_value())
         {
             // **Spent here, after every reading of the token and before anything is
@@ -172,7 +179,16 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // only a grant that has never been used can move it, which is what makes a
             // lower term unambiguously a scheduler that was legitimately reset rather
             // than a replay.
-            if (!lease.spent.Spend(token, verified->expiresAt, now))
+            // **Every refusal a client would RETRY on is decided before this runs**, and
+            // that is load-bearing rather than incidental. `CompileResponder` answers
+            // `Stopping`, `NoCapacity` and `EndpointBusy` -- the three a client is told
+            // to come back from -- before this validator is reached at all. Refusals
+            // BELOW this point do burn the grant, which costs nothing today because
+            // `Dispatch::CompileOnWorker` sends one frame and never re-presents a token;
+            // the day a client retries one of them, or the slot and byte-budget checks
+            // move inside this function, that retry becomes a permanent `Replayed` and
+            // distribution stops with this counter blaming an attacker.
+            if (!lease.spent.Spend(token, verified->expiresAt, now, slack))
                 return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Replayed,
                                                    .detail = "this lease has already been spent at this worker; a "
                                                              "grant authorizes exactly one compile" };
@@ -200,7 +216,7 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // and again inside `Observe` would be one decision made in two places, and
             // whichever copy is edited next is the one that stops agreeing.
             if (lease.notice.Observe(lease.term.Learn(verified->epoch)))
-                metrics.Increment(IMetricsSink::Counter::WorkerSchedulerTermResets);
+                metrics.Increment(IMetricsSink::Counter::WorkerSchedulerTermRegressions);
             return std::nullopt;
         }
 

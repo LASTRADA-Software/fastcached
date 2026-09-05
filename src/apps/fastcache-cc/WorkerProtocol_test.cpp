@@ -206,7 +206,7 @@ struct Fixture
     /// is what guarantees it outlives the thing holding the reference. Silent, because
     /// these cases assert on the REPLY rather than on the log -- named through
     /// `Silent()` rather than defaulted, which is that notice's own rule.
-    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermResetNotice::Silent() };
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
 
     WorkerProtocol worker;
 
@@ -1407,7 +1407,7 @@ TEST_CASE("A grant from a term this worker has not heard of is honoured", "[work
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 0);
 }
 
 TEST_CASE("A scheduler reset is adopted, and the fleet keeps compiling", "[worker-protocol][lease][epoch]")
@@ -1436,13 +1436,13 @@ TEST_CASE("A scheduler reset is adopted, and the fleet keeps compiling", "[worke
 
     // And it STUCK, which is what says the term was adopted rather than merely ignored.
     CHECK(fix.lease.term.Known() == std::optional<std::uint64_t> { GrantTerm });
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 
     // Once per reset, not once per grant: the fleet is steady at the lower term now.
     auto const steady = fix.worker.Answer(FrameGrantedUnder(GrantTerm, "l3"));
     REQUIRE(steady.has_value());
     CHECK(Decode(Unwrap(steady)).status == Wire::Status::Ok);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 }
 
 TEST_CASE("A replayed grant cannot walk this worker's term backwards", "[worker-protocol][lease][replay][epoch]")
@@ -1468,7 +1468,7 @@ TEST_CASE("A replayed grant cannot walk this worker's term backwards", "[worker-
     CHECK(ErrorOf(Unwrap(replayed)) == Wire::ErrorCode::LeaseUnauthorized);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 1);
     CHECK(fix.lease.term.Known() == std::optional<std::uint64_t> { 9 });
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 0);
 }
 
 TEST_CASE("No grant is refused on its term, whatever this worker has learned", "[worker-protocol][lease][epoch]")
@@ -1538,7 +1538,7 @@ TEST_CASE("A worker that has never learned a term refuses nothing for it", "[wor
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 0);
 }
 
 TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole policy", "[worker-protocol][lease]")

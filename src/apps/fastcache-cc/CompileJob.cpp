@@ -830,20 +830,37 @@ std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePa
     if (row == nullptr)
         return std::nullopt;
 
-    // **Every failure here is NO RULE, never a refusal**, and that is the difference
-    // between this and `WorkerPrefixMapRules` below. That one is honouring a mapping
-    // the client ASKED for, so silently skipping it would return an object whose
-    // compilation directory disagrees with a locally built one -- #506 itself. Nothing
-    // asked for this: it repairs a name the worker's own scratch layout put into the
-    // object, and a source file with a space in it or an `=` in it is completely
-    // ordinary. Refusing those would stop distributing them altogether, to improve a
-    // debug record.
+    // **A name the CLIENT sent that cannot be spelled: no rule, and no refusal.** That is
+    // the difference between this and `WorkerPrefixMapRules` below. That one is honouring
+    // a mapping the client ASKED for, so silently skipping it would return an object
+    // whose compilation directory disagrees with a locally built one -- #506 itself.
+    // Nothing asked for this: it repairs a name the worker's own scratch layout put into
+    // the object, and a source file called `my file.cpp` is completely ordinary.
+    // Refusing those would stop distributing whole translation units to improve a debug
+    // record.
     //
     // The `=` case is the one worth naming, because skipping it is the NARROW choice
     // rather than the lazy one: gcc cuts `<from>=<to>` at the last separator and clang
-    // at the first, so such a rule records a name neither machine has -- a wrong
-    // recorded name rather than the worker's, which is worse than the defect.
-    if (!SpellableInRule(clientSourceName, *row) || !SpellableInRule(scratchSourcePath, *row))
+    // at the first, so such a rule records a name neither machine has -- a wrong recorded
+    // name rather than the worker's, which is worse than the defect.
+    if (!SpellableInRule(clientSourceName, *row))
+        return std::nullopt;
+
+    // **This worker's OWN scratch path failing the same test is a different fault**, and
+    // the two were briefly one branch, which is how it comes to be treated as ordinary.
+    // A client's odd file name is ordinary; a scratch ROOT carrying a space or an `=` is
+    // the operator's `--scratch-root`, and skipping here silently restores `job-N` in
+    // every dispatched object this worker produces -- nondeterministically, under one
+    // cache key, with nothing counting it.
+    //
+    // Still skipped rather than refused, because refusing would take a whole machine out
+    // of the fleet for a debug record. But it is a startup-time property of a path chosen
+    // once, not a per-job accident, so the place to say it is startup, in front of the
+    // operator -- which is this repository's own rule about degradation decided per
+    // request. That check is
+    // [#810](https://github.com/LASTRADA-Software/fastcached/issues/810); until it lands
+    // this is a known silent case, recorded here rather than left looking deliberate.
+    if (!SpellableInRule(scratchSourcePath, *row))
         return std::nullopt;
 
     return PrefixMapRule(*row, scratchSourcePath, clientSourceName);

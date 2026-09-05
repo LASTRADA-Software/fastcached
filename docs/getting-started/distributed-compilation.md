@@ -578,8 +578,8 @@ fixes, and one number covering both tells you neither.
 > scheduler term that went backwards instead of refusing it, because replay is closed by
 > grants being spendable once. Point those alerts at
 > `fastcache_worker_jobs_refused_lease_replayed_total` (somebody presenting a captured
-> grant twice) and `fastcache_worker_scheduler_term_resets_total` (a scheduler that was
-> reset). The reasoning is under "A grant is spendable once" below. It was retired rather
+> grant twice) and `fastcache_worker_scheduler_term_regressions_total` (a scheduler term
+> that went backwards). The reasoning is under "A grant is spendable once" below. It was retired rather
 > than left exported at zero because a series that reads zero for ever because its event
 > is impossible looks exactly like one reading zero because the event has not happened,
 > and only one of those means your fleet is healthy.
@@ -641,10 +641,24 @@ question, so the term check is gone and
 named can no longer happen, and a series reading zero because its event is impossible
 looks exactly like one reading zero because the event did not happen.
 
-What you watch instead is `fastcache_worker_scheduler_term_resets_total`, which counts a
-worker adopting a term that went backwards, alongside one `WARN` line per reset naming
-both terms. It should read zero except on the day somebody resets a cluster. If it rises
-across the fleet at once and nobody reset anything, a scheduler has lost its state.
+What you watch instead is `fastcache_worker_scheduler_term_regressions_total`, which counts
+a worker adopting a term that went backwards, alongside one `WARN` line naming both terms.
+
+**It does not mean somebody reset a cluster, and you have to read the rate to know which
+it is.** Two things produce a lower term and a worker cannot tell them apart from the
+grant:
+
+- **A grant that arrived late.** A client asks for a lease, then preprocesses and uploads
+  a translation unit — seconds — and an election inside that window puts its term-N grant
+  behind somebody else's term-N+1 grant at the same worker. Completely ordinary. Expect
+  occasional single counts that line up with leadership changes.
+- **A scheduler that lost its state** — Raft directory wiped, cluster re-bootstrapped,
+  consensus turned off. This one *repeats*, because every grant that scheduler mints now
+  carries the lower term.
+
+So: occasional counts tracking elections are the first and need nothing from you. A
+sustained rise, especially across the fleet at once and against no election, is the
+second.
 
 The trade, stated plainly because it is real: a grant captured *before* it ever reached
 its worker used to stop being good at the next election, and now stops being good at its

@@ -506,7 +506,16 @@ enum class TermTransition : std::uint8_t
 {
     Unchanged, ///< The same term this worker already knew.
     Advanced,  ///< A newer term -- an election, or the first one ever learned.
-    Reset,     ///< A term BELOW the one this worker knew: the scheduler was reset.
+    /// A term BELOW the one this worker knew.
+    ///
+    /// **Named for what was OBSERVED, never for what caused it**, and that is why this
+    /// is not called `Reset`. A worker cannot tell a scheduler that was genuinely reset
+    /// from a grant minted before a leadership change and delivered after one: both
+    /// arrive as a lower term, both are authentic, and nothing in the token separates
+    /// them. The second is ORDINARY -- a client holds its grant across a preprocess and
+    /// a multi-megabyte upload, which is seconds, and an election inside that window
+    /// puts a term-N grant behind a term-N+1 one at the same worker.
+    Regressed,
 };
 
 /// What a `Learn` call did, and what it did it to.
@@ -576,7 +585,7 @@ class KnownSchedulerTerm
             return TermChange { .transition = TermTransition::Advanced, .previous = term, .current = term };
         if (term == previous)
             return TermChange { .transition = TermTransition::Unchanged, .previous = previous, .current = term };
-        return TermChange { .transition = term > previous ? TermTransition::Advanced : TermTransition::Reset,
+        return TermChange { .transition = term > previous ? TermTransition::Advanced : TermTransition::Regressed,
                             .previous = previous,
                             .current = term };
     }
@@ -624,6 +633,20 @@ class KnownSchedulerTerm
 /// unlearned after a restart and the old check accepted every term, so the ratchet had
 /// the identical hole for the identical duration. It is the residual the expiry is
 /// documented to bound, and closing it needs durable state a worker does not have.
+///
+/// **A wall clock stepping BACKWARDS is the second, and it is not the restart case in
+/// disguise.** Retention is re-evaluated only inside `Spend`, against the caller's
+/// `now`, so "everything still acceptable is still remembered" holds exactly while the
+/// clock is monotone. A worker whose clock is minutes AHEAD -- a resumed VM, a container
+/// with no time source, the population `LeaseTokenClockSkewSlack` exists for -- prunes
+/// entries whose window merely looks passed; when NTP steps it back, those tokens verify
+/// again and are no longer remembered. One extra spend each. Bounded by the same window
+/// and by how far the clock moved, and not worth durable state either, but it is a
+/// second residual rather than a restatement of the first.
+///
+/// Two worker PROCESSES advertising one endpoint is a third, for the same reason: each
+/// keeps its own set. That one is a deployment mistake rather than a property of this
+/// type.
 ///
 /// ## Bound
 ///
@@ -716,8 +739,8 @@ class SpentLeases
     std::unordered_map<Sha256::Digest, std::chrono::system_clock::time_point, DigestHash> _spent;
 };
 
-/// Says, once per reset, that this worker has adopted a scheduler term that went
-/// BACKWARDS.
+/// Says, once per regression, that this worker has adopted a scheduler term that went
+/// BACKWARDS -- **without claiming to know why**.
 ///
 /// Named for what it reports rather than for what it used to refuse: it was
 /// `LeaseEpochNotice` when the condition was a refusal on the lease's epoch, and #614
@@ -751,14 +774,14 @@ class SpentLeases
 /// would need a new `_fc_cc_core` row and this needs none. It takes a SINK rather than
 /// an `ILogger` for the same reason -- and it is the shape `Cc::CredentialNotice`
 /// already uses to say a thing once.
-class SchedulerTermResetNotice
+class SchedulerTermRegressionNotice
 {
   public:
     /// Where the line goes. Empty means say nothing.
     using Sink = std::function<void(std::string_view)>;
 
     /// @param sink Where to report; may be empty.
-    explicit SchedulerTermResetNotice(Sink sink) noexcept:
+    explicit SchedulerTermRegressionNotice(Sink sink) noexcept:
         _sink { std::move(sink) }
     {
     }
@@ -769,9 +792,9 @@ class SchedulerTermResetNotice
     /// defaulted parameter is how a diagnostic comes to be dropped at six call sites. A
     /// caller with nowhere to report has to say so.
     /// @return A notice with no sink.
-    [[nodiscard]] static SchedulerTermResetNotice Silent()
+    [[nodiscard]] static SchedulerTermRegressionNotice Silent()
     {
-        return SchedulerTermResetNotice { Sink {} };
+        return SchedulerTermRegressionNotice { Sink {} };
     }
 
     /// Report, if this change was a scheduler term going backwards.
@@ -779,7 +802,7 @@ class SchedulerTermResetNotice
     /// **The return value is the answer, and there is no tally beside it.** This owns
     /// the predicate "is this reportable"; a caller that tested `transition == Reset`
     /// itself and then called this would decide it twice, and a counter kept in here
-    /// would be a second tally of what `WorkerSchedulerTermResets` already counts. So
+    /// would be a second tally of what `WorkerSchedulerTermRegressions` already counts. So
     /// the one call site drives its metric off this, and a silent notice answers the
     /// same question a speaking one does.
     /// @param change What `KnownSchedulerTerm::Learn` reported, from the caller that
@@ -787,16 +810,18 @@ class SchedulerTermResetNotice
     /// @return True when this change was a reset -- reported, if there is a sink.
     bool Observe(TermChange const& change)
     {
-        if (change.transition != TermTransition::Reset)
+        if (change.transition != TermTransition::Regressed)
             return false;
         if (_sink)
-            _sink(std::format("this scheduler's term went BACKWARDS, from {} to {}: it has been reset -- its Raft "
-                              "directory wiped, the cluster re-bootstrapped, or consensus turned off. Adopting the "
-                              "new term and continuing to compile; a captured grant cannot be replayed through it, "
-                              "because a grant is spendable exactly once. If the reset was not intentional, the "
-                              "fleet has a scheduler it did not mean to reset",
-                              change.previous,
-                              change.current));
+            _sink(std::format(
+                "adopted a scheduler term that went BACKWARDS, from {} to {}. TWO things look like this and this "
+                "worker cannot tell them apart: a grant minted before a leadership change and delivered after one, "
+                "which is ordinary and should appear once without repeating; or a scheduler that was reset -- its "
+                "Raft directory wiped, the cluster re-bootstrapped, or consensus turned off -- which will repeat "
+                "until somebody stops it. So the count is the diagnosis, not this line. Compiling either way, and a "
+                "captured grant cannot be replayed through this, because a grant is spendable exactly once",
+                change.previous,
+                change.current));
         return true;
     }
 
@@ -822,17 +847,17 @@ struct WorkerLeaseState
 {
     /// @param reported Where a scheduler term going backwards is reported. Taken as the
     ///        whole notice rather than as a sink, so a caller with nowhere to report
-    ///        still has to say `SchedulerTermResetNotice::Silent()` by name -- which is
+    ///        still has to say `SchedulerTermRegressionNotice::Silent()` by name -- which is
     ///        that type's own rule, and a defaulted sink here would have quietly
     ///        undone it.
-    explicit WorkerLeaseState(SchedulerTermResetNotice reported) noexcept:
+    explicit WorkerLeaseState(SchedulerTermRegressionNotice reported) noexcept:
         notice { std::move(reported) }
     {
     }
 
-    SpentLeases spent;               ///< The grants already run here, so none runs twice.
-    KnownSchedulerTerm term;         ///< The term the last authentic grant named.
-    SchedulerTermResetNotice notice; ///< Where a term going backwards is said.
+    SpentLeases spent;                    ///< The grants already run here, so none runs twice.
+    KnownSchedulerTerm term;              ///< The term the last authentic grant named.
+    SchedulerTermRegressionNotice notice; ///< Where a term going backwards is said.
 };
 
 /// What a verifier expects a grant to say about itself.

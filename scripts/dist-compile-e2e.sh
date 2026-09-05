@@ -1812,11 +1812,27 @@ case13_at() {
     # one cache key. gcc takes it from the `#line` marker and already agreed, which is
     # why this must not be read as covering both drivers equally: on gcc it is a
     # regression guard, on clang it is the ticket.
+    #
+    # **What this case does NOT cover**, stated because the arrangement hides it: the
+    # source lives at `${proj}/thirteen-<label>.cpp` while the mapped directory is
+    # `${proj}/build/mapcase`, so the source is OUTSIDE the mapped root and the
+    # reference compile's own `-fdebug-prefix-map` never matches it. Both sides
+    # therefore record the same raw absolute path and agree. A build whose source lies
+    # UNDER a mapped root -- which is what `_fc_debug_prefix_map_rules` produces for an
+    # in-tree build -- records the MAPPED spelling locally and the unmapped one
+    # remotely, because the client's own rules never reach the worker. That divergence
+    # is #800 and this case cannot see it.
     local reference_source_name remote_source_name
     reference_source_name="$(source_name_of "$reference_dump")"
     remote_source_name="$(source_name_of "$remote_dump")"
 
-    [[ -n "$reference_source_name" ]] || fail "the case 13 reference object records no source name (${label})"
+    # Two ways to be empty and the message names both: a `-g` object must record a source
+    # name, so either the subject is broken or this parser does not know this reader's
+    # `AT_name` rendering. The reader was selected on `comp_dir` alone, so the second is
+    # live -- it fails closed rather than green, which makes it a diagnosis problem rather
+    # than a hole, but a verdict that blames the wrong end costs the reader an hour.
+    [[ -n "$reference_source_name" ]] \
+        || fail "the case 13 reference object records no source name (${label}); either the compile did not record one, or ${dwarf_reader}'s DW_AT_name rendering is one source_name_of cannot parse"
     [[ "$remote_source_name" == "$reference_source_name" ]] \
         || {
             echo "--- spelling: ${label}" >&2

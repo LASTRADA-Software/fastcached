@@ -124,7 +124,8 @@ namespace
 struct WorkerState
 {
     /// @param reported Where a term going backwards is said; silent unless a case cares.
-    explicit WorkerState(Distributed::SchedulerTermResetNotice reported = Distributed::SchedulerTermResetNotice::Silent()):
+    explicit WorkerState(
+        Distributed::SchedulerTermRegressionNotice reported = Distributed::SchedulerTermRegressionNotice::Silent()):
         lease { std::move(reported) }
     {
     }
@@ -206,10 +207,10 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     auto const cfg = ConfigWithKey(keyFile);
 
     // Recording rather than silent, because the notice's WIRING is the half no unit test
-    // of the notice itself can see: a `SchedulerTermResetNotice` that works perfectly and
+    // of the notice itself can see: a `SchedulerTermRegressionNotice` that works perfectly and
     // is never reached is the defect it was written to fix (#614).
     std::vector<std::string> said;
-    WorkerState state { Distributed::SchedulerTermResetNotice {
+    WorkerState state { Distributed::SchedulerTermRegressionNotice {
         [&said](std::string_view line) { said.emplace_back(line); } } };
 
     auto validator = MakeWorkerLeaseValidator(
@@ -249,7 +250,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     auto const afterReset = GrantUnder(DeposedTerm, "l1-again");
     CHECK_FALSE((*validator)(afterReset, "gcc-13").has_value());
     CHECK(state.lease.term.Known() == std::optional<std::uint64_t> { DeposedTerm });
-    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 
     // **And the worker said so.** Without this the notice could be correct in isolation
     // and reached by nothing, which is exactly the shape of a guard nothing constructs.
@@ -258,13 +259,15 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     REQUIRE(said.size() == 1);
     CHECK(said.front().contains(std::to_string(CurrentTerm)));
     CHECK(said.front().contains(std::to_string(DeposedTerm)));
-    CHECK(said.front().contains("Adopting"));
+    // Names BOTH causes rather than asserting the one it cannot know; the wording's own
+    // case is in `LeaseToken_test`.
+    CHECK(said.front().contains("leadership change"));
 
     // Once per reset, not once per grant: the fleet is now steady at the lower term and
     // every compile learns it again.
     CHECK_FALSE((*validator)(GrantUnder(DeposedTerm, "l2"), "gcc-13").has_value());
     CHECK(said.size() == 1);
-    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 }
 
 TEST_CASE("A node with no cluster key builds a validator that learns and spends nothing", "[node][lease][epoch]")

@@ -417,7 +417,7 @@ TEST_CASE("A legitimate scheduler reset is adopted rather than refused", "[distr
     // the condition sayable at all -- re-reading the member afterwards would race
     // another compile thread's grant.
     auto const change = term.Learn(0);
-    CHECK(change.transition == TermTransition::Reset);
+    CHECK(change.transition == TermTransition::Regressed);
     CHECK(change.previous == 7);
     CHECK(change.current == 0);
     CHECK(term.Known() == std::optional<std::uint64_t> { 0 });
@@ -564,7 +564,7 @@ TEST_CASE("What a worker knows about the term is three states, and zero is not o
 
     KnownSchedulerTerm elected;
     REQUIRE(elected.Learn(7).transition == TermTransition::Advanced);
-    CHECK(elected.Learn(0).transition == TermTransition::Reset);
+    CHECK(elected.Learn(0).transition == TermTransition::Regressed);
 }
 
 TEST_CASE("A worker adopts the term of the last authentic grant, in either direction", "[distributed][lease][token][epoch]")
@@ -580,7 +580,7 @@ TEST_CASE("A worker adopts the term of the last authentic grant, in either direc
     CHECK(term.Learn(7).transition == TermTransition::Advanced);
 
     auto const backwards = term.Learn(4);
-    CHECK(backwards.transition == TermTransition::Reset);
+    CHECK(backwards.transition == TermTransition::Regressed);
     CHECK(backwards.previous == 7);
     CHECK(backwards.current == 4);
     CHECK(term.Known() == std::optional<std::uint64_t> { 4 });
@@ -656,7 +656,7 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     CHECK(refusal.error() == LeaseRefusalReason::Malformed);
 }
 
-TEST_CASE("The worker says once, per reset, that a scheduler term went backwards", "[distributed][lease][token][epoch]")
+TEST_CASE("The worker reports a term regression without claiming to know its cause", "[distributed][lease][token][epoch]")
 {
     // **The signal this replaces was WRONG, not missing** (#614). On the worker a
     // scheduler reset showed only as `WorkerLeaseStaleEpoch` climbing, which reads like
@@ -668,19 +668,27 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
     // condition is gone: the worker adopts the lower term and goes on compiling. So the
     // line reports a TRANSITION, which happens once by construction and needs no latch.
     std::vector<std::string> said;
-    SchedulerTermResetNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
+    SchedulerTermRegressionNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
 
     SECTION("a reset is reported, and it names both terms and what it did")
     {
-        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Regressed, .previous = 7, .current = 0 }));
 
         REQUIRE(said.size() == 1);
         // Both numbers, because that is what turns "the fleet stopped behaving" into
-        // "somebody reset the scheduler". And the ACTION, because the reader's next
-        // question is whether they have to do anything -- since #614 they do not, which
-        // is worth saying rather than leaving them to infer from silence.
+        // something an operator can act on.
         CHECK(said.front().contains("from 7 to 0"));
-        CHECK(said.front().contains("Adopting"));
+
+        // **And BOTH causes, because this worker cannot tell them apart.** A grant
+        // minted before a leadership change and delivered after one produces exactly
+        // this, and it is ordinary; a scheduler that was reset produces it too. An
+        // earlier wording asserted the second outright, which is the same class of
+        // defect #614 exists to fix -- a confident wrong signal -- pointing the other
+        // way. Asserted on the text, because a line that names one cause reads as a
+        // diagnosis and this one is not.
+        CHECK(said.front().contains("leadership change"));
+        CHECK(said.front().contains("reset"));
+        CHECK((said.front().contains("rate") || said.front().contains("repeat")));
     }
 
     SECTION("nothing else reaches it, however many compiles arrive")
@@ -703,9 +711,9 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
         // notice exists to prevent, reached by the mechanism meant to prevent it. A
         // transition cannot repeat without the term moving back first, so this needs no
         // latch to be re-armed: the arithmetic is the latch.
-        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Regressed, .previous = 7, .current = 0 }));
         CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 7 }));
-        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Regressed, .previous = 7, .current = 0 }));
         CHECK(said.size() == 2);
     }
 
@@ -719,8 +727,8 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
         // owns the predicate "is this reportable", so a caller with nowhere to report
         // still gets the decision -- and the one production call site drives its counter
         // off exactly this, rather than testing the transition a second time itself.
-        auto quiet = SchedulerTermResetNotice::Silent();
-        CHECK(quiet.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        auto quiet = SchedulerTermRegressionNotice::Silent();
+        CHECK(quiet.Observe(TermChange { .transition = TermTransition::Regressed, .previous = 7, .current = 0 }));
         CHECK_FALSE(quiet.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 1 }));
     }
 }

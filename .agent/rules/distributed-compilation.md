@@ -845,8 +845,21 @@ Consequences that are each load-bearing:
   from a graph — which is this file's *skipped, absent, unstarted and failed are four
   states* rule, one level up. Its replacements are
   `fastcache_worker_jobs_refused_lease_replayed_total` (the new refusal) and
-  `fastcache_worker_scheduler_term_resets_total` (the adoption, which is not a refusal and
-  so is deliberately not in `LeaseRefusalTable`).
+  `fastcache_worker_scheduler_term_regressions_total` (the adoption, which is not a refusal
+  and so is deliberately not in `LeaseRefusalTable`).
+- **A worker cannot tell a scheduler RESET from a grant that arrived late, so neither the
+  counter nor the line may claim it can.** Both shipped asserting the reset — the counter's
+  help said *"zero except on the day somebody resets a cluster"* and the log line named a
+  wiped Raft directory outright. Both are false on any fleet that elects: a client holds
+  its grant across a preprocess and a multi-megabyte upload, and an election inside that
+  window delivers a term-N grant behind a term-N+1 one at the same worker. That is the
+  ordinary case, and it is indistinguishable from the alarming one in the token.
+  **The RATE separates them** — occasional counts tracking elections against a sustained
+  rise — so the signal reports what it OBSERVED (`TermTransition::Regressed`, a term
+  regression) and names both causes. This is #614's own defect class pointing the other
+  way: the ticket exists because `WorkerLeaseStaleEpoch` climbing *read like* an election
+  storm, and the first replacement read like an operator error that had not happened. A
+  confident wrong signal is worse than a vague right one.
 - **Adoption happens after the MAC verified AND after the spend, never before either.**
   The grant is a learning channel precisely because `VerifyLeaseToken` authenticates
   before it reports on any claim; reading a term off a *refused* token would let anybody

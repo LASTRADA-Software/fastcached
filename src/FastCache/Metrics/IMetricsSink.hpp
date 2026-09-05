@@ -453,20 +453,29 @@ class IMetricsSink
 
         /// Times this worker adopted a scheduler term that went BACKWARDS.
         ///
-        /// A scheduler whose Raft directory was wiped, whose cluster was
-        /// re-bootstrapped, or which had consensus turned off states a lower term than
-        /// this worker last saw. Since
-        /// [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) that is
-        /// ADOPTED rather than refused -- replay is closed by grants being spendable
-        /// once -- so it costs the fleet nothing and the event would otherwise be
-        /// invisible on the machine it happened to.
+        /// Since [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) a
+        /// lower term is ADOPTED rather than refused -- replay is closed by grants being
+        /// spendable once -- so it costs the fleet nothing, and the event would otherwise
+        /// be invisible on the machine it happened to.
+        ///
+        /// **This does NOT mean somebody reset a cluster, and an earlier spelling of this
+        /// row said it did.** Two causes produce it and a worker cannot tell them apart
+        /// from the token: a grant minted before a leadership change and delivered after
+        /// one -- which is ORDINARY, because a client holds its grant across a preprocess
+        /// and a large upload while an election happens inside that window -- or a
+        /// scheduler whose Raft directory was wiped, whose cluster was re-bootstrapped,
+        /// or which had consensus turned off.
+        ///
+        /// **The RATE is what separates them.** Occasional single counts that track
+        /// elections are the first; a sustained rise, especially fleet-wide and against
+        /// no election, is the second. A row claiming "zero except on the day somebody
+        /// resets a cluster" would be false on any fleet that elects, and would teach an
+        /// operator to ignore the series that is supposed to tell them their scheduler
+        /// lost its state.
         ///
         /// Not a refusal, so it is deliberately not in `LeaseRefusalTable`. It is the
-        /// scrapeable half of the log line `SchedulerTermResetNotice` prints: an operator who
-        /// did the reset sees it confirmed, and one who did not sees the first news
-        /// that a scheduler lost its state. Expected to read zero except on the day
-        /// somebody resets a cluster.
-        WorkerSchedulerTermResets,
+        /// scrapeable half of the line `SchedulerTermRegressionNotice` prints.
+        WorkerSchedulerTermRegressions,
 
         /// Scratch roots this worker took over from a node that died without
         /// cleaning up.

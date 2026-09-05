@@ -818,7 +818,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // compiling, because the term is a diagnostic rather than a gate since #614. What
     // may have changed under it is the operator's own configuration, which is exactly
     // what one line is for.
-    Distributed::WorkerLeaseState leaseState { Distributed::SchedulerTermResetNotice {
+    Distributed::WorkerLeaseState leaseState { Distributed::SchedulerTermRegressionNotice {
         [&logger](std::string_view line) { logger.Logf(LogLevel::Warn, "{}", line); } } };
 
     auto validator =
