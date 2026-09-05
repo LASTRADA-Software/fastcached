@@ -845,12 +845,15 @@ Every rule below has already been a bug.
   - **A deadline expiry is TWO error codes and the platforms disagree about which.**
     `SO_RCVTIMEO` expires as `EAGAIN`/`EWOULDBLOCK` on POSIX and `WSAETIMEDOUT` on
     Winsock, so a reader spelling only the obvious one is correct on one platform and
-    silently wrong on the other. It was open-coded at three sites in two subsystems
-    and a fourth tested `WouldBlock` alone; it is `Net::IsDeadlineExpiry` now, beside
-    the enum, which is a dependency-free leaf and so costs nothing at the
-    `net-boundary` line. `Consensus/RaftPeerServer.cpp` and
-    `apps/fastcache-compile-node/FrameEndpoint.cpp` still spell it by hand — the
-    latter with one operand.
+    silently wrong on the other. It was open-coded at three sites in two subsystems;
+    it is `Net::IsDeadlineExpiry` now, beside the enum, which is a dependency-free
+    leaf and so costs nothing at the `net-boundary` line.
+    **`FrameEndpoint`'s accept loop tests `WouldBlock` ALONE and is right to** —
+    that listener has no poll timeout, so the other code cannot arrive there, and its
+    own comment says so. A narrower test with a stated reason is not the same finding
+    as a narrower test by omission, and reading the first as the second is the easy
+    mistake here, because the grep looks identical. This one was reported as a defect
+    by two reviewers and repeated once before anybody opened the file.
   - **The reported shape cannot be asserted on, and its deterministic twin can.**
     *Connect, wait, then ask* is a RACE to observe: an unfixed server answers and
     closes at the deadline, the client's late write then draws an RST, and the RST

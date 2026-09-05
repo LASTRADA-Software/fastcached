@@ -699,7 +699,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   header past 8192 and answering `401` to a browser whose credential fell beyond it. Neither
   silent outcome is counted, deliberately — a healthy browser produces them by the minute. A
   deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
-  never one operand. **The reported shape cannot be asserted on** — connect-wait-send is a race,
+  never one operand — except where a listener has no poll timeout and says so, which two reviewers
+  read as the same defect. **The reported shape cannot be asserted on** — connect-wait-send is a race,
   because the late write draws an RST that destroys the very response being asserted on (measured:
   python saw the `400`, bash saw nothing) — so the probe never writes. And a probe reporting
   silence must be able to say it observed none, or an expired `read -t` reads as the answer.

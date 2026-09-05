@@ -165,8 +165,8 @@ namespace
                                       }),
                   "a head outcome answered with silence must carry no body");
 
-    /// Parsed HTTP request head. `ok` is false when no complete line arrived
-    /// within the byte cap or the line was malformed.
+    /// Parsed HTTP request head, and why reading it ended. Only `Complete` carries
+    /// a method and a target; every other outcome carries nothing but itself.
     ///
     /// Owns each field as its own `std::string` rather than keeping the raw head
     /// and viewing into it. That is not redundancy: an earlier version held the
@@ -535,8 +535,7 @@ Task<void> AdminHttpServer::Run()
             // A poll-timeout on the listening socket is how we wake to observe
             // Shutdown() on POSIX (where Close() does not unblock a parked
             // accept()); it is not a real failure, so loop and re-check the flag.
-            auto const code = accepted.error().code;
-            if (code == NetErrorCode::WouldBlock || code == NetErrorCode::Timeout)
+            if (IsDeadlineExpiry(accepted.error().code))
                 continue;
             _logger.Logf(LogLevel::Debug, "admin: accept loop ended ({})", accepted.error().ToString());
             co_return;
