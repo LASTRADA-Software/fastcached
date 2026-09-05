@@ -3238,6 +3238,53 @@ one finding: this rule says an insert must check the container's claim, and that
 one says a container should avoid making a claim nobody can check. Neither
 supersedes the other, and the BUILD lane's branch touches this same file.
 
+### A counterfactual must be RE-RUN after a refactor -- a refactor can move what it was catching
+
+**A counterfactual establishes that a guard bites the code as it is written. Rewrite
+the code and it establishes nothing, even when it still passes** -- and the way it
+fails is to keep passing while testing something that is no longer the risky part.
+
+Measured on #658. The decision "does this rejection reason predict the hazard the
+winning launcher carries" started as a hardcoded predicate inside a function, and
+its counterfactual was to widen that predicate: doing so warned on three rejection
+reasons that must stay silent, and the check went red. Good guard.
+
+The `/simplify` pass then made it **data-driven**, which was the right call for an
+otherwise strictly table-driven file: the pattern became a `predicts` column on the
+candidate row, and the decision became winner-agnostic. Every row of the check
+stayed green, as it should have -- the behaviour was unchanged.
+
+Then the same counterfactual was re-run against the new shape. **Widening the
+column to `.` left every row green.** The check drove the pure function with a
+pattern of its OWN and never read what the module declared, so the column -- the
+thing a maintainer would actually get wrong -- was covered by nothing at all.
+
+**The generalisation had relocated the untested part, and looked like an
+improvement while doing it.** That is the clause that makes this a rule rather than
+an anecdote: the refactor was correct, the tests were green, the design was better
+by every stated principle in this file, and the guard had quietly stopped guarding.
+Nothing in the diff, the review or the suite said so. Only re-running the
+counterfactual did.
+
+The repair is the same idiom as everywhere else here -- **read the literal from the
+file that owns it, never restate it.** The check now reads the `predicts` column out
+of `cmake/portable/CompileCache.cmake` and `UnsupportedVersion`'s `.name` out of
+`src/FastCache/Protocol/CompileCacheWire.hpp` and asserts they agree, which also
+closed a pre-existing coupling nobody had connected: the launcher reports the wire
+name, and a rename there would have disarmed the warning with every test green.
+
+So:
+
+> **When a refactor moves the thing a counterfactual was aimed at, the
+> counterfactual moves with it. Re-run it against the new shape and watch it fail,
+> or it is now asserting something you did not intend to assert.**
+
+Two things this is NOT. It is not an argument against generalising -- the column is
+the better design and stays. And it is not the "deriving is necessary and not
+sufficient" rule above wearing a different hat: that one is about a guard that was
+never sufficient, this one is about a guard that WAS sufficient and stopped being,
+without anybody touching it. A green suite distinguishes neither.
+
 ## A branch behind master is unverified, and only a build says otherwise
 
 A pull request's CI ran against the master it was branched from. Every green check
