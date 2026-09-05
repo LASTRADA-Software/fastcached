@@ -2997,12 +2997,13 @@ into "unmergeable".** Master here is protected by a ruleset (`default-master`,
 enforcement `active`), not by classic branch protection — so the
 `/branches/master/protection` endpoint answers `404 Branch not protected`, and
 anything reasoning from that endpoint is reading a lie. Its required contexts are
-`Windows-cl-release`, `Windows-clangcl-release`, `Linux-clang-release`,
-`Linux-gcc-release`, `macOS-clang-release`, `clang-tidy`, the three
-`sccache smoke (...)` jobs, `Check C++ style` and `Require a type label`. A
-workflow-level path filter stops the workflow from triggering, so no check run is
-ever created for any of those, and the pull request waits on a context that will
-never arrive.
+`RequiredContexts` in `scripts/check-merge-queue-contexts.sh`, which every tool
+that needs them reads — this paragraph used to enumerate them and went stale the
+moment two were promoted (#408, #629), which is the *count* problem in its worse
+form: **a stale list reads as complete**, so a leg checked against it is concluded
+unrequired rather than merely miscounted. A workflow-level path filter stops the
+workflow from triggering, so no check run is ever created for any of those, and the
+pull request waits on a context that will never arrive.
 
 A **job-level** `if:` is a different mechanism: the job is created and reports a
 `skipped` conclusion, which a required check accepts. That is what
@@ -3196,7 +3197,7 @@ indistinguishable from a success.**
 
 ### A non-required job failing in a merge group is reported nowhere (#684)
 
-The queue holds on the eleven required contexts and on nothing else, which is
+The queue holds on the required contexts and on nothing else, which is
 correct — the packaging and coverage jobs are deliberately unrequired because
 they are slow and because a packaging failure should not block ordinary work.
 What is *not* correct is that such a failure reaches no surface at all: the pull
@@ -3255,6 +3256,53 @@ turn those jobs into gates by the back door.
 - The required-context list is READ out of `check-merge-queue-contexts.sh`. With
   an empty list every failure looks unrequired, so an empty read is refused rather
   than treated as *nothing is required*.
+- **Neither the SET nor its COUNT is written in prose — this bullet is where that is
+  recorded, and every other mention of it points here.** Every consumer reads
+  `RequiredContexts`; the check prints `all <n> required contexts ...` on every run.
+  Both were restated anyway, and promoting `clang-asan-ubsan` and `clang-tsan`
+  ([#408](https://github.com/LASTRADA-Software/fastcached/issues/408),
+  [#629](https://github.com/LASTRADA-Software/fastcached/issues/629)) meant editing all
+  thirteen sites by hand with nothing to catch a miss: **eleven sentences across nine
+  files** restating the count (`.github/workflows/build.yml`,
+  `.github/workflows/merge-group-report.yml` twice, `scripts/ci-merge-group-report.sh`,
+  `scripts/check-merge-queue-contexts.sh`'s own bash-3.2 guard comment,
+  `src/tests/CMakeLists.txt`, `AGENT.md`, this file, `.agent/rules/testing.md`,
+  `.agent/guides/team-run.md` twice), and **two more enumerating the whole set**
+  (`build.yml`'s `changes` job and this file's own `paths-ignore` section). Eleven
+  sentences in nine files, because two files carry it twice.
+
+  **The first count of this said ten, and the miss is the interesting part.** The
+  eleventh sentence was inside an anecdote about a past incident, so it was classified
+  as a RECORD and left alone — and its verb was present tense: *"the required set **has**
+  eleven members"*. A record of what was measured then and a claim about now are
+  different things, and a paragraph can be the first while one of its sentences is the
+  second. Sort by the VERB, not by the paragraph's subject.
+  `git diff origin/master...HEAD | grep '^-' | grep -iE 'eleven|\b11\b'` returns eleven
+  lines, one per sentence — but that is a count of LINES and agrees only because no
+  sentence carries the word twice, so read it as corroboration and not as the census.
+  One of the eleven sat **four lines below**
+  `merge-group-report.yml`'s own header stating *a figure others will cite lives in ONE
+  place they point at* — a file obeying a rule in one paragraph and breaking it in the
+  next, which is how this shape survives review.
+
+  **A stale LIST is worse than a stale count, and no count-shaped search finds one.**
+  It reads as complete, so a leg checked against either enumeration would have been
+  concluded *unrequired* rather than merely miscounted — and an enumeration carries no
+  number, so the census that finds every restatement finds neither of them.
+
+  **It is not guarded by a scan, and that is a decision rather than an omission.** The
+  obvious guard — refuse a number adjacent to *required context* unless it matches
+  `${#RequiredContexts[@]}` — was measured against the tree and matches six historical
+  records that are not cardinality claims at all (*three required contexts came back
+  `skipped`*, *five required contexts went green*, *ten required contexts went
+  unwatched*, and #557's *ABSENT for all eleven*). Marking those as counts would
+  misdescribe them, and narrowing the pattern to the cardinality phrasings means
+  guessing at English determiners — which is [#495](https://github.com/LASTRADA-Software/fastcached/issues/495)'s
+  and the `pgrep -f` lesson's warning that a pattern is broader than its author reads
+  it. A guard whose false positives outnumber its true ones teaches people to work
+  around it. [#830](https://github.com/LASTRADA-Software/fastcached/issues/830) carries
+  the analysis; the enforcement here is that **the count is not written down**, so there
+  is nothing for a scan to check.
 
 ### Doc-subject checks were skipped on doc-only changes (#687)
 
@@ -3679,6 +3727,36 @@ been built on the first.
 
 ## Open work
 
+- **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
+  contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table
+  (`Windows-cl-debug`, `Code coverage`, both `compile-cache E2E` legs, the
+  `fastcache-cc` smoke and `Docker image`). They cited #408, which the sanitizer
+  promotion settles, so they were re-pointed at #829 in the same change: **an
+  `Undecided` row naming a CLOSED issue is the "forgot" state the three spellings
+  exist to keep distinguishable from a decision** — it still reads as *somebody will
+  settle this*, the tally goes on printing it every run, and nobody owns it. The
+  check asserts a row NAMES an issue and cannot tell an open one from a closed one,
+  so nothing offline catches this; it was found by hand. `NotBinding` with a reason
+  is a complete answer for most of these — a verdict is what is missing, not a
+  promotion.
+- **[#835](https://github.com/LASTRADA-Software/fastcached/issues/835)** — `clang-tsan`
+  is the ONLY job in `build.yml` that sets `timeout-minutes`, so the jobs behind **twelve
+  of the thirteen** required contexts inherit GitHub's 360-minute default. Raised while
+  promoting the two sanitizer legs, and the survey is what stops it being filed as a
+  regression from that: the promotion added two instances of a condition eleven required
+  contexts were already in, and the likeliest leg to wedge is `clang-tidy`, the slowest in
+  the workflow and required all along. The cost is **not** "six hours of held queue" — the
+  ruleset's `check_response_timeout_minutes` is 60, so the entry is EJECTED at an hour
+  (#359 already has) — it is an hour of queue latency plus up to six hours of runner time
+  after the queue gave up. A bound needs measured durations: one set below a leg's real p99
+  is a flake generator, and `clang-tsan`'s own 60 is a leg-specific argument about bounding
+  its BUILD rather than a house number to copy.
+- **[#830](https://github.com/LASTRADA-Software/fastcached/issues/830)** — nothing
+  stops the required set or its count being restated in prose again. There is no
+  drift today; what is missing is the guard, and the obvious one was measured against
+  the tree and rejected rather than skipped. The measurement and the alternatives it
+  rules out are on the ticket, and the rule it enforces is the
+  *neither-the-set-nor-its-count* bullet above.
 - **[#723](https://github.com/LASTRADA-Software/fastcached/issues/723)** — nothing
   checks that a workflow's script invocation agrees with that script's file mode.
   The complement of [#720](https://github.com/LASTRADA-Software/fastcached/issues/720)

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 name: Merge-group failure report
 
-# A merge group whose only failing job is NOT one of the eleven required
-# contexts is invisible to every surface anybody looks at: the pull request page
+# A merge group whose only failing job is NOT one of the required contexts
+# is invisible to every surface anybody looks at: the pull request page
 # is green (its own run passed on the head), the queue reports success (every
 # required context passed), master is green afterwards (the same job passes on
 # the merge commit), and the only trace is an `event=merge_group` run that no
@@ -171,8 +171,8 @@ jobs:
           - run: ${RUN_URL}
           - queue branch: \`${HEAD_BRANCH}\` (commit \`${HEAD_SHA}\`)
 
-          That context is not one of the eleven the \`default-master\` ruleset requires, so the
-          queue was never going to hold on it and the pull request merged. Nothing here proposes
+          That context is not one the \`default-master\` ruleset requires, so the queue was
+          never going to hold on it and the pull request merged. Nothing here proposes
           changing that: the packaging and coverage jobs are unrequired because they are slow and
           because a packaging failure should not block ordinary work.
 

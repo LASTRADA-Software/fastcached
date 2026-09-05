@@ -1645,7 +1645,7 @@ endif()
 # A non-required job failing inside a merge group reaches somebody (#684).
 #
 # Measured over every failing `merge_group` `Build` run the API still held on
-# 2026-09-04: five of six failed a job that is NOT one of the eleven required
+# 2026-09-04: five of six failed a job that is NOT one of the required
 # contexts -- `Code coverage`, `Windows-cl-debug` twice, `Package (macOS .pkg)`
 # twice -- and all five pull requests merged with nothing anywhere reporting it.
 # The pull request page is green, the queue reports success, and master is green

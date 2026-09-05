@@ -37,7 +37,13 @@
 #
 # A context added to the ruleset and not added here is not caught. A context here
 # that no longer resolves to a job IS caught, which is the direction a rename
-# breaks in.
+# breaks in. And a context added HERE and not in the ruleset is not caught
+# either -- the direction a PROMOTION breaks in, and the costly one: this table
+# is what `ci-merge-group-report.sh` reads to decide whether a merge-group
+# failure still needs reporting, so while it leads the ruleset that leg's
+# failure is classified *already surfaced* by a queue that never held on it.
+# The trade-off is argued at `RequiredContexts` below; re-read the live list
+# above before concluding a promotion is in force.
 
 set -euo pipefail
 
@@ -121,34 +127,71 @@ if [[ "${1:-}" == "--self-test" ]]; then
         && SelfTestCase "a NonBindingContexts row naming a context no job produces is REFUSED" want-fail
 
     # One context claiming both verdicts at once.
+    #
+    # ## Why nothing here names a context
+    #
+    # This case used to anchor on the literal row `"clang-tsan|Undecided|#408"`,
+    # and promoting that context to `RequiredContexts` DELETED the anchor -- so
+    # the case died on its own `assert` instead of reporting anything about the
+    # rule. The assertion was working exactly as designed; the defect is which
+    # line it was anchored on. A row's membership in these tables is the one
+    # thing this file exists to change, so ANY named row is a scheduled failure
+    # and re-anchoring on a different row only relocates it.
+    #
+    # So both ends are DERIVED. The contradictory row takes its context from
+    # whatever `RequiredContexts` lists first, and is inserted at the opening
+    # line of `NonBindingContexts`. Neither depends on a value; both fail loudly
+    # if a table is renamed or emptied, which is a change that SHOULD stop the
+    # self-test rather than one that should quietly disarm it.
     Stage
     cp "$scratch/tree/scripts/$(basename "$me")" "$scratch/before"
     python3 - "$scratch/tree/scripts/$(basename "$me")" <<'PY'
-import sys
+import re, sys
 p = sys.argv[1]
 s = open(p).read()
-anchor = '    "clang-tsan|Undecided|#408"\n'
+first = re.search(r'^RequiredContexts=\(\n    "([^"|]+)\|', s, re.M)
+assert first, "self-test anchor is missing: no first row of RequiredContexts to contradict"
+anchor = 'NonBindingContexts=(\n'
 assert s.count(anchor) == 1, "self-test anchor is missing or not unique"
-open(p, 'w').write(s.replace(anchor, anchor + '    "clang-tidy|NotBinding|a deliberately contradictory row\n'.rstrip('\n') + '"\n'))
+open(p, 'w').write(s.replace(
+    anchor, anchor + '    "%s|NotBinding|a deliberately contradictory row"\n' % first.group(1)))
 PY
     Injected "a doubly-classified context" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" \
         && SelfTestCase "a context in BOTH tables is REFUSED; required and non-binding are opposite claims" want-fail
 
     # A verdict spelling this check does not recognise, and an Undecided row
     # with no issue -- the two ways the three spellings collapse back into one.
-    for defect in "Undecided|Probably fine" "Undecided|soon"; do
+    #
+    # Anchored on the SHAPE of an `Undecided` row rather than on a named one,
+    # for the reason the case above records: this one anchored on
+    # `"Docker image|Undecided|#408"`, and that row's issue number moved in the
+    # same change that promoted the sanitizer legs. The corrupted row keeps its
+    # own context, so it stays a context some job produces and the case fails
+    # for the VERDICT rather than for naming a context nothing emits -- inside a
+    # `want-fail` assertion those two are indistinguishable.
+    #
+    # The two defects are the two arms, and they have to differ in the VERDICT
+    # field or the second one is a duplicate of the first: both used to begin
+    # `Undecided|`, so both landed on *names no issue* and the `*)` arm -- the
+    # one that refuses a spelling this check does not recognise -- had never
+    # been seen to fire. Verified by reading the refusal each case produces, not
+    # by the exit status, because `want-fail` cannot tell two arms apart.
+    for defect in "Probably fine|it is slow" "Undecided|soon"; do
         Stage
         cp "$scratch/tree/scripts/$(basename "$me")" "$scratch/before"
         python3 - "$scratch/tree/scripts/$(basename "$me")" "$defect" <<'PY'
-import sys
+import re, sys
 p, defect = sys.argv[1], sys.argv[2]
 s = open(p).read()
-anchor = '    "Docker image|Undecided|#408"\n'
-assert s.count(anchor) == 1, "self-test anchor is missing or not unique"
-open(p, 'w').write(s.replace(anchor, '    "Docker image|%s"\n' % defect))
+row = re.compile(r'^    "([^"|]+)\|Undecided\|#[0-9]+"$', re.M)
+found = row.search(s)
+assert found, "self-test anchor is missing: no `Undecided` row carrying an issue to corrupt"
+# A lambda and not a template string: `re.sub` reads backslashes and `\1` in a
+# replacement, and the defect text comes from the loop above.
+open(p, 'w').write(row.sub(lambda m: '    "%s|%s"' % (m.group(1), defect), s, count=1))
 PY
         Injected "verdict '$defect'" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" \
-            && SelfTestCase "the verdict '$defect' is REFUSED rather than read as a decision" want-fail
+            && SelfTestCase "a row spelled '$defect' is REFUSED rather than read as a decision" want-fail
     done
 
     # And the empty read, which is the failure every table in this tree shares:
@@ -170,6 +213,31 @@ fi
 # The table: one row per required context, naming the workflow that produces it.
 # A context whose job lives in a matrix is written as the EXPANDED name, because
 # that is what GitHub reports and what the ruleset names.
+#
+# ## This table is the one place the required-context COUNT lives
+#
+# The run prints `all <n> required contexts ...` from `${#RequiredContexts[@]}`,
+# and every other surface that needs the list READS it from here -- see
+# `scripts/ci-merge-group-report.sh`, `scripts/check-gated-jobs.sh` and
+# `scripts/check-merge-group-report.sh`. Nothing restates the set or the number
+# in prose: point at this table, or at the line the run prints, and do not write
+# either down again. `.agent/rules/build-and-toolchain.md` carries that rule and
+# the sites it was written from.
+#
+# ## The docs-only `skipped` hazard is INHERITED here, not introduced
+#
+# On a docs-only pull request the scope classifier answers `code=false` and the
+# compiler legs report `skipped`, which a required context is read as PASSING.
+# That is already true of every required context whose JOB carries the scope gate
+# rather than gating its STEPS -- derive the set rather than reading one from here,
+# with `awk '/^  [A-Za-z0-9_-]+:$/{j=$0} /^    if:/{print j, $0}' .github/workflows/build.yml`
+# and intersect it with the table below; naming one member would read as complete,
+# which is the failure this whole header exists to refuse. It is deliberate: a
+# matrix job must NOT be job-gated (its per-leg contexts would never exist), and a
+# non-matrix one has nothing to gain from starting a runner to do nothing.
+# Promoting `clang-asan-ubsan` and `clang-tsan` adds no new KIND of instance
+# of it -- said out loud so the next reader does not meet it here and file it as
+# a regression this change introduced (#629's acceptance, clause 4).
 RequiredContexts=(
     "Windows-cl-release|.github/workflows/build.yml"
     "Windows-clangcl-release|.github/workflows/build.yml"
@@ -177,6 +245,8 @@ RequiredContexts=(
     "Linux-gcc-release|.github/workflows/build.yml"
     "macOS-clang-release|.github/workflows/build.yml"
     "clang-tidy|.github/workflows/build.yml"
+    "clang-asan-ubsan|.github/workflows/build.yml"
+    "clang-tsan|.github/workflows/build.yml"
     "sccache smoke (memcached text)|.github/workflows/build.yml"
     "sccache smoke (memcached binary)|.github/workflows/build.yml"
     "sccache smoke (redis RESP2)|.github/workflows/build.yml"
@@ -190,18 +260,54 @@ RequiredContexts=(
 #
 # ## The gap this closes
 #
-# #408 records that `clang-tsan` runs, is proven live by its own canary, and
-# cannot block a merge -- and says the answer is not to add one row to the
+# #408 recorded that `clang-tsan` runs, is proven live by its own canary, and
+# could not block a merge -- and said the answer was not to add one row to the
 # ruleset, because "the same question applies to every other non-required leg"
-# and deciding one in isolation leaves the gap in seven places. #629 is the same
-# ticket for `clang-asan-ubsan`, which is the project's ENTIRE sanitizer test
-# run. Neither can be closed here: which contexts are required is a server-side
-# ruleset, and changing it is a repository-admin decision.
+# and deciding one in isolation leaves the gap in seven places. #629 was the
+# same ticket for `clang-asan-ubsan`, the project's ENTIRE sanitizer test run.
 #
-# What CAN be written down without that decision is which legs are binding and
-# why -- so that a leg nobody has decided about is DISTINGUISHABLE from one
-# somebody deliberately left unrequired. Today they look identical: absent from
-# `RequiredContexts` and absent from everywhere else.
+# Both are now `Binding`. What settled them was a MEASUREMENT rather than the
+# cost argument their own bodies carried, which the measurement FALSIFIED:
+# neither leg is on the merge queue's critical path, and the slowest leg in the
+# workflow was already required. #629 carries the numbers, the window they were
+# taken over and the contention they were taken under -- read them there.
+#
+# What this table records without a ruleset decision is which legs are binding
+# and why -- so that a leg nobody has decided about is DISTINGUISHABLE from one
+# somebody deliberately left unrequired. Without it they look identical: absent
+# from `RequiredContexts` and absent from everywhere else.
+#
+# The `Binding` column remains a copy of a server-side setting, per this file's
+# header, and the ruleset is still the authority. A promotion is not in force
+# until an administrator adds the row there.
+#
+# ## The two copies were out of step, in the measured direction
+#
+# The ruleset went FIRST: an administrator added both rows on 2026-09-05, while
+# the branch carrying this table change was still open. So the blind spot this
+# file's header states -- *a context added to the ruleset and not added here is
+# not caught* -- happened for real rather than hypothetically, and it is worth
+# recording which cost that bought, because the two orderings have OPPOSITE ones
+# and neither is free.
+#
+#   Ruleset first (what happened). `ci-merge-group-report.sh` READS this table.
+#   Between the flip and this landing, a failing sanitizer leg inside a merge
+#   group would have been classified unrequired-and-unreported and had a #684
+#   issue filed for a failure the queue had already ejected the pull request
+#   over -- the reporter creating the bug it was written to prevent. #629's
+#   acceptance predicted exactly this, which is why it asks for the ruleset row
+#   and the table row in ONE change.
+#
+#   Table first. A failure of either leg inside a merge group would be
+#   classified *already surfaced* by a queue that never held on it: #684's
+#   silence, narrowed to two jobs and to the window.
+#
+# Both windows are one administrator action wide, and #629 measured 132
+# executions of the two jobs across the 69 most recent `Build` runs with zero
+# failures -- so neither was likely to fire. That is luck about the exposure,
+# not an argument that the ordering does not matter. The standing instruction is
+# the `gh api` call in this file's header: **re-read the live list rather than
+# inferring it from this table**, in either direction.
 #
 # ## Three spellings, because two collapse the distinction
 #
@@ -245,14 +351,20 @@ NonBindingContexts=(
     "Check the release gate covers every job|NotBinding|it guards a TAG run, and a tag is not a merge. A release that lost a gating job is caught by this job on the tag, which is the event that can act on it"
 
     # Nobody has decided. Tallied per issue on every run.
-    "clang-tsan|Undecided|#408"
-    "clang-asan-ubsan|Undecided|#629"
-    "Windows-cl-debug|Undecided|#408"
-    "Code coverage|Undecided|#408"
-    "compile-cache E2E (Linux)|Undecided|#408"
-    "compile-cache E2E (Windows)|Undecided|#408"
-    "fastcache-cc smoke (compile-cache 0xFC)|Undecided|#408"
-    "Docker image|Undecided|#408"
+    #
+    # These six used to cite #408, which the promotion above settles and the
+    # pull request carrying it closes on merge.
+    # An `Undecided` row naming a CLOSED issue is exactly the "forgot" state the
+    # three spellings exist to keep distinguishable from a decision -- it still
+    # reads as *somebody will settle this*, and nobody will. #829 is that
+    # somebody. (The check asserts a row NAMES an issue; it cannot tell an open
+    # one from a closed one, which is why this had to be caught by hand.)
+    "Windows-cl-debug|Undecided|#829"
+    "Code coverage|Undecided|#829"
+    "compile-cache E2E (Linux)|Undecided|#829"
+    "compile-cache E2E (Windows)|Undecided|#829"
+    "fastcache-cc smoke (compile-cache 0xFC)|Undecided|#829"
+    "Docker image|Undecided|#829"
 )
 
 problems=0
@@ -471,10 +583,15 @@ for workflow in "${allWorkflows[@]}"; do
 done
 
 # `${arr[@]+"${arr[@]}"}` and not a bare `"${arr[@]}"`, in both places the
-# non-binding table is expanded. It cannot legitimately be empty here -- 30
-# contexts, 11 of them required -- and the completeness check below would catch
-# an empty one anyway, since every non-required context would then fail for want
-# of a row. The guard is for bash 3.2, which is macOS's /bin/bash and a platform
+# non-binding table is expanded. It cannot legitimately be empty here -- these
+# workflows produce far more contexts than the ruleset requires, so most of them
+# must carry a row -- and the completeness check below would catch an empty one
+# anyway, since every non-required context would then fail for want of a row.
+# (This sentence used to state both figures, and they went stale the first time a
+# context was promoted -- which is why the counts are printed at the end of the
+# run and written down nowhere.)
+#
+# The guard is for bash 3.2, which is macOS's /bin/bash and a platform
 # this check runs on from the default ctest set: there `"${arr[@]}"` on an empty
 # array is an UNBOUND VARIABLE under `set -u`, so the check would die with a
 # shell error rather than print the sentence it exists to print.

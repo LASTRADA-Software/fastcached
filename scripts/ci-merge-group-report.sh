@@ -13,8 +13,8 @@
 #
 # ## The failure this exists for, measured rather than argued
 #
-# A merge group whose only failing job is not one of the eleven REQUIRED contexts
-# is invisible to every surface anybody looks at. The pull request page is green
+# A merge group whose only failing job is not one of the REQUIRED contexts is
+# invisible to every surface anybody looks at. The pull request page is green
 # (its own run passed on the head), the queue reports success (every required
 # context passed), master is green afterwards (the same job passes on the merge
 # commit), and the only trace is an `event=merge_group` run that no part of the
