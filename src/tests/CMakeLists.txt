@@ -2027,6 +2027,26 @@ elseif(WIN32)
     # coverage.
     message(STATUS "fleet-dashboard-e2e: POSIX-only fixture — skipping on Windows")
 else()
+    # Socket-activate the node for real, which nothing else here does -- and that
+    # absence is why #770 reached master: `ParseSocketActivation` is unit-tested and
+    # passes under the bug, while the packaging job that caught it is not a required
+    # context. Two instruments that cannot fail the same way, with nothing between
+    # them. Skips 77 where `systemd-socket-activate` is absent, and says which mode it
+    # ran in so a green run is never silently the skip.
+    add_test(
+        NAME "node-socket-activation-e2e"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/node-socket-activation-e2e.sh"
+            --node "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    # Serial for `fleet-dashboard-e2e`'s reason: it starts a real node and reads a
+    # well-known default port, so it must not race the other server-starting fixtures.
+    set_tests_properties("node-socket-activation-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 600
+    )
+
     add_test(
         NAME "fleet-dashboard-e2e"
         COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
