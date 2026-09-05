@@ -370,6 +370,25 @@ And note how it was found, because the alternative was filing a regression that 
 exist: by reading **one failure's actual output**, not by comparing counts. "23 of 3285"
 against "0 of 3285" is arithmetic that is true and useless.
 
+### Attributing a stranded process: `readlink -f` under-counts and reports clean
+
+**Reap by `/proc/<pid>/cwd`, never `pkill -f` — but read that link RAW.** `readlink -f`
+resolves the path and **fails on a deleted directory**, which is exactly the state a
+stranded helper reaches once its build or scratch tree is removed. Measured: a sweep built
+on `readlink -f` reported **0 left while three were still holding ports**; the raw
+`readlink`, keeping the `… (deleted)` suffix, found them.
+
+So the failure is the worst shape available — the sweep says the host is clean *because*
+the processes are the ones most detached from any live tree.
+
+`pkill -f` remains wrong for the separate reason that a pattern is broader than its author
+reads it as: two worktrees here are named `SAN-408` and `SAN-REQ-408`, one token apart.
+
+And **a count taken across a shared host describes the host, not your change.** A review
+here ran `pgrep -f 'IO::Socket::INET'` around a run, got 12 survivors, and nearly filed
+them — they belonged to other lanes, betrayed by a variable name the file under test never
+uses. Attribution by cwd is what makes a before/after number mean anything.
+
 ### Pairwise clean is not serially clean
 
 **Before sequencing two PRs that touch the same file, merge-tree the second onto a

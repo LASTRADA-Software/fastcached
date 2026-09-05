@@ -993,7 +993,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
-- Run `scripts/local-gate.sh` before pushing. One configuration is not the gate. A RED run
+- Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare
+  path**, which is this file's own #723 rule and is load-bearing here: the script is mode
+  **644 in git** (15 of 31 under `scripts/` are), so a bare invocation exits **126**, and a
+  reader who checks only *did the gate pass* reads that as a red branch. One configuration
+  is not the gate. A RED run
   stops at the first failing leg — correct, and it now NAMES the legs it skipped, because
   "GATE FAILED: clang-debug tests" alone read as "the rest passed" and two `-Werror`
   defects hid behind five red runs that never reached `gcc-release` (#501). Read the
@@ -1030,7 +1034,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   value check agreed with it. And a run that was KILLED mid-build is discarded rather than
   read — an unfinished run has told you nothing, which is not the same as telling you the
   tree is fine. None
-  announces itself; each looks like a flake; a re-run clears all twelve. A dirty-tree guard
+  announces itself; each looks like a flake; a re-run clears all twelve. **And a gate that
+  DIED partway writes no verdict at all** — two full gates ran concurrently on one host,
+  swap went to 7G of 7G with no OOM kill logged, and one died mid-build with exit **144**.
+  A nonzero exit from a KILLED gate is not a red tree, and 144 turned up twice that day in
+  unrelated contexts, so it means *something killed this* and never *the tree is bad*.
+  Serialise the gate across lanes rather than racing it. A dirty-tree guard
   that samples once AT THE START cannot see an instrument that dirties the tree itself —
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a
@@ -1390,6 +1399,24 @@ what differs between compilers, standard libraries, hosts and tool versions.
   rebased and rebuilt before it merges, never inspected — the #292 worktree was nine
   behind and the rebuild took about two minutes and was clean, which is what this costs
   when it passes, and passing is why skipping it feels free.
+- **After a revert, test for the REVERT, never for the defect.** A revert leaves the
+  reverted commit in the ancestry forever, so `--is-ancestor <fix>` answers YES for every
+  branch including master and discriminates nothing; the only useful question is
+  `--is-ancestor <revert>` coming back NO. The instinct is to check for the thing that
+  broke you, and it is the one test that cannot work.
+- **A subject line is an abbreviated identifier with no prefix to disagree about.** Two
+  commits here carried the identical subject and opposite revert status — one rebased from
+  the other — and two people measured correctly and reported contradictory answers. A
+  truncated SHA at least *looks* like an identifier and invites comparison; a subject line
+  looks like a description, so nobody checks whether two exist. Same family as a ctest
+  index (per build), two worktrees one token apart, and `gate-gcc-release` against
+  `Linux-gcc-release` — **a leg travels with its compiler and its machine.**
+- **A reason that generalises further than the fact it was drawn from is worse than the
+  narrow one**, because it reads as licence somewhere it was never measured — and it is
+  introduced while TIDYING, which is when it is least likely to be re-checked. Measured:
+  `IsDeadlineExpiry`'s true reachability reason was "improved" into a false semantic one
+  during a `/simplify`, a later review faithfully propagated it into two rulebook files
+  and added a counter-paragraph beside it, and the header then argued both sides.
 - A reference-build refusal is a REFUSAL and not a warning, because a verdict about a
   tree that was not built cannot be read in EITHER direction. #626 was five metrics
   tests failing in four files the branch never touched, all clearing under
