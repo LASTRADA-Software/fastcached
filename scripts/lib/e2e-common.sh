@@ -741,16 +741,23 @@ stop_and_require_exit() {
 
 # ---------------------------------------------------------------------------
 
+# How long any one read here may block before the probe gives up.
+#
+# Named once so the read and the code that INTERPRETS the read cannot disagree
+# about it. A bound in one place and a threshold in another is two numbers that
+# have to stay equal forever.
+_e2e_http_read_bound=5
+
 # Read one whole response off fd 3 and close it.
 #
 # The read half of every helper below, in ONE place. Called directly rather than
-# through a command substitution, so `_http_drain_status` reaches its caller: a
+# through a command substitution, so its two output variables reach the caller: a
 # subshell's variable does not.
 #
-# `read -t 5` and not a fractional timeout, because bash 3.2 rejects one. Every
-# read is bounded because the endpoint closes the connection itself
-# (`Connection: close`), so a healthy server ends the loop on its own -- and a
-# WEDGED one, which is exactly the state these probes exist to detect, would
+# `read -t` with a whole number and not a fractional timeout, because bash 3.2
+# rejects one. Every read is bounded because the endpoint closes the connection
+# itself (`Connection: close`), so a healthy server ends the loop on its own -- and
+# a WEDGED one, which is exactly the state these probes exist to detect, would
 # otherwise hang the suite instead of failing it.
 #
 # THE LAST CHUNK. `read` sets its variable and returns non-zero on a final chunk
@@ -761,24 +768,49 @@ stop_and_require_exit() {
 # copies this file replaced learnt that; the other six never did -- which is the
 # whole argument for there being one copy now rather than one per helper.
 #
-# @return echoes the body; sets `_http_drain_status` to the `read` that ended the
-#         loop -- 1 when the PEER closed, above 128 when OUR bound expired. Those
-#         are different facts and one of them is not an answer.
+# ## Why the elapsed time and not `read`'s exit status
+#
+# "The peer closed" and "our own bound expired" are different facts, and the
+# obvious way to tell them apart is that `read -t` returns **above 128** on a
+# timeout and `1` on EOF. **That is bash 4.0+.** bash 3.2 -- which macOS ships, and
+# which `FASTCACHED_BASH` resolves to on every non-Windows platform -- returns a
+# plain `1` for both, so the discrimination silently collapses on the one platform
+# it was written to protect, in the direction that reports a WEDGED server as one
+# that answered nothing. This file's header already records the same shape for
+# `BASHPID`: correct on bash 4, silently inert on 3.2.
+#
+# So the status is not asked. The read that ENDED the loop is timed instead, and a
+# read that consumed the whole bound is one the bound ended. That is true on every
+# bash. *Inferred, not measured*: no 3.2 was available to test against -- this host
+# is 5.3.9, where a timeout is 142. Removing the dependency is what makes that
+# acceptable; testing it here would have proved nothing about macOS.
+#
+# `SECONDS` is whole seconds, and the arithmetic is exact rather than lucky:
+# `floor(a + BOUND) - floor(a)` is exactly `BOUND` for any `a`, so a read that
+# times out always measures `BOUND` and never one less. It times the LAST read
+# rather than the loop, because a server that dribbles a line every two seconds
+# would otherwise accumulate past the bound and be called a timeout.
+#
+# @return echoes the body. Sets `_http_drain_elapsed` to how long the read that
+#         ended the loop took, and `_http_drain_status` to what it returned --
+#         the latter for diagnostics only, never to tell a timeout from an EOF.
 _http_drain_fd3() {
-    local line="" body=""
-    # The read's own status, taken at the read. A `while read ...; do ...; done`
-    # leaves `$?` holding the last command of the BODY -- so on a peer that never
-    # says anything the body never runs and `$?` is a clean 0, which reads as "the
-    # peer closed" for a read that in fact timed out. Caught by the selftest case
-    # that stages exactly that peer, which is the reason it exists.
+    local line="" body="" before=0
     while :; do
         # `|| _http_drain_status=$?` rather than a bare read: a command whose failure
         # is TESTED is exempt from `set -e`, and a bare one is not. This file is
         # sourced by fixtures on both settings -- `check-e2e-helpers.sh` sets `-e`,
         # `fleet-dashboard-e2e.sh` sets only `-uo pipefail` -- so a bare read here
         # ended the whole shell on EOF in one and returned normally in the other.
+        #
+        # And the status is taken AT the read: a `while read ...; do ...; done`
+        # leaves `$?` holding the last command of the BODY, so on a peer that never
+        # says anything the body never runs and `$?` is a clean 0 -- which reads as
+        # "the peer closed" for a read that in fact timed out.
         _http_drain_status=0
-        IFS= read -r -t 5 line <&3 || _http_drain_status=$?
+        before=$SECONDS
+        IFS= read -r -t "$_e2e_http_read_bound" line <&3 || _http_drain_status=$?
+        _http_drain_elapsed=$(( SECONDS - before ))
         [ "$_http_drain_status" -eq 0 ] || break
         body+="${line}"$'\n'
     done
@@ -797,10 +829,10 @@ _http_drain_fd3() {
 # ways against one unfixed binary: a `python` client saw the `400`, a bash client
 # saw nothing. A guard built on that passes on the bug about half the time.
 #
-# No idle parameter. `read -t 5` outlasts any request deadline this tree sets, so
-# a server that means to answer a silent peer has answered by the time the bound
-# expires and one that means to close has closed. Sleeping first would only make
-# the case slower.
+# No idle parameter. `_e2e_http_read_bound` outlasts any request deadline this tree
+# sets, so a server that means to answer a silent peer has answered by the time the
+# bound expires and one that means to close has closed. Sleeping first would only
+# make the case slower.
 #
 # It REFUSES rather than answering when that bound is what ended the read: an
 # expired `read -t` yields an empty body, which is byte-identical to "the server
@@ -823,10 +855,10 @@ http_response_to_silence() {
     local host="$1" port="$2"
     exec 3<>"/dev/tcp/${host}/${port}" || return 2
     _http_drain_fd3
-    # `-eq 1` and not `-le 128`: `1` is the peer closing, which is an answer. Any
-    # other non-zero is a `read` that failed some other way, and reporting that as
-    # "the server said nothing" would be a pass for a question nobody asked.
-    [ "$_http_drain_status" -eq 1 ]
+    # Elapsed, never `read`'s status -- see `_http_drain_fd3`. A read that consumed
+    # the whole bound is one OUR bound ended, and that is not an answer about the
+    # server; anything shorter is the peer having closed, which is.
+    [ "$_http_drain_elapsed" -lt "$_e2e_http_read_bound" ]
 }
 
 # ---------------------------------------------------------------------------
