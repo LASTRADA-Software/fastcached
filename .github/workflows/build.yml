@@ -2777,48 +2777,120 @@ jobs:
           $cfg = "$dir\fastcached.yaml"
 
           # Seeding happened at all. This is also the assertion that catches
-          # %ProgramData% being absent from the LocalSystem service environment,
-          # which would make both the seed and the daemon's own lookup no-ops.
+          # %ProgramData% being absent from the service environment, which would
+          # make both the seed and the daemon's own lookup no-ops -- and it is the
+          # positive control for everything below, all of which is "no entry
+          # matches" and would pass loudest on a file that is not there.
           if (-not (Test-Path $cfg)) { throw "installer did not seed $cfg" }
           if (-not (Select-String -Path $cfg -Pattern '^#port:' -Quiet)) {
             throw "$cfg does not look like the shipped template"
           }
 
-          # The ACL, by SID rather than account name so the check is not itself
-          # wrong on a non-English runner. A standard account able to create
-          # files here owns the configuration of a LocalSystem service.
-          $acl = Get-Acl $dir
-          if (-not $acl.AreAccessRulesProtected) {
-            throw "$dir still inherits from C:\ProgramData, which grants BUILTIN\Users create-file"
+          # Ask for the rules as SIDs rather than translating names afterwards:
+          # entries like ALL APPLICATION PACKAGES have no account to resolve to,
+          # and Translate() throws on them rather than returning nothing, which
+          # would abort this check instead of passing it. An empty list is refused
+          # for the same reason the Test-Path above is: nothing to scan reads
+          # exactly like nothing wrong.
+          function Get-AllowRules($path) {
+            $acl = Get-Acl $path
+            $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+                       Where-Object { $_.AccessControlType -eq 'Allow' })
+            if ($rules.Count -eq 0) { throw "read no allow entries from $path; the assertions below cannot run" }
+            return @{ Acl = $acl; Rules = $rules }
           }
 
+          # Which of $sids is granted any of $rights. One filter, so the direction
+          # that must find nothing and the direction that must find something
+          # cannot end up keying on different bits.
+          # FileSystemRights is a signed int, so GENERIC_READ arrives as a negative
+          # number and a naive -band against a positive long mask would miss it.
+          # Widened to the unsigned 32-bit value both sides agree on first.
+          function Get-Grantees($rules, $sids, $rights) {
+            $mask = [uint32]($rights -band 0xFFFFFFFF)
+            return @($rules | Where-Object {
+              $sids -contains $_.IdentityReference.Value -and
+              (([uint32]($_.FileSystemRights -band 0xFFFFFFFF)) -band $mask) -ne 0
+            })
+          }
+
+          # By SID rather than account name so the check is not itself wrong on a
+          # non-English runner. This is the set Platform/FileTrust calls broad --
+          # Everyone, Authenticated Users, BUILTIN\Users, INTERACTIVE, Guests --
+          # and it is declared once because two copies is how one of them loses an
+          # entry.
+          $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546')
+          # The write mask, unchanged. It is the directory's, it predates this
+          # branch, and widening it to match PlantingRights exactly would be a
+          # change to a pre-existing assertion on a platform this branch cannot
+          # run -- that belongs with whoever can test it.
           $planting = [Security.AccessControl.FileSystemRights]::CreateFiles `
                     -bor [Security.AccessControl.FileSystemRights]::CreateDirectories `
                     -bor [Security.AccessControl.FileSystemRights]::Write `
                     -bor [Security.AccessControl.FileSystemRights]::ChangePermissions `
                     -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
-          $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546')
+          # The read mask is ReadingRights from src/FastCache/Platform/FileTrust.cpp,
+          # spelled for PowerShell. ReadData rather than the Read composite: that
+          # one includes ReadPermissions, which almost every entry carries, so a
+          # band against it would fire on principals that cannot read a byte. The
+          # two GENERIC_* bits are in the C++ deliberately -- an inherited entry is
+          # usually spelled with them, and its comment says a scan for the bare bit
+          # "would miss the very entry this exists to find" -- and FileSystemRights
+          # has no name for either, hence the raw values.
+          $reading = [int][Security.AccessControl.FileSystemRights]::ReadData `
+                    -bor 0x80000000 `
+                    -bor 0x10000000
 
-          # Ask for the rules as SIDs rather than translating names afterwards:
-          # entries like ALL APPLICATION PACKAGES have no account to resolve to,
-          # and Translate() throws on them rather than returning nothing, which
-          # would abort this check instead of passing it.
-          foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-            if ($rule.AccessControlType -ne 'Allow') { continue }
-            $sid = $rule.IdentityReference.Value
-            if ($broad -contains $sid -and ($rule.FileSystemRights -band $planting)) {
-              throw "$dir grants $sid $($rule.FileSystemRights); a standard account could plant a config there"
-            }
+          # --- The DIRECTORY answers integrity. A standard account able to create
+          # files here owns the configuration of a service this machine trusts.
+          $directory = Get-AllowRules $dir
+          if (-not $directory.Acl.AreAccessRulesProtected) {
+            throw "$dir still inherits from C:\ProgramData, which grants BUILTIN\Users create-file"
+          }
+
+          $planters = @(Get-Grantees $directory.Rules $broad $planting)
+          if ($planters.Count -gt 0) {
+            $planters | ForEach-Object { Write-Host "::error::$($_.IdentityReference) may write in $dir ($($_.FileSystemRights))" }
+            throw "a standard account could plant a config in $dir"
           }
 
           # An owner keeps ChangePermissions whatever the entries say.
-          $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+          $owner = $directory.Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
           if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) {
             throw "$dir is owned by $owner, not by SYSTEM or Administrators"
           }
 
+          # --- The FILE answers secrecy, and the directory's list cannot: it grants
+          # BUILTIN\Users read and execute INHERITABLY, deliberately, and a file
+          # left to inherit that is readable by every local account. That file is
+          # where InlineCredentialRejection tells operators to put `requirepass:`,
+          # so the documented remedy used to move the secret from one world-readable
+          # place to another (#741). No test on a POSIX host can construct or read a
+          # DACL, so this is the whole of the Windows evidence for that fix.
+          $file = Get-AllowRules $cfg
+          if (-not $file.Acl.AreAccessRulesProtected) {
+            throw "$cfg still inherits from $dir, so it carries the directory's read for BUILTIN\Users"
+          }
+
+          $readers = @(Get-Grantees $file.Rules $broad $reading)
+          if ($readers.Count -gt 0) {
+            $readers | ForEach-Object { Write-Host "::error::$($_.IdentityReference) may read $cfg ($($_.FileSystemRights))" }
+            throw "the seeded config is readable by a broad principal"
+          }
+
+          # And the other direction, which is what separates SECURED from BROKEN: a
+          # config nothing can read is not a fix, it is a daemon that silently falls
+          # back to built-in defaults. S-1-5-6 is NT AUTHORITY\SERVICE, which the
+          # daemon's virtual account is a member of.
+          $service = @(Get-Grantees $file.Rules @('S-1-5-6') $reading)
+          if ($service.Count -eq 0) {
+            $file.Rules | ForEach-Object { Write-Host "  $($_.IdentityReference) $($_.FileSystemRights)" }
+            throw "nothing grants NT AUTHORITY\SERVICE (S-1-5-6) read on $cfg"
+          }
+
           Write-Host "seeded $cfg"
-          Write-Host "  owner: $owner  protected: $($acl.AreAccessRulesProtected)"
+          Write-Host "  directory owner: $owner  protected: $($directory.Acl.AreAccessRulesProtected)"
+          Write-Host "  file restricted to SYSTEM, Administrators and services"
 
       # Seed-once, the property the whole arrangement exists for: an MSI
       # overwrites its payload on every install, so the live config is kept out

@@ -518,6 +518,45 @@ readable and silently ignored. Every rule below has already been one of them.
   it has the rights for none of this, and deletes a directory it created but
   could not secure — which would otherwise be the very shape being defended
   against, authored by the defence.
+- **The directory answers integrity; the FILE has to answer secrecy, and the
+  directory's list cannot.** `%ProgramData%\fastcached` grants `BUILTIN\Users`
+  read *inheritably* and must — the daemon runs as the virtual account
+  `NT SERVICE\FastCached`, an ordinary `BUILTIN\Users` member, and that grant is
+  how it reached its own configuration. `OICI` then handed the same read to the one
+  file `InlineCredentialRejection` tells operators to move `requirepass:` into,
+  *because* a command line is world-readable — so the documented remedy relocated
+  the secret rather than protecting it, and #384's readability check correctly fires
+  on the shipped default (#741). The file therefore carries a **protected** list of
+  its own: SYSTEM and Administrators in full, `NT AUTHORITY\SERVICE` read. Five
+  things follow and each was a wrong turn first.
+  - **Not `PermissionEx` in the MSI**, which is what the ticket proposed:
+    `PermissionEx` targets a component the installer *installs*, and the live config
+    is deliberately not payload. `--seed-config` writes it, so that is the only place
+    the list can be applied — and it is one implementation for the custom action and
+    a hand-run seed alike.
+  - **`SU` (S-1-5-6, every service logon), not `NT SERVICE\<name>`.** The
+    per-service trustee resolves only once the service exists — `GrantPathAccess`
+    says so at its own call site — and the MSI seeds *before* it registers anything,
+    so naming it would grant nothing on the one path this exists for. It also
+    survives `--service-name`. It is a real widening over the per-service SID and is
+    written down as one rather than presented as the tight answer: `SERVICE` is every
+    principal logged on as a service, which takes an administrator to arrange and
+    excludes every interactive account, but it is not only this daemon.
+  - **Repair on upgrade only when the file is currently broadly readable.**
+    Seed-once finds an existing file, and one seeded by an older build carries the
+    inherited grant; a narrower delegation is an administrator's own and an
+    undetermined answer is not an exposure anybody established. The repair is its own
+    `SeedOutcome`, because a seed-once action modifying something silently is what it
+    exists to avoid. Content is never touched.
+  - **A comment that vouches for a grant moves with it.** `MakeDaemonServiceSpec`
+    cited the `BU` ACE as how the account reads its config — true when written, and
+    this change deletes exactly that ACE's role. Leaving it would be the
+    comment-naming-what-it-duplicates shape one level up.
+  - Windows is the platform this is *about* and no test on a POSIX host can
+    construct a DACL, so the evidence is the `package-windows` job asserting the
+    installed file's access list — no broad principal may read, `S-1-5-6` may, and
+    the list is protected. **Both directions**: a config nothing can read is not a
+    fix, it is a daemon that silently starts on built-in defaults.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
