@@ -813,11 +813,37 @@ _e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
 # is 5.3.9, where a timeout is 142. Removing the dependency is what makes that
 # acceptable; testing it here would have proved nothing about macOS.
 #
-# `SECONDS` is whole seconds, and the arithmetic is exact rather than lucky:
-# `floor(a + BOUND) - floor(a)` is exactly `BOUND` for any `a`, so a read that
-# times out always measures `BOUND` and never one less. It times the LAST read
-# rather than the loop, because a server that dribbles a line every two seconds
-# would otherwise accumulate past the bound and be called a timeout.
+# `SECONDS` is whole seconds sampled off a boundary this process does not choose,
+# so the reading carries a one-second ambiguity -- the same work reads `floor(T)`
+# or `floor(T)+1` depending on where the shell started. **That ambiguity is real
+# and it is argued rather than ignored, because it lands entirely on one side.**
+#
+# In the TIMEOUT direction there is none: `floor(a + BOUND) - floor(a)` is exactly
+# `BOUND` for any `a`, since adding a whole number preserves the fractional part,
+# and `read -t` cannot return BEFORE its bound. So a timed-out read measures
+# `BOUND` or more, never less, and is never mistaken for a peer that closed.
+#
+# In the EOF direction the band bites: a peer closing at 4.7s of a 5s bound reads
+# 4 or 5, so it can be called the bound's. That direction FAILS CLOSED -- the
+# probe answers `$E2eSilenceInconclusive` and REFUSES rather than reporting a
+# verdict it did not establish, which is the whole point of the third status. The
+# alternative error, calling a wedged server one that answered nothing, is the
+# silent one and cannot happen here.
+#
+# A peer that closes within a second of the bound is pathological anyway: this
+# probe faces a server that either answers at once or holds forever. Measured
+# over 200k simulated placements -- `T=5.0` gives delta 5 always, `T=5.003` gives
+# {5,6}, `T=4.7` gives {4,5}, `T=0.6` gives {0,1}. The last matches #678's thirty
+# runs of ~600ms reading 0 fourteen times and 1 sixteen times.
+#
+# Sub-second precision is available (`TIMEFORMAT='%3R'` with `time`, bash 2.0+)
+# and is NOT used: it returns a locale-formatted decimal, and `0,255` fed to
+# `$(( 10#... ))` is a wrong small number rather than an error, because bash
+# arithmetic reads `,` as the comma operator. Integer `SECONDS` has no such path.
+#
+# It times the LAST read rather than the loop, because a server that dribbles a
+# line every two seconds would otherwise accumulate past the bound and be called
+# a timeout.
 #
 # The read's own status is LOCAL, deliberately. It is loop control and nothing
 # else: an earlier draft exported it and had to carry a written prohibition against
