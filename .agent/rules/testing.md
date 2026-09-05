@@ -474,6 +474,63 @@ guard back in and running the self-test on a bash 5 runner leaves every behaviou
 case **green**, because on bash 5 the guard works. The bash-3.2 scan in
 `check-e2e-helpers.sh` is the only check in the tree that can see it.
 
+**And that scan reads every script under `scripts/`, not the library.** It read
+one file for two tickets while `launcher-replay-e2e.sh` carried the exact guard
+the rule bans by name, under a comment arguing it was correct — so the repository
+had the rule written down, had a check enforcing it, and the check did not read
+the file that broke it (#627). The set is WALKED rather than listed, because a
+list is exact about the files it knows and silent about the ones it does not;
+restricting the walk to `scripts/` is a scope choice, so a tracked `*.sh` outside
+it is refused by name, the message states the pattern it searched, and where git
+is absent that half reports as NOT CHECKED rather than as clean. It refuses on an
+empty file list and on an emptied token table — two empty lists agree perfectly,
+and this scan has two ways to become one.
+
+**One enumeration serves all three scans in that file**, and folding them found a
+second instance of the same defect: the `timeout` scan's own failure message says
+*"use `run_bounded` from `scripts/lib/e2e-common.sh`"*, and its non-recursive glob
+could not read the file that DEFINES `run_bounded`. Three copies of a file list
+is three answers to one question, and the delta was exactly the worst file.
+
+**A file exempts a REGION, not itself.** `check-e2e-helpers.sh` has to hold the
+banned-token table and the canary's staged text, so it matches its own scan by
+construction — and the first fix was an allowlist row for the whole file. That is
+the wrong altitude by three orders of magnitude: the file is over 1700 lines, is
+the heaviest array user under `scripts/`, and ctest runs it through `/bin/bash`,
+so on macOS it is a bash 3.2 script like any other. It now marks those two blocks
+with `# bash32-scan: data-begin` / `-end`, the scan reads everything else, an
+unbalanced region is refused (an unclosed one would blank the rest of a file), and
+every declared region is NAMED on each run — an exemption with a smaller blast
+radius is still an exemption. Watched: a `local -n` planted outside a region is
+caught, where under the whole-file row it was not. The markers a file has to
+*write* are spelled `bash32-%s` through `printf`, or a heredoc holding them
+verbatim closes the enclosing region early — which happened on the first run of
+that block, and the scan reading its own source is what caught it.
+
+**Whether a region is well formed is asked by a STATE MACHINE, not by counting the
+two markers.** Counting is the obvious spelling and it fails in the hiding
+direction: a `data-end` sitting above the first `data-begin` is a no-op for the
+reader and leaves a region open to end of file, while the totals come out equal and
+the file reads as balanced. Measured by staging exactly that into
+`check-e2e-helpers.sh` with a `mapfile` below it — the whole run's output was
+byte-identical to a clean one, census line included. A checker that does not ask its
+question the way the reader asks it is answering a different question.
+
+**`BASHPID` is one of at least three doors to the same room**, and the general
+form belongs beside the fix: *inside a `want-fail` assertion, any failure to run
+is indistinguishable from the rule firing.* #723 reached it through a mode bit (a
+bare `"$0"` exited **126**, and eight cases passed because the SHELL refused);
+`set -u` reaches it by expanding an empty array, which is an unbound variable
+before 4.4 (`${1+"$@"}` is the remedy; #793, #794); `BASHPID` reaches it by making
+the abort a no-op. The token table covers the first and the third and
+**deliberately not the second** — measured, `"${x[@]}"` and `"$@"` occur about 110
+times across the 22 scripts that set `-u`, essentially all of them arrays that
+cannot be empty, and no regex over shell can tell a possibly-empty array from a
+never-empty one. A row for it would be ~110 findings on a correct tree, and a
+scan that reports noise is a scan somebody deletes — which would cost the eight
+rows that do work. That is the decision, recorded so the next instance is not
+missed for want of anyone having made one.
+
 `ctest -R e2e-helpers-selftest` is the test, in the default set, POSIX-only. Its
 decision half — which kind of failure a wait suffered — is `_e2e_verdict`, pure and
 driven from staged records with both sides of every threshold pinned, for the reason
@@ -683,9 +740,12 @@ worked was the one nobody had invented.
 launcher environment — does not stop the script. It then reported two further
 failures about the artefacts the first one explains, so a reader working upward
 from the last line starts on the wrong question. Fixed at the helper, not the
-call site, because the next subshell will not remember: signal the top-level
-shell, and test with `BASHPID` rather than `$$` — bash keeps `$$` at the parent's
-value inside a subshell, so the guard would always hold and silently do nothing.
+call site, because the next subshell will not remember: **signal the top-level
+shell unconditionally.** This paragraph used to end "and test with `BASHPID`
+rather than `$$`", and that half was wrong for two tickets — see the rule above,
+and #627. `$$` cannot detect a subshell, `BASHPID` can and is bash 4.0+, so on
+macOS the guard degrades to exactly the `$$` comparison it was written to
+replace. There is no detection that works on both; unconditional costs nothing.
 
 **A guard that proves a fixture bites can itself fail to bite.** The canary
 compiled a deliberately wrong object over the object of the first `_test.cpp` in
@@ -1352,9 +1412,12 @@ output.
   scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
   `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
   has been copied wrong before.
-- **[#627](https://github.com/LASTRADA-Software/fastcached/issues/627)** —
-  `launcher-replay-e2e.sh` keeps its own `fail`, carrying the
-  `[ "${BASHPID:-$$}" = "$top_pid" ]` guard the bash-3.2 table above bans by name:
-  correct on bash 4, silently inert on macOS 3.2, where a `fail` inside `( ... )`
-  then ends only the subshell. Allowlisted in `check-e2e-helpers.sh`'s
-  helper-collision scan until it takes the shared `fail`.
+- **[#813](https://github.com/LASTRADA-Software/fastcached/issues/813)** —
+  `launcher-replay-e2e.sh` is the last POSIX fixture that does not source
+  `lib/e2e-common.sh` at all, so its `fail`, `skip` and `note` are private copies.
+  The DEFECT in that `fail` is gone — #627 made the signal unconditional — and
+  what is left is the duplication and the allowlist row in `check-e2e-helpers.sh`
+  that goes with it. Deliberately not folded into #627: the fixture builds three
+  CMake trees and runs a real suite, so converting it cannot be verified in the
+  session that does it, and this is the fixture whose first run anywhere died on
+  the first line that starts a process.

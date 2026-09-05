@@ -878,7 +878,13 @@ failed_cases=""
 # @param 1 The case name, matching the `FAIL <name>:` line beside the call.
 note_failure() {
     failures=$(( failures + 1 ))
-    failed_cases="${failed_cases}${failed_cases:+ }$1"
+    # De-duplicated: the scans below call this once per offending SCRIPT, so an
+    # unconditional append printed `failed: bash32 bash32 bash32` -- a list that
+    # says less than the count beside it.
+    case " ${failed_cases} " in
+        *" $1 "*) ;;
+        *) failed_cases="${failed_cases}${failed_cases:+ }$1" ;;
+    esac
 }
 
 # What each case must exit with and what its combined output must and must not
@@ -1234,6 +1240,24 @@ rm -rf "$canary_dir"
 # @param 1 the script's basename
 # @param 2 the allowlist text, one `basename:reason` per line
 # @return 0 when exempt
+# Every shell script in this repository, sorted, one per line.
+#
+# ONE generator for all three scans below. It used to be three copies of
+# `"${source_dir}"/scripts/*.sh`, which is not recursive -- so `lib/e2e-common.sh`
+# was outside every one of them. Measured, that delta is exactly one file and it
+# is the worst possible one: the `timeout` scan's own failure message says "use
+# run_bounded from scripts/lib/e2e-common.sh", and it could not read the file
+# that DEFINES `run_bounded`. A `timeout 5 ...` added inside `run_bounded` was
+# invisible to the check written to ban it, on the one platform that check
+# exists for.
+#
+# `find` and not a glob, because a glob cannot recurse portably and this has to
+# work in an exported tarball where there is no git. Scoped to `scripts/`, which
+# is a choice and is therefore checked further down rather than assumed.
+_shell_scripts() {
+    find "${source_dir}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
+}
+
 _scan_exempt() {
     local base="$1" row=""
     while IFS= read -r row; do
@@ -1252,9 +1276,12 @@ EOF
 # everything else and this scan now covers it. An exemption outlives the shape it
 # was granted for, so it is deleted with the shape rather than reworded.
 timeout_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary invocations above. They are heredoc text and run nothing; the canary asserting all seven are caught is what covers them."
-for script in "${source_dir}"/scripts/*.sh; do
-    base="$(basename "$script")"
+timeout_scanned=0
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
     _scan_exempt "$base" "$timeout_allowed" && continue
+    timeout_scanned=$(( timeout_scanned + 1 ))
     ran=$(( ran + 1 ))
     hits="$(_timeout_invocations "$script")"
     if [ -n "$hits" ]; then
@@ -1263,7 +1290,16 @@ for script in "${source_dir}"/scripts/*.sh; do
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "timeout-scan"
     fi
-done
+done < <( _shell_scripts )
+
+# This scan was the one of the three with no census. If `source_dir` ever
+# resolved wrong it reported clean over zero files and nothing said so -- the
+# "two empty lists agree perfectly" failure its neighbours already guard against.
+ran=$(( ran + 1 ))
+if [ "$timeout_scanned" -lt 1 ]; then
+    echo "FAIL timeout-scan: the walk matched no shell scripts, so every one of them 'passed'." >&2
+    note_failure "timeout-scan"
+fi
 
 # --- no script keeps its own copy of a shared helper ------------------------
 #
@@ -1278,11 +1314,15 @@ done
 # the library already defines has a second implementation of it, whatever the
 # body says. That is exact in one direction and blind in the other, and the
 # blindness is said here rather than left to be found: a helper reimplemented
-# under a DIFFERENT name is invisible to this. `migrate-storage-e2e.sh` spells
+# under a DIFFERENT name is invisible to this. `migrate-storage-e2e.sh` spelled
 # `free_port` as `port`, drawing from 40000-59999 -- entirely inside Linux's
 # default ephemeral range, which is the `bind(...) failed: 98` the shared one
-# moved to 20000-31999 to avoid (#628). No regex over shell can see that, which
-# is what the allowlist's per-row reasons are for.
+# moved to 20000-31999 to avoid. This scan never saw it, and could not: no regex
+# over shell can. It took a person reading the file (#628, since landed), which
+# is what the allowlist's per-row reasons are for -- and it is why a row is
+# deleted when its defect is fixed rather than left standing as a description of
+# the file. That row outlived #628 by a day and had become an exemption for a
+# fixture with nothing to exempt.
 #
 # The names are READ from the library rather than restated here. A second copy of
 # the list is not a cross-check, it is a second thing to be wrong -- and wrong in
@@ -1385,12 +1425,13 @@ rm -rf "$canary_dir"
 # The same `_scan_exempt` the timeout scan above uses. Each row names why, and the
 # two that are defects name the ISSUE, so an exclusion cannot rot into folklore and
 # closing the ticket has an obvious row to delete.
-helper_copy_allowed="local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it.
-launcher-replay-e2e.sh:#627. Its 'fail' carries the '[ \"\${BASHPID:-\$\$}\" = \"\$top_pid\" ]' guard the bash-3.2 table below bans by name -- correct on bash 4, silently inert on macOS 3.2, where a 'fail' inside ( ... ) then ends only the subshell.
-migrate-storage-e2e.sh:#628. Its 'fail' is the ordinary private copy; the sharper defect is its 'port', which this NAME scan cannot see -- see the header above."
+helper_copy_allowed="e2e-common.sh:the library itself, which defines every one of these names -- that being what the scan reads them out of. It entered this scan's set when the three enumerations were folded into one recursive walk; the row is what keeps that fold from reporting the definitions as copies.
+local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it.
+launcher-replay-e2e.sh:#813. It is the last POSIX fixture that does not source the library at all, so its 'fail' and 'note' are private. The DEFECT that row used to name is gone (#627 made its 'fail' signal unconditionally, which is what the library does); what is left is the duplication, and converting a fixture that builds three CMake trees is its own change."
 scanned=0
-for script in "${source_dir}"/scripts/*.sh; do
-    base="$(basename "$script")"
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
     _scan_exempt "$base" "$helper_copy_allowed" && continue
     scanned=$(( scanned + 1 ))
     ran=$(( ran + 1 ))
@@ -1401,10 +1442,10 @@ for script in "${source_dir}"/scripts/*.sh; do
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "helper-scan"
     fi
-done
+done < <( _shell_scripts )
 ran=$(( ran + 1 ))
 if [ "$scanned" -lt 1 ]; then
-    echo "FAIL helper-scan: the glob matched no scripts, so every one of them 'passed'." >&2
+    echo "FAIL helper-scan: the walk matched no shell scripts, so every one of them 'passed'." >&2
     note_failure "helper-scan"
 fi
 
@@ -1426,8 +1467,8 @@ fi
 
 # --- bash 3.2 --------------------------------------------------------------
 #
-# macOS ships a 2007 `/bin/bash` and these fixtures run on every platform CI
-# builds, so a construct newer than that is a fixture that does not start there.
+# macOS ships a 2007 `/bin/bash` and these scripts run on every platform CI
+# builds, so a construct newer than that is a script that does not start there.
 # Scanned rather than remembered: the constraint was already written down in
 # `coverage.sh`'s comments, where nobody writing a new script would find it.
 #
@@ -1435,7 +1476,7 @@ fi
 # `[ "${BASHPID:-$$}" = "$top_pid" ]` guard is CORRECT on bash 4 and silently
 # inert on 3.2, where BASHPID is unset and the test reduces to comparing `$$`
 # with itself -- so the subshell defect it was written to close is closed on
-# Linux and open on macOS. `fail` avoids the question entirely.
+# Linux and open on macOS. The unconditional `kill -TERM` avoids the question.
 #
 # And this row is LOAD-BEARING rather than belt-and-braces, which is only visible
 # from having tried it: staging that guard back into `fail` and running this file
@@ -1443,7 +1484,50 @@ fi
 # works. The behavioural case cannot see a 3.2-only defect from a 4-or-later
 # shell, and every machine this is developed and tested on is a 4-or-later shell.
 # The scan is the only check here that can.
+#
+# ## The scope, which is the half that was wrong (#627)
+#
+# This scan read ONE file -- `$library` -- for two tickets, while
+# `launcher-replay-e2e.sh` carried the exact guard the paragraph above bans by
+# name, under a comment arguing it was correct. So the repository had the rule
+# written down, had a check enforcing it, and the check did not read the file
+# that broke it: a confident verdict over the wrong set, the same shape as a
+# clang-tidy sweep whose database was missing five of CI's targets.
+#
+# The set is therefore DERIVED, by walking `scripts/` for `*.sh`. Not a list: a
+# list is exact about the files it knows and silent about the ones it does not,
+# and silence reads identically to complete coverage (#492) -- #379 named six
+# call sites where the tree had thirty. Not the two-directory glob its
+# neighbours use either, which would miss the next subdirectory.
+#
+# Restricting the walk to `scripts/` is a scope choice, so it is CHECKED rather
+# than assumed: when git is available, a tracked `*.sh` living anywhere else is
+# refused by name. A classifier that cannot see a file must say so instead of
+# passing it, and the day one appears outside `scripts/` this says which rather
+# than quietly excluding it. Where git is not available -- an exported tarball --
+# that half is reported as not run, which is a third state and not a pass.
+#
+# ## The whole family, and what this deliberately does NOT cover
+#
+# `BASHPID` is one of at least three ways bash 3.2 makes a script silently inert,
+# and the general form is worth stating because it is what the next instance will
+# look like: **inside a want-fail assertion, any failure to run is
+# indistinguishable from the rule firing.** #723 reached it through a mode bit (a
+# bare `"$0"` exited 126 and eight cases passed because the SHELL refused);
+# `set -u` reaches it through expanding an empty array, which is an unbound
+# variable before 4.4; `BASHPID` reaches it by making the abort a no-op.
+#
+# The token table covers the first and the third. It does NOT cover the empty
+# array, and that is a decision rather than an omission. MEASURED on this tree:
+# `"${x[@]}"` and `"$@"` occur about 110 times across the 22 scripts that set
+# `-u`, and essentially every one of them is an array that cannot be empty. No
+# regex over shell can tell a possibly-empty array from a never-empty one, so a
+# row for it would be ~110 findings on a correct tree -- and a scan that reports
+# noise is a scan somebody deletes, which costs the eight rows that do work. That
+# leaves the empty-array sites as per-site tickets, which is where they already
+# are (#793, #794); the remedy spelling is `${1+"$@"}`.
 echo "== bash 3.2 constructs"
+# bash32-scan: data-begin
 banned=(
     "mapfile:reads into an array; bash 4.0+"
     "readarray:the same builtin under its other name; bash 4.0+"
@@ -1454,21 +1538,334 @@ banned=(
     "^^}:case modification; bash 4.0+"
     ",,}:case modification; bash 4.0+"
 )
-for entry in "${banned[@]}"; do
-    token="${entry%%:*}"
-    why="${entry#*:}"
-    # Comment lines are excluded, because the header explains WHY several of
-    # these are banned and a scan that fails on its own rationale is a scan
-    # nobody can write the rationale for. Indented comments too: the reason for
-    # `BASHPID` is inside `fail`.
-    hits="$(grep -n -F -- "$token" "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+# bash32-scan: data-end
+
+# Two empty lists agree perfectly, and this one has a second way to empty itself:
+# a table that loses its rows reports every script clean, exactly like a scan that
+# found no scripts.
+ran=$(( ran + 1 ))
+if [ "${#banned[@]}" -lt 1 ]; then
+    echo "FAIL bash32: the banned-construct table is empty, so every script 'passed'." >&2
+    note_failure "bash32"
+fi
+
+# The prefilter's needles, written once rather than per file.
+bash32_needles="$(mktemp)"
+for entry in ${banned[@]+"${banned[@]}"}; do
+    printf '%s\n' "${entry%%:*}" >> "$bash32_needles"
+done
+
+# What of a file this scan may read.
+#
+# Comment lines are dropped, because the header above explains WHY several of
+# these are banned and a scan that fails on its own rationale is a scan nobody
+# can write the rationale for. Indented comments too: the reason for the guard
+# now sits inside a comment in `launcher-replay-e2e.sh`'s `fail`.
+#
+# And a file may declare a DATA REGION, between
+#
+#     # bash32-scan: data-begin
+#     # bash32-scan: data-end
+#
+# which is dropped as well. That exists because this file has to hold the token
+# table and the canary's staged text, and both are data rather than constructs
+# this shell executes. The alternative -- and what this replaced -- was an
+# allowlist row exempting the whole file, which is the wrong altitude by three
+# orders of magnitude: `check-e2e-helpers.sh` is over 1700 lines, is the heaviest
+# array user under `scripts/`, and IS RUN BY CTEST through `/bin/bash`, so on
+# macOS it is a bash 3.2 script like any other. Exempting it wholesale would make
+# the one file the scan can never read the one file most likely to break the rule
+# -- and the neighbouring helper scan explicitly refused to pay that price 200
+# lines up.
+#
+# Blank lines are substituted rather than deleted, so `grep -n` keeps reporting
+# the real line numbers.
+#
+# A region opened and never closed would blank the rest of the file, so it is
+# refused below rather than tolerated, and the number of regions is REPORTED --
+# a region nobody can see added is this mechanism's own way of becoming an
+# exemption.
+_bash32_readable() {
+    awk '
+        /^[[:space:]]*# bash32-scan: data-begin[[:space:]]*$/ { skip = 1; print ""; next }
+        /^[[:space:]]*# bash32-scan: data-end[[:space:]]*$/   { skip = 0; print ""; next }
+        skip                                                 { print ""; next }
+        /^[[:space:]]*#/                                     { print ""; next }
+        { print }
+    ' "$1"
+}
+
+# Every hit in one file, as `<table index> <lineno>:<text>`. The INDEX rather than
+# the token, because three of the tokens contain a space and a caller splitting on
+# one would report the wrong row for them.
+#
+# WHOLE-FILE FIRST, for the reason the helper scan above makes the same trade and
+# `check-worker-refusals-counted.cmake` records it: without it this is two greps
+# per token per script, and eight tokens over thirty scripts is ~480 processes.
+# This test is in the DEFAULT set on every platform CI builds.
+#
+# MEASURED, with its conditions, because a bare ratio gets quoted at the wrong
+# thing: on this 32-core Linux host with a warm cache, over the 31 scripts in
+# this tree, the eight-grep loop costs 0.147 s and the prefiltered form 0.066 s
+# -- about 2.2x. Not the 18x the naive comparison suggests, and the difference is
+# worth stating: `_bash32_readable` is itself an `awk` per file, so the prefilter
+# buys the greps back and then pays part of it out again for the region and
+# comment filtering it also does. Today 15 of the 31 hold no token at all and
+# stop after one `grep -q`.
+#
+# The prefilter is EXACT in both directions rather than merely cheap: it is the
+# literal set of the same fixed strings, over the same filtered text, so it can
+# produce neither a false negative nor a false positive.
+_bash32_hits() {
+    local file="$1" i=0 token="" hits="" text=""
+    text="$(_bash32_readable "$file")"
+    printf '%s\n' "$text" | grep -qFf "$bash32_needles" || return 0
+    while [ "$i" -lt "${#banned[@]}" ]; do
+        token="${banned[$i]%%:*}"
+        hits="$(printf '%s\n' "$text" | grep -n -F -- "$token" || true)"
+        [ -n "$hits" ] && printf '%s\n' "$hits" | sed "s/^/${i} /"
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+# A malformed region, in any scanned file. Prints what is wrong and returns 0
+# when there is a fault; returns 1 when the file is well formed.
+#
+# A STATE MACHINE, and it has to be, because `_bash32_readable` is one. Counting
+# the two markers and comparing totals is the obvious spelling and it is wrong in
+# the direction that hides things: a `data-end` sitting ABOVE the first
+# `data-begin` is a no-op for the reader and leaves a region open to EOF, while
+# the counts come out 1 and 1 and the file reads as balanced. Measured -- staged
+# into this very file, the whole run's output was byte-identical to a clean one,
+# census line included, with a `mapfile` hidden after the stray marker.
+#
+# So this asks the same question the reader does, in the same order: a close with
+# nothing open, a second open inside one, and anything still open at the end.
+_bash32_region_fault() {
+    awk '
+        /^[[:space:]]*# bash32-scan: data-begin[[:space:]]*$/ {
+            if (open) { print "line " NR ": a data-begin inside a region opened at line " at; exit }
+            open = 1; at = NR; next
+        }
+        /^[[:space:]]*# bash32-scan: data-end[[:space:]]*$/ {
+            if (!open) { print "line " NR ": a data-end with no region open"; exit }
+            open = 0; next
+        }
+        END { if (open) print "the region opened at line " at " is never closed" }
+    ' "$1" | grep . || return 1
+}
+
+# Print one file's hits in full, resolving each index back to its reason.
+_bash32_report() {
+    local base="$1" hits="$2" hit="" idx="" rest="" entry=""
+    echo "FAIL bash32: ${base} uses a construct newer than bash 3.2." >&2
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        idx="${hit%% *}"
+        rest="${hit#* }"
+        entry="${banned[$idx]}"
+        echo "     | ${rest}" >&2
+        echo "         '${entry%%:*}' -- ${entry#*:}" >&2
+    done < <( printf '%s\n' "$hits" )
+}
+
+# The canary, both directions. A scan that has never been seen to fire is a scan
+# reporting PASS over a set in which nothing could fail -- and this one has to be
+# watched catching the EXACT text #627 was filed about, not a stand-in, because
+# the guard's whole property is that it reads as correct.
+canary_dir="$(mktemp -d)"
+#
+# Written with `printf` and not a heredoc, for the reason the helper-scan canary
+# above gives: heredoc text is still text in THIS file, the helper scan reads
+# whole scripts, and a staged `fail() {` at column zero is a genuine hit against
+# it. Observed -- the first run of this block took that scan red. Every line
+# below begins with `printf` in the source, so there is no definition here to
+# find.
+# bash32-scan: data-begin
+{
+    printf '%s\n' 'fail() {'
+    printf '%s\n' '    echo "staged FAILED: $*" >&2'
+    printf '%s\n' '    [ "${BASHPID:-$$}" = "$top_pid" ] || kill -TERM "$top_pid" 2>/dev/null'
+    printf '%s\n' '    exit 1'
+    printf '%s\n' '}'
+    printf '%s\n' 'mapfile -t rows < /dev/null'
+} > "${canary_dir}/must-catch.sh"
+# bash32-scan: data-end
+# The negative half. `$$` alone, a `#` comment naming a banned token, and an
+# ordinary array expansion -- none of which is a construct newer than 3.2. The
+# comment line is the one that matters: without it, a scan that stopped excluding
+# comments would still pass every arm here.
+cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
+top_pid=$$
+# BASHPID would be wrong here, and mapfile too.
+for arg in ${1+"$@"}; do echo "$arg"; done
+CANARY
+# And the third arm, which is the one the DATA REGION mechanism needs: text
+# inside a declared region is not read, and text outside one still is. Without
+# it, a region that swallowed the whole file would pass both arms above.
+# bash32-scan: data-begin
+#
+# Staged with `printf` and the marker SPLIT (`bash32-%s`), so the region markers
+# this file needs to write do not read as region markers OF this file. A heredoc
+# holding them verbatim would close the enclosing region four lines early and
+# expose the `declare -A` below it -- which is exactly what happened on the first
+# run of this block, caught by the scan now reading its own source.
+{
+    printf '# bash32-%s: data-begin\n' scan
+    printf '%s\n' 'rows="mapfile is data here"'
+    printf '# bash32-%s: data-end\n' scan
+    printf '%s\n' 'declare -A real=()'
+} > "${canary_dir}/region.sh"
+# bash32-scan: data-end
+ran=$(( ran + 1 ))
+staged="$(_bash32_hits "${canary_dir}/must-catch.sh")"
+caught="$(printf '%s\n' "$staged" | grep -c . || true)"
+if [ "$caught" -ne 2 ]; then
+    echo "FAIL bash32-canary: the scan caught ${caught} of 2 staged constructs," >&2
+    echo "     so it cannot be trusted to have found none in the real scripts" >&2
+    printf '%s\n' "$staged" | sed 's/^/     | /' >&2
+    note_failure "bash32-canary"
+fi
+ran=$(( ran + 1 ))
+spurious="$(_bash32_hits "${canary_dir}/must-not-catch.sh")"
+if [ -n "$spurious" ]; then
+    echo "FAIL bash32-canary: the scan fired on a script that uses nothing newer than 3.2" >&2
+    printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
+    note_failure "bash32-canary"
+fi
+ran=$(( ran + 1 ))
+region_hits="$(_bash32_hits "${canary_dir}/region.sh")"
+region_count="$(printf '%s\n' "$region_hits" | grep -c . || true)"
+if [ "$region_count" -ne 1 ]; then
+    echo "FAIL bash32-canary: a declared data region should hide exactly its own text;" >&2
+    echo "     the scan reported ${region_count} hit(s) where 1 is right (the one OUTSIDE it)" >&2
+    printf '%s\n' "$region_hits" | sed 's/^/     | /' >&2
+    note_failure "bash32-canary"
+fi
+# The control for the region check, staged against the file that actually HAS a
+# balanced pair. It used to point at `must-catch.sh`, which carries no marker at
+# all -- so the arm read "a file with no markers is not reported unbalanced",
+# which is not what its own message claimed and is a far weaker thing.
+ran=$(( ran + 1 ))
+if _bash32_region_fault "${canary_dir}/region.sh" >/dev/null; then
+    echo "FAIL bash32-canary: a balanced pair was reported as malformed" >&2
+    _bash32_region_fault "${canary_dir}/region.sh" | sed 's/^/     | /' >&2
+    note_failure "bash32-canary"
+fi
+# And the three malformed shapes, each of which the READER treats differently
+# from the way a count would.
+ran=$(( ran + 1 ))
+printf '%s\n' '# bash32-scan: data-begin' > "${canary_dir}/unclosed.sh"
+if ! _bash32_region_fault "${canary_dir}/unclosed.sh" >/dev/null; then
+    echo "FAIL bash32-canary: an unclosed data region was not reported; one would blank" >&2
+    echo "     the rest of a file and hide every construct after it" >&2
+    note_failure "bash32-canary"
+fi
+ran=$(( ran + 1 ))
+# bash32-scan: data-begin
+{
+    printf '# bash32-%s: data-end\n' scan
+    printf '# bash32-%s: data-begin\n' scan
+    printf '%s\n' 'mapfile -t hidden < /dev/null'
+} > "${canary_dir}/swapped.sh"
+# bash32-scan: data-end
+if ! _bash32_region_fault "${canary_dir}/swapped.sh" >/dev/null; then
+    echo "FAIL bash32-canary: a data-end ABOVE the first data-begin was not reported." >&2
+    echo "     The counts balance and the reader still blanks everything after the open," >&2
+    echo "     so a construct below it is invisible with nothing saying so." >&2
+    note_failure "bash32-canary"
+fi
+ran=$(( ran + 1 ))
+{
+    printf '# bash32-%s: data-begin\n' scan
+    printf '# bash32-%s: data-begin\n' scan
+    printf '# bash32-%s: data-end\n' scan
+} > "${canary_dir}/nested.sh"
+if ! _bash32_region_fault "${canary_dir}/nested.sh" >/dev/null; then
+    echo "FAIL bash32-canary: a second data-begin inside an open region was not reported" >&2
+    note_failure "bash32-canary"
+fi
+rm -rf "$canary_dir"
+
+# The allowlist, in the `_scan_exempt` shape the two scans above use. Each row
+# names WHY, and a row that is a deferred defect names the ISSUE so an exclusion
+# cannot rot into folklore. Neither of these two is a defect.
+bash32_allowed="tidy-sweep.sh:not a bash 3.2 script and does not claim to be. It declares a bash 4.4 floor in its own header (wait -n is 4.3; expanding an empty array under set -u stops erroring at 4.4), and its 'tidy-sweep-selftest' registration carries SKIP_RETURN_CODE 77 so a stock macOS runner reports SKIPPED rather than red. A declared exception with an enforcement mechanism, not an omission."
+
+# DERIVED, by walking the tree rather than by listing files or naming
+# directories. `find` because a glob cannot recurse portably and this must work in
+# an exported tarball, where there is no git.
+bash32_scanned=0
+bash32_regions=""
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    _scan_exempt "$base" "$bash32_allowed" && continue
+    bash32_scanned=$(( bash32_scanned + 1 ))
     ran=$(( ran + 1 ))
+
+    fault="$(_bash32_region_fault "$script")" && {
+        echo "FAIL bash32: ${base} has a malformed data region -- ${fault}." >&2
+        echo "     An unclosed one blanks the rest of the file, so every construct after" >&2
+        echo "     it would be invisible to this scan." >&2
+        note_failure "bash32"
+    }
+    if grep -q '^[[:space:]]*# bash32-scan: data-begin[[:space:]]*$' "$script"; then
+        bash32_regions="${bash32_regions}${bash32_regions:+, }${base}"
+    fi
+
+    hits="$(_bash32_hits "$script")"
     if [ -n "$hits" ]; then
-        echo "FAIL bash32: ${library} uses '${token}' (${why})" >&2
-        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        _bash32_report "$base" "$hits"
         note_failure "bash32"
     fi
-done
+done < <( _shell_scripts )
+rm -f "$bash32_needles"
+
+ran=$(( ran + 1 ))
+if [ "$bash32_scanned" -lt 1 ]; then
+    echo "FAIL bash32: the walk of ${source_dir}/scripts matched no shell scripts," >&2
+    echo "     so every one of them 'passed'. This is the clause that decides whether" >&2
+    echo "     widening the scan bought anything (#627)." >&2
+    note_failure "bash32"
+else
+    echo "   bash 3.2: scanned ${bash32_scanned} script(s) under scripts/ (walked, not listed)"
+    # Named rather than counted. A declared region is an exemption with a smaller
+    # blast radius, not no exemption, so it is visible on every run.
+    echo "   bash 3.2: declared data region(s) in: ${bash32_regions:-none}"
+fi
+
+# And the scope choice itself, checked rather than assumed. A tracked `*.sh`
+# outside `scripts/` is outside the walk, and a file the classifier cannot see is
+# refused by name rather than silently excluded.
+#
+# The claim states its SEARCH, because a census that does not is one somebody
+# quotes at the wrong set. The pattern is `git ls-files '*.sh'` -- tracked files
+# whose NAME ends `.sh` -- so this says nothing about the ten `#!/bin/sh`
+# templates under `packaging/` (`*.sh.in`, `*.in`), which are installer text
+# rather than scripts ctest runs and are not bash at all. Widening it to classify
+# by shebang would report those ten on a correct tree, which is the noise that
+# gets a scan deleted.
+if git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    ran=$(( ran + 1 ))
+    stray="$(git -C "$source_dir" ls-files '*.sh' | grep -v '^scripts/' || true)"
+    if [ -n "$stray" ]; then
+        echo "FAIL bash32-scope: tracked shell script(s) live outside scripts/, where the walk" >&2
+        echo "     above does not reach them:" >&2
+        printf '%s\n' "$stray" | sed 's/^/     | /' >&2
+        echo "     Widen the walk, or give each one an allowlist row saying why it is exempt." >&2
+        note_failure "bash32-scope"
+    else
+        echo "   bash 3.2: scope confirmed -- git ls-files '*.sh' finds none outside scripts/"
+    fi
+else
+    # Not a pass and not a failure: the question could not be asked. Said out
+    # loud, because "no strays found" and "nothing looked" read identically --
+    # and counted as SKIPPED only, never also as run.
+    echo "   bash 3.2: NOT CHECKED whether any *.sh lives outside scripts/ -- no git repository here" >&2
+    skipped=$(( skipped + 1 ))
+fi
 
 # --- every failure is recorded BY NAME ------------------------------------
 #

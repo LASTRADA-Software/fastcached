@@ -1551,7 +1551,21 @@ and what they may assume.
   observed — the one reading that says whether the machine was slow, derived from
   assuming it was fast. A bespoke condition is a predicate passed to `wait_until`,
   never a new loop. And `fail` signals the top-level shell unconditionally rather than
-  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2.
+  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2 — **every**
+  script under `scripts/`, since the scan that enforces that read only the library for
+  two tickets while `launcher-replay-e2e.sh` carried the banned guard under a comment
+  arguing it was correct (#627). The file set is WALKED, refuses when it matches
+  nothing and when the token table empties, and a tracked `*.sh` outside `scripts/` is
+  refused by name rather than quietly excluded — ONE enumeration for all three scans in
+  that file, since the `timeout` scan's own glob could not read the file defining the
+  `run_bounded` its failure message names. A file that matches its own scan by
+  construction exempts a REGION (`# bash32-scan: data-begin`), never itself: a
+  whole-file row would blind the scan to the 1700-line script ctest runs on macOS, and a
+  planted `local -n` proves the difference. `BASHPID` is one of three doors to
+  *inside a `want-fail` assertion, any failure to run is indistinguishable from the
+  rule firing* — a mode bit is #723, an empty array under `set -u` is #793/#794 — and
+  the empty array is deliberately NOT scanned: measured ~110 sites across 22 scripts,
+  essentially all never-empty, and no regex can tell the two apart.
 - A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
   `OnCompile` places the interleaving rather than waiting for one. It is in
   `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library
