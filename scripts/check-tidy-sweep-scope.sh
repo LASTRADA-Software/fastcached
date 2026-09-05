@@ -166,16 +166,25 @@ FindSweep() {
 #
 # @param 1 The workflow file.
 # @param 2 The sweep step's id.
+# @param 1 workflow  @param 2 the sweep step's `id:`  @param 3 the JOB it sits in
+#
+# Scoped to the job, and that is not tidiness. `steps.<id>.conclusion` only ever
+# resolves within its own job, so a reader in job A says nothing about a sweep in
+# job B. Before this took a job, two sweep steps both using `id: sweep` made the
+# check report the SECOND one as having a reader -- it had found the FIRST one's.
+# The generalisation to N steps is what exposed it: with one sweep the bug was
+# unreachable, and it would have shipped a leg whose failures reach nobody while
+# the guard said otherwise.
 FindReader() {
-    awk -v id="$2" '
+    awk -v id="$2" -v want="$3" '
         function strip(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
         function flush() {
-            if (index(ifExpr, "steps." id ".conclusion") && index(ifExpr, "refs/heads/master"))
+            if (job == want && index(ifExpr, "steps." id ".conclusion") && index(ifExpr, "refs/heads/master"))
                 print ifExpr
             ifExpr = ""; inIf = 0
         }
         /^[ \t]*#/               { next }
-        /^  [A-Za-z0-9_-]+:[ \t]*$/ { flush(); next }
+        /^  [A-Za-z0-9_-]+:[ \t]*$/ { flush(); job = strip($0); sub(/:$/, "", job); next }
         /^      - /              { flush(); inIf = 0 }
         /^        [A-Za-z_-]+:/  { inIf = 0 }
         /^        if:/           { inIf = 1
@@ -222,13 +231,20 @@ CheckWorkflow() {
     fi
 
     sweepCount="$(printf '%s\n' "$sweep" | wc -l | tr -d ' ')"
-    [[ "$sweepCount" -eq 1 ]] \
-        || Fail "$sweepCount steps run the sweep; this check reasons about one and cannot vouch for the rest"
+    echo "  ok: $sweepCount step(s) run the sweep; every rule below is applied to each"
 
-    sweepJob="$(printf '%s\n' "$sweep" | head -1 | cut -f1)"
-    sweepId="$(printf '%s\n' "$sweep" | head -1 | cut -f2)"
-    sweepRun="$(printf '%s\n' "$sweep" | head -1 | cut -f3)"
-    sweepEnv="$(printf '%s\n' "$sweep" | head -1 | cut -f4)"
+    # EVERY sweep step, not the first. This used to assert there was exactly one,
+    # saying it "reasons about one and cannot vouch for the rest" -- which was
+    # honest, and became a wall the moment a second analyser leg existed (#858).
+    #
+    # The rules were always per-STEP, so the generalisation is a loop rather than a
+    # rewrite. What must NOT happen is the count assertion being replaced by a
+    # count: rules A-D each close a way a sweep reports nothing, so a check that
+    # merely tallied steps would pass while the reporting hole it exists to guard
+    # reopened -- the fix wearing the defect's clothes.
+    while IFS=$'\t' read -r sweepJob sweepId sweepRun sweepEnv; do
+        [[ -z "${sweepJob:-}" ]] && continue
+        echo "  -- sweep in job \`${sweepJob}\`"
 
     [[ -n "$sweepId" ]] \
         || Fail "the sweep step has no \`id:\`, so nothing downstream can read its conclusion apart from the whole job's -- which fires on every unrelated infrastructure failure in the job, and is the alarm people mute"
@@ -252,7 +268,19 @@ CheckWorkflow() {
     # workflow reaches the table at all, and that it has not started deciding
     # again alongside it. Two decisions that can disagree are worse than one that
     # is coarse.
-    if [[ "$sweepRun" != *"--ci"* ]]; then
+    # `--only=` is the second legitimate scope source: an explicit set named by a
+    # file IN THE REPOSITORY, for a leg that covers a fixed subset rather than a
+    # diff (#858's Windows leg reads the units `tidy-blind-spots.txt` says it
+    # reaches). It satisfies the same property `--ci` does -- the workflow does not
+    # DECIDE the scope, it passes a fact -- so it is accepted, and the branch-on-
+    # event rules below still apply to it.
+    if [[ "$sweepRun" == *"--only="* ]]; then
+        if [[ "$sweepRun" != *"scripts/"* ]]; then
+            Fail "the sweep passes \`--only=\` but the set does not come from a file under \`scripts/\`, so what this leg covers is decided in the workflow rather than somewhere reviewable -- run: $sweepRun"
+        else
+            echo "  ok: the sweep is explicitly scoped from a file under \`scripts/\`"
+        fi
+    elif [[ "$sweepRun" != *"--ci"* ]]; then
         Fail "the sweep does not pass \`--ci\`, so it does not consult \`CiScopeTable\` in scripts/tidy-sweep.sh and the event -> (scope, base) mapping is being decided somewhere else -- run: $sweepRun"
     elif [[ "$sweepRun" == *"--all"* ]]; then
         Fail "the sweep passes \`--all\` alongside \`--ci\`; every pull request and every queue entry would sweep the whole tree again, which is the cost #554 removed -- run: $sweepRun"
@@ -297,7 +325,7 @@ CheckWorkflow() {
     # sample the job failed 18 times and the sweep step itself failed none, so a
     # job-keyed alarm is a thing people mute by the second week.
     local reader
-    reader="$(FindReader "$workflow" "$sweepId")"
+    reader="$(FindReader "$workflow" "$sweepId" "$sweepJob")"
     if [[ -z "$reader" ]]; then
         Fail "no step reads \`steps.${sweepId}.conclusion\` for a push to \`refs/heads/master\`. That push is the only full sweep left, it blocks nothing and notifies nobody -- 18 of 18 failed master-push runs were never once re-run -- so with no reader the check runs, fails, and reaches no one."
     else
@@ -320,11 +348,12 @@ CheckWorkflow() {
         local perms
         perms="$(FindJobPermissions "$workflow" "$sweepJob")"
         if [[ "$perms" != *"issues:"*"write"* ]]; then
-            Fail "job \`${sweepJob}\` does not grant \`issues: write\`, so its report step would be refused by the API and the only reader on the only full sweep would be decorative -- permissions: ${perms:-<none>}"
+            Fail "job \`${sweepJob}\` does not grant \`issues: write\`, so its report step would be refused by the API and its reader would be decorative -- permissions: ${perms:-<none>}"
         else
             echo "  ok: job \`${sweepJob}\` grants the reader \`issues: write\`"
         fi
     fi
+    done < <(printf '%s\n' "$sweep")
 
     return "$problems"
 }

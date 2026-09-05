@@ -245,7 +245,6 @@ RequiredContexts=(
     "Linux-gcc-release|.github/workflows/build.yml"
     "macOS-clang-release|.github/workflows/build.yml"
     "clang-tidy|.github/workflows/build.yml"
-    "clang-tidy-windows|.github/workflows/build.yml"
     "clang-asan-ubsan|.github/workflows/build.yml"
     "clang-tsan|.github/workflows/build.yml"
     "sccache smoke (memcached text)|.github/workflows/build.yml"
@@ -339,6 +338,7 @@ RequiredContexts=(
 # to that column unchanged.
 NonBindingContexts=(
     # Decided, with the record that decided it.
+    "clang-tidy-windows|Undecided|#874: it ships UNREQUIRED and CONDITIONALLY. The leg works -- it parsed 514 units on Windows and found real diagnostics -- but the tree has findings it cannot pass today, and a gate that is reliably red teaches everyone to ignore it, which disarms it as thoroughly as deleting it (the argument in tsan-canary-rate.sh, harder at 100% than at a few percent). It becomes REQUIRED when it has been green on master twice consecutively AND #874 is decided: #874 is the MSVC-STL category, which unlike the other two does not converge, so requiring this leg before that decision is requiring a gate that may never settle"
     "Package (Linux .deb/.rpm)|NotBinding|#684: the packaging jobs are slow and a packaging failure should not block ordinary work. That ticket calls the reasoning sound and proposes REPORTING the failure instead, which merge-group-report.yml now does"
     "Package (macOS .pkg)|NotBinding|#684, as above -- and this is the job whose silent failure #684 was filed about"
     "Package (Windows .msi)|NotBinding|#684, as above"

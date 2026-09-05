@@ -865,6 +865,12 @@ jobs:
     runs-on: windows-2025
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    # `issues: write` for the reader at the bottom, `contents: read` for checkout.
+    # A job-level block is exhaustive -- every scope not named drops to none -- so
+    # these two are the whole list.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -915,11 +921,82 @@ jobs:
         run: bash scripts/tidy-sweep.sh --self-test
 
       - name: "Sweep"
+        id: sweep
         shell: bash
         env:
           TIDY: clang-tidy
           DB: out/build/clangcl-debug
-        run: bash scripts/tidy-sweep.sh --ci
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          # Leg scope = ticket scope = check scope, from ONE table. The six units
+          # this leg covers are the rows `scripts/tidy-blind-spots.txt` says it
+          # reaches, so what is swept and what the coverage check measures cannot
+          # drift apart -- they are the same data.
+          only="$(mktemp)"
+          grep -v '^[[:space:]]*#' scripts/tidy-blind-spots.txt | grep . \
+            | awk -F'\t' '$2 ~ /clang-tidy-windows/ { print $1 }' > "$only"
+          echo "::notice title=clang-tidy-windows scope::$(wc -l < "$only") unit(s), from scripts/tidy-blind-spots.txt"
+
+          # What this leg does NOT cover, stated on every run. A narrowing nobody
+          # can see is worse than none: whoever reads a green here must know what
+          # is not behind it.
+          echo "NOT covered by this leg, deliberately:"
+          echo "  * _WIN32 REGIONS inside files Linux already analyses -- #873."
+          echo "    This leg sweeps whole files, and the coverage check measures"
+          echo "    whole-unit emptiness, so neither can see a guarded region."
+          echo "  * findings that differ only because MSVC's standard library"
+          echo "    differs -- #874. Those units ARE analysed on Linux; a second"
+          echo "    analysis of shared code does not converge, which is why it is"
+          echo "    a decision rather than a backlog."
+          echo "  * the five __APPLE__ units -- they need a macOS leg (#858)."
+
+          bash scripts/tidy-sweep.sh "--only=$only"
+
+      # The same reader the Linux leg has, and a SECOND COPY on purpose.
+      #
+      # A master push blocks nothing here either -- this leg is unrequired -- so
+      # without a reader it fails and reaches nobody, which is #684 exactly.
+      # `steps.sweep.conclusion` rather than the job's `failure()`: the job fails
+      # for every unrelated infrastructure reason, and a job-keyed alarm is one
+      # people mute.
+      #
+      # **This duplication has an expiry, not a note: #872.** It is a PREREQUISITE
+      # for the macOS leg, because a third copy is not acceptable and the macOS leg
+      # is already planned for the five `__APPLE__` units. There is no
+      # `.github/actions/`, no `workflow_call` and no local `uses: ./` in this
+      # repository today, so factoring it out means either restructuring the
+      # required `clang-tidy` job or introducing a composite action as the first of
+      # its kind -- neither of which belongs in a change whose leg had never
+      # successfully run.
+      - name: "Report a Windows sweep that only master saw"
+        if: ${{ failure() && steps.sweep.conclusion == 'failure' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "clang-tidy-windows: the Windows sweep on master is failing"
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="The \`clang-tidy-windows\` sweep failed on the master push for \`${GITHUB_SHA}\`.
+
+          ${run_url}
+
+          This leg reads the six \`_WIN32\` units that no other analyser sees. It is
+          UNREQUIRED, so nothing is blocked by this — which is exactly why it needs
+          a reader rather than a red square nobody is obliged to look at.
+
+          It does not cover \`_WIN32\` regions inside files Linux analyses (#873),
+          findings that differ only because MSVC's standard library differs (#874),
+          or the five \`__APPLE__\` units (#858)."
+          existing="$(gh issue list --state open --search "$TITLE" --json number,title \
+                      --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body" --label status/needs-triage
+          fi
 
   clang-asan-ubsan:
     name: "clang-asan-ubsan"

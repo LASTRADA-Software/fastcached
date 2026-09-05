@@ -775,6 +775,7 @@ SelfTest() {
     cat > "$scratch/stub-cc" <<'STUB'
 #!/bin/sh
 mode=none
+onlyList=""
 src=""
 sawE=0
 for a in "$@"; do
@@ -923,8 +924,8 @@ mode=diff
 scopeFlag=""
 for arg in "$@"; do
     case "$arg" in
-        --all|--ci|--self-test) ;;
-        *) fatal "usage: $0 [--all|--ci|--self-test]" ;;
+        --all|--ci|--self-test|--only=*) ;;
+        *) fatal "usage: $0 [--all|--ci|--only=<file>|--self-test]" ;;
     esac
     if [[ -n "$scopeFlag" && "$scopeFlag" != "$arg" ]]; then
         fatal "${scopeFlag} and ${arg} each choose what this run does; pass exactly one"
@@ -934,6 +935,7 @@ done
 case "$scopeFlag" in
     --all) mode=all ;;
     --ci) mode=ci ;;
+    --only=*) mode=only; onlyList="${scopeFlag#--only=}" ;;
     --self-test) mode=selftest ;;
 esac
 
@@ -1127,7 +1129,32 @@ if [[ "$mode" != all ]]; then
     fi
 fi
 
-if [[ "$mode" != all ]]; then
+# `--only=<file>`: sweep exactly the paths that file names, and nothing else.
+#
+# For a leg covering a NAMED subset rather than a diff -- the Windows analyser leg
+# reads the six units `scripts/tidy-blind-spots.txt` says it reaches, and no more.
+# The narrowing is deliberate and is stated on every run rather than being a filter
+# nobody can find: a leg quietly analysing less than its ticket claims is the exact
+# silence this area is about.
+#
+# EXPLICIT rather than another diff mode: the set comes from a file somebody wrote,
+# so what a leg covers is reviewable in the same place the check that measures
+# coverage reads from.
+if [[ "$mode" == only ]]; then
+    [[ -f "$onlyList" ]] || fatal "--only=${onlyList} does not name a readable file"
+    mapfile -t onlyPaths < <(grep -v '^[[:space:]]*#' "$onlyList" | grep . | sort -u)
+    [[ "${#onlyPaths[@]}" -gt 0 ]] \
+        || fatal "--only=${onlyList} names no paths; a sweep of nothing would report clean"
+    for path in "${onlyPaths[@]}"; do
+        [[ -f "$path" ]] || fatal "--only=${onlyList} names '${path}', which is not a file"
+    done
+    printf '%s\n' "${onlyPaths[@]}" > "${scratch}/selection"
+    selection="${scratch}/selection"
+    echo "TIDY SWEEP: --only, sweeping exactly ${#onlyPaths[@]} named file(s) from ${onlyList}"
+    printf 'TIDY SWEEP:   %s\n' "${onlyPaths[@]}"
+fi
+
+if [[ "$mode" != all && "$mode" != only ]]; then
     mapfile -t changed < <({ git diff --name-only "${BASE}...HEAD"
                              git diff --name-only HEAD
                              git ls-files --others --exclude-standard; } | sort -u)
@@ -1140,7 +1167,7 @@ if [[ "$mode" != all ]]; then
     done
 fi
 
-if [[ "$mode" != all ]]; then
+if [[ "$mode" != all && "$mode" != only ]]; then
     declare -a sources=() touched=() globs=()
     for extension in "${SourceExtensions[@]}"; do globs+=("*.${extension}"); done
     # `--cached --others --exclude-standard`, the same definition of first-party
