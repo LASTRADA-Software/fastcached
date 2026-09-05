@@ -481,6 +481,74 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
+# A reactor's teardown rule is watched refusing, on every platform rather than one.
+#
+# `IReactor::TeardownIsSerialisedWithDispatch()` is the tripwire for #668: an object
+# a reactor owns is destroyed on that reactor's worker thread or with the reactor
+# stopped, or clearing a pending awaitable races the completion dispatch.
+#
+# **The registration is the point of the ticket, not an accessory to it.** That rule
+# was asserted only in `IocpSocket.cpp` -- wholly inside `#if defined(_WIN32)` -- and
+# only `IocpReactor` could answer the two questions it rests on. So the sole observer
+# in the whole CI matrix was `Windows-cl-debug`: the only leg that both builds Debug
+# and runs `ctest`, not a required context, and reporting the violation
+# intermittently (two greens and one red on identical source). Making the question
+# askable of every reactor is what lets this canary run everywhere, which is why the
+# ticket's second half -- "the only leg that can see it does not gate" -- is answered
+# here rather than by promoting that leg.
+#
+# `scripts/reactor-teardown-gate.cmake` and not a bare `WILL_FAIL`, for the reason
+# the two blocks above give: an inversion cannot say WHY a green result is
+# meaningless, and a non-zero exit is not proof on its own. The gate requires the
+# assertion's own words, and keeps "never got that far", "survived" and "died of
+# something else" apart from "the guard refused".
+#
+# Guarded to Debug because `assert` compiles out everywhere else. Every preset this
+# project ships is single-config Ninja with an explicit `CMAKE_BUILD_TYPE`, so this
+# is a real condition rather than one that is silently always false.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(reactor-teardown-canary ReactorTeardownCanary.cpp)
+    target_link_libraries(reactor-teardown-canary PRIVATE FastCache)
+    add_test(
+        NAME "reactor-teardown-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_CANARY=$<TARGET_FILE:reactor-teardown-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate.cmake"
+    )
+    set_tests_properties("reactor-teardown-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# The teardown gate is watched refusing, because a gate is an instrument too.
+#
+# `reactor-teardown-canary` above only runs where `assert` is live, so on a Release
+# leg the gate itself is the only part of #668's mechanism present -- and a gate that
+# has never been seen to refuse is the thing this whole ticket is about, one level up.
+# Five staged canary outcomes, and each case asserts WHICH refusal it got rather than
+# only that it refused: the gate's first check is "did the canary establish the
+# arrangement", so a stub that failed to start would be refused by it and a
+# refusal-only assertion would pass with every later check deleted (#723).
+#
+# `${FASTCACHED_BASH} <path>` rather than a bare path, so a mode-644 checkout fails
+# the SCRIPT and not five want-fail assertions that cannot tell exit 126 from the
+# rule firing -- and through the PINNED interpreter rather than a bare `bash`, which
+# ctest resolves from PATH at run time and which `script-interpreter` refuses (#379).
+add_test(
+    NAME "reactor-teardown-gate-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate-selftest.sh"
+            "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate.cmake"
+)
+set_tests_properties("reactor-teardown-gate-selftest" PROPERTIES
+    ENVIRONMENT "CMAKE_COMMAND=${CMAKE_COMMAND}"
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A hygiene check traverses each directory once, not once per file pattern.
 #
 # `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN, and the call site

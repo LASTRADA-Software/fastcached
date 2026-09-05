@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #if defined(__APPLE__)
@@ -107,6 +108,16 @@ class KqueueReactor: public IReactor
         std::coroutine_handle<> handle {};
     };
 
+    [[nodiscard]] bool Running() const noexcept override
+    {
+        return _worker.Running();
+    }
+
+    [[nodiscard]] bool IsOnWorkerThread() const noexcept override
+    {
+        return _worker.IsOnWorkerThread();
+    }
+
   private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
@@ -126,6 +137,7 @@ class KqueueReactor: public IReactor
     int _kq { -1 };
     int _wakePipe[2] { -1, -1 }; ///< [0]=read, [1]=write; write-end signal wakes kevent.
     std::atomic<bool> _stopped { false };
+    ReactorWorkerIdentity _worker;
     std::uint64_t _nextSequence { 0 };
 
     std::mutex _submitMutex;

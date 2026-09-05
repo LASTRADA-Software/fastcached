@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <atomic>
@@ -63,6 +64,16 @@ class TestReactor: public IReactor
         std::coroutine_handle<> handle {};
     };
 
+    [[nodiscard]] bool Running() const noexcept override
+    {
+        return _worker.Running();
+    }
+
+    [[nodiscard]] bool IsOnWorkerThread() const noexcept override
+    {
+        return _worker.IsOnWorkerThread();
+    }
+
   private:
     void FireExpiredTimers();
 
@@ -85,6 +96,7 @@ class TestReactor: public IReactor
     mutable std::mutex _mutex;
 
     std::atomic<bool> _stopped { false };
+    ReactorWorkerIdentity _worker;
     std::uint64_t _nextSequence { 0 };
     std::deque<std::coroutine_handle<>> _ready;
     std::vector<ScheduledEntry> _timers; ///< Min-heap by (deadline, sequence).

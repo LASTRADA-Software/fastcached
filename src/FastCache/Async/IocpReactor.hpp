@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #if defined(_WIN32)
@@ -93,22 +94,16 @@ class IocpReactor: public IReactor
     /// cannot run concurrently -- so the property became load-bearing and needs
     /// something better than a paragraph. Their destructors assert on this.
     ///
-    /// False before `Run()` has been entered and after it returns, which is the
-    /// honest answer: with nothing dequeuing, there is no worker thread to be on.
-    /// Callers that legitimately tear down outside a running reactor check
-    /// `Running()` first rather than treating false as a violation.
     /// @return True when this thread is the reactor's worker thread.
-    [[nodiscard]] bool IsOnWorkerThread() const noexcept
+    [[nodiscard]] bool IsOnWorkerThread() const noexcept override
     {
-        return _running.load(std::memory_order_acquire)
-               && _workerThread.load(std::memory_order_relaxed) == std::this_thread::get_id();
+        return _worker.IsOnWorkerThread();
     }
 
-    /// Whether a thread is currently inside `Run()`.
     /// @return True between entry to and return from `Run()`.
-    [[nodiscard]] bool Running() const noexcept
+    [[nodiscard]] bool Running() const noexcept override
     {
-        return _running.load(std::memory_order_acquire);
+        return _worker.Running();
     }
 
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
@@ -126,12 +121,7 @@ class IocpReactor: public IReactor
     IClock& _clock;
     void* _iocp { nullptr };
     std::atomic<bool> _stopped { false };
-    /// Identity of the thread inside `Run()`, and whether one is there at all.
-    /// Two variables because a default-constructed `thread::id` is a valid value
-    /// to compare against and would make "nobody is running" indistinguishable
-    /// from "some thread whose id happens to compare equal".
-    std::atomic<std::thread::id> _workerThread {};
-    std::atomic<bool> _running { false };
+    ReactorWorkerIdentity _worker;
     std::uint64_t _nextSequence { 0 };
     std::mutex _timerMutex;
     std::vector<TimerEntry> _timers;
