@@ -93,6 +93,25 @@ namespace
     /// naming the directory, not as a silently weaker ACL.
     constexpr auto AdministratorOnlyDacl = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
+    /// The access list a file holding a secret should carry: SYSTEM and
+    /// Administrators in full, the machine's services read, and nobody else.
+    ///
+    /// `P` for protected, and here it is the entire point rather than a
+    /// hardening detail. The directory above grants `BU` read *inheritably*, on
+    /// purpose -- the daemon runs as a virtual account, which is an ordinary
+    /// `BUILTIN\Users` member -- so a file left to inherit is readable by every
+    /// local account, which is the file `requirepass:` is told to live in (#741).
+    ///
+    /// `SU` is `NT AUTHORITY\SERVICE`, S-1-5-6: every principal logged on as a
+    /// service. See `SecureSecretFileForServices` for why it is that and not the
+    /// per-service SID. No inheritance flags -- a file has nothing to inherit it.
+    ///
+    /// As with AdministratorOnlyDacl, this and `SecretExposureHint`'s `icacls`
+    /// line are not required to be identical strings: `SecretFileExposure` is the
+    /// single arbiter both are judged by, so a drift between them shows up as a
+    /// warning naming the file rather than as a silently weaker list.
+    constexpr auto SecretFileDacl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SU)";
+
     /// The principals a machine-wide directory may belong to. An owner keeps
     /// WRITE_DAC whatever the access list says, so a directory owned by a
     /// standard account is one that account can re-open at will — which makes
@@ -286,6 +305,66 @@ namespace
 
 #endif
 
+#if defined(_WIN32)
+
+    /// Apply @p sddl to @p path as a PROTECTED access list, optionally taking
+    /// ownership.
+    ///
+    /// The apply half of both public functions below, parameterised for the same
+    /// reason `NoBroadPrincipalMay` is: integrity and secrecy are the same call
+    /// over a different list, and a copy is the one that never learns whatever the
+    /// original learns next. `PROTECTED_DACL_SECURITY_INFORMATION` in particular is
+    /// load-bearing in both and is written here once — the `P` in an SDDL string
+    /// marks only the descriptor being built, not the object it ends up on, so
+    /// leaving the flag out applies the entries and then lets the parent's
+    /// permissive ones flow in beside them.
+    ///
+    /// @param path Existing file or directory; `SE_FILE_OBJECT` covers both.
+    /// @param sddl The access list to apply, in SDDL.
+    /// @param owner Owner to set, or nullptr to leave ownership alone.
+    /// @return true when the list was applied.
+    [[nodiscard]] bool ApplyProtectedDacl(std::filesystem::path const& path, wchar_t const* sddl, PSID owner)
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr) == FALSE)
+            return false;
+
+        auto const owned = LocalBlock { descriptor };
+
+        BOOL present = FALSE;
+        BOOL defaulted = FALSE;
+        PACL dacl = nullptr;
+        if (::GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) == FALSE || present == FALSE)
+            return false;
+
+        auto const what =
+            static_cast<SECURITY_INFORMATION>(DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION)
+            | (owner != nullptr ? static_cast<SECURITY_INFORMATION>(OWNER_SECURITY_INFORMATION) : SECURITY_INFORMATION {});
+
+        // SetNamedSecurityInfoW takes a mutable name, hence the owned copy.
+        auto name = path.wstring();
+        return ::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, what, owner, nullptr, dacl, nullptr) == ERROR_SUCCESS;
+    }
+
+#else
+
+    /// Take @p permissions away from @p path.
+    ///
+    /// The POSIX apply half, beside its Windows counterpart for the same reason:
+    /// the two public functions differ in the mask and in nothing else.
+    ///
+    /// @param path Existing file or directory.
+    /// @param permissions Bits to clear.
+    /// @return true when the change was made.
+    [[nodiscard]] bool RemovePermissions(std::filesystem::path const& path, std::filesystem::perms permissions)
+    {
+        std::error_code ec;
+        std::filesystem::permissions(path, permissions, std::filesystem::perm_options::remove, ec);
+        return !ec;
+    }
+
+#endif
+
     /// Can only an administrator add or replace an entry in @p directory?
     ///
     /// The load-bearing half of both public functions: the one they ask about a
@@ -393,9 +472,14 @@ std::string SecretExposureHint(std::filesystem::path const& path, SecretExposure
                                path.string());
         case SecretExposure::AnyLocalAccount:
 #if defined(_WIN32)
+            // Raw SIDs throughout, and no account name anywhere: `NT SERVICE\<x>`
+            // resolves only once that service exists, and an advice line that
+            // fails on the machine it is pasted into is worse than none. These are
+            // SecretFileDacl's three entries in icacls's grammar -- SYSTEM,
+            // Administrators, and every principal logged on as a service.
             return std::format("{} is readable by every account on this machine, so the secret in it is not protected; "
-                               "restrict it with: icacls \"{}\" /inheritance:r /grant *S-1-5-18:R /grant "
-                               "\"NT SERVICE\\fastcached\":R",
+                               "restrict it with: icacls \"{}\" /inheritance:r /grant *S-1-5-18:F /grant "
+                               "*S-1-5-32-544:F /grant *S-1-5-6:R",
                                path.string(),
                                path.string());
 #else
@@ -416,19 +500,6 @@ std::string SecretExposureHint(std::filesystem::path const& path, SecretExposure
 bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)
 {
 #if defined(_WIN32)
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    if (::ConvertStringSecurityDescriptorToSecurityDescriptorW(AdministratorOnlyDacl, SDDL_REVISION_1, &descriptor, nullptr)
-        == FALSE)
-        return false;
-
-    auto const owned = LocalBlock { descriptor };
-
-    BOOL present = FALSE;
-    BOOL defaulted = FALSE;
-    PACL dacl = nullptr;
-    if (::GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) == FALSE || present == FALSE)
-        return false;
-
     // The owner goes with the entries, and it is the half that cannot be
     // faked: Windows lets a caller hand ownership to a group its own token
     // carries, so an elevated administrator can do this and a standard account
@@ -441,32 +512,13 @@ bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)
     if (::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &size) == FALSE)
         return false;
 
-    // PROTECTED_DACL_SECURITY_INFORMATION is what actually severs inheritance.
-    // The `P` in the SDDL only marks the descriptor being built here, not the
-    // object it ends up on, so leaving the flag out would apply the three
-    // entries and then let %ProgramData%'s permissive ones flow in beside them.
-    //
-    // SetNamedSecurityInfoW takes a mutable name, hence the owned copy.
-    auto name = directory.wstring();
-    if (::SetNamedSecurityInfoW(name.data(),
-                                SE_FILE_OBJECT,
-                                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                                administrators.data(),
-                                nullptr,
-                                dacl,
-                                nullptr)
-        != ERROR_SUCCESS)
+    if (!ApplyProtectedDacl(directory, AdministratorOnlyDacl, administrators.data()))
         return false;
 #else
     // Ownership is not something chmod can fix, and it does not need fixing:
     // only root can create the machine-wide config directory. What is left is
     // the umask, which can leave a fresh directory group-writable.
-    std::error_code ec;
-    std::filesystem::permissions(directory,
-                                 std::filesystem::perms::group_write | std::filesystem::perms::others_write,
-                                 std::filesystem::perm_options::remove,
-                                 ec);
-    if (ec)
+    if (!RemovePermissions(directory, std::filesystem::perms::group_write | std::filesystem::perms::others_write))
         return false;
 #endif
 
@@ -476,6 +528,36 @@ bool SecureDirectoryForAdministrators(std::filesystem::path const& directory)
     // a tidy directory it still owns. Asking the same question the startup
     // check asks is also what keeps the two from ever disagreeing.
     return IsAdministrativeContainer(directory);
+}
+
+bool SecureSecretFileForServices(std::filesystem::path const& file)
+{
+#if defined(_WIN32)
+    // No owner, unlike the directory. An owner keeps WRITE_DAC, so the directory
+    // has to name one or a standard account that created it can re-open it — but
+    // this file's directory has just been established as administrator-only
+    // writable, so only an administrator can have created what is in it, and
+    // `IsAdministratorOnlyWritable` deliberately does not test a file's owner for
+    // exactly that reason. Setting it here would be a second thing that can fail
+    // for no property gained.
+    if (!ApplyProtectedDacl(file, SecretFileDacl, nullptr))
+        return false;
+#else
+    // Group as well as other. A group grant is only safe where an administrator
+    // chose the group -- which is a packaging decision (the macOS postinstall
+    // chowns to `_fastcached` and chmods 0640) and not something this call can
+    // guess a name for, so it hands back a file with no delegation at all and
+    // lets the package add one.
+    if (!RemovePermissions(file, std::filesystem::perms::group_all | std::filesystem::perms::others_all))
+        return false;
+#endif
+
+    // The property, not the syscall -- the same rule SecureDirectoryForAdministrators
+    // reports by, and asked through the very predicate that would otherwise warn
+    // about this file at startup, so the two can never disagree about what
+    // "secured" means. `Undetermined` fails here, deliberately: a list that would
+    // not be read back is not one this claimed to have set.
+    return SecretFileExposure(file) == SecretExposure::None;
 }
 
 std::string SecureDirectoryHint(std::filesystem::path const& directory)

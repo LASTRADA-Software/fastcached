@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #include <tests/ScratchPath.hpp>
@@ -130,6 +131,29 @@ TEST_CASE("FileTrust: every exposure names its own remedy", "[platform][filetrus
 
 #if !defined(_WIN32)
 
+namespace
+{
+/// Write a secret-bearing file into @p scratch at a given mode.
+///
+/// File scope rather than a lambda inside one case, because both POSIX cases
+/// below need the same three lines and a third copy of them is how the content
+/// string and the mode drift apart.
+///
+/// @param scratch Directory to write into.
+/// @param stem File name inside it.
+/// @param mode Mode to chmod it to.
+/// @return The path written.
+[[nodiscard]] std::filesystem::path SecretFileAtMode(FastCache::Testing::ScratchDirectory const& scratch,
+                                                     char const* stem,
+                                                     ::mode_t mode)
+{
+    scratch.Write(stem, "requirepass: hunter2\n");
+    auto const path = scratch / stem;
+    REQUIRE(::chmod(path.c_str(), mode) == 0);
+    return path;
+}
+} // namespace
+
 TEST_CASE("FileTrust: the POSIX acquisition reports what the mode bits say", "[platform][filetrust][secret]")
 {
     // The real acquisition, on the platform that has it. The verdict is asserted
@@ -139,10 +163,7 @@ TEST_CASE("FileTrust: the POSIX acquisition reports what the mode bits say", "[p
     FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-mode" };
 
     auto const modeIs = [&scratch](char const* stem, ::mode_t mode) {
-        scratch.Write(stem, "requirepass: hunter2\n");
-        auto const path = scratch / stem;
-        REQUIRE(::chmod(path.c_str(), mode) == 0);
-        return path;
+        return SecretFileAtMode(scratch, stem, mode);
     };
 
     SECTION("0600 is fit")
@@ -181,6 +202,51 @@ TEST_CASE("FileTrust: the POSIX acquisition reports what the mode bits say", "[p
         CHECK(facts.readableByAnyAccount);
         CHECK(ClassifySecretFile(facts) == FastCache::SecretFileExposure(path));
     }
+}
+
+TEST_CASE("FileTrust: securing a secret file takes read away from everyone but its owner", "[platform][filetrust][secret]")
+{
+    // #741, on the platform this host can actually run. The Windows arm applies a
+    // protected access list instead and is asserted against a real installed MSI
+    // by the `package-windows` CI job -- there is no way to exercise a DACL here,
+    // and pretending otherwise is what a synthesised record is for elsewhere in
+    // this file.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-secret" };
+
+    auto const path = SecretFileAtMode(scratch, "exposed.yaml", S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+    // The state a packaged config arrives in, and the reason this function exists.
+    // Asserted first so a later green cannot come from a file that was already fit.
+    REQUIRE(FastCache::SecretFileExposure(path) == SecretExposure::AnyLocalAccount);
+
+    REQUIRE(FastCache::SecureSecretFileForServices(path));
+
+    // The MODE, not only the verdict. `SecureSecretFileForServices` REPORTS through
+    // `SecretFileExposure`, so asserting only that is one function agreeing with
+    // itself -- it would pass just as well if the call had changed nothing and the
+    // predicate had been broken instead.
+    struct ::stat info {};
+
+    REQUIRE(::stat(path.c_str(), &info) == 0);
+    CHECK((info.st_mode & static_cast<::mode_t>(S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)) == 0);
+
+    // And the owner still reads it, which is the half that distinguishes SECURED
+    // from BROKEN: a daemon that cannot open its own configuration falls back to
+    // built-in defaults in silence.
+    CHECK((info.st_mode & static_cast<::mode_t>(S_IRUSR)) != 0);
+    std::ifstream probe { path };
+    CHECK(probe.is_open());
+
+    CHECK(FastCache::SecretFileExposure(path) == SecretExposure::None);
+}
+
+TEST_CASE("FileTrust: securing a file that is not there fails rather than claiming success", "[platform][filetrust][secret]")
+{
+    // "I could not tell" and "nothing else can read it" have to lead to different
+    // places, and this is the caller-facing end of that: a seed that could not
+    // restrict what it wrote must not report that it did.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-absent" };
+    CHECK_FALSE(FastCache::SecureSecretFileForServices(scratch / "absent.yaml"));
 }
 
 #endif

@@ -217,10 +217,12 @@ LocalSystem, which has unrestricted access to every local resource and is a
 member of the local Administrators group — more than a cache daemon listening on
 a socket has any use for.
 
-It can still read `C:\ProgramData\fastcached\fastcached.yaml`, because that
-directory grants `BUILTIN\Users` read and execute. It deliberately cannot *write*
-there: a service that cannot rewrite its own configuration cannot be talked into
-loading a different one.
+It can still read `C:\ProgramData\fastcached\fastcached.yaml`, because seeding
+grants `NT AUTHORITY\SERVICE` read on that file and a service logon is a member
+of it. The file does **not** inherit the directory's `BUILTIN\Users` read, so a
+`requirepass:` written there is not readable by every local account. It
+deliberately cannot *write* there either: a service that cannot rewrite its own
+configuration cannot be talked into loading a different one.
 
 **If you set `storage_path`, the account needs access to it.** `--install-service`
 hands over whatever `storage_path` is configured at the time it runs, so seeding
