@@ -296,6 +296,7 @@ TEST_CASE("A Mach-O object is not laid out as COFF", "[launcher][verify][object]
     std::ranges::copy(std::array { std::byte { 0xCF }, std::byte { 0xFA }, std::byte { 0xED }, std::byte { 0xFE } },
                       served.begin());
     auto fresh = served;
+    REQUIRE(fresh.size() > 5);
     fresh[5] = std::byte { 0x99 };
 
     auto const result = CompareObjectImages(served, fresh);
@@ -313,6 +314,7 @@ TEST_CASE("Nothing is excused in a format that has no clock", "[launcher][verify
     std::ranges::copy(std::array { std::byte { 0x7F }, std::byte { 'E' }, std::byte { 'L' }, std::byte { 'F' } },
                       served.begin());
     auto fresh = served;
+    REQUIRE(fresh.size() > 5);
     fresh[5] = std::byte { 0x99 };
 
     CHECK(CompareObjectImages(served, fresh).outcome == ObjectComparison::Different);

@@ -92,7 +92,7 @@ namespace
     /// Serialize an integer in little-endian byte order directly into a
     /// caller-provided buffer (the in-place mirror of AppendLe). Lets hot-path
     /// callers fill a fixed page layout without allocating a scratch vector.
-    /// Constrained to integral `T` so the byte-swap and memcpy are only ever
+    /// Constrained to integral `T` so the byte-swap and copy are only ever
     /// instantiated for trivially-copyable fixed-width integers.
     /// @tparam T Integral type to serialize.
     /// @param dst Destination span; must hold at least sizeof(T) bytes.
@@ -102,7 +102,17 @@ namespace
     {
         if constexpr (std::endian::native != std::endian::little)
             value = std::byteswap(value);
-        std::memcpy(dst.data(), &value, sizeof(T));
+        // The documented precondition, enforced rather than assumed. `dst` is a
+        // subspan of a runtime-sized vector, so GCC 16 cannot prove `data()` is
+        // non-null and reports -Wnull-dereference, fatal under WERROR (#805).
+        if (dst.size() < sizeof(T))
+            return;
+        // Copied through the span's iterator rather than `memcpy(dst.data(), ...)`.
+        // `dst` is a subspan of a runtime-sized vector, so no caller's size is a
+        // constant here and GCC 16 cannot prove `data()` is non-null -- it reports
+        // -Wnull-dereference on the raw call, fatal under PEDANTIC_COMPILER_WERROR
+        // (#805). The precondition is unchanged and this generates the same store.
+        std::ranges::copy(std::bit_cast<std::array<std::byte, sizeof(T)>>(value), dst.begin());
     }
 
     template <typename T>

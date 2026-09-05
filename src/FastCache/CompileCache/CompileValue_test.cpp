@@ -210,6 +210,7 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
         // key every machine computes. Before this outcome existed the two SECTIONs
         // below were one `std::nullopt` and no caller could separate them.
         auto foreign = wire;
+        REQUIRE(!foreign.empty());
         foreign[0] = std::byte { CompileValueVersion + 1 };
 
         auto const canonical = CanonicalStoredValue(foreign, "/home/dev/proj", "/home/dev/proj/build");
