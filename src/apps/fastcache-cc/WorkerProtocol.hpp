@@ -93,28 +93,35 @@ using LeaseValidator =
 ///        off the host that read it. Borrowed, so it must outlive the validator.
 /// @return The validator.
 ///
-/// @param term Where this worker's knowledge of the scheduler's term lives. Borrowed,
-///        so it must outlive the validator -- and it is deliberately not captured by
-///        value, because the whole point is that the heartbeat thread writes it while
-///        the compile threads read it.
+/// @param lease What this worker keeps between lease checks: the grants it has already
+///        run, the term it last learned, and where a term going backwards is said. ONE
+///        object rather than three references, for the reason on
+///        `Distributed::WorkerLeaseState`. Borrowed, so it must outlive the validator,
+///        and deliberately not captured by value -- every compile thread writes it.
 ///
-/// **The term is checked since #421, and the check is one-sided**: a grant from a
-/// term below what this worker has learned is refused, one from a term above it is
-/// accepted and adopted, and a worker that has learned nothing refuses none of them.
-/// `Distributed::LeaseEpochCheck`'s class comment owns the argument for that
-/// asymmetry -- it is the type that makes the decision, and one explanation copied to
-/// each site is four places to edit and four chances to drift.
-/// @param epochNotice Where "this worker is refusing every grant because its learned
-///        term is higher" is said, once per entry into that condition. Borrowed like
-///        `term`, and for the same reason: it is per-worker mutable state the validator
-///        writes and something outside it owns. See `Distributed::LeaseEpochNotice` for
-///        why the line exists and what it deliberately does NOT settle (#614).
+/// **The spend is what makes a lease single-use, and it is the LAST thing this does**
+/// (#614). Everything above it is a reading of the token, so a grant refused for a bad
+/// endpoint, a wrong toolchain or an expiry has not been consumed; only a grant that
+/// was about to be compiled is. `Distributed::SpentLeases` owns the argument for why a
+/// second presentation is always a replay and never an honest client.
+///
+/// **The term is a diagnostic and no longer a gate.** Until #614 a grant naming a term
+/// below what this worker had learned was refused, which made a legitimate scheduler
+/// reset stop the whole fleet until every worker restarted -- and, measured, refused
+/// the honest grant while ACCEPTING a token captured before the reset, since the check
+/// asked `claimed >= expected`. `Distributed::KnownSchedulerTerm`'s class comment owns
+/// that argument; what belongs here is only that this adopts whatever an authentic,
+/// unspent grant names, in either direction.
+/// @param metrics Where an adopted term reset is counted. Borrowed. Refusals are NOT
+///        counted here -- the surface converts one `LeaseRefusalTable` row into the
+///        wire code and the counter together -- so this sink exists for the one event
+///        that is not a refusal and would otherwise be visible only in a log.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
                                                   std::string clusterId,
                                                   IWallClock const& clock,
-                                                  Distributed::KnownSchedulerTerm& term,
-                                                  Distributed::LeaseEpochNotice& epochNotice);
+                                                  Distributed::WorkerLeaseState& lease,
+                                                  IMetricsSink& metrics);
 
 /// The validator a worker with no cluster key builds: it refuses nothing.
 ///

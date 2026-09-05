@@ -129,15 +129,15 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     std::string clusterId,
                                     IWallClock const& clock,
-                                    Distributed::KnownSchedulerTerm& term,
-                                    Distributed::LeaseEpochNotice& epochNotice)
+                                    Distributed::WorkerLeaseState& lease,
+                                    IMetricsSink& metrics)
 {
     return [key = std::move(signingKey),
             endpoint = std::move(advertisedEndpoint),
             cluster = std::move(clusterId),
             &clock,
-            &term,
-            &epochNotice](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+            &lease,
+            &metrics](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -146,17 +146,53 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // toolchain's lease from paying for another's compile; neither does it alone,
         // which is why the grant's fingerprint check is not redundant with the
         // worker's.
-        auto verified =
-            Distributed::VerifyLeaseToken(key,
-                                          token,
-                                          Distributed::LeaseExpectation { .endpoint = endpoint,
-                                                                          .fingerprint = fingerprint,
-                                                                          .clusterId = cluster,
-                                                                          // Stated, not omitted -- see the header.
-                                                                          .epoch = term.Check() },
-                                          clock.Now());
+        // Read ONCE and used for both the verification and the spend, because those two
+        // have to agree about when this is: a token that verified as unexpired against
+        // one reading and was then filed against a later one would be remembered under a
+        // deadline the check never saw. It is also one syscall rather than two on the
+        // path of every dispatched compile.
+        auto const now = clock.Now();
+
+        // ONE slack, passed to BOTH, rather than each site taking the same default. The
+        // shared predicate makes them agree on the COMPARISON; only passing one value
+        // makes them agree on the WINDOW, and it is the window a future caller with a
+        // non-default slack would split.
+        constexpr auto slack = Distributed::LeaseTokenClockSkewSlack;
+
+        auto verified = Distributed::VerifyLeaseToken(
+            key,
+            token,
+            Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster },
+            now,
+            slack);
         if (verified.has_value())
         {
+            // **Spent here, after every reading of the token and before anything is
+            // learned from it** (#614). A lease is single-use by construction -- the
+            // scheduler mints one grant per lease, the client presents it in exactly one
+            // COMPILE frame with no retry, and a RELEASE goes to the scheduler rather
+            // than here -- so a second arrival is a replay and never an honest client.
+            //
+            // The order is the whole safety argument for the line below it. If the term
+            // were adopted first, a captured grant naming an old term would walk this
+            // worker's picture of the fleet backwards on demand; spending first means
+            // only a grant that has never been used can move it, which is what makes a
+            // lower term unambiguously a scheduler that was legitimately reset rather
+            // than a replay.
+            // **Every refusal a client would RETRY on is decided before this runs**, and
+            // that is load-bearing rather than incidental. `CompileResponder` answers
+            // `Stopping`, `NoCapacity` and `EndpointBusy` -- the three a client is told
+            // to come back from -- before this validator is reached at all. Refusals
+            // BELOW this point do burn the grant, which costs nothing today because
+            // `Dispatch::CompileOnWorker` sends one frame and never re-presents a token;
+            // the day a client retries one of them, or the slot and byte-budget checks
+            // move inside this function, that retry becomes a permanent `Replayed` and
+            // distribution stops with this counter blaming an attacker.
+            if (!lease.spent.Spend(token, verified->expiresAt, now, slack))
+                return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Replayed,
+                                                   .detail = "this lease has already been spent at this worker; a "
+                                                             "grant authorizes exactly one compile" };
+
             // **The second learning channel, and it works when the first does not.**
             // A grant naming a later term than this worker knows is adopted -- and it
             // is safe to adopt precisely BECAUSE this line sits after the MAC
@@ -169,27 +205,20 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // It also makes the refusal in test terms observable at all: without
             // adoption, a validator that accepted everything and one that adopts
             // forward are indistinguishable from outside.
-            term.Learn(verified->epoch);
-
-            // The latch is cleared by an ACCEPTED grant, so the notice marks each entry
-            // into the refusing condition rather than only the first ever (#614). A
-            // worker that refuses once to a stale token and then goes on working must
-            // still be able to report a real reset an hour later.
-            epochNotice.Accepted();
+            // A term that went BACKWARDS is a scheduler somebody reset -- its Raft
+            // directory wiped, the cluster re-bootstrapped, consensus turned off -- and
+            // it is ADOPTED rather than refused since #614. Reported both ways round,
+            // because the two audiences differ: the line is for whoever is reading this
+            // worker's log after a fleet stopped behaving, the counter is for whoever is
+            // looking at a dashboard and never reads a log.
+            //
+            // ONE predicate, and it belongs to the notice. Testing the transition here
+            // and again inside `Observe` would be one decision made in two places, and
+            // whichever copy is edited next is the one that stops agreeing.
+            if (lease.notice.Observe(lease.term.Learn(verified->epoch)))
+                metrics.Increment(IMetricsSink::Counter::WorkerSchedulerTermRegressions);
             return std::nullopt;
         }
-
-        // **Said once per entry into the condition, on the WORKER.** The refusal below
-        // travels to the client and is rendered there, which is how an operator running
-        // a build learns of it -- but an operator looking at the worker saw only
-        // `WorkerLeaseStaleEpoch` climbing, which reads like an election storm rather
-        // than like the scheduler reset it usually is (#614). A wrong signal, not a
-        // missing one.
-        //
-        // It reports only the epoch reason; every other refusal here is about one grant
-        // and is already answered per request. This one is a condition that persists
-        // until the process restarts, which is what makes it worth a line.
-        (void) epochNotice.Observe(verified.error());
 
         // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
         // permission, and the object key inside it is the SCHEDULER's bookkeeping, so

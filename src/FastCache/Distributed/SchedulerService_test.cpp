@@ -1007,13 +1007,11 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
 
     SECTION("the worker it names accepts it")
     {
-        auto const verified = VerifyLeaseToken(fleet.key,
-                                               token,
-                                               LeaseExpectation { .endpoint = "peer-1:7100",
-                                                                  .fingerprint = "gcc-14",
-                                                                  .clusterId = Signing::TestCluster,
-                                                                  .epoch = LeaseEpochCheck::NotKnownHere() },
-                                               Noon);
+        auto const verified = VerifyLeaseToken(
+            fleet.key,
+            token,
+            LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
+            Noon);
         REQUIRE(verified.has_value());
         CHECK(verified->key == "obj-1");
 
@@ -1028,26 +1026,22 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
         // The replay the endpoint is inside the MAC for. Without it, one grant is a
         // grant on every machine that trusts the key -- which is every machine in
         // the fleet.
-        auto const refusal = VerifyLeaseToken(fleet.key,
-                                              token,
-                                              LeaseExpectation { .endpoint = "peer-2:7100",
-                                                                 .fingerprint = "gcc-14",
-                                                                 .clusterId = Signing::TestCluster,
-                                                                 .epoch = LeaseEpochCheck::NotKnownHere() },
-                                              Noon);
+        auto const refusal = VerifyLeaseToken(
+            fleet.key,
+            token,
+            LeaseExpectation { .endpoint = "peer-2:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
+            Noon);
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::EndpointMismatch);
     }
 
     SECTION("and it stops being good once it has expired")
     {
-        auto const refusal = VerifyLeaseToken(fleet.key,
-                                              token,
-                                              LeaseExpectation { .endpoint = "peer-1:7100",
-                                                                 .fingerprint = "gcc-14",
-                                                                 .clusterId = Signing::TestCluster,
-                                                                 .epoch = LeaseEpochCheck::NotKnownHere() },
-                                              Noon + LeaseTable::DefaultLeaseTimeout + LeaseTokenClockSkewSlack + 1s);
+        auto const refusal = VerifyLeaseToken(
+            fleet.key,
+            token,
+            LeaseExpectation { .endpoint = "peer-1:7100", .fingerprint = "gcc-14", .clusterId = Signing::TestCluster },
+            Noon + LeaseTable::DefaultLeaseTimeout + LeaseTokenClockSkewSlack + 1s);
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Expired);
     }

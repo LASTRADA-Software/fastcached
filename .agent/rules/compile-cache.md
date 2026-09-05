@@ -1465,10 +1465,54 @@ stops being one — the same confound that cost #493 a re-run.
     layer down.
   - The `#line` markers still carry the client's paths, so a dispatched object's
     line table names the producing checkout's headers. On gcc that already matches a
-    local compile's; on clang the unit's own `DW_AT_name` is the worker's scratch
-    file and varies with the job counter
-    ([#660](https://github.com/LASTRADA-Software/fastcached/issues/660)).
-  - Read `comp_dir`, never compare objects: two different-but-checkout-independent
+    local compile's, because gcc takes the unit's `DW_AT_name` from the marker — on
+    **clang it comes from the INPUT FILE PATH**, so a dispatched object recorded the
+    worker's `<scratch>/job-N/<name>` until
+    [#660](https://github.com/LASTRADA-Software/fastcached/issues/660).
+  - **`DW_AT_name` is `comp_dir`'s sibling and needed its own rule** (#660). Two
+    consequences, and the second is the one that matters: the debug path named a
+    directory on no developer's machine, AND the job counter advances, so two
+    dispatches of ONE translation unit to ONE worker produced byte-differing objects
+    under one cache key — the exact property a compile cache exists to deny.
+    - **The client's spelling TRAVELS, as a REPLACEMENT, never as a path the worker
+      opens.** The invariant this was stopped on — *"Nothing the client sent decides
+      where a byte lands"*, sitting directly above `create_directories` — is a
+      FILESYSTEM guarantee, and `DW_AT_name` is a recorded string. They are not in
+      tension, and the same file was already building rules out of client-sent fields
+      for `compileDir`. `SafeSourceName` still decides the file the worker creates, and
+      `CompileJob_test` asserts that on the paths the worker actually created — captured
+      at spawn, because `ScratchGuard` removes the directory before any later look.
+    - **NO wire bump, and this was established before an encoder was written.**
+      `DecodeCompilePayload` splits an EXACT arity, so a new field would have broken
+      every deployed peer and moved `CurrentVersion`/`MinSupportedVersion` 3→4. It is
+      not needed: `sourceName` already travels, the client simply stops truncating it,
+      and both directions of a mixed fleet degrade to the previous behaviour — an old
+      worker sanitizes what arrives exactly as before, and an old client sends no
+      directory, so no rule is built.
+    - **The WHOLE path is mapped, not the directory**, which is the narrowest rule that
+      works: it matches exactly one path, so it cannot reach `comp_dir` or anything
+      else, and it survives `SafeSourceName` having renamed the scratch file.
+    - **It goes LAST, and the order is the difference between fixed and not fixed.**
+      Measured on clang 22.1.8 with the worker-directory rule also matching the scratch
+      path: this rule FIRST gives `./scratch/job-7/tu.cpp` — still broken — and LAST
+      gives `../src/tu.cpp` with `comp_dir` still `.`. The first measurement of this
+      said the order did not matter and was taken through **ccache**, which sits ahead
+      of the real compiler on `PATH` on the machine it was measured on; pin the compiler
+      by absolute path or the answer is whatever was cached.
+    - **Every way of not being able to build it is NO RULE, never a refusal**, unlike
+      the `compileDir` rules beside it. Those honour a mapping the client ASKED for, so
+      skipping one silently is #506 itself. Nothing asked for this one, and a source
+      file whose name carries a space, or an `=`, or an MSVC worker with no path-map
+      switch at all, are ordinary. Skipping an `=` is also the NARROW choice: gcc cuts
+      `<from>=<to>` at the last separator and clang at the first, so such a rule records
+      a name NEITHER machine has, which is worse than recording the worker's.
+    - **One residual, measured**: a client whose source argument is ABSOLUTE and whose
+      line carries a matching `-fdebug-prefix-map` records the mapped spelling locally,
+      while the dispatched object records the unmapped one, because `RemoteCompileArgs`
+      drops the client's rules by design. Deterministic and strictly better than
+      `job-N`, and it is [#800](https://github.com/LASTRADA-Software/fastcached/issues/800).
+      MSVC keeps its own residual for the same reason `cl` has no row here at all.
+  - Read `comp_dir` and `DW_AT_name`, never compare objects: two different-but-checkout-independent
     mappings compare EQUAL, which is how the rule-order defect above first read
     green. `dist-compile-e2e --case suite` case 13 runs the launcher from a
     directory the worker is not in — a case compiled in the worker's own directory
@@ -1856,15 +1900,17 @@ worth acting on is worth one clause saying which of the two it is.
   per-spawn environment on `IProcessRunner` -- setting it process-wide would change the
   language of the diagnostics the operator sees. Not token extraction: no rule over
   "the version-looking word and the last one" survives a locale nobody has read.
-- **[#660](https://github.com/LASTRADA-Software/fastcached/issues/660)** — clang
-  takes a compilation unit's `DW_AT_name` from the INPUT FILE path, which on a
-  worker is `<scratch>/job-N/<name>`, so two dispatches of one translation unit from
-  one worker produce byte-differing objects under the same key and different workers
-  differ again. gcc is unaffected: it takes the name from the `#line` marker, so a
-  dispatched gcc object already matches a local one. Closing it needs the client's
-  source spelling on the wire, which `CompileRequest::sourceName` deliberately
-  refuses to carry. Found beside #506 and left out of it: #506 is about `comp_dir`,
-  this is about determinism.
+- **[#800](https://github.com/LASTRADA-Software/fastcached/issues/800)** — a client
+  whose source argument is ABSOLUTE and whose line carries a matching
+  `-fdebug-prefix-map` records the mapped spelling locally, while the dispatched object
+  records the unmapped one: `RemoteCompileArgs` drops the client's rules by design, so
+  the worker maps its scratch to the raw spelling it was sent. #506's disagreement shape
+  one attribute over, and strictly better than the `job-N` scratch path #660 replaced.
+  The fix is to send what the client's own compile RECORDS rather than what the build
+  system wrote -- `MappedCompileDirectory` is already that computation, named and
+  documented for the working directory only -- and the reason it was not folded into
+  #660 is that its only call site is `main.cpp`, which no test can reach. No wire field
+  either way.
 - **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
   relative include-dir argument still reaches the key verbatim through
   `RelativizeArgs`, so two build trees at different depths key apart on the

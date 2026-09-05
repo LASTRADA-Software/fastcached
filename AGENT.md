@@ -333,6 +333,35 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.
+- A grant is spendable **once**, at the worker it names, and nothing enforced that until
+  #614 — a captured token was replayable there until it expired. The spend runs LAST, so
+  a grant refused on a reading of its claims is not consumed, and every refusal a client
+  RETRIES is decided above the validator or a retry becomes a permanent `Replayed`. Keyed
+  by a DIGEST, since `LeaseTable::_nextToken` restarts at 1 with the scheduler and serials
+  repeat across a restart while tokens do not.
+- **Retention window and acceptance window are ONE window**, and one predicate — not one
+  constant, because both sites would still spell the comparison and the comparison is the
+  part that is easy to get wrong (`expiresAt` is attacker-chosen, so it is a comparison
+  BEFORE a subtraction). A set pruned at `expiresAt` while the verifier accepts for
+  another five minutes of skew slack leaves a captured grant replayable again for the
+  difference: a spend that expires before the thing it is spending.
+- The learned scheduler term is a DIAGNOSTIC, never a gate. As a monotonic maximum it was
+  **exactly inverted** across a legitimate reset — measured: worker at term 7, scheduler
+  truthfully reset to 0, the honest grant REFUSED and a captured term-7 token ACCEPTED,
+  for every worker until every one of them restarted. The monotonic term was standing in
+  for replay protection; once the spend provides that, a lower term is ADOPTED.
+  `WorkerJobsRefusedLeaseStaleEpoch` is RETIRED rather than left reading zero — impossible
+  and did-not-happen are one number otherwise. A ratchet is a permanent denial of service
+  **with no attacker at all**: an operator turns it too.
+- **A lower term is a REGRESSION, and calling it a reset is a claim the worker cannot
+  make.** A grant minted before a leadership change and delivered after one arrives as a
+  lower term too — a client holds its grant across a preprocess and a large upload, so
+  this is ORDINARY — and nothing in the token separates it from a wiped Raft directory.
+  The first replacement asserted the reset in its log line and in a counter documented as
+  "zero except on the day somebody resets a cluster", which would have fired on every
+  election: #614's own complaint, pointing the other way. Report what is OBSERVED, name
+  both causes, and say that the RATE separates them. **A confident wrong signal is worse
+  than a vague right one.**
 - No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
   never a silent fallback. Its startup refusal is still open (#303) and must take the
   worker's shape above, or it breaks every single-machine install.

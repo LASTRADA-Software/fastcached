@@ -5,6 +5,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -73,20 +74,21 @@ enum class SocketActivation : std::uint8_t
 /// @param clock Where "now" comes from. A **wall** clock, not a steady one: the
 ///        expiry was stamped on another machine, and a steady instant means nothing
 ///        off the host that read it. Borrowed, so it must outlive the validator.
-/// @param term What this node knows about the scheduler's term (#421). Borrowed by
-///        the validator, so it must outlive it -- and it is the one object the
-///        heartbeat thread and the compile threads share. Taken even on the paths
-///        that build an unchecked validator, because whether a node has a cluster key
-///        is not a reason for its caller to hold a different set of objects.
+/// @param lease What this node keeps between lease checks -- the grants it has already
+///        run (#614), the scheduler term it last learned (#421), and where a term going
+///        backwards is reported. Borrowed by the validator, so it must outlive it, and
+///        shared by every compile thread. Taken even on the paths that build an
+///        unchecked validator, because whether a node has a cluster key is not a reason
+///        for its caller to hold a different set of objects.
+/// @param metrics Where an adopted term reset is counted.
 /// @param logger Where the chosen mode is announced.
 /// @return The validator, or why the key file cannot serve as one.
-[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
-    NodeConfig const& cfg,
-    std::string_view advertise,
-    SocketActivation activation,
-    IWallClock const& clock,
-    Distributed::KnownSchedulerTerm& term,
-    Distributed::LeaseEpochNotice& epochNotice,
-    ILogger& logger);
+[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
+                                                                                      std::string_view advertise,
+                                                                                      SocketActivation activation,
+                                                                                      IWallClock const& clock,
+                                                                                      Distributed::WorkerLeaseState& lease,
+                                                                                      IMetricsSink& metrics,
+                                                                                      ILogger& logger);
 
 } // namespace FastCache::Node

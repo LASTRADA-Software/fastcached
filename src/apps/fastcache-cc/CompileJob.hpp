@@ -521,4 +521,45 @@ class CompileJobRunner final: public ICompileJobRunner
                                                                                      std::string_view replacement,
                                                                                      DriverFamily family);
 
+/// The rule that makes a dispatched object record the CLIENT's source spelling.
+///
+/// A compiler with debug info on records the name of the file it was handed. gcc takes
+/// it from the `#line` marker the preprocessed text carries, so a dispatched object
+/// already reads what a locally built one does; **clang takes it from the input file
+/// path**, so it recorded this worker's scratch —
+/// [#660](https://github.com/LASTRADA-Software/fastcached/issues/660).
+///
+/// That is two defects and the second is the one that matters. The debug path names a
+/// directory that exists on no developer's machine; and the scratch directory carries a
+/// per-job counter, so two dispatches of the SAME translation unit to the SAME worker
+/// produce byte-differing objects stored under one cache key. A compile cache exists to
+/// deny exactly that.
+///
+/// **The whole path is mapped, not the directory**, which is the narrowest rule that
+/// works: it matches exactly one path — the source file — so it cannot reach
+/// `DW_AT_comp_dir` or anything else in the object, and it survives `SafeSourceName`
+/// having renamed the scratch file, since the recorded name is the client's spelling on
+/// both sides of that.
+///
+/// **Every way of not being able to build it is NO RULE, never a refusal.** That is the
+/// difference from `WorkerPrefixMapRules` below, which is honouring a mapping the client
+/// asked for and must refuse rather than silently skip. Nothing asked for this one: a
+/// source file whose name carries a space, or an `=`, or a driver family with no
+/// path-mapping switch at all, are ordinary things, and refusing them would stop
+/// distributing those translation units to improve a debug record. Skipping an `=` is
+/// also the NARROW choice rather than the lazy one — gcc cuts `<from>=<to>` at the last
+/// separator and clang at the first, so such a rule records a name neither machine has,
+/// which is worse than recording the worker's.
+///
+/// @param scratchSourcePath The path this compile is actually handed — the SANITIZED
+///        one, since that is what the driver will match against.
+/// @param clientSourceName The client's own spelling of its source, exactly as it sent
+///        it. Never opened, never joined to a path: it is only ever the right-hand side
+///        of a rule, and `SafeSourceName` is what decides the file this worker creates.
+/// @param family This worker's OWN driver family, never anything the client sent.
+/// @return The argument to append, or nothing when no unambiguous rule exists.
+[[nodiscard]] std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePath,
+                                                              std::string_view clientSourceName,
+                                                              DriverFamily family);
+
 } // namespace FastCache::Cc

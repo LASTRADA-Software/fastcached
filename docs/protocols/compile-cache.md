@@ -206,11 +206,22 @@ software version and the cache budgets; `load` is what it is *doing* — CPU bus
 available memory, free scratch and what its cache holds. `inFlight` stays outside
 the nested record, because it is the one number a worker can never fail to have.
 
-`sourceName` is the **base name** of the client's translation unit, so the worker
-can name its scratch file the same way: a compiler records the name of the file it
-was handed, and an object built under an invented name is gratuitously different
-from a locally built one. It is sanitized before it becomes a path, and it never
-decides the language — the client states that explicitly.
+`sourceName` is the client's translation unit **as the build system spelled it**,
+directory and all. A compiler records the name of the file it was handed, so an object
+built under an invented name is gratuitously different from a locally built one — and
+clang takes that name from the *input file path* rather than from the `#line` marker,
+so a dispatched object recorded the worker's per-job scratch directory until
+[#660](https://github.com/LASTRADA-Software/fastcached/issues/660). That directory
+carries a counter, so two dispatches of one translation unit produced two different
+objects under one cache key.
+
+The worker uses it two ways and they are not the same kind of use. It **sanitizes** it
+down to a single safe component to name its scratch file — a string off a socket that
+becomes a path, so nothing in it may decide a directory — and it puts the value
+**verbatim** on the right-hand side of a `-fdebug-prefix-map` rule whose left-hand side
+is that scratch file, which is what makes the recorded name the client's. A rule's
+replacement is a string the compiler records, never a path anything opens. It never
+decides the language either — the client states that explicitly.
 
 `correlation` is what ties a reply to the request that asked for it, and it is the
 one field on this wire that exists only to catch a defect. Everything else here is
