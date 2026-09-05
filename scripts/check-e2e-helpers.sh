@@ -1219,6 +1219,64 @@ if [ "$distinct" -ne 6 ]; then
 fi
 ran=$(( ran + 1 ))
 
+# --- the drain's verdict, against staged readings ---------------------------
+#
+# `_e2e_read_hit_bound` decides whether OUR bound or the PEER ended a read, from
+# the CLOCK. `read -t`'s exit status cannot carry that: a timeout is above 128 on
+# bash 4.0+ and a plain `1` -- byte-identical to EOF -- on the 3.2 that macOS ships.
+# The status-based version therefore failed on macOS ALONE and passed everywhere
+# else, which is why the decision is driven DIRECTLY here rather than through a
+# staged listener: on this platform the real path cannot exhibit the difference.
+# `.agent/rules/testing.md`, on splitting the decision out as a pure function over
+# a record so a verdict needing a rare machine to reproduce needs one line here.
+#
+# The listener-backed arm of the same property is `http-silence-inconclusive`,
+# which spends the whole five-second bound. These cost nothing and cover the
+# branch on every platform, which that case cannot.
+echo "== the drain's verdict, against staged readings"
+read_bound_rows=(
+    "hit-bound-exact|5|5|0|a read that consumed its whole bound is the bound's"
+    "hit-bound-over|6|5|0|a read that overran its bound is still the bound's"
+    "hit-bound-eof|0|5|1|a peer that closed at once is the peer's"
+    "hit-bound-early|4|5|1|a peer that closed inside the bound is the peer's"
+)
+# Two empty lists agree perfectly: a table that loses its rows reports every
+# reading clean, exactly like a scan that found no readings.
+ran=$(( ran + 1 ))
+if [ "${#read_bound_rows[@]}" -lt 1 ]; then
+    echo "FAIL read-bound: the reading table is empty, so every row 'passed'." >&2
+    note_failure "read-bound"
+fi
+
+for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
+    old="$IFS"
+    IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+    IFS="$old"
+    ( . "$library"; _e2e_read_hit_bound "$relapsed" "$rbound" ) && rgot=0 || rgot=$?
+    ran=$(( ran + 1 ))
+    if [ "$rgot" -ne "$rwant" ]; then
+        echo "FAIL ${rname}: ${rwhat} -- elapsed ${relapsed}s against a ${rbound}s bound returned ${rgot}, wanted ${rwant}" >&2
+        note_failure "${rname}"
+    fi
+done
+
+# Four rows that all answer the same way pass every assertion above while testing
+# nothing -- the `verdict-branches` argument thirty lines up, applied to a
+# predicate with exactly two answers. Both must appear.
+read_bound_answers="$(
+    for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
+        old="$IFS"
+        IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+        IFS="$old"
+        printf '%s\n' "$rwant"
+    done | sort -u | grep -c .
+)"
+ran=$(( ran + 1 ))
+if [ "$read_bound_answers" -ne 2 ]; then
+    echo "FAIL read-bound-branches: the readings produced ${read_bound_answers} distinct answers, not 2" >&2
+    note_failure "read-bound-branches"
+fi
+
 # --- the cases -------------------------------------------------------------
 
 cases=(
