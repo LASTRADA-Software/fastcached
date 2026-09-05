@@ -3898,6 +3898,43 @@ carries: two empty lists agree perfectly, so a `## Open Work` or a heading with
 nothing under it would take one file's entries out of the scanned set forever while
 the total stayed healthy.
 
+## A green local gate says NOTHING when the subject under test is the build environment
+
+**Measured across one change, in one afternoon: three platforms, three defects, none of
+them visible locally.** A check that measures which translation units the analyser sees
+went green on the local gate and then failed CI three times running:
+
+| platform | defect |
+|---|---|
+| Linux (`clang-asan-ubsan`) | the third-party filter was a **denylist** naming `/_deps/`, and CI caches CPM sources under `.cache/CPM/` **inside the repository**, so ~40 vendored units read as analysed-by-nothing and the check refused a healthy tree |
+| Windows | the selftest's fake `nm` was a POSIX shell stub spawned through Python -- `CreateProcess`, **ENOEXEC** |
+| macOS | **bash 3.2 cannot parse a here-document inside a command substitution**, so the check died at PARSE time and all eight selftest cases refused for a reason unrelated to what they test |
+
+<!-- table-total: none -->
+
+**They are one failure, not three.** The subject under test was the build environment, and
+that is the one variable a local run holds fixed. So the rule is stronger than "a local
+gate says less here": **on this class of change it says nothing**, and a green one is not
+weak evidence but no evidence.
+
+Three rules fall out, each generalising past this change:
+
+- **An exclusion list is a bet on the world's layout; an inclusion list is a statement
+  about your own.** `/_deps/` was not the wrong *path* -- a denylist was the wrong *shape*,
+  because it can only be right about locations it already knows. An allowlist naming this
+  project's `src/` cannot be wrong about a directory it never mentions.
+- **Knowing a rule and having just applied it is not protection.** That Windows ENOEXEC is
+  the same defect the same author had fixed in another selftest **three hours earlier**,
+  reproduced in a file written afterwards -- and the bash 3.2 hazard was already written
+  down in this file. **A fix that is not structural does not transfer to the next file you
+  write**, which is the argument for the scan living in its own `.py` sibling rather than
+  as a heredoc, and for registering a check by its SUBJECT (what the *Linux* sweep cannot
+  see) rather than by its mechanics.
+- **A local run and a CI run can read different trees without either being wrong.** Catch2
+  is a distribution package on the developer host and a CPM checkout in CI, so its sources
+  were never in the local compile database at all. Not a misconfiguration -- two
+  environments answering honestly about themselves.
+
 ## Open work
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six

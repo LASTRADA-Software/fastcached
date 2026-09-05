@@ -1353,6 +1353,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   changes at all — which is how #518 classified `net-boundary` as merely PARTIAL. Three arms, and the third is
   not decoration: violation alone, violation behind a bracket, bracket alone. Without the last, a check that
   refused every bracket would pass the middle one for the wrong reason.
+- **A census cannot falsify a premise — it can only produce a number consistent with it.**
+  Re-derive an inherited claim BEFORE the census, never after: afterwards it has already
+  told you what you expected to hear. Measured: a lane counted eleven analyser-blind
+  translation units and `scripts/tidy-sweep.sh` had already recorded the same 13/11/2
+  breakdown in its own comments — **agreement between a fresh measurement and a source you
+  have not read is worth nothing**, and it *felt* like corroboration. The ticket's premise
+  ("the sweep reports clean") was false throughout, and seven consecutive tickets fell to
+  premise checks that a count would have confirmed.
 - **A census states its PATTERN, not only its number.** Two independent audits of one file set differed by
   exactly one and neither had miscounted: `scripts/check-*.cmake` (the glob a ticket names) gives 20 / 18 /
   34 for cac9bda-all / cac9bda-excl-selftests / HEAD, while an unanchored `grep 'check-.*\.cmake$'` gives
