@@ -1092,11 +1092,13 @@ if(NOT WIN32)
         NAME "e2e-helpers-selftest"
         COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
     )
-    # It stages several deliberate timeouts of a couple of seconds each and one
+    # It stages several deliberate timeouts of a couple of seconds each, one
     # four-second wait that must really take four seconds -- the check that the
-    # bound comes from a clock rather than from an iteration count. Bounded so a
-    # helper that stops being bounded reports here rather than as a suite timeout
-    # naming nothing.
+    # bound comes from a clock rather than from an iteration count -- and one
+    # four-second staged DEFECT, which is `bounded-fast-path-bites` proving that
+    # the fast-path ceiling still separates a healthy `run_bounded` from a broken
+    # one on the machine actually running it. Bounded so a helper that stops being
+    # bounded reports here rather than as a suite timeout naming nothing.
     #
     # MEASURED, so that a timeout here is diagnosable rather than a guess (#678
     # was reported as one failure in four runs with no output captured, and a
@@ -1104,6 +1106,17 @@ if(NOT WIN32)
     # alone). On a 32-core Linux host, local ext4:
     #
     #     1-min load 5.04 -> 1.90     37.2s / 37.0s / 37.0s   (three runs, 172 checks)
+    #     1-min load 1.65 -> 7.42     40.6-41.1s              (six runs,   174 checks)
+    #     1-min load 55.0 -> 57.8     42.9-44.3s              (four runs,  174 checks)
+    #
+    # The check COUNT is part of each row for the reason the load is: 172 and 174 are
+    # different trees, and 37s against 41s is mostly that difference rather than the
+    # host. A total is comparable only against the same tree.
+    #
+    # The stray-listener floor was `pgrep -x perl` = 0 at BOTH ends of both batches,
+    # so these readings are not sitting on accumulated orphans from earlier runs --
+    # `pgrep -x`, never `pgrep -f`, which matches the shell running the census and
+    # reports a non-zero floor on a host with no perl at all.
     #
     # **The load is part of the reading, and an earlier version of this block got
     # that wrong in the direction that matters.** It recorded the same shape as
@@ -1115,25 +1128,33 @@ if(NOT WIN32)
     # number while calling one of them quiet. The row above states the load it was
     # taken at because that is the only form in which it can be checked.
     #
-    # **No loaded band is measured here**, deliberately rather than by omission: this
-    # host is rarely quiet and a band taken during someone else's gate is not
-    # reproducible either. The headroom below is therefore derived from the reading
-    # that exists, and anyone adding a loaded band should derive it from the WORST
-    # band measured -- a `TIMEOUT` justified by a quiet host is a bound that fails on
-    # a busy one. `check-e2e-helpers.sh` is contended by three lanes as this is
-    # written; whoever lands last owns the combined block, keeping each cost
-    # separately attributed.
+    # **A loaded band IS measured now** -- the previous version of this block said
+    # there was none, deliberately, and invited whoever landed last to add one from
+    # the WORST band rather than the best. This is that lane. The two rows above are
+    # the same tree at two load levels, and the headroom below is taken from the
+    # slowest reading of the slower band, not from the typical.
     #
-    # #824 added ~6s, by construction rather than by accident:
-    # `http-silence-inconclusive` stages a listener that accepts and then neither
-    # speaks nor closes, so it costs `_http_drain_fd3`'s whole `read -t` bound --
-    # that expiry is the thing it asserts on.
+    # `check-e2e-helpers.sh` was contended by three lanes while this was written and
+    # each cost stays separately attributed, because a single total cannot be
+    # re-derived when the next case arrives:
+    #
+    #   * #824  ~6s  `http-silence-inconclusive` stages a listener that accepts and
+    #                then neither speaks nor closes, so it costs `_http_drain_fd3`'s
+    #                whole `read -t` bound -- that expiry is the thing it asserts on.
+    #   * #678  ~4s  `bounded-fast-path-bites` stages the flat-pause defect, which is
+    #                `FastPathCommands` polls of `_e2e_poll_pause`.
+    #
+    # Both by CONSTRUCTION rather than by measurement: each is a bound the case
+    # deliberately spends, so the figure follows from the constant and does not need
+    # re-timing when the host changes.
     #
     # So the cost is almost entirely the deliberate SLEEPS rather than CPU work,
     # which is the REASON to expect contention to move it little -- an argument from
-    # what the run spends its time on, not from the pair of numbers above, which
-    # cannot support it. Roughly 3x headroom against this bound at the load stated;
-    # a run approaching 120s means something other than a busy machine. A figure
+    # what the run spends its time on, and one the loaded row now supports rather
+    # than merely asserting: eight times the load average cost about 3s. 2.7x
+    # headroom against this bound at the worst reading of 44.3s -- taken from the
+    # slowest run of the loaded band, not the typical of the quiet one; a run
+    # approaching 120s means something other than a busy machine. A figure
     # here rather than "well inside": #665 is the same shape, a registration's
     # stated cost against its measured one.
     set_tests_properties("e2e-helpers-selftest" PROPERTIES
