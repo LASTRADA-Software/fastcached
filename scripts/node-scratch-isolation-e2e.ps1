@@ -505,6 +505,32 @@ function ConvertTo-QuotedArgs([string[]]$arguments) {
 # hard to exercise wherever they live. So is the early return that reports a
 # process which died mid-wait; the record below covers only the end-of-wait form.
 
+# What the serving wait says when it gives up.
+#
+# A FUNCTION rather than a literal at the throw site, because a self-test cannot
+# reach `Wait-ForNodeUp`: that is defined inside the run body, and `-SelfTest`
+# exits well before the script gets there. Pulling the message out is what makes
+# it addressable at all -- the same split this file already made for the verdict,
+# and for the same reason.
+#
+# The wording is load-bearing in BOTH directions, which is why it is tested:
+#
+#   * it must say the wait was for SERVING, the fact `compile node ready`
+#     actually reports (`Core/ReadinessMarker.hpp`, whose `ReadinessFact` has no
+#     `Bound` enumerator on purpose);
+#   * it must NOT claim a bind failure, which is what it said before #652 and
+#     which sent whoever read it to check a port that is open and answering.
+#
+# And it must still MENTION that the port is bound, because that is the sentence
+# telling the reader an open port is not evidence the wait succeeded. So "does
+# not mention bind" is the wrong assertion and would fail the correct message;
+# what is forbidden is the CLAIM, not the word.
+#
+# @param name the node whose wait gave up
+function Get-NodeNotServingMessage([string]$name) {
+    "$name never reported serving. That marker is logged after the port is bound and accepting, so the port being open says nothing about this wait; the stage not reached is between the accept start and the ready line."
+}
+
 function Invoke-SelfTest {
     # The reading a healthy-looking but idle process produces: alive, a log that
     # grew long ago, nothing burning. That is BLOCKED, so every case that wants
@@ -726,11 +752,57 @@ function Invoke-SelfTest {
         }
     }
 
+    # --- the serving wait's failure MESSAGE (#833) --------------------------
+    #
+    # A different subject from the verdicts above, so a block of its own rather
+    # than rows in `$cases`: those are driven through `Get-WaitVerdict` and every
+    # one is additionally required to carry the evidence lines, neither of which
+    # applies here.
+    #
+    # ROUTE, stated because it decides what this does and does not cover: this
+    # exercises the MESSAGE as a pure function, not the wait. Whether
+    # `Wait-ForNodeUp` reaches this text on a real timeout is covered by the
+    # `throw (Get-NodeNotServingMessage $name)` at its call site being the only
+    # thing it can throw there -- there is no literal left to drift. What is NOT
+    # covered is the wait's own polling, which needs a real process and a real
+    # log and stays in the end-to-end fixture.
+    $messageCases = @(
+        @{  Name  = "the serving wait names the stage it observed"
+            Text  = (Get-NodeNotServingMessage "workerA")
+            # BOTH halves. Asserting only that it says "serving" would pass a
+            # message that said both, which is exactly the drift #652 corrected.
+            Expect = @("workerA never reported serving",
+                       "the stage not reached is between the accept start and the ready line")
+            # The CLAIM, not the word. The message must still mention that the
+            # port is bound -- that is the half telling the reader an open port
+            # proves nothing -- so forbidding "bind"/"bound" outright would fail
+            # the correct text.
+            Forbid = @("did not bind", "failed to bind", "to bind its compile port") }
+    )
+
+    foreach ($case in $messageCases) {
+        $problems = [System.Collections.Generic.List[string]]::new()
+        foreach ($wanted in @($case.Expect)) {
+            if (-not $case.Text.Contains($wanted)) { $problems.Add("expected `"$wanted`"") }
+        }
+        foreach ($banned in @($case.Forbid)) {
+            if ($banned -and $case.Text.Contains($banned)) { $problems.Add("must not say `"$banned`"") }
+        }
+        if ($problems.Count -eq 0) {
+            Write-Host ("PASS  {0}" -f $case.Name)
+        } else {
+            $failures++
+            Write-Host ("FAIL  {0}: {1}" -f $case.Name, ($problems -join "; "))
+            Write-Host $case.Text
+        }
+    }
+
+    $total = $cases.Count + $messageCases.Count
     if ($failures -gt 0) {
-        Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $cases.Count)
+        Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $total)
         return 1
     }
-    Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} cases passed" -f $cases.Count)
+    Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} cases passed" -f $total)
     return 0
 }
 
@@ -852,7 +924,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $readySeconds "$name to report serving on its compile port" $proc)) {
                 # States what was and was not established, and stops. A bound port is
                 # NOT evidence this succeeded, so the message must not point at one.
-                throw "$name never reported serving. That marker is logged after the port is bound and accepting, so the port being open says nothing about this wait; the stage not reached is between the accept start and the ready line."
+                throw (Get-NodeNotServingMessage $name)
             }
             if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc)) {
                 throw "$name did not finish its toolchain survey"
