@@ -1008,8 +1008,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   direction: four defects in four tickets were reachable only by the analyser or a
   sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
   them. A platform's leg answers a different question, not a weaker version of the same one.
-- **A retry makes an instrument's own failures disappear without fixing them.** Eleven ways
-  the gate reported on something other than the tree under test have turned up across four
+- **A retry makes an instrument's own failures disappear without fixing them.** Twelve ways
+  the gate reported on something other than the tree under test have turned up across five
   tickets — `| tail` reporting the pipe's status, quoting collapsing through three parsers
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
@@ -1022,8 +1022,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   same tree, the same platform AND the same target set, and a LOG THAT DOES NOT NAME ITS
   OWN COMMIT — a `/tmp` wipe left the previous run's durable copy sitting where the current
   one goes, reporting a failure already fixed, and only an accident of timestamps told them
-  apart. A verdict must carry what it is a verdict about. None
-  announces itself; each looks like a flake; a re-run clears all eleven. A dirty-tree guard
+  apart. A verdict must carry what it is a verdict about, and a WRAPPER's exit code is a
+  verdict about the WRAPPER — `setsid` **forks when the caller is already a process-group
+  leader**, so the parent returned instantly and `GATE EXIT=$?` recorded **0 before the gate
+  ran a step**, which a waiter keyed on that string then believed. It was caught because the
+  line sat ABOVE the gate's own `LOCAL GATE STARTED` marker: an ORDERING check, where every
+  value check agreed with it. And a run that was KILLED mid-build is discarded rather than
+  read — an unfinished run has told you nothing, which is not the same as telling you the
+  tree is fine. None
+  announces itself; each looks like a flake; a re-run clears all twelve. A dirty-tree guard
   that samples once AT THE START cannot see an instrument that dirties the tree itself —
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a
