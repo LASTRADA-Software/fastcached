@@ -523,6 +523,41 @@ struct NodeConfig
     /// value equals the default (#286).
     bool nodeListenExplicit { false };
 
+    /// Whether each remaining service-argv flag was TYPED rather than defaulted.
+    ///
+    /// One bit per flag `MakeNodeServiceSpec` emits, because emitting on a value
+    /// COMPARISON is only sound while every default is a compile-time constant the
+    /// next start re-derives identically (#713). That is a property of today's
+    /// constants and not of the mechanism, and this binary has already watched it
+    /// move once: `DefaultLogTimestamps` became platform-dependent in #496, and the
+    /// `--log-timestamps` pair below still carries the comment explaining what that
+    /// cost. The daemon's audit under #349 found FIVE rows once somebody looked,
+    /// not the one that had been reported.
+    ///
+    /// So the bits are not added where a default looks risky today -- that judgement
+    /// is what has to be re-made correctly every time a constant changes, by whoever
+    /// changes it, without the change looking like it touches registration at all.
+    /// They are added everywhere, and the mechanism stops depending on the
+    /// constants.
+    ///
+    /// Set only by the ARGV parse: `--install-service` builds its spec from
+    /// `cliOnly`, so a key in a config file never reaches these and never gets baked
+    /// into a unit that would then outrank the file it came from.
+    bool schedulerExplicit { false };
+    bool advertiseExplicit { false };
+    bool slotsExplicit { false };
+    bool nodeClassExplicit { false };
+    bool adminListenExplicit { false };
+    bool cacheDiskBytesExplicit { false };
+    bool nodeIdExplicit { false };
+    bool raftListenExplicit { false };
+    bool clusterIdExplicit { false };
+    bool discoveryAddressExplicit { false };
+    bool discoveryReplyPortExplicit { false };
+    bool upstreamExplicit { false };
+    bool drainTimeoutSecondsExplicit { false };
+    bool logLevelExplicit { false };
+
     /// Whether the admin surface also serves the fleet dashboard.
     ///
     /// Off unless asked for, like every other surface this program serves. The page

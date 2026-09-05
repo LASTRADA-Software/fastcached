@@ -499,6 +499,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<host:port>",
             .apply = AssignFrom<&NodeConfig::scheduler, ParseText>(),
+            .explicitBit = &NodeConfig::schedulerExplicit,
             .description = "the scheduler's --listen-node endpoint. Required: a\n"
                            "worker nothing knows about serves nobody.",
             .yamlKey = "scheduler",
@@ -509,6 +510,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<host:port>",
             .apply = AssignFrom<&NodeConfig::advertise, ParseUtf8Text>(),
+            .explicitBit = &NodeConfig::advertiseExplicit,
             .description = "host:port CLIENTS should use to reach this worker.\n"
                            "Defaults to --listen-node, which binds loopback unless\n"
                            "widened: the scheduler hands this string to clients\n"
@@ -570,6 +572,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<n>",
             .apply = AssignFrom<&NodeConfig::slots, ParseSlots>(),
+            .explicitBit = &NodeConfig::slotsExplicit,
             .description = "concurrent compiles. Default: derived from this\n"
                            "machine's cores and memory, less what --node-class\n"
                            "reserves. A number given here is the answer and is\n"
@@ -585,6 +588,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=workstation|dedicated",
             .apply = AssignFrom<&NodeConfig::nodeClass, ParseNodeClass>(),
+            .explicitBit = &NodeConfig::nodeClassExplicit,
             .description = "how hard this machine may be driven (default:\n"
                            "workstation). A workstation keeps cores free for the\n"
                            "person using it; a dedicated node may be driven to its\n"
@@ -598,6 +602,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<seconds>",
             .apply = AssignFrom<&NodeConfig::drainTimeoutSeconds, ParseDrainTimeout>(),
+            .explicitBit = &NodeConfig::drainTimeoutSecondsExplicit,
             .description = "seconds a stop waits for compiles still running\n"
                            "before giving up and saying what it abandoned;\n"
                            "0 waits forever. Unbounded, the supervisor\n"
@@ -623,6 +628,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<id>",
             .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
+            .explicitBit = &NodeConfig::nodeIdExplicit,
             .description = "this node's identity in the cluster. Giving it turns\n"
                            "consensus ON; without it this node leads alone,\n"
                            "which is right for one machine and is the default.",
@@ -634,6 +640,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=[<address>:]<port>",
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
+            .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port. A bare\n"
                            "port binds the WILDCARD: peers are on other machines\n"
                            "by definition, so loopback would silently not work.",
@@ -716,6 +723,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<name>",
             .apply = AssignFrom<&NodeConfig::clusterId, ParseUtf8Text>(),
+            .explicitBit = &NodeConfig::clusterIdExplicit,
             .description = "which fleet this node belongs to. Plain text in every\n"
                            "beacon and NOT a credential: what it buys is that two\n"
                            "unrelated fleets on one segment ignore each other.",
@@ -727,6 +735,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<address>:<port>",
             .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
+            .explicitBit = &NodeConfig::discoveryAddressExplicit,
             .description = "announce this node on the segment and listen for peers\n"
                            "here; off unless given. Needs --node-id and\n"
                            "--cluster-key-file. Without it a cluster is exactly\n"
@@ -739,6 +748,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<n>",
             .apply = AssignFrom<&NodeConfig::discoveryReplyPort, ParseNodePort>(),
+            .explicitBit = &NodeConfig::discoveryReplyPortExplicit,
             .description = "port peers unicast their discovery challenges and\n"
                            "proofs to; kernel-chosen unless given. NOT the\n"
                            "--discovery port: that one is shared by every node on\n"
@@ -782,6 +792,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=[<address>:]<port>",
             .apply = AssignFrom<&NodeConfig::adminListen, ParseText>(),
+            .explicitBit = &NodeConfig::adminListenExplicit,
             .description = "serve /metrics and /healthz here; off unless given.\n"
                            "A bare port binds loopback: a scrape endpoint on a\n"
                            "public interface is an operator's decision, not a\n"
@@ -908,6 +919,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<bytes>",
             .apply = AssignFrom<&NodeConfig::cacheDiskBytes, ParseCacheDiskBytes>(),
+            .explicitBit = &NodeConfig::cacheDiskBytesExplicit,
             .description = "cap this node's on-disk cache tier at this size\n"
                            "(default 0, meaning grow as needed). Only means\n"
                            "anything with --cache-dir: without a path there is\n"
@@ -952,6 +964,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<host:port>",
             .apply = AssignFrom<&NodeConfig::upstream, ParseText>(),
+            .explicitBit = &NodeConfig::upstreamExplicit,
             .description = "the shared fastcached this node reads through to.\n"
                            "Empty is honest rather than broken: one developer's\n"
                            "machine has no shared cache.",
@@ -972,6 +985,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<level>",
             .apply = AssignFrom<&NodeConfig::logLevel, ParseNodeLogLevel>(),
+            .explicitBit = &NodeConfig::logLevelExplicit,
             .description = "trace, debug, info, warn, error, fatal (default info)",
             .yamlKey = "log_level",
             // The ONE reloadable row today, and it earns it: `ILogger::SetMinLevel`
@@ -1329,31 +1343,37 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
 
 ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg)
 {
-    NodeConfig const defaults {};
     std::vector<std::string> argv;
-
-    /// Emit `--flag=value` when the field differs from its default.
-    auto const emitIfSet = [&argv](std::string_view flag, auto const& value, auto const& fallback) {
-        if (value != fallback)
-            argv.emplace_back(std::format("--{}={}", flag, value));
-    };
 
     /// Emit `--flag=value` when the operator TYPED it, whatever its value.
     ///
-    /// A named sibling of `emitIfSet` rather than an `if` per flag, because reaching
-    /// for `emitIfSet` IS the mistake: it compares the value against the default, and
-    /// the two answers part company on the one input that matters -- an operator
-    /// typing the default, which is what somebody does after reading the value off
-    /// the startup line to pin it. That value is then dropped from the registration
-    /// and the service re-derives it at every start.
+    /// **The only value-bearing emitter, and there is deliberately no sibling that
+    /// compares against a default** (#713). There was one -- `emitIfSet` -- and
+    /// fourteen rows used it. Deleting it rather than leaving it beside this is the
+    /// point: reaching for it IS the mistake, so the fix is that there is nothing
+    /// left to reach for.
     ///
-    /// Which flags need this is not a matter of taste. `--cache-memory`'s default is
-    /// a share of host RAM, so a pinned budget moves under a VM resize; and
-    /// `--listen-node` decides on provenance whether a bind failure is FATAL, so a
-    /// registration that lost the bit warns past a taken port forever and the node
-    /// comes up healthy serving no cache (#286). `NodeConfig_test` walks
-    /// `NodeOptions()` and requires every row carrying an `explicitBit` to arrive
-    /// here, so a new one cannot go back to `emitIfSet` by omission.
+    /// What it got wrong: a value comparison and a provenance question part company
+    /// on the one input that matters, an operator typing the default. That is what
+    /// somebody does after reading a value off the startup line to pin it -- and the
+    /// flag was then dropped from the registration, so the service re-derived it at
+    /// every start. A registration replays its command line forever, so the pin was
+    /// lost permanently and silently.
+    ///
+    /// Emission by value is sound only while every default is a compile-time
+    /// constant the next start re-derives identically. The node's were, when those
+    /// fourteen rows were written. That is a property of the constants and not of
+    /// the mechanism, and this binary has already watched it move: the
+    /// `--log-timestamps` pair below carries the comment explaining what happened
+    /// when `DefaultLogTimestamps` became platform-dependent in #496. The daemon's
+    /// audit under #349 found FIVE unsafe rows once somebody looked, not the one
+    /// that had been reported.
+    ///
+    /// So the bits are not on the rows whose defaults look risky today. That
+    /// judgement would have to be re-made correctly by whoever next changes a
+    /// constant, in a change that does not look like it touches registration at all.
+    /// `NodeConfig_test` walks `NodeOptions()` and requires every row carrying an
+    /// `explicitBit` to arrive here.
     auto const emitIfExplicit = [&argv](std::string_view flag, auto const& value, bool wasTyped) {
         if (wasTyped)
             argv.emplace_back(std::format("--{}={}", flag, value));
@@ -1396,18 +1416,17 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // file without touching the registration.
     emitPathIfSet("config", cfg.configPath);
 
-    emitIfSet("scheduler", cfg.scheduler, defaults.scheduler);
-    emitIfSet("advertise", cfg.advertise, defaults.advertise);
-    emitIfSet("slots", cfg.slots, defaults.slots);
-    emitIfSet("node-class",
-              std::string { Distributed::TraitsFor(cfg.nodeClass).name },
-              std::string { Distributed::TraitsFor(defaults.nodeClass).name });
-    // Emitted on presence rather than on difference, because the difference this
-    // flag carries IS presence: a reserve of zero the operator typed and a reserve
-    // nobody mentioned are different instructions, and `emitIfSet` compares values.
+    emitIfExplicit("scheduler", cfg.scheduler, cfg.schedulerExplicit);
+    emitIfExplicit("advertise", cfg.advertise, cfg.advertiseExplicit);
+    emitIfExplicit("slots", cfg.slots, cfg.slotsExplicit);
+    emitIfExplicit("node-class", std::string { Distributed::TraitsFor(cfg.nodeClass).name }, cfg.nodeClassExplicit);
+    // Emitted on presence, because the difference this flag carries IS presence: a
+    // reserve of zero the operator typed and a reserve nobody mentioned are
+    // different instructions. The `optional` is this row's provenance bit, and it
+    // predates the ones the other rows now carry.
     if (cfg.reservedCores.has_value())
         argv.push_back(std::format("--reserve-cores={}", *cfg.reservedCores));
-    emitIfSet("admin-listen", cfg.adminListen, defaults.adminListen);
+    emitIfExplicit("admin-listen", cfg.adminListen, cfg.adminListenExplicit);
     if (cfg.dashboard)
         argv.emplace_back("--dashboard");
     // The PATH, never the secret it holds -- the same rule `--requirepass` is
@@ -1421,14 +1440,14 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     if (cfg.serveScheduler)
         argv.emplace_back("--serve-scheduler");
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
-    emitIfSet("cache-disk", cfg.cacheDiskBytes, defaults.cacheDiskBytes);
+    emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
     emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
-    emitIfSet("node-id", cfg.nodeId, defaults.nodeId);
-    emitIfSet("listen-raft", cfg.raftListen, defaults.raftListen);
+    emitIfExplicit("node-id", cfg.nodeId, cfg.nodeIdExplicit);
+    emitIfExplicit("listen-raft", cfg.raftListen, cfg.raftListenExplicit);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
-    emitIfSet("cluster-id", cfg.clusterId, defaults.clusterId);
-    emitIfSet("discovery", cfg.discoveryAddress, defaults.discoveryAddress);
-    emitIfSet("discovery-reply-port", cfg.discoveryReplyPort, defaults.discoveryReplyPort);
+    emitIfExplicit("cluster-id", cfg.clusterId, cfg.clusterIdExplicit);
+    emitIfExplicit("discovery", cfg.discoveryAddress, cfg.discoveryAddressExplicit);
+    emitIfExplicit("discovery-reply-port", cfg.discoveryReplyPort, cfg.discoveryReplyPortExplicit);
     emitPathIfSet("cluster-key-file", cfg.clusterKeyFile.string());
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
@@ -1438,7 +1457,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // at the FIRST `=` and keeps the endpoint verbatim.
     for (auto const& peer: cfg.raftPeers)
         argv.push_back(std::format("--raft-peer={}={}", peer.id, peer.raftEndpoint));
-    emitIfSet("upstream", cfg.upstream, defaults.upstream);
+    emitIfExplicit("upstream", cfg.upstream, cfg.upstreamExplicit);
     emitPathIfSet("cache-dir", cfg.cacheDir.string());
     if (cfg.raftJoin)
         argv.emplace_back("--raft-join");
@@ -1446,8 +1465,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--fleet-open");
     for (auto const& member: cfg.fleetMembers)
         argv.push_back(std::format("--fleet-member={}", member));
-    emitIfSet("drain-timeout", cfg.drainTimeoutSeconds, defaults.drainTimeoutSeconds);
-    emitIfSet("log-level", LogLevelName(cfg.logLevel), LogLevelName(defaults.logLevel));
+    emitIfExplicit("drain-timeout", cfg.drainTimeoutSeconds, cfg.drainTimeoutSecondsExplicit);
+    emitIfExplicit("log-level", LogLevelName(cfg.logLevel), cfg.logLevelExplicit);
 
     // **Both spellings, because the DEFAULT is platform-dependent** (#496, #507).
     // Emitting only the positive one is sound while the default is false everywhere:
