@@ -28,30 +28,97 @@ function(fastcached_notarize artifact)
         return()
     endif()
 
-    message(STATUS "Notarizing ${artifact} (waits for Apple, typically 1-5 min)")
-    execute_process(
-        COMMAND xcrun notarytool submit "${artifact}"
-                --keychain-profile "${CPACK_FASTCACHED_NOTARY_PROFILE}"
-                --wait --output-format json
-        OUTPUT_VARIABLE _out
-        RESULT_VARIABLE _rc
-    )
+    # Bounded, and retried only on a STALL. An unbounded `--wait` does not avoid
+    # an ending, it hands the ending to the runner, which answers after thirty
+    # minutes with "The action 'Package' has timed out" and no statement of which
+    # operation did not finish (#376). That is the rule this file's own `hdiutil`
+    # block a few lines down already applied; the call sitting next to it did not
+    # get it.
+    #
+    # 600 s against a documented 1-5 minutes, two attempts: generous enough that a
+    # slow-but-working Apple is never cut off, and 20 minutes of worst case still
+    # leaves the 30-minute step budget room to report rather than be killed.
+    #
+    # **A stall is retried; a REJECTION is not.** Apple answering "Invalid" is a
+    # verdict, and retrying a verdict just spends the budget to be told the same
+    # thing. `_rc` separates them: non-zero means no answer arrived, zero means one
+    # did and `status` decides it.
+    #
+    # `xcrun` EXECs the tool rather than forking it -- measured on the runner,
+    # `macos-15`/Xcode 26.3.0, same pid for `xcrun` and its target -- so
+    # `execute_process`'s child IS `notarytool` and a TIMEOUT ends the real work
+    # rather than a wrapper. That mattered: `execute_process` waits for stdout EOF
+    # and not for the child to exit, so had `xcrun` forked and exited, a TIMEOUT
+    # would have left `notarytool` running and reported a SUCCESSFUL submission as
+    # a timeout. **That measurement is of this image**; if this job moves to
+    # another runner it is worth re-asking rather than assuming.
+    set(_notaryAttempts 2)
+    set(_notaryTimeout 600)
+    set(_rc "not attempted")
 
-    if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"status\":\"?Accepted")
+    foreach(_attempt RANGE 1 ${_notaryAttempts})
+        message(STATUS
+            "Notarizing ${artifact} (attempt ${_attempt}/${_notaryAttempts}, "
+            "waits for Apple, typically 1-5 min)")
+        execute_process(
+            COMMAND xcrun notarytool submit "${artifact}"
+                    --keychain-profile "${CPACK_FASTCACHED_NOTARY_PROFILE}"
+                    --wait --output-format json
+            TIMEOUT ${_notaryTimeout}
+            OUTPUT_VARIABLE _out
+            RESULT_VARIABLE _rc
+        )
+        if(_rc STREQUAL "0")
+            break()
+        endif()
+        message(WARNING
+            "notarytool submit for ${artifact} did not answer (${_rc}); retrying")
+    endforeach()
+
+    # No answer at all, across every attempt. Distinct from a refusal below, and
+    # named separately because the operator actions differ: this one is Apple or
+    # the network, that one is the artifact.
+    if(NOT _rc STREQUAL "0")
+        message(FATAL_ERROR
+            "notarytool submit for ${artifact} did not answer within "
+            "${_notaryTimeout}s across ${_notaryAttempts} attempt(s): ${_rc}")
+    endif()
+
+    if(NOT _out MATCHES "\"status\":\"?Accepted")
         # The submission id is the only way to find out *why* Apple refused;
         # without the log a rejection is undebuggable, so fetch it before
-        # failing.
+        # failing. Bounded too: a diagnostic that hangs costs the same half hour
+        # as the call it was diagnosing, and it must not be able to turn a clear
+        # rejection into a timeout.
         if(_out MATCHES "\"id\":\"([0-9a-fA-F-]+)\"")
             execute_process(
                 COMMAND xcrun notarytool log "${CMAKE_MATCH_1}"
                         --keychain-profile "${CPACK_FASTCACHED_NOTARY_PROFILE}"
+                TIMEOUT 120
+                RESULT_VARIABLE _logRc
             )
+            if(NOT _logRc STREQUAL "0")
+                message(WARNING
+                    "could not fetch the notarization log for ${artifact} (${_logRc}); "
+                    "the refusal below is reported without it")
+            endif()
         endif()
         message(FATAL_ERROR "Notarization of ${artifact} was not accepted: ${_out}")
     endif()
 
-    execute_process(COMMAND xcrun stapler staple "${artifact}" COMMAND_ERROR_IS_FATAL ANY)
-    execute_process(COMMAND xcrun stapler validate "${artifact}" COMMAND_ERROR_IS_FATAL ANY)
+    # Bounded for the same reason, and reported by name rather than through
+    # `COMMAND_ERROR_IS_FATAL ANY`: that spells a timeout and a refusal the same
+    # way, and stapling failures are read by whoever is holding a broken artifact.
+    foreach(_step IN ITEMS staple validate)
+        execute_process(
+            COMMAND xcrun stapler ${_step} "${artifact}"
+            TIMEOUT 300
+            RESULT_VARIABLE _stapleRc
+        )
+        if(NOT _stapleRc STREQUAL "0")
+            message(FATAL_ERROR "stapler ${_step} failed for ${artifact}: ${_stapleRc}")
+        endif()
+    endforeach()
 endfunction()
 
 # ----------------------------------------------------------------------------
@@ -126,11 +193,18 @@ foreach(_package IN LISTS CPACK_PACKAGE_FILES)
         # No --options=runtime here: a disk image holds no executable code of
         # its own, and the hardened runtime is a property of a running process.
         message(STATUS "Signing ${_dmg}")
+        # The fifth unbounded call. `codesign --timestamp` contacts Apple's
+        # timestamp authority, so it has the same stall shape as the notarization
+        # above and the same consequence if it never returns.
         execute_process(
             COMMAND codesign --force --timestamp
                     --sign "${CPACK_FASTCACHED_SIGN_IDENTITY_APP}" "${_dmg}"
-            COMMAND_ERROR_IS_FATAL ANY
+            TIMEOUT 300
+            RESULT_VARIABLE _signRc
         )
+        if(NOT _signRc STREQUAL "0")
+            message(FATAL_ERROR "codesign failed for ${_dmg}: ${_signRc}")
+        endif()
     endif()
 
     fastcached_notarize("${_dmg}")
