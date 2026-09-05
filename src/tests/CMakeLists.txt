@@ -1027,6 +1027,47 @@ set_tests_properties("node-config-reference" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The DAEMON's shipped reference configuration against its option table.
+#
+# The same question the check above asks about the worker, asked about the binary
+# most operators actually run -- which had no such check
+# (#759). Every word of that check's own
+# reasoning was true here too: `CliOptions()` drives the parse, the YAML is prose,
+# and a build in which they describe different products is a build in which
+# everything passes.
+#
+# Its first run against the shipped file found a real one: `listeners:` was
+# documented in TWO commented blocks, the second opening "This is also how to...",
+# which invites uncommenting it in ADDITION. That is a duplicate YAML mapping key,
+# which the parser resolves by silently keeping one -- and the endpoint most likely
+# to be lost is the TLS one, which is not a startup failure. The daemon comes up,
+# serves plaintext, and reports nothing (#769).
+#
+# One script serves both binaries, parameterised, because two checks differing only
+# in two paths is the copy-paste this project treats as a defect. The older
+# `check-node-config-reference.cmake` is deliberately NOT repointed here: that is a
+# change to a guard other work depends on, and absorbing it would close one ticket
+# by swallowing another. The follow-up is small precisely because this is
+# parameterised.
+#
+# Labelled `docs-subject` for the reason the worker's is: its SUBJECT is prose, and
+# prose drifts by being edited, so a change that touches no code must still run it.
+add_test(
+    NAME "daemon-config-reference"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_TABLE=src/FastCache/Config/CliParser.cpp"
+        "-DFASTCACHED_REFERENCE=packaging/linux/fastcached.yaml"
+        "-DFASTCACHED_LABEL=fastcached"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-config-reference.cmake"
+)
+set_tests_properties("daemon-config-reference" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # The operator port docs against `NodeSurfaceTable()`. Fails when a document
 # claims a surface the table does not declare, omits one it does, or states a
 # count of the port set that the table contradicts.
