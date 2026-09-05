@@ -2168,25 +2168,10 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     fleet.Serve();
 
     auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const sweptBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
 
-    Conversation client { port };
-    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
-    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
-
-    // The client walks away with the answer still running. That is the whole subject:
-    // a cancelled build, a Ctrl-C, a CI runner reclaimed mid-job.
-    client.CloseNow();
-    responder.Hold(false);
-
-    // **TWO waits, because they are two diagnoses**, and one `REQUIRE` over the
-    // counter alone could not tell them apart. This case failed once on a loaded
-    // macOS runner inside a merge group and dequeued an unrelated documentation pull
-    // request ([#691](https://github.com/LASTRADA-Software/fastcached/issues/691)),
-    // and all its CI output could say was `WaitFor(...)` expanding to `false` --
-    // which is consistent with the answer never finishing, with the watch never
-    // arming, and with the watch not having concluded by the time the loop read its
-    // flags. Those are three different repairs.
-    //
     // **The elapsed cost is recorded because it is what refutes the tempting fix.**
     // `WaitFor` is bounded by a CLOCK (`DrainWithin`, `WatchWait` = 15 s), not by an
     // iteration count, so a run that spends the whole ceiling did not run out of
@@ -2200,12 +2185,55 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
                            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start) };
     };
 
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // The client walks away with the answer still running. That is the whole subject:
+    // a cancelled build, a Ctrl-C, a CI runner reclaimed mid-job.
+    client.CloseNow();
+
+    // **Waited for BEFORE the answer is released, and that ordering is the fix to
+    // [#691](https://github.com/LASTRADA-Software/fastcached/issues/691).** The
+    // departure and the answer are two reactor events with no order between them, so
+    // releasing the responder first left the case asserting whichever won -- and on
+    // kqueue and on IOCP the answer sometimes did, at which point nothing was ever
+    // going to move the row below and the fifteen seconds were spent proving it.
+    // Twice on macOS (#691) and once on Windows
+    // ([#776](https://github.com/LASTRADA-Software/fastcached/issues/776)), each time
+    // dequeuing or reddening a pull request that could not reach this code. Waiting
+    // here removes the order-dependence rather than widening the bound, which is the
+    // remedy that ticket rules out at length: the watch has spoken before the answer
+    // is allowed to finish, so what follows is a fact about the connection's decision
+    // and not about which event the reactor got to first.
+    //
+    // It is also the diagnosis the fifteen-second silence could not give. This row
+    // rising says the watcher SAW the departure; `WorkerJobsAbandonedClientGone`
+    // below says the connection ACTED on it. A run that fails here is the watcher --
+    // an arm of `WatchPeer` that does not fire on this platform's spelling of a
+    // graceful close. A run that fails below is the connection.
+    auto const [seen, seenMs] = timedWait([&fleet, seenBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1;
+    });
+    INFO("watch saw the departure=" << seen << " after " << seenMs.count() << "ms");
+    REQUIRE(seen);
+
+    responder.Hold(false);
+
+    // **TWO further waits, because they are two diagnoses**, and one `REQUIRE` over
+    // the counter alone could not tell them apart: `WaitFor(...)` expanding to
+    // `false` is consistent with the answer never finishing and with the departure
+    // being seen and deliberately not filed. Those are different repairs.
+    //
     // The compile finishing is the cheaper fact and the one that must hold first: if
     // it does not, nothing below is about the peer watch at all.
     auto const [answered, answeredMs] = timedWait([&responder] { return responder.Answered() == 1; });
 
     // Waited for: the abandoned delivery to be recorded. A failure here IS the bug --
-    // the reply went into a dead socket and nothing anywhere said so.
+    // the reply went into a dead socket and nothing anywhere said so. With the
+    // departure already seen above, the only ways left to reach it are the two
+    // deliberate suppressions, which is why the sweep row is printed beside it: a
+    // connection this node swept is one `ClosedLocally` correctly withholds.
     auto const [recorded, recordedMs] = timedWait(
         [&fleet, before] { return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1; });
 
@@ -2213,7 +2241,13 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
                      << ", recorded=" << recorded << " after " << recordedMs.count() << "ms"
                      << "; responder entered=" << responder.Entered() << " answered=" << responder.Answered()
                      << "; abandoned-counter delta="
-                     << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - before));
+                     << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - before)
+                     << "; departure-counter delta="
+                     << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) - seenBefore)
+                     << "; departures-observed delta="
+                     << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) - observedBefore)
+                     << "; answer-deadline sweeps delta="
+                     << (fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) - sweptBefore));
 
     // **And the compile still completed.** Two facts, two rows, on purpose: the
     // compiler ran and this machine paid for it, and only the handover found nobody
@@ -2221,6 +2255,187 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     REQUIRE(answered);
     REQUIRE(recorded);
     CHECK(responder.Answered() == 1);
+
+    // The node's own teardown is not a client-side story: nothing this case does
+    // after the delivery was abandoned may move the row again.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+}
+
+/// Assert that a connection whose watcher has spoken filed no departure.
+///
+/// **The wait is the whole helper**, and it is why this is not two copies of three
+/// lines: asserting the rows are flat says nothing unless the watcher has CONCLUDED,
+/// and written out at each site that reasoning is a comment somebody has to reproduce.
+///
+/// **What it waits on is the watcher's own unguarded row, because the obvious
+/// observable is unsound on one of the two paths.** Waiting for the connection to be
+/// OVER carries the ordinary hang-up: the loop reaches `SettleWatch`, which will not
+/// let it end while the watch is still parked. It does NOT carry the swept one.
+/// `ExplainIfSwept` returns true and breaks BEFORE `SettleWatch` is ever reached, and
+/// its own `AwaitWatchQuiet` is BOUNDED by `RefusalTimeout` -- so whether it comes back
+/// with the watcher retrieved or still parked is decided by the same alignment of two
+/// equal 1250 ms windows that decides which guard suppresses the count below. When it
+/// comes back parked, the only thing left to retrieve that watcher is the
+/// `socket->Close()` after the loop: inline on epoll and kqueue, MARSHALLED TO A LATER
+/// TURN on IOCP. A case that waited for the connection instead would there assert two
+/// flat rows against a watcher that has not spoken and PASS -- a green result for a
+/// broken guard, which is #691's own shape reappearing inside the control written to
+/// close it.
+///
+/// Measured on this host, `AwaitWatchQuiet` does NOT come back parked: the deferral
+/// close retrieves the watcher inside it, 30 runs out of 30. That is an alignment and
+/// not a property, which is precisely why the control rests on neither outcome.
+///
+/// `FramePeerWatchDeparturesObserved` takes the platform out of the question rather
+/// than racing it. `RecordDeparture` increments it and then decides the filed row in
+/// the same statement sequence with nothing suspending between, so a run that has seen
+/// it move has a watcher that has already made both decisions -- on every reactor,
+/// including one nothing in this tree can execute. It is also a POSITIVE observation,
+/// so a watcher that never concludes fails this by name instead of passing quietly.
+///
+/// **All three of those claims were staged and watched fail**, on Linux/epoll, five
+/// runs each: deleting `ClosedLocally` fails the swept case and only it, deleting
+/// `PeerWatch::consulted` fails the hang-up case and only it, and deleting the
+/// unguarded increment fails BOTH at the `REQUIRE` below rather than passing -- 5/5,
+/// 5/5 and 5/5, the last of which cannot be satisfied at all, so its rate is a
+/// statement about the harness rather than about a race. That third one matters most
+/// here: a wait that cannot be made to fail is not a wait. The first two are one case
+/// each only because this helper stopped opening a connection of its own, which used
+/// to charge the swept case a hang-up it had not made.
+/// @param fleet The harness, for the counters.
+/// @param observedBefore The unguarded departure row before whatever the case did.
+///        Exactly one further departure is expected: both callers watch one connection
+///        and this helper opens none of its own. Asked as `== +1` rather than `>= +1`
+///        so a caller that grew a second watched connection fails here instead of
+///        satisfying the wait on the wrong watcher.
+/// @param seenBefore The filed departure row before whatever the case did.
+/// @param abandonedBefore The abandoned-delivery row before whatever the case did.
+void RequireNoDepartureFiled(Fleet& fleet,
+                             std::uint64_t observedBefore,
+                             std::uint64_t seenBefore,
+                             std::uint64_t abandonedBefore)
+{
+    // Waited for: this connection's watcher to have reached its verdict.
+    REQUIRE(WaitFor([&fleet, observedBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1;
+    }));
+
+    INFO("observed delta=" << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) - observedBefore)
+                           << "; departure delta="
+                           << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) - seenBefore)
+                           << "; abandoned delta="
+                           << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - abandonedBefore));
+
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == abandonedBefore);
+}
+
+TEST_CASE("A client that hangs up after reading its reply is not a mid-answer departure", "[node][frame][peerwatch]")
+{
+    // **The control the counter above is worth nothing without.** Every honest client
+    // of this surface hangs up: `Cc::RunOneExchange` opens a connection, sends, reads
+    // its reply and closes, and its watcher reaches `gone` exactly as a vanished
+    // client's does -- both arms of `WatchPeer` set one flag. So a departure row that
+    // did not discriminate would rise once per compile, at which point the case above
+    // passes for a counter that means nothing and #691 comes back wearing a green
+    // suite. What separates them is WHEN: here the connection has already asked the
+    // watch what it learned, and `PeerWatch::consulted` is what records that.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(false); // Answers straight away: this client is not vanishing.
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+    auto const abandonedBefore = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+
+    {
+        Conversation client { port };
+        REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+        CHECK_FALSE(client.ReadReply().empty());
+    } // Hangs up here, with its answer in hand.
+
+    INFO("responder entered=" << responder.Entered() << " answered=" << responder.Answered());
+    CHECK(responder.Answered() == 1);
+    RequireNoDepartureFiled(fleet, observedBefore, seenBefore, abandonedBefore);
+}
+
+TEST_CASE("A connection this node sweeps is not filed as a peer departure", "[node][frame][peerwatch]")
+{
+    // **`ConsultedAtExit`'s own case, and without it that guard is a guard nobody has
+    // watched refuse.** A swept connection never reaches `AbandonIfPeerGone` -- the
+    // deferred refusal breaks the loop before it -- so nothing on that path reads the
+    // watch, and the `socket->Close()` that follows reaches the parked watcher looking
+    // exactly like a peer hanging up. Counted, this node's own teardown would arrive
+    // in a row about clients vanishing, which is `TrackedConnection::closedLocally`'s
+    // whole subject one level down and would be reintroduced one row over.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+
+    // Shortened so the sweep costs a sweep interval rather than a lease timeout, the
+    // way the two-arm case above does it: the responder owns this number in
+    // production too, so this exercises the mechanism rather than a test seam.
+    responder.PlaceRequestTimeout(50ms);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+    auto const abandonedBefore = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    auto const sweptBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+
+    // Held open for the whole case: this client does NOT go away, which is what makes
+    // any departure counted here provably this node's own.
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // Waited for: the sweep to find this connection inside the responder. Its window
+    // has elapsed and the watch is armed and parked, which is the arrangement.
+    REQUIRE(WaitFor([&fleet, sweptBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == sweptBefore + 1;
+    }));
+
+    // Released, so `ExplainIfSwept` writes the deferred refusal and the loop breaks --
+    // past the guard's scope and into the close, which is the close whose effect on
+    // the watcher is this case's subject.
+    responder.Hold(false);
+
+    // **Which of the two guards suppresses the count here is measured, not pinned, and
+    // the difference matters.** `ExplanationGraceFor(50ms)` is `max(window,
+    // SweepInterval)` = 1250 ms and `RefusalTimeout` is `SweepInterval` = 1250 ms --
+    // the SAME number, with their clocks started at different instants and the
+    // deferral inspected only on the sweeper's tick. So whether `CloseExpiredDeferrals`
+    // closes the socket first (`ClosedLocally` suppresses, `consulted` still false) or
+    // `AwaitWatchQuiet` returns first (`ConsultedAtExit` runs and `consulted`
+    // suppresses) is an alignment of two equal numbers rather than a guarantee.
+    //
+    // Measured on Linux/epoll, by printing both flags at `RecordDeparture` over 30
+    // runs of this case: `consulted=0 closedLocally=1`, 30 out of 30 -- so on this
+    // host it is the local close, every time, and deleting `ClosedLocally` fails this
+    // case 10 runs out of 10 while leaving the hang-up case green. That is what makes
+    // this the `ClosedLocally` control rather than a case that happens to be green.
+    // What it is NOT is a claim about macOS or Windows: a platform landing the other
+    // way passes for the OTHER reason and this case cannot tell you it did, so pinning
+    // the guard everywhere wants the shutdown path, where `CloseAll` closes with the
+    // connection provably still inside the responder.
+    INFO("answer-deadline sweeps delta=" << (fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps)
+                                             - sweptBefore));
+    RequireNoDepartureFiled(fleet, observedBefore, seenBefore, abandonedBefore);
 }
 
 TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")

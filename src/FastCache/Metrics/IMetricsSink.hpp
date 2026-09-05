@@ -871,6 +871,53 @@ class IMetricsSink
         /// says a peer was TOLD, and a frame nobody received told nobody.
         FrameDeadlineRefusalsSent,
 
+        /// Peers the watch saw leave while the connection could still act on it.
+        ///
+        /// **The observation, where `WorkerJobsAbandonedClientGone` is the decision**,
+        /// and they are two rows because the gap between them is the only thing that
+        /// separates three outcomes that used to be one silence: a peer that went and
+        /// was noticed, a peer that went and was not, and a peer whose departure was
+        /// noticed and deliberately not filed. This row rises on the second and third
+        /// alike; that one rises on the third alone. So `departures - abandoned` is
+        /// what was suppressed on purpose -- an empty reply, or a socket this node
+        /// closed itself -- and a client that vanished unnoticed is this row staying
+        /// flat while the object went out anyway
+        /// ([#691](https://github.com/LASTRADA-Software/fastcached/issues/691)).
+        ///
+        /// **Not once per exchange**, which is what would bury it. Every ordinary
+        /// client hangs up too -- `Cc::RunOneExchange` reads its reply and closes --
+        /// and its watcher reaches "gone" just the same; by then the connection has
+        /// already asked the watch what it learned, and a departure after that is not
+        /// counted here. What is left is the mid-answer case this surface exists to
+        /// notice: a cancelled build, a `Ctrl-C`, a CI runner reclaimed with the
+        /// compile still running.
+        ///
+        /// It is never below the row it is read against, by construction: the mark
+        /// that stops this counting is set AFTER the flags are read.
+        FramePeerWatchDepartures,
+
+        /// Every peer departure the watch reached, before either suppression.
+        ///
+        /// **The denominator the row above cannot supply for itself.**
+        /// `FramePeerWatchDepartures` staying flat is the ordinary healthy reading AND
+        /// what a watch that never armed, never concluded or never fired its arms looks
+        /// like, and no amount of staring at one row separates them -- which is this
+        /// tree's rule that a count of BAD things needs a separate assertion that the
+        /// good things exist. This row is that assertion: it rises once per watched
+        /// exchange whose peer went away, which on a healthy surface is once per
+        /// compile, so an operator reading zero here knows the mechanism is not running
+        /// rather than that nobody left.
+        ///
+        /// `observed - departures` is what the two guards suppressed: an ordinary
+        /// hang-up the connection had already read the watch for, or a socket this node
+        /// closed itself. It is therefore never below `FramePeerWatchDepartures`, by
+        /// construction rather than by convention -- the same statement increments this
+        /// and then decides that one.
+        ///
+        /// It does NOT count a watch that concluded because the peer sent BYTES: that
+        /// is a pipelined request, not a departure, and it reaches neither row.
+        FramePeerWatchDeparturesObserved,
+
         Last,
     };
 
