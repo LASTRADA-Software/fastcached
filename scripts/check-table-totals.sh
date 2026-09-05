@@ -93,9 +93,14 @@ set -uo pipefail
 # Number words this check can read, in prose and in a multiplier. Digits are read
 # too. A figure spelled in a word this table lacks is a REFUSAL rather than a
 # skipped assertion -- an unreadable number and a correct one must not look alike.
-NumberWords="one=1 two=2 three=3 four=4 five=5 six=6 seven=7 eight=8 nine=9 ten=10
-eleven=11 twelve=12 thirteen=13 fourteen=14 fifteen=15 sixteen=16 seventeen=17
-eighteen=18 nineteen=19 twenty=20"
+# Built by append rather than as one multi-line literal: macOS ships BWK awk, which
+# REFUSES a newline inside a `-v` assignment ("awk: newline in string ... at source
+# line 1") where gawk accepts it. This check is in the DEFAULT ctest set, so it runs
+# on that awk, and the literal form failed every file on macOS while passing on
+# Linux -- including all five of its own self-test cases.
+NumberWords="one=1 two=2 three=3 four=4 five=5 six=6 seven=7 eight=8 nine=9 ten=10 "
+NumberWords+="eleven=11 twelve=12 thirteen=13 fourteen=14 fifteen=15 sixteen=16 "
+NumberWords+="seventeen=17 eighteen=18 nineteen=19 twenty=20"
 
 # How many words may sit between a stated figure and the noun the marker names.
 # 3, because "the six remaining file(STRINGS) readers" is two, and a marker forced
