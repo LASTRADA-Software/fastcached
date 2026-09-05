@@ -968,10 +968,32 @@ _selftest_listener() {
 # @param 1 port
 # @param 2 `answer` to speak first and close, `hold` to accept and do neither
 # @param 3 the log to write failures to
+#
+# ## Two lifetime bounds, and neither closes the other's hole
+#
+# **`exec`, because `$!` for a backgrounded shell FUNCTION is the subshell bash
+# forks, not the program that subshell goes on to run.** Every `kill "$listener"` in
+# this file therefore reaped a wrapper and left `perl` alive, reparented, still
+# holding its LISTEN socket. Measured: `$! comm=bash` with a `perl` child, and the
+# port still held after the kill. `exec` replaces the subshell, so the pid the caller
+# holds IS the perl. Safe ONLY because these helpers are always invoked with `&` --
+# in the foreground `exec` would replace the calling shell and end the run.
+#
+# **`alarm`, because no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
+# CI job**, which are the paths a leak actually accumulates on. A bound on TIME and
+# deliberately not on connection count: `port_answers` is `/dev/tcp`, so every
+# `free_port` draw and every `wait_for_port` poll costs this listener an `accept()`,
+# and a count bound would kill it before the request under test ever arrived.
+#
+# **They are independent, and a survivor COUNT cannot tell you whether either works**
+# -- each alone drives it to zero, for a different reason, so a count reads as "both
+# arms fine" while one is dead. Ask the process TREE. (#839)
 _selftest_unprompted_listener() {
-    perl -e '
+    exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
+        # Outlives any case here; dies without one whatever killed the run.
+        alarm 30;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
