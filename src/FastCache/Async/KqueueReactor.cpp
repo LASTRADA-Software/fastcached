@@ -282,8 +282,9 @@ void KqueueReactor::DrainPendingSubmits()
     }
 }
 
-void KqueueReactor::Run()
+void KqueueReactor::RunLoop()
 {
+
     constexpr int Batch = 32;
     struct kevent events[Batch];
 

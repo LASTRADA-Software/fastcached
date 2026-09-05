@@ -225,8 +225,9 @@ void EpollReactor::DrainPendingSubmits()
     }
 }
 
-void EpollReactor::Run()
+void EpollReactor::RunLoop()
 {
+
     constexpr int Batch = 32;
     epoll_event events[Batch];
 

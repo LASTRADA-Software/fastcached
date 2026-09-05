@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <atomic>
@@ -30,7 +31,6 @@ class TestReactor: public IReactor
     /// @param clock Backing clock. Owned by the caller — typically a ManualClock.
     explicit TestReactor(IClock& clock) noexcept;
 
-    void Run() override;
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
@@ -85,6 +85,11 @@ class TestReactor: public IReactor
     mutable std::mutex _mutex;
 
     std::atomic<bool> _stopped { false };
+
+  protected:
+    void RunLoop() override;
+
+  private:
     std::uint64_t _nextSequence { 0 };
     std::deque<std::coroutine_handle<>> _ready;
     std::vector<ScheduledEntry> _timers; ///< Min-heap by (deadline, sequence).

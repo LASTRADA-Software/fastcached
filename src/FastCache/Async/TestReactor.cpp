@@ -27,8 +27,9 @@ TestReactor::TestReactor(IClock& clock) noexcept:
 {
 }
 
-void TestReactor::Run()
+void TestReactor::RunLoop()
 {
+
     while (!_stopped.load(std::memory_order_acquire))
     {
         if (Tick() == 0)

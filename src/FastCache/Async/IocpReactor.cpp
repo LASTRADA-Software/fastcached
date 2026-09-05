@@ -140,33 +140,18 @@ void IocpReactor::FireExpiredTimers()
             handle.resume();
 }
 
-void IocpReactor::Run()
+void IocpReactor::RunLoop()
 {
     // Publish which thread is dequeuing, so `IsOnWorkerThread()` can answer.
     // `IocpSocket` and `IocpListener` clear a pending awaitable in their
     // destructors and that is only safe against this thread; both assert on it.
-    // Cleared on the way out by the guard below, including on the early return
-    // in the error branch -- a stale id outliving `Run()` would make a
-    // destructor on any thread look correct.
-    struct WorkerScope
-    {
-        IocpReactor* reactor;
-        explicit WorkerScope(IocpReactor* r) noexcept:
-            reactor { r }
-        {
-            reactor->_workerThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
-            reactor->_running.store(true, std::memory_order_release);
-        }
-        WorkerScope(WorkerScope const&) = delete;
-        WorkerScope(WorkerScope&&) = delete;
-        WorkerScope& operator=(WorkerScope const&) = delete;
-        WorkerScope& operator=(WorkerScope&&) = delete;
-        ~WorkerScope()
-        {
-            reactor->_running.store(false, std::memory_order_release);
-        }
-    };
-    WorkerScope const workerScope { this };
+    // Cleared on the way out by the guard, including on the early return in the
+    // error branch -- a stale id outliving `Run()` would make a destructor on any
+    // thread look correct.
+    //
+    // The guard used to be a `WorkerScope` local to this function, which is the
+    // reason the question was IOCP-only: three other reactors could not be asked it
+    // at all. `ReactorWorkerIdentity` is that same pair with a name (#668).
 
     constexpr ULONG Batch = 32;
     OVERLAPPED_ENTRY entries[Batch];
