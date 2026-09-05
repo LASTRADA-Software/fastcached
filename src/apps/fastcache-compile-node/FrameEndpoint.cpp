@@ -754,6 +754,26 @@ namespace
         /// True when the peer is gone: EOF, a reset, or a socket error.
         bool gone { false };
 
+        /// True once the connection has asked this watch what it learned.
+        ///
+        /// **What separates a departure the connection could act on from one it could
+        /// not**, and `FramePeerWatchDepartures` is the only thing that reads it.
+        /// Every honest client hangs up as well -- `Cc::RunOneExchange` reads its
+        /// reply and closes -- so a counter without this discriminator would rise once
+        /// per watched exchange and bury the mid-answer case it exists to show.
+        ///
+        /// It is set AFTER the flags are read and never before: set first, a watcher
+        /// concluding inside `AbandonIfPeerGone`'s one yield would be acted on and not
+        /// counted, and the two rows would disagree in the one direction the counter's
+        /// documentation promises they cannot.
+        ///
+        /// **One of two questions, not the whole of it.** This bit can only say what
+        /// the CONNECTION did; a sweep closing the socket while that connection is
+        /// still parked inside the responder leaves it false, and `RecordDeparture`
+        /// asks `ClosedLocally` for exactly that case. Deleting either question fails
+        /// a different case on purpose.
+        bool consulted { false };
+
         /// Bytes the watcher took off the socket proving the peer is still there.
         ///
         /// A pipelined request, in whole or in part. They are handed back rather than
@@ -773,6 +793,54 @@ namespace
         /// `bugprone-unchecked-optional-access` objects to and it is right to.
         IMetricsSink::Counter counter {};
     };
+
+    /// Mark a watch as having reached "gone", and count it when it still means
+    /// something.
+    ///
+    /// One function rather than the same two statements at each of `WatchPeer`'s two
+    /// arms, because those arms are exactly what nobody may forget: they set one flag,
+    /// so a green suite proves nothing about which of them is live, and an arm that
+    /// set the flag without the count would be invisible to the very row that exists
+    /// to show it ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)).
+    ///
+    /// **TWO questions guard the count, and neither covers the other.** They exclude
+    /// two different things that both reach a parked watcher looking exactly like a
+    /// client hanging up:
+    ///
+    /// - `PeerWatch::consulted` excludes the ORDINARY hang-up. Every honest client
+    ///   closes once it has its reply, and by then the connection has read the watch,
+    ///   so an unconditional count would rise once per watched exchange.
+    /// - `ClosedLocally` excludes THIS NODE's teardowns -- a sweep past the
+    ///   explanation grace, a shutdown -- which arrive while the connection is still
+    ///   inside the responder and has consulted nothing, so the flag above is false
+    ///   and says nothing about them. It is the same question `AbandonIfPeerGone` asks
+    ///   before it files an abandoned delivery, for the same reason and one row over:
+    ///   an orderly stop must not read as a fleet losing its users.
+    ///
+    /// Asked in that order because the first is a plain bool and the second takes the
+    /// state's mutex, so the ordinary exchange -- which is nearly all of them -- pays
+    /// nothing.
+    ///
+    /// **The unguarded row is counted first, and it is not bookkeeping.** A filed
+    /// departure is a count of BAD things, and a count of bad things staying at zero
+    /// is the healthy reading AND what a watch that never armed or never concluded
+    /// looks like; `FramePeerWatchDeparturesObserved` is the separate assertion that
+    /// the good thing happened, which is what makes the flat row mean something to an
+    /// operator and to a test. Incremented in the SAME statement sequence as the
+    /// decision, with nothing suspending between, so a reader that has seen this row
+    /// move knows the row below has already been decided for that watch -- which is
+    /// the only observation a case can make that does not depend on when a given
+    /// reactor retrieves a parked watcher.
+    /// @param state The server state: the counters, and whether this node closed it.
+    /// @param socket The connection, to ask that second question about.
+    /// @param watch The watch reaching its verdict.
+    void RecordDeparture(FrameServer::State& state, ISocket const* socket, PeerWatch& watch)
+    {
+        watch.gone = true;
+        state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+        if (!watch.consulted && !state.ClosedLocally(socket))
+            state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDepartures);
+    }
 
     /// How much a watcher takes when the socket turns out to have data on it.
     ///
@@ -801,12 +869,28 @@ namespace
     /// object every time a client pipelined a request, which is a worse bug than the
     /// one this closes.
     ///
+    /// @param state The server state, shared for the same LIFETIME reason the socket
+    ///        is: this watcher can still be parked when the connection's frame has
+    ///        gone, and it reaches a counter and the local-close question through
+    ///        this.
+    ///
+    ///        **What that pointer does and does not buy, stated because the
+    ///        comfortable version is wrong.** It keeps the STRUCT alive; it does not
+    ///        keep `metrics`, `logger`, `io` or `listener` alive, which are
+    ///        references to objects `State` does not own. Those outlive it by their
+    ///        owners' construction order -- the sink and the loop are `main`'s and
+    ///        the endpoint's, both declared before the surface -- and not by anything
+    ///        this parameter enforces. So this is protection against the connection
+    ///        frame unwinding, which is the case that happens, and not a general
+    ///        lifetime guarantee.
     /// @param socket The connection, shared so a parked wait cancelled by `Close()`
     ///        cannot resume onto a destroyed socket -- the second use-after-free
     ///        `RedisResp`'s readable watcher records, in a tree where `Close()`
     ///        resumes inline on epoll and marshals on IOCP.
     /// @param watch Where the answer is left; shared with the connection.
-    DetachedTask WatchPeer(std::shared_ptr<ISocket> socket, std::shared_ptr<PeerWatch> watch)
+    DetachedTask WatchPeer(std::shared_ptr<FrameServer::State> state,
+                           std::shared_ptr<ISocket> socket,
+                           std::shared_ptr<PeerWatch> watch)
     {
         auto const readable = co_await socket->WaitReadable();
         if (!readable.has_value())
@@ -815,7 +899,7 @@ namespace
             // the connection issues to retrieve this very frame. Either way there is
             // nobody to answer, and a connection tearing itself down does not care
             // which of the two it was.
-            watch->gone = true;
+            RecordDeparture(*state, socket.get(), *watch);
             watch->finished = true;
             co_return;
         }
@@ -823,7 +907,7 @@ namespace
         std::array<std::byte, PeerWatchProbeBytes> probe {};
         auto const got = co_await socket->Read(std::span<std::byte> { probe });
         if (!got.has_value() || *got == 0)
-            watch->gone = true;
+            RecordDeparture(*state, socket.get(), *watch);
         else
             watch->pulled.assign(probe.begin(), probe.begin() + static_cast<std::ptrdiff_t>(*got));
         watch->finished = true;
@@ -909,24 +993,79 @@ namespace
     ///
     /// The optional is consulted HERE and nowhere else; what travels on is a plain
     /// counter on the watch, so the loop holds no optional it could mis-handle.
-    /// @param responder The surface, which decides whether this verb is watched.
+    /// @param state The server state: the surface that decides, and the sink the
+    ///        watcher records through. By reference, and copied only on the arming
+    ///        path, because this runs for EVERY verb while the two surfaces that watch
+    ///        nothing -- the scheduler and the cache tier -- are the high-frequency
+    ///        ones; an owning parameter charged both of them a control-block
+    ///        increment for a pointer this function returns without having used.
     /// @param opRaw The verb, as received.
     /// @param reader The connection's reader; a non-empty buffer declines the watch.
     /// @param socket The connection, shared with the watcher for its lifetime.
     /// @return The watch, or null when this request is not watched.
-    [[nodiscard]] std::shared_ptr<PeerWatch> ArmPeerWatch(IFrameResponder const& responder,
+    [[nodiscard]] std::shared_ptr<PeerWatch> ArmPeerWatch(std::shared_ptr<FrameServer::State> const& state,
                                                           std::uint8_t opRaw,
                                                           ByteReader const& reader,
                                                           std::shared_ptr<ISocket> socket)
     {
-        auto const counter = responder.PeerWatchCounter(opRaw);
+        auto const counter = state->responder.PeerWatchCounter(opRaw);
         if (!counter.has_value() || !reader.Buffered().empty())
             return nullptr;
 
         auto watch = std::make_shared<PeerWatch>(PeerWatch { .counter = *counter });
-        WatchPeer(std::move(socket), watch);
+        WatchPeer(state, std::move(socket), watch);
         return watch;
     }
+
+    /// Marks a peer watch consulted when the request that armed it ends, however it
+    /// ends.
+    ///
+    /// RAII for the reason `OpenConnectionSlot` above is RAII, and it is the same
+    /// failure: a request ends several ways -- a pulse that will not let go, a
+    /// deferred refusal, an abandoned delivery, a write that fails, a throw -- and the
+    /// exit that gets forgotten leaves the watch looking actionable after the
+    /// connection has stopped being able to act, so the `socket->Close()` that follows
+    /// arrives at the watcher as a departure.
+    ///
+    /// **It covers only the closes the CONNECTION performs**, which is what its scope
+    /// can express, and that is why `RecordDeparture` asks `ClosedLocally` as well
+    /// rather than instead. A sweep past the explanation grace closes the socket while
+    /// this scope is still open -- the connection is parked inside the responder and
+    /// has ended nothing -- so this guard is structurally unable to see it. Measured,
+    /// not reasoned: the swept case counted a departure until that second question was
+    /// added.
+    ///
+    /// It is a backstop and not the mechanism: `AbandonIfPeerGone` marks the watch
+    /// itself, immediately after reading the flags, because only there is the ORDER
+    /// right. See `PeerWatch::consulted`.
+    class ConsultedAtExit
+    {
+      public:
+        /// @param watch The watch to mark; null is the ordinary unwatched request.
+        ///        NOT owning, exactly as `OpenConnectionSlot` above is not: this is
+        ///        declared after the watch in the same block, so reverse destruction
+        ///        order already keeps the pointee alive across `~ConsultedAtExit` on
+        ///        every exit -- fallthrough, `break` and a throw alike -- and an owning
+        ///        copy would buy that same guarantee a second time, at an atomic apiece.
+        explicit ConsultedAtExit(PeerWatch* watch) noexcept:
+            _watch { watch }
+        {
+        }
+
+        ~ConsultedAtExit()
+        {
+            if (_watch != nullptr)
+                _watch->consulted = true;
+        }
+
+        ConsultedAtExit(ConsultedAtExit const&) = delete;
+        ConsultedAtExit(ConsultedAtExit&&) = delete;
+        ConsultedAtExit& operator=(ConsultedAtExit const&) = delete;
+        ConsultedAtExit& operator=(ConsultedAtExit&&) = delete;
+
+      private:
+        PeerWatch* _watch;
+    };
 
     /// Whether the peer has already gone, asked before the reply is written -- and if
     /// so, record it.
@@ -944,6 +1083,11 @@ namespace
     /// **It records the abandonment as well as reporting it**, and that is deliberate:
     /// the decision and the counter are one fact, and split across a helper and its call
     /// site they were a nested condition in the loop that owns neither.
+    /// **It writes exactly one flag on the watch**, and that is not a widening of its
+    /// job: `PeerWatch::consulted` records that this question was ASKED, which only
+    /// this function can say, and it has to be said in the same statement sequence as
+    /// the read or the ordering `FramePeerWatchDepartures` rests on becomes a rule
+    /// somebody has to remember. It still touches no write side of the socket.
     /// @param state The server state, for the counter and the local-close question.
     /// @param socket The connection, to ask whether THIS node closed it.
     /// @param watch The watch, shared so it cannot die under the yield; may be null.
@@ -951,7 +1095,7 @@ namespace
     /// @return True when the peer went before the answer was ready.
     Task<bool> AbandonIfPeerGone(FrameServer::State* state,
                                  ISocket const* socket,
-                                 std::shared_ptr<PeerWatch const> watch,
+                                 std::shared_ptr<PeerWatch> watch,
                                  bool hadReply)
     {
         // **Both arms end the connection without writing, which is why they are one
@@ -979,7 +1123,15 @@ namespace
         // arrive.
         if (!watch->finished)
             co_await ResumeOn { *reactor };
-        if (!watch->gone)
+
+        // **Read, then marked, and the order is the whole of it.** A watcher that
+        // concluded inside the yield above is acted on here AND counted by
+        // `RecordDeparture`, because the mark is still unset while it runs; marked
+        // first, that departure would be acted on and not counted, which is the one
+        // direction `FramePeerWatchDepartures` promises cannot happen.
+        auto const gone = watch->gone;
+        watch->consulted = true;
+        if (!gone)
             co_return false;
 
         // Counted only when there was something to deliver AND when a CLIENT is what
@@ -1577,7 +1729,14 @@ namespace
                 // Null when this surface does not watch this verb, or when the reader
                 // already holds a pipelined request -- see `ArmPeerWatch`, which carries
                 // the ordering argument. Every helper below takes that null.
-                auto watch = ArmPeerWatch(state->responder, decoded->opRaw, reader, socket);
+                auto watch = ArmPeerWatch(shared, decoded->opRaw, reader, socket);
+
+                // Closes the window in which this watch's verdict can still change what
+                // this connection does -- see `ConsultedAtExit`, which carries why the
+                // exits are what nobody may forget. Scoped to the request, not the
+                // connection: the socket is closed after the loop, so the departure that
+                // close provokes lands after this mark and is this node's own.
+                ConsultedAtExit const consulted { watch.get() };
 
                 // The write-side mirror of the watch above: while the responder answers,
                 // this connection writes nothing, so the pulse is the only writer and

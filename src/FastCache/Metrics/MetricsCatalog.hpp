@@ -608,6 +608,26 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "the socket is ended by the close and the close is the write side gone. "
               "The gap between the two is how many swept peers were left to infer it.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FramePeerWatchDepartures,
+      .prometheusName = "fastcache_frame_peer_watch_departures_total",
+      .help = "Peers the watch saw leave while the connection could still act on it: "
+              "the observation, where jobs_abandoned_client_gone is the decision. "
+              "Subtract the second from the first for what was suppressed on purpose "
+              "-- an empty reply, or a socket this node closed itself. A client that "
+              "vanished and was NOT noticed is this row flat while the object was "
+              "written anyway. It does not rise for a client that hangs up after "
+              "reading its reply, which is every honest one.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FramePeerWatchDeparturesObserved,
+      .prometheusName = "fastcache_frame_peer_watch_departures_observed_total",
+      .help = "Every peer departure the watch reached, before either suppression: the "
+              "denominator peer_watch_departures cannot supply for itself. That row "
+              "flat is both the healthy reading and a watch that never ran; this one "
+              "rising says the mechanism is live. Subtract to get what was suppressed "
+              "on purpose -- an ordinary hang-up, or a socket this node closed. Never "
+              "below peer_watch_departures. A watch that ended because the peer sent "
+              "BYTES is a pipelined request and is in neither row.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents
