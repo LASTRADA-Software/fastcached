@@ -147,6 +147,28 @@ DocSubjectRunner="scripts/doc-subject-checks.sh"
 # Rule E's subject and the two clauses its `save:` must name. Named once, so the
 # self-test cannot drift from the rule by restating either.
 CcacheAction="hendrikmuhs/ccache-action"
+
+# The field separator every awk emitter below writes and every reader splits on.
+#
+# NOT a tab, and that is #791. Tab is IFS *whitespace*, so `IFS=$'\t' read` treats
+# runs of it as one delimiter and drops leading and trailing ones -- which means an
+# empty field in the MIDDLE of a row collapses and shifts every field after it.
+# Rule C read four fields with two that can legitimately be empty, and when the
+# first was, it read the second's value into the first's variable and reported the
+# wrong half of a real defect. `\x1f` (ASCII unit separator) is not IFS whitespace,
+# so an empty field at any position survives. Checked, not reasoned:
+#
+#   printf 'k\tn\t\ts\n' | { IFS=$'\t'  read -r a b c d; }  ->  c=[s] d=[]
+#   printf 'k\x1fn\x1f\x1fs\n' | { IFS=$'\x1f' read -r a b c d; }  ->  c=[]  d=[s]
+#
+# Applied to all four emitters rather than only the one that was broken. Rules B,
+# D and E were audited and are safe, each for a DIFFERENT reason -- B because its
+# emitter substitutes `<no job-level if:>` for an empty condition so no field can
+# be empty at all, D and E because they have two fields and the only one that can
+# be empty is last. None of those three reasons survives a fifth rule being added,
+# and two of them are accidents: B's placeholder was chosen to make a MESSAGE read
+# well, not to dodge this. So the separator is the fix rather than rule C's read.
+FieldSep=$'\x1f'
 CcacheSavePush="github.event_name == 'push'"
 CcacheSaveBranch="github.ref_type == 'branch'"
 
@@ -186,10 +208,10 @@ fi
 # and rule A buys nothing. For a matrix job it is worse than a wrong-green: a
 # skipped matrix job never expands, so its per-leg contexts never exist at all
 # and the pull request cannot merge.
-guarded="$(awk '
+guarded="$(awk -v sep="$FieldSep" '
     function flush() {
         if (jobKey != "" && usesCode && index(jobIf, "!cancelled()") == 0)
-            print "MISSING\t" jobKey "\t" (jobIf == "" ? "<no job-level if:>" : jobIf)
+            print "MISSING" sep jobKey sep (jobIf == "" ? "<no job-level if:>" : jobIf)
         jobKey = ""; jobIf = ""; usesCode = 0
     }
     /^jobs:[ \t]*$/             { inJobs = 1; next }
@@ -207,7 +229,7 @@ guarded="$(awk '
 ' "$workflow")"
 
 if [[ -n "$guarded" ]]; then
-    while IFS=$'\t' read -r _ jobKey jobIf; do
+    while IFS="$FieldSep" read -r _ jobKey jobIf; do
         Fail "job '$jobKey' consults the scope classifier but its job-level condition does not contain \`!cancelled()\`, so a FAILED \`changes\` skips it outright -- if: $jobIf"
     done <<< "$guarded"
 else
@@ -225,10 +247,10 @@ fi
 # The whole step block is read -- its own `if:`, and the job-level `if:` above it
 # -- because either can carry the condition and only one of the two is where a
 # reader would look.
-docSubject="$(awk -v runner="$DocSubjectRunner" '
+docSubject="$(awk -v runner="$DocSubjectRunner" -v sep="$FieldSep" '
     function flushStep() {
         if (inStep && stepUsesRunner)
-            print jobKey "\t" jobName "\t" jobIf "\t" stepIf
+            print jobKey sep jobName sep jobIf sep stepIf
         inStep = 0; stepIf = ""; stepUsesRunner = 0
     }
     function flushJob() { flushStep(); jobKey = ""; jobName = ""; jobIf = "" }
@@ -278,7 +300,7 @@ else
         Fail "read 0 required contexts out of $requiredFile; with an empty list every job looks unrequired and rule C would vouch for a doc check nothing gates on"
     fi
 
-    while IFS=$'\t' read -r jobKey jobName jobIf stepIf; do
+    while IFS="$FieldSep" read -r jobKey jobName jobIf stepIf; do
         [[ -n "$jobKey" ]] || continue
         if [[ "$stepIf" == *needs.changes.outputs.code* ]]; then
             Fail "the \`$DocSubjectRunner\` step in job '$jobKey' is gated on the scope classifier -- if: $stepIf. A docs-only change answers code=false, so the checks whose subject is documentation would be skipped on exactly the change they exist to catch (#687)."
@@ -319,8 +341,8 @@ releaseNeeds="$(awk '
 if [[ -z "$releaseNeeds" ]]; then
     Fail "read 0 jobs out of \`release.needs\` in $workflow; with an empty gating set every event-keyed condition looks unregulated and rule D would vouch for all of them."
 else
-    # Every job's own `if:`, one `key<TAB>condition` row per job that has one.
-    jobConditions="$(awk '
+    # Every job's own `if:`, one `key<SEP>condition` row per job that has one.
+    jobConditions="$(awk -v sep="$FieldSep" '
         /^jobs:[ \t]*$/             { inJobs = 1; next }
         inJobs && /^[^ \t]/         { inJobs = 0 }
         !inJobs                     { next }
@@ -329,11 +351,11 @@ else
                                       sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
                                       next }
         /^    if:/                  { cond = $0; sub(/^    if:[ \t]*/, "", cond)
-                                      print jobKey "\t" cond }
+                                      print jobKey sep cond }
     ' "$workflow")"
 
     trimmed=0
-    while IFS=$'\t' read -r jobKey cond; do
+    while IFS="$FieldSep" read -r jobKey cond; do
         [[ -n "$jobKey" ]] || continue
         # Only jobs that gate the release, and only conditions keyed on the event.
         printf '%s\n' "$releaseNeeds" | grep -Fxq -- "$jobKey" || continue
@@ -357,7 +379,7 @@ fi
 # ---------------------------------------------------------------------------
 # Rule E: every `ccache-action` step saves on a branch push and nowhere else.
 #
-# One `jobKey<TAB>saveExpr` row per step that uses the action, with an empty
+# One `jobKey<SEP>saveExpr` row per step that uses the action, with an empty
 # expression where the input is absent -- so "carries no `save:`" and "carries a
 # `save:` this rule cannot vouch for" are distinguishable and neither is silent.
 #
@@ -365,9 +387,9 @@ fi
 # canonical explanation of this very clause is a comment block naming the action,
 # and rule C already shipped the bug where a comment satisfied the rule the step
 # was supposed to.
-ccacheSteps="$(awk -v action="$CcacheAction" '
+ccacheSteps="$(awk -v action="$CcacheAction" -v sep="$FieldSep" '
     function flushStep() {
-        if (inStep && stepUsesAction) print jobKey "\t" saveExpr
+        if (inStep && stepUsesAction) print jobKey sep saveExpr
         inStep = 0; saveExpr = ""; stepUsesAction = 0
     }
     function flushJob() { flushStep(); jobKey = "" }
@@ -388,7 +410,7 @@ ccacheSteps="$(awk -v action="$CcacheAction" '
 
 ccacheTotal=0
 ccacheProblemsBefore=$problems
-while IFS=$'\t' read -r jobKey saveExpr; do
+while IFS="$FieldSep" read -r jobKey saveExpr; do
     [[ -n "$jobKey" ]] || continue
     ccacheTotal=$((ccacheTotal + 1))
     if [[ -z "$saveExpr" ]]; then
@@ -437,7 +459,11 @@ REQ
     # Knobs, one per case, applied to a correct workflow by GENERATING it.
     #   $1 = output file
     #   $2 = classifier comparison for the linux job: safe | equality | odd
-    #   $3 = whether the linux job carries !cancelled(): yes | no
+    #   $3 = whether the linux job carries !cancelled(): yes | no | none
+    #        `none` emits no job-level `if:` at all, which is what makes the
+    #        empty-middle-field case (#791) reachable: rule C's row is then
+    #        `key<SEP>name<SEP><SEP>stepIf` and a collapsing split reads the
+    #        step's condition into the job's variable.
     #   $4 = the doc-subject step: ungated | gated | absent
     #   $5 = the name of the job carrying it: required | unrequired
     #   $6 = the `coverage` job's push trim: none | canonical | tagless
@@ -461,7 +487,7 @@ REQ
             echo "jobs:"
             echo "  style:"
             echo "    name: \"${docName}\""
-            echo "    if: ${jobIf}"
+            [[ "$cancelled" == "none" ]] || echo "    if: ${jobIf}"
             echo "    steps:"
             echo "      - uses: actions/checkout@v4"
             # A comment naming the runner, always. Rule C must be satisfied by
@@ -537,6 +563,34 @@ REQ
         fi
     }
 
+    # A refusal that names the WRONG half still exits non-zero, so `Case` cannot
+    # see #791 at all: both the defect and the fix are `want-fail`. This asserts
+    # the SENTENCE -- one substring that must appear and one that must not.
+    CaseSaying() {
+        local what="$1" mustSay="$2" mustNotSay="$3" file="${scratch}/wf.yml" out got=0
+        cases=$((cases + 1))
+        if diff -q "$correct" "$file" >/dev/null 2>&1; then
+            echo "  FAIL  '$what' generated a workflow identical to the correct one; the case stages nothing" >&2
+            status=1
+            return
+        fi
+        out="$(FASTCACHED_REQUIRED_CONTEXTS_FILE="$requiredFile" bash "$0" --workflow "$file" 2>&1)" || got=$?
+        if [[ "$got" -eq 0 ]]; then
+            echo "  FAIL  (want-fail, exit 0) $what" >&2
+            status=1
+        elif [[ "$out" != *"$mustSay"* ]]; then
+            echo "  FAIL  $what -- the refusal never says '$mustSay'" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            status=1
+        elif [[ -n "$mustNotSay" && "$out" == *"$mustNotSay"* ]]; then
+            echo "  FAIL  $what -- the refusal names the WRONG half, saying '$mustNotSay'" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            status=1
+        else
+            echo "  ok    (want-fail, correctly attributed) $what"
+        fi
+    }
+
     # The baseline. Every negative case below is evidence only if this passes --
     # and it is not decoration: it is what caught the whole self-test running
     # nothing at all. See the note on `bash "$0"` above.
@@ -575,6 +629,17 @@ REQ
 
     Generate "${scratch}/wf.yml" safe yes ungated unrequired
     Case "rule C: the doc-subject step in a job that is not a required context (#684)" want-fail
+
+    # #791. The job carries NO `if:` and the step carries one, so rule C's row has
+    # an empty MIDDLE field. Under `IFS=$'\t'` that field collapsed, the step's
+    # condition was read into the job's variable, and the check reported the JOB as
+    # gated -- a true refusal naming the wrong half, which sends a maintainer to a
+    # job-level `if:` that is not there. Both spellings exit non-zero, so this
+    # asserts the sentence rather than the status.
+    Generate "${scratch}/wf.yml" safe none gated required
+    CaseSaying "rule C: with no job-level \`if:\`, the refusal names the STEP and not the job (#791)" \
+        "step in job 'style' is gated on the scope classifier" \
+        "but the JOB is gated on the scope classifier"
 
     # And the direction that rots silently: an empty required table would make
     # every job look unrequired, so rule C must refuse rather than vouch.

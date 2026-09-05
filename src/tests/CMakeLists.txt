@@ -318,6 +318,40 @@ set_tests_properties("fatal-error-exit-selftest" PROPERTIES
     TIMEOUT 60
 )
 
+# And that check watched REFUSING, which it had never been (#680).
+#
+# It has run green since #497 and nothing had ever made it object. #680 widened
+# its pass 3 to the two CPack hook scripts -- `cmake/MacOSSignBinaries.cmake` and
+# `cmake/MacOSNotarizePkg.cmake`, which no registration in this file names and
+# which CPack runs in script mode exactly as ctest runs a check. A widening whose
+# failure mode is silence needs the refusal shown: a scan that stops matching
+# reports the same "all clear" as one that matched everything.
+#
+# Five synthesised trees -- a control that must PASS, then a hook stripped of its
+# declaration, the hook VARIABLE renamed so the scan matches nothing, the variable
+# pointing at a script that is not there, and a `;` in the hook path. The last is
+# there because the check was caught miscounting its own output: CMake splits a
+# semicolon inside `list(APPEND)` into two elements, so one violation reported as
+# two. Each arm asserts the finding COUNT, not just that something was refused.
+#
+# Subject to the rule it tests, like everything else here: FAIL_REGULAR_EXPRESSION.
+# NOT for the "FATAL_ERROR exits 0 on 3.28" reason, which #565 refuted and #788
+# corrected two blocks up -- for the reason that actually applies to this script:
+# it runs the check under test through `execute_process` and reads its OUTPUT, so
+# its own exit status says nothing about what it found.
+add_test(
+    NAME "script-check-signals-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/script-check-signals-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-script-check-signals-selftest.cmake"
+)
+set_tests_properties("script-check-signals-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
 # ---------------------------------------------------------------------------
 # The read-slot canary: the third program in this file that MUST die.
 #

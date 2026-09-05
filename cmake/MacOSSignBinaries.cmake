@@ -11,6 +11,13 @@
 #
 # Runs as a `cmake -P` script, so only CPACK_-prefixed variables are visible.
 
+# Script mode sets no policies, so every policy-gated construct in this file
+# would mean different things depending on which CMake ran it -- `if(x IN_LIST y)`
+# errors out on 3.28 and answers on 4.x. CPack runs this hook the same way ctest
+# runs a `cmake -P` check, so the same declaration applies, and #680 put it inside
+# `script-check-signals`'s pass 3 rather than leaving it to be remembered.
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT CPACK_FASTCACHED_SIGN_IDENTITY_APP)
     return()
 endif()
