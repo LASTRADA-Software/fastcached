@@ -53,7 +53,7 @@
 # macOS/libc++, which needs a Mac. Those stay CI's job, and the point of this script
 # is that everything reproducible locally is reproduced locally.
 #
-# Usage:  scripts/local-gate.sh [--no-format] [--self-test]
+# Usage:  scripts/local-gate.sh [--no-format] [--self-test] [--classify=<log>]
 #
 #   --no-format  skip the clang-format pass. It does NOT loosen the clang-tidy pin:
 #                those are two tools and the flag names one of them.
@@ -61,6 +61,52 @@
 #                the launcher refusal against synthetic `build.ninja` files, then
 #                exit. Needs no compiler, no cmake and no clang-tidy, which is what
 #                lets `ctest -R local-gate-selftest` run it everywhere.
+#   --classify=  read a captured gate log and say what happened to the run that
+#                wrote it -- `passed`, `failed`, `did-not-conclude` or
+#                `no-gate-run` -- with a distinct exit status for each. `-` reads
+#                stdin. See "A run that never concluded" below.
+#
+# ## A run that never concluded (#584)
+#
+# The verdict came from `fail()` and from the green path, and NEITHER runs when the
+# process is killed. So a run terminated by a signal ended with no `GATE FAILED`,
+# no `LOCAL GATE PASSED` and -- after #501 -- no leg block either, and the only
+# thing distinguishing it from a completed run was the ABSENCE of both lines. That
+# is a real signal and a fragile one: absence is also what a scrolled-past line, a
+# truncated log and a lost terminal look like.
+#
+# It is not hypothetical. Every lane on a shared machine runs these same script
+# names out of different worktrees, so a name-matched `pkill -f local-gate.sh` in
+# one lane hits every other lane's run -- the worktree path appears nowhere in the
+# pattern.
+#
+# **A trap does not fix this here, and that is measured rather than assumed.** Bash
+# defers a TRAPPED signal until the running foreground command returns, and this
+# gate's foreground commands are `cmake`, `ninja` and `ctest`. Measured on bash
+# 5.3: SIGTERM sent at t=2s into a 6s foreground command ran the handler at t=6s.
+# The standard workaround -- background the command and `wait` for it, which bash
+# interrupts -- does fire immediately (t=2s, measured), and it is WORSE here: the
+# child is orphaned and reparented, so the gate would report `did-not-conclude`
+# while leaving `ninja` still writing into the build directory. A developer's
+# re-run then races an orphaned build in the same `binaryDir`, which is the
+# two-gates-in-one-build-directory defect this rulebook already names. A late trap
+# is close to no trap; an early one that orphans the build is a worse bug than the
+# reporting gap it closes.
+#
+# So the route is a START MARKER plus a rule, and the rule is:
+#
+#     A log with a start marker and no terminal line DID NOT CONCLUDE. Re-run it.
+#     Never interpret it, and never read it as a red gate.
+#
+# `did-not-conclude` is a distinct outcome from `failed` because they are fixed in
+# different places -- one is somebody else's `pkill`, the other is your code. It is
+# the fifth state beside skipped / absent / unstarted / failed.
+#
+# `--classify` is that rule as a function rather than as prose, so the tooling
+# around a run can tell. It is pure -- log text in, one word out -- which is why
+# `--self-test` drives every outcome in milliseconds. Capture BOTH streams into the
+# log (`> gate.log 2>&1`): the failure line goes to stderr and the pass line to
+# stdout, and a log holding only one of them can answer only half the question.
 #
 # Exits non-zero on the first configuration that fails, having printed its errors.
 # It never runs ctest against a build that did not complete -- a stale binary
@@ -95,13 +141,25 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root" || exit 1
 
+# The status a usage error exits with. Defined here because the argument loop below
+# is the first thing that can use it, and READ by the outcome table further down
+# rather than restated there: `--classify=$LOG` with an unset `LOG` lands on this
+# arm, so no classification outcome may share the number, and a second literal `2`
+# would go on agreeing with itself after one of them moved.
+gate_usage_status=2
+
 format=1
 self_test=0
+classify_log=""
 for arg in "$@"; do
     case "$arg" in
         --no-format) format=0 ;;
         --self-test) self_test=1 ;;
-        *) echo "usage: $0 [--no-format] [--self-test]" >&2; exit 2 ;;
+        # `=<value>` rather than a second token, so this stays the one-pass `for`
+        # loop it has always been. An empty value is refused here rather than read
+        # as stdin: `--classify=` is a typo, and `-` is how stdin is asked for.
+        --classify=?*) classify_log="${arg#*=}" ;;
+        *) echo "usage: $0 [--no-format] [--self-test] [--classify=<log>|-]" >&2; exit "$gate_usage_status" ;;
     esac
 done
 
@@ -222,6 +280,131 @@ leg_pairs() {
         i=$((i + 1))
     done
 }
+
+# ---------------------------------------------------------------------------
+# What a run says about itself, and what a LOG of one says afterwards (#584).
+#
+# The three lines a run emits about its own fate, defined once and both WRITTEN
+# and READ through these names. A classifier holding its own copy of the strings
+# would be a second claim rather than a cross-check: it would go on agreeing with
+# itself after the gate stopped printing what it looks for, which is the shape of
+# defect this whole file is about.
+#
+# Matched anchored at the start of a line, never as a substring anywhere -- this
+# script's own text quotes all three, and a log carrying a `set -x` trace or a
+# quoted message must not be read as a verdict. (`LOCAL GATE SELF-TEST PASSED` is
+# safe for the same reason: it does not START with the pass marker.)
+gate_start_marker="== LOCAL GATE STARTED"
+gate_passed_marker="LOCAL GATE PASSED"
+gate_failed_marker="GATE FAILED:"
+
+# Outcome, exit status, and what a reader should do about it.
+#
+# A table, so the statuses are DERIVED from one place and the self-test can assert
+# what the ticket actually requires -- that no two outcomes share a status. A
+# killed run rendering as a red gate is the failure being fixed; two rows that
+# drifted onto one number would rebuild it silently.
+#
+# `0` and `1` are the gate's OWN statuses for those two outcomes, so classifying a
+# log answers with what the run itself answered. `2` is skipped deliberately and is
+# the interesting one: it is this script's usage status, and `--classify=$LOG` with
+# an unset `LOG` is a usage error -- a caller reading only the status would take
+# "you typed that wrong" for "the run was killed". The two are not commensurable, so
+# no outcome may sit on it, and the self-test asserts that rather than trusting it.
+#
+# EVERY status `--classify` can exit with, including the last two, which are not
+# verdicts about a log at all -- one says this gate has no row for an outcome, the
+# other that the log could not be read. They belong in the table for the reason
+# the table exists: a status spelled as a literal somewhere else is invisible to
+# the distinctness assertion below, so it can drift onto another one silently,
+# which is the whole failure being prevented.
+#
+#   outcome|status|sentence
+gate_outcomes=(
+    "passed|0|the gate ran to the end and passed."
+    "failed|1|the gate ran and FAILED. Read the log; this is a verdict about your tree."
+    "did-not-conclude|3|the run STARTED and printed no verdict. It was killed -- a signal, a lost terminal, a reboot. It did NOT fail. Re-run it; do not interpret it."
+    "no-gate-run|4|this log holds no gate run to classify. It was truncated above the start marker, or it is not a gate log."
+    "unrecognised|5|UNRECOGNISED OUTCOME -- this gate has no row for that, which is a bug in the gate and not a verdict."
+    "unreadable-log|6|the log named could not be read, so there is nothing here to classify. That is a different fact from anything the log might have said."
+)
+
+# What a gate LOG says about the run that produced it. PURE: log text on stdin,
+# one outcome word on stdout, nothing else read and nothing written.
+#
+# The LAST start marker wins, and a terminal line counts only when a marker came
+# before it. Both halves are load-bearing:
+#
+#   - A log file is reused. A `/tmp` wipe once left a PREVIOUS run's durable copy
+#     sitting where the current one goes, and it reported a failure already fixed;
+#     only an accident of timestamps told them apart. So a green run followed by a
+#     killed one is `did-not-conclude`, which a `grep -c PASSED` gets backwards.
+#   - A terminal line with no marker before it is not attributable to a run this
+#     log can show, so it is `no-gate-run` rather than the verdict it looks like.
+#     Escalating every way of not knowing to "re-run it" is the fail-closed
+#     direction, and the only one that cannot silently vouch for a tree.
+gate_outcome() {
+    local line outcome="no-gate-run"
+    # `|| [[ -n "$line" ]]` so a final line with no trailing newline is still read.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            "$gate_start_marker"*)
+                outcome="did-not-conclude"
+                ;;
+            "$gate_passed_marker"*)
+                [[ "$outcome" == "did-not-conclude" ]] && outcome="passed"
+                ;;
+            "$gate_failed_marker"*)
+                [[ "$outcome" == "did-not-conclude" ]] && outcome="failed"
+                ;;
+        esac
+    done
+    echo "$outcome"
+}
+
+# The table row for an outcome, or the `unrecognised` row for one that has no
+# row. An outcome this table cannot name renders as unrecognised rather than as
+# the nearest plausible neighbour -- a seventh outcome arriving here as `passed`
+# would be #501's defect rebuilt inside #584's fix. The fallback comes from the
+# TABLE like every other row, so the distinctness assertion covers it too.
+# @param 1 outcome word. Echoes `status|sentence`.
+gate_outcome_row() {
+    local row fallback=""
+    for row in "${gate_outcomes[@]}"; do
+        case "${row%%|*}" in
+            "$1")         echo "${row#*|}"; return 0 ;;
+            unrecognised) fallback="${row#*|}" ;;
+        esac
+    done
+    echo "${fallback} (asked for '$1')"
+}
+
+# The exit-status column of an outcome's row. An accessor rather than a
+# `${row%%|*}` at each call site: five temporaries existed only to hold the row
+# on its way to this one field.
+# @param 1 outcome word.
+gate_outcome_status() {
+    local row
+    row="$(gate_outcome_row "$1")"
+    echo "${row%%|*}"
+}
+
+if [[ -n "$classify_log" ]]; then
+    if [[ "$classify_log" == "-" ]]; then
+        _classify_outcome="$(gate_outcome)"
+    elif [[ -r "$classify_log" ]]; then
+        _classify_outcome="$(gate_outcome < "$classify_log")"
+    else
+        # Not an outcome: the classifier could not READ its subject, which is a
+        # different fact from anything the subject might have said. Reporting it as
+        # `no-gate-run` would answer a question nobody could ask.
+        echo "local-gate --classify: cannot read '$classify_log'" >&2
+        exit "$(gate_outcome_status unreadable-log)"
+    fi
+    _classify_row="$(gate_outcome_row "$_classify_outcome")"
+    echo "local-gate: ${_classify_outcome} -- ${_classify_row#*|}"
+    exit "${_classify_row%%|*}"
+fi
 
 # Run every leg in table order, marking each one as it goes.
 #
@@ -469,6 +652,14 @@ if [[ "$self_test" -eq 1 ]]; then
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     self_test_failures=0
+    # How many checks RAN, printed on both paths. `expect` is silent when it
+    # passes, so without this a run that died half way through -- an unbound
+    # variable, a syntax error in a case, a stray `exit` -- is indistinguishable
+    # from one where every check passed, and "no failures printed" reads as "the
+    # guard did not fire". That is #584's own confusion one level down, and it is
+    # what makes breaking a rule and WATCHING this refuse a check rather than a
+    # hope.
+    self_test_ran=0
     # Skipped is its own outcome, and it has to be VISIBLE or it reads as tested.
     # `ctest` shows a passing test's output to nobody, so a skip announced only on
     # stderr is a case that silently did not run -- which is the exact collapse this
@@ -478,6 +669,7 @@ if [[ "$self_test" -eq 1 ]]; then
 
     # @param 1 What is being checked. @param 2 Expected. @param 3 Actual.
     expect() {
+        self_test_ran=$((self_test_ran + 1))
         if [[ "$2" != "$3" ]]; then
             echo "SELF-TEST FAILED: $1: expected '$2', got '$3'" >&2
             self_test_failures=$((self_test_failures + 1))
@@ -741,6 +933,99 @@ gate-gcc-release=passed" \
 ==   gate-gcc-release   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
         "$( (run_all_legs stub_returns_one; echo CONTINUED) 2>&1 )"
 
+    # -----------------------------------------------------------------------
+    # A run that never concluded (#584), driven as a pure function over staged log
+    # text. No signal is sent and no gate is run: `gate_outcome` reads lines and
+    # writes a word, so every outcome is exercised in milliseconds -- the same
+    # split #501's renderer took, for the same reason. That a REAL signal produces
+    # this shape is a separate claim and was checked separately, by sending one.
+    #
+    # @param 1 case name. @param 2 expected outcome. @param 3 log text.
+    outcome_case() {
+        expect "$1" "$2" "$(printf '%s' "$3" | gate_outcome)"
+    }
+
+    _started="$gate_start_marker -- pid 1, tree /w, commit abc1234, 2026-01-01T00:00:00Z"
+    _legs="== gate legs:
+==   gate-clang-debug   passed"
+
+    outcome_case "a run that reached the green line passed" \
+        "passed" "$_started
+$_legs
+$gate_passed_marker"
+
+    outcome_case "a run that refused through fail() failed" \
+        "failed" "$_started
+$gate_failed_marker gate-clang-debug tests
+$_legs"
+
+    # The whole ticket: a run with a start marker and NO terminal line. Before the
+    # marker existed this log and a truncated one were the same object.
+    outcome_case "a killed run did not conclude, and says so" \
+        "did-not-conclude" "$_started
+== gate-clang-debug: build"
+
+    # ... and its converse, which is the half that gets skipped: absence of the
+    # negative is not the positive. A log with no marker at all cannot be
+    # attributed to a run, so it is not a quiet `did-not-conclude` either.
+    outcome_case "a log with no start marker holds no run to classify" \
+        "no-gate-run" "$_legs
+$gate_passed_marker"
+
+    outcome_case "an empty log holds no run to classify" "no-gate-run" ""
+
+    # A log file gets REUSED. A previous run's durable copy sitting where the
+    # current one goes has already reported a failure that was fixed, told apart
+    # only by an accident of timestamps -- so the LAST marker wins. `grep -c
+    # PASSED` gets this one backwards, which is why it is a case.
+    outcome_case "a green run followed by a killed one did not conclude" \
+        "did-not-conclude" "$_started
+$gate_passed_marker
+$_started
+== gate-clang-debug: build"
+
+    outcome_case "a killed run followed by a green one passed" \
+        "passed" "$_started
+== gate-clang-debug: build
+$_started
+$_legs
+$gate_passed_marker"
+
+    # A verdict is a line, not a substring. A log quoting the pass marker inside a
+    # message must not be read as one -- this script's own header quotes all three.
+    outcome_case "a quoted marker mid-line is not a verdict" \
+        "did-not-conclude" "$_started
+==   note: a run printing $gate_passed_marker would be green"
+
+    # The ticket's own requirement, asserted over the TABLE rather than restated:
+    # `did-not-conclude` must not render as a red gate, so no two outcomes may
+    # share an exit status. Two rows drifting onto one number is how that
+    # distinction would be lost without anybody writing a bug.
+    expect "every outcome has an exit status of its own" \
+        "${#gate_outcomes[@]}" \
+        "$(printf '%s\n' "${gate_outcomes[@]}" | cut -d'|' -f2 | sort -u | grep -c .)"
+    # The STATUS field, not the whole row. Comparing rows compares the sentences
+    # too, which differ whatever the statuses do -- so the check would have read
+    # green for exactly the collapse it names. A signal that cannot be false in
+    # the failing case is not evidence, and this one was caught by being watched
+    # rather than by being read.
+    expect "did-not-conclude and failed do not share a status" \
+        "no" "$([[ "$(gate_outcome_status did-not-conclude)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no)"
+
+    # ... and no outcome may sit on the USAGE status, because `--classify=$LOG`
+    # with an unset variable exits with it. A caller checking only the status would
+    # read "you typed that wrong" as "the run was killed" -- two facts that are not
+    # commensurable and are fixed in different places.
+    expect "no outcome sits on the usage exit status" "0" \
+        "$(printf '%s\n' "${gate_outcomes[@]}" | cut -d'|' -f2 | grep -c "^${gate_usage_status}$")"
+
+    # An outcome with no row renders as unrecognised rather than as the nearest
+    # plausible verdict -- #501's defect rebuilt inside #584's fix.
+    expect "an outcome the table cannot name is refused, not guessed" \
+        "$(gate_outcome_status unrecognised)" "$(gate_outcome_status invented-outcome)"
+    expect "an outcome the table cannot name says it is a bug" \
+        "yes" "$([[ "$(gate_outcome_row invented-outcome)" == *"UNRECOGNISED OUTCOME"* ]] && echo yes || echo no)"
+
     # The table drives the launcher and analyser decisions above, the `leg_pairs`
     # checks, and the whole gate below, so a row that stopped parsing would make
     # those vacuous while every one of them passed. The `leg_summary` checks are
@@ -755,6 +1040,7 @@ gate-gcc-release=passed" \
         esac
     done
 
+    echo "local-gate --self-test: ${self_test_ran} checks ran, ${self_test_failures} failed"
     [[ "$self_test_failures" -eq 0 ]] || exit 1
 
     # The interpreter is named for the same reason the gate names its analyser: this
@@ -765,6 +1051,24 @@ gate-gcc-release=passed" \
     echo "LOCAL GATE SELF-TEST PASSED (bash ${BASH_VERSION})${self_test_skipped:+ -- SKIPPED: $self_test_skipped}"
     exit 0
 fi
+
+# The start marker, and it is the FIRST thing a real run does -- before the analyser
+# is resolved, before the formatter runs, before anything that can `fail`. A marker
+# printed after the first refusal would be absent from exactly the runs it exists to
+# describe.
+#
+# It names its own subject. A verdict that does not say what it is a verdict about
+# has already cost this repository a run: a `/tmp` wipe left one gate's log where
+# another's goes and it reported a failure that was already fixed. The pid is here
+# because #584's cause is a name-matched kill across worktrees on a shared machine,
+# and the tree is here because that is the field such a kill does not look at.
+#
+# The commit is read BEFORE the `clang-format -i` pass below, so `-dirty` describes
+# the tree as the developer handed it over rather than one this gate rewrote and
+# then measured.
+gate_commit="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+git -C "$repo_root" diff --quiet HEAD 2>/dev/null || gate_commit="${gate_commit}-dirty"
+echo "$gate_start_marker -- pid $$, tree $repo_root, commit $gate_commit, $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # Resolved once, to an absolute path, and checked before anything is built -- the
 # treatment `clang-format` already had, for the same reason: a gate whose tool is

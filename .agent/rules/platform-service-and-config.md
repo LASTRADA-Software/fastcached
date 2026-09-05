@@ -742,6 +742,7 @@ guessed, and guessed wrong in both directions. **A binary's console logger is no
 sink in every deployment, and the supervisors do not agree about times.** For
 `fastcache-compile-node`, which is the shape both binaries have:
 
+<!-- table-total: none -->
 | deployment | the sink | who stamps |
 |---|---|---|
 | systemd | `ConsoleLogger` → stderr → journald. The unit is `Type=simple` and deliberately passes **no** `--daemon` — a double-fork silences journald | **journald** |

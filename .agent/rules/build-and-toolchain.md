@@ -63,6 +63,7 @@ determinism rests on.
   is per `stat` on a filesystem where each crosses a translation layer, so it is
   invisible on CI and on ext4 and it varies with page-cache warmth:
 
+  <!-- table-total: none -->
   | check | filesystem | standalone | single gate | two lanes | budget |
   |---|---|---|---|---|---|
   | `sccache-backend-caveat`, before #502 | 9p | 78.7 s | 60.0 s (timeout) | -- | 60 s |
@@ -154,6 +155,7 @@ determinism rests on.
   remaining `file(STRINGS)` readers, by injecting one unbalanced `]` into a comment on a
   line the reader KEEPS:
 
+  <!-- table-total: readers=rows -->
   | reader | verdict |
   |---|---|
   | `check-tsan-scope:109` | clean pass -> hard refusal, **LOUD** |
@@ -219,6 +221,7 @@ determinism rests on.
   same file set differed by exactly one, and neither party had miscounted — they had
   counted through different patterns:
 
+  <!-- table-total: none -->
   | pattern | cac9bda, all | cac9bda, excl. selftests | HEAD |
   |---|---|---|---|
   | `scripts/check-*.cmake` (the glob a ticket names) | **20** | **18** | **34** |
@@ -235,6 +238,54 @@ determinism rests on.
   to a developer — the correction was wrong for the same reason as the thing it was
   correcting. Nobody is outside this; the remedy is that the pattern travels with the
   figure, not that people count more carefully.
+- **A stated total beside a table is DERIVED from it, or it is a second claim.** A
+  hand-maintained number describing a hand-maintained list is two sources of truth
+  wearing one hat: editing the table does not update the number, nothing checked that it
+  did, and the failure is silent because the sentence still reads correctly. Measured on
+  ONE table across THREE consecutive commits — `.agent/rules/metrics-and-observability.md`'s
+  four-states table — where each commit fixed the previous count and introduced the next,
+  all three by the same author, in the same file, on the same day, with the rule about
+  instruments that miscount open in the next tab
+  ([#780](https://github.com/LASTRADA-Software/fastcached/issues/780)). At three
+  occurrences it is not a discipline problem: prose did not prevent it and re-reading did
+  not prevent it. It is the `RowsInEnumeratorOrder` argument arriving in markdown — the
+  count comes from the table or it is not a count.
+
+  `ctest -R table-totals` derives it. Two decisions are recorded in the check rather than
+  in a commit message, because picking either silently is what the ticket refuses:
+  - **The multipliers are PARSED, not banned.** That table's rows carry `(twice)` and
+    `(three times)`, so 8 rows describe 12 collapses and the prose states BOTH figures. A
+    checker that counts rows is wrong for exactly the table that motivated it, and wrong
+    in the direction that looks right — `8` beside a table of 8 rows is entirely
+    plausible. Two quantities, two modes, both derived. A multiplier the check cannot
+    read is a REFUSAL, never a silent 1.
+  - **The marker is MANDATORY, and `none` is how a table says it has no total.** Not
+    opt-in: an opt-in marker is exact about the tables it knows and silent about the ones
+    it does not (#492). That is the `Refuse` / `RefuseWithoutCounter` idiom from
+    [`metrics-and-observability.md`](metrics-and-observability.md) — *deliberately
+    uncounted must not be spelled like forgot* — costing one comment line per table and
+    buying the property that a table ARRIVING cannot join the tree unchecked.
+
+  Three things the implementation got wrong first, all found by watching rather than by
+  reading, and all the same family as the bullet above:
+  - **The scope census was wrong by 100%.** An `^\|`-anchored scan found 10 tables and
+    was silent about 10 more, because a table INSIDE a bullet is indented. The scope
+    decision was then argued from the wrong number, and the miss surfaced only because
+    one skipped table happened to catch the eye — which is the census bullet's own lesson
+    met while implementing the check for it.
+  - **The figure NEAREST a table is the one that describes it.** A first-match search read
+    the four-states table as claiming 4, because its paragraph legitimately states the
+    older "five separate times, in four different instruments" as well as the current
+    "twelve collapses across eight instruments". The check refused a CORRECT tree, which
+    is how it was found.
+  - **A number need not sit immediately before its noun** — "the six remaining
+    `file(STRINGS)` readers" is two words apart — and a marker forced to spell the
+    intervening words would be a copy of the sentence, which is a third source of truth.
+
+  **What is deliberately NOT checked**, recorded because the ticket asked: `AGENT.md`'s
+  tripwire restates *"five times in four instruments in one session"*. That figure is not
+  derived from the table — it describes the FIRST session, five of the twelve — so
+  asserting it against the table would assert a wrong thing.
 - **A scan whose needle can appear in its own source, or in the text it reports, will
   match itself.** The guard added for
   [#678](https://github.com/LASTRADA-Software/fastcached/issues/678) scans
@@ -322,6 +373,7 @@ determinism rests on.
   Linux box such scripts are written on. The bash-4 constructs to avoid are few
   and worth knowing by name:
 
+  <!-- table-total: none -->
   | avoid | use |
   |---|---|
   | `mapfile` / `readarray` | `while IFS= read -r x; do a+=("$x"); done < <(...)` |
@@ -510,6 +562,80 @@ determinism rests on.
   reports nothing and a run that found nothing render identically.** Read the raw log
   the message names, or filter on `FAILED:` as well.
 
+- **A run that never concluded is the fifth state, and a trap cannot report it here.**
+  The verdict came from `fail()` and from the green path, and NEITHER runs when the
+  process is killed -- so a run terminated by a signal ended with no `GATE FAILED`, no
+  `LOCAL GATE PASSED` and, after #501, no leg block either. The only thing separating
+  it from a completed run was the ABSENCE of both lines, and absence is equally what a
+  scrolled-past line, a truncated log and a lost terminal look like
+  ([#584](https://github.com/LASTRADA-Software/fastcached/issues/584)). It is not
+  hypothetical: every lane on a shared machine runs these script names out of different
+  worktrees, so a name-matched `pkill -f local-gate.sh` in one lane hits every other
+  lane's run -- the worktree path appears nowhere in the pattern. Twice in one night.
+
+  **The trap route was measured and rejected, and the measurement is the entry.** Bash
+  defers a TRAPPED signal until the running foreground command returns, and this gate's
+  foreground commands are `cmake`, `ninja` and `ctest`. On bash 5.3, a SIGTERM sent at
+  **t=2s** into a 6s foreground command ran the handler at **t=6s** -- a trap that fires
+  only after `ninja` finishes is close to no trap at all. The standard workaround,
+  backgrounding the command and `wait`ing for it, does fire immediately (**t=2s**,
+  measured) and is **worse**: the child is orphaned and reparented, so the gate would
+  print a tidy `did-not-conclude` while leaving `ninja` still writing into the build
+  directory. Measured on a real killed run of this gate mid-build-leg: **34 descendant
+  processes** left alive under the worktree, which had to be cleaned up by matching
+  `/proc/<pid>/cwd`. A developer's re-run then races an orphaned build in the same
+  `binaryDir` -- the two-gates-in-one-build-directory defect already listed above. So
+  the deferral is not a detail to work around; it is the argument for the other route.
+
+  The route is a **start marker plus a rule**, and the rule is: *a log with a start
+  marker and no terminal line DID NOT CONCLUDE -- re-run it, never interpret it, and
+  never read it as a red gate.* `did-not-conclude` is a distinct outcome from `failed`
+  because they are fixed in different places: one is somebody else's `pkill`, the other
+  is your code. Four things make that more than prose:
+  - **The marker names its own subject** -- pid, worktree and commit. A verdict that
+    does not say what it is a verdict about has already cost a run here, when a `/tmp`
+    wipe left one gate's log where another's goes and it reported a failure that was
+    already fixed. The pid is there because the cause is a name-matched kill, and the
+    tree because that is the field such a kill does not look at.
+  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers
+    `passed` / `failed` / `did-not-conclude` / `no-gate-run`, each with an exit status
+    of its own, so the tooling around a run can tell. Pure -- log text in, one word out
+    -- which is the standing answer above applied once more. `passed` and `failed` keep
+    the gate's own `0` and `1`; `2` is skipped because it is the script's USAGE status,
+    and `--classify=$LOG` with an unset `LOG` lands there -- a caller reading only the
+    status would take *you typed that wrong* for *the run was killed*. Those two are not
+    commensurable, so the self-test asserts no outcome sits on it, and the constant is
+    defined once and read by both the argument loop and the table rather than spelled
+    twice.
+  - **The LAST marker wins, and a terminal line counts only after one.** A log file
+    gets reused, so a green run followed by a killed one is `did-not-conclude`, which
+    `grep -c PASSED` gets backwards; and a terminal line with no marker before it is
+    `no-gate-run` rather than the verdict it resembles, because it cannot be attributed
+    to a run the log can show. Both escalate not-knowing to *re-run it*, which is the
+    only direction that cannot silently vouch for a tree.
+  - **Capture both streams.** The failure line goes to stderr and the pass line to
+    stdout, so a log holding one of them can answer half the question.
+
+  Watched refusing, which for this one takes two forms because the mechanism has two
+  halves. The classifier: four breaks -- `did-not-conclude` given `failed`'s status, the
+  first marker winning instead of the last, substring matching instead of line-anchored,
+  and a terminal line counting with no marker before it -- each reddened a named case.
+  The marker: a **real** SIGTERM to a **real** run mid-build-leg, by pid and never by
+  name match, which exited 143, left a log with a start marker and zero terminal lines,
+  and classified `did-not-conclude` at exit 3. A start-marker scheme never interrupted
+  is untested in the only case it exists for.
+
+  And the self-test gained a `N checks ran, M failed` line in the same change, because
+  without it none of the four breaks above could be believed: `expect` is silent when
+  it passes, so a run that died half way through is indistinguishable from one where
+  everything passed, and *no failures printed* reads as *the guard did not fire*. That
+  is this ticket's own confusion one level down. It immediately earned itself -- one of
+  the new checks claimed to assert that `did-not-conclude` and `failed` have different
+  exit statuses and actually compared whole table ROWS, whose sentences differ whatever
+  the statuses do. It read green for exactly the collapse it names, and only watching it
+  fail to fire found it. **A signal that cannot be false in the failing case is not
+  evidence**, and a check is not evidence that it fires until it has been seen to.
+
 - **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
   `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
   so both its configurations were fronted by whichever launcher happened to be installed, at
@@ -595,6 +721,7 @@ determinism rests on.
     single number here is the wrong quantity in whichever direction it is quoted. One
     `gcc-release` configuration, 630 object edges, from scratch, 32 jobs, WSL2 on a 9p mount:
 
+    <!-- table-total: none -->
     | leg | wall clock |
     |---|---|
     | launcher on, nothing stored yet (629 fronted edges) | 224 s |
@@ -1410,6 +1537,7 @@ rule, rest on that sentence, and it does not reproduce** (#565).
   Measured on 3.28.3 — the declared minimum and the version CI runs — against the same
   script with the declaration added:
 
+  <!-- table-total: none -->
   | construct | policy | bare `cmake -P` on 3.28.3 | declared, or on 4.x |
   |---|---|---|---|
   | `if("b" IN_LIST haystack)` | CMP0057 | `CMake Error: Unknown arguments`, **exit 1** — errors before answering | answers |
@@ -1511,6 +1639,7 @@ recorded, so do not reconcile a step mean against a job range below to the tenth
 diff-scoped**, which is the bullet three below and is what makes them worth
 re-measuring rather than citing forward:
 
+<!-- table-total: none -->
 | event | runs | runner-min, mean | longest job, mean | run wall, mean | which job is longest |
 |---|--:|--:|--:|--:|---|
 | `pull_request`, code-touching | 36 | 102.7 | 19.0 | 24.1 | `clang-tidy` (18 of 36) |
@@ -1953,6 +2082,7 @@ makes it anyway and says so there.
   shapes occur on pull requests and on master pushes alike. What is left is not
   cacheable at all:
 
+  <!-- table-total: none -->
   | leg | `Build`, mean | `Test`, mean | whole job, mean (min–max) |
   |---|--:|--:|--:|
   | `Windows-cl-release` | 4.7 | 3.5 | 8.5 (6.0–12.1) |
@@ -2056,6 +2186,7 @@ makes it anyway and says so there.
   `USE_COMPILER_CACHE=OFF`, `-j8`, target `fastcached`, a warm configure so only
   the compile is timed:
 
+  <!-- table-total: none -->
   | | ext4 (`~`) | 9p (`/mnt/d`) | |
   |---|---|---|---|
   | build, wall | **19.6 s** | **60.5 s** | 3.1× |
@@ -2087,6 +2218,7 @@ makes it anyway and says so there.
   `5.15.167.4-microsoft-standard-WSL2`, 32 cores, load average under 0.3, best of
   three, 2026-09-02:
 
+  <!-- table-total: none -->
   | probe | ext4 (`~`) | 9p (`/mnt/d`) | ratio |
   |---|--:|--:|--:|
   | 6000 ops through a shell loop (`: >`, `stat`, `rm`) | 1.80 s | 12.02 s | 6.7× |
@@ -2927,6 +3059,7 @@ part of the normal flow ever lists.
 **Measured, over every failing `merge_group` `Build` run the API still held on
 2026-09-04 — six of them:**
 
+<!-- table-total: of them=rows -->
 | run | failing job | required? | pull request |
 |---|---|---|---|
 | 33783939363 | `Code coverage` | no | #689 merged |
@@ -3135,6 +3268,7 @@ are recorded together because the shape is one shape.
   was in fact RED with four cases named. The phrase it matched on,
   `did not behave as claimed`, straddled the wrap point. Measured:
 
+  <!-- table-total: none -->
   | message type | matches for a phrase crossing column 74 |
   |---|---|
   | `message(STATUS)` | **1** — does not wrap |

@@ -27,6 +27,7 @@ time.
 Tickets are assigned by **component**, not by priority. Priority decides *order*; component
 decides *who*, because that is what keeps three branches from colliding.
 
+<!-- table-total: none -->
 | Lane | Owns |
 |---|---|
 | **L — launcher** | `src/apps/fastcache-cc/` |

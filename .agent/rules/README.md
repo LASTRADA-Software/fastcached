@@ -25,6 +25,7 @@ the build or the test suite already says it.
 
 ## Files
 
+<!-- table-total: none -->
 | File | Governs |
 |---|---|
 | [`compile-cache.md`](compile-cache.md) | `apps/fastcache-cc/`, `CompileCache/` — the cache key, path canonicalization, manifests, replay |
