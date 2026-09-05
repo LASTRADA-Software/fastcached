@@ -1,0 +1,23 @@
+# Translation units that contribute NOTHING on the platform the clang-tidy sweep
+# runs on, and are therefore analysed by no analyser in this project's CI.
+#
+# `scripts/check-tidy-blind-spots.sh` MEASURES the real set and refuses when it
+# disagrees with this table, in either direction: a TU that goes blind and is not
+# listed here is a new hole, and a row that is no longer blind is a stale claim.
+# The list is never the evidence -- the measurement is -- so nobody can widen the
+# hole by editing prose.
+#
+# Format: <path><TAB><reason>
+#
+# See https://github.com/LASTRADA-Software/fastcached/issues/682.
+src/FastCache/Async/IocpReactor.cpp	whole file inside `#if defined(_WIN32)`; the tidy job runs on ubuntu-24.04
+src/FastCache/Async/IocpReactor_test.cpp	whole file inside `#if defined(_WIN32)`
+src/FastCache/Net/IocpConnector.cpp	whole file inside `#if defined(_WIN32)`
+src/FastCache/Net/IocpConnector_test.cpp	whole file inside `#if defined(_WIN32)`
+src/FastCache/Net/IocpSocket.cpp	whole file inside `#if defined(_WIN32)`
+src/FastCache/Net/IocpSocket_test.cpp	whole file inside `#if defined(_WIN32)`
+src/FastCache/Async/KqueueReactor.cpp	whole file inside the kqueue guard; no macOS/BSD analyser leg exists at all
+src/FastCache/Async/KqueueReactor_test.cpp	whole file inside the kqueue guard
+src/FastCache/Net/KqueueConnector.cpp	whole file inside the kqueue guard
+src/FastCache/Net/KqueueSocket.cpp	whole file inside the kqueue guard
+src/FastCache/Net/KqueueSocket_test.cpp	whole file inside the kqueue guard
