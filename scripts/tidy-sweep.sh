@@ -77,9 +77,14 @@
 # offers, and nothing here checks it.
 #
 # Usage:  [TIDY=clang-tidy-22] [DB=out/build/tidy22] [BASE=origin/master] \
-#         [JOBS=4] scripts/tidy-sweep.sh [--all|--self-test]
+#         [JOBS=4] scripts/tidy-sweep.sh [--all|--ci|--self-test]
 #
 #   --all        sweep every translation unit in the database, whatever changed.
+#   --ci         take the scope and the base from `CiScopeTable` and the event in
+#                the environment (`GITHUB_EVENT_NAME`, `GITHUB_BASE_REF`,
+#                `MERGE_GROUP_BASE_SHA`). This is how the workflow invokes it, so
+#                that the event -> (scope, base) mapping lives in one place a
+#                reader can see whole rather than in three CI expressions.
 #   --self-test  check the scope computation against a synthetic tree and exit.
 #                Needs no compile database and no clang-tidy.
 set -u
@@ -187,6 +192,103 @@ fatal() { echo "TIDY SWEEP FATAL: $*" >&2; exit 2; }
 # ---------------------------------------------------------------------------
 # Scope
 # ---------------------------------------------------------------------------
+
+# What CI asks for, as ONE table, because the SCOPE decision used to be two
+# GitHub expressions plus the shell here, and nothing stated the mapping (#570).
+#
+# The `BASE:` env expression and the `--all` argument expression each carried a
+# piece of it in `.github/workflows/build.yml`, so answering "what happens on
+# event X" meant composing GitHub expression syntax with shell. The report step's
+# `if:` is a THIRD per-event expression there and has deliberately NOT moved
+# here: it decides who is TOLD about a failure, not how wide the analysis is, and
+# folding a notification rule into the scope table would make the table describe
+# two things, which is the opposite of what #570 asked for. Its acceptance is
+# worded around all three, so the deviation is stated here rather than left for a
+# reader to notice: two moved, the third stays, and `check-tidy-sweep-scope.sh`
+# rule C still checks it where it is. The soundness argument #554 rests on -- that
+# the master push is the only full sweep, and the diff-scoped events are exactly
+# the two that have a base to diff against -- is checkable only where the mapping
+# can be read whole.
+#
+# Rows are matched in order; anything not named falls to `CiScopeDefaultRow`.
+# That default is the whole point rather than a tidy-up. The guard used to be
+# spelled as an exclusion (`event_name != 'pull_request' && event_name !=
+# 'merge_group'`) precisely so that a trigger added to `on:` later would sweep
+# everything instead of diff-scoping against a base whose diff on master is
+# EMPTY -- which makes the sweep print `no source changed` and exit 0 having
+# analysed nothing. A table with a default row is that property made structural:
+# there is no spelling of it left to get backwards.
+#
+#   <event>        <scope>  <where BASE comes from>
+CiScopeTable=(
+    "pull_request  diff     pull-request-base-ref"
+    "merge_group   diff     merge-queue-base-sha"
+)
+
+# Every other event this workflow can dispatch a sweep from -- a `push` to
+# master, a tag push, and any trigger added to `on:` later. `BASE` is not read.
+CiScopeDefaultRow="*  all  none"
+
+# The mapping, as a pure function of the three things it depends on.
+#
+# Pure and separately callable for the reason `InterpreterVerdict` is: the
+# environment it reads exists only inside a GitHub runner, so a decision made
+# inline at the call site is untestable BY CONSTRUCTION. `SelfTest` drives every
+# row of the table above through this, which is what makes the mapping something
+# a reader can both see whole and see refused.
+#
+# @param 1 The event name (`GITHUB_EVENT_NAME`).
+# @param 2 The pull request's base ref (`GITHUB_BASE_REF`); empty off a pull request.
+# @param 3 The queue entry's base commit (`MERGE_GROUP_BASE_SHA`); empty off the queue.
+# @return Prints `<scope>\t<base>`, `<base>` empty when the scope is `all`.
+#         Exit 2 when a row names a scope or a base this function cannot resolve,
+#         and when NO row matched at all -- a fourth state must not arrive
+#         silently as a third. Both columns are checked and the fall-off-the-end
+#         is a refusal, because every one of those failures reads downstream as
+#         `mode=diff` against `origin/master`, whose diff on master is EMPTY: the
+#         sweep would print `no source changed` and exit 0 having analysed
+#         nothing, which is the exact failure the default row exists to prevent.
+CiScopeFor() {
+    local event="$1" pullRequestBaseRef="$2" mergeQueueBaseSha="$3"
+    local row rowEvent rowScope rowBase
+    for row in "${CiScopeTable[@]}" "$CiScopeDefaultRow"; do
+        # `read`, never `set -- $row`: an unquoted expansion is PATHNAME-expanded,
+        # so the default row's `*` became the working directory's file list and
+        # every unlisted event fell off the end of this loop returning nothing.
+        # Measured -- `push` answered the empty string, and an empty answer is the
+        # one shape a caller reading `${x%%<tab>*}` cannot tell from a scope.
+        read -r rowEvent rowScope rowBase <<<"$row"
+        [[ "$rowEvent" == "*" || "$rowEvent" == "$event" ]] || continue
+        # The scope column is checked as strictly as the base column below. An
+        # unimplemented value here is not an unknown scope downstream -- `mode`
+        # is compared against `all` and everything else IS `diff`, so a typo
+        # would diff-scope silently rather than refuse.
+        case "$rowScope" in
+            diff|all) ;;
+            *) return 2 ;;
+        esac
+        case "$rowBase" in
+            # `origin/master` when the ref is missing, which is what the workflow
+            # expression it replaces fell back to. It resolves and
+            # over-approximates; a base that does not resolve escalates further
+            # down to a full sweep.
+            pull-request-base-ref) printf '%s\torigin/%s\n' "$rowScope" "${pullRequestBaseRef:-master}" ;;
+            # A queue entry stacks on the entry ahead of it, so its own base_sha
+            # is the tree its change is actually being added to. Missing or
+            # renamed, this lands on `origin/master`, which over-approximates for
+            # the same reason.
+            merge-queue-base-sha)  printf '%s\t%s\n' "$rowScope" "${mergeQueueBaseSha:-origin/master}" ;;
+            none)                  printf '%s\t\n' "$rowScope" ;;
+            *)                     return 2 ;;
+        esac
+        return 0
+    done
+    # No row matched, which means `CiScopeDefaultRow` has stopped being one. The
+    # comment above records this arriving once already, as an empty answer the
+    # caller could not tell from a scope; it is a refusal now rather than a
+    # silent diff against `origin/master`.
+    return 2
+}
 
 # A change to any of these decides how EVERY translation unit is interpreted, so
 # a diff-scoped sweep would be answering the wrong question. One row per reason,
@@ -752,20 +854,88 @@ STUB
     Expect "a non-bash interpreter refuses a sweep"  "fatal" "$(InterpreterVerdict "" 0 0)"
     Expect "a non-bash interpreter skips a self-test" "skip" "$(InterpreterVerdict "" 0 1)"
 
+    # The event -> (scope, base) mapping (#570). One case per event
+    # `.github/workflows/build.yml` can dispatch a sweep from, so the table is not
+    # merely readable but refusable: change a row so the queue sweeps fully and
+    # the `merge_group` case below says so by name.
+    #
+    # Asserted as `<scope>\t<base>` rather than as two calls, because the pair is
+    # the answer -- a scope with the wrong base is exactly as wrong as the wrong
+    # scope, and it is the half nothing used to check.
+    Expect "a pull request diff-scopes against its own base branch" \
+           "diff"$'\t'"origin/feature-x" \
+           "$(CiScopeFor pull_request feature-x '')"
+    # `github.base_ref` was empty here BEFORE this table existed too, and the
+    # workflow expression it replaces fell back the same way.
+    Expect "a pull request with no base ref falls back to origin/master" \
+           "diff"$'\t'"origin/master" \
+           "$(CiScopeFor pull_request '' '')"
+    # The queue stacks: an entry's own base is the entry ahead of it, never master.
+    Expect "a merge-queue entry diff-scopes against its own base_sha" \
+           "diff"$'\t'"d483441a" \
+           "$(CiScopeFor merge_group '' d483441a)"
+    Expect "a merge-queue entry with no base_sha falls back to origin/master" \
+           "diff"$'\t'"origin/master" \
+           "$(CiScopeFor merge_group '' '')"
+    # The two events the whole soundness argument rests on. A `push` carries no
+    # base to diff against, and a tag push is the same row rather than a fourth
+    # behaviour -- both sweep everything, and neither reads BASE.
+    Expect "a push sweeps everything and reads no base" \
+           "all"$'\t' \
+           "$(CiScopeFor push master '')"
+    Expect "a tag push sweeps everything and reads no base" \
+           "all"$'\t' \
+           "$(CiScopeFor push '' '')"
+    # The direction that makes the default row worth having: a trigger nobody has
+    # added yet must sweep everything rather than diff-scope against a base whose
+    # diff on master is empty, which would exit 0 having analysed nothing.
+    Expect "a trigger added to on: later sweeps everything" \
+           "all"$'\t' \
+           "$(CiScopeFor schedule '' '')"
+    Expect "and so does an empty event name" \
+           "all"$'\t' \
+           "$(CiScopeFor '' '' '')"
+    # And the three ways the table can stop answering. Each of them reads
+    # downstream as `mode=diff` against `origin/master` -- empty on master, so
+    # `no source changed` and exit 0 having analysed nothing -- which is why a
+    # refusal is the only safe shape and why each direction is driven here rather
+    # than argued for in a comment.
+    ( CiScopeTable=("push  full  none"); CiScopeFor push '' '' >/dev/null 2>&1 )
+    Expect "a scope column this script does not implement is refused" "2" "$?"
+    ( CiScopeTable=("push  diff  somewhere-else"); CiScopeFor push '' '' >/dev/null 2>&1 )
+    Expect "a base column this script does not implement is refused" "2" "$?"
+    ( CiScopeTable=(); CiScopeDefaultRow=""; CiScopeFor push '' '' >/dev/null 2>&1 )
+    Expect "a default row that stopped being one is refused, never an empty answer" "2" "$?"
+
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
 
 # ---------------------------------------------------------------------------
 
+# Every flag here chooses what this run DOES, so two of them is a contradiction
+# rather than a preference order. Accepted last-one-wins, `--ci --all` would sweep
+# everything while `--all --ci` consulted the table -- two different runs from the
+# same two words, decided silently by the order they were typed in, which is the
+# state `check-tidy-sweep-scope.sh` refuses in the workflow and this script should
+# not offer anywhere else.
 mode=diff
+scopeFlag=""
 for arg in "$@"; do
     case "$arg" in
-        --all) mode=all ;;
-        --self-test) mode=selftest ;;
-        *) fatal "usage: $0 [--all|--self-test]" ;;
+        --all|--ci|--self-test) ;;
+        *) fatal "usage: $0 [--all|--ci|--self-test]" ;;
     esac
+    if [[ -n "$scopeFlag" && "$scopeFlag" != "$arg" ]]; then
+        fatal "${scopeFlag} and ${arg} each choose what this run does; pass exactly one"
+    fi
+    scopeFlag="$arg"
 done
+case "$scopeFlag" in
+    --all) mode=all ;;
+    --ci) mode=ci ;;
+    --self-test) mode=selftest ;;
+esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || fatal "cannot locate the repository"
 cd "$repo_root" || fatal "cannot enter ${repo_root}"
@@ -783,6 +953,22 @@ if [[ "$mode" == selftest ]]; then
     fi
     SelfTest
     exit $?
+fi
+
+# `--ci` resolves the scope and the base from the table above, so the workflow
+# hands over the three FACTS its context holds and restates none of the decision.
+# It prints what it resolved, because a scope nobody can see in the log is the
+# thing this script exists to make impossible one level down.
+if [[ "$mode" == ci ]]; then
+    ciDecision="$(CiScopeFor "${GITHUB_EVENT_NAME:-}" "${GITHUB_BASE_REF:-}" "${MERGE_GROUP_BASE_SHA:-}")" \
+        || fatal "CiScopeTable names a scope or a base this script cannot resolve, or matched no row at all; refusing rather than guessing a scope"
+    mode="${ciDecision%%$'\t'*}"
+    if [[ "$mode" == diff ]]; then
+        BASE="${ciDecision#*$'\t'}"
+        echo "TIDY SWEEP: event ${GITHUB_EVENT_NAME:-<none>} diff-scopes against ${BASE}"
+    else
+        echo "TIDY SWEEP: event ${GITHUB_EVENT_NAME:-<none>} sweeps everything"
+    fi
 fi
 
 command -v "$TIDY" >/dev/null 2>&1 || fatal "$TIDY is not on PATH"

@@ -21,9 +21,10 @@
 # Runs as `cmake -P`, for the reason check-net-boundary.cmake states: this
 # compares strings and reports, so a .sh + .ps1 pair would be two implementations
 # of one rule differing only in syntax, and cmake is the one tool guaranteed
-# present. Its registration therefore carries `FAIL_REGULAR_EXPRESSION`:
-# `message(FATAL_ERROR)` prints `CMake Error` and exits **0** on CMake 3.28, this
-# project's declared minimum, so the exit code cannot be the verdict.
+# present. Its registration therefore carries `FAIL_REGULAR_EXPRESSION`, and that
+# property rather than the exit code is the verdict -- the measurement and the
+# reasons live in `scripts/check-script-check-signals.cmake` and are deliberately
+# not restated here (#565).
 #
 # **It fails when its own scan matches nothing.** A check that counted zero
 # callers and reported success would pass vacuously the day somebody renames the

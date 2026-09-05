@@ -1275,27 +1275,57 @@ problems, which is why it survived being seen repeatedly.
 
 ## A `cmake -P` check cannot fail its own test
 
-`message(FATAL_ERROR)` in script mode prints `CMake Error ...` and then exits
-**0**. Measured on both sides: CMake 3.28.3 exits 0, CMake 4.3.1 exits 1. This
-project declares `cmake_minimum_required(VERSION 3.28)`, so on its own stated
-minimum every `cmake -P` hygiene check reported PASSED however loudly it had just
-objected. **Thirteen were registered that way**, and AGENT.md names several of
-them as the one thing standing behind a rule that has already been a bug:
-`target-file-guards`, `net-boundary`, `repository-hygiene`, `test-name-hygiene`,
-`node-config-reference`, `tsan-scope-hygiene`.
+This section used to open by stating, as a measurement, that `message(FATAL_ERROR)`
+in script mode prints `CMake Error ...` and then exits **0** on CMake 3.28 — this
+project's declared minimum — so that every `cmake -P` hygiene check reported
+PASSED however loudly it had just objected. **Thirteen registrations, and this
+rule, rest on that sentence, and it does not reproduce** (#565).
 
-- **The fact was already written down, one clause short of the conclusion.** The
-  `repository-hygiene` registration says a `-P` script "cannot choose its own exit
-  code before CMake 3.29 (`cmake_language(EXIT)`) while this project supports
-  3.28", and draws from it the right answer for SKIP — `SKIP_REGULAR_EXPRESSION`
-  rather than `SKIP_RETURN_CODE 77`. The same sentence decides the FAIL direction
-  and nobody carried it there. The skip direction is the cosmetic one; the fail
-  direction is the whole check.
-- **So the verdict is read from the output**, which every CMake version produces
-  identically: `FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"`, one
-  spelling defined once in `src/tests/CMakeLists.txt`. A pattern restated per
-  registration is one that drifts, and a drifted pattern stops matching without
-  saying so.
+- **What reproduces.** Exit **1**, on 3.22.6, 3.25.2, 3.27.9, 3.28.3, 3.31.6 and
+  4.3.0, for six script shapes — bare, inside `if()`, inside `function()`, inside
+  `foreach()`, inside `macro()`, and `SEND_ERROR` — each reading taken with
+  controls proving the harness could report a zero. Two machines in the ticket
+  read the same on Ubuntu's 3.28.3 and on Windows. The claim is now **asked**
+  rather than remembered: `ctest -R fatal-error-exit`, in the default set, so
+  every platform CI builds answers it on every run. A red one is a discovery —
+  the condition has been found somewhere — not a defect in the check.
+- **How a measured claim came out wrong, which is the transferable part.** A TRUE
+  neighbouring fact carried one clause too far. A `-P` script genuinely cannot
+  **choose** its exit code before CMake 3.29 — `cmake_language(EXIT)` is 3.29, and
+  on 3.28.3 it is an unknown command, measured — which is why the SKIP direction
+  correctly uses `SKIP_REGULAR_EXPRESSION` rather than `SKIP_RETURN_CODE 77`.
+  *Cannot choose its exit code* then became *cannot signal failure by exit code*,
+  and `message(FATAL_ERROR)` hands you exactly one code you did not choose, `1`,
+  which is the only one a failure needs. Both reproducible ways to see a 0 are
+  instrument shapes rather than CMake versions: an unguarded pipeline (`cmake -P …
+  | tail` reports the pipe's status) and a nested `cmake -P` whose
+  `RESULT_VARIABLE` is unread. The first is this file's own eleven-ways bullet;
+  the second is now what `script-check-canary` is built out of.
+- **The verdict is still read from the output, for two reasons that are true and
+  neither of which was the stated one.** `message(WARNING)` exits **0** on every
+  version above while printing `CMake Warning`, so only an output verdict can hear
+  a check that warns (#517) — which is why the pattern covers both words and why
+  `script-check-warning-canary` is the half that proves the mechanism. And a check
+  that shells out to another CMake without reading `RESULT_VARIABLE` exits 0 with
+  its child's error on the output. `FAIL_REGULAR_EXPRESSION
+  "${FASTCACHED_SCRIPT_CHECK_FAILED}"`, one spelling defined once in
+  `src/tests/CMakeLists.txt`: a pattern restated per registration is one that
+  drifts, and a drifted pattern stops matching without saying so.
+- **A canary carried by its exit code is vacuous, and correcting the note is what
+  exposed it.** A test fails when its exit code is non-zero **OR** the pattern
+  matches, and `WILL_FAIL` inverts that whole verdict — so `script-check-canary`,
+  a bare `message(FATAL_ERROR)` exiting 1, passed on its exit code alone and would
+  have gone on reporting green with `FAIL_REGULAR_EXPRESSION` deleted from every
+  registration in the tree. Measured under ctest, three cases: the old shape
+  passes without the property, the new shape passes with it and **fails** without
+  it. So the canary now exits **0** and prints a real `CMake Error` from a nested
+  `cmake -P`, which leaves the pattern as the only thing that can fail it. That
+  exit status is now load-bearing and therefore **asserted rather than
+  remembered**: `check-script-check-signals` runs every `WILL_FAIL` registration's
+  script and refuses a non-zero one, with a positive control refusing a scan that
+  found no canary at all — otherwise "it exits 0" would be the next sentence
+  somebody carries one clause too far. Fixing a wrong *reason* without re-deriving
+  what it justified is how a guard survives as decoration.
 - **A failure signal that is a property needs a canary and an omission check, and
   they answer different questions.** `script-check-canary` is a script whose only
   job is to fail, registered `WILL_FAIL TRUE`: it is green exactly while the
@@ -1537,23 +1567,43 @@ makes it anyway and says so there.
   translation units — the failure `tidy-sweep.sh` exists to prevent one level down,
   reached one level up. Delete the report step and the full sweep still runs, still
   fails and still reaches nobody. So the check reads the workflow for four things:
-  that `--all` is passed, and that its guard **EXCLUDES the two diff-scoped events**
-  rather than NAMING the event that gets the full sweep; that a queue entry diffs
-  against its own `base_sha`; that some step reads the sweep STEP's conclusion for
-  `refs/heads/master`; and that the job grants the `issues: write` without which
-  that reader is decorative.
+  that the sweep step **consults the mapping** (`--ci`) and restates none of it;
+  that the queue entry's own `base_sha` reaches that mapping **under the
+  environment name `tidy-sweep.sh` reads it from**, which the check takes from that
+  script rather than restating — matching only the expression cannot see a rename,
+  and a rename is the one edit that breaks the wiring while leaving the expression
+  in place, silently, in the direction where the queue diffs against master; that
+  some step reads
+  the sweep STEP's conclusion for `refs/heads/master`; and that the job grants the
+  `issues: write` without which that reader is decorative.
 
-  The first of those is a spelling, and the spelling is the whole rule.
-  `event_name == 'push'` and `event_name != 'pull_request' && event_name !=
-  'merge_group'` select the same events today and fall opposite ways tomorrow: a
-  trigger added to `on:` later diff-scopes under the first and sweeps everything
-  under the second, and on master a diff-scoped run has an EMPTY diff, so
-  `tidy-sweep.sh` prints `no source changed` and exits 0 having analysed nothing.
-  Narrowing silently is the failure; re-widening is merely slow. The check
-  therefore refuses the inclusive spelling outright — this paragraph said the
-  reverse until the review caught it, which is worth leaving recorded, because an
-  agent reading this file before touching the area would have rewritten the guard
-  on its authority and been failed by the check.
+  **The mapping itself is one table**, `CiScopeTable` in `scripts/tidy-sweep.sh`,
+  driven by that script's own `--self-test` (#570). It was two GitHub expressions —
+  a `BASE:` env expression and an `--all` argument expression — composed with the
+  shell inside the script, so "what happens on event X" had to be read out of two
+  languages, and nothing stated it. The reader's `if:` is a third per-event
+  expression in that workflow and deliberately did **not** move: it decides who is
+  TOLD about a failure rather than how wide the analysis is, and rule C still
+  checks it where it stands. The
+  workflow now hands over the three FACTS its context holds
+  (`GITHUB_EVENT_NAME`, `GITHUB_BASE_REF`, `MERGE_GROUP_BASE_SHA`) and decides
+  nothing, which is why the check's first rule is now *do not decide here* rather
+  than *spell the guard this way*.
+
+  That respelling is not a tidy-up, and what it preserves is worth keeping written
+  down. The old guard had to EXCLUDE the two diff-scoped events rather than NAME
+  the event that gets the full sweep: `event_name == 'push'` and `event_name !=
+  'pull_request' && event_name != 'merge_group'` select the same events today and
+  fall opposite ways tomorrow — a trigger added to `on:` later diff-scopes under
+  the first and sweeps everything under the second, and on master a diff-scoped run
+  has an EMPTY diff, so `tidy-sweep.sh` prints `no source changed` and exits 0
+  having analysed nothing. Narrowing silently is the failure; re-widening is merely
+  slow. A table with a **default row** is that property made structural: the events
+  that diff-scope are listed, everything else falls to `all`, and there is no
+  spelling left to get backwards. The paragraph this replaces said the reverse of
+  the old rule until a review caught it, which is worth leaving recorded, because
+  an agent reading this file before touching the area would have rewritten the
+  guard on its authority and been failed by the check.
 
   Each rule is driven red on a GENERATED workflow by `--self-test`, in both
   directions, because a guard nobody has seen bite has told you nothing. Generated
@@ -3003,12 +3053,19 @@ are recorded together because the shape is one shape.
   here, since `gh` renders an unfinished job's conclusion as the empty string.
   Split by hand (`${line%%$'\t'*}`) and count the delimiters first.
 - **A fixture built on `message(FATAL_ERROR)` cannot test the rule that verdicts
-  are read from OUTPUT.** It exits **0** on CMake 3.28, this project's declared
-  minimum, and **1** on the 4.3 this was written against — so on a modern host the
-  exit status alone is sufficient and deleting the output half of the verdict left
-  the self-test GREEN. The mode under test was not the mode in use. There is now a
-  fixture per arm: one that prints the failure text and exits 0, one that exits
-  non-zero with clean output.
+  are read from OUTPUT.** It exits **1**, so the exit status alone is sufficient
+  and deleting the output half of the verdict left the self-test GREEN. The mode
+  under test was not the mode in use. There is now a fixture per arm: one that
+  prints the failure text and exits 0, one that exits non-zero with clean output.
+
+  This bullet said the exit code was **0** on 3.28 and **1** on 4.3, which made
+  the defect sound like a property of the reviewer's host. It is not — the exit is
+  1 on every version measured (#565) — and the correction makes the finding
+  **stronger**, not weaker: the fixture was insufficient on every machine, always,
+  rather than only on a modern one. It is left recorded because a wrong premise
+  under a right conclusion is the hardest kind to notice, and this bullet is the
+  same defect as the section above it, one level down.
+
 - **CMake WRAPS its diagnostic messages, so a phrase you grep for may exist in the
   output and in no single LINE of it.** A mutation harness reported all three of its
   arms as `SELFTEST STAYED GREEN -- this mutation is NOT covered` while the self-test
@@ -3032,14 +3089,27 @@ are recorded together because the shape is one shape.
   different tool.
 
   **And this is a property of every verdict this repository reads, not a trap somebody
-  might hit.** A `cmake -P` script cannot fail by exit code — `message(FATAL_ERROR)`
-  prints and exits 0 on 3.28 — so the verdict travels through the diagnostic channel by
-  construction. Measured: **37 of 37** `scripts/check-*.cmake` report through
-  `message(FATAL_ERROR)` — on the branch that added this entry; **35 of 35** on the
-  master it branched from, the two extra being that change's own. Both figures are
-  right for the tree they were taken on, which is the census rule arriving a third
-  time: not a different pattern here, the *same* pattern on a different tree. State
-  which tree, or the next person measures 35 and concludes the rule overstates itself.
+  might hit.** A `cmake -P` check's verdict travels through the DIAGNOSTIC channel by
+  construction — its registration is read by `FAIL_REGULAR_EXPRESSION`, which must also
+  hear a check that merely WARNS, and `message(WARNING)` exits 0 on every CMake. (This
+  said *"`message(FATAL_ERROR)` prints and exits 0 on 3.28"*; that does not reproduce —
+  exit **1** on 3.22.6 through 4.3.0, #565 — and the conclusion never needed it, since
+  what makes the channel load-bearing is the warning half, not the exit code.)
+
+  Measured: **37 of 37** `scripts/check-*.cmake` carry `message(FATAL_ERROR)` — on the
+  branch that added this entry; **35 of 35** on the master it branched from, the two
+  extra being that change's own; and **43 of 44** after #565 landed beside it. Every
+  figure is right for the tree it was taken on, which is the census rule arriving a
+  third time: not a different pattern here, the *same* pattern on a different tree.
+  State which tree, or the next person measures 35 and concludes the rule overstates
+  itself.
+
+  **And the 44th is the one to read.** `scripts/check-fatal-error-exit-selftest.cmake`
+  carries no `message(FATAL_ERROR)` at all — it reports through `message("CMake Error:
+  …")`, which is what several checks here already do. So the census was a PROXY for
+  "reports through the diagnostic channel" and the proxy has now parted company with the
+  property: the conclusion above still holds for all 44, and the count that stood in for
+  it does not. A census whose pattern is a proxy states which one it measured.
   Every one of them is a check whose verdict cannot be read by a substring match that
   crosses column 74. So flatten (`tr '\n' ' ' | tr -s ' '`)
   before matching any verdict text, or match a phrase short enough that it cannot

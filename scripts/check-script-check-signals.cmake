@@ -8,18 +8,53 @@
 # CMake minimum, because script mode sets no policies. Pass 3 states the second
 # in full.
 #
-# `message(FATAL_ERROR)` in script mode prints `CMake Error ...` and exits **0**
-# on CMake 3.28 -- this project's declared minimum. Measured: 3.28.3 exits 0,
-# 4.3.1 exits 1. So a check registered as a bare `cmake -P` is a check ctest
-# marks PASSED however loudly it objected, on the platform CI builds on. Thirteen
-# were registered that way, several of them the only thing standing behind a rule
-# that has already been a bug.
+# This file used to justify itself by saying that `message(FATAL_ERROR)` in
+# script mode prints `CMake Error ...` and exits **0** on CMake 3.28, this
+# project's declared minimum -- "measured: 3.28.3 exits 0, 4.3.1 exits 1".
 #
-# The fix is FAIL_REGULAR_EXPRESSION, and the fix's own weakness is that it is a
-# property somebody has to remember. `script-check-canary` covers the case where
-# the mechanism stops working; this covers the case where a new registration
-# never opts into it -- which is the far likelier of the two, and the one that
-# reads as a working check.
+# **That does not reproduce, and the sentence was the sole stated reason for
+# thirteen registrations** (#565). Measured across six CMake versions -- 3.22.6,
+# 3.25.2, 3.27.9, 3.28.3, 3.31.6, 4.3.0 -- and six script shapes -- bare, inside
+# `if()`, inside `function()`, inside `foreach()`, inside `macro()`, and
+# `SEND_ERROR` -- the exit code is **1** every time, with controls proving the
+# harness could read a zero. `ctest -R fatal-error-exit` now asks the same
+# question on every platform CI builds rather than leaving it a sentence.
+#
+# The likely mechanism, because it is worth recording how a measured claim came
+# out wrong: a TRUE neighbouring fact carried one clause too far. A `-P` script
+# genuinely cannot CHOOSE its exit code before CMake 3.29 -- `cmake_language(EXIT)`
+# is 3.29, and on 3.28.3 it is an unknown command -- which is why the SKIP
+# direction correctly uses `SKIP_REGULAR_EXPRESSION` rather than
+# `SKIP_RETURN_CODE 77`. "Cannot choose its exit code" was then read as "cannot
+# signal failure by exit code", and `message(FATAL_ERROR)` gives you exactly one
+# code you did not choose, 1, which is the only one a failure needs. The two
+# reproducible ways to see a 0 are both instrument shapes and neither is a CMake
+# version: an unguarded pipeline (`cmake -P … | tail` reports the pipe), and a
+# nested `cmake -P` whose `RESULT_VARIABLE` is unread.
+#
+# **The requirement stays, and its reasons are now the true ones.** Two, and
+# neither was the stated one:
+#
+#   * `message(WARNING)` exits **0** on every version above while printing
+#     `CMake Warning`, so only an output verdict can hear a check that warns --
+#     the pattern covers both words for that reason (#517), and
+#     `script-check-warning-canary` is the half that proves it.
+#   * a check that shells out to another CMake without reading `RESULT_VARIABLE`
+#     exits 0 with its child's `CMake Error` on the output. That is a real shape
+#     for a check that drives another script, and it is what
+#     `script-check-canary` is now built out of.
+#
+# The fix's own weakness is that it is a property somebody has to remember.
+# `script-check-canary` covers the case where the mechanism stops working; this
+# covers the case where a new registration never opts into it -- which is the far
+# likelier of the two, and the one that reads as a working check.
+#
+# And the third question, which is about the canaries rather than the checks:
+# `WILL_FAIL` inverts ctest's whole verdict, and that verdict is `non-zero exit OR
+# the pattern matched`, so a canary exiting non-zero passes on its status alone and
+# proves nothing about the property. Pass 4 runs every WILL_FAIL registration's
+# script and refuses a non-zero one -- the alternative being one more sentence
+# somebody has to remember, which is what #565 was about.
 #
 # The set of checks is READ from src/tests/CMakeLists.txt, never restated here.
 # A second copy of the list is not a cross-check; it is a second thing to be
@@ -33,8 +68,10 @@
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-script-check-signals.cmake
 #
-# Exit codes: 0 always -- see above. The verdict is the presence of `CMake Error`
-# in the output.
+# Exit codes: whatever CMake gives it, which for `message(FATAL_ERROR)` is 1 on
+# every version measured. The verdict is still read from the presence of
+# `CMake Error` in the output, because that is the rule this file enforces and a
+# check exempting itself from its own rule is not one.
 
 cmake_minimum_required(VERSION 3.28)
 
@@ -152,6 +189,8 @@ endfunction()
 
 set(sawMissingSignal FALSE)
 set(sawMissingDeclaration FALSE)
+set(sawVacuousCanary FALSE)
+set(willFailRegistrations "")
 
 # ---------------------------------------------------------------------------
 # Pass 2: each of them must be given the failure signal.
@@ -167,6 +206,7 @@ foreach(registration IN LISTS scriptRegistrations)
     string(REPLACE "}" "\\}" escaped "${escaped}")
 
     set(signalled FALSE)
+    set(willFail FALSE)
     set(inBlock FALSE)
     foreach(line IN LISTS lines)
         if(line MATCHES "^[ \t]*#")
@@ -176,11 +216,20 @@ foreach(registration IN LISTS scriptRegistrations)
             set(inBlock TRUE)
         elseif(inBlock AND line MATCHES "FAIL_REGULAR_EXPRESSION")
             set(signalled TRUE)
-            break()
+        elseif(inBlock AND line MATCHES "WILL_FAIL[ \t]+TRUE")
+            # Recorded rather than acted on here; pass 4 is where it is spent,
+            # beside the resolved path it needs. The scan no longer stops at the
+            # first property it recognises, because two of them are wanted now.
+            set(willFail TRUE)
         elseif(inBlock AND line MATCHES "^[ \t]*\\)[ \t]*$")
             set(inBlock FALSE)
+            break()
         endif()
     endforeach()
+
+    if(willFail)
+        list(APPEND willFailRegistrations "${registration}")
+    endif()
 
     if(NOT signalled)
         set(sawMissingSignal TRUE)
@@ -259,6 +308,41 @@ foreach(registration IN LISTS scriptRegistrations)
         list(APPEND violations
              "`${scriptPath}`, run by `${check}`, declares no cmake_minimum_required, so every policy is unset in it and a policy-gated construct will mean different things on 3.28 and on 4.x")
     endif()
+
+    # -----------------------------------------------------------------------
+    # Pass 4, folded into pass 3 because it needs the same resolved path: a
+    # WILL_FAIL registration's script must exit **0**.
+    #
+    # ctest fails a test when its exit code is non-zero OR the FAIL pattern
+    # matches, and WILL_FAIL inverts that whole verdict. So a canary that exits
+    # non-zero is green on its exit code alone: delete FAIL_REGULAR_EXPRESSION
+    # from every registration in this tree and it would go on reporting success,
+    # having proved nothing about the property it exists to prove. That is
+    # exactly the vacuous shape #565 found in `script-check-canary`, and the
+    # canaries now avoid it only by exiting 0 -- which was a property nothing
+    # asserted, i.e. the same "a property somebody has to remember" this file
+    # exists to stop relying on.
+    #
+    # Only the exit status is asserted. The other half announces itself: a canary
+    # that stops PRINTING the pattern passes under ctest, WILL_FAIL inverts it,
+    # and the canary itself goes red by name.
+    #
+    # The child's output is CAPTURED, never inherited -- a canary prints
+    # `CMake Error` on purpose and inheriting it would trip this check's own
+    # FAIL_REGULAR_EXPRESSION and report a violation for a canary that works.
+    if(registration IN_LIST willFailRegistrations)
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -P "${resolved}"
+            RESULT_VARIABLE canaryStatus
+            OUTPUT_VARIABLE canaryOut
+            ERROR_VARIABLE canaryErr
+        )
+        if(NOT canaryStatus STREQUAL "0")
+            set(sawVacuousCanary TRUE)
+            list(APPEND violations
+                 "`${check}` is registered WILL_FAIL and its script exits ${canaryStatus} -- ctest's verdict is `non-zero OR pattern`, so WILL_FAIL inverts a pass it got from the exit code alone, and the canary would stay green with every FAIL_REGULAR_EXPRESSION in this file deleted")
+        endif()
+    endif()
 endforeach()
 
 if(violations)
@@ -268,12 +352,22 @@ if(violations)
     endforeach()
     message("")
     if(sawMissingSignal)
-    message("A `cmake -P` script cannot fail its own test: message(FATAL_ERROR) prints")
-    message("`CMake Error` and exits 0 on CMake 3.28, this project's minimum. Add")
+    message("A `cmake -P` check is judged by its OUTPUT here, not by its exit code:")
+    message("the pattern must also hear a check that merely WARNS, and a warning")
+    message("exits 0 on every CMake. Add")
     message("")
     message("    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"")
     message("")
     message("to the set_tests_properties() block, alongside LABELS and TIMEOUT.")
+    message("")
+    endif()
+    if(sawVacuousCanary)
+    message("A WILL_FAIL registration inverts ctest's WHOLE verdict, and that verdict is")
+    message("`non-zero exit OR the pattern matched`. A canary that exits non-zero therefore")
+    message("passes on its exit code alone and says nothing about the pattern -- which is")
+    message("the shape #565 found. Make the script exit 0 and print `CMake Error` (a nested")
+    message("`cmake -P` whose RESULT_VARIABLE is unread does exactly that), so the pattern")
+    message("is the only thing left that can fail it.")
     message("")
     endif()
     if(sawMissingDeclaration)
@@ -291,6 +385,20 @@ if(violations)
         "registration(s)")
 endif()
 
+# A count of BAD things says nothing about whether the good things exist, so the
+# canary pass gets its own positive control: the two WILL_FAIL registrations are
+# what the whole FAIL_REGULAR_EXPRESSION mechanism rests on, and a scan that found
+# none of them would have checked nothing while printing the same summary.
+list(LENGTH willFailRegistrations willFailCount)
+if(willFailCount EQUAL 0)
+    message(FATAL_ERROR
+        "no WILL_FAIL registration was found in ${testsFile} at all; the canaries that "
+        "prove the FAIL_REGULAR_EXPRESSION mechanism still works are gone, or this scan "
+        "has stopped seeing them -- either way pass 4 checked nothing")
+endif()
+
 message(STATUS
     "script-check signals: ${scriptCheckCount} `cmake -P` registration(s), all able to "
-    "report failure and all running a script that declares a CMake minimum")
+    "report failure and all running a script that declares a CMake minimum; "
+    "${willFailCount} WILL_FAIL canary/canaries, all exiting 0 so the pattern is what "
+    "decides them")

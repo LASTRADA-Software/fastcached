@@ -67,6 +67,46 @@ on:
   merge_group:
     branches: [master]
 
+# The floor every job in this file starts from, and it is a REDUCTION rather than
+# a grant: without it each job inherits the repository's workflow-permissions
+# default, which an administrator can widen for reasons that have nothing to do
+# with this workflow. `pr-labels.yml` and `issue-triage.yml` declare
+# `permissions: {}`, `docs.yml` declares `contents: read` and
+# `merge-group-report.yml` declares `contents: read` + `issues: write` -- FOUR,
+# not the three #572 names, `merge-group-report.yml` having arrived with #684.
+# This was the one workflow with no floor, which left a reader unable to tell
+# whether narrowing is this repository's convention or an option some files
+# happen to take.
+#
+# `contents: read` and nothing else, ENUMERATED from what the jobs do rather than
+# copied from a sibling workflow:
+#
+#   * `actions/checkout` is the only thing 19 of the 21 jobs ask a token for, and
+#     it needs `contents: read`.
+#   * `actions/cache`, `actions/cache/restore`, `actions/upload-artifact`,
+#     `actions/download-artifact` and `hendrikmuhs/ccache-action` reach the cache
+#     and artifact services through `ACTIONS_RUNTIME_TOKEN`, which this block does
+#     not govern. A too-narrow `permissions:` cannot break them and a wider one
+#     would not help them.
+#   * `mozilla-actions/sccache-action` lists a public repository's releases, and
+#     `codecov/codecov-action` is handed `secrets.CODECOV_TOKEN` explicitly rather
+#     than minting an OIDC one -- so neither needs `id-token: write`.
+#   * `docker` builds an image and runs it; it pushes to no registry, so no
+#     `packages: write`.
+#
+# The two jobs that need more say so themselves, and that is what keeps the
+# exception visible: `clang-tidy` adds `issues: write` for its report step and
+# `release` takes `contents: write` to draft the release. A job-level block
+# REPLACES this one rather than adding to it -- every scope a job names is the
+# whole of what that job gets -- which is also the verification argument for a
+# change that cannot be exercised on a pull request. `release` runs only on a tag
+# and carries its own exhaustive block, so this floor cannot reach it. Every other
+# job in this file runs on a pull request, so a green pull request does exercise
+# the narrowing for all of them.
+
+permissions:
+  contents: read
+
 concurrency:
   # Inside a queue `github.ref` is the temporary branch
   # `refs/heads/gh-readonly-queue/master/pr-<n>-<sha>`, which is unique per queue
@@ -616,45 +656,43 @@ jobs:
       - name: "Self-test the sweep's scope computation"
         run: scripts/tidy-sweep.sh --self-test
 
-      # A pull request and a merge-queue entry diff-scope; everything else sweeps
-      # everything, which today is the `push` and nothing else. Why that is sound,
-      # what it costs and what it buys are one bullet in *What CI costs* in
-      # `.agent/rules/build-and-toolchain.md` — pointed at rather than summarised,
-      # because the last two figures written down in this file went stale while
-      # reading as current fact. What is here is only what a reader AT THIS STEP
-      # cannot get from there.
+      # WHICH events diff-scope and which base each one uses is `CiScopeTable` in
+      # `scripts/tidy-sweep.sh`, and `--ci` is this step consulting it. It used to
+      # be two GitHub expressions here composed with the shell inside the script,
+      # so answering "what happens on event X" meant composing two languages, and
+      # nothing stated the mapping (#570). The table is driven by
+      # `scripts/tidy-sweep.sh --self-test`, which the step above already runs.
+      # The reader's `if:` below is a third per-event expression and stays where
+      # it is: it decides who is TOLD, not how wide the analysis is.
       #
-      # The guard NAMES THE TWO DIFF-SCOPED EVENTS and excludes them, rather than
-      # naming `push` and including it, and the difference is which way an
-      # unforeseen trigger falls. `on:` is contemplated growing — the comment above
-      # this job says a nightly is *deliberately* not a third trigger — and under an
-      # `== 'push'` guard a `schedule:` or a `workflow_dispatch:` added later would
-      # diff-scope against `origin/master`. On master that diff is EMPTY, so the
-      # sweep prints `no source changed` and exits 0: a green check that analysed
-      # nothing, which is the verdict `tidy-sweep.sh`'s own header exists to make
-      # impossible. Spelled as an exclusion, a trigger nobody thought of gets the
-      # full sweep — slow, never wrong, and `ci-scope.sh`'s principle rather than
-      # its inverse. `ctest -R tidy-sweep-scope` refuses the inclusive spelling.
+      # So this step hands over the three FACTS its context holds and restates none
+      # of the decision. `GITHUB_EVENT_NAME` and `GITHUB_BASE_REF` are already in
+      # every step's environment; the queue's base commit is not, which is the one
+      # value below.
       #
-      # BASE in a queue is the event's own `base_sha`, which is the head of the
-      # entry AHEAD of this one, not master: the queue stacks, and the branch names
-      # say so — `pr-546-f209cf1c…` ran at head `d483441a`, which is the base of
-      # `pr-551-d483441a…`. So each entry sweeps its own change against a tree that
-      # already carries the entries before it, which is the scope that composes.
+      # Why that is sound, what it costs and what it buys are one bullet in
+      # *What CI costs* in `.agent/rules/build-and-toolchain.md` -- pointed at
+      # rather than summarised, because the last two figures written down in this
+      # file went stale while reading as current fact. What is here is only what a
+      # reader AT THIS STEP cannot get from there.
       #
-      # `tidy-sweep.sh` reads BASE only through `git rev-parse --verify` and
-      # `git diff BASE...HEAD`, both of which take a raw SHA, and `fetch-depth: 0`
-      # above puts it in the clone. A BASE it cannot RESOLVE makes it sweep
-      # EVERYTHING — `ci-scope.sh`'s own principle, already inside the script.
+      # `fetch-depth: 0` above is what makes a queue entry's base RESOLVE. The base
+      # there is a bare COMMIT (`merge_group.base_sha`, the head of the entry ahead
+      # of this one, not master), and a shallow clone of
+      # `gh-readonly-queue/master/pr-N-<sha>` would not contain it. `tidy-sweep.sh`
+      # escalates a base it cannot resolve to a full sweep -- `ci-scope.sh`'s own
+      # principle -- so the depth going missing would hide the regression as a
+      # permanently full sweep in the queue, the cost #554 exists to remove,
+      # restored silently.
       #
       # That covers the absent and the malformed, and it is deliberately not the
       # stronger claim, because the script has a second exit: a base that resolves
       # but whose diff holds no source prints `no source changed` and exits 0,
-      # having analysed nothing. That is CORRECT for what reaches it here — a
+      # having analysed nothing. That is CORRECT for what reaches it here -- a
       # docs-only entry has nothing to tidy, exactly as its own pull-request run
-      # found — but it is the one direction that does not escalate, so a future
-      # change to how BASE is derived has to be judged against it rather than
-      # against the resolve check.
+      # found -- but it is the one direction that does not escalate, so a future
+      # change to the table has to be judged against it rather than against the
+      # resolve check.
       #
       # This does NOT contradict the `changes` job's refusal to scope a queue
       # entry, which stands. That job decides whether a JOB RUNS AT ALL, where a
@@ -663,25 +701,19 @@ jobs:
       # shape GitHub chooses. This decides how WIDE one analysis is, over a tree
       # that is being fully built either way, and the only way of being wrong about
       # the batch shape that this step can PRODUCE is a base it cannot resolve,
-      # which escalates. Not the general claim that being wrong escalates — the
+      # which escalates. Not the general claim that being wrong escalates -- the
       # paragraph above says exactly where that stops holding.
-      #
-      # `github.base_ref` is empty on a push, where `--all` is passed anyway and
-      # BASE is never read. It is ALSO empty on a `merge_group`, where `--all` is
-      # not passed — so the `format(...)` fallback is what a missing or renamed
-      # `merge_group.base_sha` lands on there, and it lands on `origin/master`,
-      # which resolves and over-approximates. That is the whole reason the default
-      # is `master` rather than a bare `origin/`: the two expressions on this step
-      # do not have to agree to be correct.
       - name: "Sweep"
         id: sweep
         env:
           TIDY: clang-tidy-${{ env.CLANG_TOOLS_VERSION }}
           DB: out/build/clang-debug
-          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || format('origin/{0}', github.base_ref || 'master') }}
-        run: >-
-          scripts/tidy-sweep.sh
-          ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') && '--all' || '' }}
+          # The queue entry's own base commit -- the head of the entry ahead of
+          # this one. Empty on every other event, which is what `CiScopeTable`'s
+          # `origin/master` fallback is for. A FACT, not a decision: whether it is
+          # read at all is the table's answer.
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: scripts/tidy-sweep.sh --ci
 
       # The step above is now the only full sweep, and a master push blocks nothing
       # and reaches nobody — measured three ways, recorded in the same rulebook
@@ -2864,9 +2896,13 @@ jobs:
       - package-macos
       - package-windows
     runs-on: ubuntu-24.04
-    # The only job here needing more than the repository's default read-only
-    # token: creating a release writes `contents`. Without this the release step
+    # One of the two jobs here needing more than this workflow's `contents: read`
+    # floor: creating a release writes `contents`. Without this the release step
     # fails with a bare 403 rather than with anything that names the cause.
+    #
+    # A job-level block REPLACES the top-level one rather than adding to it, so
+    # `contents: write` is the whole of what this job gets -- which is also why
+    # narrowing the floor cannot break the one job a pull request never exercises.
     permissions:
       contents: write
     steps:

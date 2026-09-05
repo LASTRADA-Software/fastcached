@@ -38,9 +38,9 @@
 # argument does not silently start running with the wrong one.
 #
 # The verdict rules are read from there too. `FASTCACHED_SCRIPT_CHECK_FAILED` is
-# this tree's one spelling of "a `cmake -P` check failed" -- a `-P` script prints
-# `CMake Error` and exits **0** on CMake 3.28, this project's declared minimum, so
-# the verdict cannot be the exit status alone -- and a check's own
+# this tree's one spelling of "a `cmake -P` check failed" -- the verdict is the
+# OUTPUT rather than the exit status alone, because the pattern also has to hear a
+# check that merely WARNS, and a warning exits 0 on every CMake -- and a check's own
 # `SKIP_REGULAR_EXPRESSION`, when it has one, is honoured. Restating either would
 # make this script's verdicts drift from ctest's for the same checks.
 #
@@ -416,15 +416,18 @@ message(FATAL_ERROR "the prose and the table disagree")'
     local skipper='cmake_minimum_required(VERSION 3.28)
 message(STATUS "SKIP: no toolchain here")'
 
-    # A failing check AS CMAKE 3.28 PRESENTS ONE: the text on stdout and an exit
-    # status of ZERO. Not a contrivance -- 3.28 is this project's declared
-    # minimum, `message(FATAL_ERROR)` prints `CMake Error` and exits 0 there, and
-    # that is the whole reason this tree reads verdicts from output and the whole
-    # reason `FASTCACHED_SCRIPT_CHECK_FAILED` exists.
+    # A failing check the way the CONTRACT allows one to present: the text on
+    # stdout and an exit status of ZERO. Not a contrivance -- a check that merely
+    # WARNS exits 0 on every CMake while printing `CMake Warning`, and a check that
+    # shells out to another `cmake -P` without reading `RESULT_VARIABLE` exits 0
+    # with its child's error on the output. That is why this tree reads verdicts
+    # from output and why `FASTCACHED_SCRIPT_CHECK_FAILED` exists.
     #
-    # It is here because the `noisy` fixture above CANNOT test that rule on a
-    # modern host: measured on cmake 4.3.0, `FATAL_ERROR` exits **1**, so a
-    # verdict judged by the exit status alone passes every case built on `noisy`.
+    # It is here because the `noisy` fixture above CANNOT test that rule: measured
+    # across six CMake versions (#565), `FATAL_ERROR` exits **1** on all of them,
+    # so a verdict judged by the exit status alone passes every case built on
+    # `noisy`. This comment attributed the exit-0 shape to CMake 3.28 until that
+    # measurement; the fixture was right and only its reason was wrong.
     # Found by deleting the output half of the verdict and watching this
     # self-test stay GREEN -- the mode under test was not the mode in use, which
     # is the defect `.agent/rules/testing.md` records against
@@ -525,9 +528,9 @@ cmake_language(EXIT 3)'
     grep -q "gamma-code" "$baseline" \
         && { echo "  FAIL  an unlabelled check was run" >&2; status=1; }
 
-    # 2. A labelled check that fails. `cmake -P` exits 0 on 3.28 for a
-    #    FATAL_ERROR, so this is also the case that proves the verdict is read
-    #    from the OUTPUT and not from the status.
+    # 2. A labelled check that fails, LOUDLY and with a non-zero status. The
+    #    output-not-status rule is proved by the `exits 0` fixture further down;
+    #    this case is the ordinary one.
     tree="${scratch}/t-failing"
     StageTree "$tree" "$(GoodCMakeLists)"
     WriteCheck "$tree" alpha.cmake "$quiet"
@@ -535,16 +538,18 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" gamma.cmake "$quiet"
     Expect "FAILED   beta-docs" "the failing check was not named" "a labelled check emitting CMake Error is FAILED" want-fail "$tree"
 
-    # 2b. The same failure the way CMake 3.28 -- this project's declared minimum
-    #     -- delivers it: the text printed, the status 0. This is the case the
-    #     verdict's output half exists for, and the only one that can go red when
-    #     that half is deleted.
+    # 2b. The same failure the way the CONTRACT allows one to arrive: the text
+    #     printed, the status 0 -- a check that merely WARNS, or one that shells
+    #     out to another `cmake -P` without reading RESULT_VARIABLE. This is the
+    #     case the verdict's output half exists for, and the only one that can go
+    #     red when that half is deleted. (It said "the way CMake 3.28 delivers it"
+    #     until #565 measured FATAL_ERROR at exit 1 everywhere.)
     tree="${scratch}/t-silently-bad"
     StageTree "$tree" "$(GoodCMakeLists)"
     WriteCheck "$tree" alpha.cmake "$quiet"
     WriteCheck "$tree" beta.cmake "$silentlyBad"
     WriteCheck "$tree" gamma.cmake "$quiet"
-    Expect "FAILED   beta-docs" "a 3.28-shaped failure was read as a pass" "a check printing the failure text and exiting 0 is FAILED (the CMake 3.28 shape)" want-fail "$tree"
+    Expect "FAILED   beta-docs" "a failure that prints and exits 0 was read as a pass" "a check printing the failure text and exiting 0 is FAILED (a warning, or a nested cmake -P)" want-fail "$tree"
 
     # 2c. And the other arm: a non-zero exit with clean output.
     tree="${scratch}/t-quietly-bad"

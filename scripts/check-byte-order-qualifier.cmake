@@ -61,9 +61,11 @@
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-byte-order-qualifier.cmake
 #
-# Exit codes: 0 always -- `message(FATAL_ERROR)` exits 0 on CMake 3.28, this
-# project's declared minimum. The verdict is the presence of `CMake Error` in the
-# output, which is what the FAIL_REGULAR_EXPRESSION on the registration reads.
+# Exit codes: whatever CMake gives it. The verdict is the presence of `CMake Error`
+# in the output, which is what the FAIL_REGULAR_EXPRESSION on the registration
+# reads -- the measurement and the reasons live in
+# `scripts/check-script-check-signals.cmake` and are deliberately not restated
+# here (#565).
 
 # Under CMP0007 OLD, `list()` DISCARDS empty elements -- every blank line in every
 # file scanned here -- so a reported line number would be off by however many

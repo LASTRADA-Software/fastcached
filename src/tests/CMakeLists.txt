@@ -138,19 +138,31 @@ endif()
 # ---------------------------------------------------------------------------
 # How a `cmake -P` check reports FAILURE.
 #
-# It cannot do it with an exit code. `message(FATAL_ERROR)` in script mode prints
+# Not with an exit code alone, and the reason is not the one written here for
+# months. This paragraph said `message(FATAL_ERROR)` in script mode "prints
 # `CMake Error ...` and then exits **0** on CMake 3.28 -- measured, not inferred:
-# 3.28.3 exits 0, 4.3.1 exits 1. So on this project's declared minimum, and on
-# every host whose CMake predates the change, `ctest` sees a clean exit and marks
-# the check PASSED however loudly it just objected. Thirteen checks were
-# registered that way, several of them named in AGENT.md as the one thing
-# standing behind a rule that has already been a bug.
+# 3.28.3 exits 0, 4.3.1 exits 1", and thirteen registrations rest on it.
 #
-# The fact was half-known: the paragraph below says a `-P` script cannot choose
-# its own exit code before 3.29, and concludes SKIP_REGULAR_EXPRESSION for the
-# skip direction. The same sentence decides the FAIL direction and nobody carried
-# it there -- which is the failure this file keeps recording in other people's
-# code, arriving in its own.
+# **It does not reproduce** (#565): exit 1 on 3.22.6, 3.25.2, 3.27.9, 3.28.3,
+# 3.31.6 and 4.3.0, across six script shapes, with controls proving the harness
+# could read a zero. `ctest -R fatal-error-exit` asks it now on every platform CI
+# builds, so the claim is a measurement rather than a sentence.
+#
+# The likely mechanism is a TRUE neighbouring fact carried one clause too far. The
+# paragraph below says a `-P` script cannot CHOOSE its own exit code before 3.29 --
+# `cmake_language(EXIT)` is 3.29, and on 3.28.3 it is an unknown command -- and
+# concludes SKIP_REGULAR_EXPRESSION for the skip direction, which is right.
+# "Cannot choose its exit code" then became "cannot signal failure by exit code",
+# and `message(FATAL_ERROR)` hands you exactly one code you did not choose, 1,
+# which is the only one a failure needs.
+#
+# **The property stays, on the two reasons that are actually true.**
+# `message(WARNING)` exits 0 on every version above while printing `CMake Warning`,
+# so a check that WARNS is audible only through the output (#517) -- which is why
+# the pattern covers both words. And a check that shells out to another CMake
+# without reading RESULT_VARIABLE exits 0 with its child's error on the output;
+# that is the shape `script-check-canary` is now built out of, because carried by
+# an exit code it proved nothing at all.
 #
 # So the verdict is read from the output, which every CMake version produces
 # identically. One spelling, here, rather than thirteen literals: a pattern that
@@ -183,8 +195,18 @@ set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 # for why a property needs one. WILL_FAIL inverts the verdict, so this reports
 # green exactly while the mechanism above works, and red the moment it does not.
 #
-# In the default set with the checks it guards, and cheap for the same reason
-# they are: it starts nothing and reads nothing.
+# That script exits **0** and prints a real `CMake Error` from a nested `cmake -P`,
+# which is not a curiosity but the only shape in which this canary means anything
+# (#565). A test fails when its exit code is non-zero OR the pattern matches, and
+# WILL_FAIL inverts the whole verdict -- so the bare `message(FATAL_ERROR)` this
+# used to be passed on its exit code alone, and would have gone on reporting green
+# with FAIL_REGULAR_EXPRESSION deleted from every registration in this file.
+# Measured under ctest, three cases: the current shape passes with the property and
+# FAILS without it; the old shape passes without it.
+#
+# In the default set with the checks it guards, and cheap for the same reason they
+# are: it reads nothing, and the one process it starts is a second `cmake -P` of
+# itself, which compiles nothing.
 add_test(
     NAME "script-check-canary"
     COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/scripts/script-check-canary.cmake"
@@ -219,8 +241,8 @@ set_tests_properties("script-check-warning-canary" PROPERTIES
 # rather than from a list restated in the checker -- a second copy of the set is
 # not a cross-check, it is a second thing to be wrong.
 #
-# TWO rules over that one derived set, and this comment named only the first
-# until #497 added the second:
+# THREE rules over that one derived set. This comment named only the first until
+# #497 added the second, and only two until #565 added the third:
 #
 #   * every registration carries FAIL_REGULAR_EXPRESSION, so ctest can hear it
 #     fail at all;
@@ -228,6 +250,13 @@ set_tests_properties("script-check-warning-canary" PROPERTIES
 #     mode sets no policies -- so `if(... IN_LIST ...)` errors out on CMake 3.28
 #     and answers on 4.x, and `if(TRUE)` is FALSE on 3.28 and true on 4.x. The
 #     check's own header carries the measurements.
+#   * every WILL_FAIL registration's script exits 0. WILL_FAIL inverts ctest's
+#     whole verdict and that verdict is `non-zero exit OR the pattern matched`, so
+#     a canary exiting non-zero passes on its status alone and would stay green
+#     with the property deleted from every registration above. The canaries avoid
+#     that by exiting 0, and this is what stops "they exit 0" being one more
+#     sentence somebody has to remember. It runs them, which is two `cmake -P`
+#     spawns and the only thing this check starts.
 #
 # Both are properties of a registration that reading it cannot reveal, which is
 # why they are asserted rather than remembered -- and why a comment here that
@@ -239,6 +268,51 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-script-check-signals.cmake"
 )
 set_tests_properties("script-check-signals" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And the third question about the same mechanism, which is neither "does it work"
+# nor "does every registration use it" but *is the reason we need it still true*.
+#
+# `FAIL_REGULAR_EXPRESSION` was required on the stated ground that
+# `message(FATAL_ERROR)` in script mode exits 0 on CMake 3.28, this project's
+# declared minimum. That does not reproduce: exit 1 on 3.22.6, 3.25.2, 3.27.9,
+# 3.28.3, 3.31.6 and 4.3.0 (#565). The property stays, because two OTHER reasons
+# are true and were never the stated one -- `message(WARNING)` exits 0 on every
+# version while printing `CMake Warning`, which only an output verdict can hear
+# (#517), and a check that shells out to another CMake without reading
+# RESULT_VARIABLE exits 0 while its child's error is on the output.
+#
+# A correction that is itself only a sentence would sit exactly where the wrong
+# sentence sat, so this asks the question on every platform CI builds, on every
+# run. It is three `cmake -P` invocations that compile nothing. A red one is a
+# discovery rather than a defect: it means the note's condition has been found on
+# some platform, and the property is load-bearing there rather than defence in
+# depth.
+add_test(
+    NAME "fatal-error-exit"
+    COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/scripts/check-fatal-error-exit.cmake"
+)
+set_tests_properties("fatal-error-exit" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Its verdict, driven against staged readings in both directions. The acquisition
+# half needs a real CMake and a real machine, so only the DECISION is driven here
+# -- the split `.agent/rules/testing.md` records. A check that has only ever been
+# seen to pass has told you nothing, and this one would otherwise be green on
+# every machine forever.
+add_test(
+    NAME "fatal-error-exit-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-fatal-error-exit-selftest.cmake"
+)
+set_tests_properties("fatal-error-exit-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 60
@@ -1470,10 +1544,12 @@ if(NOT WIN32)
     # argument, the missing script, the missing fail-regex, the all-skipped run.
     #
     # Two of its cases exist because a mutation exposed them. `message(FATAL_ERROR)`
-    # exits **0** on CMake 3.28, this project's declared minimum, and **1** on the
-    # 4.3 this was written against -- so a fixture built on `FATAL_ERROR` cannot
-    # test the rule that verdicts are read from OUTPUT, and deleting that half
-    # left the self-test green. There is now a fixture for each arm.
+    # exits **1**, so a fixture built on it cannot test the rule that verdicts are
+    # read from OUTPUT: the status alone is sufficient and deleting that half left
+    # the self-test green. There is now a fixture for each arm. (This said 0 on
+    # 3.28 and 1 on 4.3 until #565 measured it; the correction makes the finding
+    # stronger -- the fixture was insufficient on every machine, not only a modern
+    # one.)
     add_test(
         NAME "doc-subject-checks-selftest"
         COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --self-test
