@@ -85,6 +85,12 @@ set -euo pipefail
 
 SelfName="doc-subject-checks"
 DocSubjectLabel="docs-subject"
+
+# The runners a doc-subject check may be spelled with. A TABLE, because this set
+# is read by the resolver AND rendered into the refusal it prints, and a set
+# stated twice is how the resolver came to know two spellings while the message
+# went on claiming one. Adding a third is adding a word here.
+DocSubjectRunners="-P bash"
 CMakeListsRelative="src/tests/CMakeLists.txt"
 FailRegexVariable="FASTCACHED_SCRIPT_CHECK_FAILED"
 
@@ -212,7 +218,13 @@ Run() {
     Say "verdict pattern read from $CMakeListsRelative: /${failRegex}/"
 
     local cmake="${CMAKE_COMMAND:-cmake}"
-    command -v "$cmake" >/dev/null || Fatal "no cmake on PATH; these checks are \`cmake -P\` scripts and this cannot silently do nothing"
+    # Demanded up front rather than at the first check that needs it, for the
+    # reason the script-existence scan below is: a refusal before anything runs
+    # beats a run whose first check happens to be the broken one. The sentence
+    # says "some of" because that stopped being "all of" when the resolver
+    # learned `bash` -- a message that describes the tool's own scope wrongly is
+    # how a reader concludes the wrong thing about what did not run.
+    command -v "$cmake" >/dev/null || Fatal "no cmake on PATH, and some ${DocSubjectLabel} checks are \`cmake -P\` scripts; refusing rather than silently doing nothing"
 
     local selected=0 passed=0 failed=0 skipped=0
     local names="" line name labels skipRegex rest
@@ -253,19 +265,33 @@ Run() {
 
         [[ ${#args[@]} -gt 0 ]] || Fatal "'$name' is labelled ${DocSubjectLabel} and has no COMMAND this could parse"
 
-        # Every `-P` argument names a script that has to exist. Checked before
-        # anything runs, so a missing one is a refusal rather than a run whose
-        # first check happens to be the broken one.
-        local i=0 script=""
+        # Which script this check RUNS. Named before anything executes, so a
+        # missing one is a refusal rather than a run whose first check happens to
+        # be the broken one.
+        #
+        # TWO spellings, `-P <script>` and `bash <script>`, because a doc-subject
+        # check is not necessarily a `cmake -P` one. The set was `cmake -P` only
+        # and this refusal said so -- which locked out a check whose SUBJECT is
+        # prose from the very set that exists to run on prose changes, and #687's
+        # whole point is that such a check is skipped on exactly the change it
+        # exists to catch. "Write it in CMake instead" is not a neutral
+        # alternative: a markdown table is dense with `[#780](...)`, and a
+        # `file(STRINGS)` reader merges list elements on brackets -- the hazard
+        # `.agent/rules/build-and-toolchain.md` records against six readers.
+        local i=0 script="" runner=""
         while [[ $i -lt ${#args[@]} ]]; do
-            if [[ "${args[$i]}" == "-P" ]]; then
-                script="${args[$((i + 1))]:-}"
-                [[ -n "$script" ]] || Fatal "'$name' has a -P with no script after it"
-                [[ -f "$script" ]] || Fatal "'$name' names '$script', which does not exist"
-            fi
+            for runner in $DocSubjectRunners; do
+                case "${args[$i]}" in
+                    "$runner"|*/"$runner")
+                        script="${args[$((i + 1))]:-}"
+                        [[ -n "$script" ]] || Fatal "'$name' has a ${args[$i]} with no script after it"
+                        [[ -f "$script" ]] || Fatal "'$name' names '$script', which does not exist"
+                        ;;
+                esac
+            done
             i=$((i + 1))
         done
-        [[ -n "$script" ]] || Fatal "'$name' is labelled ${DocSubjectLabel} but its command runs no \`cmake -P\` script"
+        [[ -n "$script" ]] || Fatal "'$name' is labelled ${DocSubjectLabel} but its command runs none of: ${DocSubjectRunners} -- so nothing here can say what it would execute"
 
         if [[ "$listOnly" == "yes" ]]; then
             echo "  runnable: $name  ->  $script"
@@ -621,6 +647,54 @@ cmake_language(EXIT 3)'
     WriteCheck "$tree" beta.cmake "$quiet"
     WriteCheck "$tree" gamma.cmake "$quiet"
     Expect "ran NOTHING" "a neighbouring label was matched" "'docs-subject-later' is not 'docs-subject'" want-fail "$tree"
+
+    # 9. A doc-subject check that is NOT a `cmake -P` script. The set was
+    #    `cmake -P` only, which locked out a check whose subject is prose from the
+    #    set that runs on prose changes -- #687 arriving one level down, inside
+    #    #687's own machinery. A `.sh` check reports by EXIT STATUS rather than by
+    #    the output pattern, so both arms are asserted: the disjunction's other
+    #    half is what the `quietlyBad` fixture above exists for.
+    local bashCML='set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
+add_test(
+    NAME "delta-docs"
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/delta.sh"
+)
+set_tests_properties("delta-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)'
+
+    tree="${scratch}/t-bash-pass"
+    StageTree "$tree" "$bashCML"
+    WriteCheck "$tree" delta.sh '#!/bin/bash
+echo "table totals: 10 table(s), 3 figure(s) asserted"'
+    Expect "passed=1 failed=0 skipped=0" "a bash-command doc-subject check did not run" \
+        "a doc-subject check spelled \`bash <script>\` runs and passes" want-pass "$tree"
+
+    tree="${scratch}/t-bash-fail"
+    StageTree "$tree" "$bashCML"
+    WriteCheck "$tree" delta.sh '#!/bin/bash
+echo "the prose says 11 collapses, the table has 12"
+exit 1'
+    Expect "FAILED   delta-docs (exit 1)" "a failing bash-command check was read as a pass" \
+        "a \`bash <script>\` check failing by EXIT STATUS is FAILED" want-fail "$tree"
+
+    # ... and the refusal stays a refusal for a command that is neither. Widening
+    # the resolver must not turn "this cannot say what it would execute" into a
+    # shrug -- that is the state #687 refuses, and it is the reason the widening
+    # names two spellings rather than dropping the requirement.
+    tree="${scratch}/t-bash-neither"
+    StageTree "$tree" 'set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
+add_test(
+    NAME "epsilon-docs"
+    COMMAND echo "nothing to see"
+)
+set_tests_properties("epsilon-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)'
+    Expect "runs none of: -P bash" "the neither-spelling refusal did not name the runner set" \
+        "a labelled check running none of the known runners is REFUSED" want-fail "$tree"
 
     if [[ "$status" -ne 0 ]]; then
         echo "${SelfName}: self-test FAILED" >&2

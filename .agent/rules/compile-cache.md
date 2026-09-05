@@ -76,6 +76,7 @@ value. Same `clang-cl.exe`, different MSVC beside it, different object.
 
 Measured on clang-cl 22.1.3, one binary:
 
+<!-- table-total: none -->
 | where it runs | effective `-fms-compatibility-version` |
 | --- | --- |
 | a developer command prompt | `19.51.36252`, from the MSVC install |
@@ -1185,6 +1186,7 @@ is repeated here**, in the launcher's own rule file, rather than linked.
 
 What was measured, on this tree, rather than reasoned from "ELF is reproducible":
 
+<!-- table-total: none -->
 | two compiles of one TU differing in | `cl` 14.51 | `clang-cl` | clang 20.1 / GCC 14.2 |
 |---|---|---|---|
 | nothing — same object path, 2 s and 300 s apart | the 4-byte `TimeDateStamp`, and **nothing else** | the same | **identical**, with and without `-g` |
@@ -1239,6 +1241,7 @@ approached from the key end.
 **Measured, one TU byte-identical in two roots differing only in name and by the
 same character count, against a same-root baseline of 0 differing bytes:**
 
+<!-- table-total: none -->
 | driver | debug info off | debug info on | remedy the driver offers |
 | --- | --- | --- | --- |
 | `g++` (ELF) | identical | **differs, 143 B** — `DW_AT_comp_dir` | `-fdebug-prefix-map` → identical |
@@ -1837,6 +1840,7 @@ amount of re-measuring would have caught.
 The corrected form is one table at the measurement site, showing the spread rather
 than a number, with the conditions as rows:
 
+<!-- table-total: none -->
 | condition | per file |
 |---|---|
 | warm page cache, local SSD | 0.21 ms |

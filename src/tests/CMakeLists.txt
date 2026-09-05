@@ -1677,6 +1677,58 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# A rulebook table's stated total against the table it describes (#780).
+#
+# A hand-maintained number describing a hand-maintained list is two sources of
+# truth wearing one hat. Measured on ONE table across THREE consecutive commits:
+# each commit fixed the previous count and introduced the next, all three by the
+# same author, in the same file, on the same day, with the rule about instruments
+# that miscount open in the next tab. Prose did not prevent it and re-reading did
+# not prevent it, which is why it is a derivation and not a better sentence --
+# the `RowsInEnumeratorOrder` argument, arriving in markdown.
+#
+# Labelled `docs-subject`: its subject IS prose, so it must run on the change
+# that has no code in it. It is the first check in that set that is not a
+# `cmake -P` script, and `doc-subject-checks.sh` was widened to name the `bash`
+# spelling rather than this being written in CMake -- a markdown table is dense
+# with `[#780](...)`, and a `file(STRINGS)` reader merges list elements on
+# brackets, which is the hazard `.agent/rules/build-and-toolchain.md` records
+# against six readers. A reader chosen to dodge a known trap is not a style
+# preference.
+#
+# Not "smoke": it reads markdown and compares numbers, so it belongs in the
+# default set where whoever edits a rulebook table is the one who sees it break.
+#
+# `if(NOT WIN32)` for the reason the checks above carry it -- the script is POSIX
+# and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "table-totals"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("table-totals" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against synthetic trees. A suite with only a
+    # correct-count case passes under every bug this check exists to catch, which
+    # is the ticket's own acceptance clause -- so each of the two ways it can
+    # fail to LOOK (no table at all; a marker syntax that has stopped matching)
+    # is watched refusing, alongside a wrong count, an unmarked table, an
+    # unreadable multiplier and a mode it cannot name.
+    add_test(
+        NAME "table-totals-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh" --self-test
+    )
+    set_tests_properties("table-totals-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # A full clang-tidy sweep still happens somewhere, and it still reaches a person.
 #
 # Since #554 a pull request and a merge-queue entry both diff-scope, and the

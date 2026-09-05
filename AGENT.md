@@ -1292,6 +1292,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   same reason as the thing it corrected. Nobody is outside this: the remedy is that the pattern travels with
   the figure, not that people count more carefully. And **a ticket cannot be closed against a count that no
   longer describes the tree** — #510's "only 4 of 16" matches none of 20, 18 or the 13 content-readers.
+- **A total stated beside a table is DERIVED from it, or it is a second claim** — a hand-maintained number
+  describing a hand-maintained list is two sources of truth wearing one hat, and it drifted three commits
+  running, in one file, in one day, each commit fixing the last count and introducing the next (#780).
+  `ctest -R table-totals`. The multipliers are PARSED, not banned: 8 rows carrying `(twice)`/`(three times)`
+  describe 12 collapses, so a checker that counts ROWS is wrong for exactly the table that motivated it, and
+  plausible enough to go green on it. The marker is MANDATORY with `none` as the opt-out, because opt-in is
+  silent about a table that never opted in (#492) — `RefuseWithoutCounter`'s argument, in markdown. Its own
+  scope census was then wrong by 100%: `^|` anchoring misses a table INDENTED inside a bullet, 10 of 20. And
+  the figure that describes a table is the one NEAREST it, since a paragraph may state an older count with
+  the same noun — that one refused a CORRECT tree, which is how it was found.
 - `clang-format -i` at any version but the pinned one silently reformats code the
   pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
   tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the

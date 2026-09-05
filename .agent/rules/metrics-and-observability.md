@@ -447,6 +447,7 @@ of them a coding mistake, all of them a representation that could not tell two
 things apart. The last three rows are from a later session and are counted
 separately, so the table now stands at **twelve collapses across eight instruments**:
 
+<!-- table-total: instruments=rows, collapses=weighted -->
 | instrument | what it reported | what was true |
 |---|---|---|
 | the e2e wait classifier | `WORKING`, from CPU spent | that CPU was *cumulative*; none of it was recent |

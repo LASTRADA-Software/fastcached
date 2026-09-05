@@ -722,6 +722,7 @@ Every rule below has already been a bug.
   stock configuration (`--save "" --appendonly no`), driven over raw sockets. Every
   scenario has a control, so a null result cannot be read as an answer:
 
+  <!-- table-total: none -->
   | | observed |
   |---|---|
   | `BLPOP` + half-close, then a push arrives | server closed, **no reply** |
