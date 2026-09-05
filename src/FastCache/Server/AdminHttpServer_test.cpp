@@ -7,6 +7,7 @@
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -16,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/SocketDecorator.hpp>
 
 namespace
 {
@@ -43,18 +46,49 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
     co_return out;
 }
 
-std::string Exchange(std::string_view request, FastCache::IMetricsSink const& metrics, FastCache::StorageStats stats)
+/// Drive the admin surface once and return every byte it wrote.
+///
+/// The tail every case in this file ends with, in ONE place. It was open-coded four
+/// times -- the two `Exchange` helpers and both `FailingReadSocket` cases -- and the
+/// four copies each carried their own `provider` lambda, which is four spellings of
+/// one snapshot that have to stay in step. That is the drift argument
+/// `SocketDecorator.hpp` was written to make about fakes, one file away and not yet
+/// applied here.
+///
+/// `serveOn` is separate from `pair` on purpose: a decorator case serves the surface
+/// on the WRAPPER while the assertion still reads from `pair.client`, so the two
+/// cannot be derived from each other.
+///
+/// @param serveOn The socket the surface is driven on -- `pair.server.get()`, or a
+///        decorator wrapping it.
+/// @param pair The pair `serveOn` belongs to; closed and drained here.
+/// @param metrics The sink the surface renders from.
+/// @param stats The storage figures the snapshot carries.
+/// @return Everything the server wrote, which is empty when it wrote none.
+std::string ServeAndCollect(FastCache::ISocket* serveOn,
+                            FastCache::InMemorySocketPair& pair,
+                            FastCache::IMetricsSink const& metrics,
+                            FastCache::StorageStats stats)
 {
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
     using namespace std::chrono_literals;
     auto provider = [&stats] {
         return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+}
+
+std::string Exchange(std::string_view request, FastCache::IMetricsSink const& metrics, FastCache::StorageStats stats)
+{
+    auto pair = FastCache::InMemorySocketPair::Create();
+    // Guarded rather than unconditional, which is what lets `ExchangeMaybeSilent`
+    // below be a wrapper instead of a second copy: an empty request is a peer that
+    // said nothing, and writing zero bytes is not the same as not writing.
+    if (!request.empty())
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    return ServeAndCollect(pair.server.get(), pair, metrics, stats);
 }
 
 /// An `ISocket` that never returns more than `limit` bytes from one `Read`.
@@ -66,45 +100,45 @@ std::string Exchange(std::string_view request, FastCache::IMetricsSink const& me
 /// the headers unread in the receive queue -- which makes `close()` send RST
 /// instead of FIN. Stating the segmentation directly is the same device the
 /// launcher's fake `IPathResolver` uses for aliasing it cannot create on the host.
-class ShortReadSocket final: public FastCache::ISocket
+///
+/// Local because the CONDITION is this file's. The forwarding is not, and lives on
+/// `SocketDecorator` -- including the four defaulted `ISocket` virtuals this used
+/// to answer from the base rather than from the socket it decorates.
+class ShortReadSocket final: public FastCache::Testing::SocketDecorator
 {
   public:
     ShortReadSocket(FastCache::ISocket& inner, std::size_t limit) noexcept:
-        _inner { inner },
+        SocketDecorator { inner },
         _limit { limit }
     {
     }
 
+    /// Hand up no more than `limit` bytes, whatever the caller asked for.
+    /// @param buffer Where to put them.
+    /// @return What the decorated socket delivered into the narrowed span.
     [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> buffer) override
     {
-        return _inner.Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable Write(std::span<std::byte const> buffer) override
-    {
-        return _inner.Write(buffer);
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                                       std::shared_ptr<void const> keepAlive = {}) override
-    {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
-    }
-
-    void Close() noexcept override
-    {
-        _inner.Close();
-    }
-
-    [[nodiscard]] bool IsClosed() const noexcept override
-    {
-        return _inner.IsClosed();
+        return SocketDecorator::Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
     }
 
   private:
-    FastCache::ISocket& _inner;
     std::size_t _limit;
 };
+
+/// Serve one request over a fresh pair, and return what reached the client.
+///
+/// `Exchange` above always writes a request first, which is precisely the shape
+/// that cannot reach #824: every fixture in this file sent immediately, and that is
+/// why a surface answering `400` to a silent peer went unnoticed for as long as it
+/// did. This one allows an EMPTY request and returns whatever the server wrote --
+/// **including nothing**, which is the assertion the silent outcomes need.
+/// @param request What the client sends before the server is driven; may be empty.
+/// @return Every byte the server wrote, which is empty when it wrote none.
+std::string ExchangeMaybeSilent(std::string_view request)
+{
+    FastCache::AtomicMetricsSink metrics;
+    return Exchange(request, metrics, {});
+}
 
 } // namespace
 
@@ -387,6 +421,136 @@ TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact
     // A prefix route is not a catch-all: a path that does not begin with it still
     // reaches the 404, so a typo is refused rather than quietly served.
     CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
+// ---------------------------------------------------------------------------
+// #824: four outcomes behind one `bool ok`, all of them answered `400`.
+//
+// The pair that matters is the first two against the third. A test that only
+// asserted "an idle connection is not answered 400" would pass just as well on a
+// server that had stopped answering 400 to *anything*, which would delete the one
+// case where 400 is the right answer. Silence and the refusal are asserted against
+// each other, or one passing test covers both and proves neither.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, not refused", "[metrics][http][admin][idle]")
+{
+    // The reported bug, at the seam: Chrome opens a preconnect socket, sends
+    // nothing, and the request deadline expires. Nothing was asked, so nothing is
+    // owed -- and the 400 this used to answer is what reached a real browser as a
+    // broken dashboard.
+    auto const code = GENERATE(FastCache::NetErrorCode::WouldBlock, FastCache::NetErrorCode::Timeout);
+    INFO("read failed with NetErrorCode " << static_cast<unsigned>(code));
+
+    auto pair = FastCache::InMemorySocketPair::Create();
+    // Reads fail; writes still go through. So an empty response is the server
+    // declining to answer, never the server failing to.
+    FastCache::Testing::FailingReadSocket stalled { *pair.server, code };
+
+    FastCache::AtomicMetricsSink metrics;
+    REQUIRE(ServeAndCollect(&stalled, pair, metrics, {}).empty());
+}
+
+TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused", "[metrics][http][admin][idle]")
+{
+    // The other silence: an abandoned preconnect, a TCP liveness probe, a port
+    // scan. `ExchangeMaybeSilent` half-closes with nothing written, so the first read
+    // is EOF rather than an error -- the state `FailingReadSocket` cannot
+    // produce and the one the case above must not be mistaken for.
+    REQUIRE(ExchangeMaybeSilent({}).empty());
+}
+
+TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served truncated", "[metrics][http][admin][idle]")
+{
+    // The second route to the defect the 431 closes, and the more reachable one: a
+    // prefix whose request line has arrived parses and routes, so the head is served
+    // with every field that had not arrived yet silently missing. `RequestTimeout` is
+    // per READ and the head has no total budget, so this needs no oversize client --
+    // just a peer that stops mid-head.
+    //
+    // The credential is what makes it visible rather than merely wrong: served
+    // truncated, this request is answered as though the client sent no
+    // `Authorization` at all.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nAuthorization: Bearer x")));
+    // Deliberately NO ShutdownWrite: EOF would mean the peer had FINISHED sending,
+    // which is a different fact and is still served on purpose. This peer has not
+    // finished; this server gave up on it.
+    FastCache::Testing::FailingReadSocket stalled { *pair.server, FastCache::NetErrorCode::WouldBlock, 1 };
+
+    FastCache::AtomicMetricsSink metrics;
+    auto const response = ServeAndCollect(&stalled, pair, metrics, {});
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+}
+
+TEST_CASE("AdminHttp: an UNFINISHED head is refused 400 even though the peer finished sending",
+          "[metrics][http][admin][idle]")
+{
+    // **This case used to assert the opposite, and the assertion was the bug.** It
+    // read the EOF rule as "the peer finished sending, so serve what arrived" and
+    // called itself a control. But `.agent/rules/wire-and-protocol.md` says a server
+    // answers what is already DETERMINED, and a head with no terminating blank line
+    // determines nothing -- this server does not know which headers the peer would
+    // have sent, so there is no reply it can be right about.
+    //
+    // What it cost: `/fleet` routed with `Authorization` never read, so a valid
+    // credential was answered `401`. Same wrong answer as the byte-cap case, reached
+    // with a thirty-byte request and no oversize client.
+    //
+    // `PING` half-closed is a complete command and is answered; this is a sentence
+    // cut off mid-word.
+    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\nHost: x\r\n").starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_CASE("AdminHttp: a COMPLETE head half-closed after is still served", "[metrics][http][admin][idle]")
+{
+    // The real control, and the line the pair sits either side of: what makes an
+    // unfinished head refusable is that it is unfinished, NOT that the peer went
+    // away. Every other case in this file half-closes too, so without stating it
+    // here the distinction is only implicit -- and "refuse an unfinished head" and
+    // "refuse every peer that half-closes" would be one passing test, which would
+    // break every probe and scraper on this endpoint.
+    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
+TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http][admin][idle]")
+{
+    // The control, and the half that was never covered at all: before #824 this
+    // file had sixteen cases and not one of them asserted a 400, so the outcome
+    // that legitimately deserves one was as untested as the three that did not.
+    auto const response = ExchangeMaybeSilent("nonsense\r\n\r\n");
+    REQUIRE(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_CASE("AdminHttp: a head that overruns the byte cap is refused 431, not served truncated",
+          "[metrics][http][admin][idle]")
+{
+    // Not a missing refusal but a wrong answer: the read loop stopped at the cap
+    // and the *prefix* was then parsed and routed, so every field past it vanished
+    // and a browser whose `Authorization` fell beyond the cap was told `401`.
+    //
+    // The padding sits between the request line and the credential, so the request
+    // line -- which is at the front and always survives truncation -- still parses.
+    // That is what makes this case fail under the old code by being *served* rather
+    // than by being unreadable.
+    std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
+    request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
+    request += "\r\n";
+    auto const response = ExchangeMaybeSilent(request);
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+TEST_CASE("AdminHttp: a large but complete head under the cap still routes", "[metrics][http][admin][idle]")
+{
+    // The control for the case above. Without it, "refuse an oversize head" and
+    // "refuse a large head" are the same passing test, and the cap could drift down
+    // to nothing with every assertion still green.
+    std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
+    request += "X-Pad: " + std::string(4000, 'p') + "\r\n";
+    request += "\r\n";
+    REQUIRE(ExchangeMaybeSilent(request).starts_with("HTTP/1.1 200 OK\r\n"));
 }
 
 TEST_CASE("A tolerated admin bind failure is reported at Warn and says the daemon carries on",

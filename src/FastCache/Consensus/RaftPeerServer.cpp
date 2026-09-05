@@ -179,8 +179,7 @@ Task<void> RaftPeerServer::Run()
             // A poll timeout is how this loop wakes to observe Shutdown() on
             // POSIX, where closing the listening socket does not unblock a
             // parked accept(). Not a failure.
-            auto const code = accepted.error().code;
-            if (code == NetErrorCode::WouldBlock || code == NetErrorCode::Timeout)
+            if (IsDeadlineExpiry(accepted.error().code))
                 continue;
             _logger.Log(LogLevel::Debug, std::format("raft: peer accept loop ended ({})", accepted.error().ToString()));
             co_return;

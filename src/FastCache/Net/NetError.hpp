@@ -56,6 +56,62 @@ struct NetError
     }
 };
 
+/// Whether a failed operation failed because its deadline expired.
+///
+/// **Two codes, one fact, and which one arrives is the platform's choice.** A
+/// receive or send deadline armed with `SO_RCVTIMEO`/`SO_SNDTIMEO` expires as
+/// `EAGAIN`/`EWOULDBLOCK` on POSIX and as `WSAETIMEDOUT` on Winsock, so a caller
+/// asking "did I run out of time" has to accept both -- and a caller that spells
+/// only the obvious one is correct on one platform and silently wrong on the other.
+///
+/// It lives here, beside the enum, because the question was open-coded
+/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)) at TWO sites
+/// in two subsystems -- `Server/AdminHttpServer.cpp` and
+/// `Consensus/RaftPeerServer.cpp`.
+///
+/// **BOTH operands are load-bearing at every caller, and neither may be dropped.**
+/// Both existing callers are accept loops whose listener arms a poll timeout, and
+/// that timeout is reported as `WouldBlock` on POSIX and `Timeout` on Winsock. Both
+/// mean the same thing there -- *the poll ticked; re-check the stop flag and accept
+/// again*. Narrow this to `Timeout` alone and both loops treat every POSIX poll tick
+/// as a fatal accept error, log once and `co_return`: the admin surface and the Raft
+/// peer server stop accepting about a quarter of a second after they start, with a
+/// single `Debug` line as the only symptom.
+///
+/// That is worth spelling out because the obvious mental model invites exactly that
+/// edit. "A deadline expiring" sounds like a *timeout*, and `WouldBlock` sounds like
+/// *would have blocked, try again* -- so the two look like different questions and
+/// are not. On a socket with a deadline armed they are one event under two names,
+/// which is the whole reason this predicate exists.
+///
+/// A third site, `apps/fastcache-compile-node/FrameEndpoint.cpp`, tests `WouldBlock`
+/// alone and is RIGHT to, for a REACHABILITY reason and not a semantic one: that
+/// listener arms no poll timeout, so `Timeout` cannot arrive there at all. An earlier
+/// version of this comment claimed the semantic reason instead -- that on an accept
+/// `WouldBlock` is not a deadline expiring -- and that was simply wrong, and wrong in
+/// the direction that argues for narrowing the two callers above. The reachability
+/// reason is narrower and true; it is recorded AT that site as well, because while it
+/// lived only here three reviewers in a row filed the narrow test as a defect without
+/// opening the file.
+///
+/// The census travels with the pattern that produced it, because a number nobody can
+/// reproduce is one the next person re-derives differently. Re-run it rather than
+/// trusting the count, which describes the tree at the commit that wrote it:
+///
+///     git grep -nE '(==|!=) *(NetErrorCode::)?(WouldBlock|Timeout)\b' -- src/
+///
+/// A dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary` line.
+///
+/// It says nothing about *whose* deadline: a caller that must tell "I gave up" from
+/// "the peer went away" asks its own timer, which is what `SocketDeadlineTarget`
+/// is for.
+/// @param code The code an operation failed with.
+/// @return Whether that code is this platform's spelling of a deadline expiry.
+[[nodiscard]] constexpr bool IsDeadlineExpiry(NetErrorCode code) noexcept
+{
+    return code == NetErrorCode::Timeout || code == NetErrorCode::WouldBlock;
+}
+
 /// Convert a NetErrorCode to a stable string name for diagnostics.
 /// @param code Code to translate.
 /// @return Static string view; never empty.

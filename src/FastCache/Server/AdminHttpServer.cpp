@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <ranges>
@@ -53,8 +54,191 @@ namespace
         co_return result.has_value() && *result == data.size();
     }
 
-    /// Parsed HTTP request head. `ok` is false when no complete line arrived
-    /// within the byte cap or the line was malformed.
+    /// Why reading one admin request head ended.
+    ///
+    /// ## Three states behind one `bool`, and a fourth that was not even behind it
+    ///
+    /// `ReadRequestHead` used to answer `bool ok`, and every falsy reason was answered
+    /// `400 Bad Request` -- including the two in which the peer had **asked nothing**.
+    /// The outcomes that were *silently served* rather than refused (`TooLarge`,
+    /// `Truncated`) were not behind the bool at all: it came back **true** for them,
+    /// which is why counting them as "four states behind a bool" understates it. A
+    /// `bool` cannot express "not attempted"; it also cannot express "attempted, and
+    /// what I have is a fragment".
+    /// Chrome opens speculative *preconnect* sockets ahead of a navigation and may send
+    /// on one long after opening it, so past `AdminHttpServer::RequestTimeout` a
+    /// perfectly valid `GET /fleet` was answered `400`, intermittently, in the browser
+    /// and never under `curl` -- which sends immediately, which is why every fixture in
+    /// this tree passed ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)).
+    ///
+    /// This is the enum the repository's own rule asks for: *an outcome that can be "not
+    /// attempted" is an enum, not a `bool`, and it is fixed at the seam rather than at
+    /// the one call site that noticed.* The seam is this return value; the call site
+    /// merely looks up the row.
+    ///
+    /// ## Why two of them are answered with silence
+    ///
+    /// `.agent/rules/wire-and-protocol.md` settles EOF as *"this peer has finished
+    /// SENDING", not "this peer is gone"* -- and a server answers what is already
+    /// determined while abandoning what is still pending. **On this surface** (that rule
+    /// requires every measurement and every reading to name its own wire) a peer that
+    /// sent no byte has determined nothing, so there is no reply it is owed. An
+    /// abandoned preconnect is what a *healthy* browser produces many times a minute;
+    /// answering it costs a real page a `400`.
+    ///
+    /// `Idle` and `PeerGone` are kept apart rather than folded into one "silent",
+    /// because they are different facts about the peer -- a socket held open with
+    /// nothing on it is a preconnect or a slowloris, a socket closed with nothing on it
+    /// is an abandoned preconnect or a liveness probe -- and folding two states that
+    /// happen to share today's disposition is exactly how this defect was built. What
+    /// `PeerGone` *does* fold is EOF and an abortive close, deliberately: both mean
+    /// there is no peer to answer and nowhere to send an answer.
+    ///
+    /// ## Why none of them is counted
+    ///
+    /// `.agent/rules/metrics-and-observability.md` requires a refusal's wire code and
+    /// its counter to be one row, and warns that a refusal answered while nothing rises
+    /// is a probed port that looks unused. It also states the limit that applies here:
+    /// **not every refusal is an EVENT.** `Idle` and `PeerGone` are what ordinary
+    /// browsers and ordinary probes do continuously, so a counter on them would be a
+    /// series that never rests and buries whatever it was scraped to show. This is a
+    /// decision, not an omission. The admin surface has no counters at all today, and
+    /// giving it one for its two *non*-events would be the wrong first row.
+    ///
+    /// `Malformed` and `TooLarge` are a different case and are uncounted for a
+    /// different reason: a rise in either WOULD mean something, and this surface has
+    /// no counters at all to raise. That gap is its own work, not this change's.
+    enum class AdminHeadOutcome : std::uint8_t
+    {
+        /// A request line arrived and parsed. The only outcome that is routed.
+        Complete = 0,
+        /// Not one byte arrived before the read deadline expired.
+        Idle,
+        /// The peer went away with the head unfinished (EOF, or an abortive close).
+        PeerGone,
+        /// Bytes arrived, the head never ended, and the read deadline expired.
+        ///
+        /// The second route to `TooLarge`'s defect, and the more reachable one: a
+        /// prefix whose request line has arrived parses and routes, so a head cut
+        /// off mid-way used to be SERVED with every header that had not arrived yet
+        /// silently missing -- which on a credentialled route is the same spurious
+        /// `401`. `RequestTimeout` is per READ and the head has no total budget, so
+        /// this needs no oversize client at all.
+        ///
+        /// It is answered rather than closed, and that is the whole distinction the
+        /// enum above is for. `Idle` and `PeerGone` are silent because the peer
+        /// determined nothing -- EOF means *finished sending*, so what arrived is
+        /// all there was. A DEADLINE says the opposite: the peer has not finished
+        /// and this server gave up, which is exactly what `408` reports.
+        Truncated,
+        /// Bytes arrived and are not a request the server can act on -- either the
+        /// line does not parse, or the head never ended and the peer stopped
+        /// (`EndOfStream` mid-head). Both are `400`: an unfinished head is a bad
+        /// request, not a slow one, so it is not `Truncated`'s `408`.
+        Malformed,
+        /// The byte cap was reached before the head ended.
+        ///
+        /// Not merely uncovered before -- *misanswered*. The read loop stopped at the cap
+        /// and the truncated buffer was then parsed and **served as though complete**, so
+        /// a client whose `Authorization` sat past byte 8192 was answered `401`, which
+        /// reads as a wrong credential rather than as an oversize head.
+        TooLarge,
+        Last
+    };
+
+    /// What one head-read outcome is answered with.
+    struct AdminHeadOutcomeRow
+    {
+        /// The outcome this row describes.
+        AdminHeadOutcome outcome;
+        /// Status line to answer with, or empty to close without answering at all.
+        std::string_view status;
+        /// The body that goes with `status`; empty wherever `status` is.
+        std::string_view body;
+        /// Why a rise on this outcome would, or would not, mean something.
+        ///
+        /// **A COLUMN and not a paragraph, so a new row cannot be written without
+        /// answering.** Nothing sends this text; it exists to be a forcing function,
+        /// exactly as `Protocol/SurfaceRefusal.hpp`'s `UncountedRefusal::rationale`
+        /// does on the `0xFC` wire. The rule it serves is
+        /// `.agent/rules/metrics-and-observability.md`'s: *deliberately uncounted must
+        /// not be spelled like forgot*. Written as prose above the enum, that decision
+        /// sat sixty lines from the rows it was about and asked the author of a seventh
+        /// outcome for a status and a body and nothing else.
+        ///
+        /// This surface reaches no counter today -- `ServeAdminHttp` takes
+        /// `IMetricsSink const*` -- and the rationale is the half that has to travel
+        /// with the row regardless, because it is what a counter would later be added
+        /// against. It is also outside `check-worker-refusals-counted.cmake`'s glob,
+        /// which keys on `EncodeErrorReply`, so nothing scans it: the column is the
+        /// only thing standing where that scan would.
+        std::string_view rationale;
+    };
+
+    /// The disposition of every head-read outcome, in enumerator order.
+    ///
+    /// File-local, like every other part of this parse: nothing outside this file names
+    /// an outcome, and `AdminHeader` is public only because `AdminRequest::Header()`
+    /// takes one. A table rather than a chain of `if`s for this codebase's usual reason, plus one
+    /// specific to it: an empty `status` is how *no response is owed* is spelled, so the
+    /// silent outcomes are visible beside the answered ones instead of being a `return`
+    /// somebody has to find.
+    inline constexpr EnumTable<AdminHeadOutcome, AdminHeadOutcomeRow> AdminHeadOutcomeTable {
+        // Never looked up -- a complete head is routed instead. Present because the
+        // table is indexed by the enum and a missing row would be a silent zero.
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete,
+                              .status = {},
+                              .body = {},
+                              .rationale = "not an outcome: a complete head is routed, never dispatched here" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle,
+                              .status = {},
+                              .body = {},
+                              .rationale = "a rise would mean nothing: an abandoned browser preconnect is what a "
+                                           "HEALTHY client produces many times a minute, so the series never rests" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone,
+                              .status = {},
+                              .body = {},
+                              .rationale = "a rise would mean nothing, for Idle's reason: a peer leaving without "
+                                           "asking is ordinary, and it is the same client behaviour observed one "
+                                           "way rather than the other" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Truncated,
+                              .status = "408 Request Timeout",
+                              .body = "request timed out\n",
+                              .rationale = "a rise WOULD mean something -- clients cut off mid-head point at a "
+                                           "deadline set too tight or a network losing segments -- but this surface "
+                                           "reaches no sink; see #828" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed,
+                              .status = "400 Bad Request",
+                              .body = "bad request\n",
+                              .rationale = "a rise WOULD mean something (a broken client, or a probe on the wrong "
+                                           "port), but this surface reaches no sink; see #828" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::TooLarge,
+                              .status = "431 Request Header Fields Too Large",
+                              .body = "request header fields too large\n",
+                              .rationale = "a rise WOULD mean something (a client whose headers outgrew the cap), "
+                                           "but this surface reaches no sink; see #828" },
+    };
+    static_assert(RowsInEnumeratorOrder(AdminHeadOutcomeTable, &AdminHeadOutcomeRow::outcome));
+
+    /// A row that says nothing must carry nothing.
+    ///
+    /// Not a restatement of the table: it is the one relation between its two columns.
+    /// A body beside an empty status is a sentence nothing would ever send, which is how
+    /// somebody adding a silent outcome writes down an answer that is then dropped.
+    static_assert(std::ranges::all_of(AdminHeadOutcomeTable,
+                                      [](AdminHeadOutcomeRow const& row) noexcept {
+                                          return !row.status.empty() || row.body.empty();
+                                      }),
+                  "a head outcome answered with silence must carry no body");
+
+    /// Every row states its counter claim. An empty `rationale` is the spelling of
+    /// *forgot*, which is the one thing the column exists to make impossible.
+    static_assert(std::ranges::all_of(AdminHeadOutcomeTable,
+                                      [](AdminHeadOutcomeRow const& row) noexcept { return !row.rationale.empty(); }),
+                  "every head outcome must say whether counting it would mean anything");
+
+    /// Parsed HTTP request head, and why reading it ended. Only `Complete` carries
+    /// a method and a target; every other outcome carries nothing but itself.
     ///
     /// Owns each field as its own `std::string` rather than keeping the raw head
     /// and viewing into it. That is not redundancy: an earlier version held the
@@ -73,11 +257,18 @@ namespace
     /// length on the other is not one to leave to a careful reader.
     struct RequestHead
     {
-        std::string method;
-        std::string target;
+        std::string method {};
+        std::string target {};
         /// One slot per `AdminHeaderTable` row, in its order.
         EnumTable<AdminHeader, std::string> headers {};
-        bool ok { false };
+        /// Why the read ended; see `AdminHeadOutcome`.
+        ///
+        /// Defaulted to `Malformed` rather than to the enum's zero. `Complete` is
+        /// `0`, so an aggregate that omits this member would value-initialize to
+        /// *the request parsed* -- a default that turns forgetting into serving.
+        /// The `bool ok { false }` this replaces defaulted the safe way, and the
+        /// property is worth keeping across the change rather than rediscovering.
+        AdminHeadOutcome outcome { AdminHeadOutcome::Malformed };
     };
 
     /// Case-insensitive comparison, for a header name.
@@ -130,9 +321,50 @@ namespace
     /// also simply what a correct HTTP server does.
     ///
     /// A client that never sends the blank line is bounded by the accepted socket's
-    /// receive timeout, which is what a request timeout is for. A head that exceeds
-    /// the cap is answered and then closed with whatever is left unread — that peer
-    /// is malformed or hostile, and a reset is a fine thing for it to see.
+    /// receive timeout, which is what a request timeout is for -- and if it never sent
+    /// a byte at all, that bound expiring is `Idle` and is answered with silence
+    /// rather than with a `400` (#824). A head that exceeds the cap is answered `431`
+    /// and then closed with whatever is left unread.
+    ///
+    /// **The reset is real, it is PRE-EXISTING, and it does not eat the answer.**
+    /// Closing with unread data in the receive queue makes the kernel send RST rather
+    /// than FIN, and an RST can discard what this server just wrote. A reviewer
+    /// predicted that would destroy this `431`. Measured instead -- Linux loopback,
+    /// one daemon built from this branch and one from master (`5e80adcd`), six client
+    /// shapes each, the client sending its whole request before reading:
+    ///
+    /// | request                          | master        | this branch   |
+    /// |----------------------------------|---------------|---------------|
+    /// | unterminated 9 KB head           | `200`, RST    | `431`, RST    |
+    /// | unterminated 60 KB head          | `200`, RST    | `431`, RST    |
+    /// | complete head + 60 KB unread body| `200`, RST    | `200`, RST    |
+    /// | complete head, nothing unread    | `200`, no RST | `200`, no RST |
+    ///
+    /// Every response arrived INTACT, on both trees, with the reset observed on the
+    /// following `recv`. Delaying the client's first read by 0.5 s, 1 s, 2 s and 5 s
+    /// changed nothing: the bytes are queued on the client before the reset reaches
+    /// it. The last row is the control -- no unread data, no reset -- which is what
+    /// licenses reading the other three as the hazard rather than as noise.
+    ///
+    /// **So the change moves WHICH response is at risk, not WHETHER one is.** Master
+    /// already answered `200 OK` and closed over ~52 KB of unread head, drawing the
+    /// identical RST; the third row is a path that predates this branch entirely and
+    /// behaves the same on both. Draining first is therefore not a fix for a hazard
+    /// this introduced -- it would be a byte budget granted to exactly the peer least
+    /// entitled to one, and it is not taken.
+    ///
+    /// **Conditions, because they are the measurement's and not a guarantee:** Linux
+    /// loopback, and a client that finishes SENDING before it reads. The bash-versus-
+    /// python result quoted elsewhere in this file is a DIFFERENT shape -- there the
+    /// client writes LATE, after the server has closed, and its own write is what
+    /// draws the RST onto a response already sitting unread. Reading that measurement
+    /// as evidence about this one is the conflation `AGENT.md` warns about under
+    /// "a figure is a quantity UNDER CONDITIONS"; the two shapes are not comparable.
+    ///
+    /// The change of ANSWER is deliberate and is not the reset: on master a 9 KB and a
+    /// 60 KB head to `/healthz` are both answered `200 OK`, from a head this server
+    /// only read the first 8,192 bytes of. That is the defect. A route reading no
+    /// headers survives it by luck; `/fleet` reads a credential and does not.
     Task<RequestHead> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;
@@ -141,7 +373,34 @@ namespace
         {
             std::array<std::byte, 1024> chunk {};
             auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
-            if (!result.has_value() || *result == 0)
+            if (!result.has_value())
+            {
+                // Answered here rather than remembered in a local the code after the
+                // loop reads: whether this was a deadline or a departure is known
+                // where the read failed and nowhere else, and a variable carrying it
+                // out would need an invariant ("only the FIRST read can leave the
+                // buffer empty") that nothing checks.
+                //
+                // The request deadline is armed as `SO_RCVTIMEO` on the accepted
+                // socket (`BlockingListener::SetTimeouts` -- a concrete-type call,
+                // with no `IListener` seam, which is why a reactor-backed admin
+                // socket would never produce `Idle` at all), so it reaches this loop
+                // as a read *error* rather than as a signal of its own.
+                // `IsDeadlineExpiry` is what knows that the two platforms spell it
+                // differently.
+                //
+                // Three outcomes, and the buffer decides only the last two: a peer
+                // that is GONE is answered by nobody whether it managed to say
+                // something first, while a peer this server gave WAITING for is
+                // told so -- silently if it had asked nothing, `408` if it had
+                // begun. Falling through to the parse here is what served a
+                // truncated head, which is `TooLarge`'s defect reached without an
+                // oversize client.
+                if (!IsDeadlineExpiry(result.error().code))
+                    co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
+                co_return RequestHead { .outcome = buffer.empty() ? AdminHeadOutcome::Idle : AdminHeadOutcome::Truncated };
+            }
+            if (*result == 0)
                 break;
             // Rescan from three bytes before the freshly-appended region: the
             // terminator is four bytes and may straddle a chunk boundary in any of
@@ -152,14 +411,55 @@ namespace
             sawHeadEnd = buffer.find("\r\n\r\n", scanFrom) != std::string::npos;
         }
 
+        // Nothing was received, so nothing was asked and nothing is owed. Reaching
+        // here with an empty buffer is the EOF path; the deadline path returned
+        // above. This is the whole of #824: below, `eol == npos` used to fold an
+        // empty buffer in with a genuinely bad request line and answer both `400`.
+        if (buffer.empty())
+            co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
+
+        // **`sawHeadEnd` decides THAT a refusal happens; the byte cap only decides
+        // WHICH.** A head with no terminating blank line is a PREFIX of a request,
+        // never a request, and parsing one is what used to happen -- silently, which
+        // is worse than any refusal: the request line is near the front and always
+        // survives truncation, so the prefix routed and answered while every field
+        // after the cut was simply gone. A browser whose `Authorization` fell beyond
+        // it was told `401`, which reads as a wrong credential.
+        //
+        // The guard used to be `!sawHeadEnd && size >= MaxRequestBytes`, which closed
+        // the cap route and left the EOF route wide open -- and the EOF route needs
+        // no oversize client at all, just a peer that half-closes after its request
+        // line. Two exits, one condition: whichever way the loop ended, an unfinished
+        // head is refused here.
+        //
+        // **This is the EOF rule applied more carefully than it was.**
+        // `.agent/rules/wire-and-protocol.md` says a server answers what is already
+        // DETERMINED, and the tempting reading -- EOF means *finished sending*, so
+        // serve what arrived -- is what put a control case in this file asserting
+        // exactly the bug. An HTTP head with no blank line determines nothing: this
+        // server does not know which headers the peer would have sent, so there is
+        // no reply it can be right about. `PING` half-closed is a complete command;
+        // this is a sentence cut off mid-word. A COMPLETE head half-closed after is
+        // still served, and that is the control that belongs beside this.
+        if (!sawHeadEnd)
+            co_return RequestHead { .outcome = buffer.size() >= MaxRequestBytes ? AdminHeadOutcome::TooLarge
+                                                                                : AdminHeadOutcome::Malformed };
+
+        // Unreachable by construction, and kept anyway. `sawHeadEnd` is only ever set
+        // by finding `"\r\n\r\n"`, so reaching here guarantees a `"\r\n"` exists and
+        // this arm cannot fire -- it is NOT a live `Malformed` route, and a reader
+        // counting them should not count it. It stays because the cost of the two
+        // outcomes is wildly asymmetric: if that invariant is ever broken by an edit
+        // to the loop above, `npos` here becomes the LENGTH of the `string_view`
+        // below, which is a read far past the buffer rather than a wrong status code.
         auto const eol = buffer.find("\r\n");
         if (eol == std::string::npos)
-            co_return RequestHead {};
+            co_return RequestHead { .outcome = AdminHeadOutcome::Malformed };
         std::string_view const line { buffer.data(), eol };
 
         auto const sp1 = line.find(' ');
         if (sp1 == std::string_view::npos)
-            co_return RequestHead {};
+            co_return RequestHead { .outcome = AdminHeadOutcome::Malformed };
         auto const rest = line.substr(sp1 + 1);
         auto const sp2 = rest.find(' ');
         auto const target = sp2 == std::string_view::npos ? rest : rest.substr(0, sp2);
@@ -196,7 +496,7 @@ namespace
         co_return RequestHead { .method = std::string { line.substr(0, sp1) },
                                 .target = std::string { target },
                                 .headers = std::move(headers),
-                                .ok = true };
+                                .outcome = AdminHeadOutcome::Complete };
     }
 
     /// Statuses whose responses carry no content at all.
@@ -260,9 +560,19 @@ Task<void> ServeAdminHttp(ISocket* socket,
         co_return;
 
     auto const request = co_await ReadRequestHead(socket);
-    if (!request.ok)
+    if (request.outcome != AdminHeadOutcome::Complete)
     {
-        (void) co_await WriteResponse(socket, PlainRefusal("400 Bad Request", "bad request\n"));
+        // The disposition is read off `AdminHeadOutcomeTable`, never decided here.
+        // A `400` spelled at this one call site is what collapsed four outcomes into
+        // one answer, and the fix belongs at the seam -- so this branch has no
+        // knowledge of which outcome deserves what, and an outcome added later
+        // arrives with its answer already attached.
+        auto const& row = AdminHeadOutcomeTable[static_cast<std::size_t>(request.outcome)];
+        // An empty status is the table's spelling of *no response is owed*: the peer
+        // asked nothing, so it is closed without being answered, which is what every
+        // mainstream HTTP server does with an abandoned preconnect.
+        if (!row.status.empty())
+            (void) co_await WriteResponse(socket, PlainRefusal(row.status, row.body));
         co_return;
     }
     if (request.method != "GET")
@@ -366,8 +676,7 @@ Task<void> AdminHttpServer::Run()
             // A poll-timeout on the listening socket is how we wake to observe
             // Shutdown() on POSIX (where Close() does not unblock a parked
             // accept()); it is not a real failure, so loop and re-check the flag.
-            auto const code = accepted.error().code;
-            if (code == NetErrorCode::WouldBlock || code == NetErrorCode::Timeout)
+            if (IsDeadlineExpiry(accepted.error().code))
                 continue;
             _logger.Logf(LogLevel::Debug, "admin: accept loop ended ({})", accepted.error().ToString());
             co_return;

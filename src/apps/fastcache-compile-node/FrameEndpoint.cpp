@@ -2018,6 +2018,22 @@ Task<void> FrameServer::Run()
             // `Close()` resolves a parked accept with Cancelled, which is how this
             // loop learns it is done -- there is no poll timeout any more, so a stop
             // is observed at once rather than after a quarter second.
+            //
+            // **`WouldBlock` alone, and NOT `Net::IsDeadlineExpiry`, deliberately.**
+            // This listener arms no poll timeout, so `Timeout` cannot arrive here at
+            // all and the second operand would be dead. That is a REACHABILITY
+            // reason: it is a fact about this listener, so an edit that gives it a
+            // poll timeout must switch this to `IsDeadlineExpiry` in the same change.
+            //
+            // Not a semantic one. `WouldBlock` at an accept whose listener DOES arm a
+            // timeout is exactly a deadline expiring -- that is what the admin surface
+            // and the Raft peer server call `IsDeadlineExpiry` for -- so "on an accept
+            // WouldBlock is not an expiry" is false in general and must not be carried
+            // back to those callers, which would stop accepting entirely.
+            //
+            // Recorded HERE because the note used to live only beside the predicate,
+            // where three reviewers in a row did not find it and filed the narrow test
+            // as a defect (#824).
             auto const code = accepted.error().code;
             if (code == NetErrorCode::WouldBlock)
                 continue;

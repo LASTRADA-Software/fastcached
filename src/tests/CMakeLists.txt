@@ -1103,12 +1103,37 @@ if(NOT WIN32)
     # ctest timeout and a failed assertion are indistinguishable from the count
     # alone). On a 32-core Linux host, local ext4:
     #
-    #     idle                       34s
-    #     load average ~44, 20 runs  35s worst
+    #     1-min load 5.04 -> 1.90     37.2s / 37.0s / 37.0s   (three runs, 172 checks)
     #
-    # So the cost is almost entirely the deliberate SLEEPS, which is why CPU
-    # contention barely moves it: 3.5x headroom against this bound, and a run
-    # that approaches 120s means something other than a busy machine. A figure
+    # **The load is part of the reading, and an earlier version of this block got
+    # that wrong in the direction that matters.** It recorded the same shape as
+    # `idle 40s (37.2 / 38.9 / 40.1)` and the runs were never verified idle -- this
+    # host's 15-minute average was 47.51 at the time, with other lanes gating
+    # throughout. A loaded figure wearing an idle label is worse than no figure,
+    # because the conclusion drawn from it was *contention barely moves this*, which
+    # is exactly what you cannot conclude by comparing a loaded number to a loaded
+    # number while calling one of them quiet. The row above states the load it was
+    # taken at because that is the only form in which it can be checked.
+    #
+    # **No loaded band is measured here**, deliberately rather than by omission: this
+    # host is rarely quiet and a band taken during someone else's gate is not
+    # reproducible either. The headroom below is therefore derived from the reading
+    # that exists, and anyone adding a loaded band should derive it from the WORST
+    # band measured -- a `TIMEOUT` justified by a quiet host is a bound that fails on
+    # a busy one. `check-e2e-helpers.sh` is contended by three lanes as this is
+    # written; whoever lands last owns the combined block, keeping each cost
+    # separately attributed.
+    #
+    # #824 added ~6s, by construction rather than by accident:
+    # `http-silence-inconclusive` stages a listener that accepts and then neither
+    # speaks nor closes, so it costs `_http_drain_fd3`'s whole `read -t` bound --
+    # that expiry is the thing it asserts on.
+    #
+    # So the cost is almost entirely the deliberate SLEEPS rather than CPU work,
+    # which is the REASON to expect contention to move it little -- an argument from
+    # what the run spends its time on, not from the pair of numbers above, which
+    # cannot support it. Roughly 3x headroom against this bound at the load stated;
+    # a run approaching 120s means something other than a busy machine. A figure
     # here rather than "well inside": #665 is the same shape, a registration's
     # stated cost against its measured one.
     set_tests_properties("e2e-helpers-selftest" PROPERTIES

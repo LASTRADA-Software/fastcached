@@ -244,6 +244,82 @@ metrics="$(dash_get "$admin_port" /metrics)"
 health="$(dash_get "$admin_port" /healthz)"
 [[ "$health" == HTTP/1.1\ 200* ]] || fail "/healthz did not answer 200 without a credential"
 
+# ------------------------------------------------- 2b. the idle preconnect (#824)
+# A connection the server has ACCEPTED and on which nothing has been said. That is
+# what a browser's speculative preconnect is, and this surface used to answer it
+# `400 Bad Request` -- so the fleet dashboard failed in Chrome, intermittently,
+# and under no fixture in this tree, because every one of them sent immediately.
+#
+# ## Why the probe never writes, although the report does
+#
+# The reported shape is *connect, wait, then ask*, and it cannot be asserted on:
+# an unfixed server answers and closes at its deadline, the client's late write
+# then draws an RST, and the RST discards the receive buffer holding the very
+# response the assertion is about. Measured against one unfixed binary here: a
+# `python` client read the `400`, a bash client read nothing. A leg built on that
+# passes on the bug about as often as it fails, which is worse than no leg -- it
+# is a guard that reports.
+#
+# What a surface volunteers to a peer that has said nothing is not a race, and
+# against the unfixed binary it is a `400` every time. That is the same defect
+# seen from the side that can be observed, so it is the whole assertion.
+#
+# The control below is not decoration: "the surface answered nothing" and "the
+# surface was never reachable" are one empty string, so a leg asserting emptiness
+# needs a sibling that must be non-empty.
+#
+# ## What this does not assert
+#
+# That the idle connection is SERVED. With the head reader fixed, a preconnect
+# used after the deadline gets no response at all, and whether the operator then
+# sees the dashboard depends on the client retrying on a fresh connection --
+# closing is retriable where a `400` is final, which is what makes it the better
+# answer and not the whole one. Serving it needs the pre-first-byte wait to stop
+# sharing one number with the mid-head read deadline; tracked on #828.
+#
+# `/healthz` and not `/fleet`, although `/fleet` is the path the report named: the
+# outcome is decided by the shared request-head reader before any route is
+# consulted, so the route is not the variable, and `/healthz` depends on neither a
+# credential nor this node having won an election.
+#
+# Plaintext only. The probe has to be silent from the accept onwards, and over TLS
+# the handshake IS the first bytes -- there is no way to connect, say nothing, and
+# still be talking to the admin surface. Said out loud rather than skipped
+# silently, so a green TLS run is never mistaken for this having been checked.
+if [[ -n "$tls" ]]; then
+    echo "-- idle-preconnect: TLS run, a silent client cannot reach the surface — not checked here"
+else
+    # Refuses rather than answering when its own read bound is what ended the
+    # read, so a green line here cannot be a question that went unasked.
+    unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")" && probe_rc=0 || probe_rc=$?
+    # The NAMES, not `0`/`1`/`2`: these arms print opposite diagnoses about
+    # different machines, so a transposed literal sends somebody to debug a node
+    # that is fine. Quoted, so each pattern is the variable's value and not a glob;
+    # unbound under `set -u` if any name is ever mistyped.
+    #
+    # And ALL THREE are named, `*)` carrying none of them. Leaving the inconclusive
+    # verdict on the default arm is the same fail-open one level up: a FOURTH status
+    # added to `http_response_to_silence` would land there and be reported as "the
+    # surface would not answer", which is a diagnosis this fixture has not
+    # established -- the exact mis-bucketing the three named statuses exist to stop.
+    case "$probe_rc" in
+        "$E2eSilenceAnswered") ;;
+        "$E2eSilenceRefused") fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
+        "$E2eSilenceInconclusive")
+            fail "the silence probe could not decide: the admin surface neither answered nor closed within the" \
+                 "probe's read bound. Either the node is wedged, or AdminHttpServer::RequestTimeout has been" \
+                 "raised to or past _e2e_http_read_bound in scripts/lib/e2e-common.sh -- those two are a pair" ;;
+        *) fail "the silence probe returned an unknown status ${probe_rc}; http_response_to_silence grew an outcome this leg does not classify" ;;
+    esac
+    [[ -z "$unasked" ]] \
+        || fail "the admin surface answered a peer that said nothing: ${unasked%%$'\n'*}"
+
+    prompt="$(dash_get "$admin_port" /healthz)"
+    [[ "$prompt" == HTTP/1.1\ 200* ]] \
+        || fail "the control (a peer that does ask) was not served 200: ${prompt%%$'\n'*}"
+    echo "-- idle-preconnect: silence closed unanswered, a real request served 200"
+fi
+
 # ------------------------------------------------------------- 3. credential
 anonymous="$(dash_get "$admin_port" /fleet)"
 [[ "$anonymous" == HTTP/1.1\ 401* ]] || fail "/fleet served without a credential: ${anonymous%%$'\n'*}"

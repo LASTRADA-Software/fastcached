@@ -690,6 +690,39 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   control that must survive an open write side, or *detect a graceful close* and
   *abandon every blocking read* are the same passing test. The signal is that the
   handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
+- A peer that sent NOTHING asked nothing, so it is CLOSED, not refused — and "sent nothing"
+  is TWO states (deadline expired, peer left), neither of which is "the request was bad". The
+  admin surface hid THREE outcomes behind one `bool ok` and answered every one `400`, so a
+  Chrome preconnect used after 2 s rendered `400` while `curl` — which sends immediately, like
+  every fixture here — never reproduced it. Two MORE were not behind the bool at all: it came
+  back TRUE and the truncated prefix was SERVED, dropping every header after the cut and
+  answering `401` to a browser whose credential fell beyond it. Over the byte cap that is `431`;
+  cut off by the DEADLINE it is `408`, and that is the reachable route, since `RequestTimeout` is
+  per READ and the head has no total budget; ended by EOF mid-head it is `400`. **`sawHeadEnd`
+  decides THAT a head is refused; the cause only selects WHICH code** — guarding on the cap alone
+  closed the oversize route and left the EOF route open, and that one needs no oversize client,
+  just a peer that half-closes after its request line. The tempting reading of the EOF rule — *the
+  peer finished sending, so serve what arrived* — is what a control case in this file asserted, and
+  the assertion WAS the bug: a head with no terminating blank line determines nothing, so there is
+  no reply this server can be right about. `PING` half-closed is a complete command; this is a
+  sentence cut off mid-word. The control that belongs beside it is a COMPLETE head half-closed
+  after, still served `200`, or *refuse an unfinished head* and *refuse every peer that
+  half-closes* are one passing test. Neither silent outcome is counted, deliberately — a healthy
+  browser produces them by the minute. A
+  deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
+  never one operand — except at a listener that arms NO poll timeout, where `Timeout` cannot arrive
+  and the operand is dead; recorded at the site, because two reviewers read the narrow test as the
+  same defect. That exception is REACHABILITY, never semantics, and the distinction is load-bearing:
+  the predicate's own two callers are accept loops whose listeners DO poll, where `WouldBlock` IS the
+  expiry, so "on an accept WouldBlock is not an expiry" invites dropping it and stops the admin and
+  Raft surfaces accepting on POSIX with one `Debug` line as the symptom. **A reason that generalises
+  further than the fact it was drawn from is worse than the narrow one** — this exact upgrade was
+  written into the rulebook and had to be taken out again. **The reported shape cannot be asserted on** — connect-wait-send is a race,
+  because the late write draws an RST that destroys the very response being asserted on (measured:
+  python saw the `400`, bash saw nothing) — so the probe never writes. And a probe reporting
+  silence must be able to say it observed none, or an expired `read -t` reads as the answer.
+  Closing is retriable where `400` is final and is still not the whole fix: one number answers
+  both *how long may a peer be silent* and *how long may a head take* (#828).
 - And a TLS peer says it with a RECORD, so the raw socket answers the OPPOSITE:
   `close_notify` then FIN means bytes are on the wire, the raw peek reports `>0`, and
   #673's EOF arm declined for every TLS client on the one transport where the graceful

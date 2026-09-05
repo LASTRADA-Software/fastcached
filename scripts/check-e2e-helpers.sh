@@ -760,6 +760,62 @@ run_case() {
         echo "both caller headers reached the server"
         ;;
 
+    # The silence probe brings back what a server volunteered without being asked.
+    #
+    # Staged against a listener that SPEAKS FIRST, because the interesting failure
+    # is a probe that reads nothing whatever the server does -- which would look
+    # identical to the property `fleet-dashboard-e2e` asserts, and would then pass
+    # on a broken server forever. A listener that says nothing cannot tell those
+    # apart; one that speaks can.
+    http-silence)
+        p="$(free_port)"
+        _selftest_unprompted_listener "$p" answer "${scratch}/silence.log" \
+            >/dev/null 2>>"${scratch}/silence.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/silence.log" 15
+        body="$(http_response_to_silence 127.0.0.1 "$p")"
+        kill "$listener" 2>/dev/null || true
+        case "$body" in
+            *UNASKED*) echo "http_response_to_silence reported what the server volunteered" ;;
+            *) fail "http_response_to_silence brought back nothing from a server that spoke: '${body}'" ;;
+        esac
+        ;;
+
+    # ... and REFUSES when its own bound is what ended the read.
+    #
+    # The arm that would otherwise never be watched, and the one that matters: an
+    # expired `read -t` yields an empty body, which is byte-identical to "the server
+    # said nothing" -- the very answer the probe exists to report. Against a listener
+    # that accepts and then neither speaks nor closes, a probe without this arm
+    # reports a clean pass for a question it could not answer. Costs the bound.
+    http-silence-inconclusive)
+        p="$(free_port)"
+        _selftest_unprompted_listener "$p" hold "${scratch}/hold.log" \
+            >/dev/null 2>>"${scratch}/hold.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/hold.log" 15
+        http_response_to_silence 127.0.0.1 "$p" >/dev/null && rc=0 || rc=$?
+        kill "$listener" 2>/dev/null || true
+        # The STATUS, not merely non-zero. A refused connection is also non-zero, so
+        # "it returned an error" would score this green against a listener that had
+        # died -- the arm passing for the reason it exists to refuse.
+        [ "$rc" -eq 1 ] \
+            || fail "expected status 1 (the bound expired) from a server that never spoke or closed; got ${rc}"
+        echo "http_response_to_silence refused rather than reporting silence it never observed"
+        ;;
+
+    # ... and says REFUSED apart from INCONCLUSIVE.
+    #
+    # The two are one non-zero unless something asserts otherwise, and the fixture
+    # prints a different sentence for each -- a node that died and a surface that
+    # would not answer are fixed by different people.
+    http-silence-refused)
+        p="$(free_port)"
+        http_response_to_silence 127.0.0.1 "$p" >/dev/null 2>&1 && rc=0 || rc=$?
+        [ "$rc" -eq 2 ] || fail "expected status 2 (refused) against an unbound port; got ${rc}"
+        echo "http_response_to_silence told a refused connection from an expired bound"
+        ;;
+
     # A refused connection is a RETURN, not a stop: a fixture asking whether a
     # surface is up wants to decide for itself what that means.
     http-refused)
@@ -925,6 +981,66 @@ _selftest_listener() {
             print $c "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                    . "Connection: close\r\n\r\n{\"tail\":\"NO-TRAILING-NEWLINE\"}";
             close $c;
+        }
+    ' "$1" "$2" "$3"
+}
+
+# A listener that answers a client which has said NOTHING, or holds it open.
+#
+# `_selftest_listener` above reads a request line before it answers, so it cannot
+# stage either half of `http_response_to_silence`'s contract. The two modes are the
+# probe's two outcomes: `answer` is a server that volunteers a response (which is
+# exactly the #824 defect), `hold` is one that neither speaks nor closes (which is
+# the state the probe must REFUSE to report on rather than read as silence).
+#
+# Perl for the listener, for the reason the other stand-ins give: nc's listen flags
+# differ between the BSD, GNU and OpenBSD builds, and one of those is on every
+# platform CI runs but never the same one.
+#
+# @param 1 port
+# @param 2 `answer` to speak first and close, `hold` to accept and do neither
+# @param 3 the log to write failures to
+#
+# ## Two lifetime bounds, and neither closes the other's hole
+#
+# **`exec`, because `$!` for a backgrounded shell FUNCTION is the subshell bash
+# forks, not the program that subshell goes on to run.** Every `kill "$listener"` in
+# this file therefore reaped a wrapper and left `perl` alive, reparented, still
+# holding its LISTEN socket. Measured: `$! comm=bash` with a `perl` child, and the
+# port still held after the kill. `exec` replaces the subshell, so the pid the caller
+# holds IS the perl. Safe ONLY because these helpers are always invoked with `&` --
+# in the foreground `exec` would replace the calling shell and end the run.
+#
+# **`alarm`, because no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
+# CI job**, which are the paths a leak actually accumulates on. A bound on TIME and
+# deliberately not on connection count: `port_answers` is `/dev/tcp`, so every
+# `free_port` draw and every `wait_for_port` poll costs this listener an `accept()`,
+# and a count bound would kill it before the request under test ever arrived.
+#
+# **They are independent, and a survivor COUNT cannot tell you whether either works**
+# -- each alone drives it to zero, for a different reason, so a count reads as "both
+# arms fine" while one is dead. Ask the process TREE. (#839)
+_selftest_unprompted_listener() {
+    exec perl -e '
+        use strict; use warnings; use IO::Socket::INET;
+        my ($port, $mode, $logfile) = @ARGV;
+        # Outlives any case here; dies without one whatever killed the run.
+        alarm 30;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => $port,
+            Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+        open(my $log, ">>", $logfile) or die $!;
+        $log->autoflush(1);
+        my @held;
+        while (my $c = $srv->accept()) {
+            if ($mode eq "answer") {
+                print $c "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nUNASKED";
+                close $c;
+            } else {
+                # Kept in scope on purpose: letting it fall out of scope would close
+                # it, which is the OTHER outcome and would stage the wrong case.
+                push @held, $c;
+            }
         }
     ' "$1" "$2" "$3"
 }
@@ -1135,6 +1251,64 @@ if [ "$distinct" -ne 6 ]; then
 fi
 ran=$(( ran + 1 ))
 
+# --- the drain's verdict, against staged readings ---------------------------
+#
+# `_e2e_read_hit_bound` decides whether OUR bound or the PEER ended a read, from
+# the CLOCK. `read -t`'s exit status cannot carry that: a timeout is above 128 on
+# bash 4.0+ and a plain `1` -- byte-identical to EOF -- on the 3.2 that macOS ships.
+# The status-based version therefore failed on macOS ALONE and passed everywhere
+# else, which is why the decision is driven DIRECTLY here rather than through a
+# staged listener: on this platform the real path cannot exhibit the difference.
+# `.agent/rules/testing.md`, on splitting the decision out as a pure function over
+# a record so a verdict needing a rare machine to reproduce needs one line here.
+#
+# The listener-backed arm of the same property is `http-silence-inconclusive`,
+# which spends the whole five-second bound. These cost nothing and cover the
+# branch on every platform, which that case cannot.
+echo "== the drain's verdict, against staged readings"
+read_bound_rows=(
+    "hit-bound-exact|5|5|0|a read that consumed its whole bound is the bound's"
+    "hit-bound-over|6|5|0|a read that overran its bound is still the bound's"
+    "hit-bound-eof|0|5|1|a peer that closed at once is the peer's"
+    "hit-bound-early|4|5|1|a peer that closed inside the bound is the peer's"
+)
+# Two empty lists agree perfectly: a table that loses its rows reports every
+# reading clean, exactly like a scan that found no readings.
+ran=$(( ran + 1 ))
+if [ "${#read_bound_rows[@]}" -lt 1 ]; then
+    echo "FAIL read-bound: the reading table is empty, so every row 'passed'." >&2
+    note_failure "read-bound"
+fi
+
+for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
+    old="$IFS"
+    IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+    IFS="$old"
+    ( . "$library"; _e2e_read_hit_bound "$relapsed" "$rbound" ) && rgot=0 || rgot=$?
+    ran=$(( ran + 1 ))
+    if [ "$rgot" -ne "$rwant" ]; then
+        echo "FAIL ${rname}: ${rwhat} -- elapsed ${relapsed}s against a ${rbound}s bound returned ${rgot}, wanted ${rwant}" >&2
+        note_failure "${rname}"
+    fi
+done
+
+# Four rows that all answer the same way pass every assertion above while testing
+# nothing -- the `verdict-branches` argument thirty lines up, applied to a
+# predicate with exactly two answers. Both must appear.
+read_bound_answers="$(
+    for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
+        old="$IFS"
+        IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+        IFS="$old"
+        printf '%s\n' "$rwant"
+    done | sort -u | grep -c .
+)"
+ran=$(( ran + 1 ))
+if [ "$read_bound_answers" -ne 2 ]; then
+    echo "FAIL read-bound-branches: the readings produced ${read_bound_answers} distinct answers, not 2" >&2
+    note_failure "read-bound-branches"
+fi
+
 # --- the cases -------------------------------------------------------------
 
 cases=(
@@ -1177,6 +1351,9 @@ socket_cases=(
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
+    "http-silence|0|http_response_to_silence reported what the server volunteered"
+    "http-silence-inconclusive|0|refused rather than reporting silence it never observed"
+    "http-silence-refused|0|told a refused connection from an expired bound"
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"
@@ -1993,6 +2170,61 @@ else
     # and counted as SKIPPED only, never also as run.
     echo "   bash 3.2: NOT CHECKED whether any *.sh lives outside scripts/ -- no git repository here" >&2
     skipped=$(( skipped + 1 ))
+fi
+
+# A fractional `read -t` is on the library's own banned list and was the one entry
+# nothing checked: the table above is `grep -F`, and this needs a pattern. So it was
+# REMEMBERED rather than scanned, in a file whose whole argument is that remembering
+# does not work -- and #824 then added a `read -t` whose comment cites bash 3.2 as
+# the reason it is an integer, resting on a check that was not there.
+#
+# Not folded into `banned`: every row there is a literal by construction, and giving
+# one of them regex meaning would make the other eight silently regexes too.
+#
+# The scan covers `$library` and not this file. Scanning this one would match the
+# `banned` table's own rows, which are data rather than uses -- the "a comment is not
+# a call site" problem in a form a comment filter cannot solve. That gap is real and
+# is not closed here; see the reported findings.
+#
+# THREE CLAUSES, because a literal scan alone could not see the very call it was
+# written for. #824's `read -t` takes `"$_e2e_http_read_bound"`, so a pattern looking
+# for a digit after `-t` matched nothing on the fixed tree AND would match nothing on
+# a tree that set that bound to `0.5` -- the regression this exists to catch, passing
+# in silence. So the bound is followed through the variable, and the scan asserts it
+# saw at least one `read -t` at all: zero is the spelling of "this stopped reading
+# what it thinks it reads", which is the same fail-closed clause the `note_failure`
+# census below uses on itself.
+echo "== bash 3.2: a fractional read -t"
+ran=$(( ran + 1 ))
+bash32_read_uses="$(grep -nE 'read [^;|&]*-t' "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+
+# (1) the bound written as a literal.
+fractional="$(printf '%s\n' "$bash32_read_uses" | grep -E -- '-t *[0-9]*\.' || true)"
+
+# (2) the bound written as a variable whose value is fractional. The name is read
+#     off the call site rather than remembered, so a second bound gets checked too.
+for bound_var in $(printf '%s\n' "$bash32_read_uses" \
+    | grep -oE -- '-t[[:space:]]*"?\$\{?[A-Za-z_][A-Za-z0-9_]*' \
+    | sed -E 's/.*\$\{?//' | sort -u); do
+    frac_assign="$(grep -nE "^[[:space:]]*(local[[:space:]]+)?${bound_var}=[^#]*[0-9]\." "$library" || true)"
+    if [ -n "$frac_assign" ]; then
+        fractional="${fractional}${fractional:+
+}${frac_assign}"
+    fi
+done
+
+if [ -n "$fractional" ]; then
+    echo "FAIL bash32: ${library} uses a fractional 'read -t' (bash 4.0+; 3.2 rejects it)" >&2
+    printf '%s\n' "$fractional" | sed 's/^/     | /' >&2
+    note_failure "bash32-fractional-read"
+elif [ -z "$bash32_read_uses" ]; then
+    # (3) the positive control. A clean verdict is only worth something if the scan
+    #     can still find the construct it is judging.
+    echo "FAIL bash32: the fractional-'read -t' scan found no 'read -t' in ${library} at all," >&2
+    echo "     so its clean verdict describes nothing. Fix the pattern, not the library." >&2
+    note_failure "bash32-fractional-read"
+else
+    echo "   bash 3.2: every 'read -t' bound in ${library##*/} is a whole number (literals and variables)"
 fi
 
 # --- every failure is recorded BY NAME ------------------------------------

@@ -741,23 +741,180 @@ stop_and_require_exit() {
 
 # ---------------------------------------------------------------------------
 
-# GET one path and echo the whole response, headers included.
+# How long any one read here may block before the probe gives up.
 #
-# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
-# tests nothing on the machine that lacks it, and this needs no more than one
-# request. Every read is bounded with `read -t`: the endpoint closes the
-# connection itself (`Connection: close`), so a healthy server ends the loop on
-# its own -- and a WEDGED one, which is exactly the state this probe exists to
-# detect, would otherwise hang the suite instead of failing it.
+# Named once so the read and the code that INTERPRETS the read cannot disagree
+# about it. A bound in one place and a threshold in another is two numbers that
+# have to stay equal forever.
 #
-# `read -t 5` and not a fractional timeout, because bash 3.2 rejects one.
+# IT IS ALSO COUPLED TO A NUMBER IN THE DAEMON, and nothing checks that. It must
+# stay STRICTLY ABOVE `AdminHttpServer::RequestTimeout`
+# (`src/FastCache/Server/AdminHttpServer.hpp`, 2000 ms today), because
+# `http_response_to_silence` reads a silent server's CLOSE as its answer: if the
+# server's deadline ever reaches this bound, the probe returns
+# `$E2eSilenceInconclusive` and `fleet-dashboard-e2e.sh` FAILS rather than skips.
+# #828 proposes splitting that deadline and is exactly the change that would do it,
+# so raise this number in the same commit -- the two files are a pair.
+_e2e_http_read_bound=5
+
+# Did the bound end that read, or did the peer?
+#
+# The verdict, split out as a pure function over a READING, for the reason
+# `.agent/rules/testing.md` gives for `node-scratch-isolation-e2e`'s classifier: a
+# decision that can only be reached by staging the real thing can only be tested
+# where the real thing misbehaves. This one misbehaved on macOS ALONE -- bash 3.2
+# is what breaks the status-based version -- so inlined in `http_response_to_silence`
+# it is a property no Linux or Windows run can exercise, and the guard against it
+# coming back is a CI leg that already went red once.
+#
+# Driven directly, both answers are one line each on any platform: `5 5` is a read
+# that consumed its whole bound and `0 5` is a peer that closed at once. That is
+# the whole rule, and it needs no listener, no port and no five-second wait.
+#
+# @param 1 how long the read that ended the loop took, in whole seconds
+# @param 2 the bound that read was given
+# @return 0 when OUR bound ended the read, 1 when the PEER did
+_e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
+
+# Read one whole response off fd 3 and close it.
+#
+# The read half of every helper below, in ONE place. Called directly rather than
+# through a command substitution, so its two output variables reach the caller: a
+# subshell's variable does not.
+#
+# `read -t` with a whole number and not a fractional timeout, because bash 3.2
+# rejects one. Every read is bounded because the endpoint closes the connection
+# itself (`Connection: close`), so a healthy server ends the loop on its own -- and
+# a WEDGED one, which is exactly the state these probes exist to detect, would
+# otherwise hang the suite instead of failing it.
 #
 # THE LAST CHUNK. `read` sets its variable and returns non-zero on a final chunk
 # with no trailing newline, so a naive loop drops it. That is not a corner case
 # here: the fleet dashboard's JSON document is ONE line with no newline at all, so
 # without the line below the whole body vanishes and every assertion about it
 # fails for a reason that has nothing to do with the server. One of the seven
-# copies of this function learnt that; the other six never did.
+# copies this file replaced learnt that; the other six never did -- which is the
+# whole argument for there being one copy now rather than one per helper.
+#
+# ## Why the elapsed time and not `read`'s exit status
+#
+# "The peer closed" and "our own bound expired" are different facts, and the
+# obvious way to tell them apart is that `read -t` returns **above 128** on a
+# timeout and `1` on EOF. **That is bash 4.0+.** bash 3.2 -- which macOS ships, and
+# which `FASTCACHED_BASH` resolves to on every non-Windows platform -- returns a
+# plain `1` for both, so the discrimination silently collapses on the one platform
+# it was written to protect, in the direction that reports a WEDGED server as one
+# that answered nothing. This file's header already records the same shape for
+# `BASHPID`: correct on bash 4, silently inert on 3.2.
+#
+# So the status is not asked. The read that ENDED the loop is timed instead, and a
+# read that consumed the whole bound is one the bound ended. That is true on every
+# bash. *Inferred, not measured*: no 3.2 was available to test against -- this host
+# is 5.3.9, where a timeout is 142. Removing the dependency is what makes that
+# acceptable; testing it here would have proved nothing about macOS.
+#
+# `SECONDS` is whole seconds, and the arithmetic is exact rather than lucky:
+# `floor(a + BOUND) - floor(a)` is exactly `BOUND` for any `a`, so a read that
+# times out always measures `BOUND` and never one less. It times the LAST read
+# rather than the loop, because a server that dribbles a line every two seconds
+# would otherwise accumulate past the bound and be called a timeout.
+#
+# The read's own status is LOCAL, deliberately. It is loop control and nothing
+# else: an earlier draft exported it and had to carry a written prohibition against
+# the one use anybody would put it to (telling a timeout from an EOF, which is the
+# very thing it cannot do here). Scoping it makes the prohibition unnecessary
+# rather than merely documented -- there is no variable left to misread.
+#
+# @return echoes the body, and sets `_http_drain_elapsed` to how long the read that
+#         ended the loop took. That elapsed time is the only output; the verdict is
+#         `_e2e_read_hit_bound`'s.
+_http_drain_fd3() {
+    local line="" body="" before=0 status=0
+    while :; do
+        # `|| status=$?` rather than a bare read: a command whose failure
+        # is TESTED is exempt from `set -e`, and a bare one is not. This file is
+        # sourced by fixtures on both settings -- `check-e2e-helpers.sh` sets `-e`,
+        # `fleet-dashboard-e2e.sh` sets only `-uo pipefail` -- so a bare read here
+        # ended the whole shell on EOF in one and returned normally in the other.
+        #
+        # And the status is taken AT the read: a `while read ...; do ...; done`
+        # leaves `$?` holding the last command of the BODY, so on a peer that never
+        # says anything the body never runs and `$?` is a clean 0 -- which reads as
+        # "the peer closed" for a read that in fact timed out.
+        status=0
+        before=$SECONDS
+        IFS= read -r -t "$_e2e_http_read_bound" line <&3 || status=$?
+        _http_drain_elapsed=$(( SECONDS - before ))
+        [ "$status" -eq 0 ] || break
+        body+="${line}"$'\n'
+    done
+    if [ -n "$line" ]; then body+="$line"; fi
+    exec 3<&-
+    printf '%s' "$body"
+}
+
+# What an HTTP surface says, unprompted, to a peer that says NOTHING.
+#
+# Connect and read; never send. That is an unused browser preconnect exactly, and
+# it is the DETERMINISTIC form of the #824 guard. The shape a report describes --
+# connect, wait, then ask -- cannot be asserted on: once the server has answered
+# and closed, the client's late write draws an RST, and the RST discards the
+# client's receive buffer before the response in it can be read. Measured both
+# ways against one unfixed binary: a `python` client saw the `400`, a bash client
+# saw nothing. A guard built on that passes on the bug about half the time.
+#
+# No idle parameter. `_e2e_http_read_bound` outlasts any request deadline this tree
+# sets, so a server that means to answer a silent peer has answered by the time the
+# bound expires and one that means to close has closed. Sleeping first would only
+# make the case slower.
+#
+# It REFUSES rather than answering when that bound is what ended the read: an
+# expired `read -t` yields an empty body, which is byte-identical to "the server
+# volunteered nothing" -- so without this the probe would go vacuous, silently,
+# the day anyone raises the server's deadline past five seconds.
+#
+# **Three outcomes, three statuses, and the statuses are NAMED.** "The connection
+# was refused" and "the bound expired" are different facts about different machines,
+# and folding them into one non-zero is the same mistake one layer up as the `bool
+# ok` this whole change is about: the caller then prints a diagnosis it has not
+# established -- a dead node reported as a surface that would not answer.
+#
+# The names exist for the reason `E2eBoundOutcomeExceeded` below gives, and this
+# function is the case that argument was written about. A bare literal FAILS OPEN:
+# writing `1)` where `2)` was meant makes a fixture print "the node is gone" for
+# "the surface would not answer" -- the exact mis-bucketing the three statuses exist
+# to prevent, and no shell setting catches it. Compared against a name instead, a
+# typo is an unbound variable and every caller here runs under `set -u`, so the same
+# mistake stops the run and says where.
+E2eSilenceAnswered=0
+E2eSilenceInconclusive=1
+E2eSilenceRefused=2
+
+# @param 1 host
+# @param 2 port
+# @return echoes whatever the server said unprompted, EMPTY when it said nothing.
+#         `$E2eSilenceAnswered` the server answered or closed, so the body is its
+#         answer; `$E2eSilenceInconclusive` the read bound expired first, so there
+#         is no answer to report; `$E2eSilenceRefused` the connection was refused,
+#         so nothing was ever asked.
+http_response_to_silence() {
+    local host="$1" port="$2"
+    exec 3<>"/dev/tcp/${host}/${port}" || return "$E2eSilenceRefused"
+    _http_drain_fd3
+    # Elapsed, never `read`'s status -- see `_http_drain_fd3`. A read that consumed
+    # the whole bound is one OUR bound ended, and that is not an answer about the
+    # server; anything shorter is the peer having closed, which is.
+    ! _e2e_read_hit_bound "$_http_drain_elapsed" "$_e2e_http_read_bound"
+}
+
+# ---------------------------------------------------------------------------
+
+# GET one path and echo the whole response, headers included.
+#
+# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
+# tests nothing on the machine that lacks it, and this needs no more than one
+# request. The read half, its bound and the last-chunk recovery are
+# `_http_drain_fd3`'s.
 #
 # @param 1 host
 # @param 2 port
@@ -767,7 +924,7 @@ stop_and_require_exit() {
 http_get() {
     local host="$1" port="$2" path="$3"
     shift 3
-    local line="" body="" header=""
+    local header=""
     exec 3<>"/dev/tcp/${host}/${port}" || return 1
     {
         printf 'GET %s HTTP/1.1\r\nHost: %s\r\n' "$path" "$host"
@@ -776,10 +933,7 @@ http_get() {
         done
         printf 'Connection: close\r\n\r\n'
     } >&3
-    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
-    if [ -n "$line" ]; then body+="$line"; fi
-    exec 3<&-
-    printf '%s' "$body"
+    _http_drain_fd3
 }
 
 # ---------------------------------------------------------------------------
