@@ -1301,6 +1301,69 @@ rule, rest on that sentence, and it does not reproduce** (#565).
   | tail` reports the pipe's status) and a nested `cmake -P` whose
   `RESULT_VARIABLE` is unread. The first is this file's own eleven-ways bullet;
   the second is now what `script-check-canary` is built out of.
+- **A census over CORRECTED prose must CLASSIFY, and a census that only counts is
+  wrong in the direction that looks like unfinished work.** Retiring the claim
+  above left thirteen places quoting it in order to refute it, because this file's
+  house style is to leave the wrong sentence visible — that is what lets a reader
+  tell *corrected* from *never said*, and a silent swap would have made the
+  retirement unauditable from outside. The cost is that **the pattern which finds
+  the claim finds its refutation too.** Three readers grepped for it after the
+  correction landed and each reported a live copy; all three had read a
+  retraction, and the worst-looking hit —
+  `src/tests/CMakeLists.txt:143`, which carries *"measured, not inferred"*, the
+  phrase this repository uses to mark a claim as trustworthy — has that phrase
+  **inside the quotation marks**, three lines above its own refutation.
+
+  The method, because a figure without its pattern is the defect this section is
+  already about. State the query, then classify each hit rather than totalling it:
+
+  ```
+  git grep -nE 'exits? \*?\*?0\*?\*? on (CMake )?3\.28|cannot fail by exit code|exits 0 on 3\.28'
+  ```
+
+  then, per hit, read ±6 lines for a retraction marker (*does not reproduce*,
+  *paragraph said*, *stated ground*, *until #565*) and report ASSERTION or
+  RETRACTION. Asked at `7952c61f`: **13 hits, 13 retractions, 0 assertions** — the
+  claim held, which is an outcome worth recording precisely because it is the one
+  nobody writes down. **14 on the tree that carries this bullet**, the extra being
+  the query above matching itself: state which tree, as always, and note that a
+  documented census counts its own documentation.
+
+  **Zero is not a verdict, so the classifier gets a positive control.** A broken
+  classifier and a clean tree produce the same output. Plant one bare assertion
+  far from any marker — `scripts/check-test-names.cmake:4` was used — confirm the
+  census reports `ASSERTION`, then restore. Without that step "0 assertions" is an
+  absence of evidence rendered as evidence of absence, which is this rulebook's
+  own four-states rule arriving in an audit.
+
+  **And the classifier is a triage aid, not an oracle — measured, it is blind
+  around this very paragraph.** The marker list two paragraphs up is prose in the
+  same file, so it puts a false-RETRACTION zone ±6 lines around itself: a bare
+  assertion planted three lines from that list was classified **RETRACTION**,
+  which is the check being defeated by its own documentation. A second positive
+  control catches it — plant the assertion *adjacent to the marker list* as well
+  as far from it — and the standing rule is that **any hit inside the block
+  documenting the census is read rather than classified.** The failure is
+  contained (it can only ever excuse a hit, never invent one) but it fails in the
+  direction that reports a clean tree, so it is stated rather than left for the
+  next reader to rediscover.
+
+  **And this is the companion to *a first failure masks its identical siblings*
+  (#172), not a replacement for it.** Both are true and they fire in OPPOSITE
+  directions: the sibling rule says a correction may have missed copies, so go
+  looking — which is exactly what sent a lane looking here, correctly. This one
+  says the looking will also turn up the correction itself. A count satisfies
+  neither. **One correction does not find its own siblings, and one correction
+  does not find its own FALSE POSITIVES either.**
+
+  The reason this is a rule rather than a note about care: the three readers each
+  knew the hazard, and one of them had written it down one paragraph above
+  reporting the false positive. **A hazard that defeats people who know about it
+  is a design problem**, and the fix that suggests itself — marking each quoted
+  line so a line-oriented search cannot pick it up — was considered and REFUSED,
+  because it optimises the file for `grep` at the cost of the reader, and the
+  retraction being readable is the property that made the audit resolvable in the
+  first place.
 - **The verdict is still read from the output, for two reasons that are true and
   neither of which was the stated one.** `message(WARNING)` exits **0** on every
   version above while printing `CMake Warning`, so only an output verdict can hear
