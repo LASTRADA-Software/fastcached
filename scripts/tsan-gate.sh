@@ -142,6 +142,113 @@ TARGETS=(
     "fastcache-compile-node-tests|"
 )
 
+# What this gate DID, one entry per row of TARGETS above.
+#
+# The gate is fail-fast and stays that way: a sanitized run is expensive, and
+# forcing a second full run after a known failure is how a gate becomes something
+# people stop running (#501 reached the same conclusion for `local-gate.sh`).
+# What was missing is not perseverance, it is the ACCOUNT.
+#
+# Every failure path in `RunTarget` ends in `fatal`, which exits -- so when the
+# first target reports a race the second never runs, and the only thing printed
+# names the first. **Skipped, absent, unstarted and failed are four states**, and
+# this gate rendered the first three as one: silence.
+#
+# The states, and why the fourth is not padding:
+#
+#   not-run    the gate stopped before this target; it has reported NOTHING here
+#   running    this target STARTED and no verdict was reached -- a killed or
+#              timed-out run. Distinct from not-run because "did not run" would
+#              be a LIE about a target that ran for ten minutes, and the two are
+#              diagnosed in different places (#584 is this state one level up)
+#   clean      ran, and this gate is satisfied
+#   FAILED     ran, and this gate is not
+#
+# Parallel INDEXED arrays rather than `declare -A`: macOS ships bash 3.2, which
+# has no associative arrays, and this script runs there -- `tsan-gate-selftest`
+# is in the default ctest set under `if(NOT WIN32)`.
+# Declared EMPTY and never pre-filled: `TargetPairs` reads an absent entry as
+# `not-run`, which is the truth for every target until the loop reaches it, and
+# is what a failure BEFORE the loop has to report. Filling it in advance would
+# only create a second list to keep in step with the first.
+TargetVerdicts=()
+
+# Whether the EXIT trap renders the account. `yes` for a real gate run -- which
+# is every invocation that is not `--self-test`, including a failing one, since a
+# failing run is exactly when the account is worth having.
+RenderVerdictsOnExit="yes"
+
+# Record a verdict against a target BY NAME, so a caller never has to know its
+# index. An unknown name is a programming error and says so rather than silently
+# recording nothing -- a verdict table that quietly drops entries is the defect
+# this whole mechanism exists to remove.
+SetTargetVerdict() {
+    local name="$1" verdict="$2" i=0 _row
+    for _row in "${TARGETS[@]}"; do
+        if [[ "${_row%%|*}" == "${name}" ]]; then
+            TargetVerdicts[$i]="${verdict}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    echo "tsan-gate: internal error: no TARGETS row named '${name}'" >&2
+    return 1
+}
+
+# Every target's state, as `name=state` pairs in TABLE order.
+#
+# Split from the renderer so the renderer stays PURE -- the same two-function
+# shape `local-gate.sh` uses (`leg_pairs` / `leg_summary`), arrived at for the
+# same reason and deliberately not shared: the common core is a `printf` and a
+# `case`, while the header, the column width and all four labels are per-caller
+# data, and bash 3.2 has no associative array to pass such a table through.
+#
+# Reading the table here is what makes a silently absent row impossible. The
+# green path used to print `all scoped targets clean under ThreadSanitizer` -- a
+# sentence about a table it did not read, which stays true-looking when a third
+# row is added and never runs.
+#
+# `:-not-run` is what makes the ABSENCE of an entry mean something rather than
+# being an unbound-variable death under `set -u`, which would print a partial
+# table with no summary -- indistinguishable from a table that judged everything
+# and found nothing to say, this ticket's defect one level down. Unquoted at the
+# call site on purpose: these are CMake target names, which carry no whitespace.
+TargetPairs() {
+    local i=0 row
+    for row in "${TARGETS[@]}"; do
+        echo "${row%%|*}=${TargetVerdicts[$i]:-not-run}"
+        i=$((i + 1))
+    done
+}
+
+# The account. PURE -- everything it reports arrives as arguments, so the
+# self-test drives every verdict in milliseconds without staging a build, and
+# without the array save/restore a global-reading renderer forces on its fixture.
+#
+# Four arms and no fall-through, because `not-run` and *a state this renderer
+# does not know* are different facts: the first is "the gate stopped before this
+# target", the second is a bug in the gate. Collapsing them is the acceptance
+# clause itself -- a fourth state reaching a default arm as a plausible verdict
+# recreates this bug one level down.
+RenderTargetVerdicts() {
+    local pair name verdict label
+    echo "==> ThreadSanitizer gate, per-target verdict:"
+    # `${1+"$@"}` rather than `"$@"`: before bash 4.4 an empty `$@` is an unbound
+    # expansion under `set -u`, and this script runs on macOS's 3.2.
+    for pair in ${1+"$@"}; do
+        name="${pair%%=*}"
+        verdict="${pair#*=}"
+        case "${verdict}" in
+            clean)   label="clean" ;;
+            FAILED)  label="FAILED" ;;
+            running) label="STARTED, NO VERDICT -- the run ended while this target was in flight" ;;
+            not-run) label="NOT RUN -- the gate stopped before this target, so it has reported nothing about it" ;;
+            *)       label="UNKNOWN STATE '${verdict}' -- this is a bug in the gate, not a verdict" ;;
+        esac
+        printf '      %-32s %s\n' "${name}" "${label}"
+    done
+}
+
 # `exitcode=66` is TSan's default and is named rather than assumed: this gate
 # decides on the exit code, so it must not be something a stray TSAN_OPTIONS in
 # the environment can change to 0. `print_suppressions=1` is on for EVERY run,
@@ -248,7 +355,22 @@ note() { echo "==> $*"; }
 # forget -- and `fatal` exits rather than returning, so a RETURN-scoped trap would
 # not have covered them either.
 SCRATCH="$(mktemp -d)"
-cleanup() { rm -rf "${SCRATCH}"; }
+# The verdict is rendered from the EXIT trap, which is the only place that covers
+# EVERY way out: `fatal` (which exits), the green path, and a signal -- `e2e_begin`
+# installs a TERM trap that ends the run through an ordinary exit, so this runs
+# then too. Printing it from the two terminal call sites instead would have left
+# the killed case silent, which is the case that most needs an account.
+cleanup() {
+    # `--self-test` runs no target and intends to run none, so a verdict table
+    # there would report NOT RUN -- "the gate stopped before this target" -- about
+    # a run that was never a gate. That is this ticket's own defect inverted: an
+    # account of work nobody asked for reads exactly like an account of work that
+    # was skipped, and both are wrong in a way a reader cannot check.
+    if [[ "${RenderVerdictsOnExit}" == "yes" ]]; then
+        RenderTargetVerdicts $(TargetPairs)
+    fi
+    rm -rf "${SCRATCH}"
+}
 trap cleanup EXIT
 
 # After the EXIT trap, which is `e2e_begin`'s stated contract: it installs a TERM
@@ -487,8 +609,30 @@ ${canary_out}"
 # The suite.
 # ---------------------------------------------------------------------------
 
+# A refusal that BELONGS to a target: record the verdict, then exit through
+# `fatal` as every other refusal here does.
+#
+# Without this every failing target rendered `STARTED, NO VERDICT`, because
+# `fatal` exits and the EXIT trap found the entry still at `running`. That is a
+# true statement and the wrong one -- the acceptance asks for `clean`, `FAILED`
+# or `NOT RUN`, and a target that RAN and was REFUSED is the second. `running`
+# then means what it should: started, and killed before any verdict was reached.
+#
+# @param 1 target name. @param 2.. the refusal message, passed to `fatal`.
+FailTarget() {
+    local name="$1"; shift
+    SetTargetVerdict "$name" "FAILED" || true
+    fatal "$@"
+}
+
 RunTarget() {
     local name="$1" tags="$2" path rc=0 log summary outcome
+    # Claimed BEFORE anything can fail, so a target killed mid-run renders as
+    # STARTED rather than NOT RUN -- it DID run, and saying it did not would be a
+    # lie about the ten minutes it spent. Every refusal below goes through
+    # `FailTarget` and overwrites this with `FAILED`; what is left at `running`
+    # is exactly the case nothing got to decide.
+    SetTargetVerdict "$name" "running"
     path="$(BinaryPath "$name")"
 
     # An empty tag expression means "run the whole binary", which is not the same
@@ -524,13 +668,13 @@ RunTarget() {
     case "$outcome" in
         "$E2eBoundOutcomeExceeded")
             cat "$log"
-            fatal "${name} did not finish within ${TargetTimeoutSeconds}s and was killed.
+            FailTarget "$name" "${name} did not finish within ${TargetTimeoutSeconds}s and was killed.
     Under ThreadSanitizer that is a deadlock until proven otherwise, and the last
     case in the log above is where to start. FASTCACHE_TSAN_TIMEOUT raises the
     bound if the suite has simply grown."
             ;;
         "$E2eBoundUnstartable")
-            fatal "${name} at ${path} could not be executed, so this target ran no cases at all.
+            FailTarget "$name" "${name} at ${path} could not be executed, so this target ran no cases at all.
     AssertInstrumented found the file and read its objects, so this is a
     permission bit, an interpreter, or a binary for another architecture."
             ;;
@@ -543,7 +687,7 @@ RunTarget() {
     # instead, and assert positively that cases ran rather than trusting the exit
     # code.
     if grep -q 'No test cases matched' "$log"; then
-        fatal "${name}: the filter '${tags}' matched no test cases, so this target tested NOTHING.
+        FailTarget "$name" "${name}: the filter '${tags}' matched no test cases, so this target tested NOTHING.
     Fix the tag expression in the TARGETS table in $(basename "${BASH_SOURCE[0]}")."
     fi
 
@@ -555,9 +699,16 @@ RunTarget() {
     if [[ "$rc" -eq 0 ]]; then
         summary="$(grep -E 'assertions in|Matched [0-9]+ suppressions' "$log" || true)"
         [[ -n "$summary" ]] \
-            || fatal "${name}: exited 0 but reported no assertions; refusing to call that clean."
+            || FailTarget "$name" "${name}: exited 0 but reported no assertions; refusing to call that clean."
         echo "$summary"
         note "${name}: clean"
+        # Recorded where `clean` is DECLARED, not by the caller. RunTarget has
+        # exactly one success return and every other path is `fatal`; recording
+        # it in the loop instead would mean a `return` added here later for some
+        # OTHER reason silently reads as clean, which is this ticket's own defect
+        # rebuilt out of the fix. Left at `running`, such a return renders
+        # STARTED, NO VERDICT -- wrong, but wrong in the direction that says so.
+        SetTargetVerdict "$name" "clean"
         return
     fi
 
@@ -567,11 +718,11 @@ RunTarget() {
     # passed" even when the process exits 66, so the exit code is what decides and
     # the output is only ever an explanation.
     if grep -q 'WARNING: ThreadSanitizer' "$log"; then
-        fatal "${name} reported an unsuppressed data race (exit ${rc}).
+        FailTarget "$name" "${name} reported an unsuppressed data race (exit ${rc}).
     If this is a NEW race, it is its own issue -- file it. If it is a known one,
     it belongs in .tsan-suppressions with its issue number, not deleted from here."
     fi
-    fatal "${name} failed (exit ${rc}) without a ThreadSanitizer report."
+    FailTarget "$name" "${name} failed (exit ${rc}) without a ThreadSanitizer report."
 }
 
 # ---------------------------------------------------------------------------
@@ -651,7 +802,13 @@ STUB
             failures=$(( failures + 1 ))
             return
         fi
-        for pattern in "$@"; do
+        # `${1+"$@"}`: before bash 4.4 -- macOS's /bin/bash, and this runs in the
+        # DEFAULT ctest set -- an empty `$@` is an unbound expansion under
+        # `set -u`. A case that asserts only an exit status passes no patterns,
+        # and would die with a shell error instead. Inside a want-fail assertion
+        # that is indistinguishable from the rule firing, which is #723's
+        # indistinguishability reached through `set -u` rather than a mode bit.
+        for pattern in ${1+"$@"}; do
             if [[ "${pattern:0:1}" == "!" ]]; then
                 if [[ "$out" == *"${pattern:1}"* ]]; then
                     echo "  FAIL ${name}: output contains '${pattern:1}' and must not" >&2
@@ -696,7 +853,7 @@ STUB
 ' "0000000000001234 T __tsan_init" > "$(BinaryPath "$target")"
         dir="${BUILD_DIR}/src/tests/CMakeFiles/${target}.dir"
         mkdir -p "$dir"
-        for spec in "$@"; do
+        for spec in ${1+"$@"}; do
             obj="${spec%%:*}"; kind="${spec#*:}"
             case "$kind" in
                 # A real instrumented object: an undefined __tsan_init, plus the
@@ -880,6 +1037,127 @@ STUB
 
     rm -rf "$scratch"
     echo
+    # ---------------------------------------------------------------------
+    # The per-target verdict (#581).
+    #
+    # `RenderTargetVerdicts` is PURE -- pairs in, lines out -- so staging its
+    # input is passing arguments, and every verdict is exercised in milliseconds
+    # with no sanitized build, no staged binaries and no timing. That is the same
+    # split the scratch-isolation fixture was rewritten to use: keep acquisition
+    # out of the decision, and the decision becomes testable. It is also what
+    # keeps this fixture from having to save and restore the gate's own arrays,
+    # which a global-reading renderer would force on it.
+    #
+    # @param 1 case name
+    # @param 2 space-separated `name=state` pairs
+    # @param 3.. text the output must contain; a leading `!` means must NOT
+    VerdictCase() {
+        local name="$1" pairs="$2"; shift 2
+        local out
+        out="$(RenderTargetVerdicts $pairs 2>&1)"
+        Expect "$name" 0 0 "$out" "$@"
+    }
+
+    # The failure #581 is about: the first target reports a race, `fatal` exits,
+    # and the second NEVER RUNS. Before this, the only thing printed named the
+    # first -- so a green re-run after the fix looked identical to a run in which
+    # the second was never examined.
+    #
+    # `!UNKNOWN` is not padding. Delete the `FAILED)` arm and the state falls to
+    # the unrecognised one, which renders `UNKNOWN STATE 'FAILED'` -- a string
+    # that still CONTAINS "FAILED", so an assertion on the word alone stays green
+    # while the verdict has become a bug report. Measured by deleting the arm: 22
+    # cases ran, 0 failed. A signal that cannot be false in the failing case is
+    # not evidence.
+    VerdictCase "verdict-stopped-before-the-second-target" \
+        "FastCacheTest=FAILED fastcache-compile-node-tests=not-run" \
+        "FastCacheTest" "FAILED" "fastcache-compile-node-tests" "NOT RUN" \
+        "reported nothing about it" \
+        "!clean" "!UNKNOWN"
+
+    # ... and the reverse reading, which is the one that actually misleads: a run
+    # where BOTH were examined must be distinguishable from the one above. It was
+    # not, because neither printed anything per target.
+    VerdictCase "verdict-both-clean-says-so-per-target" \
+        "FastCacheTest=clean fastcache-compile-node-tests=clean" \
+        "FastCacheTest" "fastcache-compile-node-tests" "clean" \
+        "!NOT RUN" "!STARTED" "!FAILED"
+
+    # An early failure, before any target: every row reports that it was not
+    # reached. Silence used to be the only signal here, and silence is also what a
+    # scrolled-past line and a truncated log look like.
+    VerdictCase "verdict-nothing-reached-at-all" \
+        "FastCacheTest=not-run fastcache-compile-node-tests=not-run" \
+        "NOT RUN" "!clean" "!FAILED"
+
+    # STARTED is not NOT RUN, and it is not FAILED either. A target killed
+    # mid-run DID run, and saying it did not would be a lie about the ten minutes
+    # it spent; saying it FAILED would be a verdict nothing reached. Three states,
+    # three diagnoses, three different people.
+    VerdictCase "verdict-started-is-not-unstarted" \
+        "FastCacheTest=running" \
+        "STARTED, NO VERDICT" "!NOT RUN" "!FAILED"
+
+    # The acceptance clause a fall-through would silently break: a state this
+    # renderer does not know is a BUG IN THE GATE, and must not be dressed as the
+    # nearest plausible verdict. `not-run` therefore has an arm of its own -- when
+    # the two shared one, an unrecognised state rendered as NOT RUN, which reads
+    # as a considered verdict about a target nobody looked at.
+    VerdictCase "verdict-unrecognised-state-renders-as-unrecognised" \
+        "FastCacheTest=wat" \
+        "UNKNOWN STATE" "wat" "bug in the gate" \
+        "!NOT RUN" "!clean" "!FAILED" "!STARTED"
+
+    # The second acceptance clause, and the one a literal would pass: the account
+    # must READ the table. Now that the renderer is pure, the derivation lives in
+    # `TargetPairs`, so that is what this drives -- with a THIRD row staged, which
+    # must appear WITHOUT this file being edited (#492: a list is exact about what
+    # it knows and silent about what it does not). Staged inside the command
+    # substitution, which is already a subshell, so the gate's own scope cannot
+    # leak into the cases after it.
+    #
+    # It covers the absence default in the same breath: two verdicts against
+    # three rows, and the third must come back `not-run` rather than aborting the
+    # render under `set -u`.
+    Expect "verdict-pairs-are-derived-from-the-table" 0 0 \
+        "$(TARGETS=("FastCacheTest|[async]" "fastcache-compile-node-tests|" "a-third-target|[new]")
+           TargetVerdicts=("clean" "clean")
+           TargetPairs)" \
+        "FastCacheTest=clean" "fastcache-compile-node-tests=clean" "a-third-target=not-run"
+
+    # Every refusal that BELONGS to a target goes through `FailTarget`, checked at
+    # the SOURCE rather than left to a reader. A bare `fatal` inside `RunTarget`
+    # renders that target `STARTED, NO VERDICT` -- a true statement and the wrong
+    # one, since the target ran and was refused. Nothing a pure renderer test can
+    # see, because the fault is in the WIRING: `fatal` exits, so the verdict is
+    # never recorded and the case would have to survive the exit to notice.
+    # `PurgeExpired` is the standing example of a correct, tested mechanism with
+    # no production caller -- assert the wiring.
+    ran=$(( ran + 1 ))
+    bareFatal="$(awk '
+        /^RunTarget\(\) \{/ { inFn = 1; next }
+        inFn && /^\}/         { inFn = 0 }
+        inFn && /(^|[^A-Za-z_])fatal / && !/^[ \t]*#/ { print NR ": " $0 }
+    ' "${BASH_SOURCE[0]}")"
+    if [[ -n "$bareFatal" ]]; then
+        echo "  FAIL verdict-target-refusals-record-FAILED: a bare \`fatal\` inside RunTarget" >&2
+        printf '%s\n' "$bareFatal" | sed 's/^/       | /' >&2
+        failures=$(( failures + 1 ))
+    else
+        echo "  ok   verdict-target-refusals-record-FAILED"
+    fi
+
+    # A verdict recorded against a name no row carries is a programming error and
+    # says so. A table that quietly drops entries is the defect this mechanism
+    # exists to remove, so the mechanism must not have it.
+    ran=$(( ran + 1 ))
+    if SetTargetVerdict "no-such-target-exists" clean 2>/dev/null; then
+        echo "  FAIL verdict-unknown-target-is-refused: accepted an unknown name" >&2
+        failures=$(( failures + 1 ))
+    else
+        echo "  ok   verdict-unknown-target-is-refused"
+    fi
+
     echo "tsan-gate --self-test: ${ran} cases ran, ${failures} failed"
     [[ "$failures" -eq 0 ]] || exit 1
     exit 0
@@ -887,6 +1165,7 @@ STUB
 
 if [[ "${1:-}" == "--self-test" ]]; then
     SelfTestTarget=""
+    RenderVerdictsOnExit="no"
     SelfTest
 fi
 
@@ -945,4 +1224,8 @@ for row in "${TARGETS[@]}"; do
     RunTarget "${row%%|*}" "${row#*|}"
 done
 
-note "all scoped targets clean under ThreadSanitizer"
+# No literal here. The per-target table the EXIT trap prints IS the green
+# account, and it is derived from TARGETS -- so this line states only the thing
+# the table cannot: that the gate reached its end rather than stopping somewhere
+# in the middle with every row already marked.
+note "ThreadSanitizer gate complete -- every row of TARGETS reached a verdict"
