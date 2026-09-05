@@ -280,27 +280,45 @@ namespace
     /// rather than with a `400` (#824). A head that exceeds the cap is answered `431`
     /// and then closed with whatever is left unread.
     ///
-    /// **That reset hazard is real and was MEASURED not to fire here.** Closing with
-    /// unread data in the receive queue makes the kernel send RST, and an RST
-    /// discards what this server just wrote -- the mechanism this function's own
-    /// header describes two paragraphs up, and the one that makes the idle-then-send
-    /// shape unassertable in the e2e fixture. A reviewer predicted it would destroy
-    /// this `431`. Against a real node on Linux loopback, with a client that sends
-    /// the whole head and then reads: a 9,043-byte head and a 60,043-byte head both
-    /// received `431 Request Header Fields Too Large` intact. The response is
-    /// already in the client's receive buffer before the reset arrives.
+    /// **The reset is real, it is PRE-EXISTING, and it does not eat the answer.**
+    /// Closing with unread data in the receive queue makes the kernel send RST rather
+    /// than FIN, and an RST can discard what this server just wrote. A reviewer
+    /// predicted that would destroy this `431`. Measured instead -- Linux loopback,
+    /// one daemon built from this branch and one from master (`5e80adcd`), six client
+    /// shapes each, the client sending its whole request before reading:
     ///
-    /// So it is BEST-EFFORT rather than lost: those conditions are the measurement's,
-    /// not a guarantee, and a slower client may still lose it -- the same binary that
-    /// delivered a `400` to a `python` client delivered nothing to a `bash` one.
-    /// Draining the rest first is the alternative and is a byte budget for exactly
-    /// the peer least entitled to one, so it is not taken.
+    /// | request                          | master        | this branch   |
+    /// |----------------------------------|---------------|---------------|
+    /// | unterminated 9 KB head           | `200`, RST    | `431`, RST    |
+    /// | unterminated 60 KB head          | `200`, RST    | `431`, RST    |
+    /// | complete head + 60 KB unread body| `200`, RST    | `200`, RST    |
+    /// | complete head, nothing unread    | `200`, no RST | `200`, no RST |
     ///
-    /// The change of ANSWER is deliberate and is not the reset: measured on master,
-    /// a 9 KB and a 60 KB head to `/healthz` are both answered `200 OK`, from a head
-    /// this server only read the first 8,192 bytes of. That is the defect. A route
-    /// reading no headers survives it by luck; `/fleet` reads a credential and does
-    /// not.
+    /// Every response arrived INTACT, on both trees, with the reset observed on the
+    /// following `recv`. Delaying the client's first read by 0.5 s, 1 s, 2 s and 5 s
+    /// changed nothing: the bytes are queued on the client before the reset reaches
+    /// it. The last row is the control -- no unread data, no reset -- which is what
+    /// licenses reading the other three as the hazard rather than as noise.
+    ///
+    /// **So the change moves WHICH response is at risk, not WHETHER one is.** Master
+    /// already answered `200 OK` and closed over ~52 KB of unread head, drawing the
+    /// identical RST; the third row is a path that predates this branch entirely and
+    /// behaves the same on both. Draining first is therefore not a fix for a hazard
+    /// this introduced -- it would be a byte budget granted to exactly the peer least
+    /// entitled to one, and it is not taken.
+    ///
+    /// **Conditions, because they are the measurement's and not a guarantee:** Linux
+    /// loopback, and a client that finishes SENDING before it reads. The bash-versus-
+    /// python result quoted elsewhere in this file is a DIFFERENT shape -- there the
+    /// client writes LATE, after the server has closed, and its own write is what
+    /// draws the RST onto a response already sitting unread. Reading that measurement
+    /// as evidence about this one is the conflation `AGENT.md` warns about under
+    /// "a figure is a quantity UNDER CONDITIONS"; the two shapes are not comparable.
+    ///
+    /// The change of ANSWER is deliberate and is not the reset: on master a 9 KB and a
+    /// 60 KB head to `/healthz` are both answered `200 OK`, from a head this server
+    /// only read the first 8,192 bytes of. That is the defect. A route reading no
+    /// headers survives it by luck; `/fleet` reads a credential and does not.
     Task<RequestHead> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;

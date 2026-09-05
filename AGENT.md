@@ -698,9 +698,17 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   back TRUE and the truncated prefix was SERVED, dropping every header after the cut and
   answering `401` to a browser whose credential fell beyond it. Over the byte cap that is `431`;
   cut off by the DEADLINE it is `408`, and that is the reachable route, since `RequestTimeout` is
-  per READ and the head has no total budget. `408` and silence divide on the EOF rule: a peer
-  that FINISHED sending is still served, a peer this server gave up on is told so. Neither
-  silent outcome is counted, deliberately — a healthy browser produces them by the minute. A
+  per READ and the head has no total budget; ended by EOF mid-head it is `400`. **`sawHeadEnd`
+  decides THAT a head is refused; the cause only selects WHICH code** — guarding on the cap alone
+  closed the oversize route and left the EOF route open, and that one needs no oversize client,
+  just a peer that half-closes after its request line. The tempting reading of the EOF rule — *the
+  peer finished sending, so serve what arrived* — is what a control case in this file asserted, and
+  the assertion WAS the bug: a head with no terminating blank line determines nothing, so there is
+  no reply this server can be right about. `PING` half-closed is a complete command; this is a
+  sentence cut off mid-word. The control that belongs beside it is a COMPLETE head half-closed
+  after, still served `200`, or *refuse an unfinished head* and *refuse every peer that
+  half-closes* are one passing test. Neither silent outcome is counted, deliberately — a healthy
+  browser produces them by the minute. A
   deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
   never one operand — except where a listener has no poll timeout and says so, which two reviewers
   read as the same defect. **The reported shape cannot be asserted on** — connect-wait-send is a race,

@@ -748,6 +748,25 @@ stop_and_require_exit() {
 # have to stay equal forever.
 _e2e_http_read_bound=5
 
+# Did the bound end that read, or did the peer?
+#
+# The verdict, split out as a pure function over a READING, for the reason
+# `.agent/rules/testing.md` gives for `node-scratch-isolation-e2e`'s classifier: a
+# decision that can only be reached by staging the real thing can only be tested
+# where the real thing misbehaves. This one misbehaved on macOS ALONE -- bash 3.2
+# is what breaks the status-based version -- so inlined in `http_response_to_silence`
+# it is a property no Linux or Windows run can exercise, and the guard against it
+# coming back is a CI leg that already went red once.
+#
+# Driven directly, both answers are one line each on any platform: `5 5` is a read
+# that consumed its whole bound and `0 5` is a peer that closed at once. That is
+# the whole rule, and it needs no listener, no port and no five-second wait.
+#
+# @param 1 how long the read that ended the loop took, in whole seconds
+# @param 2 the bound that read was given
+# @return 0 when OUR bound ended the read, 1 when the PEER did
+_e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
+
 # Read one whole response off fd 3 and close it.
 #
 # The read half of every helper below, in ONE place. Called directly rather than
@@ -858,7 +877,7 @@ http_response_to_silence() {
     # Elapsed, never `read`'s status -- see `_http_drain_fd3`. A read that consumed
     # the whole bound is one OUR bound ended, and that is not an answer about the
     # server; anything shorter is the peer having closed, which is.
-    [ "$_http_drain_elapsed" -lt "$_e2e_http_read_bound" ]
+    ! _e2e_read_hit_bound "$_http_drain_elapsed" "$_e2e_http_read_bound"
 }
 
 # ---------------------------------------------------------------------------

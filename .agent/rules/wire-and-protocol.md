@@ -871,6 +871,24 @@ Every rule below has already been a bug.
     leaves `$?` holding the last command of the BODY (so a peer that says nothing
     gives a clean `0`), and moving the read out of the condition made its failure
     fatal under `set -e`, which one fixture sets and another does not.
+  - **What makes a head refusable is that it is UNFINISHED, not how the read ended.**
+    The guard was `!sawHeadEnd && buffer.size() >= MaxRequestBytes`, which closed the
+    byte-cap route and left the EOF route wide open — and the EOF route needs no
+    oversize client at all, only a peer that half-closes after its request line. Same
+    wrong answer (`/fleet` telling a valid credential `401`), reached with a
+    thirty-byte request. `sawHeadEnd` decides THAT a refusal happens; the cause only
+    selects WHICH code — cap `431`, deadline `408`, EOF `400`.
+    **And this is the EOF rule applied more carefully, not an exception to it.** The
+    tempting reading — *EOF means the peer finished sending, so serve what arrived* —
+    had a control case in `AdminHttpServer_test.cpp` asserting exactly that, which is
+    how the hole survived review: the bug was written down as the intended behaviour.
+    A reply is owed for what is DETERMINED, and an HTTP head with no terminating blank
+    line determines nothing — this server does not know which headers the peer would
+    have sent. `PING` half-closed is a complete command; this is a sentence cut off
+    mid-word. The control that belongs there is a COMPLETE head half-closed after,
+    still served `200`, or *refuse an unfinished head* and *refuse every peer that
+    half-closes* are one passing test and every probe on the endpoint breaks.
+
   - **Closing is better than refusing and is not the whole fix.** A closed connection
     is retriable where a `400` is final, but the idle connection is still not SERVED,
     because one number — `AdminHttpServer::RequestTimeout` — answers both *how long
