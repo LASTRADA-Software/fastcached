@@ -88,6 +88,37 @@
 # is a refusal: with no gating jobs every condition would look unregulated and
 # this rule would vouch for all of them, which is rule C's empty-table failure
 # one file over.
+#
+# ## And the fifth rule: a ccache step saves on a branch push and nowhere else
+#
+# #558. The four rules above are about a job RUNNING or not; this one is about a
+# step WRITING or not, and its failure is invisible in a way none of theirs is:
+# every check stays green, every build succeeds, and the only symptom is that the
+# repository's shared 10 GB Actions cache is over its cap and evicting, which
+# nothing attributes to any run.
+#
+# `hendrikmuhs/ccache-action` appends a timestamp to its key, so a run that saves
+# writes a NEW entry rather than updating one. On a pull request that entry is
+# scoped to `refs/pull/<n>/merge`, and MEASURED (run 33941494414, 2026-09-05, a
+# branch pushed more than once) the writing branch does not read it back: all
+# seven of that run's restores came from `refs/heads/master`, because the
+# restore-key prefix matches many entries, the newest wins, and master writes a
+# fresh one on every merge. So a pull-request write is not a trade -- it is
+# eviction pressure on the entries every run, the writer's own included, actually
+# reads.
+#
+# Two substrings are required, and the second is the one that looks redundant:
+# `github.event_name == 'push'` alone still saves on a TAG push, into a
+# `refs/tags/v*` scope nothing can ever read, a full set of entries per release.
+# That is rule D's clause arriving from the opposite side -- there a tag must not
+# be SKIPPED, here it must not SAVE -- and the same sentence explains both: a tag
+# push is a push.
+#
+# Any other spelling, `save: false` included, is refused by name rather than
+# analysed, which is the answer rules A and D already give a shape they do not
+# recognise. A workflow with no ccache step at all has nothing to vouch for and
+# says so; that is not the same claim as a table read coming back empty, because
+# here the steps are the SUBJECT rather than an input this rule depends on.
 
 # ## What is asserted rather than demonstrated
 #
@@ -112,6 +143,12 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DocSubjectRunner="scripts/doc-subject-checks.sh"
+
+# Rule E's subject and the two clauses its `save:` must name. Named once, so the
+# self-test cannot drift from the rule by restating either.
+CcacheAction="hendrikmuhs/ccache-action"
+CcacheSavePush="github.event_name == 'push'"
+CcacheSaveBranch="github.ref_type == 'branch'"
 
 Main() {
 workflow="$1"
@@ -317,6 +354,56 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# Rule E: every `ccache-action` step saves on a branch push and nowhere else.
+#
+# One `jobKey<TAB>saveExpr` row per step that uses the action, with an empty
+# expression where the input is absent -- so "carries no `save:`" and "carries a
+# `save:` this rule cannot vouch for" are distinguishable and neither is silent.
+#
+# Full-line comments are skipped, and that is load-bearing rather than tidy: the
+# canonical explanation of this very clause is a comment block naming the action,
+# and rule C already shipped the bug where a comment satisfied the rule the step
+# was supposed to.
+ccacheSteps="$(awk -v action="$CcacheAction" '
+    function flushStep() {
+        if (inStep && stepUsesAction) print jobKey "\t" saveExpr
+        inStep = 0; saveExpr = ""; stepUsesAction = 0
+    }
+    function flushJob() { flushStep(); jobKey = "" }
+    /^jobs:[ \t]*$/                  { inJobs = 1; next }
+    inJobs && /^[^ \t]/              { flushJob(); inJobs = 0 }
+    !inJobs                          { next }
+    /^[ \t]*#/                       { next }
+    /^  [A-Za-z0-9_-]+:[ \t]*$/      { flushJob()
+                                       jobKey = $0
+                                       sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
+                                       next }
+    /^      - /                      { flushStep(); inStep = 1 }
+    inStep && /^          save:[ \t]*/ { saveExpr = $0
+                                       sub(/^          save:[ \t]*/, "", saveExpr) }
+    inStep && index($0, action)      { stepUsesAction = 1 }
+    END                              { flushJob() }
+' "$workflow")"
+
+ccacheTotal=0
+ccacheProblemsBefore=$problems
+while IFS=$'\t' read -r jobKey saveExpr; do
+    [[ -n "$jobKey" ]] || continue
+    ccacheTotal=$((ccacheTotal + 1))
+    if [[ -z "$saveExpr" ]]; then
+        Fail "the \`$CcacheAction\` step in job '$jobKey' carries no \`save:\`, so a pull-request run writes a cache entry into its own ref's scope. Measured, the writing branch restores from master rather than from that entry, so it buys nothing and evicts what every run does read (#558). Add: save: \${{ $CcacheSavePush && $CcacheSaveBranch }}"
+    elif [[ "$saveExpr" != *"$CcacheSavePush"* || "$saveExpr" != *"$CcacheSaveBranch"* ]]; then
+        Fail "the \`$CcacheAction\` step in job '$jobKey' has a \`save:\` this check cannot vouch for -- save: $saveExpr. It must name both \`$CcacheSavePush\` and \`$CcacheSaveBranch\`: without the first a pull-request run writes an entry nothing reads, and without the second a TAG push does, into a \`refs/tags/*\` scope nothing can ever read."
+    fi
+done <<< "$ccacheSteps"
+
+if [[ "$ccacheTotal" -eq 0 ]]; then
+    echo "ok: no \`$CcacheAction\` step in $workflow (nothing for rule E to vouch for)"
+elif [[ "$problems" -eq "$ccacheProblemsBefore" ]]; then
+    echo "ok: all $ccacheTotal \`$CcacheAction\` step(s) save on a branch push and nowhere else"
+fi
+
 if [[ $problems -gt 0 ]]; then
     echo "check-gated-jobs: $problems problem(s); a failed scope classifier would go green" >&2
     return 1
@@ -355,9 +442,11 @@ REQ
     #   $5 = the name of the job carrying it: required | unrequired
     #   $6 = the `coverage` job's push trim: none | canonical | tagless
     #   $7 = what `release` gates on: all | nothing
+    #   $8 = the `coverage` job's ccache step:
+    #        none | canonical | nosave | eventonly | comment
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
-        local trim="${6:-none}" gate="${7:-all}"
+        local trim="${6:-none}" gate="${7:-all}" ccache="${8:-none}"
         local compare="needs.changes.outputs.code != 'false'"
         [[ "$comparison" == "equality" ]] && compare="needs.changes.outputs.code == 'true'"
         [[ "$comparison" == "odd" ]] && compare="contains(needs.changes.outputs.code, 'true')"
@@ -399,6 +488,20 @@ REQ
             echo "    name: \"Code coverage\""
             echo "    if: \${{ !cancelled() && ${compare}${trimClause} }}"
             echo "    steps:"
+            # Rule E's subject. `comment` stages the trap rule C already fell
+            # into once: prose naming the action, and no step using it. That case
+            # wants a PASS, so a check that read the comment as a call site would
+            # report the enclosing step as a ccache step with no `save:`.
+            if [[ "$ccache" == "comment" ]]; then
+                echo "      # ${CcacheAction} is deliberately not used by this job"
+            elif [[ "$ccache" != "none" ]]; then
+                echo "      - name: \"ccache\""
+                echo "        uses: ${CcacheAction}@v1.2"
+                echo "        with:"
+                echo "          key: \${{ runner.os }}-generated"
+                [[ "$ccache" == "canonical" ]] && echo "          save: \${{ ${CcacheSavePush} && ${CcacheSaveBranch} }}"
+                [[ "$ccache" == "eventonly" ]] && echo "          save: \${{ ${CcacheSavePush} }}"
+            fi
             echo "      - run: ctest"
 
             echo "  release:"
@@ -500,6 +603,20 @@ REQ
 
     Generate "${scratch}/wf.yml" safe yes ungated required canonical nothing
     Case "rule D: an unreadable/empty \`release.needs\` is REFUSED, not read as 'no job gates the release'" want-fail
+
+    # Rule E. The baseline carries no ccache step at all, so "nothing to vouch
+    # for" is already covered; these four are the states that differ.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all canonical
+    Case "rule E: a ccache step saving on a branch push and nowhere else" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all nosave
+    Case "rule E: a ccache step with no \`save:\` -- every pull-request run then writes an entry into its own ref's scope that nothing, its own next run included, reads back (#558)" want-fail
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all eventonly
+    Case "rule E: a \`save:\` naming only \`${CcacheSavePush}\` -- a tag push IS a push, so a release writes a full set of entries into a \`refs/tags/*\` scope nothing can read" want-fail
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all comment
+    Case "rule E: a COMMENT naming the action is not a step using it (rule C's own trap, one rule over)" want-pass
 
     if [[ "$status" -ne 0 ]]; then
         echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2

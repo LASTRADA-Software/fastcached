@@ -1245,6 +1245,27 @@ if(NOT WIN32)
         LABELS "hygiene"
         TIMEOUT 60
     )
+
+    # And the half that decides whether the above is a guard at all (#408/#629).
+    # That check now asserts every context every workflow produces carries
+    # exactly ONE verdict -- required, deliberately not binding, or undecided
+    # with the issue that will settle it -- and the arm that matters is a leg
+    # ADDED with no row, because that is how a job joins the workflow unrequired
+    # with nobody told. On a clean tree there is no such leg, so that arm can
+    # never fire during an ordinary run and had never been seen to.
+    #
+    # `--self-test` synthesises one, plus five other defects, and a baseline that
+    # must PASS. It drives a COPY of the real script against a copy of the
+    # workflow tree rather than reimplementing the parser: a self-test with its
+    # own parser tests the parser it ships with, not the one that runs.
+    add_test(
+        NAME "merge-queue-contexts-selftest"
+        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh" --self-test
+    )
+    set_tests_properties("merge-queue-contexts-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
 endif()
 
 # ---------------------------------------------------------------------------

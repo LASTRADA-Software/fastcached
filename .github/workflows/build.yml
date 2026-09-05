@@ -387,12 +387,52 @@ jobs:
           key: cpm-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-${{ matrix.preset }}-
 
+      # `save` on a branch push and nowhere else, and this is the canonical
+      # statement of that clause — every other `ccache-action` step in this file
+      # repeats the same expression and points back here. YAML cannot factor a
+      # step input out, so the value is repeated and the reason is stated once,
+      # exactly as `fetch-depth: 0` is at the top of this file.
+      # `scripts/check-gated-jobs.sh` rule E asserts no step omits it.
+      #
+      # ## Why a pull-request run must not save
+      #
+      # The action appends a timestamp to the key, so every run that saves
+      # writes a NEW entry rather than updating one, and a pull-request run's
+      # entry is scoped to its own ref. Nothing outside that pull request can
+      # ever read it — and, measured, neither can the pull request.
+      #
+      # MEASURED on run 33941494414 (`claude/corrupt-store-diagnostics-633`, a
+      # branch pushed more than once), 2026-09-05T03:35Z, under six lanes of
+      # contention: **all seven of its ccache restores came from
+      # `refs/heads/master`, and not one from the pull request's own scope**,
+      # while that scope held 1.118 GB across 6 entries its earlier runs had
+      # written. The restore-key prefix matches many entries and the newest
+      # wins; master writes a fresh entry on every merge, so at this
+      # repository's merge rate master's is always newer than the branch's own
+      # earlier push. Corroborating, from the same window: only 37 ccache
+      # entries were alive at all and the oldest was 71 minutes old, so every
+      # key that branch's PREVIOUS run had restored was already evicted.
+      #
+      # So the pull-request write is not a trade of iteration hits against
+      # storage — #558 was right to refuse to price it blind, and the price is
+      # zero. It is eviction pressure on the master entries that every run,
+      # including the writer's own, actually reads back. The repository was at
+      # 12.87 GB against GitHub's 10 GB cap when this was measured.
+      #
+      # ## And why `ref_type`, not `event_name` alone
+      #
+      # A tag push is a push. `event_name == 'push'` alone therefore saves on a
+      # release tag too, into a `refs/tags/v*` scope nothing can ever read —
+      # a full set of entries per release, for nothing. Same clause #559 needed
+      # one level up, for the opposite reason: there a tag must not be skipped,
+      # here it must not save.
       - name: "ccache"
         if: ${{ needs.changes.outputs.code != 'false' }}
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-${{ matrix.preset }}
           max-size: 256M
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       # libssl-dev + openssl: TLS is built and tested (the tls-smoke CTest uses
       # the openssl CLI) in every platform job, not a dedicated one.
@@ -787,20 +827,19 @@ jobs:
       # with the CPM and sccache entries, and `Cleanups` in the step below is
       # what says whether it is enough.
       #
-      # `save` only on a push, and that is what makes 1G affordable. The action
-      # appends a timestamp to the key, so every run writes a NEW entry rather
-      # than updating one — at 1G that is a gigabyte of the repository's shared
-      # 10 GB Actions budget per run, competing with the Windows sccache entries
-      # this workflow now also fills. A pull-request run's entry is scoped to its
-      # own ref and can never be read by master or by another pull request, so it
-      # only ever helps a repeat push to the same branch; restoring from master's
-      # entry, which is what actually gives the 90% hit rate, still works.
+      # `save` on a branch push only — the reason is on the `linux` job's step,
+      # and this was the first place in the file to carry it. It is also what
+      # makes 1G affordable: at a gigabyte per saved entry, a pull-request write
+      # is the largest single contributor to the repository's shared 10 GB
+      # Actions budget. Restoring from master's entry, which is what actually
+      # gives the 90% hit rate, still works — measured, it is the ONLY thing
+      # that ever hit.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-debug
           max-size: 1G
-          save: ${{ github.event_name == 'push' }}
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       - name: "Install build tools"
         run: |
@@ -930,14 +969,13 @@ jobs:
       # spends a shared budget on nothing, and that budget also carries the
       # Windows sccache entries. The `--show-stats` step below is what says
       # whether 512M is enough; raise it when `Cleanups` is non-zero, not before.
-      # `save` only on a push, so pull-request runs read master's entry without
-      # each writing their own.
+      # `save` on a branch push only; the reason is on the `linux` job's step.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-tsan
           max-size: 512M
-          save: ${{ github.event_name == 'push' }}
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       - name: "Install build tools"
         run: |
@@ -1158,11 +1196,13 @@ jobs:
           key: cpm-${{ runner.os }}-clang-release-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-clang-release-
 
+      # `save` on a branch push only; the reason is on the `linux` job's step.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-clang-release
           max-size: 256M
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       # Apple's bundled AppleClang 15 ships a libc++ without std::jthread
       # (libc++ only implemented it in LLVM 18). Use Homebrew's LLVM, whose
@@ -1568,11 +1608,13 @@ jobs:
           key: cpm-${{ runner.os }}-cc-e2e-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-cc-e2e-
 
+      # `save` on a branch push only; the reason is on the `linux` job's step.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-cc-e2e
           max-size: 256M
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       # clang is installed explicitly rather than relied on: the second E2E step
       # below exits 77 (skip) when its compiler is absent, and a skipped step
@@ -1745,11 +1787,13 @@ jobs:
           key: cpm-${{ runner.os }}-package-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-package-
 
+      # `save` on a branch push only; the reason is on the `linux` job's step.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-package
           max-size: 256M
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       # rpm builds the .rpm on this Debian-family runner; systemd provides
       # systemd-analyze for the unit check below. g++-14 is symlinked as plain
@@ -2089,11 +2133,13 @@ jobs:
           key: cpm-${{ runner.os }}-package-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cpm-${{ runner.os }}-package-
 
+      # `save` on a branch push only; the reason is on the `linux` job's step.
       - name: "ccache"
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ runner.os }}-package
           max-size: 256M
+          save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
       - name: "Install build tools"
         # Note what is NOT installed: llvm. The plain `macos` job above builds

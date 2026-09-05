@@ -44,6 +44,129 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # ---------------------------------------------------------------------------
+# `--self-test` drives the verdict rules against SYNTHESISED trees, in both
+# directions. A guard nobody has watched refuse is not a guard, and the arm that
+# matters most -- a leg added to a workflow with no row -- had never been seen to
+# fire, because on a clean tree there is no such leg to fire on.
+#
+# It runs a COPY of this script against a copy of the workflow tree rather than
+# reimplementing anything: the script cds to its own parent's parent, so a copy
+# at `$scratch/scripts/` reads `$scratch/.github/workflows/`, and there is no
+# second implementation to drift. Each case asserts its tree DIFFERS from the
+# baseline, so an injection that stopped injecting is a failure rather than a
+# pass, and `bash <path>` is never a bare path -- this file is mode 644, so a
+# bare invocation would exit 126 and every negative case would pass because the
+# SHELL refused.
+if [[ "${1:-}" == "--self-test" ]]; then
+    scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
+    # shellcheck disable=SC2064  # expand $scratch now, not at trap time
+    trap "rm -rf '$scratch'" EXIT
+    selfTestStatus=0
+    selfTestCases=0
+    me="$(pwd)/scripts/$(basename "${BASH_SOURCE[0]}")"
+
+    # A pristine copy of the tree this check reads, remade for every case.
+    Stage() {
+        rm -rf "$scratch/tree"
+        mkdir -p "$scratch/tree/scripts" "$scratch/tree/.github/workflows"
+        cp "$me" "$scratch/tree/scripts/"
+        cp .github/workflows/*.yml "$scratch/tree/.github/workflows/"
+    }
+
+    SelfTestCase() {
+        local what="$1" want="$2" out got=0
+        selfTestCases=$((selfTestCases + 1))
+        out="$(bash "$scratch/tree/scripts/$(basename "$me")" 2>&1)" || got=$?
+        if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
+            echo "  ok    ($want) $what"
+        else
+            echo "  FAIL  ($want, exit $got) $what" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            selfTestStatus=1
+        fi
+    }
+
+    # Assert an injection actually injected. An edit that matches no anchor
+    # changes nothing and reports success, which is how three tools in this tree
+    # reported work they did not do.
+    Injected() {
+        local what="$1" file="$2" before="$3"
+        if cmp -s "$before" "$file"; then
+            echo "  FAIL  '$what' changed nothing; the case stages no defect" >&2
+            selfTestStatus=1
+            return 1
+        fi
+    }
+
+    # The baseline, and it is not decoration: every negative case below is
+    # evidence only if the unmodified tree passes.
+    Stage
+    SelfTestCase "the real tree, copied unmodified, passes" want-pass
+
+    # The arm this whole table exists for.
+    Stage
+    cp "$scratch/tree/.github/workflows/build.yml" "$scratch/before"
+    printf '  a-newly-added-leg:\n    name: "A newly added leg"\n    steps:\n      - run: true\n' \
+        >> "$scratch/tree/.github/workflows/build.yml"
+    Injected "an extra leg" "$scratch/tree/.github/workflows/build.yml" "$scratch/before" \
+        && SelfTestCase "a leg added to a workflow with no verdict row is REFUSED (#408/#629 arriving again)" want-fail
+
+    # A row naming a context nothing produces any more.
+    Stage
+    cp "$scratch/tree/.github/workflows/build.yml" "$scratch/before"
+    sed -i.bak 's/^    name: "Docker image"$/    name: "Container image"/' \
+        "$scratch/tree/.github/workflows/build.yml"
+    rm -f "$scratch/tree/.github/workflows/build.yml.bak"
+    Injected "a renamed job" "$scratch/tree/.github/workflows/build.yml" "$scratch/before" \
+        && SelfTestCase "a NonBindingContexts row naming a context no job produces is REFUSED" want-fail
+
+    # One context claiming both verdicts at once.
+    Stage
+    cp "$scratch/tree/scripts/$(basename "$me")" "$scratch/before"
+    python3 - "$scratch/tree/scripts/$(basename "$me")" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+anchor = '    "clang-tsan|Undecided|#408"\n'
+assert s.count(anchor) == 1, "self-test anchor is missing or not unique"
+open(p, 'w').write(s.replace(anchor, anchor + '    "clang-tidy|NotBinding|a deliberately contradictory row\n'.rstrip('\n') + '"\n'))
+PY
+    Injected "a doubly-classified context" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" \
+        && SelfTestCase "a context in BOTH tables is REFUSED; required and non-binding are opposite claims" want-fail
+
+    # A verdict spelling this check does not recognise, and an Undecided row
+    # with no issue -- the two ways the three spellings collapse back into one.
+    for defect in "Undecided|Probably fine" "Undecided|soon"; do
+        Stage
+        cp "$scratch/tree/scripts/$(basename "$me")" "$scratch/before"
+        python3 - "$scratch/tree/scripts/$(basename "$me")" "$defect" <<'PY'
+import sys
+p, defect = sys.argv[1], sys.argv[2]
+s = open(p).read()
+anchor = '    "Docker image|Undecided|#408"\n'
+assert s.count(anchor) == 1, "self-test anchor is missing or not unique"
+open(p, 'w').write(s.replace(anchor, '    "Docker image|%s"\n' % defect))
+PY
+        Injected "verdict '$defect'" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" \
+            && SelfTestCase "the verdict '$defect' is REFUSED rather than read as a decision" want-fail
+    done
+
+    # And the empty read, which is the failure every table in this tree shares:
+    # with no workflows nothing produces a context, so every row would look
+    # accounted for and the check would vouch for a tree it never read.
+    Stage
+    rm -f "$scratch/tree/.github/workflows/"*.yml
+    SelfTestCase "an empty workflow glob is REFUSED, not read as 'every context is accounted for'" want-fail
+
+    if [[ "$selfTestStatus" -ne 0 ]]; then
+        echo "check-merge-queue-contexts: self-test FAILED after $selfTestCases case(s)" >&2
+        exit 1
+    fi
+    echo "check-merge-queue-contexts: self-test passed ($selfTestCases cases)"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # The table: one row per required context, naming the workflow that produces it.
 # A context whose job lives in a matrix is written as the EXPANDED name, because
 # that is what GitHub reports and what the ruleset names.
@@ -59,6 +182,77 @@ RequiredContexts=(
     "sccache smoke (redis RESP2)|.github/workflows/build.yml"
     "Check C++ style|.github/workflows/build.yml"
     "Require a type label|.github/workflows/pr-labels.yml"
+)
+
+# ---------------------------------------------------------------------------
+# The binding table: every OTHER context these workflows can produce, and why it
+# does not gate a merge.
+#
+# ## The gap this closes
+#
+# #408 records that `clang-tsan` runs, is proven live by its own canary, and
+# cannot block a merge -- and says the answer is not to add one row to the
+# ruleset, because "the same question applies to every other non-required leg"
+# and deciding one in isolation leaves the gap in seven places. #629 is the same
+# ticket for `clang-asan-ubsan`, which is the project's ENTIRE sanitizer test
+# run. Neither can be closed here: which contexts are required is a server-side
+# ruleset, and changing it is a repository-admin decision.
+#
+# What CAN be written down without that decision is which legs are binding and
+# why -- so that a leg nobody has decided about is DISTINGUISHABLE from one
+# somebody deliberately left unrequired. Today they look identical: absent from
+# `RequiredContexts` and absent from everywhere else.
+#
+# ## Three spellings, because two collapse the distinction
+#
+# This is `Protocol/SurfaceRefusal.hpp`'s idiom, one layer out. There a refusal
+# is `Refuse` (a rise means something), `RefuseWithoutCounter` (a rise would
+# mean nothing, and why) or `RefuseUntriaged` (nobody has decided, and which
+# issue will) -- because "deliberately uncounted" must not be spelled like
+# "forgot". The same three states exist here:
+#
+#   Binding      membership in `RequiredContexts` above; the ruleset gates it.
+#   NotBinding   a considered decision that this must not block a merge, with
+#                the reason and, where one exists, the issue that recorded it.
+#   Undecided    nobody has decided. Carries the issue that will, and the run
+#                TALLIES these per issue -- which is the only thing that keeps
+#                `Undecided` from becoming a synonym for `forgot`.
+#
+# ## And the completeness assertion, which is the load-bearing half
+#
+# Every context every workflow produces must appear in exactly ONE of the two
+# tables. A leg added to a workflow with no row is REFUSED, because today it
+# joins as unrequired with nobody told -- exactly #492's shape, a list that is
+# exact about what it knows and silent about what it does not. The workflow set
+# is a GLOB and never a file list, for the same reason.
+#
+# Note this asserts nothing about whether a verdict is RIGHT; it asserts that
+# one was reached and written down. The ruleset remains the authority on
+# `Binding`, and the caveat above about a copy of a server-side setting applies
+# to that column unchanged.
+NonBindingContexts=(
+    # Decided, with the record that decided it.
+    "Package (Linux .deb/.rpm)|NotBinding|#684: the packaging jobs are slow and a packaging failure should not block ordinary work. That ticket calls the reasoning sound and proposes REPORTING the failure instead, which merge-group-report.yml now does"
+    "Package (macOS .pkg)|NotBinding|#684, as above -- and this is the job whose silent failure #684 was filed about"
+    "Package (Windows .msi)|NotBinding|#684, as above"
+    "Report a failure the merge queue did not gate on|NotBinding|#684 is explicit that this must gate NOTHING: a notifier that turns unrequired jobs into gates by the back door defeats the reason they are unrequired"
+    "Decide what this change can affect|NotBinding|check-gated-jobs.sh rule A exists BECAUSE this job can fail without gating -- the fix for a dead classifier is that every reader compares != 'false', not that the classifier becomes a gate"
+    "Draft GitHub release|NotBinding|tag-only (if: startsWith(github.ref, 'refs/tags/v')). A pull request can never produce this context, so requiring it would leave every branch waiting on a check that never reports"
+    "Mark as needing triage|NotBinding|triggered by an issues event, so it produces no check run on a pull request at all"
+    "Apply derivable labels|NotBinding|a pull_request_target job, and it MUTATES rather than checks. Its outcome is enforced by the required Require a type label"
+    "Deploy to Pages|NotBinding|a deployment, not a check, and it runs only after a push to master has already merged"
+    "Build site (strict)|NotBinding|docs.yml is not reachable from a code change; a docs break is caught on the push that lands it and blocks no unrelated work"
+    "Check the release gate covers every job|NotBinding|it guards a TAG run, and a tag is not a merge. A release that lost a gating job is caught by this job on the tag, which is the event that can act on it"
+
+    # Nobody has decided. Tallied per issue on every run.
+    "clang-tsan|Undecided|#408"
+    "clang-asan-ubsan|Undecided|#629"
+    "Windows-cl-debug|Undecided|#408"
+    "Code coverage|Undecided|#408"
+    "compile-cache E2E (Linux)|Undecided|#408"
+    "compile-cache E2E (Windows)|Undecided|#408"
+    "fastcache-cc smoke (compile-cache 0xFC)|Undecided|#408"
+    "Docker image|Undecided|#408"
 )
 
 problems=0
@@ -230,8 +424,130 @@ else
     Fail "the \`changes\` job in build.yml has no explicit \`merge_group)\` arm; it would fall through to the non-pull-request default and nothing would say so"
 fi
 
+# ---------------------------------------------------------------------------
+# Every context every workflow produces carries a verdict, and exactly one.
+#
+# The workflow set is a GLOB, never a file list: a list is exact about the files
+# it knows and silent about the ones it does not, and silence reads identically
+# to complete coverage (#492). An empty glob is a REFUSAL rather than a vacuous
+# pass, for the same reason the two empty-table reads elsewhere in this tree are.
+allWorkflows=()
+for candidate in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [[ -f "$candidate" ]] && allWorkflows+=("$candidate")
+done
+if [[ "${#allWorkflows[@]}" -eq 0 ]]; then
+    # Refuse and STOP, rather than falling through to a loop over an empty
+    # array. On bash before 4.4 -- which is macOS's /bin/bash, and this check is
+    # in the default ctest set -- `"${arr[@]}"` on an empty array is an unbound
+    # variable under `set -u`, so the fall-through would die with a shell error
+    # instead of this sentence. The self-test's empty-glob case would still be
+    # red, and red for a reason that has nothing to do with the rule: a
+    # `want-fail` case cannot tell the rule firing from the shell refusing.
+    #
+    # That is #723 arriving through a different door. There the `want-fail` case
+    # was satisfied by a MODE BIT refusing the script; here by `set -u` refusing
+    # an expansion. The general form has two independent instances now: inside a
+    # `want-fail` assertion, ANY failure to run is indistinguishable from the
+    # rule firing.
+    #
+    # And the second half, which has to be written down because it is invisible:
+    # NO TEST ON A MODERN BASH CAN CATCH A REGRESSION OF THIS. `BASH_COMPAT=3.2`
+    # does not restore the old behaviour, so the guard is closed by construction
+    # and a refactor that removes it would go green everywhere but macOS. Do not
+    # collapse this arm back into the loop below.
+    Fail "found no workflow files under .github/workflows/; with none, every context would look accounted for and this check would vouch for a tree it never read"
+    echo "check-merge-queue-contexts: $problems problem(s); a merge queue would stall on these" >&2
+    exit 1
+fi
+
+# `context<TAB>workflow` for every context the tree can produce.
+producedContexts=""
+for workflow in "${allWorkflows[@]}"; do
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        producedContexts="${producedContexts}${line}	${workflow}
+"
+    done < <(EmitJobContexts "$workflow" | cut -f1)
+done
+
+# `${arr[@]+"${arr[@]}"}` and not a bare `"${arr[@]}"`, in both places the
+# non-binding table is expanded. It cannot legitimately be empty here -- 30
+# contexts, 11 of them required -- and the completeness check below would catch
+# an empty one anyway, since every non-required context would then fail for want
+# of a row. The guard is for bash 3.2, which is macOS's /bin/bash and a platform
+# this check runs on from the default ctest set: there `"${arr[@]}"` on an empty
+# array is an UNBOUND VARIABLE under `set -u`, so the check would die with a
+# shell error rather than print the sentence it exists to print.
+#
+# Same caveat as the empty-glob arm above, and for the same reason it is stated
+# rather than left implicit: no test on a modern bash can catch a regression of
+# this, because `BASH_COMPAT=3.2` does not restore the behaviour. A reviewer who
+# reads `${arr[@]+"${arr[@]}"}` as noise and simplifies it back would see every
+# check stay green here and only macOS go red.
+requiredNames="$(printf '%s\n' "${RequiredContexts[@]}" | cut -d'|' -f1)"
+nonBindingNames="$(printf '%s\n' ${NonBindingContexts[@]+"${NonBindingContexts[@]}"} | cut -d'|' -f1)"
+
+# Direction one: a context the tree produces and neither table names. This is
+# the arm that fires when a leg is ADDED, which is the whole point -- an
+# unrequired leg joining silently is what #408 and #629 are both instances of.
+accounted=0
+while IFS=$'\t' read -r context workflow; do
+    [[ -n "$context" ]] || continue
+    inRequired=no
+    inNonBinding=no
+    printf '%s\n' "$requiredNames" | grep -Fxq -- "$context" && inRequired=yes
+    printf '%s\n' "$nonBindingNames" | grep -Fxq -- "$context" && inNonBinding=yes
+
+    if [[ "$inRequired" == "yes" && "$inNonBinding" == "yes" ]]; then
+        Fail "'$context' is in BOTH tables. Required and non-binding are opposite claims; a context carrying both has no verdict at all."
+    elif [[ "$inRequired" == "no" && "$inNonBinding" == "no" ]]; then
+        Fail "'$context' (from $workflow) carries no verdict: it is neither in \`RequiredContexts\` nor in \`NonBindingContexts\`. A leg added with no row joins as UNREQUIRED with nobody told, which is #408 and #629 arriving again. Add a row: \`NotBinding\` with the reason, or \`Undecided\` with the issue that will settle it."
+    else
+        accounted=$((accounted + 1))
+    fi
+done <<< "$producedContexts"
+
+# Direction two: a non-binding row naming a context nothing produces any more --
+# the same rename failure the required table is already checked for above.
+allProduced="$(printf '%s\n' "$producedContexts" | cut -f1)"
+undecidedIssues=""
+for row in ${NonBindingContexts[@]+"${NonBindingContexts[@]}"}; do
+    context="${row%%|*}"
+    rest="${row#*|}"
+    verdict="${rest%%|*}"
+    reason="${rest#*|}"
+
+    printf '%s\n' "$allProduced" | grep -Fxq -- "$context" \
+        || Fail "\`NonBindingContexts\` names '$context', which no job in any workflow produces. A stale row silently excuses nothing and hides the context that replaced it."
+
+    case "$verdict" in
+        NotBinding)
+            [[ -n "$reason" && "$reason" != "$verdict" ]] \
+                || Fail "'$context' is \`NotBinding\` with no reason. A verdict with no reason is indistinguishable from having forgotten, which is the distinction these three spellings exist to keep."
+            ;;
+        Undecided)
+            case "$reason" in
+                '#'[0-9]*) undecidedIssues="${undecidedIssues}${reason%% *}
+" ;;
+                *) Fail "'$context' is \`Undecided\` but names no issue ('$reason'). An undecided row with no issue IS the forgotten row it is meant to be distinguishable from." ;;
+            esac
+            ;;
+        *)
+            Fail "'$context' carries the verdict '$verdict', which is not one of \`NotBinding\` or \`Undecided\`. A spelling this check does not recognise is refused rather than read as a decision."
+            ;;
+    esac
+done
+
+# The tally. Printed on EVERY run, not only when it changes: an `Undecided` row
+# is only safe because the total is visible, exactly as `RefuseUntriaged`'s is.
+if [[ -n "$undecidedIssues" ]]; then
+    echo "check-merge-queue-contexts: contexts nobody has decided about, by issue:"
+    printf '%s' "$undecidedIssues" | sort | uniq -c | sed 's/^/  /'
+fi
+
 if [[ $problems -gt 0 ]]; then
     echo "check-merge-queue-contexts: $problems problem(s); a merge queue would stall on these" >&2
     exit 1
 fi
 echo "check-merge-queue-contexts: all ${#RequiredContexts[@]} required contexts can report inside a merge_group event"
+echo "check-merge-queue-contexts: all $accounted context(s) across ${#allWorkflows[@]} workflow(s) carry exactly one verdict"
