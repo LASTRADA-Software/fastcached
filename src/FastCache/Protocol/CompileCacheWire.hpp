@@ -108,7 +108,13 @@ using WireVersion = std::uint8_t;
 /// **3 added `Status::Progress`**, the liveness pulse a worker writes while a
 /// dispatched compile runs
 /// ([#245](https://github.com/LASTRADA-Software/fastcached/issues/245)).
-inline constexpr WireVersion CurrentVersion = 3;
+///
+/// **4 gave the REGISTER reply a shape.** It was the worker id as bare bytes; it is
+/// now a nested record carrying the id, the fleet identity and the scheduler epoch,
+/// so a worker learns which fleet it serves from the one exchange it has with the
+/// scheduler it was configured to reach
+/// ([#401](https://github.com/LASTRADA-Software/fastcached/issues/401)).
+inline constexpr WireVersion CurrentVersion = 4;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -133,7 +139,18 @@ inline constexpr WireVersion CurrentVersion = 3;
 /// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)) — one
 /// installation, major version 0 — and a loud, named, immediate refusal is what that
 /// budget is best spent on.
-inline constexpr WireVersion MinSupportedVersion = 3;
+///
+/// **It moved again for version 4, for the same reason and a sharper one.** The
+/// REGISTER reply's payload changed shape, and a reply carries a status byte and a
+/// length and no kind -- so a version-3 worker meeting a version-4 reply does not
+/// refuse it. It reads the whole payload as its worker id, exactly as it always has,
+/// and registers successfully under an id that is really a serialized record. That
+/// is silent, it is durable, and it is the shape
+/// [`.agent/rules/metrics-and-observability.md`](../../../.agent/rules/metrics-and-observability.md)
+/// spends its length on: a wrong answer that looks like a right one. Refusing the
+/// older REGISTER outright is `UnsupportedVersion`, which names the range and
+/// arrives before the worker believes it has joined anything.
+inline constexpr WireVersion MinSupportedVersion = 4;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -1831,6 +1848,25 @@ struct CodecEnvelopeView
     return WireFields::FromBigEndian<std::uint32_t>(field);
 }
 
+/// Encode a `u64` as its own length-prefixed field's contents.
+/// @param value The value.
+/// @return Exactly eight big-endian bytes.
+[[nodiscard]] inline std::array<std::byte, sizeof(std::uint64_t)> EncodeU64Field(std::uint64_t value)
+{
+    return WireFields::ToBigEndian<std::uint64_t>(value);
+}
+
+/// Read a `u64` from a field that must hold exactly eight bytes.
+///
+/// Strict about the width for the same reason `DecodeU32Field` is: a field of
+/// another length is a sender speaking a shape this build does not know.
+/// @param field The field.
+/// @return The value, or nullopt when the field is not exactly eight bytes.
+[[nodiscard]] inline std::optional<std::uint64_t> DecodeU64Field(std::span<std::byte const> field)
+{
+    return WireFields::FromBigEndian<std::uint64_t>(field);
+}
+
 /// A codec preference list, most-preferred first.
 ///
 /// Travels as one byte per codec id in a single field. A list rather than a single
@@ -2483,6 +2519,59 @@ struct CompileView
                                    std::span<std::byte const> { slots },
                                    std::span<std::byte const> { codecs },
                                    std::span<std::byte const> { capacity } });
+}
+
+/// What a scheduler tells a worker in answer to REGISTER.
+///
+/// This **owns** its strings rather than viewing the decoded buffer, and that is the
+/// rule from [`.agent/rules/wire-and-protocol.md`](../../../.agent/rules/wire-and-protocol.md)
+/// applied rather than a preference: the worker holds every one of these fields for
+/// the rest of its life -- the id goes in each heartbeat, the identity into every
+/// lease expectation -- so the record outlives the bytes it was decoded from by a
+/// long way. `DecodeRegisterReply(EncodeRegisterReply(x))` is the obvious spelling
+/// and would be a use-after-free the moment a member became a view.
+struct RegisterReplyFields
+{
+    /// The id the scheduler assigned; what every later heartbeat names.
+    std::string workerId;
+    /// Which fleet this scheduler leads. The worker pins this and refuses a lease
+    /// token bound to any other, which is the whole of #401: the worker is TOLD,
+    /// by the scheduler it was configured to reach, rather than inferring it.
+    std::string clusterId;
+    /// The scheduler term this registration belongs to.
+    std::uint64_t epoch = 0;
+};
+
+/// Encode a REGISTER reply's payload.
+///
+/// A nested record read with the variable-arity split, like the capacity record
+/// inside the REGISTER request: a field this build has not heard of is skipped and
+/// one it expects but was not sent keeps its default. That is what keeps the NEXT
+/// fact addable without a fourth version, which is worth having precisely because
+/// this change cost a bump.
+/// @param reply The facts to send.
+/// @return The payload bytes, to be carried as the reply's body.
+[[nodiscard]] inline std::vector<std::byte> EncodeRegisterReply(RegisterReplyFields const& reply)
+{
+    auto const epoch = EncodeU64Field(reply.epoch);
+    return WireFields::Encode({ AsBytes(reply.workerId), AsBytes(reply.clusterId), std::span<std::byte const> { epoch } });
+}
+
+/// Read a REGISTER reply's payload back.
+/// @param payload The reply body.
+/// @return The facts, or nullopt when the record is malformed or the epoch is not
+///         exactly eight bytes.
+[[nodiscard]] inline std::optional<RegisterReplyFields> DecodeRegisterReply(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitAll(payload);
+    if (!fields.has_value() || fields->size() < 3)
+        return std::nullopt;
+    auto const epoch = DecodeU64Field((*fields)[2]);
+    if (!epoch.has_value())
+        return std::nullopt;
+    return RegisterReplyFields { .workerId = std::string { AsStringView((*fields)[0]) },
+                                 .clusterId = std::string { AsStringView((*fields)[1]) },
+                                 .epoch = *epoch };
 }
 
 /// Split a REGISTER payload.

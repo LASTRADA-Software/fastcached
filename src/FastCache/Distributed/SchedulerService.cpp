@@ -512,8 +512,12 @@ SchedulerReply SchedulerService::Register(CallerContext const& caller, WorkerReg
     // scheduler's side.
     _metrics.Increment(IMetricsSink::Counter::DispatchWorkerRegistrations);
 
-    auto const bytes = Wire::AsBytes(id);
-    return SchedulerReply::Success(std::vector<std::byte> { bytes.begin(), bytes.end() });
+    // The reply carries the fleet identity and the term, not only the id. This is
+    // the one exchange in which a worker talks to the scheduler it was CONFIGURED to
+    // reach, so it is the only place an identity can be handed over without either
+    // end inferring it (#401).
+    return SchedulerReply::Success(Wire::EncodeRegisterReply(
+        { .workerId = std::string { id }, .clusterId = _clusterId, .epoch = _epoch.load(std::memory_order_relaxed) }));
 }
 
 void SchedulerService::SetHistorySink(IFleetHistorySink* sink) noexcept

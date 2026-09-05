@@ -118,7 +118,6 @@ using LeaseValidator =
 ///        that is not a refusal and would otherwise be visible only in a log.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
-                                                  std::string clusterId,
                                                   IWallClock const& clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics);
@@ -346,6 +345,37 @@ class WorkerRegistrar
         return _workerId;
     }
 
+    /// The fleet this scheduler told us we serve, empty until a successful
+    /// `Register`.
+    ///
+    /// The worker is TOLD this rather than configured with it or inferring it from
+    /// the first grant it happens to verify (#401). Empty therefore means "has not
+    /// registered", which is exactly the state in which no lease may be honoured.
+    [[nodiscard]] std::string const& ClusterId() const noexcept
+    {
+        return _clusterId;
+    }
+
+    /// The scheduler term the registration belongs to, zero until a successful
+    /// `Register`.
+    ///
+    /// **It must never reach `Distributed::KnownSchedulerTerm`.** #421 built exactly
+    /// that -- the scheduler's reply stating the term -- and deleted it before it
+    /// shipped, because a reply is UNAUTHENTICATED: anything able to answer a worker's
+    /// `--scheduler` dial could write into it. The only channel allowed to move that
+    /// number is an authentic grant that was also spent, where the MAC is verified
+    /// first. This is the same unauthenticated channel, so it is a diagnostic and
+    /// nothing else.
+    ///
+    /// There is also no gate left to feed: since #614 the term decides nothing at all
+    /// (`LeaseEpochCheck` was deleted), because the monotonic rule was measured to be
+    /// exactly inverted -- it refused the honest grant from a reset scheduler and
+    /// accepted a token captured before the reset.
+    [[nodiscard]] std::uint64_t Epoch() const noexcept
+    {
+        return _epoch;
+    }
+
     /// The toolchain this registrar announces, so a diagnostic can name which of
     /// a node's several registrars it is about.
     [[nodiscard]] std::string const& Fingerprint() const noexcept
@@ -366,6 +396,8 @@ class WorkerRegistrar
     CompileCacheWire::CodecList _acceptedCodecs;
     CompileCacheWire::CapacityFields _capacity;
     std::string _workerId;
+    std::string _clusterId;
+    std::uint64_t _epoch = 0;
 };
 
 } // namespace FastCache::Cc

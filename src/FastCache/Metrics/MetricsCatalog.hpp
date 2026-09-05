@@ -341,6 +341,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "security signal, not a capacity one -- or a launcher predating "
               "signed leases, which presents a token that cannot authenticate.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnregistered,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_unregistered_total",
+      .help = "Jobs refused because this worker has not registered and so knows no fleet. "
+              "A few at startup are ordinary; a rise that does not stop means the scheduler "
+              "is unreachable and this node is compiling nothing while looking alive.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_wrong_cluster_total",
       .help = "Jobs refused because an authentic lease was issued by a different fleet. "

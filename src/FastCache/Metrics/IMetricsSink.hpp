@@ -411,6 +411,13 @@ class IMetricsSink
         /// that cannot authenticate. The two are indistinguishable here by design;
         /// what tells them apart is whether the rise tracks a rollout.
         WorkerJobsRefusedLeaseUnauthorized,
+        /// Jobs refused because this worker has not registered, so it knows no fleet.
+        ///
+        /// A few of these at startup are ordinary: a node serves before its first
+        /// heartbeat round has registered it. A rise that does not stop means the
+        /// scheduler is unreachable and this node is compiling nothing while looking
+        /// alive, which no other counter distinguishes from an idle fleet.
+        WorkerJobsRefusedLeaseUnregistered,
         /// Jobs refused because an AUTHENTIC lease came from a different fleet.
         ///
         /// Its own counter rather than a share of the one above, because the operator

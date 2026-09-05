@@ -140,12 +140,14 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
 {
     // **#401's acceptance clause, asserted at the production seam.**
     //
-    // That ticket says a worker "pins the first identity it authenticates", leaving a
+    // That ticket said a worker "pins the first identity it authenticates", leaving a
     // window in which one that has verified nothing accepts whichever fleet reaches it
-    // first. It is not so at this ref, and this case is what says so rather than a
-    // reading of the code: the worker is TOLD its fleet by `--cluster-id`, that value
-    // reaches `LeaseExpectation::clusterId` through the factory `main.cpp` calls, and
-    // `VerifyLeaseToken` compares it before it looks at anything else.
+    // first. That was never so: the worker was TOLD its fleet, and `VerifyLeaseToken`
+    // compared it before anything else. What has changed is WHERE it is told -- since
+    // #401 the identity comes from the REGISTER reply rather than from `--cluster-id`,
+    // so this case pins it the way a completed registration round does. The property
+    // under test is unchanged: having verified NO grant is not the same as being
+    // unpinned, and a worker that has verified nothing still refuses a foreign fleet.
     //
     // Written through `MakeWorkerLeaseValidator` rather than `VerifyLeaseToken`,
     // because the primitive already had a case and the primitive is not where the
@@ -162,6 +164,11 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+
+    // What a completed registration round does, and the only way this worker learns a
+    // fleet since #401. Before this line it refuses everything as `Unregistered`, which
+    // is a different case and has its own.
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     // Nothing has been verified. Asserted, because if the worker had already learnt
     // something this case would be about the term rather than the fleet.
@@ -216,6 +223,8 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+    // Registered, as every case here but the unregistered one assumes (#401).
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     // Nothing learned yet, so this is honoured -- and honouring it is what teaches the
     // term and spends the grant. All three are asserted: without the first, the case
@@ -287,6 +296,8 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+    // Registered, as every case here but the unregistered one assumes (#401).
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());

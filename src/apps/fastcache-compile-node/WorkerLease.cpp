@@ -61,11 +61,15 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
     // verified and the fleet did not" is the failure two sites provisioned from one
     // key file produce, and an operator reading a startup line is who has to notice
     // that this node believes it belongs to a cluster they did not mean (#322).
+    // The fleet is no longer named here. It is learned from the REGISTER reply and
+    // read per request out of `lease.fleet` (#401), so this line can only say what
+    // this node was configured to REACH -- and the identity it ends up pinned to is
+    // reported when it registers, which is the moment that fact first exists.
     logger.Logf(LogLevel::Info,
-                "verifying lease signatures against the cluster key, for grants naming {} issued by cluster '{}'",
-                advertise,
-                cfg.clusterId);
-    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, cfg.clusterId, clock, lease, metrics);
+                "verifying lease signatures against the cluster key, for grants naming {}; the fleet is adopted "
+                "from the scheduler's registration reply",
+                advertise);
+    return Cc::SignedLeaseValidator(*std::move(key), std::string { advertise }, clock, lease, metrics);
 }
 
 } // namespace FastCache::Node

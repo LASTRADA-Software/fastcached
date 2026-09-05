@@ -269,7 +269,10 @@ struct HeartbeatRound
     IMetricsSink const& metrics;                  ///< Where the cache figures are read.
     Node::FleetSampler& sampler;                  ///< This machine's own series.
     Cc::Credential const& credential;             ///< What the scheduler requires.
-    ILogger& logger;                              ///< Where a refusal is named.
+    /// Where the fleet this node was admitted to is recorded, so the lease check can
+    /// read it. Registration is the only place that fact arrives (#401).
+    Distributed::WorkerLeaseState& lease;
+    ILogger& logger; ///< Where a refusal is named.
 };
 
 /// What one announcement learned, beyond how many entries landed.
@@ -366,7 +369,15 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
         // fingerprint the scheduler will not accept, a cluster this node is not a
         // member of, a leader that has moved.
         if (auto const registered = registrar.Register(client, round.credential); registered.has_value())
+        {
+            // The fleet the scheduler named, adopted here rather than configured. Until
+            // this runs the worker is unpinned and refuses every grant, which is the
+            // window #401 closes; from here it refuses every grant naming another fleet.
+            // Re-registration re-pins, because a node that has been accepted somewhere
+            // else now serves whatever that scheduler leads.
+            round.lease.fleet.Pin(registrar.ClusterId());
             ++accepted;
+        }
         else
         {
             if (!leader.has_value())
@@ -1246,6 +1257,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
                                  .metrics = metrics,
                                  .sampler = sampler,
                                  .credential = credential,
+                                 .lease = leaseState,
                                  .logger = logger };
 
     // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of

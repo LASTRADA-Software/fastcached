@@ -127,17 +127,12 @@ namespace
 
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
-                                    std::string clusterId,
                                     IWallClock const& clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics)
 {
-    return [key = std::move(signingKey),
-            endpoint = std::move(advertisedEndpoint),
-            cluster = std::move(clusterId),
-            &clock,
-            &lease,
-            &metrics](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock, &lease, &metrics](
+               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -153,6 +148,21 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // path of every dispatched compile.
         auto const now = clock.Now();
 
+        // The fleet is READ per request rather than captured at construction, because
+        // this validator is built at startup and the identity arrives later, in the
+        // REGISTER reply (#401). Absent means this worker has not registered, and a
+        // worker that does not know its fleet honours no grant -- which is the window
+        // the ticket closes. An engaged but EMPTY identity is a scheduler that names
+        // no cluster, is legal, and expects a grant that names none either.
+        auto const cluster = lease.fleet.Pinned();
+        //
+        // Answered BEFORE the MAC, and that is not the oracle the MAC-first rule
+        // guards against: this reports a fact about THIS WORKER, not about the token,
+        // so a caller learns nothing about a grant it did not already hold. `detail`
+        // is left empty for the same reason -- there is no authenticated fact to name.
+        if (!cluster.has_value())
+            return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Unregistered, .detail = {} };
+
         // ONE slack, passed to BOTH, rather than each site taking the same default. The
         // shared predicate makes them agree on the COMPARISON; only passing one value
         // makes them agree on the WINDOW, and it is the window a future caller with a
@@ -162,7 +172,7 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         auto verified = Distributed::VerifyLeaseToken(
             key,
             token,
-            Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster },
+            Distributed::LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = *cluster },
             now,
             slack);
         if (verified.has_value())
@@ -497,7 +507,23 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
         // lease chain and this alike.
         return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 
-    _workerId = std::string { Wire::AsStringView(outcome.value) };
+    // The reply is a record since wire version 4, not a bare id. A payload this
+    // build cannot read is a refusal rather than a worker id of whatever the bytes
+    // happened to spell -- which is what the previous shape would have done with it.
+    auto reply = Wire::DecodeRegisterReply(outcome.value);
+    if (!reply.has_value())
+        return std::unexpected { AnnounceRefusal { .reason = "accepted, and answered with a malformed registration record",
+                                                   .leader = std::nullopt } };
+
+    _workerId = std::move(reply->workerId);
+    _clusterId = std::move(reply->clusterId);
+    _epoch = reply->epoch;
+    // An EMPTY fleet identity is not refused, and that is deliberate. It is what a
+    // scheduler with no `--cluster-id` sends, which is the one-machine deployment --
+    // `SchedulerService`'s own contract says empty is legal and that a verifier
+    // naming none expects none. Refusing it here would close #401's window by
+    // breaking every single-machine install, which is the shape #303 is about.
+    // "Registered" is what pins a worker; the identity is what it pins TO.
     if (_workerId.empty())
         // Accepted and unusable: every later heartbeat needs the id, so a worker
         // that kept going here would heartbeat nothing into a fleet that thinks it

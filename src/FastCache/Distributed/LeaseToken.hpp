@@ -157,6 +157,16 @@ enum class LeaseRefusalReason : std::uint8_t
     Malformed = 0,
     /// A lease token this cluster's key does not authenticate.
     Unauthorized,
+    /// An authentic lease reaching a worker that has not registered, so it has no
+    /// fleet to compare against.
+    ///
+    /// Its own reason rather than a share of `ClusterMismatch`, because the operator
+    /// actions are opposite: a mismatch means two fleets share a key file, while this
+    /// means a worker is serving before its first registration round completed --
+    /// which is ordinary and transient at startup, and permanent if the scheduler is
+    /// unreachable. Collapsing them would report a key-provisioning fault every time
+    /// a node started (#401).
+    Unregistered,
     /// An authentic lease, issued by a different fleet that shares this key.
     ClusterMismatch,
     /// An authentic lease, for a different worker.
@@ -230,6 +240,9 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
+    { .reason = LeaseRefusalReason::Unregistered,
+      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnregistered },
     { .reason = LeaseRefusalReason::ClusterMismatch,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster },
@@ -829,6 +842,47 @@ class SchedulerTermRegressionNotice
     Sink _sink;
 };
 
+/// The fleet a worker was told it serves, learned once at registration.
+///
+/// **An `optional`, and that is the entire point of the type.** Three states have to
+/// stay apart here and a bare string can only hold two: *never registered*, *registered
+/// into a fleet that names itself*, and *registered into one that names none*. The last
+/// is the one-machine deployment and is legal -- `SchedulerService`'s constructor says
+/// so -- while the first must honour no grant at all. A bare string spells the first and
+/// the third identically, which is how "harden the fleet check" becomes "every
+/// single-machine install stops compiling" (#303's shape, #401's window).
+///
+/// Mutex-guarded rather than atomic for the reason `KnownSchedulerTerm` is: the value is
+/// a string, it is written by the heartbeat thread on registration and read by every
+/// compile thread, and it is borrowed for the life of the process.
+class PinnedFleet
+{
+  public:
+    /// Adopt the identity the scheduler named in its REGISTER reply.
+    ///
+    /// Idempotent and last-writer-wins: a worker that re-registers -- which it does
+    /// after any refused heartbeat, not only after a restart -- adopts whatever the
+    /// scheduler that accepted it says now.
+    /// @param clusterId The fleet named, which may legally be empty.
+    void Pin(std::string clusterId)
+    {
+        std::scoped_lock const guard { _mutex };
+        _clusterId = std::move(clusterId);
+    }
+
+    /// @return The fleet this worker registered with, or nullopt when it has not
+    ///         registered. An engaged but EMPTY string is a fleet that names none.
+    [[nodiscard]] std::optional<std::string> Pinned() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return _clusterId;
+    }
+
+  private:
+    mutable std::mutex _mutex;
+    std::optional<std::string> _clusterId;
+};
+
 /// Everything a worker's lease check keeps between requests.
 ///
 /// **One object rather than three references threaded through two factories.** All
@@ -858,6 +912,7 @@ struct WorkerLeaseState
     SpentLeases spent;                    ///< The grants already run here, so none runs twice.
     KnownSchedulerTerm term;              ///< The term the last authentic grant named.
     SchedulerTermRegressionNotice notice; ///< Where a term going backwards is said.
+    PinnedFleet fleet;                    ///< The fleet this worker registered with.
 };
 
 /// What a verifier expects a grant to say about itself.
