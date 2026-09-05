@@ -183,12 +183,6 @@ std::string ForeignGenerationMessage(std::uint8_t generation)
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
     std::vector<std::byte> out;
-    // Reserved before the first insert, which is what the object blob costs and is
-    // the bulk of any real value. It also keeps GCC 16 from reasoning about the
-    // five-byte buffer the header alone would leave: it deduced the insertion point
-    // as "offset 5 out of the bounds [0, 5]" and reported -Warray-bounds= against
-    // the reallocation that was about to happen, fatal under WERROR (#805).
-    out.reserve(1 + sizeof(std::uint32_t) + value.objectBlob.size());
     out.push_back(static_cast<std::byte>(CompileValueVersion));
 
     AppendU32(out, static_cast<std::uint32_t>(value.objectBlob.size()));

@@ -141,22 +141,6 @@ if(${PEDANTIC_COMPILER})
             try_add_compile_options(-Wno-error=c2y-extensions)
             try_add_compile_options(-Wno-error=class-memaccess)
             try_add_compile_options(-Wno-error=missing-declarations)
-
-            # Load-bearing, unlike the four above, and deliberately NOT paired with
-            # a `-Wno-maybe-uninitialized`: the diagnostic is worth SEEING, it is
-            # only its fatality that is wrong here.
-            #
-            # GCC 16.2.1 reports it inside `std::function`'s copy constructor every
-            # time an `AdminRoute` -- a struct holding one -- is copied out of an
-            # `initializer_list`, which is how every route table in
-            # `AdminHttpServer_test.cpp` is built. The object it calls uninitialized
-            # is libstdc++'s own `_Any_data` union, not ours, and no arrangement of
-            # those tables avoids it without making the tests worse. CI's g++ 13 and
-            # 14 do not report it at all, so it is a GCC-16-and-later false positive
-            # that became fatal only when a developer host moved ahead of the
-            # runners -- which is the whole of #805 and is why the other four
-            # diagnostics in that ticket were fixed at the source instead.
-            try_add_compile_options(-Wno-error=maybe-uninitialized)
         endif()
     else()
         message(STATUS "Enabling pedantic compiler options: unsupported platform")
