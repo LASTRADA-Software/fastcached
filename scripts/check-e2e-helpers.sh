@@ -665,9 +665,30 @@ run_case() {
     # wedged process looks like, and a helper that waits politely for such a
     # child has put an unbounded wait inside the thing that exists to bound one.
     # The driver times this row; the assertion here is only that it returned.
+    #
+    # `exec`, so the process that ignores TERM is the `sleep` ITSELF and the
+    # stand-in is ONE process deep -- which is what `run_bounded` documents it
+    # signals ("a caller that would not must not use this"), and the only depth
+    # `cleanup` above can see. A forked `sleep` is a job of nobody: `run_bounded`
+    # KILLs the `sh` alone, so the `sleep` reparents and outlives the run by up to
+    # thirty seconds, and it is not in this shell's jobs table for the reap to
+    # find. Smaller than #839 -- it holds no port and it does end -- but the same
+    # shape, inside the change that claims to have closed it.
+    #
+    # STATED, not measured everywhere it matters. MEASURED here: `/bin/sh` is
+    # bash on this host, and bash already execs the last command of a `-c` list,
+    # so the fork was not happening and this changes nothing observable. NOT
+    # measured: dash and the BSD shells, which are what `/bin/sh` is on the other
+    # platforms CI builds. The `exec` is what makes the property hold without
+    # depending on that optimisation being present.
+    #
+    # An ignored disposition is INHERITED across exec -- the rule
+    # `.agent/rules/wire-and-protocol.md` states for SIGPIPE, arriving here -- so
+    # the child still ignores TERM and this row still discriminates: a helper that
+    # waited politely still takes thirty seconds.
     bounded-outlasts-a-trapped-term)
         rc=0
-        run_bounded 1 sh -c 'trap "" TERM; sleep 30' >/dev/null || rc=$?
+        run_bounded 1 sh -c 'trap "" TERM; exec sleep 30' >/dev/null || rc=$?
         echo "a TERM-ignoring child exited ${rc}"
         ;;
 
@@ -853,6 +874,17 @@ _selftest_listener() {
     #
     # Only ever called with `&`. In the FOREGROUND this would replace the calling
     # shell, so a new call site backgrounds it or does not use it.
+    #
+    # That sentence is the ONLY guard, and it is worth saying why rather than
+    # leaving the next reader to wonder whether one was forgotten. Enforcing it
+    # means asking "am I in a subshell", which needs `BASHPID` -- bash 4.0+, and
+    # UNSET on the macOS 3.2 this script also runs under, so the check would hold
+    # on Linux and be silently inert on the platform it matters on. That is the
+    # exact trap this file already records in its own bash 3.2 table, where
+    # `BASHPID` is a banned construct for the same reason: a guard that cannot
+    # fire everywhere is worse than a comment, because it reads as enforcement.
+    # A rule nothing can express is a rule nothing can be held to, so this one is
+    # written down instead of pretended at.
     exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile) = @ARGV;
