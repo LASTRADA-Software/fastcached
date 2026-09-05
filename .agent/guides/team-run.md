@@ -262,6 +262,39 @@ session that found it; the rulebook carries the same shape for a *measurement*
 [`../rules/testing.md`](../rules/testing.md). Its companion for reading a *failure*
 is the section above; this one is how to know the run happened at all.
 
+### `--force-with-lease` protects nothing across a fetch
+
+**Read the LEFT-HAND side of a force-push. If it is not the SHA you last pushed,
+stop — you have just overwritten somebody.** Git states it plainly and the push
+still reports success:
+
+```
++ 217886a0...32e83495  claude/flake-disconnect-691-700 -> ... (forced update)
+```
+
+Measured, on this repository. Two lanes held one branch; the second pushed
+`217886a0`; the first then rebased and force-pushed **with a lease**, and the lease
+did not fire. **A lease compares against your remote-tracking ref, and `git fetch`
+is step one of a rebase** — so the fetch adopted the other lane's commit, the lease
+matched it, and the force succeeded. 473 lines across five files left the branch,
+and the only thing in the output that said so was a SHA the pusher had never seen.
+
+So the safety everyone relies on is defeated by the protocol they were told to
+follow, silently, on the success path. Neither `--force-with-lease` nor
+`--force-if-includes` helps once the fetch has happened; the left-hand SHA is the
+one signal that survives, and checking it costs nothing.
+
+**The real remedy is upstream: do not put two lanes on one branch.** A manager who
+believes a lane has gone quiet must establish it by comparing the branch head
+against the head the work was based on — **never by the head's age.** A commit's
+author date is not its push time, because a rebase preserves author dates, so a
+freshly-pushed branch can present a head hours old. Absence from an agent roster
+is not death either; idle and gone look identical from outside.
+
+And when it does happen, **pin the overwritten commit** (`git update-ref
+refs/rescue/<lane>-<sha> <sha>`) before doing anything else. Nothing is lost until
+the object is collected, and the pin costs one command.
+
 ### Pairwise clean is not serially clean
 
 **Before sequencing two PRs that touch the same file, merge-tree the second onto a
