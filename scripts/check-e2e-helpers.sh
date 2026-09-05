@@ -58,7 +58,66 @@ run_case() {
     scratch="$(mktemp -d)"
     # shellcheck source=lib/e2e-common.sh
     . "$library"
-    cleanup() { echo "cleanup ran"; rm -rf "$scratch"; }
+    # The scratch directory AND the processes this case started. It was
+    # `rm -rf "$scratch"` alone, which reaped nothing at all: `_selftest_listener`
+    # below is an unbounded `accept()` loop, so every case that backgrounded one
+    # stranded an immortal `perl` holding a 127.0.0.1 LISTEN socket for the life
+    # of the machine. Measured on one dev host before this fix: 1368 orphans
+    # holding 1444 loopback sockets, the oldest 30.5 hours old, and three more
+    # from every `ctest -R e2e-helpers-selftest` (#839).
+    #
+    # The load is the visible half and the cheap half. The PORTS are the
+    # expensive one. `free_port` draws by asking whether anything is listening,
+    # so a held LISTEN socket is precisely what its probe refuses -- in growing
+    # numbers, forever, on a machine several lanes share. The failure that
+    # produces surfaces in whatever OTHER fixture next draws a port, which is the
+    # worst shape available: nothing points back here. Two lanes had already
+    # misread it, one as CPU contention and one as an unreproducible flake.
+    #
+    # `jobs -pr`, and not a pid ledger the call sites append to -- for the reason
+    # `note_failure` below is a function rather than a convention. A ledger is
+    # per-site, so the next background site reopens this by forgetting one line,
+    # and #834 was already writing that site while this was being fixed. There is
+    # nothing here to forget: every still-RUNNING background job of this shell is
+    # reaped, whatever started it, on whichever path the case left by -- the path
+    # the ticket names, `wait_for_port` calling `fail` before its `kill`,
+    # included. That the trap runs on the `fail` paths at all is not assumed:
+    # the three `fail-*` rows in the table below already assert `cleanup ran`.
+    #
+    # This is worth nothing without the `exec` on each helper below. `$!` for a
+    # backgrounded FUNCTION is the subshell bash forks to run it, not the program
+    # that subshell then runs, so reaping the job pid killed the wrapper and left
+    # the `perl` -- which is also why the three `kill "$listener"` calls already
+    # in this file never worked. Both halves or neither.
+    #
+    # `-r` rather than a bare `-p`. Bash reaps a finished job internally while
+    # keeping it in the jobs table, so a finished job pid is free to have been
+    # recycled and signalling it would hit a process belonging to somebody else
+    # -- the `pgrep -f` misattribution lesson arriving through another door. Only
+    # a RUNNING job is still ours to signal.
+    #
+    # Not `kill 0`: a case runs as `bash "$0" --case NAME` from a command
+    # substitution in the driver, with no job control, so it shares the DRIVER
+    # process group and `kill 0` would take the whole run down with it.
+    #
+    # It signals and does NOT wait, which is deliberate and is the one thing a
+    # reader is likely to want to "fix". `stop_and_require_exit` in the library
+    # is the richer recipe (TERM, poll, KILL, wait) and is wrong in a trap twice
+    # over: it ends in `fail`, which does `kill -TERM $_e2e_top_pid; exit 1`
+    # re-entrantly inside the EXIT trap already firing, and a bare `wait` here
+    # would be an UNBOUNDED wait inside cleanup -- `bounded-outlasts-a-trapped-term`
+    # below stages a child that ignores TERM on purpose, which is exactly the
+    # process such a wait would hang on. Escalation is unnecessary for the same
+    # reason it would be needed: these helpers install no TERM handler, and the
+    # `alarm` below is the backstop for anything that outlives the signal.
+    #
+    # bash 3.2: `jobs -pr` is in that shell, and this is a plain `for` over word
+    # splitting -- no `mapfile`, no arrays, no `wait -n`.
+    cleanup() {
+        echo "cleanup ran"
+        for leftover in $(jobs -pr); do kill "$leftover" 2>/dev/null || true; done
+        rm -rf "$scratch"
+    }
     trap cleanup EXIT
     e2e_begin "selftest" "$scratch"
     e2e_wait_seconds 1
@@ -787,10 +846,43 @@ run_case() {
 #          POLLS rather than happening to be called after the bind
 # @param 3 file to record request lines in
 _selftest_listener() {
-    perl -e '
+    # `exec` for the reason `cleanup` above gives: without it `$!` is the subshell
+    # bash forks for a backgrounded function, so the three `kill "$listener"`
+    # calls below signalled a wrapper and left this perl reparented to init with
+    # its listening socket still open (#839).
+    #
+    # Only ever called with `&`. In the FOREGROUND this would replace the calling
+    # shell, so a new call site backgrounds it or does not use it.
+    exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile) = @ARGV;
         sleep $delay if $delay;
+        # A self-imposed lifetime -- the belt-and-braces half of #839, and the
+        # same shape `_selftest_node` below already has in its trailing
+        # `sleep 30`. `cleanup` reaps this process on every path a case can take,
+        # but a trap does not run on SIGKILL, and this fixture is in the DEFAULT
+        # ctest set: it therefore also runs under `ctest --timeout`, under every
+        # cancelled CI job and under any `kill -9`, on every platform CI builds,
+        # and on those paths nothing whatever reaps it.
+        #
+        # A TIME bound and not a connection count. `port_answers` is `/dev/tcp`,
+        # so every `free_port` draw and every `wait_for_port` poll costs this
+        # loop an `accept()`; a loop bounded by connections would exit before the
+        # request under test arrived, and the case would then fail for a reason
+        # having nothing to do with the helper it exists to test.
+        #
+        # Armed AFTER the delay and never across it: the perl `sleep` builtin may
+        # be implemented with `alarm` on some systems, and the two must not
+        # overlap. There is deliberately no handler -- the default disposition of
+        # SIGALRM terminates, and that is what interrupts the blocking `accept()`.
+        #
+        # NOTE: this program is a shell single-quoted string, so no apostrophe
+        # may appear anywhere inside it, comments included. One here ended the
+        # quote and the script died at PARSE time -- which leaks nothing, and is
+        # therefore indistinguishable, by a count of survivors alone, from the
+        # fix working -- which is the argument this file makes in its own
+        # header, arriving from inside the file.
+        alarm 30;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
@@ -826,7 +918,11 @@ _selftest_listener() {
 # @param 2 seconds to wait before logging the marker, or `never`
 # @param 3 the log to write it to
 _selftest_node() {
-    perl -e '
+    # `exec` for the reason `_selftest_listener` above gives: `$!` must be this
+    # perl and not the subshell bash forks for a backgrounded function, or the
+    # `kill "$staged"` at the call site signals a wrapper and leaves this process
+    # holding its port for the full 30 seconds below. Only ever called with `&`.
+    exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile) = @ARGV;
         my $srv = IO::Socket::INET->new(
