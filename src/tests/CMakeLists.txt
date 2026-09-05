@@ -856,6 +856,44 @@ set_tests_properties("net-boundary" PROPERTIES
     TIMEOUT 60
 )
 
+# A stall is retried; a verdict is not.
+#
+# `cmake/MacOSNotarizePkg.cmake` bounds `notarytool submit --wait` and retries it
+# ([#376](https://github.com/LASTRADA-Software/fastcached/issues/376)). The property
+# that needs a guard is not the timeout -- it is that Apple answering "Invalid" is an
+# ANSWER, so retrying it spends half an hour of the step budget to be told the same
+# thing. That condition is exactly what gets simplified away while making a retry
+# "more robust", and nothing else in this tree would notice.
+#
+# Watched refusing: neutering the `_rc` separation fails the two refusal cases and
+# ONLY those two, with the other three still green -- the asymmetry being the
+# evidence rather than a red run.
+#
+# It drives the real function out of the real file with a fake `xcrun` on PATH, so
+# it needs no macOS and no Apple credentials, and what it exercises is what ships.
+# NOT on Windows, and for the SUBJECT rather than the mechanics. The fake `xcrun`
+# is a POSIX shell stub and the hook spawns it through `execute_process`, which on
+# Windows is `CreateProcess` and cannot start a shebang script -- the third time
+# that ENOEXEC has been written into this tree in one day, twice by the session
+# that added the rulebook entry about it.
+#
+# Staging a `.cmd` would fix the mechanics and would be the wrong fix:
+# `MacOSNotarizePkg.cmake` is a macOS packaging hook that never runs on Windows,
+# so validating it there would exercise a configuration that does not exist. The
+# subject decides where a check belongs; the mechanics only decide whether it can
+# run at all.
+if(NOT WIN32)
+    add_test(
+        NAME "notarize-retry"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-notarize-retry.sh"
+    )
+    set_tests_properties("notarize-retry" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 # Which translation units the analyser never sees.
 #
 # The `clang-tidy` job runs on `ubuntu-24.04` and `scripts/local-gate.sh` tidies
