@@ -67,6 +67,46 @@ on:
   merge_group:
     branches: [master]
 
+# The floor every job in this file starts from, and it is a REDUCTION rather than
+# a grant: without it each job inherits the repository's workflow-permissions
+# default, which an administrator can widen for reasons that have nothing to do
+# with this workflow. `pr-labels.yml` and `issue-triage.yml` declare
+# `permissions: {}`, `docs.yml` declares `contents: read` and
+# `merge-group-report.yml` declares `contents: read` + `issues: write` -- FOUR,
+# not the three #572 names, `merge-group-report.yml` having arrived with #684.
+# This was the one workflow with no floor, which left a reader unable to tell
+# whether narrowing is this repository's convention or an option some files
+# happen to take.
+#
+# `contents: read` and nothing else, ENUMERATED from what the jobs do rather than
+# copied from a sibling workflow:
+#
+#   * `actions/checkout` is the only thing 19 of the 21 jobs ask a token for, and
+#     it needs `contents: read`.
+#   * `actions/cache`, `actions/cache/restore`, `actions/upload-artifact`,
+#     `actions/download-artifact` and `hendrikmuhs/ccache-action` reach the cache
+#     and artifact services through `ACTIONS_RUNTIME_TOKEN`, which this block does
+#     not govern. A too-narrow `permissions:` cannot break them and a wider one
+#     would not help them.
+#   * `mozilla-actions/sccache-action` lists a public repository's releases, and
+#     `codecov/codecov-action` is handed `secrets.CODECOV_TOKEN` explicitly rather
+#     than minting an OIDC one -- so neither needs `id-token: write`.
+#   * `docker` builds an image and runs it; it pushes to no registry, so no
+#     `packages: write`.
+#
+# The two jobs that need more say so themselves, and that is what keeps the
+# exception visible: `clang-tidy` adds `issues: write` for its report step and
+# `release` takes `contents: write` to draft the release. A job-level block
+# REPLACES this one rather than adding to it -- every scope a job names is the
+# whole of what that job gets -- which is also the verification argument for a
+# change that cannot be exercised on a pull request. `release` runs only on a tag
+# and carries its own exhaustive block, so this floor cannot reach it. Every other
+# job in this file runs on a pull request, so a green pull request does exercise
+# the narrowing for all of them.
+
+permissions:
+  contents: read
+
 concurrency:
   # Inside a queue `github.ref` is the temporary branch
   # `refs/heads/gh-readonly-queue/master/pr-<n>-<sha>`, which is unique per queue
@@ -2864,9 +2904,13 @@ jobs:
       - package-macos
       - package-windows
     runs-on: ubuntu-24.04
-    # The only job here needing more than the repository's default read-only
-    # token: creating a release writes `contents`. Without this the release step
+    # One of the two jobs here needing more than this workflow's `contents: read`
+    # floor: creating a release writes `contents`. Without this the release step
     # fails with a bare 403 rather than with anything that names the cause.
+    #
+    # A job-level block REPLACES the top-level one rather than adding to it, so
+    # `contents: write` is the whole of what this job gets -- which is also why
+    # narrowing the floor cannot break the one job a pull request never exercises.
     permissions:
       contents: write
     steps:
