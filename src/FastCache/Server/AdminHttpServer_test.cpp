@@ -46,18 +46,49 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
     co_return out;
 }
 
-std::string Exchange(std::string_view request, FastCache::IMetricsSink const& metrics, FastCache::StorageStats stats)
+/// Drive the admin surface once and return every byte it wrote.
+///
+/// The tail every case in this file ends with, in ONE place. It was open-coded four
+/// times -- the two `Exchange` helpers and both `FailingReadSocket` cases -- and the
+/// four copies each carried their own `provider` lambda, which is four spellings of
+/// one snapshot that have to stay in step. That is the drift argument
+/// `SocketDecorator.hpp` was written to make about fakes, one file away and not yet
+/// applied here.
+///
+/// `serveOn` is separate from `pair` on purpose: a decorator case serves the surface
+/// on the WRAPPER while the assertion still reads from `pair.client`, so the two
+/// cannot be derived from each other.
+///
+/// @param serveOn The socket the surface is driven on -- `pair.server.get()`, or a
+///        decorator wrapping it.
+/// @param pair The pair `serveOn` belongs to; closed and drained here.
+/// @param metrics The sink the surface renders from.
+/// @param stats The storage figures the snapshot carries.
+/// @return Everything the server wrote, which is empty when it wrote none.
+std::string ServeAndCollect(FastCache::ISocket* serveOn,
+                            FastCache::InMemorySocketPair& pair,
+                            FastCache::IMetricsSink const& metrics,
+                            FastCache::StorageStats stats)
 {
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
     using namespace std::chrono_literals;
     auto provider = [&stats] {
         return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+}
+
+std::string Exchange(std::string_view request, FastCache::IMetricsSink const& metrics, FastCache::StorageStats stats)
+{
+    auto pair = FastCache::InMemorySocketPair::Create();
+    // Guarded rather than unconditional, which is what lets `ExchangeMaybeSilent`
+    // below be a wrapper instead of a second copy: an empty request is a peer that
+    // said nothing, and writing zero bytes is not the same as not writing.
+    if (!request.empty())
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    return ServeAndCollect(pair.server.get(), pair, metrics, stats);
 }
 
 /// An `ISocket` that never returns more than `limit` bytes from one `Read`.
@@ -106,17 +137,7 @@ class ShortReadSocket final: public FastCache::Testing::SocketDecorator
 std::string ExchangeMaybeSilent(std::string_view request)
 {
     FastCache::AtomicMetricsSink metrics;
-    auto pair = FastCache::InMemorySocketPair::Create();
-    if (!request.empty())
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
-    using namespace std::chrono_literals;
-    auto provider = [] {
-        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
-    };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider));
-    pair.server->Close();
-    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    return Exchange(request, metrics, {});
 }
 
 } // namespace
@@ -427,14 +448,7 @@ TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, no
     FastCache::Testing::FailingReadSocket stalled { *pair.server, code };
 
     FastCache::AtomicMetricsSink metrics;
-    using namespace std::chrono_literals;
-    auto provider = [] {
-        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
-    };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&stalled, &metrics, provider));
-    pair.server->Close();
-
-    REQUIRE(FastCache::SyncRun(ReadAvailable(pair.client.get())).empty());
+    REQUIRE(ServeAndCollect(&stalled, pair, metrics, {}).empty());
 }
 
 TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused", "[metrics][http][admin][idle]")
@@ -465,14 +479,7 @@ TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served 
     FastCache::Testing::FailingReadSocket stalled { *pair.server, FastCache::NetErrorCode::WouldBlock, 1 };
 
     FastCache::AtomicMetricsSink metrics;
-    using namespace std::chrono_literals;
-    auto provider = [] {
-        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
-    };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&stalled, &metrics, provider));
-    pair.server->Close();
-
-    auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    auto const response = ServeAndCollect(&stalled, pair, metrics, {});
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
 }

@@ -150,10 +150,7 @@ class FailingReadSocket final: public SocketDecorator
     /// @return The decorated socket's answer, or the configured failure.
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
-        if (_remaining == 0)
-            return Failure();
-        --_remaining;
-        return SocketDecorator::Read(buffer);
+        return TakeAllowance() ? SocketDecorator::Read(buffer) : Failure();
     }
 
     /// The same answer `Read` would give.
@@ -166,13 +163,26 @@ class FailingReadSocket final: public SocketDecorator
     /// @return The decorated socket's answer, or the configured failure.
     [[nodiscard]] IoAwaitable WaitReadable() override
     {
-        if (_remaining == 0)
-            return Failure();
-        --_remaining;
-        return SocketDecorator::WaitReadable();
+        return TakeAllowance() ? SocketDecorator::WaitReadable() : Failure();
     }
 
   private:
+    /// Spend one forwarded read, if any are left.
+    ///
+    /// Shared by `Read` and `WaitReadable` because they are ONE read operation --
+    /// the same reason `WaitReadable` is overridden at all. Written out twice, the
+    /// allowance could be decremented in one and not the other, which is a fake that
+    /// forwards a different number of reads depending on which spelling the code
+    /// under test happens to use.
+    /// @return Whether this call may be forwarded to the decorated socket.
+    [[nodiscard]] bool TakeAllowance() noexcept
+    {
+        if (_remaining == 0)
+            return false;
+        --_remaining;
+        return true;
+    }
+
     /// @return The configured failure, without touching the decorated socket.
     [[nodiscard]] IoAwaitable Failure() const noexcept
     {

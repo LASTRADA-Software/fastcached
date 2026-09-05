@@ -69,11 +69,17 @@ struct NetError
 /// in two subsystems -- `Server/AdminHttpServer.cpp` and
 /// `Consensus/RaftPeerServer.cpp`. A third,
 /// `apps/fastcache-compile-node/FrameEndpoint.cpp`, tests `WouldBlock` alone and is
-/// RIGHT to: that listener has no poll timeout, so the other code cannot arrive
-/// there, and its own comment says so.
+/// RIGHT to -- on an ACCEPT, `WouldBlock` means *no connection is ready yet, retry*,
+/// which is not a deadline expiring. **That reason is recorded at the site, not only
+/// here**: while it lived only here, three reviewers in a row filed the narrow test
+/// as a defect without opening the file. A note the next editor must already know
+/// about is a note in the wrong place. It is also the SEMANTIC reason rather than
+/// the reachability one -- "that listener has no poll timeout" is a fact about
+/// today's wiring and would stop being true the day one is injected.
 ///
 /// The census travels with the pattern that produced it, because a number nobody can
-/// reproduce is one the next person re-derives differently:
+/// reproduce is one the next person re-derives differently. Re-run it rather than
+/// trusting the count, which describes the tree at the commit that wrote it:
 ///
 ///     git grep -nE '(==|!=) *(NetErrorCode::)?(WouldBlock|Timeout)\b' -- src/
 ///

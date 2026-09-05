@@ -292,9 +292,13 @@ else
     # Refuses rather than answering when its own read bound is what ended the
     # read, so a green line here cannot be a question that went unasked.
     unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")" && probe_rc=0 || probe_rc=$?
+    # The NAMES, not `0`/`2`: these two arms print opposite diagnoses about
+    # different machines, so a transposed literal sends somebody to debug a node
+    # that is fine. Quoted, so each pattern is the variable's value and not a glob;
+    # unbound under `set -u` if either name is ever mistyped.
     case "$probe_rc" in
-        0) ;;
-        2) fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
+        "$E2eSilenceAnswered") ;;
+        "$E2eSilenceRefused") fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
         *) fail "the silence probe could not decide: the admin surface neither answered nor closed within its bound" ;;
     esac
     [[ -z "$unasked" ]] \

@@ -2018,6 +2018,17 @@ Task<void> FrameServer::Run()
             // `Close()` resolves a parked accept with Cancelled, which is how this
             // loop learns it is done -- there is no poll timeout any more, so a stop
             // is observed at once rather than after a quarter second.
+            //
+            // **`WouldBlock` alone, and NOT `Net::IsDeadlineExpiry`, deliberately.**
+            // That predicate answers "did my deadline expire", and on an ACCEPT
+            // `WouldBlock` does not mean that -- it means *no connection is ready
+            // yet, retry*, which is an ordinary tick rather than an expiry. Reading
+            // `Timeout` here as the same fact would swallow a real one. The reason is
+            // semantic and not merely that this listener happens to have no poll
+            // timeout: a reachability argument would stop being true the day one is
+            // injected, and this one does not. Recorded HERE because the note used to
+            // live only beside the predicate, where three reviewers in a row did not
+            // find it and filed the narrow test as a defect (#824).
             auto const code = accepted.error().code;
             if (code == NetErrorCode::WouldBlock)
                 continue;

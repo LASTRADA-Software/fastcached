@@ -810,13 +810,19 @@ _e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
 # rather than the loop, because a server that dribbles a line every two seconds
 # would otherwise accumulate past the bound and be called a timeout.
 #
-# @return echoes the body. Sets `_http_drain_elapsed` to how long the read that
-#         ended the loop took, and `_http_drain_status` to what it returned --
-#         the latter for diagnostics only, never to tell a timeout from an EOF.
+# The read's own status is LOCAL, deliberately. It is loop control and nothing
+# else: an earlier draft exported it and had to carry a written prohibition against
+# the one use anybody would put it to (telling a timeout from an EOF, which is the
+# very thing it cannot do here). Scoping it makes the prohibition unnecessary
+# rather than merely documented -- there is no variable left to misread.
+#
+# @return echoes the body, and sets `_http_drain_elapsed` to how long the read that
+#         ended the loop took. That elapsed time is the only output; the verdict is
+#         `_e2e_read_hit_bound`'s.
 _http_drain_fd3() {
-    local line="" body="" before=0
+    local line="" body="" before=0 status=0
     while :; do
-        # `|| _http_drain_status=$?` rather than a bare read: a command whose failure
+        # `|| status=$?` rather than a bare read: a command whose failure
         # is TESTED is exempt from `set -e`, and a bare one is not. This file is
         # sourced by fixtures on both settings -- `check-e2e-helpers.sh` sets `-e`,
         # `fleet-dashboard-e2e.sh` sets only `-uo pipefail` -- so a bare read here
@@ -826,11 +832,11 @@ _http_drain_fd3() {
         # leaves `$?` holding the last command of the BODY, so on a peer that never
         # says anything the body never runs and `$?` is a clean 0 -- which reads as
         # "the peer closed" for a read that in fact timed out.
-        _http_drain_status=0
+        status=0
         before=$SECONDS
-        IFS= read -r -t "$_e2e_http_read_bound" line <&3 || _http_drain_status=$?
+        IFS= read -r -t "$_e2e_http_read_bound" line <&3 || status=$?
         _http_drain_elapsed=$(( SECONDS - before ))
-        [ "$_http_drain_status" -eq 0 ] || break
+        [ "$status" -eq 0 ] || break
         body+="${line}"$'\n'
     done
     if [ -n "$line" ]; then body+="$line"; fi
@@ -858,21 +864,33 @@ _http_drain_fd3() {
 # volunteered nothing" -- so without this the probe would go vacuous, silently,
 # the day anyone raises the server's deadline past five seconds.
 #
-# **Three outcomes, three statuses.** "The connection was refused" and "the bound
-# expired" are different facts about different machines, and folding them into one
-# non-zero is the same mistake one layer up as the `bool ok` this whole change is
-# about: the caller then prints a diagnosis it has not established -- a dead node
-# reported as a surface that would not answer.
+# **Three outcomes, three statuses, and the statuses are NAMED.** "The connection
+# was refused" and "the bound expired" are different facts about different machines,
+# and folding them into one non-zero is the same mistake one layer up as the `bool
+# ok` this whole change is about: the caller then prints a diagnosis it has not
+# established -- a dead node reported as a surface that would not answer.
 #
+# The names exist for the reason `E2eBoundOutcomeExceeded` below gives, and this
+# function is the case that argument was written about. A bare literal FAILS OPEN:
+# writing `1)` where `2)` was meant makes a fixture print "the node is gone" for
+# "the surface would not answer" -- the exact mis-bucketing the three statuses exist
+# to prevent, and no shell setting catches it. Compared against a name instead, a
+# typo is an unbound variable and every caller here runs under `set -u`, so the same
+# mistake stops the run and says where.
+E2eSilenceAnswered=0
+E2eSilenceInconclusive=1
+E2eSilenceRefused=2
+
 # @param 1 host
 # @param 2 port
 # @return echoes whatever the server said unprompted, EMPTY when it said nothing.
-#         `0` the server answered or closed, so the body is its answer;
-#         `1` the read bound expired first, so there is no answer to report;
-#         `2` the connection was refused, so nothing was ever asked.
+#         `$E2eSilenceAnswered` the server answered or closed, so the body is its
+#         answer; `$E2eSilenceInconclusive` the read bound expired first, so there
+#         is no answer to report; `$E2eSilenceRefused` the connection was refused,
+#         so nothing was ever asked.
 http_response_to_silence() {
     local host="$1" port="$2"
-    exec 3<>"/dev/tcp/${host}/${port}" || return 2
+    exec 3<>"/dev/tcp/${host}/${port}" || return "$E2eSilenceRefused"
     _http_drain_fd3
     # Elapsed, never `read`'s status -- see `_http_drain_fd3`. A read that consumed
     # the whole bound is one OUR bound ended, and that is not an answer about the

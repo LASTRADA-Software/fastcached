@@ -155,6 +155,24 @@ namespace
         std::string_view status;
         /// The body that goes with `status`; empty wherever `status` is.
         std::string_view body;
+        /// Why a rise on this outcome would, or would not, mean something.
+        ///
+        /// **A COLUMN and not a paragraph, so a new row cannot be written without
+        /// answering.** Nothing sends this text; it exists to be a forcing function,
+        /// exactly as `Protocol/SurfaceRefusal.hpp`'s `UncountedRefusal::rationale`
+        /// does on the `0xFC` wire. The rule it serves is
+        /// `.agent/rules/metrics-and-observability.md`'s: *deliberately uncounted must
+        /// not be spelled like forgot*. Written as prose above the enum, that decision
+        /// sat sixty lines from the rows it was about and asked the author of a seventh
+        /// outcome for a status and a body and nothing else.
+        ///
+        /// This surface reaches no counter today -- `ServeAdminHttp` takes
+        /// `IMetricsSink const*` -- and the rationale is the half that has to travel
+        /// with the row regardless, because it is what a counter would later be added
+        /// against. It is also outside `check-worker-refusals-counted.cmake`'s glob,
+        /// which keys on `EncodeErrorReply`, so nothing scans it: the column is the
+        /// only thing standing where that scan would.
+        std::string_view rationale;
     };
 
     /// The disposition of every head-read outcome, in enumerator order.
@@ -168,15 +186,37 @@ namespace
     inline constexpr EnumTable<AdminHeadOutcome, AdminHeadOutcomeRow> AdminHeadOutcomeTable {
         // Never looked up -- a complete head is routed instead. Present because the
         // table is indexed by the enum and a missing row would be a silent zero.
-        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete, .status = {}, .body = {} },
-        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle, .status = {}, .body = {} },
-        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone, .status = {}, .body = {} },
-        AdminHeadOutcomeRow {
-            .outcome = AdminHeadOutcome::Truncated, .status = "408 Request Timeout", .body = "request timed out\n" },
-        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed, .status = "400 Bad Request", .body = "bad request\n" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete,
+                              .status = {},
+                              .body = {},
+                              .rationale = "not an outcome: a complete head is routed, never dispatched here" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle,
+                              .status = {},
+                              .body = {},
+                              .rationale = "a rise would mean nothing: an abandoned browser preconnect is what a "
+                                           "HEALTHY client produces many times a minute, so the series never rests" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone,
+                              .status = {},
+                              .body = {},
+                              .rationale = "a rise would mean nothing, for Idle's reason: a peer leaving without "
+                                           "asking is ordinary, and it is the same client behaviour observed one "
+                                           "way rather than the other" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Truncated,
+                              .status = "408 Request Timeout",
+                              .body = "request timed out\n",
+                              .rationale = "a rise WOULD mean something -- clients cut off mid-head point at a "
+                                           "deadline set too tight or a network losing segments -- but this surface "
+                                           "reaches no sink; see #828" },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed,
+                              .status = "400 Bad Request",
+                              .body = "bad request\n",
+                              .rationale = "a rise WOULD mean something (a broken client, or a probe on the wrong "
+                                           "port), but this surface reaches no sink; see #828" },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::TooLarge,
                               .status = "431 Request Header Fields Too Large",
-                              .body = "request header fields too large\n" },
+                              .body = "request header fields too large\n",
+                              .rationale = "a rise WOULD mean something (a client whose headers outgrew the cap), "
+                                           "but this surface reaches no sink; see #828" },
     };
     static_assert(RowsInEnumeratorOrder(AdminHeadOutcomeTable, &AdminHeadOutcomeRow::outcome));
 
@@ -190,6 +230,12 @@ namespace
                                           return !row.status.empty() || row.body.empty();
                                       }),
                   "a head outcome answered with silence must carry no body");
+
+    /// Every row states its counter claim. An empty `rationale` is the spelling of
+    /// *forgot*, which is the one thing the column exists to make impossible.
+    static_assert(std::ranges::all_of(AdminHeadOutcomeTable,
+                                      [](AdminHeadOutcomeRow const& row) noexcept { return !row.rationale.empty(); }),
+                  "every head outcome must say whether counting it would mean anything");
 
     /// Parsed HTTP request head, and why reading it ended. Only `Complete` carries
     /// a method and a target; every other outcome carries nothing but itself.
@@ -399,6 +445,13 @@ namespace
             co_return RequestHead { .outcome = buffer.size() >= MaxRequestBytes ? AdminHeadOutcome::TooLarge
                                                                                 : AdminHeadOutcome::Malformed };
 
+        // Unreachable by construction, and kept anyway. `sawHeadEnd` is only ever set
+        // by finding `"\r\n\r\n"`, so reaching here guarantees a `"\r\n"` exists and
+        // this arm cannot fire -- it is NOT a live `Malformed` route, and a reader
+        // counting them should not count it. It stays because the cost of the two
+        // outcomes is wildly asymmetric: if that invariant is ever broken by an edit
+        // to the loop above, `npos` here becomes the LENGTH of the `string_view`
+        // below, which is a read far past the buffer rather than a wrong status code.
         auto const eol = buffer.find("\r\n");
         if (eol == std::string::npos)
             co_return RequestHead { .outcome = AdminHeadOutcome::Malformed };
