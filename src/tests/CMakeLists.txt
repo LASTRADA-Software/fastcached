@@ -856,6 +856,73 @@ set_tests_properties("net-boundary" PROPERTIES
     TIMEOUT 60
 )
 
+# Which translation units the analyser never sees.
+#
+# The `clang-tidy` job runs on `ubuntu-24.04` and `scripts/local-gate.sh` tidies
+# through the Linux presets, so a TU whose whole body sits behind a guard that is
+# false on Linux preprocesses to nothing and is reported CLEAN without being read
+# ([#682](https://github.com/LASTRADA-Software/fastcached/issues/682)).
+#
+# **Registered on Linux only, and that is about the SUBJECT rather than about
+# portability.** The question is what the CI sweep cannot see, and that sweep runs on
+# Linux. The same check on Windows would measure the mirror set -- the Iocp units
+# analysed, the Epoll ones blind -- which is a different and currently unasked
+# question. It is not a skip standing in for a pass; on other platforms there is
+# nothing here to answer.
+#
+# It reads the compile database and the OBJECTS, so it runs after a build like
+# `tsan-gate.sh` does. A missing `nm` is a refusal, never a skip.
+# It also needs the SWEEP's configuration, not merely a Linux one. The empty-object
+# signature is two symbols because AddressSanitizer adds them; without ASan an empty
+# unit defines nothing and so does one that defines only inline or template entities,
+# and the check would report both alike -- measured, 11 in the sweep's configuration
+# against 26 in a Release build of the same tree. `FASTCACHED_ENABLE_TLS` matters for
+# the same reason one level up: with TLS off, two TLS test units are legitimately
+# empty and the blind set is a different set than the table records.
+#
+# In CI that configuration is the `clang-asan-ubsan` job, which configures
+# `clang-debug` with TLS on and runs `ctest` -- the same configuration the `clang-tidy`
+# job sweeps, which is what makes its answer the one the sweep would give.
+#
+# KNOWN RESIDUAL: if that job's flags change, this stops being registered and reports
+# nothing, which reads like a pass. The selftest below runs everywhere and keeps the
+# check itself honest, but nothing yet asserts that some CI job still configures a
+# build this can run in.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_SANITIZER_ADDRESS AND FASTCACHED_ENABLE_TLS)
+    add_test(
+        NAME "tidy-blind-spots"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots.sh"
+                "${CMAKE_BINARY_DIR}"
+    )
+    set_tests_properties("tidy-blind-spots" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 300
+    )
+endif()
+
+# The half that makes the above a guard rather than a hope: eight staged outcomes,
+# each asserted for WHICH refusal it gets. Needs no build and no real `nm` -- it
+# stages a fake one.
+#
+# NOT on Windows, and for the subject rather than for convenience. The fake `nm` is a
+# POSIX shell stub, and the check spawns it through Python, which on Windows is
+# `CreateProcess` and cannot start a shebang script -- the same ENOEXEC that broke
+# #668's gate selftest. Staging a `.cmd` would fix the mechanics, but it would be
+# validating a check that can never run on this platform: `tidy-blind-spots` is
+# registered on Linux only, because the question is what the Linux sweep cannot see.
+if(NOT WIN32)
+    add_test(
+        NAME "tidy-blind-spots-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots-selftest.sh"
+    )
+    set_tests_properties("tidy-blind-spots-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 # And the half that did not exist. `net-boundary` had NO selftest: nothing had
 # ever watched it refuse, which by this tree's standard means it was not a guard
 # -- and it had been carrying a wrong rule for as long as the rule existed (#517,
