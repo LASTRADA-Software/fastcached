@@ -498,8 +498,9 @@ same on both — the same defect with no MSVC anywhere near it.
       classification is the same defect as a host-sensitive one, and this layer exists to
       have neither.
   - **A stream driver's notes must not reach the hashed text, and which stream carries them
-    is not the driver table's answer to give.** `DriverSpec::includeStream` describes the
-    *compile* run; the probe is a different command line and clang moves the notes off
+    is not the driver table's answer to give.** No field encodes it -- `DriverSpec` carries
+    no `includeStream`, and the claim lives only in `Flavor`'s doc comments and the driver
+    table in `docs/tools/fastcache-cc.md`, both of which describe the *compile* run; the probe is a different command line and clang moves the notes off
     whichever stream the preprocessed text is using — measured, `clang-cl /c /showIncludes`
     reports on **stdout** while `clang-cl /EP /showIncludes` reports on **stderr** (LLVM
     D46394). Routing the probe by that table therefore read an empty set on clang-cl and
@@ -509,6 +510,21 @@ same on both — the same defect with no MSVC anywhere near it.
     question, "rather than guessing which compiler produced this value". A note left in the
     text would be keyed as if it were source, and it carries an absolute path, which is
     precisely what suppressing line markers exists to prevent.
+  - **Which channel a driver writes `/showIncludes` on is stated ONCE -- here -- and the two
+    halves of the answer do not have the same evidence.** MEASURED, and the bullet above is
+    the reading: `clang-cl /c /showIncludes` reports on **stdout**, `clang-cl /EP
+    /showIncludes` on **stderr** (LLVM D46394). **NOT MEASURED: `cl`.** Three sites assert it
+    writes on stderr -- `Flavor::Cl`'s doc comment, the driver table in
+    `docs/tools/fastcache-cc.md`, and the stored-region comment in `fastcache-cc/main.cpp`
+    -- while the analysis on #700 and the review of #821 both say stdout. Nobody on this team
+    has a Windows host, so **no reading has been taken either way**, and those three sites now
+    say so instead of restating the claim: a claim stated in three places needs a correction
+    that finds all three, which is how a wrong one survives being corrected. It is inert
+    today because both regions are tagged `ShowIncludes` whichever stream carries the notes
+    -- and it stopped being inert the moment #821 built a dispatch refusal fed from stderr
+    alone, which is why it is written down rather than left to be rediscovered.
+    [#825](https://github.com/LASTRADA-Software/fastcached/issues/825) holds the probe that
+    would settle it; until that runs, the `cl` half is unverified and must not be relied on.
   - **The note grammar is one rule, not one string, and it is anchored.** `SplitIncludeNotes`
     and `ParseIncludePaths` both call `IncludeNotePath`, which matches after leading blanks
     (`cl` indents by nesting depth) and **nowhere else**. Matching the marker anywhere in the

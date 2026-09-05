@@ -22,7 +22,10 @@ namespace FastCache::Cc
 enum class Flavor : std::uint8_t
 {
     Unknown,
-    Cl,      ///< MSVC cl.exe — /showIncludes notes on stderr.
+    /// MSVC cl.exe. Believed to write /showIncludes notes on stderr, UNVERIFIED
+    /// (#825): the analysis on #700 says stdout and nobody here has a Windows host.
+    /// `.agent/rules/compile-cache.md` states it once; do not restate it.
+    Cl,
     ClangCl, ///< clang-cl.exe (MSVC-compatible driver) — notes on stdout.
     Gcc,     ///< gcc / g++ — GNU driver, depfile via -MD -MF.
     Clang,   ///< clang / clang++ — GNU driver, depfile via -MD -MF.

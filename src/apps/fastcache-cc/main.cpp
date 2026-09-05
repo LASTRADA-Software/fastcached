@@ -1256,8 +1256,9 @@ struct ProbedDependencies
     }
 
     // A stream driver's notes are taken from BOTH streams, and stdout is split
-    // unconditionally — `DriverSpec::includeStream` describes the COMPILE run and
-    // must not be trusted here. Measured: `clang-cl /c /showIncludes` puts notes
+    // unconditionally — no field encodes the channel (`DriverSpec` has no
+    // `includeStream`); the claim lives in `Flavor`'s doc comments, it describes
+    // the COMPILE run, and it must not be trusted here. Measured: `clang-cl /c /showIncludes` puts notes
     // on stdout, but `clang-cl /EP /showIncludes` — the probe's own line — puts
     // them on STDERR, because clang deliberately moves them off the stream the
     // preprocessed text is using (LLVM D46394). Routing by the table therefore
@@ -2480,9 +2481,14 @@ void RecordManifest(Config const& cfg,
     value.objectBlob = *objectBytes;
     // Two regions, one per stream, in a fixed order (0=stdout, 1=stderr) so the
     // hit path replays each on its correct channel. clang-cl emits
-    // /showIncludes on stdout, cl on stderr — we tag BOTH with the ShowIncludes
-    // grammar so whichever stream carries include notes gets canonicalized; a
-    // non-matching line in either region is preserved verbatim.
+    // /showIncludes on stdout; `cl` is believed to use stderr but that half is
+    // UNVERIFIED (#825) — nobody here has a Windows host and no reading has been
+    // taken. `.agent/rules/compile-cache.md` states it once and is where a
+    // measurement lands; this comment must not become a second home for it.
+    //
+    // Which is why nothing here depends on the answer: we tag BOTH regions with
+    // the ShowIncludes grammar, so whichever stream carries include notes gets
+    // canonicalized; a non-matching line in either region is preserved verbatim.
     //
     // Both are reconciled first, and only the STORED copy is: ReplayStreams above
     // has already passed the compiler's own bytes through untouched. The daemon
