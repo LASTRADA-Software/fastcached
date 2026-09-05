@@ -56,8 +56,13 @@ run_case() {
 sanflag="-fsanitize=address"
 
 stage() {
-    rm -rf "$work/build" "$work/src" "$work/scripts"
-    mkdir -p "$work/build" "$work/scripts"
+    rm -rf "$work/build" "$work/src" "$work/scripts" "$work/.github"
+    mkdir -p "$work/build" "$work/scripts" "$work/.github/workflows"
+    # A workflow the leg-derivation can read. Staged rather than copied from the real
+    # tree, so a case can name a leg that does or does not exist without depending on
+    # what CI happens to run today.
+    printf 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --ci\n' \
+        > "$work/.github/workflows/build.yml"
     printf '%s\n' "$1" > "$work/scripts/tidy-blind-spots.txt"
     shift
     entries=""
@@ -80,16 +85,16 @@ stage() {
 ctrl="src/FastCache/Net/EpollSocket.cpp"
 
 # Everything blind is listed, and the control is analysed: the only passing shape.
-stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tguarded\n')" \
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
-run_case accounted pass "1 translation unit(s) analysed by nothing, all accounted for"
+run_case accounted pass "1 translation unit(s) contribute nothing in this configuration, all accounted for"
 
 # A TU goes blind with no row. The hole this check exists to find.
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
 run_case unlisted refuse "is analysed by nothing and is not in scripts/tidy-blind-spots.txt"
 
 # A row that is no longer true. A stale exemption hides the next real one.
-stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tguarded\n')" \
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 40
 run_case stale refuse "is listed as analysed by nothing, but it is analysed now"
 
@@ -97,16 +102,16 @@ run_case stale refuse "is listed as analysed by nothing, but it is analysed now"
 # The reason this case exists is that a check reporting only a number would read 1 -> 1
 # and call it unchanged, while the set it describes is a different set. Both halves
 # must be named.
-stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tguarded\n')" \
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 40 "src/FastCache/Net/KqueueSocket.cpp" 2
 run_case swap refuse "KqueueSocket.cpp' is analysed by nothing and is not in"
-stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tguarded\n')" \
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 40 "src/FastCache/Net/KqueueSocket.cpp" 2
 run_case swap_names_both refuse "IocpSocket.cpp' is listed as analysed by nothing, but it is analysed now"
 
 # A row naming a file that is gone. Distinguished from `stale`, because the fix is
 # different: one is a deletion, the other is a file that grew an analyser.
-stage "$(printf 'src/FastCache/Net/Vanished.cpp\tguarded\n')" "$ctrl" 50
+stage "$(printf 'src/FastCache/Net/Vanished.cpp\tnone\tguarded\n')" "$ctrl" 50
 run_case vanished refuse "which does not exist"
 
 # The instrument itself broken: `nm` answers nothing, so EVERY TU reads as blind.
@@ -121,6 +126,22 @@ sanflag=""
 stage "$(printf '# empty\n')" "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
 run_case no_sanitizer refuse "no AddressSanitizer"
 sanflag="-fsanitize=address"
+
+# The reached-by column. A row may name a leg that EXISTS, or `none`; naming one
+# that does not is a claim of coverage nothing provides, and it fails silently --
+# the unit stays listed and the table stays plausible while nobody analyses it.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tclang-tidy-windows\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_case reached_by_real_leg pass "contribute nothing in this configuration"
+
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tclang-tidy-solaris\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_case reached_by_absent_leg refuse "which is not a clang-tidy leg"
+
+# And the number #858 is about is reported on every run, not only on a refusal.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_case reports_unreached_count pass "reached by NO analyser leg"
 
 echo "check-tidy-blind-spots-selftest: ran $cases case(s), $failures failure(s)"
 [[ $failures -eq 0 ]] || exit 1

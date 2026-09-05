@@ -1,23 +1,31 @@
-# Translation units that contribute NOTHING on the platform the clang-tidy sweep
-# runs on, and are therefore analysed by no analyser in this project's CI.
+# Translation units that contribute NOTHING on the platform a given clang-tidy leg
+# runs on, and which OTHER leg (if any) does read them.
 #
-# `scripts/check-tidy-blind-spots.sh` MEASURES the real set and refuses when it
-# disagrees with this table, in either direction: a TU that goes blind and is not
-# listed here is a new hole, and a row that is no longer blind is a stale claim.
-# The list is never the evidence -- the measurement is -- so nobody can widen the
-# hole by editing prose.
+# **"Blind" is a property of (unit, set of legs), not of a unit.** A unit inside
+# `#if defined(_WIN32)` is empty on Linux and real on Windows, so whether anything
+# analyses it depends on which legs exist -- and the answer changes when a leg is
+# added. The middle column is therefore a LIST of legs, and `none` means exactly
+# that: no analyser this project runs reads this unit.
 #
-# Format: <path><TAB><reason>
+# `scripts/check-tidy-blind-spots.sh` MEASURES the blind set for the build it is
+# given and refuses when this table disagrees, in either direction. It also refuses
+# a row naming a leg that does not exist in `.github/workflows/build.yml`, so a leg
+# that is deleted or renamed cannot leave rows quietly claiming coverage. The list
+# is never the evidence -- the measurement is.
 #
-# See https://github.com/LASTRADA-Software/fastcached/issues/682.
-src/FastCache/Async/IocpReactor.cpp	whole file inside `#if defined(_WIN32)`; the tidy job runs on ubuntu-24.04
-src/FastCache/Async/IocpReactor_test.cpp	whole file inside `#if defined(_WIN32)`
-src/FastCache/Net/IocpConnector.cpp	whole file inside `#if defined(_WIN32)`
-src/FastCache/Net/IocpConnector_test.cpp	whole file inside `#if defined(_WIN32)`
-src/FastCache/Net/IocpSocket.cpp	whole file inside `#if defined(_WIN32)`
-src/FastCache/Net/IocpSocket_test.cpp	whole file inside `#if defined(_WIN32)`
-src/FastCache/Async/KqueueReactor.cpp	whole file inside the kqueue guard; no macOS/BSD analyser leg exists at all
-src/FastCache/Async/KqueueReactor_test.cpp	whole file inside the kqueue guard
-src/FastCache/Net/KqueueConnector.cpp	whole file inside the kqueue guard
-src/FastCache/Net/KqueueSocket.cpp	whole file inside the kqueue guard
-src/FastCache/Net/KqueueSocket_test.cpp	whole file inside the kqueue guard
+# The count of units reached by NO leg is printed on every run. That number is
+# https://github.com/LASTRADA-Software/fastcached/issues/858, and it is 5 until a
+# macOS leg exists.
+#
+# Format: <path><TAB><reached-by, comma-separated, or `none`><TAB><reason>
+src/FastCache/Async/IocpReactor.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Async/IocpReactor_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Net/IocpConnector.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Net/IocpConnector_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Net/IocpSocket.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Net/IocpSocket_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
+src/FastCache/Async/KqueueReactor.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/FastCache/Async/KqueueReactor_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/FastCache/Net/KqueueConnector.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/FastCache/Net/KqueueSocket.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
+src/FastCache/Net/KqueueSocket_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists

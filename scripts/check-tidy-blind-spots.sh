@@ -94,6 +94,32 @@ measured="$(NM_BIN="$nm_bin" DB="$db" REPO="$repo" python3 "$here/tidy-blind-spo
 
 analysed="$(printf '%s' "$measured" | grep -c . || true)"
 
+# Which analyser legs EXIST, derived from the workflow rather than restated here.
+# A second copy of this list would be a second thing to be wrong, and the failure
+# would be silent: rows claiming coverage from a leg that was renamed away.
+legs="$(python3 - "$repo/.github/workflows/build.yml" <<'LEGS'
+import re, sys
+# A leg is a job whose steps invoke the sweep. Scanned line by line, tracking the
+# current job key, rather than split on a regex -- the first version split on the
+# job separator and the split CONSUMED the indent the match then required, so it
+# found nothing and the check refused a correct tree.
+#
+# Read as text rather than through a YAML parser so this needs no third-party
+# module on any platform.
+job, found = None, []
+for line in open(sys.argv[1]):
+    m = re.match(r"  ([A-Za-z0-9_-]+):\s*$", line)
+    if m:
+        job = m.group(1)
+    elif job and "tidy-sweep.sh --ci" in line:
+        if job not in found:
+            found.append(job)
+for j in found:
+    print(j)
+LEGS
+)"
+[[ -n $legs ]] || refuse "no clang-tidy leg found in .github/workflows/build.yml; the reached-by column cannot be checked"
+
 expected="$(grep -v '^[[:space:]]*#' "$table" | grep . | cut -f1 | sort)"
 actual="$(printf '%s\n' "$measured" | grep . | sort)"
 
@@ -118,6 +144,36 @@ while IFS= read -r f; do
     rc=1
 done < <(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
 
+# Every row's reached-by column must name legs that EXIST, or `none`. A row naming a
+# leg that was renamed or deleted is a claim of coverage nothing provides, and it is
+# the shape that fails silently: the unit stays listed, the table stays plausible,
+# and nobody is analysing it.
+unreached=0
+while IFS=$'\t' read -r path reached _; do
+    [[ -z ${path:-} ]] && continue
+    [[ $path == \#* ]] && continue
+    if [[ $reached == "none" ]]; then
+        unreached=$((unreached + 1))
+        continue
+    fi
+    IFS=',' read -ra names <<< "$reached"
+    for leg in "${names[@]}"; do
+        leg="${leg// /}"
+        if ! printf '%s\n' "$legs" | grep -qx -- "$leg"; then
+            echo "CMake Error: tidy-blind-spots: '$path' claims coverage by '$leg', which is not a clang-tidy leg in .github/workflows/build.yml." >&2
+            echo "  A row naming a leg that does not exist is a claim of coverage nothing provides." >&2
+            rc=1
+        fi
+    done
+done < <(grep -v '^[[:space:]]*#' "$table" | grep .)
+
+# The number #858 is about, printed on every run and not only on a refusal. A leg
+# that closes part of the hole must not be able to read as closing it.
+echo "tidy-blind-spots: $unreached translation unit(s) are reached by NO analyser leg (#858)"
+if [[ $unreached -gt 0 ]]; then
+    grep -v '^[[:space:]]*#' "$table" | grep . | awk -F'\t' '$2 == "none" { print "    " $1 }'
+fi
+
 # The count is printed whatever the verdict, because "how much of this tree does the
 # analyser never see" is the question the ticket asks and a pass that says nothing
 # answers it for nobody. But the two verdicts get DIFFERENT sentences: a refusing run
@@ -130,8 +186,12 @@ done < <(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
 # exactly how the first census of this set came out wrong.
 config="AddressSanitizer on, FASTCACHED_ENABLE_TLS on, $(uname -s)"
 if [[ $rc -eq 0 ]]; then
-    echo "tidy-blind-spots: [$config] $analysed translation unit(s) analysed by nothing, all accounted for in scripts/tidy-blind-spots.txt"
+    # "contribute nothing HERE", not "analysed by nothing" -- since a second leg
+    # exists those are different numbers, and the one above is the smaller and the
+    # one that matters. Saying 11 are analysed by nothing while reporting 5 reached
+    # by no leg would contradict itself in the direction of alarm.
+    echo "tidy-blind-spots: [$config] $analysed translation unit(s) contribute nothing in this configuration, all accounted for in scripts/tidy-blind-spots.txt"
 else
-    echo "tidy-blind-spots: [$config] measured $analysed translation unit(s) analysed by nothing; the table above does not describe them"
+    echo "tidy-blind-spots: [$config] measured $analysed translation unit(s) contributing nothing in this configuration; the table above does not describe them"
 fi
 exit "$rc"
