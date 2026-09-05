@@ -84,6 +84,21 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.advertise = "worker-01.internal:6674";
     cfg.toolchains = { "/usr/bin/g++" };
+
+    // The provenance bits for what this fixture TYPES (#713). Since emission follows
+    // whether the operator said a thing rather than whether its value differs from a
+    // default, a fixture that assigns values and no bits models an operator who
+    // typed nothing -- and every registration built from it would come back almost
+    // empty. This fixture is named `Installable`, so it has to model somebody who
+    // actually installed.
+    //
+    // `nodeListenExplicit` is deliberately NOT set here even though `nodeListen` is.
+    // That bit is not bookkeeping: it decides whether a bind failure is FATAL
+    // (#286), so cases that care set it themselves and say why. A fixture turning it
+    // on for everybody would change what those cases are testing without their
+    // authors ever seeing it.
+    cfg.schedulerExplicit = true;
+    cfg.advertiseExplicit = true;
     return cfg;
 }
 
@@ -378,6 +393,19 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // was typed alongside --install-service, which for a package install is close
     // to nothing.
     cfg.configPath = "node.yaml";
+
+    // Every provenance bit, set by WALKING the table rather than by fourteen
+    // assignments here (#713). Emission follows whether the operator TYPED a flag,
+    // not whether its value differs from a default, so a fixture that only assigns
+    // values models an operator who typed nothing -- and this sweep would then be
+    // asserting that a registration carrying almost nothing is complete.
+    //
+    // Derived and not restated, for the same reason the excluded-flag list above is:
+    // a hand-written set of bits is maintained by the same person who forgot to add
+    // one, and it would go stale silently in the direction that PASSES.
+    for (auto const& option: NodeOptions())
+        if (option.explicitBit != nullptr)
+            cfg.*option.explicitBit = true;
 
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
 
@@ -2449,12 +2477,27 @@ TEST_CASE("NodeConfig: a setting the operator pinned reaches the supervisor as p
     //
     // The value is left at its DEFAULT while the bit is set, which is the shape no
     // value comparison can tell from silence, and the only shape that matters here.
+    //
+    // Both halves start from a config with EVERY bit cleared rather than from
+    // `Installable()` as it comes. That fixture names two flags of its own since
+    // #713, so building on it directly would make the first half pass for
+    // `--scheduler` and `--advertise` whether or not their bit was the one set, and
+    // would make the second half assert silence about a config that is not silent.
+    // Cleared by walking the table, so a row added later arrives here already
+    // handled.
+    auto const named = [](NodeConfig cfg) {
+        for (auto const& option: NodeOptions())
+            if (option.explicitBit != nullptr)
+                cfg.*option.explicitBit = false;
+        return cfg;
+    };
+
     for (auto const& option: NodeOptions())
     {
         if (option.explicitBit == nullptr)
             continue;
 
-        auto pinned = Installable();
+        auto pinned = named(Installable());
         pinned.*option.explicitBit = true;
         INFO("flag: " << option.primary);
 
@@ -2465,7 +2508,7 @@ TEST_CASE("NodeConfig: a setting the operator pinned reaches the supervisor as p
 
     // Its converse, or "always emit it" would pass: a setting nobody named stays out
     // of the registration, so the machine's default is not frozen at install time.
-    auto const silent = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", Installable());
+    auto const silent = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", named(Installable()));
     for (auto const& option: NodeOptions())
     {
         if (option.explicitBit == nullptr)
