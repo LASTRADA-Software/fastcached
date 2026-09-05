@@ -773,12 +773,26 @@ run_case() {
             >/dev/null 2>>"${scratch}/hold.log" &
         listener=$!
         wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/hold.log" 15
-        if http_response_to_silence 127.0.0.1 "$p" >/dev/null; then
-            kill "$listener" 2>/dev/null || true
-            fail "http_response_to_silence reported an answer for a server that never spoke or closed"
-        fi
+        http_response_to_silence 127.0.0.1 "$p" >/dev/null && rc=0 || rc=$?
         kill "$listener" 2>/dev/null || true
+        # The STATUS, not merely non-zero. A refused connection is also non-zero, so
+        # "it returned an error" would score this green against a listener that had
+        # died -- the arm passing for the reason it exists to refuse.
+        [ "$rc" -eq 1 ] \
+            || fail "expected status 1 (the bound expired) from a server that never spoke or closed; got ${rc}"
         echo "http_response_to_silence refused rather than reporting silence it never observed"
+        ;;
+
+    # ... and says REFUSED apart from INCONCLUSIVE.
+    #
+    # The two are one non-zero unless something asserts otherwise, and the fixture
+    # prints a different sentence for each -- a node that died and a surface that
+    # would not answer are fixed by different people.
+    http-silence-refused)
+        p="$(free_port)"
+        http_response_to_silence 127.0.0.1 "$p" >/dev/null 2>&1 && rc=0 || rc=$?
+        [ "$rc" -eq 2 ] || fail "expected status 2 (refused) against an unbound port; got ${rc}"
+        echo "http_response_to_silence told a refused connection from an expired bound"
         ;;
 
     # A refused connection is a RETURN, not a stop: a fixture asking whether a
@@ -1227,6 +1241,7 @@ socket_cases=(
     "http-refused|0|http_get returned non-zero for a refused connection"
     "http-silence|0|http_response_to_silence reported what the server volunteered"
     "http-silence-inconclusive|0|refused rather than reporting silence it never observed"
+    "http-silence-refused|0|told a refused connection from an expired bound"
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"
@@ -2043,6 +2058,28 @@ else
     # and counted as SKIPPED only, never also as run.
     echo "   bash 3.2: NOT CHECKED whether any *.sh lives outside scripts/ -- no git repository here" >&2
     skipped=$(( skipped + 1 ))
+fi
+
+# A fractional `read -t` is on the library's own banned list and was the one entry
+# nothing checked: the table above is `grep -F`, and this needs a pattern. So it was
+# REMEMBERED rather than scanned, in a file whose whole argument is that remembering
+# does not work -- and #824 then added a `read -t` whose comment cites bash 3.2 as
+# the reason it is an integer, resting on a check that was not there.
+#
+# Not folded into `banned`: every row there is a literal by construction, and giving
+# one of them regex meaning would make the other eight silently regexes too.
+#
+# The scan covers `$library` and not this file. Scanning this one would match the
+# `banned` table's own rows, which are data rather than uses -- the "a comment is not
+# a call site" problem in a form a comment filter cannot solve. That gap is real and
+# is not closed here; see the reported findings.
+echo "== bash 3.2: a fractional read -t"
+ran=$(( ran + 1 ))
+fractional="$(grep -nE 'read [^;|&]*-t *[0-9]*\.' "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+if [ -n "$fractional" ]; then
+    echo "FAIL bash32: ${library} uses a fractional 'read -t' (bash 4.0+; 3.2 rejects it)" >&2
+    printf '%s\n' "$fractional" | sed 's/^/     | /' >&2
+    note_failure "bash32-fractional-read"
 fi
 
 # --- every failure is recorded BY NAME ------------------------------------

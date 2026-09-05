@@ -446,6 +446,49 @@ TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused"
     REQUIRE(ExchangeMaybeSilent({}).empty());
 }
 
+TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served truncated",
+          "[metrics][http][admin][idle]")
+{
+    // The second route to the defect the 431 closes, and the more reachable one: a
+    // prefix whose request line has arrived parses and routes, so the head is served
+    // with every field that had not arrived yet silently missing. `RequestTimeout` is
+    // per READ and the head has no total budget, so this needs no oversize client --
+    // just a peer that stops mid-head.
+    //
+    // The credential is what makes it visible rather than merely wrong: served
+    // truncated, this request is answered as though the client sent no
+    // `Authorization` at all.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nAuthorization: Bearer x")));
+    // Deliberately NO ShutdownWrite: EOF would mean the peer had FINISHED sending,
+    // which is a different fact and is still served on purpose. This peer has not
+    // finished; this server gave up on it.
+    FastCache::Testing::FailingReadSocket stalled { *pair.server, FastCache::NetErrorCode::WouldBlock, 1 };
+
+    FastCache::AtomicMetricsSink metrics;
+    using namespace std::chrono_literals;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&stalled, &metrics, provider));
+    pair.server->Close();
+
+    auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+}
+
+TEST_CASE("AdminHttp: a head the peer FINISHED sending is still served", "[metrics][http][admin][idle]")
+{
+    // The control for the case above, and the line the two sit either side of. EOF
+    // means "this peer has finished sending", so what arrived is all there ever was
+    // and answering it is right -- `.agent/rules/wire-and-protocol.md`, on this
+    // surface. A deadline means the opposite. Without this case, "refuse a truncated
+    // head" and "refuse every head without a blank line" are the same passing test,
+    // and the second would break every hand-rolled probe that forgets the CRLF.
+    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
+}
+
 TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http][admin][idle]")
 {
     // The control, and the half that was never covered at all: before #824 this

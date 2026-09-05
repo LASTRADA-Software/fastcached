@@ -4,6 +4,7 @@
 #include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <span>
 #include <string>
@@ -131,23 +132,55 @@ class SocketDecorator: public ISocket
 class FailingReadSocket final: public SocketDecorator
 {
   public:
-    /// @param inner The socket writes are forwarded to; must outlive this.
-    /// @param code What every read fails with.
-    FailingReadSocket(ISocket& inner, NetErrorCode code) noexcept:
+    /// @param inner The socket writes, and the first `forwardFirst` reads, go to.
+    /// @param code What every read after those fails with.
+    /// @param forwardFirst How many reads are forwarded before the failures start.
+    ///        `0` fails from the first. Any other value stages a peer that said
+    ///        SOMETHING and then stopped, which is a different fact from a peer that
+    ///        said nothing and a different answer on the wire.
+    FailingReadSocket(ISocket& inner, NetErrorCode code, std::size_t forwardFirst = 0) noexcept:
         SocketDecorator { inner },
-        _code { code }
+        _code { code },
+        _remaining { forwardFirst }
     {
     }
 
-    /// Fail, without touching the decorated socket.
-    /// @return The configured failure.
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> /*buffer*/) override
+    /// Forward while the allowance lasts, then fail.
+    /// @param buffer Where a forwarded read puts its bytes.
+    /// @return The decorated socket's answer, or the configured failure.
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    {
+        if (_remaining == 0)
+            return Failure();
+        --_remaining;
+        return SocketDecorator::Read(buffer);
+    }
+
+    /// The same answer `Read` would give.
+    ///
+    /// Overridden rather than inherited: `ISocket` documents `Read` and
+    /// `WaitReadable` as one read operation sharing one slot, so a fake answering
+    /// them from two different sockets parks a wait on a socket whose reads are
+    /// never going to resolve or retrieve it. Nothing calls it on this fake today;
+    /// the pairing is a property of the type, not of its current callers.
+    /// @return The decorated socket's answer, or the configured failure.
+    [[nodiscard]] IoAwaitable WaitReadable() override
+    {
+        if (_remaining == 0)
+            return Failure();
+        --_remaining;
+        return SocketDecorator::WaitReadable();
+    }
+
+  private:
+    /// @return The configured failure, without touching the decorated socket.
+    [[nodiscard]] IoAwaitable Failure() const noexcept
     {
         return IoAwaitable { IoResult { std::unexpected(NetError { .code = _code, .systemCode = 0, .context = {} }) } };
     }
 
-  private:
     NetErrorCode _code;
+    std::size_t _remaining;
 };
 
 } // namespace FastCache::Testing

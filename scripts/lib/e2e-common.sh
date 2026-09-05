@@ -807,16 +807,26 @@ _http_drain_fd3() {
 # volunteered nothing" -- so without this the probe would go vacuous, silently,
 # the day anyone raises the server's deadline past five seconds.
 #
+# **Three outcomes, three statuses.** "The connection was refused" and "the bound
+# expired" are different facts about different machines, and folding them into one
+# non-zero is the same mistake one layer up as the `bool ok` this whole change is
+# about: the caller then prints a diagnosis it has not established -- a dead node
+# reported as a surface that would not answer.
+#
 # @param 1 host
 # @param 2 port
-# @return echoes whatever the server said unprompted, EMPTY when it said nothing;
-#         returns 1 if the connection was refused or if the read bound expired
-#         before the server either answered or closed
+# @return echoes whatever the server said unprompted, EMPTY when it said nothing.
+#         `0` the server answered or closed, so the body is its answer;
+#         `1` the read bound expired first, so there is no answer to report;
+#         `2` the connection was refused, so nothing was ever asked.
 http_response_to_silence() {
     local host="$1" port="$2"
-    exec 3<>"/dev/tcp/${host}/${port}" || return 1
+    exec 3<>"/dev/tcp/${host}/${port}" || return 2
     _http_drain_fd3
-    [ "$_http_drain_status" -le 128 ]
+    # `-eq 1` and not `-le 128`: `1` is the peer closing, which is an answer. Any
+    # other non-zero is a `read` that failed some other way, and reporting that as
+    # "the server said nothing" would be a pass for a question nobody asked.
+    [ "$_http_drain_status" -eq 1 ]
 }
 
 # ---------------------------------------------------------------------------

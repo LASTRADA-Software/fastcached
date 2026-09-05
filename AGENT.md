@@ -692,11 +692,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
 - A peer that sent NOTHING asked nothing, so it is CLOSED, not refused — and "sent nothing"
   is TWO states (deadline expired, peer left), neither of which is "the request was bad". The
-  admin surface hid four outcomes behind one `bool ok` and answered every one `400`, so a
+  admin surface hid THREE outcomes behind one `bool ok` and answered every one `400`, so a
   Chrome preconnect used after 2 s rendered `400` while `curl` — which sends immediately, like
-  every fixture here — never reproduced it. A head over the byte cap is `431`, and was not
-  merely uncounted before but MISANSWERED: the prefix was parsed and SERVED, dropping every
-  header past 8192 and answering `401` to a browser whose credential fell beyond it. Neither
+  every fixture here — never reproduced it. Two MORE were not behind the bool at all: it came
+  back TRUE and the truncated prefix was SERVED, dropping every header after the cut and
+  answering `401` to a browser whose credential fell beyond it. Over the byte cap that is `431`;
+  cut off by the DEADLINE it is `408`, and that is the reachable route, since `RequestTimeout` is
+  per READ and the head has no total budget. `408` and silence divide on the EOF rule: a peer
+  that FINISHED sending is still served, a peer this server gave up on is told so. Neither
   silent outcome is counted, deliberately — a healthy browser produces them by the minute. A
   deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
   never one operand — except where a listener has no poll timeout and says so, which two reviewers

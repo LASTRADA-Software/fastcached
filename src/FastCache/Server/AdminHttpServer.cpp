@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <ranges>
@@ -55,10 +56,15 @@ namespace
 
     /// Why reading one admin request head ended.
     ///
-    /// ## Four states behind one `bool`
+    /// ## Three states behind one `bool`, and a fourth that was not even behind it
     ///
     /// `ReadRequestHead` used to answer `bool ok`, and every falsy reason was answered
     /// `400 Bad Request` -- including the two in which the peer had **asked nothing**.
+    /// The outcomes that were *silently served* rather than refused (`TooLarge`,
+    /// `Truncated`) were not behind the bool at all: it came back **true** for them,
+    /// which is why counting them as "four states behind a bool" understates it. A
+    /// `bool` cannot express "not attempted"; it also cannot express "attempted, and
+    /// what I have is a fragment".
     /// Chrome opens speculative *preconnect* sockets ahead of a navigation and may send
     /// on one long after opening it, so past `AdminHttpServer::RequestTimeout` a
     /// perfectly valid `GET /fleet` was answered `400`, intermittently, in the browser
@@ -108,8 +114,23 @@ namespace
         Complete = 0,
         /// Not one byte arrived before the read deadline expired.
         Idle,
-        /// Not one byte arrived, and the peer went away (EOF, or an abortive close).
+        /// The peer went away with the head unfinished (EOF, or an abortive close).
         PeerGone,
+        /// Bytes arrived, the head never ended, and the read deadline expired.
+        ///
+        /// The second route to `TooLarge`'s defect, and the more reachable one: a
+        /// prefix whose request line has arrived parses and routes, so a head cut
+        /// off mid-way used to be SERVED with every header that had not arrived yet
+        /// silently missing -- which on a credentialled route is the same spurious
+        /// `401`. `RequestTimeout` is per READ and the head has no total budget, so
+        /// this needs no oversize client at all.
+        ///
+        /// It is answered rather than closed, and that is the whole distinction the
+        /// enum above is for. `Idle` and `PeerGone` are silent because the peer
+        /// determined nothing -- EOF means *finished sending*, so what arrived is
+        /// all there was. A DEADLINE says the opposite: the peer has not finished
+        /// and this server gave up, which is exactly what `408` reports.
+        Truncated,
         /// Bytes arrived, and they are not a request line. The one honest `400`.
         Malformed,
         /// The byte cap was reached before the head ended.
@@ -147,6 +168,9 @@ namespace
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete, .status = {}, .body = {} },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle, .status = {}, .body = {} },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone, .status = {}, .body = {} },
+        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Truncated,
+                              .status = "408 Request Timeout",
+                              .body = "request timed out\n" },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed, .status = "400 Bad Request", .body = "bad request\n" },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::TooLarge,
                               .status = "431 Request Header Fields Too Large",
@@ -252,9 +276,15 @@ namespace
     /// receive timeout, which is what a request timeout is for -- and if it never sent
     /// a byte at all, that bound expiring is `Idle` and is answered with silence
     /// rather than with a `400` (#824). A head that exceeds the cap is answered `431`
-    /// and then closed with whatever is left unread; a reset is a fine thing for that
-    /// peer to see, and `431` is what tells an honest browser with too many cookies
-    /// which half of the exchange was wrong.
+    /// and then closed with whatever is left unread -- so the `431` is BEST-EFFORT,
+    /// and deliberately so: closing with unread data in the receive queue makes the
+    /// kernel send RST, and an RST discards what this server just wrote. That is the
+    /// same mechanism this function's own header describes two paragraphs up. The
+    /// alternative is draining an oversize head before answering it, which is a
+    /// budget for exactly the peer least entitled to one. `431` when it lands tells
+    /// an honest browser with too many cookies which half of the exchange was wrong;
+    /// when it does not, the peer sees a reset instead of a wrong answer, which is
+    /// still better than the truncated `200` this replaces.
     Task<RequestHead> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;
@@ -278,10 +308,18 @@ namespace
                 // as a read *error* rather than as a signal of its own.
                 // `IsDeadlineExpiry` is what knows that the two platforms spell it
                 // differently.
-                if (buffer.empty())
-                    co_return RequestHead { .outcome = IsDeadlineExpiry(result.error().code) ? AdminHeadOutcome::Idle
-                                                                                             : AdminHeadOutcome::PeerGone };
-                break;
+                //
+                // Three outcomes, and the buffer decides only the last two: a peer
+                // that is GONE is answered by nobody whether it managed to say
+                // something first, while a peer this server gave WAITING for is
+                // told so -- silently if it had asked nothing, `408` if it had
+                // begun. Falling through to the parse here is what served a
+                // truncated head, which is `TooLarge`'s defect reached without an
+                // oversize client.
+                if (!IsDeadlineExpiry(result.error().code))
+                    co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
+                co_return RequestHead { .outcome = buffer.empty() ? AdminHeadOutcome::Idle
+                                                                  : AdminHeadOutcome::Truncated };
             }
             if (*result == 0)
                 break;

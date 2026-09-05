@@ -291,8 +291,12 @@ if [[ -n "$tls" ]]; then
 else
     # Refuses rather than answering when its own read bound is what ended the
     # read, so a green line here cannot be a question that went unasked.
-    unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")" \
-        || fail "the silence probe could not decide: the admin surface neither answered nor closed within its bound"
+    unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")" && probe_rc=0 || probe_rc=$?
+    case "$probe_rc" in
+        0) ;;
+        2) fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
+        *) fail "the silence probe could not decide: the admin surface neither answered nor closed within its bound" ;;
+    esac
     [[ -z "$unasked" ]] \
         || fail "the admin surface answered a peer that said nothing: ${unasked%%$'\n'*}"
 

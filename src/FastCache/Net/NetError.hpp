@@ -64,10 +64,15 @@ struct NetError
 /// asking "did I run out of time" has to accept both -- and a caller that spells
 /// only the obvious one is correct on one platform and silently wrong on the other.
 ///
-/// It lives here, beside the enum, because the question was open-coded at three
-/// sites in two subsystems and a fourth spelled it with one operand
-/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)). A
-/// dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary` line.
+/// It lives here, beside the enum, because the question was open-coded
+/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)). It was open-coded at TWO sites in two subsystems -- `Server/AdminHttpServer.cpp` and
+/// `Consensus/RaftPeerServer.cpp` -- with a third, `apps/fastcache-compile-node/FrameEndpoint.cpp`,
+/// testing `WouldBlock` alone and RIGHT to: that listener has no poll timeout, so
+/// the other code cannot arrive there, and its own comment says so. The pattern is
+/// `git grep -nE '(==|!=) *(NetErrorCode::)?(WouldBlock|Timeout)\b' -- src/`, stated
+/// because a census without its pattern is a number nobody can reproduce.
+/// A dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary`
+/// line.
 ///
 /// It says nothing about *whose* deadline: a caller that must tell "I gave up" from
 /// "the peer went away" asks its own timer, which is what `SocketDeadlineTarget`

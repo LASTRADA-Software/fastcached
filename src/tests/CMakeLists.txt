@@ -1103,13 +1103,18 @@ if(NOT WIN32)
     # ctest timeout and a failed assertion are indistinguishable from the count
     # alone). On a 32-core Linux host, local ext4:
     #
-    #     idle                       40s
-    #     load average ~44, 20 runs  35s worst  (at 34s idle, before #824)
+    #     idle                       40s   (three runs: 37.2s, 38.9s, 40.1s)
     #
-    # #824 added ~6s: `http-silence-inconclusive` stages a listener that accepts and
-    # then neither speaks nor closes, so it costs `_http_drain_fd3`'s whole `read -t`
-    # bound BY CONSTRUCTION -- that expiry is the thing it asserts on. Three runs:
-    # 37.2s, 38.9s, 40.1s.
+    # The loaded figure is NOT re-measured against this tree and is deliberately out
+    # of the table: at 34s idle, before #824, twenty runs at load average ~44 came to
+    # 35s worst -- contention cost about 1s. Printed as a row beside a 40s idle
+    # reading it would say load is FASTER than idle, which is what a table says when
+    # it mixes a current quantity with a stale one.
+    #
+    # #824 added ~6s, by construction rather than by accident:
+    # `http-silence-inconclusive` stages a listener that accepts and then neither
+    # speaks nor closes, so it costs `_http_drain_fd3`'s whole `read -t` bound --
+    # that expiry is the thing it asserts on.
     #
     # So the cost is almost entirely the deliberate SLEEPS, which is why CPU
     # contention barely moves it: 3x headroom against this bound, and a run
