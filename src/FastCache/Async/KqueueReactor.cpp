@@ -282,9 +282,8 @@ void KqueueReactor::DrainPendingSubmits()
     }
 }
 
-void KqueueReactor::Run()
+void KqueueReactor::RunLoop()
 {
-    ReactorWorkerIdentity::Scope const onWorker { _worker };
 
     constexpr int Batch = 32;
     struct kevent events[Batch];

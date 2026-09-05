@@ -225,9 +225,8 @@ void EpollReactor::DrainPendingSubmits()
     }
 }
 
-void EpollReactor::Run()
+void EpollReactor::RunLoop()
 {
-    ReactorWorkerIdentity::Scope const onWorker { _worker };
 
     constexpr int Batch = 32;
     epoll_event events[Batch];

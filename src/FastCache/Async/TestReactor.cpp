@@ -27,9 +27,8 @@ TestReactor::TestReactor(IClock& clock) noexcept:
 {
 }
 
-void TestReactor::Run()
+void TestReactor::RunLoop()
 {
-    ReactorWorkerIdentity::Scope const onWorker { _worker };
 
     while (!_stopped.load(std::memory_order_acquire))
     {

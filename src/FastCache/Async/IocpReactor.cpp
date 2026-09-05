@@ -140,7 +140,7 @@ void IocpReactor::FireExpiredTimers()
             handle.resume();
 }
 
-void IocpReactor::Run()
+void IocpReactor::RunLoop()
 {
     // Publish which thread is dequeuing, so `IsOnWorkerThread()` can answer.
     // `IocpSocket` and `IocpListener` clear a pending awaitable in their
@@ -152,7 +152,6 @@ void IocpReactor::Run()
     // The guard used to be a `WorkerScope` local to this function, which is the
     // reason the question was IOCP-only: three other reactors could not be asked it
     // at all. `ReactorWorkerIdentity` is that same pair with a name (#668).
-    ReactorWorkerIdentity::Scope const onWorker { _worker };
 
     constexpr ULONG Batch = 32;
     OVERLAPPED_ENTRY entries[Batch];

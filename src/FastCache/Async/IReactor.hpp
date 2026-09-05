@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IExecutor.hpp>
+#include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <coroutine>
@@ -30,7 +31,22 @@ class IReactor: public IExecutor
 
     /// Block on the event loop until Stop() is called and the ready queue
     /// drains. Re-entry is undefined behaviour.
-    virtual void Run() = 0;
+    ///
+    /// **Non-virtual, and that is the obligation half of this interface's rule**
+    /// ([#668](https://github.com/LASTRADA-Software/fastcached/issues/668)). It claims
+    /// the worker identity and then runs the loop, so a reactor cannot answer
+    /// `Running()` without having entered `Run()`, and cannot enter `Run()` without
+    /// answering `Running()`. Generalising the QUERY without this would be a
+    /// false-safe: a reactor that forgot to claim would report "nobody is running"
+    /// forever, `TeardownIsSerialisedWithDispatch()` would answer `true`
+    /// unconditionally, and every guard built on it would stay green while checking
+    /// nothing. The four reactors that exist today each claimed correctly by
+    /// convention; a fifth is what conventions lose to.
+    void Run()
+    {
+        ReactorWorkerIdentity::Scope const onWorker { _worker };
+        RunLoop();
+    }
 
     /// Ask Run() to exit gracefully. Idempotent. May be called from any
     /// thread (including from inside the reactor's own thread).
@@ -81,12 +97,20 @@ class IReactor: public IExecutor
     ///
     /// False before `Run()` is entered and after it returns. See
     /// `TeardownIsSerialisedWithDispatch()`, which is the only thing either of these
-    /// two exists to answer.
+    /// two exists to answer. Answered here rather than by each reactor: all four
+    /// implementations were the same delegation, and a fact the base already holds is
+    /// not one a subclass should be trusted to restate.
     /// @return True between entry to and return from `Run()`.
-    [[nodiscard]] virtual bool Running() const noexcept = 0;
+    [[nodiscard]] bool Running() const noexcept
+    {
+        return _worker.Running();
+    }
 
     /// @return True when the calling thread is the one currently inside `Run()`.
-    [[nodiscard]] virtual bool IsOnWorkerThread() const noexcept = 0;
+    [[nodiscard]] bool IsOnWorkerThread() const noexcept
+    {
+        return _worker.IsOnWorkerThread();
+    }
 
     /// Whether an object this reactor owns may be destroyed right now, on this thread.
     ///
@@ -114,6 +138,18 @@ class IReactor: public IExecutor
     {
         return !Running() || IsOnWorkerThread();
     }
+
+  protected:
+    /// The event loop itself, without the identity bookkeeping `Run()` wraps it in.
+    ///
+    /// Protected rather than public: a caller that could reach this directly could run
+    /// a loop without claiming the thread, which is the hole `Run()` exists to close.
+    virtual void RunLoop() = 0;
+
+  private:
+    /// Which thread is inside `Run()`, if any. Held here so no reactor can have a
+    /// different answer, or forget to have one.
+    ReactorWorkerIdentity _worker;
 };
 
 } // namespace FastCache

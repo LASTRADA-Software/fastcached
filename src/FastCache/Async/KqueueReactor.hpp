@@ -62,7 +62,6 @@ class KqueueReactor: public IReactor
     KqueueReactor& operator=(KqueueReactor const&) = delete;
     KqueueReactor& operator=(KqueueReactor&&) = delete;
 
-    void Run() override;
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
@@ -108,16 +107,6 @@ class KqueueReactor: public IReactor
         std::coroutine_handle<> handle {};
     };
 
-    [[nodiscard]] bool Running() const noexcept override
-    {
-        return _worker.Running();
-    }
-
-    [[nodiscard]] bool IsOnWorkerThread() const noexcept override
-    {
-        return _worker.IsOnWorkerThread();
-    }
-
   private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
@@ -137,7 +126,11 @@ class KqueueReactor: public IReactor
     int _kq { -1 };
     int _wakePipe[2] { -1, -1 }; ///< [0]=read, [1]=write; write-end signal wakes kevent.
     std::atomic<bool> _stopped { false };
-    ReactorWorkerIdentity _worker;
+
+  protected:
+    void RunLoop() override;
+
+  private:
     std::uint64_t _nextSequence { 0 };
 
     std::mutex _submitMutex;

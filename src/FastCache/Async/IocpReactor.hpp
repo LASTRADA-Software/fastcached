@@ -61,7 +61,6 @@ class IocpReactor: public IReactor
     IocpReactor& operator=(IocpReactor const&) = delete;
     IocpReactor& operator=(IocpReactor&&) = delete;
 
-    void Run() override;
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
@@ -85,27 +84,6 @@ class IocpReactor: public IReactor
         return _iocp;
     }
 
-    /// Whether the calling thread is the one inside `Run()`.
-    ///
-    /// The one-worker-thread property above has always been true and was, until
-    /// the completion-lifetime fix, only documented. `IocpSocket` and
-    /// `IocpListener` now clear a pending awaitable in their destructors, and
-    /// that is safe **only** because the destructor and the completion dispatch
-    /// cannot run concurrently -- so the property became load-bearing and needs
-    /// something better than a paragraph. Their destructors assert on this.
-    ///
-    /// @return True when this thread is the reactor's worker thread.
-    [[nodiscard]] bool IsOnWorkerThread() const noexcept override
-    {
-        return _worker.IsOnWorkerThread();
-    }
-
-    /// @return True between entry to and return from `Run()`.
-    [[nodiscard]] bool Running() const noexcept override
-    {
-        return _worker.Running();
-    }
-
     /// Min-heap entry; public so anonymous-namespace helpers in the .cpp
     /// can name the type. Treat as Detail.
     struct TimerEntry
@@ -121,7 +99,11 @@ class IocpReactor: public IReactor
     IClock& _clock;
     void* _iocp { nullptr };
     std::atomic<bool> _stopped { false };
-    ReactorWorkerIdentity _worker;
+
+  protected:
+    void RunLoop() override;
+
+  private:
     std::uint64_t _nextSequence { 0 };
     std::mutex _timerMutex;
     std::vector<TimerEntry> _timers;
