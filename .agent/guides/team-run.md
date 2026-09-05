@@ -309,6 +309,39 @@ And when it does happen, **pin the overwritten commit** (`git update-ref
 refs/rescue/<lane>-<sha> <sha>`) before doing anything else. Nothing is lost until
 the object is collected, and the pin costs one command.
 
+### Wipe `out/build/gate-*` after a rebase
+
+**A reused build directory across a rebase can produce a binary that is internally
+inconsistent, and the failures point at innocent files.** Measured: rebasing past
+`a68b61a2` (#821) with a reused gate directory gave **23 failures out of 3285** --
+fourteen `AdminHttp: *` cases, plus connection-tracking, membership-oracle, refusal-counter
+and health-probe tests -- while clean master in a fresh worktree was **3285/3285**.
+
+The mechanism will recur. #821 added counters, so `Counter::Last` grew, and
+`IMetricsSink.hpp` sizes an array with it inside an **inline constructor in a header**:
+
+```cpp
+std::atomic<std::uint64_t> _counters[static_cast<std::size_t>(Counter::Last)] {};
+```
+
+Objects built before the rebase carry the old `Last`; objects built after carry the new
+one. The linker keeps **one** inline constructor, and it memsets the new count into a
+stack object sized by the old -- an ODR mismatch inside a single binary, reported by ASan
+as a `stack-buffer-overflow` in `AtomicMetricsSink`'s constructor, from tests that never
+touch metrics. **The build step is green; the suite is red; the redness names the wrong
+files.**
+
+So this is not a fact about #821. **Any enum with a trailing `Last` that sizes an array in
+a header has this shape**, and the `EnumTable` / `RowsInEnumeratorOrder` idiom in
+[`../../AGENT.md`](../../AGENT.md) makes those common by design.
+
+#818's stale-cache handling does not cover it: that guards the CMake **cache**, and these
+are stale **objects**.
+
+And note how it was found, because the alternative was filing a regression that did not
+exist: by reading **one failure's actual output**, not by comparing counts. "23 of 3285"
+against "0 of 3285" is arithmetic that is true and useless.
+
 ### Pairwise clean is not serially clean
 
 **Before sequencing two PRs that touch the same file, merge-tree the second onto a
