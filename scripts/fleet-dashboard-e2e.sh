@@ -244,6 +244,67 @@ metrics="$(dash_get "$admin_port" /metrics)"
 health="$(dash_get "$admin_port" /healthz)"
 [[ "$health" == HTTP/1.1\ 200* ]] || fail "/healthz did not answer 200 without a credential"
 
+# ------------------------------------------------- 2b. the idle preconnect (#824)
+# A connection the server has ACCEPTED and on which nothing has been said. That is
+# what a browser's speculative preconnect is, and this surface used to answer it
+# `400 Bad Request` -- so the fleet dashboard failed in Chrome, intermittently,
+# and under no fixture in this tree, because every one of them sent immediately.
+#
+# ## Three legs, and the first is the only deterministic one
+#
+# The report's shape is *connect, wait, then ask*, and it is a RACE to observe: an
+# unfixed server answers and closes at the deadline, the client's late write then
+# draws an RST, and the RST discards the receive buffer holding the very response
+# the assertion is about. Measured against one unfixed binary here: `python` read
+# the `400`, this suite's own bash client read nothing. A fixture built on that
+# alone PASSES ON THE BUG about as often as it fails, which is worse than no
+# fixture -- it is a guard that reports.
+#
+# So the first leg never writes at all. What a surface volunteers to a peer that
+# has said nothing is not a race, and against the unfixed binary it is a `400`
+# every time (measured, both with and without a preceding idle).
+#
+# The second leg keeps the reported shape anyway, asserting only the half that is
+# stable -- that it is not answered `400`. The third is the control: the same
+# request on the same port with no idle is served, so a green run above cannot be
+# the surface having been unreachable.
+#
+# ## What none of them asserts
+#
+# That the idle connection is SERVED. With the head reader fixed, a preconnect
+# used after the deadline gets no response at all, and whether the operator then
+# sees the dashboard depends on the client retrying on a fresh connection --
+# closing is retriable where a `400` is final, which is what makes it the better
+# answer and not the whole one. Serving it needs the pre-first-byte wait to stop
+# sharing one number with the mid-head read deadline; tracked on #824.
+#
+# `/healthz` and not `/fleet`, although `/fleet` is the path the report named: the
+# outcome is decided by the shared request-head reader before any route is
+# consulted, so the route is not the variable, and `/healthz` depends on neither a
+# credential nor this node having won an election.
+#
+# Plaintext only. The idle has to sit between the accept and the first byte, and
+# over TLS the handshake IS the first bytes -- curl has no way to connect, wait,
+# and only then begin. Said out loud rather than skipped silently, so a green TLS
+# run is never mistaken for this having been checked.
+if [[ -n "$tls" ]]; then
+    echo "-- idle-preconnect: TLS run, an idle cannot precede a handshake — not checked here"
+else
+    unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")"
+    [[ -z "$unasked" ]] \
+        || fail "the admin surface answered a peer that said nothing: ${unasked%%$'\n'*}"
+
+    idle="$(http_get_after_idle 127.0.0.1 "$admin_port" /healthz 3)"
+    case "$idle" in
+        *400*) fail "an idle-then-used connection was answered 400: ${idle%%$'\n'*}" ;;
+    esac
+
+    prompt="$(http_get_after_idle 127.0.0.1 "$admin_port" /healthz 0)"
+    [[ "$prompt" == HTTP/1.1\ 200* ]] \
+        || fail "the control (no idle) was not served 200: ${prompt%%$'\n'*}"
+    echo "-- idle-preconnect: silence unanswered, idle 3s not refused, no idle served 200"
+fi
+
 # ------------------------------------------------------------- 3. credential
 anonymous="$(dash_get "$admin_port" /fleet)"
 [[ "$anonymous" == HTTP/1.1\ 401* ]] || fail "/fleet served without a credential: ${anonymous%%$'\n'*}"

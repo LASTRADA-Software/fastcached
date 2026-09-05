@@ -77,8 +77,30 @@ namespace
         std::string target;
         /// One slot per `AdminHeaderTable` row, in its order.
         EnumTable<AdminHeader, std::string> headers {};
-        bool ok { false };
+        /// Why the read ended; see `AdminHeadOutcome`.
+        ///
+        /// Defaulted to `Malformed` rather than to the enum's zero. `Complete` is
+        /// `0`, so an aggregate that omits this member would value-initialize to
+        /// *the request parsed* -- a default that turns forgetting into serving.
+        /// The `bool ok { false }` this replaces defaulted the safe way, and the
+        /// property is worth keeping across the change rather than rediscovering.
+        AdminHeadOutcome outcome { AdminHeadOutcome::Malformed };
     };
+
+    /// A head that was not read, carrying only why.
+    ///
+    /// A named factory rather than a designated initializer per return site: every
+    /// member has to be named for `-Wmissing-field-initializers`, so four such
+    /// returns would be four places to keep in step with the struct, each of which
+    /// reads as though the empty method and target were a decision.
+    /// @param outcome Why the read ended.
+    /// @return A head with no request in it.
+    [[nodiscard]] RequestHead NoRequest(AdminHeadOutcome outcome)
+    {
+        RequestHead head {};
+        head.outcome = outcome;
+        return head;
+    }
 
     /// Case-insensitive comparison, for a header name.
     ///
@@ -130,18 +152,44 @@ namespace
     /// also simply what a correct HTTP server does.
     ///
     /// A client that never sends the blank line is bounded by the accepted socket's
-    /// receive timeout, which is what a request timeout is for. A head that exceeds
-    /// the cap is answered and then closed with whatever is left unread — that peer
-    /// is malformed or hostile, and a reset is a fine thing for it to see.
+    /// receive timeout, which is what a request timeout is for -- and if it never sent
+    /// a byte at all, that bound expiring is `Idle` and is answered with silence
+    /// rather than with a `400` (#824). A head that exceeds the cap is answered `431`
+    /// and then closed with whatever is left unread; a reset is a fine thing for that
+    /// peer to see, and `431` is what tells an honest browser with too many cookies
+    /// which half of the exchange was wrong.
     Task<RequestHead> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;
         bool sawHeadEnd = false;
+        // Why the loop stopped, consulted only when nothing at all arrived -- which
+        // can only happen on the very first read, so this holds that read's verdict.
+        // The buffer cannot answer it: "the peer is holding a socket open and saying
+        // nothing" and "the peer went away without saying anything" are one empty
+        // string, and they are the two facts #824 was about.
+        auto silence = AdminHeadOutcome::PeerGone;
         while (!sawHeadEnd && buffer.size() < MaxRequestBytes)
         {
             std::array<std::byte, 1024> chunk {};
             auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
-            if (!result.has_value() || *result == 0)
+            if (!result.has_value())
+            {
+                // The request deadline is armed as `SO_RCVTIMEO` on the accepted
+                // socket (`IListener::SetTimeouts`), so it reaches this loop as a
+                // read *error* and not as a signal of its own. **Both codes**, and
+                // the one that fires here is platform-dependent: POSIX reports the
+                // expiry as `EAGAIN`/`EWOULDBLOCK` (`WouldBlock`) and Winsock as
+                // `WSAETIMEDOUT` (`Timeout`). Matching only the obvious spelling
+                // would classify every Linux idle client as a departed peer -- the
+                // same disposition today, and a wrong answer the first time the two
+                // stop sharing one.
+                auto const code = result.error().code;
+                silence = code == NetErrorCode::Timeout || code == NetErrorCode::WouldBlock
+                              ? AdminHeadOutcome::Idle
+                              : AdminHeadOutcome::PeerGone;
+                break;
+            }
+            if (*result == 0)
                 break;
             // Rescan from three bytes before the freshly-appended region: the
             // terminator is four bytes and may straddle a chunk boundary in any of
@@ -152,14 +200,29 @@ namespace
             sawHeadEnd = buffer.find("\r\n\r\n", scanFrom) != std::string::npos;
         }
 
+        // Nothing was received, so nothing was asked and nothing is owed. This is
+        // the whole of #824: below, `eol == npos` used to fold an empty buffer in
+        // with a genuinely bad request line and answer both `400`.
+        if (buffer.empty())
+            co_return NoRequest(silence);
+
+        // The cap was reached before the head ended, so what is in hand is a PREFIX
+        // of the request rather than the request. Parsing it on regardless is what
+        // used to happen -- silently, and it is worse than a refusal: the request
+        // line is near the front and always survives, so the truncated head routed
+        // and answered while every field past byte 8192 was simply gone. A browser
+        // whose `Authorization` fell past the cap was told `401`.
+        if (!sawHeadEnd && buffer.size() >= MaxRequestBytes)
+            co_return NoRequest(AdminHeadOutcome::TooLarge);
+
         auto const eol = buffer.find("\r\n");
         if (eol == std::string::npos)
-            co_return RequestHead {};
+            co_return NoRequest(AdminHeadOutcome::Malformed);
         std::string_view const line { buffer.data(), eol };
 
         auto const sp1 = line.find(' ');
         if (sp1 == std::string_view::npos)
-            co_return RequestHead {};
+            co_return NoRequest(AdminHeadOutcome::Malformed);
         auto const rest = line.substr(sp1 + 1);
         auto const sp2 = rest.find(' ');
         auto const target = sp2 == std::string_view::npos ? rest : rest.substr(0, sp2);
@@ -196,7 +259,7 @@ namespace
         co_return RequestHead { .method = std::string { line.substr(0, sp1) },
                                 .target = std::string { target },
                                 .headers = std::move(headers),
-                                .ok = true };
+                                .outcome = AdminHeadOutcome::Complete };
     }
 
     /// Statuses whose responses carry no content at all.
@@ -260,9 +323,19 @@ Task<void> ServeAdminHttp(ISocket* socket,
         co_return;
 
     auto const request = co_await ReadRequestHead(socket);
-    if (!request.ok)
+    if (request.outcome != AdminHeadOutcome::Complete)
     {
-        (void) co_await WriteResponse(socket, PlainRefusal("400 Bad Request", "bad request\n"));
+        // The disposition is read off `AdminHeadOutcomeTable`, never decided here.
+        // A `400` spelled at this one call site is what collapsed four outcomes into
+        // one answer, and the fix belongs at the seam -- so this branch has no
+        // knowledge of which outcome deserves what, and an outcome added later
+        // arrives with its answer already attached.
+        auto const& row = AdminHeadOutcomeTable[static_cast<std::size_t>(request.outcome)];
+        // An empty status is the table's spelling of *no response is owed*: the peer
+        // asked nothing, so it is closed without being answered, which is what every
+        // mainstream HTTP server does with an abandoned preconnect.
+        if (!row.status.empty())
+            (void) co_await WriteResponse(socket, PlainRefusal(row.status, row.body));
         co_return;
     }
     if (request.method != "GET")

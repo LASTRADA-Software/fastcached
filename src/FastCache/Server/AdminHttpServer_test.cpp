@@ -7,9 +7,11 @@
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -105,6 +107,94 @@ class ShortReadSocket final: public FastCache::ISocket
     FastCache::ISocket& _inner;
     std::size_t _limit;
 };
+
+/// An `ISocket` whose every read fails, the way an expired receive deadline does.
+///
+/// The request deadline is armed as `SO_RCVTIMEO` on the accepted socket, so its
+/// expiry reaches the server as a read *error* -- there is no separate signal to
+/// simulate. `InMemorySocketPair` cannot produce one: it is a byte pipe whose reads
+/// either deliver bytes or report EOF, which is exactly the *other* silent outcome,
+/// so a fixture built on it alone cannot tell the two apart. Same device as
+/// `ShortReadSocket` above, for a condition the host cannot be made to create.
+///
+/// The code is a parameter because the platforms disagree about which one an expiry
+/// is: POSIX reports `EAGAIN`/`EWOULDBLOCK` and Winsock `WSAETIMEDOUT`. A fixture
+/// pinning one of them would leave the other's classification untested on the
+/// platform that actually uses it.
+class FailingReadSocket final: public FastCache::ISocket
+{
+  public:
+    FailingReadSocket(FastCache::ISocket& inner, FastCache::NetErrorCode code) noexcept:
+        _inner { inner },
+        _code { code }
+    {
+    }
+
+    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> /*buffer*/) override
+    {
+        return FastCache::IoAwaitable { FastCache::IoResult { std::unexpected(FastCache::NetError { .code = _code, .systemCode = 0, .context = {} }) } };
+    }
+
+    [[nodiscard]] FastCache::IoAwaitable Write(std::span<std::byte const> buffer) override
+    {
+        return _inner.Write(buffer);
+    }
+
+    [[nodiscard]] FastCache::IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> keepAlive = {}) override
+    {
+        return _inner.WriteVectored(segments, std::move(keepAlive));
+    }
+
+    void Close() noexcept override
+    {
+        _inner.Close();
+    }
+
+    [[nodiscard]] bool IsClosed() const noexcept override
+    {
+        return _inner.IsClosed();
+    }
+
+  private:
+    FastCache::ISocket& _inner;
+    FastCache::NetErrorCode _code;
+};
+
+/// Serve one request over a caller-supplied server-side socket decorator.
+///
+/// `Exchange` above always writes the request first, which is precisely the shape
+/// that cannot reach #824: every fixture in this file sent immediately, and that is
+/// why a surface answering `400` to a silent peer went unnoticed for as long as it
+/// did. This one hands the decorator the server end and returns whatever reached the
+/// client -- **including nothing**, which is the assertion the silent outcomes need.
+/// @param request What the client sends before the server is driven; may be empty.
+/// @param decorate Wraps the server-side socket; the wrapper must outlive the call.
+/// @return Every byte the server wrote, which is empty when it wrote none.
+std::string ExchangeOver(std::string_view request,
+                         std::function<FastCache::ISocket*(FastCache::ISocket*)> const& decorate)
+{
+    FastCache::AtomicMetricsSink metrics;
+    auto pair = FastCache::InMemorySocketPair::Create();
+    if (!request.empty())
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
+    pair.client->ShutdownWrite();
+    using namespace std::chrono_literals;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(decorate(pair.server.get()), &metrics, provider));
+    pair.server->Close();
+    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+}
+
+/// The server end, undecorated.
+/// @param socket The server-side socket.
+/// @return The same socket.
+FastCache::ISocket* AsIs(FastCache::ISocket* socket) noexcept
+{
+    return socket;
+}
 
 } // namespace
 
@@ -387,6 +477,82 @@ TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact
     // A prefix route is not a catch-all: a path that does not begin with it still
     // reaches the 404, so a typo is refused rather than quietly served.
     CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
+
+// ---------------------------------------------------------------------------
+// #824: four outcomes behind one `bool ok`, all of them answered `400`.
+//
+// The pair that matters is the first two against the third. A test that only
+// asserted "an idle connection is not answered 400" would pass just as well on a
+// server that had stopped answering 400 to *anything*, which would delete the one
+// case where 400 is the right answer. Silence and the refusal are asserted against
+// each other, or one passing test covers both and proves neither.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, not refused",
+          "[metrics][http][admin][idle]")
+{
+    // The reported bug, at the seam: Chrome opens a preconnect socket, sends
+    // nothing, and the request deadline expires. Nothing was asked, so nothing is
+    // owed -- and the 400 this used to answer is what reached a real browser as a
+    // broken dashboard.
+    auto const code = GENERATE(FastCache::NetErrorCode::WouldBlock, FastCache::NetErrorCode::Timeout);
+    std::optional<FailingReadSocket> stalled;
+    auto const response = ExchangeOver({}, [&](FastCache::ISocket* server) -> FastCache::ISocket* {
+        stalled.emplace(*server, code);
+        return &*stalled;
+    });
+    INFO("read failed with NetErrorCode " << static_cast<unsigned>(code));
+    REQUIRE(response.empty());
+}
+
+TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused", "[metrics][http][admin][idle]")
+{
+    // The other silence: an abandoned preconnect, a TCP liveness probe, a port
+    // scan. `ExchangeOver` half-closes with nothing written, so the server's first
+    // read is EOF rather than an error -- the state `FailingReadSocket` cannot
+    // produce and the one the case above must not be mistaken for.
+    REQUIRE(ExchangeOver({}, AsIs).empty());
+}
+
+TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http][admin][idle]")
+{
+    // The control, and the half that was never covered at all: before #824 this
+    // file had sixteen cases and not one of them asserted a 400, so the outcome
+    // that legitimately deserves one was as untested as the three that did not.
+    auto const response = ExchangeOver("nonsense\r\n\r\n", AsIs);
+    REQUIRE(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_CASE("AdminHttp: a head that overruns the byte cap is refused 431, not served truncated",
+          "[metrics][http][admin][idle]")
+{
+    // Not a missing refusal but a wrong answer: the read loop stopped at the cap
+    // and the *prefix* was then parsed and routed, so every field past it vanished
+    // and a browser whose `Authorization` fell beyond the cap was told `401`.
+    //
+    // The padding sits between the request line and the credential, so the request
+    // line -- which is at the front and always survives truncation -- still parses.
+    // That is what makes this case fail under the old code by being *served* rather
+    // than by being unreadable.
+    std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
+    request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
+    request += "\r\n";
+    auto const response = ExchangeOver(request, AsIs);
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+TEST_CASE("AdminHttp: a large but complete head under the cap still routes", "[metrics][http][admin][idle]")
+{
+    // The control for the case above. Without it, "refuse an oversize head" and
+    // "refuse a large head" are the same passing test, and the cap could drift down
+    // to nothing with every assertion still green.
+    std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
+    request += "X-Pad: " + std::string(4000, 'p') + "\r\n";
+    request += "\r\n";
+    REQUIRE(ExchangeOver(request, AsIs).starts_with("HTTP/1.1 200 OK\r\n"));
 }
 
 TEST_CASE("A tolerated admin bind failure is reported at Warn and says the daemon carries on",

@@ -9,11 +9,13 @@
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -98,6 +100,112 @@ struct AdminResponse
     /// credential" into "this page is broken".
     std::vector<std::string> extraHeaders {};
 };
+
+/// Why reading one admin request head ended.
+///
+/// ## Four states behind one `bool`
+///
+/// `ReadRequestHead` used to answer `bool ok`, and every falsy reason was answered
+/// `400 Bad Request` -- including the two in which the peer had **asked nothing**.
+/// Chrome opens speculative *preconnect* sockets ahead of a navigation and may send
+/// on one long after opening it, so past `AdminHttpServer::RequestTimeout` a
+/// perfectly valid `GET /fleet` was answered `400`, intermittently, in the browser
+/// and never under `curl` -- which sends immediately, which is why every fixture in
+/// this tree passed ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)).
+///
+/// This is the enum the repository's own rule asks for: *an outcome that can be "not
+/// attempted" is an enum, not a `bool`, and it is fixed at the seam rather than at
+/// the one call site that noticed.* The seam is this return value; the call site
+/// merely looks up the row.
+///
+/// ## Why two of them are answered with silence
+///
+/// `.agent/rules/wire-and-protocol.md` settles EOF as *"this peer has finished
+/// SENDING", not "this peer is gone"* -- and a server answers what is already
+/// determined while abandoning what is still pending. **On this surface** (that rule
+/// requires every measurement and every reading to name its own wire) a peer that
+/// sent no byte has determined nothing, so there is no reply it is owed. An
+/// abandoned preconnect is what a *healthy* browser produces many times a minute;
+/// answering it costs a real page a `400`.
+///
+/// `Idle` and `PeerGone` are kept apart rather than folded into one "silent",
+/// because they are different facts about the peer -- a socket held open with
+/// nothing on it is a preconnect or a slowloris, a socket closed with nothing on it
+/// is an abandoned preconnect or a liveness probe -- and folding two states that
+/// happen to share today's disposition is exactly how this defect was built. What
+/// `PeerGone` *does* fold is EOF and an abortive close, deliberately: both mean
+/// there is no peer to answer and nowhere to send an answer.
+///
+/// ## Why none of them is counted
+///
+/// `.agent/rules/metrics-and-observability.md` requires a refusal's wire code and
+/// its counter to be one row, and warns that a refusal answered while nothing rises
+/// is a probed port that looks unused. It also states the limit that applies here:
+/// **not every refusal is an EVENT.** `Idle` and `PeerGone` are what ordinary
+/// browsers and ordinary probes do continuously, so a counter on them would be a
+/// series that never rests and buries whatever it was scraped to show. This is a
+/// decision, not an omission. The admin surface has no counters at all today, and
+/// giving it one for its two *non*-events would be the wrong first row.
+enum class AdminHeadOutcome : std::uint8_t
+{
+    /// A request line arrived and parsed. The only outcome that is routed.
+    Complete = 0,
+    /// Not one byte arrived before the read deadline expired.
+    Idle,
+    /// Not one byte arrived, and the peer went away (EOF, or an abortive close).
+    PeerGone,
+    /// Bytes arrived, and they are not a request line. The one honest `400`.
+    Malformed,
+    /// The byte cap was reached before the head ended.
+    ///
+    /// Not merely uncovered before -- *misanswered*. The read loop stopped at the cap
+    /// and the truncated buffer was then parsed and **served as though complete**, so
+    /// a client whose `Authorization` sat past byte 8192 was answered `401`, which
+    /// reads as a wrong credential rather than as an oversize head.
+    TooLarge,
+    Last
+};
+
+/// What one head-read outcome is answered with.
+struct AdminHeadOutcomeRow
+{
+    /// The outcome this row describes.
+    AdminHeadOutcome outcome;
+    /// Status line to answer with, or empty to close without answering at all.
+    std::string_view status;
+    /// The body that goes with `status`; empty wherever `status` is.
+    std::string_view body;
+};
+
+/// The disposition of every head-read outcome, in enumerator order.
+///
+/// A table rather than a chain of `if`s for this codebase's usual reason, plus one
+/// specific to it: an empty `status` is how *no response is owed* is spelled, so the
+/// silent outcomes are visible beside the answered ones instead of being a `return`
+/// somebody has to find.
+inline constexpr EnumTable<AdminHeadOutcome, AdminHeadOutcomeRow> AdminHeadOutcomeTable {
+    // Never looked up -- a complete head is routed instead. Present because the
+    // table is indexed by the enum and a missing row would be a silent zero.
+    AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete, .status = {}, .body = {} },
+    AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle, .status = {}, .body = {} },
+    AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone, .status = {}, .body = {} },
+    AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed, .status = "400 Bad Request", .body = "bad request\n" },
+    AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::TooLarge,
+                          .status = "431 Request Header Fields Too Large",
+                          .body = "request header fields too large\n" },
+};
+static_assert(RowsInEnumeratorOrder(AdminHeadOutcomeTable, &AdminHeadOutcomeRow::outcome));
+
+/// A row that says nothing must carry nothing.
+///
+/// Not a restatement of the table: it is the one relation between its two columns.
+/// A body beside an empty status is a sentence nothing would ever send, which is how
+/// somebody adding a silent outcome writes down an answer that is then dropped.
+static_assert(std::ranges::all_of(AdminHeadOutcomeTable,
+                                  [](AdminHeadOutcomeRow const& row) noexcept {
+                                      return !row.status.empty() || row.body.empty();
+                                  }),
+              "a head outcome answered with silence must carry no body");
 
 /// Renders one route, or refuses it.
 ///

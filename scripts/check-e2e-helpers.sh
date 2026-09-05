@@ -739,6 +739,57 @@ run_case() {
         echo "both caller headers reached the server"
         ;;
 
+    # The idle variant still sends and still reads. `http_get` is a wrapper over
+    # `http_get_after_idle`, so a defect in the shared sequence takes both with it
+    # -- but only this case exercises the sleep sitting between the connect and the
+    # first byte, and a `sleep` in the wrong place would look identical from the
+    # caller's side on a listener that answers whenever it is asked.
+    #
+    # What this CANNOT assert is what a server does with the silence, which is the
+    # subject of #824: the staged listener has no request deadline, so it waits.
+    # That half is `fleet-dashboard-e2e`'s, against a real node.
+    http-idle)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/idle.log" \
+            >/dev/null 2>>"${scratch}/idle.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/idle.log" 15
+        body="$(http_get_after_idle 127.0.0.1 "$p" /fleet.json 1)"
+        kill "$listener" 2>/dev/null || true
+        case "$body" in
+            *NO-TRAILING-NEWLINE*) echo "http_get_after_idle asked and was answered" ;;
+            *) fail "http_get_after_idle brought back nothing; the body was '${body}'" ;;
+        esac
+        ;;
+
+    # The silence probe brings back what a server volunteered without being asked.
+    #
+    # Staged against a listener that SPEAKS FIRST, because the interesting failure
+    # is a probe that reads nothing whatever the server does -- which would look
+    # identical to the property #824's fixture asserts, and would pass on a broken
+    # server forever. A listener that says nothing cannot tell those apart; one
+    # that speaks can.
+    http-silence)
+        p="$(free_port)"
+        perl -e '
+            use strict; use warnings; use IO::Socket::INET;
+            my $srv = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0],
+                Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+            while (my $c = $srv->accept()) {
+                print $c "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nUNASKED";
+                close $c;
+            }
+        ' "$p" >/dev/null 2>>"${scratch}/silence.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/silence.log" 15
+        body="$(http_response_to_silence 127.0.0.1 "$p")"
+        kill "$listener" 2>/dev/null || true
+        case "$body" in
+            *UNASKED*) echo "http_response_to_silence reported what the server volunteered" ;;
+            *) fail "http_response_to_silence brought back nothing from a server that spoke: '${body}'" ;;
+        esac
+        ;;
+
     # A refused connection is a RETURN, not a stop: a fixture asking whether a
     # surface is up wants to decide for itself what that means.
     http-refused)
@@ -1145,6 +1196,8 @@ socket_cases=(
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
+    "http-idle|0|http_get_after_idle asked and was answered"
+    "http-silence|0|http_response_to_silence reported what the server volunteered"
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"

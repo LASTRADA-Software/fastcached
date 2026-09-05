@@ -767,8 +767,77 @@ stop_and_require_exit() {
 http_get() {
     local host="$1" port="$2" path="$3"
     shift 3
+    http_get_after_idle "$host" "$port" "$path" 0 ${@+"$@"}
+}
+
+# What an HTTP surface says, unprompted, to a peer that says NOTHING.
+#
+# Connect and read; never send. That is an unused browser preconnect exactly, and
+# it is the DETERMINISTIC form of the #824 guard -- the idle-then-send shape a
+# report describes is a race once the server has already answered and closed: the
+# client's late write draws an RST, the RST discards the client's receive buffer,
+# and the response the server really did send is destroyed before it can be read.
+# Measured both ways against one unfixed binary: `python` saw the `400`, this
+# file's own `http_get_after_idle` saw nothing. A probe that never writes cannot
+# provoke that RST, so what comes back is what the server volunteered and nothing
+# else.
+#
+# No sleep parameter. `read -t 5` outlasts any request deadline this tree sets, so
+# a server that means to answer a silent peer has answered by the time the bound
+# expires, and one that means to close has closed. Adding a sleep in front would
+# only make the case slower and its bound harder to reason about.
+#
+# @param 1 host
+# @param 2 port
+# @return echoes whatever the server said unprompted, EMPTY when it said nothing;
+#         returns 1 if the connection was refused
+http_response_to_silence() {
+    local host="$1" port="$2"
+    local line="" body=""
+    exec 3<>"/dev/tcp/${host}/${port}" || return 1
+    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
+    if [ -n "$line" ]; then body+="$line"; fi
+    exec 3<&-
+    printf '%s' "$body"
+}
+
+# The same, after holding the connection open and silent for a while first.
+#
+# A browser opens speculative *preconnect* sockets ahead of a navigation and may
+# send on one much later, so "connect, wait, then ask" is an ordinary thing for a
+# real client to do and was a thing NO fixture in this tree did -- every one of
+# them sent immediately, which is why an admin surface answering `400` to a silent
+# peer past its request deadline reached production
+# ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)).
+#
+# `http_get` is a wrapper over this rather than a sibling of it. A second copy of
+# the connect/send/read sequence is precisely what this file exists to stop: the
+# trailing-chunk fix below is one such divergence that took six copies with it,
+# and a new copy would inherit that bug by construction.
+#
+# The idle is an INTEGER number of seconds. POSIX `sleep` is only required to take
+# one, and this file already refuses a fractional `read -t` for the bash 3.2 that
+# macOS ships; a caller wanting to straddle a sub-second deadline should move the
+# deadline, not the sleep.
+#
+# @param 1 host
+# @param 2 port
+# @param 3 path
+# @param 4 whole seconds to stay connected and silent before sending; 0 to send at once
+# @param 5.. extra request header lines, without CRLF, e.g. "Authorization: x"
+# @return echoes the response, which is EMPTY when the server answered nothing;
+#         returns 1 if the connection was refused
+http_get_after_idle() {
+    local host="$1" port="$2" path="$3" idle="$4"
+    shift 4
     local line="" body="" header=""
     exec 3<>"/dev/tcp/${host}/${port}" || return 1
+    # After the connect and before the first byte: a socket the server has
+    # accepted and on which nothing has been said, which is the whole state under
+    # test. Sending first and sleeping after would test something else entirely.
+    if [ "$idle" -gt 0 ]; then
+        sleep "$idle"
+    fi
     {
         printf 'GET %s HTTP/1.1\r\nHost: %s\r\n' "$path" "$host"
         for header in ${@+"$@"}; do
