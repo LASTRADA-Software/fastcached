@@ -80,11 +80,13 @@ enum class SocketActivation : std::uint8_t
 ///        is not a reason for its caller to hold a different set of objects.
 /// @param logger Where the chosen mode is announced.
 /// @return The validator, or why the key file cannot serve as one.
-[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
-                                                                                      std::string_view advertise,
-                                                                                      SocketActivation activation,
-                                                                                      IWallClock const& clock,
-                                                                                      Distributed::KnownSchedulerTerm& term,
-                                                                                      ILogger& logger);
+[[nodiscard]] std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(
+    NodeConfig const& cfg,
+    std::string_view advertise,
+    SocketActivation activation,
+    IWallClock const& clock,
+    Distributed::KnownSchedulerTerm& term,
+    Distributed::LeaseEpochNotice& epochNotice,
+    ILogger& logger);
 
 } // namespace FastCache::Node

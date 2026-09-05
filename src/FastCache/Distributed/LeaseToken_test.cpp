@@ -589,6 +589,90 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     CHECK(refusal.error() == LeaseRefusalReason::Malformed);
 }
 
+TEST_CASE("The worker says once that it is refusing every grant on the term", "[distributed][lease][token]")
+{
+    // **The signal this replaces is WRONG, not missing** (#614). On the worker a
+    // scheduler reset showed only as `WorkerLeaseStaleEpoch` climbing, which reads like
+    // an election storm -- so an operator whose fleet stopped distributing was pointed
+    // at consensus instability when the cause was a reset they performed themselves.
+    //
+    // It settles nothing about the downward path, which is still open. This is the
+    // observability half, true under every shape that question could be answered with.
+    std::vector<std::string> said;
+    LeaseEpochNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
+
+    auto const reset = LeaseRefusal { .reason = LeaseRefusalReason::EpochMismatch,
+                                      .detail = "this lease was issued under scheduler term 0; this worker has "
+                                                "seen term 7" };
+
+    SECTION("it reports once, however many compiles arrive")
+    {
+        // A worker refusing thousands of compiles must say this once. The whole point
+        // is a line an operator reads, and a line per refused compile is not one.
+        CHECK(notice.Observe(reset));
+        for (auto attempt = 0; attempt < 500; ++attempt)
+            CHECK_FALSE(notice.Observe(reset));
+
+        REQUIRE(said.size() == 1);
+
+        // It carries the refusal's own numbers -- which is what turns "the fleet
+        // stopped" into "the scheduler was reset" -- and names the remedy, because an
+        // operator who has just learned the condition still needs to be told that it
+        // clears on a restart and not on its own.
+        CHECK(said.front().contains("term 0"));
+        CHECK(said.front().contains("term 7"));
+        CHECK(said.front().contains("restart"));
+    }
+
+    SECTION("an accepted grant re-arms it, so a later reset is not silent")
+    {
+        // **Latched per CONDITION, not per process**, and this is the case that
+        // separates the two. Once-per-process would spend the line on the first stale
+        // token to arrive and leave a real reset an hour later unreported -- the exact
+        // failure the notice exists to prevent, reached by the mechanism meant to
+        // prevent it.
+        CHECK(notice.Observe(reset));
+        CHECK(said.size() == 1);
+
+        notice.Accepted();
+        CHECK_FALSE(notice.Reported());
+
+        CHECK(notice.Observe(reset));
+        CHECK(said.size() == 2);
+    }
+
+    SECTION("no other refusal reaches it")
+    {
+        // Every other refusal here is about ONE grant and is already answered per
+        // request. This one is a condition that persists until the process restarts,
+        // which is what makes it worth a line -- so a notice that spoke for all of them
+        // would be back to noise.
+        for (auto const reason: { LeaseRefusalReason::Malformed,
+                                  LeaseRefusalReason::Unauthorized,
+                                  LeaseRefusalReason::ClusterMismatch,
+                                  LeaseRefusalReason::EndpointMismatch,
+                                  LeaseRefusalReason::FingerprintMismatch,
+                                  LeaseRefusalReason::Expired })
+        {
+            INFO("reason " << static_cast<int>(reason));
+            CHECK_FALSE(notice.Observe(LeaseRefusal { .reason = reason, .detail = "irrelevant" }));
+        }
+        CHECK(said.empty());
+    }
+
+    SECTION("a silent notice reports nowhere and still latches")
+    {
+        // `Silent()` is named rather than defaulted, which is `CredentialNotice`'s rule
+        // and the reason is the same: a defaulted sink is how a diagnostic comes to be
+        // dropped at every call site at once. It still answers whether it WOULD have
+        // spoken, so a caller can assert the decision without a sink.
+        auto quiet = LeaseEpochNotice::Silent();
+        CHECK(quiet.Observe(reset));
+        CHECK(quiet.Reported());
+        CHECK_FALSE(quiet.Observe(reset));
+    }
+}
+
 TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token]")
 {
     // `DiscoveryWire`'s scar, and it applies here with more force: an endpoint is
