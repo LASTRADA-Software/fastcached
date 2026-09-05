@@ -127,7 +127,12 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     Distributed::KnownSchedulerTerm term;
     NullLogger logger;
 
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, logger);
+    // This case is about the fleet check and says nothing about the epoch notice, so
+    // the notice is inert here rather than absent -- the parameter is a reference and
+    // there is no "no notice" to pass.
+    Distributed::LeaseEpochNotice epochNotice { [](std::string_view) {} };
+
+    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
     REQUIRE(validator.has_value());
 
     // Nothing has been verified: the epoch check is `NotKnownHere` and accepts any
