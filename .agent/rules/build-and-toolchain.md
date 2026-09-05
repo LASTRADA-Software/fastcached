@@ -3917,12 +3917,20 @@ inside the probe written to settle one of them.
   visible in the UI rather than buried in a green log.
 - **Three outcomes, never two.** A probe that can only answer the two you expect will
   answer one of them whatever it sees. `INCONCLUSIVE` is a verdict.
-- **Proving the CLASSIFIER is not proving the ARTIFACT.** The broken version's decision
-  logic had been driven against three fake `xcrun`s and was correct throughout -- the
-  logic was never what failed. **What was tested was not what shipped.** The repair is to
-  extract the step's own `run:` block out of the workflow YAML and execute *that*, so the
-  thing under test is the thing that runs. A reconstruction tests your understanding of the
-  artifact, which is the part that was already right.
+- **A green test on the wrong object is worse than no test, because it RETIRES THE
+  SUSPICION.** This is the finding; executing the workflow's own `run:` block is only its
+  remedy, and a remedy does not transfer to the next instance the way the finding does.
+  The broken probe's decision logic had been driven against three fake `xcrun`s and was
+  **correct the entire time** -- so every test passed, every test was honest, and every
+  test told me nothing. Had there been no test at all, the step would still have been
+  suspect and someone would have looked at it. **The passing suite is what stopped anyone
+  looking.**
+
+  So the question is never "is this tested" but "is the thing tested the thing that
+  ships". Here they differed as *text*: a reconstruction of the step, versus the step. The
+  repair is to extract the `run:` block out of the workflow and execute **that** -- a
+  reconstruction tests your understanding of the artifact, which is the part that was
+  already right.
 
 This is the same family as the entry below, one layer out: there the local run and CI read
 different **trees**; here the tested script and the shipped script were different **text**.

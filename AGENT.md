@@ -1497,10 +1497,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   and the job reported **SUCCESS**. Keep the flag; add the missing half — **assert the
   classifier was REACHED** (a verdict as `::notice`, its absence as `::warning`), and give
   it **three** outcomes, since a probe that can only answer the two you expect will answer
-  one of them whatever it sees. And **proving the CLASSIFIER is not proving the ARTIFACT**:
-  that version's decision logic had been driven against three fake `xcrun`s and was correct
-  the whole time — **what was tested was not what shipped**. Extract the step's own `run:`
-  block from the workflow and execute THAT.
+  one of them whatever it sees. And **a green test on the wrong object is worse
+  than no test, because it RETIRES THE SUSPICION** — that version's classifier had been
+  driven against three fake `xcrun`s and was correct the whole time, so every test passed
+  honestly and told nobody anything, and the passing suite is what stopped anyone looking.
+  Ask not *is this tested* but *is the thing tested the thing that ships*; here they
+  differed as TEXT, so extract the step's own `run:` block from the workflow and execute
+  THAT.
 - `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag
   and the suppressions it makes necessary are governed by ONE condition — split, a
   build directory reused across presets holds `PEDANTIC_COMPILER` ON with `WERROR`
