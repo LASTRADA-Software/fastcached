@@ -571,6 +571,19 @@ The refusals are split by reason for the same reason the scheduler's two are:
 a full worker and a misconfigured one are different problems with different
 fixes, and one number covering both tells you neither.
 
+> **Retired series.** `fastcache_worker_jobs_refused_lease_stale_epoch_total` no longer
+> exists, as of [#614](https://github.com/LASTRADA-Software/fastcached/issues/614). If a
+> dashboard or alert of yours scrapes it, it will now find nothing — that is the change,
+> not a fault. The refusal it counted **can no longer happen**: a worker adopts a
+> scheduler term that went backwards instead of refusing it, because replay is closed by
+> grants being spendable once. Point those alerts at
+> `fastcache_worker_jobs_refused_lease_replayed_total` (somebody presenting a captured
+> grant twice) and `fastcache_worker_scheduler_term_resets_total` (a scheduler that was
+> reset). The reasoning is under "A grant is spendable once" below. It was retired rather
+> than left exported at zero because a series that reads zero for ever because its event
+> is impossible looks exactly like one reading zero because the event has not happened,
+> and only one of those means your fleet is healthy.
+
 The five `..._lease_*` counters move only on a node that holds
 `--cluster-key-file`. Without one a worker cannot check a signature, and it says so
 at startup rather than leaving these at zero and looking healthy — a node that
