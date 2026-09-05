@@ -304,3 +304,41 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     CHECK_FALSE(state.lease.term.Known().has_value());
     CHECK(state.lease.spent.Size() == 0);
 }
+
+TEST_CASE("The --cluster-id flag asserts the fleet rather than choosing it", "[node][lease][fleet]")
+{
+    using FastCache::Node::FleetAssertionHolds;
+
+    // The flag is an ASSERTION since #401: registration decides which fleet this node
+    // serves, and `--cluster-id` says which one the operator expected to be admitted
+    // to. The three rows below are the whole contract.
+
+    SECTION("nothing asserted, so nothing to check")
+    {
+        // The default is a real fleet name (`fastcache`), so this is asked on
+        // PROVENANCE and not by comparing against it -- an operator who types the
+        // default has still asserted it, and one who types nothing has not.
+        CHECK(FleetAssertionHolds(/*asserted=*/false, "fastcache", "some-other-fleet"));
+        CHECK(FleetAssertionHolds(/*asserted=*/false, "", "some-other-fleet"));
+    }
+
+    SECTION("asserted and agreed, so the node serves")
+    {
+        CHECK(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-a"));
+        // A scheduler that names no fleet, asserted as such. This is the one-machine
+        // deployment and must keep working.
+        CHECK(FleetAssertionHolds(/*asserted=*/true, "", ""));
+    }
+
+    SECTION("asserted and contradicted, so the node refuses")
+    {
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-b"));
+        // The two asymmetric cases, which are the ones a substring or prefix test
+        // would let through: asserted a fleet and got none, asserted none and got one.
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", ""));
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "", "fleet-a"));
+        // And the default is not special: a node left on `fastcache` that is admitted
+        // to a fleet naming itself is exactly the cross-fleet accept #401 closes.
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fastcache", "production"));
+    }
+}

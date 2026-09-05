@@ -91,4 +91,34 @@ enum class SocketActivation : std::uint8_t
                                                                                       IMetricsSink& metrics,
                                                                                       ILogger& logger);
 
+/// Whether the fleet a scheduler admitted this node to is the one the operator asked
+/// for.
+///
+/// `--cluster-id` is an **assertion**, not a source and not an override. Since #401 the
+/// identity comes from the REGISTER reply; the flag, when the operator NAMED one, says
+/// which fleet they expected. Disagreement is a provisioning fault -- this node would be
+/// serving a fleet nobody meant -- so the caller refuses rather than silently preferring
+/// one side. Preferring the config would put configuration back above registration and
+/// reopen the default-`fastcache` cross-fleet accept; preferring the registration
+/// quietly would make the flag a lie.
+///
+/// A free function over the two values rather than a branch inside the heartbeat round,
+/// because that round lives in `main.cpp`'s anonymous namespace where nothing can reach
+/// it, and a rule nothing can test is a rule nothing is held to.
+///
+/// @param asserted Whether the operator NAMED a cluster. Asked as provenance rather
+///        than by comparing the value against the default, which cannot see an operator
+///        who typed the default -- the option table's own rule.
+/// @param configured What `--cluster-id` says.
+/// @param registered What the scheduler's REGISTER reply named, which may legally be
+///        empty for a scheduler that names no fleet.
+/// @return True when the node may serve: either nothing was asserted, or what was
+///         asserted is what was registered.
+[[nodiscard]] constexpr bool FleetAssertionHolds(bool asserted,
+                                                 std::string_view configured,
+                                                 std::string_view registered) noexcept
+{
+    return !asserted || configured == registered;
+}
+
 } // namespace FastCache::Node

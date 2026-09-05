@@ -272,6 +272,9 @@ struct HeartbeatRound
     /// Where the fleet this node was admitted to is recorded, so the lease check can
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;
+    /// Raised when a scheduler registers this node into a fleet other than the one
+    /// `--cluster-id` asserts. Never lowered: the answer will not change by itself.
+    std::atomic<bool>& fleetMismatch;
     ILogger& logger; ///< Where a refusal is named.
 };
 
@@ -370,6 +373,32 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
         // member of, a leader that has moved.
         if (auto const registered = registrar.Register(client, round.credential); registered.has_value())
         {
+            // `--cluster-id` is an ASSERTION, not a source and not an override. The
+            // identity comes from registration; the flag, when the operator NAMED one,
+            // says which fleet they expected to be admitted to. Disagreement is a
+            // provisioning fault -- this node is serving a fleet somebody did not mean
+            // -- so it is fatal and names both sides rather than silently preferring
+            // either. Preferring the config would put configuration back above
+            // registration and reopen the default-`fastcache` cross-fleet accept;
+            // preferring the registration silently would make the flag a lie.
+            //
+            // Asked on `clusterIdExplicit` rather than on the VALUE, because the
+            // default is a real fleet name and comparing against it cannot see the
+            // operator who typed it. That is the option table's own provenance rule.
+            if (!Node::FleetAssertionHolds(round.cfg.clusterIdExplicit, round.cfg.clusterId, registrar.ClusterId()))
+            {
+                round.logger.Logf(LogLevel::Error,
+                                  "scheduler {} registered this node into fleet '{}', but --cluster-id asserts "
+                                  "'{}'. Refusing to serve a fleet that was not asked for: correct the flag or "
+                                  "the scheduler this node is pointed at",
+                                  endpoint,
+                                  registrar.ClusterId(),
+                                  round.cfg.clusterId);
+                round.fleetMismatch = true;
+                DaemonControls::Instance().RequestStop();
+                return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
+            }
+
             // The fleet the scheduler named, adopted here rather than configured. Until
             // this runs the worker is unpinned and refuses every grant, which is the
             // window #401 closes; from here it refuses every grant naming another fleet.
@@ -1249,6 +1278,13 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     BlockingConnector heartbeatConnector { DefaultAddressResolver(),
                                            BlockingConnectorOptions { .ioTimeout = HeartbeatIoTimeout } };
 
+    /// Set when the fleet a scheduler registered this node into is not the one the
+    /// operator asserted with `--cluster-id`. Fatal for the same reason
+    /// `surveyFoundNothing` is: the node is running, but not as configured, and a
+    /// supervisor restarting it will reach the same answer until somebody changes the
+    /// flag or the scheduler this node is pointed at (#401).
+    std::atomic<bool> fleetAssertionFailed { false };
+
     HeartbeatRound const round { .cfg = cfg,
                                  .registrars = registrars,
                                  .capacity = compileCapacity,
@@ -1258,6 +1294,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
                                  .sampler = sampler,
                                  .credential = credential,
                                  .lease = leaseState,
+                                 .fleetMismatch = fleetAssertionFailed,
                                  .logger = logger };
 
     // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of
@@ -1565,7 +1602,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // exits as the refusal it would have been before #365 -- late, but with the same
     // code and the same diagnostic. A supervisor that restarts on failure must not
     // read this as a clean stop.
-    return surveyFoundNothing ? ExitUsage : ExitOk;
+    return surveyFoundNothing || fleetAssertionFailed ? ExitUsage : ExitOk;
 }
 
 } // namespace
