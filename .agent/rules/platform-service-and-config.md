@@ -896,3 +896,16 @@ boot, silently, because a registration replays its command line forever. So:
   the failure the emptiness rule beside it was written to prevent. Deciding it needs
   a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
   `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".
+
+- **[#864](https://github.com/LASTRADA-Software/fastcached/issues/864)** — #752 wired
+  the worker's path-reached secrets and the daemon still has its own. The rule that a
+  secret reached BY PATH is not provenance-gated is not specific to a binary: the path
+  is not the secret and the file is. Measured over the six `=<path>` rows of
+  `CliOptions()`, the daemon's gap is exactly ONE — `--tls-key`, the private key
+  terminating TLS on the CACHE port, so a world-readable one lets any local account
+  impersonate the daemon to its clients or decrypt the session `--requirepass` travels
+  over. `--tls-cert` is public by construction, and the other four rows are a store, a
+  pid and two config paths. `DaemonSecretFiles` is already the daemon's subject list and
+  both the start and #753's reload subscriber read it, so the row reaches both moments
+  for free; what is missing beside it is the daemon's own mandatory classification, or a
+  seventh path-valued flag is covered by silence.

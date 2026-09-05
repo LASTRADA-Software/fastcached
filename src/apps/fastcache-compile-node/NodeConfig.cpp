@@ -9,6 +9,7 @@
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
@@ -2092,6 +2093,70 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
             return std::string { rule.message };
 
     return std::nullopt;
+}
+
+std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
+{
+    static constexpr auto table = std::to_array<NodeSecretFile>({
+        // The PSK, and the worst of the four: it MACs discovery proofs AND lease
+        // grants, so a leak admits a node whose objects the whole fleet then caches.
+        { .flag = "--cluster-key-file", .path = &NodeConfig::clusterKeyFile },
+        // What this node REQUIRES of its own callers. A leak makes membership -- a
+        // host list, not a credential -- the only gate left on the scheduler verbs.
+        { .flag = "--scheduler-token-file", .path = &NodeConfig::schedulerTokenFile },
+        // The admin credential. The dashboard's own rules are REFUSALS about a
+        // MISSING one; this is a warning about an EXPOSED one, and the two
+        // deliberately differ in kind about one file for #384's stated reason:
+        // refusing a missing credential fails closed and breaks nothing that worked,
+        // while refusing an exposed one breaks a deployment that is running today.
+        { .flag = "--dashboard-token-file", .path = &NodeConfig::dashboardTokenFile },
+        // A TLS private key, which #752's own list does not name. At least as severe
+        // as the PSK: anything holding it can terminate this node's admin surface.
+        { .flag = "--tls-key", .path = &NodeConfig::tlsKeyFile },
+    });
+    return table;
+}
+
+std::span<NodePublicPathFlag const> NodePublicPathFlags() noexcept
+{
+    static constexpr auto table = std::to_array<NodePublicPathFlag>({
+        { .flag = "--config",
+          .why = "the file itself holds no secret by construction; whether the secret IN it is exposed is the "
+                 "provenance-gated question NodeSecretFiles asks separately" },
+        { .flag = "--cluster-dir", .why = "a directory of Raft state: log entries and snapshots, no credential" },
+        { .flag = "--cache-dir", .why = "compiled objects, which the fleet already shares" },
+        { .flag = "--pidfile", .why = "a process id, which every process list already publishes" },
+        // Explicitly classified rather than left off, because it is the one an
+        // author would reach for by symmetry with `--tls-key`. A certificate is
+        // handed to every client during the handshake, so it is public BY
+        // CONSTRUCTION -- and warning about the mode of a file that is meant to be
+        // readable is the alarm that teaches operators to ignore the other four.
+        { .flag = "--tls-cert", .why = "a certificate is presented to every client during the handshake" },
+    });
+    return table;
+}
+
+std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
+                                                   std::filesystem::path const& configFile,
+                                                   bool secretNamedOnCommandLine)
+{
+    std::vector<std::filesystem::path> files;
+
+    // First, because it is the one an operator most often has open. Gated on the
+    // shared provenance rule rather than a second copy of it: `--requirepass` typed
+    // in argv is a `ps` exposure, which is a different problem with a different owner.
+    if (SecretCameFromConfigFile(SecretProvenanceFacts {
+            .secretInForce = !cfg.token.empty(),
+            .namedOnCommandLine = secretNamedOnCommandLine,
+            .fileWasRead = !configFile.empty(),
+        }))
+        files.push_back(configFile);
+
+    for (auto const& row: NodeSecretFileTable())
+        if (auto const& path = cfg.*row.path; !path.empty())
+            files.push_back(path);
+
+    return files;
 }
 
 std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)

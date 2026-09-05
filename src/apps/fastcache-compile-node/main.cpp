@@ -37,6 +37,7 @@
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -1896,6 +1897,48 @@ int main(int argc, char** argv)
         logger.Logf(LogLevel::Error, "{}", *rejection);
         return ExitUsage;
     }
+
+    // A secret is only as private as the file holding it, and this worker has FIVE
+    // such files where the daemon has one. #384 landed that rule and wired only the
+    // daemon; the exposure here is identical for `--requirepass` out of a
+    // configuration file, and WIDER for the four secrets reached by path -- a
+    // world-readable `--cluster-key-file` is the PSK that MACs both discovery proofs
+    // and lease tokens, handed to every account on the machine
+    // ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
+    //
+    // `lookup.path` guarded by `fileApplied`, never `cfg.configPath`: the resolved
+    // path is what was actually opened, and a discovered machine-wide file is named
+    // by no flag at all -- so the flag's value would answer "no file" for the
+    // deployment the packaging ships. And a file that failed halfway was DECLINED,
+    // so its secret is not the one in force.
+    //
+    // **A warning and not a refusal**, for #384's reason: refusing a MISSING
+    // credential fails closed and breaks nothing that worked, while refusing an
+    // EXPOSED one breaks a deployment that is running today. It goes to `logger`,
+    // which is journald, the Windows event log or launchd's file -- a durable record
+    // rather than a console line that scrolls past.
+    //
+    // After `StartupPolicyRejection`, so a worker that will not start is told the
+    // one thing it can act on rather than that plus a list about files it never
+    // reaches.
+    //
+    // **`!cliOnly.token.empty()` is provenance, not a value comparison.** `cliOnly` is
+    // the command line ALONE -- parsed above, before any file was opened -- so a
+    // non-empty token in it is argv having named one. The rulebook's clause is that a
+    // flag whose default is EMPTY needs no explicit bit, there being nothing to arrive
+    // at without asking; `--requirepass=` typed on purpose empties the merged value
+    // too, and `secretInForce` is what answers it.
+    //
+    // A `tokenExplicit` column would buy nothing here and would be a live hazard.
+    // `ApplyFileSettings` sets a row's `explicitBit` for a key it read out of the FILE
+    // (`Config/FileOptions.hpp` says so, and names this call site), and the worker
+    // applies the file and argv into ONE `NodeConfig` -- so the bit read off `cfg`
+    // means "named anywhere" and answers true for exactly the secret this warning
+    // exists to report. Only a bit read off `cliOnly` would be right, which is the
+    // same fact this expression already reads, one column and one bool later.
+    for (auto const& warning: SecretFileWarnings(
+             NodeSecretFiles(cfg, fileApplied ? lookup.path : std::filesystem::path {}, !cliOnly.token.empty())))
+        logger.Logf(LogLevel::Warn, "{}", warning);
 
     // The host is chosen last, so everything that can be reported to a terminal
     // already has been. `--daemon` is what a SUPERVISOR THAT WANTS BACKGROUNDING
