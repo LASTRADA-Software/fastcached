@@ -3171,6 +3171,45 @@ only through the rule. Where an amputation genuinely is the right shape, the har
 has to be able to say the build broke; a script that reports "red" for both is an
 instrument that cannot tell you what it measured.
 
+### A counterfactual must be RE-RUN after a refactor, because a refactor can move what it was catching
+
+Its own section for the same reason the one above is: this is a different branch and
+a different ticket, so folding it into the counted heading further up would falsify a
+scoped claim silently. It is the *third* thing that can be wrong with a
+counterfactual, after "it must fail through the rule" above and "an arm that cannot
+run is neither a pass nor a failure".
+
+**A guard that was watched biting is only known to bite the code it was watched
+against.** Refactor that code and the guard is untouched, still green, and now
+guarding nothing — and nothing in a diff, a test run or a review says so, because
+the guard did not change.
+
+Measured on
+[#658](https://github.com/LASTRADA-Software/fastcached/issues/658). A check
+hard-coded `unsupported-version` and `chosen STREQUAL "sccache"`; generalising it to
+a `predicts` column on the candidate row was correct and was a real improvement. Then
+the counterfactual was re-run: **widening that column to `.` left every row of the
+check green.** The check drove the pure function with a pattern of its own and never
+read what the module declared, so the generalisation had **relocated** the untested
+part rather than deleting it.
+
+**It looked like an improvement right up until the counterfactual was re-run against
+the new shape** — which is the whole rule. The old counterfactual still passed, for
+the old reason, and told you nothing about the new code.
+
+The repair is the one this file states elsewhere for census patterns: make the check
+read both literals **from the files that own them** — the column out of
+`cmake/portable/CompileCache.cmake`, `UnsupportedVersion`'s `.name` out of
+`Protocol/CompileCacheWire.hpp` — and assert they agree. That closed a coupling which
+**predated the branch and was invisible**: the launcher reports the wire name, nothing
+connected the two, and a rename there would have disarmed the warning with every test
+green. Both directions then shown red — widened column, and renamed wire constant.
+
+So: **a refactor of guarded code is a refactor of the guard's subject, and the guard
+must be re-armed against the new shape.** Re-running a counterfactual costs one
+command; not re-running it costs the guard, silently, at the moment somebody has just
+improved the code.
+
 ### An insert is judged by what its CONTAINER claims, not by its neighbours
 
 **Adjacency is not the test, and checking it is not enough.** A rule inserted into
