@@ -196,11 +196,14 @@ namespace
         /// @param socket The connection socket to watch.
         void StartReadableWatcher(ISocket* socket)
         {
-            if (_watcherStarted)
-                return;
-            _watcherStarted = true;
             {
                 std::scoped_lock const lock { _mu };
+                if (_watcherStarted)
+                    return;
+                _watcherStarted = true;
+                // A watcher retired by a previous UNSUBSCRIBE must not carry its stop
+                // flag into the new one (#755).
+                _retire = false;
                 // Retain the socket pointer so ShutdownWatcher can cancel a
                 // parked initial WaitReadable. Without this, the watcher
                 // parked on the very first WaitReadable (before any rearm
@@ -268,6 +271,46 @@ namespace
             return _readablePending;
         }
 
+        /// @return True while a watcher coroutine exists and may hold the socket's
+        ///         single read-op slot.
+        ///
+        /// The command loop consults this because leaving subscribe mode does not end
+        /// the watcher: until it has actually retired, issuing a `Read` would claim the
+        /// slot out from under a parked `WaitReadable` (#755).
+        [[nodiscard]] bool WatcherActive() const
+        {
+            std::scoped_lock const lock { _mu };
+            return _watcherStarted;
+        }
+
+        /// Stop the watcher instead of re-arming it, without touching the socket.
+        ///
+        /// **Not `ShutdownWatcher`**, which also `Close()`s the connection -- right for
+        /// teardown and catastrophic for a client that merely unsubscribed. This trips
+        /// the same rearm latch `RearmReadable` does, but tells the watcher to exit
+        /// rather than to watch again, so the coroutine ends where it is already parked
+        /// and no parked `WaitReadable` has to be retrieved from a socket that has no
+        /// way to retrieve one (#710 is the ticket about that missing primitive).
+        ///
+        /// Safe precisely because the watcher is parked on the LATCH at this point: the
+        /// loop re-arms only once the reader has drained, so a watcher that has not
+        /// fired is still waiting to be told to watch again rather than sitting in
+        /// `WaitReadable`.
+        void RetireReadableWatcher()
+        {
+            std::shared_ptr<WakeLatch> resume;
+            {
+                std::scoped_lock const lock { _mu };
+                if (!_watcherStarted)
+                    return;
+                _retire = true;
+                _readablePending = false;
+                resume = std::exchange(_rearm, {});
+            }
+            if (resume)
+                resume->WakeOnce(_reactor);
+        }
+
         /// shared_from_this() on the ISubscriber base returns
         /// std::shared_ptr<ISubscriber>; we want a Subscriber pointer to
         /// access the private latch/reactor state. The static cast is safe:
@@ -318,6 +361,16 @@ namespace
                     std::scoped_lock const lock { self->_mu };
                     if (self->_shuttingDown)
                         co_return;
+                    if (self->_retire)
+                    {
+                        // The connection left subscribe mode. End here, parked on the
+                        // latch and holding nothing, and let a later SUBSCRIBE start a
+                        // fresh watcher (#755).
+                        self->_retire = false;
+                        self->_watcherStarted = false;
+                        self->_socket = nullptr;
+                        co_return;
+                    }
                 }
             }
         }
@@ -355,7 +408,10 @@ namespace
         ISocket* _socket { nullptr };
         bool _readablePending { false }; ///< Watcher saw readable bytes.
         bool _watcherStarted { false };  ///< StartReadableWatcher ran.
-        bool _shuttingDown { false };    ///< Connection torn down; watcher should exit.
+        bool _shuttingDown { false };
+
+        /// Set by `RetireReadableWatcher`: stop watching, but do not close anything.
+        bool _retire { false }; ///< Connection torn down; watcher should exit.
     };
 
     /// Mutable per-connection protocol state, owned by RedisRespHandler::Run's
@@ -5117,9 +5173,32 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         // drain messages on wake, and only read a command when the watcher says
         // bytes are pending (or the reader already buffered a full command) —
         // never blocking in ReadOneCommand while messages could arrive.
+        // **Settling the watcher happens HERE, not after `ReadOneCommand`, and the
+        // ordering is the whole of #755.** The re-arm used to run immediately after a
+        // command was read -- which is BEFORE it is dispatched, so on `UNSUBSCRIBE` the
+        // watcher re-armed into `WaitReadable` and only then did the subscription count
+        // reach zero. The loop then stopped entering this block, called
+        // `ReadOneCommand`, and the `Read` under it claimed the socket's single read-op
+        // slot out from under a wait that was still parked: a Debug abort since #725,
+        // and a leaked coroutine frame before that.
+        //
+        // Deciding it at the top of the next iteration puts the choice AFTER dispatch,
+        // where the count is final, so the watcher is either re-armed or retired -- and
+        // it is still parked on the rearm latch at this instant, which is what makes
+        // retiring it a latch trip rather than a socket cancellation nobody can spell.
+        if (subscriber->WatcherActive() && state.subscriptionCount == 0)
+            subscriber->RetireReadableWatcher();
+
         if (state.subscriptionCount > 0)
         {
             subscriber->StartReadableWatcher(socket);
+            // Only once the reader has drained, because a watcher re-armed while a
+            // pipelined command is still buffered goes back into `WaitReadable` and is
+            // then unreachable by the retirement above -- the same defect arriving
+            // through `SUBSCRIBE` and `UNSUBSCRIBE` in one packet. While bytes are
+            // buffered there is nothing to wait for anyway.
+            if (reader.Buffered().empty())
+                subscriber->RearmReadable();
             if (!co_await DrainPushes(socket, subscriber.get(), state.resp))
                 co_return;
             if (reader.Buffered().empty() && !subscriber->ReadablePending())
@@ -5134,10 +5213,6 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
         }
 
         auto cmd = co_await ReadOneCommand(&reader);
-        // The watcher flagged readable bytes; we have now consumed a command from
-        // them, so let it re-arm for the next readability edge.
-        if (state.subscriptionCount > 0)
-            subscriber->RearmReadable();
         if (!cmd.has_value())
         {
             // Truncated means the peer hung up mid-frame — nothing to reply to.

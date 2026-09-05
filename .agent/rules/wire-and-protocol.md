@@ -1068,6 +1068,39 @@ Every rule below has already been a bug.
     how many of those peers were told why, moved by the connection when the write
     SUCCEEDS. The gap between them is a real quantity — swept peers left to infer it —
     rather than an error term, and a peer that had already hung up belongs in it.
+- **An awaitable's address is taken in `await_suspend`, never in the function that
+  returns it.** A factory like `Accept()` or `Read()` builds the awaitable as a LOCAL
+  and returns it by value, so the object the caller suspends on is a different one;
+  the address of the local names storage that is gone before anything can complete
+  through it. `InMemorySocket::Read` had this right and wrote down why -- *"at that
+  point `self` is the awaitable living in the awaiting coroutine's frame, not this
+  local"* -- and `InMemoryListener::Accept` two hundred lines away did
+  `_pendingAwaitable = &awaitable;` instead
+  ([#734](https://github.com/LASTRADA-Software/fastcached/issues/734)). Both `Close`
+  and `TryCompletePendingAccept` then completed through it. `SetSuspendCallback` is
+  the seam that makes the right answer the only reachable one, which is why every
+  other awaitable in that file uses it.
+  - **It was latent for a reason that expired.** Every case in that file used the lazy
+    `Task` shape and reached `Shutdown()` before anything suspended, so the parked
+    path was never taken and the dangling pointer never dereferenced. #712's detached
+    pump made eager, parking coroutines an ordinary shape in this tree, which is what
+    turns a dormant trap into one somebody walks into. A fake that faults only under a
+    shape nobody has used yet is a trap set for whoever uses it first.
+  - **Reproduced before it was fixed**, and it is not a subtle failure once reached:
+    an eager `DetachedTask` parked on `Accept` followed by `Close()` is a **SIGSEGV**,
+    caught by Catch2 as a fatal error condition. Two cases, because `Close` and
+    `TryCompletePendingAccept` are two call sites and fixing one would leave the other
+    reading freed storage -- plus a control on the QUEUED path, since an
+    implementation that resolved every accept synchronously would satisfy both while
+    never parking at all.
+  - **Third in a family found in one week**, and the family is the point: a fake more
+    PERMISSIVE than the thing it stands for. `InMemorySocket::Close` did not retrieve
+    a parked read where `EpollSocket::Close` always had; `InMemoryPageStore` modelled
+    behaviour the real store no longer has; this one holds a pointer no reactor socket
+    would. `testing.md`'s *a test fake is a shared helper too* is the general rule --
+    what these add is that the divergence is always in the direction that lets MORE
+    through, because a fake is written to satisfy the callers that exist.
+
 - **A parked read is retrieved by `Close()` and by nothing else, so the FAKE has to
   do it too.** `EpollSocket::Close` has always detached its parked awaitables and
   completed them with `Cancelled`; `InMemorySocket::Close` -- the socket every test in
@@ -1098,6 +1131,27 @@ Every rule below has already been a bug.
   - **Detach FIRST, complete LAST, touch no member after** -- `EpollSocket::Close`'s
     own rule, copied deliberately rather than re-derived, because completing resumes a
     coroutine that may own the socket and destroy it before `Complete` returns.
+
+- **A read-slot fixture with a byte in flight tests nothing**, because both arm sites
+  take a SYNCHRONOUS path first. `EpollSocket::Read` tries `recv` and
+  `EpollSocket::WaitReadable` tries `recv(MSG_PEEK)` before either reaches
+  `ClaimReadSlot`, so whichever call would have claimed an occupied slot returns early
+  the moment there is anything to read. Measured while reproducing
+  [#755](https://github.com/LASTRADA-Software/fastcached/issues/755): a fixture that
+  sent one more command after `UNSUBSCRIBE` PASSED against the unfixed tree, and the
+  same fixture with the wire left quiet aborted in `ClaimReadSlot` every time. **Keep
+  the wire silent and let the parks happen**, or the case is green for the same reason
+  the defect is invisible in production traffic.
+  - And the ordering that produced it is worth naming on its own: `RearmReadable` ran
+    immediately after `ReadOneCommand`, which is BEFORE the command is dispatched -- so
+    `UNSUBSCRIBE` re-armed the watcher and only then dropped the subscription count.
+    Settling a watcher belongs after the dispatch that can change what it is watching
+    for, which is the top of the next iteration, where the count is final and the
+    watcher is still parked on its rearm LATCH. That last clause is what lets it be
+    retired by tripping a latch rather than by a socket cancellation primitive this
+    tree does not have (#710) -- and it is why the re-arm now waits for the reader to
+    drain, since a watcher re-armed over buffered bytes goes back into `WaitReadable`
+    and out of the latch's reach.
 
 - **A socket has ONE read operation, `Read` and `WaitReadable` share it, and the
   rule lived nowhere it could be obeyed.** Both verbs begin by claiming the same

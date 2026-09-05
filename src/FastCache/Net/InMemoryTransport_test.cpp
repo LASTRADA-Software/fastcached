@@ -39,6 +39,37 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view p
     co_return result.has_value() && *result == payload.size();
 }
 
+/// What one parked `Accept` answered, published out of an EAGER coroutine.
+///
+/// Plain flags rather than a captured result: the point of these cases is whether the
+/// awaiting coroutine is reached at all, and a value that never arrives cannot be
+/// asserted on.
+struct AcceptOutcome
+{
+    bool resolved { false };  ///< The await returned.
+    bool hasValue { false };  ///< It carried a socket rather than a NetError.
+    bool cancelled { false }; ///< That error was `Cancelled`.
+};
+
+/// Park an eager coroutine on `Accept` and publish what it resolves with.
+///
+/// `DetachedTask` and not `Task`, and that is the whole fixture. A lazy `Task` does
+/// not start until it is awaited, so every existing case here reaches `Shutdown()`
+/// before anything suspends and the parked-accept path is never taken. An eager
+/// coroutine suspends inside `Accept` immediately, which is the shape #712's detached
+/// pump made ordinary in this tree.
+/// @param listener The listener to accept on.
+/// @param out Where the outcome is published; must outlive the task.
+/// @return The detached task.
+FastCache::DetachedTask ObserveAccept(FastCache::InMemoryListener* listener, AcceptOutcome* out)
+{
+    auto accepted = co_await listener->Accept();
+    out->hasValue = accepted.has_value();
+    if (!accepted.has_value())
+        out->cancelled = accepted.error().code == FastCache::NetErrorCode::Cancelled;
+    out->resolved = true;
+}
+
 /// Gather-write three text segments and report whether all bytes were sent.
 FastCache::Task<bool> WriteThreeSegments(FastCache::ISocket* socket,
                                          std::string_view a,
@@ -160,4 +191,69 @@ TEST_CASE("InMemoryPipe respects the backpressure cap", "[net][inmemory]")
         co_return !result.has_value();
     }(pair.client.get()));
     REQUIRE(second);
+}
+
+// -- #734: the pending accept must be the caller's awaitable, not a local ----
+//
+// `Accept` recorded `&awaitable` -- the address of a FUNCTION LOCAL -- and then
+// returned that local by value. The object the awaiting coroutine actually suspends
+// on is the copy in its own frame, so the recorded pointer named storage that was
+// gone before anything could complete it. Every other awaitable in this file takes
+// its pointer inside `await_suspend` through `SetSuspendCallback`, which is the only
+// moment `self` IS the frame-resident object.
+//
+// Latent until now because every existing case here uses the lazy `Task` shape and
+// reaches `Shutdown()` before anything parks. These two take the parking path on
+// purpose, one for each site that dereferences the pointer.
+
+TEST_CASE("InMemoryListener: Close retrieves an eagerly parked Accept", "[net][inmemory][accept]")
+{
+    FastCache::InMemoryListener listener;
+
+    AcceptOutcome observed;
+    ObserveAccept(&listener, &observed);
+    REQUIRE_FALSE(observed.resolved); // parked: nothing queued and not closed
+
+    // Pre-fix this completes through a pointer to a dead stack local.
+    listener.Close();
+
+    CHECK(observed.resolved);
+    CHECK_FALSE(observed.hasValue);
+    CHECK(observed.cancelled);
+}
+
+TEST_CASE("InMemoryListener: a connection completes an eagerly parked Accept", "[net][inmemory][accept]")
+{
+    // The second site that dereferences the same pointer. Asserted separately because
+    // `Close` and `TryCompletePendingAccept` are two call sites, and a fix applied to
+    // one of them would leave the other reading freed storage.
+    FastCache::InMemoryListener listener;
+
+    AcceptOutcome observed;
+    ObserveAccept(&listener, &observed);
+    REQUIRE_FALSE(observed.resolved);
+
+    auto client = listener.ConnectClient();
+    REQUIRE(client != nullptr);
+
+    CHECK(observed.resolved);
+    CHECK(observed.hasValue);
+}
+
+TEST_CASE("InMemoryListener: a queued connection is accepted without parking", "[net][inmemory][accept]")
+{
+    // The control, and not decoration: both cases above assert that a parked accept is
+    // REACHED, and an implementation that resolved every accept synchronously would
+    // satisfy them while never parking at all. Here the connection is queued first, so
+    // `Accept` must answer without suspending.
+    FastCache::InMemoryListener listener;
+
+    auto client = listener.ConnectClient();
+    REQUIRE(client != nullptr);
+
+    AcceptOutcome observed;
+    ObserveAccept(&listener, &observed);
+
+    CHECK(observed.resolved); // resolved on the spot, never parked
+    CHECK(observed.hasValue);
 }
