@@ -813,6 +813,69 @@ Every rule below has already been a bug.
   minutes against any `redis-server`. A rule people can re-run is one they stop
   re-litigating.
 
+- **A peer that has sent NOTHING has asked nothing, so there is nothing to answer --
+  and "it sent nothing" is two states, not one, neither of which is "the request was
+  bad".** The admin HTTP surface read its request head behind a `bool ok` and refused
+  every falsy reason `400 Bad Request`, so a connection the peer had opened and left
+  silent past the request deadline was *told its request was malformed*
+  ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)). This is the
+  EOF rule above evaluated on a fourth surface, and it lands the other way from
+  RESP's: a reply is owed for what is already DETERMINED, and a peer that has not
+  spoken has determined nothing.
+  - **It reached production because every fixture in this tree sends immediately.**
+    A browser opens speculative *preconnect* sockets ahead of a navigation and may
+    send on one much later or never, so the failing client was Chrome and the passing
+    one was `curl` — and sixteen `AdminHttpServer` cases, none of which asserted a
+    `400` at all, could not see it. The shape to add to a server fixture is the
+    client that connects and waits, not another that connects and asks.
+  - **Four outcomes, and the two that owe silence are still two.** `Idle` (the
+    deadline expired with nothing received) and `PeerGone` (the peer left with
+    nothing received) share today's disposition and are *different facts about the
+    peer*; folding them because the answer currently matches is how the `bool` this
+    replaces was built. `Malformed` keeps the `400` it always deserved, and a head
+    over the byte cap is `431` — which was not merely uncounted before but
+    MISANSWERED: the read loop stopped at the cap and the truncated prefix was then
+    parsed and SERVED, so a request line (which is at the front and always survives)
+    routed while every header past byte 8192 vanished, and a browser whose
+    `Authorization` fell beyond it was told `401`.
+  - **Neither silent outcome is counted, and that is a decision.**
+    `.agent/rules/metrics-and-observability.md`'s limit applies exactly here: not
+    every refusal is an EVENT, and an abandoned preconnect is what a HEALTHY browser
+    produces many times a minute. A counter on it is a series that never rests.
+  - **A deadline expiry is TWO error codes and the platforms disagree about which.**
+    `SO_RCVTIMEO` expires as `EAGAIN`/`EWOULDBLOCK` on POSIX and `WSAETIMEDOUT` on
+    Winsock, so a reader spelling only the obvious one is correct on one platform and
+    silently wrong on the other. It was open-coded at three sites in two subsystems
+    and a fourth tested `WouldBlock` alone; it is `Net::IsDeadlineExpiry` now, beside
+    the enum, which is a dependency-free leaf and so costs nothing at the
+    `net-boundary` line. `Consensus/RaftPeerServer.cpp` and
+    `apps/fastcache-compile-node/FrameEndpoint.cpp` still spell it by hand — the
+    latter with one operand.
+  - **The reported shape cannot be asserted on, and its deterministic twin can.**
+    *Connect, wait, then ask* is a RACE to observe: an unfixed server answers and
+    closes at the deadline, the client's late write then draws an RST, and the RST
+    discards the receive buffer holding the response the assertion is about.
+    Measured against one unfixed binary: a `python` client read the `400`, a bash
+    client read nothing, and a fixture built on that passes on the bug about half the
+    time. *Connect and never write* provokes no RST, so what comes back is what the
+    server volunteered — a `400` every time on the unfixed binary. Assert the shape
+    you can observe, not the shape the report described.
+  - **And a probe that reports silence must be able to say it never observed any.**
+    An expired `read -t` yields an empty body, byte-identical to *the server said
+    nothing* — which is the probe's own answer. `http_response_to_silence` refuses
+    instead, and the selftest case that stages a peer which neither speaks nor closes
+    is what caught the two defects in that refusal: `while read ...; do ...; done`
+    leaves `$?` holding the last command of the BODY (so a peer that says nothing
+    gives a clean `0`), and moving the read out of the condition made its failure
+    fatal under `set -e`, which one fixture sets and another does not.
+  - **Closing is better than refusing and is not the whole fix.** A closed connection
+    is retriable where a `400` is final, but the idle connection is still not SERVED,
+    because one number — `AdminHttpServer::RequestTimeout` — answers both *how long
+    may a peer be silent before it starts* and *how long may a head take*. That is
+    the same defect `.agent/rules/distributed-compilation.md` records for the compile
+    deadline, on another wire.
+    [#828](https://github.com/LASTRADA-Software/fastcached/issues/828).
+
 - **A TLS peer says "I have finished sending" with a RECORD, so the raw socket
   cannot answer that question, and delegating to it was reporting the opposite.**
   A well-behaved peer emits `close_notify` and only THEN the transport FIN, so at
@@ -1460,6 +1523,15 @@ consequence rather than a precaution.
 
 ## Open work
 
+- **[#828](https://github.com/LASTRADA-Software/fastcached/issues/828)** — the admin
+  surface's pre-first-byte wait and its mid-head read deadline are one number
+  (`AdminHttpServer::RequestTimeout`, armed as `SO_RCVTIMEO`), so a browser
+  preconnect used after 2 s is closed rather than served. #824 fixed the
+  disposition; this is the deadline. Not "raise the timeout", which slackens the
+  mid-head bound in exchange — split the two. The ticket carries the measured
+  before/after table and the two viable designs, and notes that
+  `RequestTimeout` is per READ rather than per request, so the head has no total
+  budget at all.
 - **[#710](https://github.com/LASTRADA-Software/fastcached/issues/710)** —
   `RunBlockingRead` arms a fresh `ArmDisconnect` per loop iteration and cancels none,
   so a wait resolved by the data or timeout arm leaves the previous trampoline parked

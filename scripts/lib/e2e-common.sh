@@ -741,23 +741,92 @@ stop_and_require_exit() {
 
 # ---------------------------------------------------------------------------
 
-# GET one path and echo the whole response, headers included.
+# Read one whole response off fd 3 and close it.
 #
-# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
-# tests nothing on the machine that lacks it, and this needs no more than one
-# request. Every read is bounded with `read -t`: the endpoint closes the
-# connection itself (`Connection: close`), so a healthy server ends the loop on
-# its own -- and a WEDGED one, which is exactly the state this probe exists to
-# detect, would otherwise hang the suite instead of failing it.
+# The read half of every helper below, in ONE place. Called directly rather than
+# through a command substitution, so `_http_drain_status` reaches its caller: a
+# subshell's variable does not.
 #
-# `read -t 5` and not a fractional timeout, because bash 3.2 rejects one.
+# `read -t 5` and not a fractional timeout, because bash 3.2 rejects one. Every
+# read is bounded because the endpoint closes the connection itself
+# (`Connection: close`), so a healthy server ends the loop on its own -- and a
+# WEDGED one, which is exactly the state these probes exist to detect, would
+# otherwise hang the suite instead of failing it.
 #
 # THE LAST CHUNK. `read` sets its variable and returns non-zero on a final chunk
 # with no trailing newline, so a naive loop drops it. That is not a corner case
 # here: the fleet dashboard's JSON document is ONE line with no newline at all, so
 # without the line below the whole body vanishes and every assertion about it
 # fails for a reason that has nothing to do with the server. One of the seven
-# copies of this function learnt that; the other six never did.
+# copies this file replaced learnt that; the other six never did -- which is the
+# whole argument for there being one copy now rather than one per helper.
+#
+# @return echoes the body; sets `_http_drain_status` to the `read` that ended the
+#         loop -- 1 when the PEER closed, above 128 when OUR bound expired. Those
+#         are different facts and one of them is not an answer.
+_http_drain_fd3() {
+    local line="" body=""
+    # The read's own status, taken at the read. A `while read ...; do ...; done`
+    # leaves `$?` holding the last command of the BODY -- so on a peer that never
+    # says anything the body never runs and `$?` is a clean 0, which reads as "the
+    # peer closed" for a read that in fact timed out. Caught by the selftest case
+    # that stages exactly that peer, which is the reason it exists.
+    while :; do
+        # `|| _http_drain_status=$?` rather than a bare read: a command whose failure
+        # is TESTED is exempt from `set -e`, and a bare one is not. This file is
+        # sourced by fixtures on both settings -- `check-e2e-helpers.sh` sets `-e`,
+        # `fleet-dashboard-e2e.sh` sets only `-uo pipefail` -- so a bare read here
+        # ended the whole shell on EOF in one and returned normally in the other.
+        _http_drain_status=0
+        IFS= read -r -t 5 line <&3 || _http_drain_status=$?
+        [ "$_http_drain_status" -eq 0 ] || break
+        body+="${line}"$'\n'
+    done
+    if [ -n "$line" ]; then body+="$line"; fi
+    exec 3<&-
+    printf '%s' "$body"
+}
+
+# What an HTTP surface says, unprompted, to a peer that says NOTHING.
+#
+# Connect and read; never send. That is an unused browser preconnect exactly, and
+# it is the DETERMINISTIC form of the #824 guard. The shape a report describes --
+# connect, wait, then ask -- cannot be asserted on: once the server has answered
+# and closed, the client's late write draws an RST, and the RST discards the
+# client's receive buffer before the response in it can be read. Measured both
+# ways against one unfixed binary: a `python` client saw the `400`, a bash client
+# saw nothing. A guard built on that passes on the bug about half the time.
+#
+# No idle parameter. `read -t 5` outlasts any request deadline this tree sets, so
+# a server that means to answer a silent peer has answered by the time the bound
+# expires and one that means to close has closed. Sleeping first would only make
+# the case slower.
+#
+# It REFUSES rather than answering when that bound is what ended the read: an
+# expired `read -t` yields an empty body, which is byte-identical to "the server
+# volunteered nothing" -- so without this the probe would go vacuous, silently,
+# the day anyone raises the server's deadline past five seconds.
+#
+# @param 1 host
+# @param 2 port
+# @return echoes whatever the server said unprompted, EMPTY when it said nothing;
+#         returns 1 if the connection was refused or if the read bound expired
+#         before the server either answered or closed
+http_response_to_silence() {
+    local host="$1" port="$2"
+    exec 3<>"/dev/tcp/${host}/${port}" || return 1
+    _http_drain_fd3
+    [ "$_http_drain_status" -le 128 ]
+}
+
+# ---------------------------------------------------------------------------
+
+# GET one path and echo the whole response, headers included.
+#
+# `/dev/tcp` rather than curl, because a fixture that skips when curl is absent
+# tests nothing on the machine that lacks it, and this needs no more than one
+# request. The read half, its bound and the last-chunk recovery are
+# `_http_drain_fd3`'s.
 #
 # @param 1 host
 # @param 2 port
@@ -767,77 +836,8 @@ stop_and_require_exit() {
 http_get() {
     local host="$1" port="$2" path="$3"
     shift 3
-    http_get_after_idle "$host" "$port" "$path" 0 ${@+"$@"}
-}
-
-# What an HTTP surface says, unprompted, to a peer that says NOTHING.
-#
-# Connect and read; never send. That is an unused browser preconnect exactly, and
-# it is the DETERMINISTIC form of the #824 guard -- the idle-then-send shape a
-# report describes is a race once the server has already answered and closed: the
-# client's late write draws an RST, the RST discards the client's receive buffer,
-# and the response the server really did send is destroyed before it can be read.
-# Measured both ways against one unfixed binary: `python` saw the `400`, this
-# file's own `http_get_after_idle` saw nothing. A probe that never writes cannot
-# provoke that RST, so what comes back is what the server volunteered and nothing
-# else.
-#
-# No sleep parameter. `read -t 5` outlasts any request deadline this tree sets, so
-# a server that means to answer a silent peer has answered by the time the bound
-# expires, and one that means to close has closed. Adding a sleep in front would
-# only make the case slower and its bound harder to reason about.
-#
-# @param 1 host
-# @param 2 port
-# @return echoes whatever the server said unprompted, EMPTY when it said nothing;
-#         returns 1 if the connection was refused
-http_response_to_silence() {
-    local host="$1" port="$2"
-    local line="" body=""
+    local header=""
     exec 3<>"/dev/tcp/${host}/${port}" || return 1
-    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
-    if [ -n "$line" ]; then body+="$line"; fi
-    exec 3<&-
-    printf '%s' "$body"
-}
-
-# The same, after holding the connection open and silent for a while first.
-#
-# A browser opens speculative *preconnect* sockets ahead of a navigation and may
-# send on one much later, so "connect, wait, then ask" is an ordinary thing for a
-# real client to do and was a thing NO fixture in this tree did -- every one of
-# them sent immediately, which is why an admin surface answering `400` to a silent
-# peer past its request deadline reached production
-# ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)).
-#
-# `http_get` is a wrapper over this rather than a sibling of it. A second copy of
-# the connect/send/read sequence is precisely what this file exists to stop: the
-# trailing-chunk fix below is one such divergence that took six copies with it,
-# and a new copy would inherit that bug by construction.
-#
-# The idle is an INTEGER number of seconds. POSIX `sleep` is only required to take
-# one, and this file already refuses a fractional `read -t` for the bash 3.2 that
-# macOS ships; a caller wanting to straddle a sub-second deadline should move the
-# deadline, not the sleep.
-#
-# @param 1 host
-# @param 2 port
-# @param 3 path
-# @param 4 whole seconds to stay connected and silent before sending; 0 to send at once
-# @param 5.. extra request header lines, without CRLF, e.g. "Authorization: x"
-# @return echoes the response, which is EMPTY when the server answered nothing;
-#         returns 1 if the connection was refused
-http_get_after_idle() {
-    local host="$1" port="$2" path="$3" idle="$4"
-    shift 4
-    local line="" body="" header=""
-    exec 3<>"/dev/tcp/${host}/${port}" || return 1
-    # After the connect and before the first byte: a socket the server has
-    # accepted and on which nothing has been said, which is the whole state under
-    # test. Sending first and sleeping after would test something else entirely.
-    if [ "$idle" -gt 0 ]; then
-        sleep "$idle"
-    fi
     {
         printf 'GET %s HTTP/1.1\r\nHost: %s\r\n' "$path" "$host"
         for header in ${@+"$@"}; do
@@ -845,10 +845,7 @@ http_get_after_idle() {
         done
         printf 'Connection: close\r\n\r\n'
     } >&3
-    while IFS= read -r -t 5 line <&3; do body+="${line}"$'\n'; done
-    if [ -n "$line" ]; then body+="$line"; fi
-    exec 3<&-
-    printf '%s' "$body"
+    _http_drain_fd3
 }
 
 # ---------------------------------------------------------------------------

@@ -6,12 +6,13 @@
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
+#include <tests/SocketDecorator.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -68,111 +69,41 @@ std::string Exchange(std::string_view request, FastCache::IMetricsSink const& me
 /// the headers unread in the receive queue -- which makes `close()` send RST
 /// instead of FIN. Stating the segmentation directly is the same device the
 /// launcher's fake `IPathResolver` uses for aliasing it cannot create on the host.
-class ShortReadSocket final: public FastCache::ISocket
+///
+/// Local because the CONDITION is this file's. The forwarding is not, and lives on
+/// `SocketDecorator` -- including the four defaulted `ISocket` virtuals this used
+/// to answer from the base rather than from the socket it decorates.
+class ShortReadSocket final: public FastCache::Testing::SocketDecorator
 {
   public:
     ShortReadSocket(FastCache::ISocket& inner, std::size_t limit) noexcept:
-        _inner { inner },
+        SocketDecorator { inner },
         _limit { limit }
     {
     }
 
+    /// Hand up no more than `limit` bytes, whatever the caller asked for.
+    /// @param buffer Where to put them.
+    /// @return What the decorated socket delivered into the narrowed span.
     [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> buffer) override
     {
-        return _inner.Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable Write(std::span<std::byte const> buffer) override
-    {
-        return _inner.Write(buffer);
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                                       std::shared_ptr<void const> keepAlive = {}) override
-    {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
-    }
-
-    void Close() noexcept override
-    {
-        _inner.Close();
-    }
-
-    [[nodiscard]] bool IsClosed() const noexcept override
-    {
-        return _inner.IsClosed();
+        return SocketDecorator::Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
     }
 
   private:
-    FastCache::ISocket& _inner;
     std::size_t _limit;
 };
 
-/// An `ISocket` whose every read fails, the way an expired receive deadline does.
+/// Serve one request over a fresh pair, and return what reached the client.
 ///
-/// The request deadline is armed as `SO_RCVTIMEO` on the accepted socket, so its
-/// expiry reaches the server as a read *error* -- there is no separate signal to
-/// simulate. `InMemorySocketPair` cannot produce one: it is a byte pipe whose reads
-/// either deliver bytes or report EOF, which is exactly the *other* silent outcome,
-/// so a fixture built on it alone cannot tell the two apart. Same device as
-/// `ShortReadSocket` above, for a condition the host cannot be made to create.
-///
-/// The code is a parameter because the platforms disagree about which one an expiry
-/// is: POSIX reports `EAGAIN`/`EWOULDBLOCK` and Winsock `WSAETIMEDOUT`. A fixture
-/// pinning one of them would leave the other's classification untested on the
-/// platform that actually uses it.
-class FailingReadSocket final: public FastCache::ISocket
-{
-  public:
-    FailingReadSocket(FastCache::ISocket& inner, FastCache::NetErrorCode code) noexcept:
-        _inner { inner },
-        _code { code }
-    {
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> /*buffer*/) override
-    {
-        return FastCache::IoAwaitable { FastCache::IoResult { std::unexpected(FastCache::NetError { .code = _code, .systemCode = 0, .context = {} }) } };
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable Write(std::span<std::byte const> buffer) override
-    {
-        return _inner.Write(buffer);
-    }
-
-    [[nodiscard]] FastCache::IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                                       std::shared_ptr<void const> keepAlive = {}) override
-    {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
-    }
-
-    void Close() noexcept override
-    {
-        _inner.Close();
-    }
-
-    [[nodiscard]] bool IsClosed() const noexcept override
-    {
-        return _inner.IsClosed();
-    }
-
-  private:
-    FastCache::ISocket& _inner;
-    FastCache::NetErrorCode _code;
-};
-
-/// Serve one request over a caller-supplied server-side socket decorator.
-///
-/// `Exchange` above always writes the request first, which is precisely the shape
+/// `Exchange` above always writes a request first, which is precisely the shape
 /// that cannot reach #824: every fixture in this file sent immediately, and that is
 /// why a surface answering `400` to a silent peer went unnoticed for as long as it
-/// did. This one hands the decorator the server end and returns whatever reached the
-/// client -- **including nothing**, which is the assertion the silent outcomes need.
+/// did. This one allows an EMPTY request and returns whatever the server wrote --
+/// **including nothing**, which is the assertion the silent outcomes need.
 /// @param request What the client sends before the server is driven; may be empty.
-/// @param decorate Wraps the server-side socket; the wrapper must outlive the call.
 /// @return Every byte the server wrote, which is empty when it wrote none.
-std::string ExchangeOver(std::string_view request,
-                         std::function<FastCache::ISocket*(FastCache::ISocket*)> const& decorate)
+std::string ExchangeMaybeSilent(std::string_view request)
 {
     FastCache::AtomicMetricsSink metrics;
     auto pair = FastCache::InMemorySocketPair::Create();
@@ -183,17 +114,9 @@ std::string ExchangeOver(std::string_view request,
     auto provider = [] {
         return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(decorate(pair.server.get()), &metrics, provider));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
-}
-
-/// The server end, undecorated.
-/// @param socket The server-side socket.
-/// @return The same socket.
-FastCache::ISocket* AsIs(FastCache::ISocket* socket) noexcept
-{
-    return socket;
 }
 
 } // namespace
@@ -498,22 +421,31 @@ TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, no
     // owed -- and the 400 this used to answer is what reached a real browser as a
     // broken dashboard.
     auto const code = GENERATE(FastCache::NetErrorCode::WouldBlock, FastCache::NetErrorCode::Timeout);
-    std::optional<FailingReadSocket> stalled;
-    auto const response = ExchangeOver({}, [&](FastCache::ISocket* server) -> FastCache::ISocket* {
-        stalled.emplace(*server, code);
-        return &*stalled;
-    });
     INFO("read failed with NetErrorCode " << static_cast<unsigned>(code));
-    REQUIRE(response.empty());
+
+    auto pair = FastCache::InMemorySocketPair::Create();
+    // Reads fail; writes still go through. So an empty response is the server
+    // declining to answer, never the server failing to.
+    FastCache::Testing::FailingReadSocket stalled { *pair.server, code };
+
+    FastCache::AtomicMetricsSink metrics;
+    using namespace std::chrono_literals;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = {}, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&stalled, &metrics, provider));
+    pair.server->Close();
+
+    REQUIRE(FastCache::SyncRun(ReadAvailable(pair.client.get())).empty());
 }
 
 TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused", "[metrics][http][admin][idle]")
 {
     // The other silence: an abandoned preconnect, a TCP liveness probe, a port
-    // scan. `ExchangeOver` half-closes with nothing written, so the server's first
-    // read is EOF rather than an error -- the state `FailingReadSocket` cannot
+    // scan. `ExchangeMaybeSilent` half-closes with nothing written, so the first read
+    // is EOF rather than an error -- the state `FailingReadSocket` cannot
     // produce and the one the case above must not be mistaken for.
-    REQUIRE(ExchangeOver({}, AsIs).empty());
+    REQUIRE(ExchangeMaybeSilent({}).empty());
 }
 
 TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http][admin][idle]")
@@ -521,7 +453,7 @@ TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http
     // The control, and the half that was never covered at all: before #824 this
     // file had sixteen cases and not one of them asserted a 400, so the outcome
     // that legitimately deserves one was as untested as the three that did not.
-    auto const response = ExchangeOver("nonsense\r\n\r\n", AsIs);
+    auto const response = ExchangeMaybeSilent("nonsense\r\n\r\n");
     REQUIRE(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
 }
 
@@ -539,7 +471,7 @@ TEST_CASE("AdminHttp: a head that overruns the byte cap is refused 431, not serv
     std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
     request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
     request += "\r\n";
-    auto const response = ExchangeOver(request, AsIs);
+    auto const response = ExchangeMaybeSilent(request);
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }
@@ -552,7 +484,7 @@ TEST_CASE("AdminHttp: a large but complete head under the cap still routes", "[m
     std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
     request += "X-Pad: " + std::string(4000, 'p') + "\r\n";
     request += "\r\n";
-    REQUIRE(ExchangeOver(request, AsIs).starts_with("HTTP/1.1 200 OK\r\n"));
+    REQUIRE(ExchangeMaybeSilent(request).starts_with("HTTP/1.1 200 OK\r\n"));
 }
 
 TEST_CASE("A tolerated admin bind failure is reported at Warn and says the daemon carries on",

@@ -1103,11 +1103,16 @@ if(NOT WIN32)
     # ctest timeout and a failed assertion are indistinguishable from the count
     # alone). On a 32-core Linux host, local ext4:
     #
-    #     idle                       34s
-    #     load average ~44, 20 runs  35s worst
+    #     idle                       40s
+    #     load average ~44, 20 runs  35s worst  (at 34s idle, before #824)
+    #
+    # #824 added ~6s: `http-silence-inconclusive` stages a listener that accepts and
+    # then neither speaks nor closes, so it costs `_http_drain_fd3`'s whole `read -t`
+    # bound BY CONSTRUCTION -- that expiry is the thing it asserts on. Three runs:
+    # 37.2s, 38.9s, 40.1s.
     #
     # So the cost is almost entirely the deliberate SLEEPS, which is why CPU
-    # contention barely moves it: 3.5x headroom against this bound, and a run
+    # contention barely moves it: 3x headroom against this bound, and a run
     # that approaches 120s means something other than a busy machine. A figure
     # here rather than "well inside": #665 is the same shape, a registration's
     # stated cost against its measured one.

@@ -56,6 +56,29 @@ struct NetError
     }
 };
 
+/// Whether a failed operation failed because its deadline expired.
+///
+/// **Two codes, one fact, and which one arrives is the platform's choice.** A
+/// receive or send deadline armed with `SO_RCVTIMEO`/`SO_SNDTIMEO` expires as
+/// `EAGAIN`/`EWOULDBLOCK` on POSIX and as `WSAETIMEDOUT` on Winsock, so a caller
+/// asking "did I run out of time" has to accept both -- and a caller that spells
+/// only the obvious one is correct on one platform and silently wrong on the other.
+///
+/// It lives here, beside the enum, because the question was open-coded at three
+/// sites in two subsystems and a fourth spelled it with one operand
+/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)). A
+/// dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary` line.
+///
+/// It says nothing about *whose* deadline: a caller that must tell "I gave up" from
+/// "the peer went away" asks its own timer, which is what `SocketDeadlineTarget`
+/// is for.
+/// @param code The code an operation failed with.
+/// @return Whether that code is this platform's spelling of a deadline expiry.
+[[nodiscard]] constexpr bool IsDeadlineExpiry(NetErrorCode code) noexcept
+{
+    return code == NetErrorCode::Timeout || code == NetErrorCode::WouldBlock;
+}
+
 /// Convert a NetErrorCode to a stable string name for diagnostics.
 /// @param code Code to translate.
 /// @return Static string view; never empty.

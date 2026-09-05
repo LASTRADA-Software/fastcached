@@ -739,47 +739,17 @@ run_case() {
         echo "both caller headers reached the server"
         ;;
 
-    # The idle variant still sends and still reads. `http_get` is a wrapper over
-    # `http_get_after_idle`, so a defect in the shared sequence takes both with it
-    # -- but only this case exercises the sleep sitting between the connect and the
-    # first byte, and a `sleep` in the wrong place would look identical from the
-    # caller's side on a listener that answers whenever it is asked.
-    #
-    # What this CANNOT assert is what a server does with the silence, which is the
-    # subject of #824: the staged listener has no request deadline, so it waits.
-    # That half is `fleet-dashboard-e2e`'s, against a real node.
-    http-idle)
-        p="$(free_port)"
-        _selftest_listener "$p" 0 "${scratch}/idle.log" \
-            >/dev/null 2>>"${scratch}/idle.log" &
-        listener=$!
-        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/idle.log" 15
-        body="$(http_get_after_idle 127.0.0.1 "$p" /fleet.json 1)"
-        kill "$listener" 2>/dev/null || true
-        case "$body" in
-            *NO-TRAILING-NEWLINE*) echo "http_get_after_idle asked and was answered" ;;
-            *) fail "http_get_after_idle brought back nothing; the body was '${body}'" ;;
-        esac
-        ;;
-
     # The silence probe brings back what a server volunteered without being asked.
     #
     # Staged against a listener that SPEAKS FIRST, because the interesting failure
     # is a probe that reads nothing whatever the server does -- which would look
-    # identical to the property #824's fixture asserts, and would pass on a broken
-    # server forever. A listener that says nothing cannot tell those apart; one
-    # that speaks can.
+    # identical to the property `fleet-dashboard-e2e` asserts, and would then pass
+    # on a broken server forever. A listener that says nothing cannot tell those
+    # apart; one that speaks can.
     http-silence)
         p="$(free_port)"
-        perl -e '
-            use strict; use warnings; use IO::Socket::INET;
-            my $srv = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0],
-                Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
-            while (my $c = $srv->accept()) {
-                print $c "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nUNASKED";
-                close $c;
-            }
-        ' "$p" >/dev/null 2>>"${scratch}/silence.log" &
+        _selftest_unprompted_listener "$p" answer "${scratch}/silence.log" \
+            >/dev/null 2>>"${scratch}/silence.log" &
         listener=$!
         wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/silence.log" 15
         body="$(http_response_to_silence 127.0.0.1 "$p")"
@@ -788,6 +758,27 @@ run_case() {
             *UNASKED*) echo "http_response_to_silence reported what the server volunteered" ;;
             *) fail "http_response_to_silence brought back nothing from a server that spoke: '${body}'" ;;
         esac
+        ;;
+
+    # ... and REFUSES when its own bound is what ended the read.
+    #
+    # The arm that would otherwise never be watched, and the one that matters: an
+    # expired `read -t` yields an empty body, which is byte-identical to "the server
+    # said nothing" -- the very answer the probe exists to report. Against a listener
+    # that accepts and then neither speaks nor closes, a probe without this arm
+    # reports a clean pass for a question it could not answer. Costs the bound.
+    http-silence-inconclusive)
+        p="$(free_port)"
+        _selftest_unprompted_listener "$p" hold "${scratch}/hold.log" \
+            >/dev/null 2>>"${scratch}/hold.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/hold.log" 15
+        if http_response_to_silence 127.0.0.1 "$p" >/dev/null; then
+            kill "$listener" 2>/dev/null || true
+            fail "http_response_to_silence reported an answer for a server that never spoke or closed"
+        fi
+        kill "$listener" 2>/dev/null || true
+        echo "http_response_to_silence refused rather than reporting silence it never observed"
         ;;
 
     # A refused connection is a RETURN, not a stop: a fixture asking whether a
@@ -944,6 +935,44 @@ _selftest_listener() {
             print $c "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                    . "Connection: close\r\n\r\n{\"tail\":\"NO-TRAILING-NEWLINE\"}";
             close $c;
+        }
+    ' "$1" "$2" "$3"
+}
+
+# A listener that answers a client which has said NOTHING, or holds it open.
+#
+# `_selftest_listener` above reads a request line before it answers, so it cannot
+# stage either half of `http_response_to_silence`'s contract. The two modes are the
+# probe's two outcomes: `answer` is a server that volunteers a response (which is
+# exactly the #824 defect), `hold` is one that neither speaks nor closes (which is
+# the state the probe must REFUSE to report on rather than read as silence).
+#
+# Perl for the listener, for the reason the other stand-ins give: nc's listen flags
+# differ between the BSD, GNU and OpenBSD builds, and one of those is on every
+# platform CI runs but never the same one.
+#
+# @param 1 port
+# @param 2 `answer` to speak first and close, `hold` to accept and do neither
+# @param 3 the log to write failures to
+_selftest_unprompted_listener() {
+    perl -e '
+        use strict; use warnings; use IO::Socket::INET;
+        my ($port, $mode, $logfile) = @ARGV;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => $port,
+            Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+        open(my $log, ">>", $logfile) or die $!;
+        $log->autoflush(1);
+        my @held;
+        while (my $c = $srv->accept()) {
+            if ($mode eq "answer") {
+                print $c "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nUNASKED";
+                close $c;
+            } else {
+                # Kept in scope on purpose: letting it fall out of scope would close
+                # it, which is the OTHER outcome and would stage the wrong case.
+                push @held, $c;
+            }
         }
     ' "$1" "$2" "$3"
 }
@@ -1196,8 +1225,8 @@ socket_cases=(
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
-    "http-idle|0|http_get_after_idle asked and was answered"
     "http-silence|0|http_response_to_silence reported what the server volunteered"
+    "http-silence-inconclusive|0|refused rather than reporting silence it never observed"
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"

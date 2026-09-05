@@ -690,6 +690,21 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   control that must survive an open write side, or *detect a graceful close* and
   *abandon every blocking read* are the same passing test. The signal is that the
   handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
+- A peer that sent NOTHING asked nothing, so it is CLOSED, not refused — and "sent nothing"
+  is TWO states (deadline expired, peer left), neither of which is "the request was bad". The
+  admin surface hid four outcomes behind one `bool ok` and answered every one `400`, so a
+  Chrome preconnect used after 2 s rendered `400` while `curl` — which sends immediately, like
+  every fixture here — never reproduced it. A head over the byte cap is `431`, and was not
+  merely uncounted before but MISANSWERED: the prefix was parsed and SERVED, dropping every
+  header past 8192 and answering `401` to a browser whose credential fell beyond it. Neither
+  silent outcome is counted, deliberately — a healthy browser produces them by the minute. A
+  deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
+  never one operand. **The reported shape cannot be asserted on** — connect-wait-send is a race,
+  because the late write draws an RST that destroys the very response being asserted on (measured:
+  python saw the `400`, bash saw nothing) — so the probe never writes. And a probe reporting
+  silence must be able to say it observed none, or an expired `read -t` reads as the answer.
+  Closing is retriable where `400` is final and is still not the whole fix: one number answers
+  both *how long may a peer be silent* and *how long may a head take* (#828).
 - And a TLS peer says it with a RECORD, so the raw socket answers the OPPOSITE:
   `close_notify` then FIN means bytes are on the wire, the raw peek reports `>0`, and
   #673's EOF arm declined for every TLS client on the one transport where the graceful
