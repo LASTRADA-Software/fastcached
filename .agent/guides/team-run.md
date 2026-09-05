@@ -658,6 +658,30 @@ of the sample**, absent as its own outcome, and no verdict. And it comes from
 enumerating `/actions/runs/<id>/jobs`: a run's own `status` field is not a summary of
 its jobs and can lag them by fifteen minutes.
 
+### A retraction reaches people; the artefact goes on asserting
+
+A manager diagnosed a gate dying with exit 144 as two concurrent gates exhausting
+swap, wrote that into the header of the shared `gate-serial.sh`, and later withdrew
+the diagnosis in a message to a lane. The header was not changed. A different lane
+then read the header, cited it as documentation, and replaced its own correctly
+hedged *"cause undetermined"* with the withdrawn explanation -- which was wrong twice
+over: swap sits at 7G/7G as a standing condition with no gate running, so it cannot
+explain one specific death, and 144 is signal 16 where a `pkill` would give 143.
+
+**A message is corrected by the next message; a comment, a header or a script is
+not.** It goes on being read by people who never saw the retraction, and it carries
+more authority than the message did, because it looks like documentation rather than
+somebody's opinion. So a retraction lands in the ARTEFACT in the same change that
+sends it, or it has not happened -- and an artefact whose claim is withdrawn says so
+in place, rather than going quiet.
+
+The receiving half is the sharper one. **Sourcing is checked for currency, not merely
+for existence.** The lane that cited the header did not believe something new; it
+traded a hedge it had reasoned its way to for a confident claim that merely looked
+better sourced. That is a downgrade that feels like an upgrade, and neither party
+noticed until the numbers were checked against the machine. Where a source cannot be
+shown to be current, the honest verdict is the one the hedge already had.
+
 ### Hand over the checkable form, not the answer
 
 The manager's half of this. Naming the master SHA rather than saying "it merged", and
