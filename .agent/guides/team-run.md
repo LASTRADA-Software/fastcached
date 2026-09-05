@@ -284,6 +284,20 @@ follow, silently, on the success path. Neither `--force-with-lease` nor
 `--force-if-includes` helps once the fetch has happened; the left-hand SHA is the
 one signal that survives, and checking it costs nothing.
 
+**But it is only informative if you know your own last-pushed SHA.** The lane that
+made this mistake HAD it -- `4fe1d41d` -- and still did not compare. So keep it, and
+prefer the two mechanical forms over memory:
+
+```
+git ls-remote origin <branch>                      # ask before pushing; no fetch, so no lease to spoil
+git push --force-with-lease=<branch>:<sha-you-last-pushed> origin <branch>
+```
+
+A lease pinned to an explicit SHA cannot be relaxed by a later fetch, so it survives
+the rebase-then-force sequence that defeats the bare form. Pair it with the eyeball
+check rather than replacing it: the pinned form needs a SHA you kept, and the eyeball
+check needs nothing and still works when you did not.
+
 **The real remedy is upstream: do not put two lanes on one branch.** A manager who
 believes a lane has gone quiet must establish it by comparing the branch head
 against the head the work was based on — **never by the head's age.** A commit's
