@@ -489,6 +489,52 @@ set_tests_properties("debug-prefix-map-rules" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Whether a set-but-EMPTY FASTCACHE_ADDR opts out of the launcher, as the
+# operator documentation promises. The module folded it into the default, so
+# `export FASTCACHE_ADDR=` kept caching on every shell and every platform (#372).
+#
+# Driven as a pure computation for a reason the fixture could not work around:
+# the two inputs that matter differ ONLY in whether the environment defines the
+# name, the value being empty either way -- and on PowerShell that case cannot be
+# expressed at all, since `$env:X = ""` keeps the name in PowerShell's own view
+# while the child never receives it. A configure-based fixture would there be
+# asserting the wrong thing while looking right.
+#
+# Not labelled "smoke": it starts nothing and finishes in milliseconds.
+add_test(
+    NAME "fastcache-addr-opt-out"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-fastcache-addr-opt-out.cmake"
+)
+set_tests_properties("fastcache-addr-opt-out" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# A version-mismatched fastcache-cc falling through to sccache must say so where
+# the fallback happens, not eighty lines from the warning about what sccache
+# costs under MSVC (#658). Narrow: only that reason, only that winner, and only
+# where the caveat exists at all.
+#
+# Pure, because the real situation needs two binaries at disagreeing wire
+# versions plus an MSVC-family compiler -- a second machine and a downgrade
+# rather than a fixture.
+add_test(
+    NAME "version-fallback-warning"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-version-fallback-warning.cmake"
+)
+set_tests_properties("version-fallback-warning" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Repository hygiene. Fails when a path that must never be committed is tracked
 # by git. Today that is version.txt, whose committed presence outranked every git
 # tag and pinned every build, every wire banner and every package to whatever it

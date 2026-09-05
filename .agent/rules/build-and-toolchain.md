@@ -2071,8 +2071,13 @@ makes it anyway and says so there.
   A rule whose own example contradicts it is worse than no example.
 
   `-B` overrides the preset's `binaryDir`, which is what keeps this out of the
-  `out/build/clang-debug` tree `local-gate.sh` builds — configuring the sweep's
-  database must not turn `ENABLE_TIDY` and module scanning off in that one.
+  `out/build/clang-debug` tree a DEVELOPER builds in — configuring the sweep's
+  database must not turn `ENABLE_TIDY` and module scanning off in that one. (It
+  used to be the tree `local-gate.sh` built in as well; since
+  [#487](https://github.com/LASTRADA-Software/fastcached/issues/487) the gate owns
+  `out/build/gate-*` and reaches this one no more than the sweep does. The
+  reasoning is unchanged — only the list of things that would otherwise collide in
+  there got shorter.)
 
   The line is the `clang-tidy` job's `Configure` step verbatim plus `-B`, and
   `ctest -R tidy-sweep-database` asserts it stays that way: nothing else connects

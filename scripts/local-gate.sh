@@ -71,7 +71,7 @@
 # per-leg verdict naming what passed, what failed, and what never started. Stopping
 # early is right; saying nothing about the legs it skipped was not, and
 #
-#     GATE FAILED: clang-debug tests
+#     GATE FAILED: gate-clang-debug tests
 #
 # read as "the rest passed" when the rest had not been asked. What that cost, and
 # why the renderer below is a pure function, is in
@@ -147,7 +147,11 @@ leg_summary() {
             not-run) label="NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" ;;
             *)       label="UNKNOWN STATE '$state' -- this is a bug in the gate, not a verdict" ;;
         esac
-        printf '==   %-14s %s\n' "$preset" "$label"
+        # 18, not 14: the gate presets are `gate-clang-debug` and
+        # `gate-gcc-release` (#487), which are 16 characters and ran into the
+        # verdict column. Sized from the longest name this table can hold rather
+        # than from the longest one it holds today.
+        printf '==   %-18s %s\n' "$preset" "$label"
     done
 }
 
@@ -161,10 +165,42 @@ leg_summary() {
 #
 #   preset|tidy      the preset runs clang-tidy, so the pin must reach it
 #   preset|no-tidy   it does not, and the run prints that rather than staying silent
+# The `gate-` presets, not the developer's. They inherit the real ones entry for
+# entry and differ in exactly two things: their own `binaryDir` (derived from the
+# preset name by `base`), and `USE_COMPILER_CACHE=OFF` as a cache variable rather
+# than a `-D` this script passes. That is #487: a `-D` writes a cache entry,
+# `option()` never overrides one, and the gate was configuring the very
+# directories AGENT.md tells developers to build in -- so one gate run left every
+# ordinary build in the tree uncached, permanently, in the repository whose
+# product is a compile cache.
+#
+# NOT hidden, and they cannot be: `"hidden": true` makes `--preset` refuse a preset
+# outright, and this script selects them by name. They are undocumented rather than
+# hidden -- their displayName says whose directory they are and whose they are not,
+# which is the most a visible preset can do.
 gate_presets=(
-    "clang-debug|tidy"
-    "gcc-release|no-tidy"
+    "gate-clang-debug|tidy"
+    "gate-gcc-release|no-tidy"
 )
+
+# Every row must name a GATE-OWNED preset, checked rather than trusted. Reverting
+# the two rows above fails the self-test, which compares literals -- but ADDING a
+# third row naming an ordinary preset reopens #487 in full and passes every check
+# in this file. That is the direction a literal comparison is blind to: exact about
+# what it knows, silent about what arrives.
+for _gate_row in "${gate_presets[@]}"; do
+    case "${_gate_row%%|*}" in
+        gate-*) ;;
+        *)
+            echo "GATE BUG: gate_presets row '${_gate_row}' does not name a gate-owned preset." >&2
+            echo "  The gate must not configure a directory a developer builds in: a reference" >&2
+            echo "  build turns the compiler cache off, and that setting is permanent for the" >&2
+            echo "  directory. See issue #487." >&2
+            exit 1
+            ;;
+    esac
+done
+unset _gate_row
 
 # What each leg has done so far, by index into the table above. Declared empty and
 # never pre-filled: `leg_pairs` reads an absent entry as `not-run`, which is the
@@ -619,45 +655,45 @@ if [[ "$self_test" -eq 1 ]]; then
     # something.
     expect "a leg that ran and passed says so" \
         "== gate legs:
-==   clang-debug    passed" \
-        "$(leg_summary clang-debug=passed)"
+==   gate-clang-debug   passed" \
+        "$(leg_summary gate-clang-debug=passed)"
     expect "a leg that ran and failed says FAILED" \
         "== gate legs:
-==   clang-debug    FAILED" \
-        "$(leg_summary clang-debug=failed)"
+==   gate-clang-debug   FAILED" \
+        "$(leg_summary gate-clang-debug=failed)"
 
     # The acceptance criterion, asserted as the inequality it actually is rather than
     # by eyeballing two literals: these two renderings must never coincide.
     expect "FAILED and NOT RUN do not render the same for the same preset" \
         "differ" \
-        "$([[ "$(leg_summary gcc-release=failed)" != "$(leg_summary gcc-release=not-run)" ]] && echo differ || echo SAME)"
+        "$([[ "$(leg_summary gate-gcc-release=failed)" != "$(leg_summary gate-gcc-release=not-run)" ]] && echo differ || echo SAME)"
 
     # The scenario from #493, end to end: first leg red, second never asked. The
     # second line is the one that was missing for five consecutive gate runs.
     expect "a first-leg failure names the leg that never started" \
         "== gate legs:
-==   clang-debug    FAILED
-==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
-        "$(leg_summary clang-debug=failed gcc-release=not-run)"
+==   gate-clang-debug   FAILED
+==   gate-gcc-release   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+        "$(leg_summary gate-clang-debug=failed gate-gcc-release=not-run)"
 
     # The fourth state, and the reason the renderer has a default arm at all: a state
     # it does not know must not be shown as the nearest plausible verdict. `passed`
     # there would recreate #501 exactly, one level down.
     expect "an unrecognised state is reported as unrecognised, never as a verdict" \
         "== gate legs:
-==   clang-debug    UNKNOWN STATE 'wat' -- this is a bug in the gate, not a verdict" \
-        "$(leg_summary clang-debug=wat)"
+==   gate-clang-debug   UNKNOWN STATE 'wat' -- this is a bug in the gate, not a verdict" \
+        "$(leg_summary gate-clang-debug=wat)"
 
     # An entry nothing has written yet reads as never run, which is what makes an
     # empty `leg_states` honest rather than a hole -- and the second check is the
     # index arithmetic itself, which pairs row N with state N.
     expect "leg_pairs reads an unwritten entry as never run" \
-        "clang-debug=not-run
-gcc-release=not-run" \
+        "gate-clang-debug=not-run
+gate-gcc-release=not-run" \
         "$(leg_pairs)"
     expect "leg_pairs pairs each table row with the state written for it" \
-        "clang-debug=passed
-gcc-release=failed" \
+        "gate-clang-debug=passed
+gate-gcc-release=failed" \
         "$(leg_states=(passed failed); leg_pairs)"
 
     # THE WIRING, which none of the above can see. Deleting the summary from `fail`,
@@ -683,15 +719,15 @@ gcc-release=failed" \
     stub_returns_one() { return 1; }
 
     expect "a run where every leg passes marks every leg passed" \
-        "clang-debug=passed
-gcc-release=passed" \
+        "gate-clang-debug=passed
+gate-gcc-release=passed" \
         "$(run_all_legs stub_ok; leg_pairs)"
 
     expect "a first-leg failure refuses through fail(), naming the leg never reached" \
-        "GATE FAILED: clang-debug tests
+        "GATE FAILED: gate-clang-debug tests
 == gate legs:
-==   clang-debug    FAILED
-==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+==   gate-clang-debug   FAILED
+==   gate-gcc-release   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
         "$( (run_all_legs stub_fail_first; echo CONTINUED) 2>&1 )"
 
     # A runner that RETURNS non-zero rather than calling `fail`. There is no `set -e`,
@@ -699,10 +735,10 @@ gcc-release=passed" \
     # gate green -- #501 one level down. The natural future edit (a non-fatal leg that
     # returns instead of exiting) is exactly what would do it.
     expect "a runner that returns non-zero is a failed leg, never a passed one" \
-        "GATE FAILED: clang-debug returned 1 rather than refusing
+        "GATE FAILED: gate-clang-debug returned 1 rather than refusing
 == gate legs:
-==   clang-debug    FAILED
-==   gcc-release    NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+==   gate-clang-debug   FAILED
+==   gate-gcc-release   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
         "$( (run_all_legs stub_returns_one; echo CONTINUED) 2>&1 )"
 
     # The table drives the launcher and analyser decisions above, the `leg_pairs`
@@ -789,7 +825,10 @@ run_preset() {
     # `"${arr[@]}"` on an empty array as an unbound variable, and this gate runs on
     # macOS.
     local -a configure
-    configure=(cmake --preset "$preset" -DUSE_COMPILER_CACHE=OFF)
+    # No `-DUSE_COMPILER_CACHE=OFF` here: the gate presets carry it as a cache
+    # variable (#487). The refusal below still reads `build.ninja` rather than the
+    # cache, for #471's reason -- passing the flag is not the fact.
+    configure=(cmake --preset "$preset")
     if [[ "$analyser" == "tidy" ]]; then
         configure+=("-DCLANG_TIDY_EXE=${tidy_path}")
         echo "== $preset: clang-tidy pinned to $tidy ($tidy_path)"
@@ -802,29 +841,19 @@ run_preset() {
     if [[ -n "$reason" ]]; then
         echo "== $preset: configure ($reason)"
 
-        # This gate does not own its build directories: `CMakePresets.json` gives
-        # every preset one `binaryDir`, `out/build/${presetName}`, and AGENT.md
-        # tells developers and agents to build in these very two. `-D` writes a
-        # cache entry and `option()` never overrides one, so turning the compiler
-        # cache off here turns it off for every ORDINARY build in this directory
-        # from now on, until somebody sets it back or reconfigures `--fresh`.
+        # The gate owns this directory (#487). It used to configure
+        # `out/build/clang-debug` and `out/build/gcc-release` -- the two AGENT.md
+        # tells developers and agents to build in -- and turning the compiler cache
+        # off there turned it off for every ORDINARY build in that tree from then
+        # on, because a `-D` writes a cache entry and `option()` never overrides
+        # one. A standing ~2.4x on a full rebuild, in the repository whose product
+        # is a compile cache.
         #
-        # That is a real standing cost -- roughly 2.4x on a full rebuild by this
-        # branch's own measurements -- and it is being accepted as a STATED one.
-        # Gate-owned directories are issue #487. Said here because a silent change
-        # to how a tree builds is the whole defect this script was just fixed for,
-        # and a developer whose builds slowed should find the answer in their
-        # scrollback rather than a mystery in the repository that makes caches.
-        #
-        # Decided from the cache entry rather than from the reason text: this is a
-        # statement about what the configure is ABOUT TO change, and the entry is
-        # what it changes.
-        if [[ "$(cached_entry "$build_dir/CMakeCache.txt" USE_COMPILER_CACHE)" != "OFF" ]]; then
-            echo "== $preset: NOTE -- this turns the compiler cache off in $build_dir"
-            echo "==   PERMANENTLY, not just for this run: ordinary 'cmake --build --preset"
-            echo "==   $preset' in this tree is uncached from here on. Undo with"
-            echo "==   -DUSE_COMPILER_CACHE=ON. Why, and the plan to stop it: issue #487."
-        fi
+        # Now the setting lives in a `gate-` preset with its own `binaryDir`, so
+        # the decision that is right for a reference build is imposed on nothing
+        # else. The NOTE that used to be printed here was the stated-cost half of
+        # accepting that hazard; it is gone with the hazard rather than kept as
+        # reassurance about something that no longer happens.
 
         # Turning the launcher off rewrites every compile command, so ninja rebuilds
         # the whole configuration once. Said HERE, at the moment it is decided,
@@ -869,7 +898,7 @@ run_preset() {
             fail "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
             ;;
         *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite -DUSE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
             ;;
     esac
 

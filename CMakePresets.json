@@ -34,6 +34,14 @@
         },
 
         {
+            "name": "gate-clang-debug",
+            "displayName": "gate: clang-debug in the gate's OWN directory, never the developer's (#487)",
+            "inherits": "clang-debug",
+            "cacheVariables": {
+                "USE_COMPILER_CACHE": "OFF"
+            }
+        },
+        {
             "name": "clang-release",
             "displayName": "Clang Release (PEDANTIC, -O3)",
             "inherits": "base",
@@ -103,6 +111,14 @@
             }
         },
 
+        {
+            "name": "gate-gcc-release",
+            "displayName": "gate: gcc-release in the gate's OWN directory, never the developer's (#487)",
+            "inherits": "gcc-release",
+            "cacheVariables": {
+                "USE_COMPILER_CACHE": "OFF"
+            }
+        },
         {
             "name": "clang-coverage",
             "displayName": "Clang Coverage (llvm-cov source-based; needs llvm-profdata/llvm-cov)",
@@ -226,10 +242,12 @@
     ],
     "buildPresets": [
         { "name": "clang-debug",      "configurePreset": "clang-debug" },
+        { "name": "gate-clang-debug", "configurePreset": "gate-clang-debug" },
         { "name": "clang-release",    "configurePreset": "clang-release" },
         { "name": "clang-tracy",      "configurePreset": "clang-tracy" },
         { "name": "gcc-debug",        "configurePreset": "gcc-debug" },
         { "name": "gcc-release",      "configurePreset": "gcc-release" },
+        { "name": "gate-gcc-release", "configurePreset": "gate-gcc-release" },
         { "name": "clang-coverage",   "configurePreset": "clang-coverage" },
         { "name": "clang-asan-ubsan", "configurePreset": "clang-asan-ubsan" },
         { "name": "clang-tsan",       "configurePreset": "clang-tsan" },
@@ -240,10 +258,12 @@
     ],
     "testPresets": [
         { "name": "clang-debug",      "configurePreset": "clang-debug",      "output": { "outputOnFailure": true } },
+        { "name": "gate-clang-debug", "configurePreset": "gate-clang-debug", "output": { "outputOnFailure": true } },
         { "name": "clang-release",    "configurePreset": "clang-release",    "output": { "outputOnFailure": true } },
         { "name": "clang-tracy",      "configurePreset": "clang-tracy",      "output": { "outputOnFailure": true } },
         { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "output": { "outputOnFailure": true } },
         { "name": "gcc-release",      "configurePreset": "gcc-release",      "output": { "outputOnFailure": true } },
+        { "name": "gate-gcc-release", "configurePreset": "gate-gcc-release", "output": { "outputOnFailure": true } },
         { "name": "clang-coverage",   "configurePreset": "clang-coverage",   "output": { "outputOnFailure": true } },
         { "name": "clang-asan-ubsan", "configurePreset": "clang-asan-ubsan", "output": { "outputOnFailure": true } },
         { "name": "clang-tsan",       "configurePreset": "clang-tsan",       "output": { "outputOnFailure": true } },
