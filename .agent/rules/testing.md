@@ -859,13 +859,18 @@ by an instance filed where nobody looking for it will read it.
 
 A required-context checker was written for the shape
 [#542](https://github.com/LASTRADA-Software/fastcached/issues/542) names: read the
-eleven names, report each one's state, and keep ABSENT distinct from pending so a
+required names, report each one's state, and keep ABSENT distinct from pending so a
 context that was never created cannot hide. Its first version captured
 `gh pr checks ... 2>/dev/null`. `gh` was not on `PATH` in that environment, so
 `command not found` went to the null device, the capture was empty, and the checker
 printed **ABSENT for all eleven required contexts** — while the data sat there,
 retrievable, one working invocation away
 ([#557](https://github.com/LASTRADA-Software/fastcached/issues/557)).
+
+*Eleven is what the instrument printed and what the required set held that day; it has
+grown since (#408, #629). The live figure is `RequiredContexts` in
+`scripts/check-merge-queue-contexts.sh`, which is the only place it is written down —
+this paragraph is a record, not a count.*
 
 Keep the output, because the rule is easy to nod at and the failure is what makes it
 stick: **eleven absent required contexts is catastrophic, plausible and

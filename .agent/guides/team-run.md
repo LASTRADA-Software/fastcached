@@ -243,10 +243,38 @@ check passed, because four contexts are only created once their dependencies go 
 it was then read as stable at 25 across three consecutive polls and **grew again to 26**.
 So a floor alone would have passed at 21, and two stable polls nearly passed at 25.
 
-**Quote the required fraction, never the total.** The eleven required contexts come from
-the ruleset, so a newly created non-required leg cannot move that denominator, while the
+**Quote the required fraction, never the total.** The required contexts come from the
+ruleset, so a newly created non-required leg cannot move that denominator, while the
 total moves under you as jobs are created. Print the total beside the verdict as context
 — it is what says whether the matrix has appeared — but never as a denominator.
+
+**And read that denominator rather than remembering it.** `RequiredContexts` in
+[`scripts/check-merge-queue-contexts.sh`](../../scripts/check-merge-queue-contexts.sh) is
+the one place the required set and its size are written down; every tool that needs them
+reads them from there, and the check prints the live count on every run. Neither goes into
+prose — [`../rules/build-and-toolchain.md`](../rules/build-and-toolchain.md) carries that
+rule and the sites it was written from. Where a number appears below, it is a record of
+what was measured then and not the count now.
+
+**And when you audit for something like that, the pattern and the CLASSIFICATION fail
+separately.** A pass over `*.md`, `*.yml`, `*.sh` and `*.cmake` for
+`eleven|11 required|11 of 11|of the eleven` reached four of the eleven restatements that
+rule lists short of naming them, and the four split evenly between the two failures:
+
+- **The pattern did not match two.** One was in `src/tests/CMakeLists.txt`, a file type it
+  did not scan. One was spelled *"11 of them required"*, which `11 required` does not
+  match — an adjacency the author read as a phrase.
+- **It matched two more that were not classified as restatements.** One was simply not
+  carried into the list. The other was inside an anecdote about a past incident, and was
+  set aside as a RECORD — correctly for the paragraph and wrongly for the sentence, whose
+  verb was present tense: *"the required set **has** eleven members"*. **Sort by the verb,
+  not by the paragraph's subject**; a record can contain a claim about now.
+
+`git grep -nI` with no `--include` filter, for a number word or digit within three words of
+*required* or *context*, matches all eleven — and matches **neither** of the two sites that
+enumerated the set instead of counting it, because an enumeration carries no number at all.
+So state the pattern with the figure, and say whether a miss was the pattern's or the
+reader's: a partial census reads exactly like a complete one either way.
 
 And distinguish the two ways a required context can be missing, because they read
 identically in a count and mean opposite things: **absent-because-not-created-yet** (the
@@ -570,8 +598,8 @@ already named, is seven. The tree said seven. Nothing was wrong with the branch.
 
 The same shape had already cost the run an hour that evening: a lane reported **eleven
 required contexts green**, and four of the eleven names were wrong. The required set
-has eleven members, so the cardinality agreed perfectly with a set assembled from what
-looked important. A correct count over the wrong set is indistinguishable from a
+had eleven members that day, so the cardinality agreed perfectly with a set assembled
+from what looked important. A correct count over the wrong set is indistinguishable from a
 correct audit, and every check run against it passes.
 
 **Recount from the enumeration; never carry a number alongside a list.** And read the

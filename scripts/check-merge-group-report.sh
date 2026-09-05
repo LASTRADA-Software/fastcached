@@ -164,6 +164,14 @@ SelfTest() {
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     trap "rm -rf '$scratch'" EXIT
 
+    # A STAND-IN table, pinned to the state the runs below were captured in
+    # (2026-09-04), not a copy of the live one. Do not sync it: the cases assert
+    # what the decider does with a GIVEN required set, so reading the production
+    # table would make every verdict here move whenever a context is promoted --
+    # which is how `clang-asan-ubsan` and `clang-tsan` joined it (#408, #629)
+    # without a single case changing meaning. The production table is READ by the
+    # decider itself, and `$Decider reads the required-context list` above is what
+    # asserts that.
     local required="${scratch}/required.sh"
     cat > "$required" <<'REQ'
 RequiredContexts=(

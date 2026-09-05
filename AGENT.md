@@ -1180,7 +1180,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   checked, or it is a stub that reads like a working gate. Check the concurrency key too (a PR-number key collapses to
   a constant and each entry cancels the last), state `merge_group` in the scope classifier rather than falling through,
   and add no JOB to `build.yml` — `check-release-gate` would drag the release behind it.
-  `ctest -R merge-queue-contexts` asserts all eleven required contexts can report.
+  `ctest -R merge-queue-contexts` asserts every required context can report. **Neither the SET nor its COUNT is
+  written in prose** — `RequiredContexts` in that script is the one place either lives, every consumer reads it
+  from there, and the run prints the live figure. A stale LIST is worse than a stale count: it reads as complete,
+  so a leg checked against it is concluded *unrequired* rather than merely miscounted, and it carries no number
+  for a count-shaped search to find. Nothing GUARDS this — the obvious scan was measured and is unsound (#830) —
+  so the rule is all there is; the sites, the figures and the argument are in the rule file.
 - A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING — measured: three required contexts came
   back `skipped` on `b4777aa`, which merged. A skipped **matrix** job is the opposite: it never expands, so its
   per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.

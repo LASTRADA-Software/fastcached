@@ -194,7 +194,7 @@ jobs:
   # like every other compiler job; the doc-subject checks below are NOT, and that
   # is #687.
   #
-  # `name:` is `Check C++ style`, which is one of the eleven contexts the
+  # `name:` is `Check C++ style`, which is one of the contexts the
   # `default-master` ruleset requires. It is a wire constant in every sense that
   # matters: renaming it renames a required context, the ruleset then waits on a
   # name nothing produces, and every branch becomes unmergeable. Do not touch it.
@@ -319,11 +319,16 @@ jobs:
   #
   # A pull request touching only `docs/`, `.agent/` or a `*.md` runs no compiler
   # here — but it must still REPORT every required check, and that is the whole
-  # difficulty. Master is protected by a ruleset (`default-master`, active) whose
-  # required contexts include Windows-cl-release, Windows-clangcl-release,
-  # Linux-clang-release, Linux-gcc-release, macOS-clang-release, clang-tidy, the
-  # three sccache smokes and Check C++ style. A required context that never
-  # reports leaves the pull request waiting on it forever.
+  # difficulty. Master is protected by a ruleset (`default-master`, active). A
+  # required context that never reports leaves the pull request waiting on it
+  # forever.
+  #
+  # WHICH contexts those are is `RequiredContexts` in
+  # `scripts/check-merge-queue-contexts.sh` and is deliberately not listed here.
+  # This comment used to enumerate them, and the list silently went stale when
+  # `clang-asan-ubsan` and `clang-tsan` were promoted (#408, #629) — a stale LIST
+  # is worse than a stale count, because it reads as complete and a reader
+  # checking a leg against it concludes the leg is unrequired.
   #
   # So this is deliberately NOT `on: paths-ignore`. That filter stops the
   # workflow from triggering at all, no check run is ever created, and "slow"
