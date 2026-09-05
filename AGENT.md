@@ -1364,6 +1364,27 @@ what differs between compilers, standard libraries, hosts and tool versions.
   rebased and rebuilt before it merges, never inspected — the #292 worktree was nine
   behind and the rebuild took about two minutes and was clean, which is what this costs
   when it passes, and passing is why skipping it feels free.
+- A reference-build refusal is a REFUSAL and not a warning, because a verdict about a
+  tree that was not built cannot be read in EITHER direction. #626 was five metrics
+  tests failing in four files the branch never touched, all clearing under
+  `-DUSE_COMPILER_CACHE=OFF` — a false alarm, which costs an investigation; **the same
+  substituted object can equally HIDE a real failure, and nothing would say so.** That
+  sentence lives in the refusal's own text, or whoever meets it argues for a warning.
+  The guard was already there under #319/#368 and the ticket did not know — check a
+  premise against the TREE before building to it. And the count is LAUNCHER
+  **BINDINGS**, not edges: ninja emits one per RULE, so this tree reads **5 covering
+  501 compile edges** on Linux where #626's Windows reproduction recorded **669**.
+  Those are not comparable and the message said nothing; the verdict is unaffected,
+  since any count above zero refuses, but **a unit error in a refusal message is how
+  two numbers get compared that should not be.** The symptom does not reproduce on
+  Linux in either cache state — three builds, three suites, all five passing — so
+  #626's Windows/MSVC/sccache reproduction stands unexecuted, stated as an analogue.
+- `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag
+  and the suppressions it makes necessary are governed by ONE condition — split, a
+  build directory reused across presets holds `PEDANTIC_COMPILER` ON with `WERROR`
+  OFF, which is a database no correction to the configure line explains. That is one
+  of #454's two halves, and **a symptom with two mechanisms reads as unreproducible
+  the moment either one alone is ruled out.**
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
