@@ -477,15 +477,34 @@ TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served 
     REQUIRE(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
 }
 
-TEST_CASE("AdminHttp: a head the peer FINISHED sending is still served", "[metrics][http][admin][idle]")
+TEST_CASE("AdminHttp: an UNFINISHED head is refused 400 even though the peer finished sending",
+          "[metrics][http][admin][idle]")
 {
-    // The control for the case above, and the line the two sit either side of. EOF
-    // means "this peer has finished sending", so what arrived is all there ever was
-    // and answering it is right -- `.agent/rules/wire-and-protocol.md`, on this
-    // surface. A deadline means the opposite. Without this case, "refuse a truncated
-    // head" and "refuse every head without a blank line" are the same passing test,
-    // and the second would break every hand-rolled probe that forgets the CRLF.
-    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
+    // **This case used to assert the opposite, and the assertion was the bug.** It
+    // read the EOF rule as "the peer finished sending, so serve what arrived" and
+    // called itself a control. But `.agent/rules/wire-and-protocol.md` says a server
+    // answers what is already DETERMINED, and a head with no terminating blank line
+    // determines nothing -- this server does not know which headers the peer would
+    // have sent, so there is no reply it can be right about.
+    //
+    // What it cost: `/fleet` routed with `Authorization` never read, so a valid
+    // credential was answered `401`. Same wrong answer as the byte-cap case, reached
+    // with a thirty-byte request and no oversize client.
+    //
+    // `PING` half-closed is a complete command and is answered; this is a sentence
+    // cut off mid-word.
+    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\nHost: x\r\n").starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_CASE("AdminHttp: a COMPLETE head half-closed after is still served", "[metrics][http][admin][idle]")
+{
+    // The real control, and the line the pair sits either side of: what makes an
+    // unfinished head refusable is that it is unfinished, NOT that the peer went
+    // away. Every other case in this file half-closes too, so without stating it
+    // here the distinction is only implicit -- and "refuse an unfinished head" and
+    // "refuse every peer that half-closes" would be one passing test, which would
+    // break every probe and scraper on this endpoint.
+    REQUIRE(ExchangeMaybeSilent("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").starts_with("HTTP/1.1 200 OK\r\n"));
 }
 
 TEST_CASE("AdminHttp: a malformed request is still refused 400", "[metrics][http][admin][idle]")

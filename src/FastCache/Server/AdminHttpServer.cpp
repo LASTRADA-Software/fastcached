@@ -131,7 +131,10 @@ namespace
         /// all there was. A DEADLINE says the opposite: the peer has not finished
         /// and this server gave up, which is exactly what `408` reports.
         Truncated,
-        /// Bytes arrived, and they are not a request line. The one honest `400`.
+        /// Bytes arrived and are not a request the server can act on -- either the
+        /// line does not parse, or the head never ended and the peer stopped
+        /// (`EndOfStream` mid-head). Both are `400`: an unfinished head is a bad
+        /// request, not a slow one, so it is not `Truncated`'s `408`.
         Malformed,
         /// The byte cap was reached before the head ended.
         ///
@@ -275,15 +278,29 @@ namespace
     /// receive timeout, which is what a request timeout is for -- and if it never sent
     /// a byte at all, that bound expiring is `Idle` and is answered with silence
     /// rather than with a `400` (#824). A head that exceeds the cap is answered `431`
-    /// and then closed with whatever is left unread -- so the `431` is BEST-EFFORT,
-    /// and deliberately so: closing with unread data in the receive queue makes the
-    /// kernel send RST, and an RST discards what this server just wrote. That is the
-    /// same mechanism this function's own header describes two paragraphs up. The
-    /// alternative is draining an oversize head before answering it, which is a
-    /// budget for exactly the peer least entitled to one. `431` when it lands tells
-    /// an honest browser with too many cookies which half of the exchange was wrong;
-    /// when it does not, the peer sees a reset instead of a wrong answer, which is
-    /// still better than the truncated `200` this replaces.
+    /// and then closed with whatever is left unread.
+    ///
+    /// **That reset hazard is real and was MEASURED not to fire here.** Closing with
+    /// unread data in the receive queue makes the kernel send RST, and an RST
+    /// discards what this server just wrote -- the mechanism this function's own
+    /// header describes two paragraphs up, and the one that makes the idle-then-send
+    /// shape unassertable in the e2e fixture. A reviewer predicted it would destroy
+    /// this `431`. Against a real node on Linux loopback, with a client that sends
+    /// the whole head and then reads: a 9,043-byte head and a 60,043-byte head both
+    /// received `431 Request Header Fields Too Large` intact. The response is
+    /// already in the client's receive buffer before the reset arrives.
+    ///
+    /// So it is BEST-EFFORT rather than lost: those conditions are the measurement's,
+    /// not a guarantee, and a slower client may still lose it -- the same binary that
+    /// delivered a `400` to a `python` client delivered nothing to a `bash` one.
+    /// Draining the rest first is the alternative and is a byte budget for exactly
+    /// the peer least entitled to one, so it is not taken.
+    ///
+    /// The change of ANSWER is deliberate and is not the reset: measured on master,
+    /// a 9 KB and a 60 KB head to `/healthz` are both answered `200 OK`, from a head
+    /// this server only read the first 8,192 bytes of. That is the defect. A route
+    /// reading no headers survives it by luck; `/fleet` reads a credential and does
+    /// not.
     Task<RequestHead> ReadRequestHead(ISocket* socket)
     {
         std::string buffer;
@@ -337,14 +354,32 @@ namespace
         if (buffer.empty())
             co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
 
-        // The cap was reached before the head ended, so what is in hand is a PREFIX
-        // of the request rather than the request. Parsing it on regardless is what
-        // used to happen -- silently, and it is worse than a refusal: the request
-        // line is near the front and always survives, so the truncated head routed
-        // and answered while every field past byte 8192 was simply gone. A browser
-        // whose `Authorization` fell past the cap was told `401`.
-        if (!sawHeadEnd && buffer.size() >= MaxRequestBytes)
-            co_return RequestHead { .outcome = AdminHeadOutcome::TooLarge };
+        // **`sawHeadEnd` decides THAT a refusal happens; the byte cap only decides
+        // WHICH.** A head with no terminating blank line is a PREFIX of a request,
+        // never a request, and parsing one is what used to happen -- silently, which
+        // is worse than any refusal: the request line is near the front and always
+        // survives truncation, so the prefix routed and answered while every field
+        // after the cut was simply gone. A browser whose `Authorization` fell beyond
+        // it was told `401`, which reads as a wrong credential.
+        //
+        // The guard used to be `!sawHeadEnd && size >= MaxRequestBytes`, which closed
+        // the cap route and left the EOF route wide open -- and the EOF route needs
+        // no oversize client at all, just a peer that half-closes after its request
+        // line. Two exits, one condition: whichever way the loop ended, an unfinished
+        // head is refused here.
+        //
+        // **This is the EOF rule applied more carefully than it was.**
+        // `.agent/rules/wire-and-protocol.md` says a server answers what is already
+        // DETERMINED, and the tempting reading -- EOF means *finished sending*, so
+        // serve what arrived -- is what put a control case in this file asserting
+        // exactly the bug. An HTTP head with no blank line determines nothing: this
+        // server does not know which headers the peer would have sent, so there is
+        // no reply it can be right about. `PING` half-closed is a complete command;
+        // this is a sentence cut off mid-word. A COMPLETE head half-closed after is
+        // still served, and that is the control that belongs beside this.
+        if (!sawHeadEnd)
+            co_return RequestHead { .outcome = buffer.size() >= MaxRequestBytes ? AdminHeadOutcome::TooLarge
+                                                                                : AdminHeadOutcome::Malformed };
 
         auto const eol = buffer.find("\r\n");
         if (eol == std::string::npos)
