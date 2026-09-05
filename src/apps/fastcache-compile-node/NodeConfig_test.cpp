@@ -3513,3 +3513,153 @@ TEST_CASE("A reload cannot reach a state startup would have refused", "[node][co
     CHECK(outcome.error().context.contains("--toolchain"));
     CHECK(reloader.Current()->toolchains == std::vector<std::string> { "/usr/bin/g++" });
 }
+
+TEST_CASE("NodeSecretFiles: every path-valued flag is classified, secret or not", "[node][config][secret]")
+{
+    // **The coverage guard, and it is mandatory rather than opt-in.** A list that is
+    // exact about the flags it knows and silent about the ones it does not reads
+    // identically to complete coverage (#492) -- and #752 is written about exactly
+    // that failure: answering the narrow half while looking complete. So a sixth
+    // `=<path>` row cannot be added without its author saying which kind it is.
+    auto const secret = NodeSecretFileTable();
+    auto const publicPaths = NodePublicPathFlags();
+
+    auto const namedSecret = [secret](std::string_view flag) {
+        return std::ranges::any_of(secret, [flag](auto const& row) { return row.flag == flag; });
+    };
+    auto const namedPublic = [publicPaths](std::string_view flag) {
+        return std::ranges::any_of(publicPaths, [flag](auto const& row) { return row.flag == flag; });
+    };
+
+    SECTION("every =<path> row of NodeOptions() is in exactly one table")
+    {
+        std::size_t pathRows = 0;
+        for (auto const& spec: NodeOptions())
+        {
+            if (spec.operand != "=<path>")
+                continue;
+            ++pathRows;
+            INFO("flag: " << spec.primary);
+            CHECK(namedSecret(spec.primary) != namedPublic(spec.primary));
+        }
+
+        // The positive control. A scan that matched nothing would pass the loop above
+        // vacuously, and "no violations found" and "the scan found nothing to look at"
+        // are the two states this codebase keeps having to tell apart.
+        CHECK(pathRows == secret.size() + publicPaths.size());
+        CHECK(pathRows > 0);
+    }
+
+    SECTION("every table entry names a row that exists")
+    {
+        // The other direction, and it is not decoration: a flag renamed in the option
+        // table would otherwise leave a row here naming nothing, and the file it used
+        // to cover would go unasked about with both tables still looking full.
+        auto const isARow = [](std::string_view flag) {
+            return std::ranges::any_of(NodeOptions(), [flag](auto const& spec) { return spec.primary == flag; });
+        };
+        for (auto const& row: secret)
+        {
+            INFO("secret row: " << row.flag);
+            CHECK(isARow(row.flag));
+        }
+        for (auto const& row: publicPaths)
+        {
+            INFO("public row: " << row.flag);
+            CHECK(isARow(row.flag));
+            // The reason is a forcing function, not a dead field: a blank one would
+            // spell "forgot" in the vocabulary of "decided".
+            CHECK_FALSE(row.why.empty());
+        }
+    }
+
+    SECTION("--tls-cert is classified as public, deliberately")
+    {
+        // Decided explicitly rather than by omission, because it is the one an author
+        // would add by symmetry with `--tls-key`. A certificate is presented to every
+        // client during the handshake, so warning about the mode of a file that is
+        // MEANT to be readable is the alarm that teaches operators to ignore the four
+        // that matter.
+        CHECK(namedPublic("--tls-cert"));
+        CHECK(namedSecret("--tls-key"));
+    }
+}
+
+TEST_CASE("NodeSecretFiles: a path-reached secret is not provenance-gated", "[node][config][secret]")
+{
+    // **#752's design decision, asserted where it can fail.** #384's rule is gated on
+    // provenance because `--requirepass` can also arrive in argv, where the exposure is
+    // `ps` and belongs to `InlineCredentialRejection`. A key FILE has no second route:
+    // the path is not the secret and the file is. Wiring these four through the
+    // provenance gate would silently skip every argv-named key file -- a change no test
+    // asserting merely that "some warning arrives" could see.
+    NodeConfig cfg;
+    cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+    cfg.schedulerTokenFile = "/etc/fastcached/scheduler.token";
+    cfg.dashboardTokenFile = "/etc/fastcached/dashboard.token";
+    cfg.tlsKeyFile = "/etc/fastcached/admin.key";
+    cfg.tlsCertFile = "/etc/fastcached/admin.crt";
+
+    SECTION("named in argv, with no configuration file at all")
+    {
+        // The provenance gate answers "no file" here, and all four must still be asked
+        // about.
+        auto const files = NodeSecretFiles(cfg, {}, /*secretNamedOnCommandLine*/ true);
+        CHECK(files
+              == std::vector<std::filesystem::path> {
+                  cfg.clusterKeyFile, cfg.schedulerTokenFile, cfg.dashboardTokenFile, cfg.tlsKeyFile });
+    }
+
+    SECTION("the certificate is never asked about")
+    {
+        auto const files = NodeSecretFiles(cfg, {}, false);
+        CHECK(std::ranges::find(files, cfg.tlsCertFile) == files.end());
+    }
+
+    SECTION("an unnamed flag contributes nothing")
+    {
+        NodeConfig bare;
+        bare.clusterKeyFile = "/etc/fastcached/cluster.key";
+        CHECK(NodeSecretFiles(bare, {}, false) == std::vector<std::filesystem::path> { bare.clusterKeyFile });
+    }
+}
+
+TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[node][config][secret]")
+{
+    // The other half, and it is #384's rule unchanged: the file's mode is what protects
+    // a secret only when the file is what supplied it.
+    std::filesystem::path const configFile { "/etc/fastcached/fastcache-compile-node.yaml" };
+
+    NodeConfig cfg;
+    cfg.token = "hunter2";
+
+    SECTION("a secret out of the file is asked about")
+    {
+        CHECK(NodeSecretFiles(cfg, configFile, false) == std::vector<std::filesystem::path> { configFile });
+    }
+
+    SECTION("a secret argv supplied is a different exposure")
+    {
+        CHECK(NodeSecretFiles(cfg, configFile, true).empty());
+    }
+
+    SECTION("no secret in force means the file's mode is not this worker's business")
+    {
+        NodeConfig quiet;
+        CHECK(NodeSecretFiles(quiet, configFile, false).empty());
+    }
+
+    SECTION("a run that read no file names none")
+    {
+        CHECK(NodeSecretFiles(cfg, {}, false).empty());
+    }
+
+    SECTION("the configuration file comes first")
+    {
+        // It is the file an operator most often has open, and the order is the
+        // caller's rather than the filesystem's.
+        cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+        CHECK(NodeSecretFiles(cfg, configFile, false)
+              == std::vector<std::filesystem::path> { configFile, cfg.clusterKeyFile });
+    }
+}
