@@ -3,6 +3,7 @@
 
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <filesystem>
 #include <span>
@@ -118,22 +119,57 @@ struct SecretProvenanceFacts
 /// @return One sentence per exposed file, in @p files order; empty when none is.
 [[nodiscard]] std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path const> files);
 
-/// What to warn about a secret whose file anyone can read, or nothing.
+/// One file found unfit to hold a secret.
+struct SecretFileFinding
+{
+    /// The file, exactly as the caller named it.
+    std::filesystem::path path;
+
+    /// Why it is unfit. Never `None` -- a fit file produces no finding at all.
+    SecretExposure exposure { SecretExposure::None };
+};
+
+/// Which of @p files are unfit to hold a secret, and why.
+///
+/// The ANSWER rather than the sentence, published because a caller that has to
+/// notice a CHANGE cannot do it on rendered text. `SecretExposureWatcher` remembers
+/// what it last said and speaks only on a transition, and a mode loosening under an
+/// unchanged secret has to read as one -- so it compares `(path, exposure)` pairs.
+/// Comparing sentences would work today and would stop working the moment a hint
+/// loses information, which is not a property worth resting a security signal on.
+///
+/// Every rule `SecretFileWarnings` documents is this function's: empty paths and
+/// absent files are skipped, an inspectable file that will not answer is
+/// `Undetermined` and IS reported, and one file named twice yields one finding.
+/// `SecretFileWarnings` is this composed with `SecretExposureHint`.
+///
+/// @param files The files this process holds secrets in, in the order to report.
+/// @return One finding per exposed file, in @p files order; empty when none is.
+[[nodiscard]] std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::path const> files);
+
+/// Every file the DAEMON's secrets live in, in the order to report them.
+///
+/// The daemon's half of what `Node::NodeSecretFiles` is for the worker: which files
+/// this binary's secrets live in, gate applied, ready for `SecretFileWarnings` or for
+/// `SecretExposureWatcher`. Two callers ask it -- the start and every reload -- and a
+/// subject list each of them derived for itself is the shape #396 and #726 paid for.
 ///
 /// The whole of [#384](https://github.com/LASTRADA-Software/fastcached/issues/384)'s
-/// startup half, composed from the two halves that can be tested separately:
+/// gate, composed from the two halves that can be tested separately:
 /// `SecretCameFromConfigFile` (provenance, pure) and
-/// `Platform/FileTrust`'s `SecretFileExposure` (the platform's answer about a
-/// mode or an access list).
+/// `Platform/FileTrust`'s `SecretFileExposure` (the platform's answer about a mode or
+/// an access list), which whoever renders this list then asks.
 ///
-/// Empty when there is nothing to say -- no secret, a secret from argv, or a file
-/// nothing else can read. **`Undetermined` is reported**, because a platform that
-/// would not answer is not a platform that answered "safe"; it is a sentence
-/// saying so, which is cheap and is the only honest option.
+/// Empty when there is nothing to look at -- no secret, or a secret from argv, or no
+/// file read. **`Undetermined` is still reported** by the renderer, because a
+/// platform that would not answer is not a platform that answered "safe".
 ///
 /// @param cfg The merged configuration in force.
 /// @param cli The command-line parse, for its provenance bits.
-/// @return A sentence naming the file, the exposure and the remedy, or empty.
-[[nodiscard]] std::string SecretFileWarning(Config const& cfg, CliResult const& cli);
+/// @return The configuration file when its mode is what protects the secret, else
+///         nothing. Never more than one element today; a list because the daemon has
+///         its own path-reached secret still to wire, and because the shape is the
+///         worker's `NodeSecretFiles` so a reader meets one answer twice.
+[[nodiscard]] std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, CliResult const& cli);
 
 } // namespace FastCache

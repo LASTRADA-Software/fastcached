@@ -25,6 +25,7 @@
 #include <FastCache/Config/ConfigMerge.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -680,10 +681,25 @@ int DaemonBody(FastCache::Config const& effective,
     // credential, which IS a startup refusal: refusing a MISSING credential fails
     // closed and breaks nothing that worked, while refusing an EXPOSED one breaks
     // something that did.)
-    if (auto const warning = FastCache::SecretFileWarning(effective, sources.cli); !warning.empty())
-        logger.Logf(FastCache::LogLevel::Warn, "{}", warning);
-
+    //
+    // **And again at every reload, through the same watcher.** `requirepass` is
+    // `Reloadable::Yes`, so a file can GAIN a secret after startup -- an operator adds
+    // `requirepass:` to a mode-0644 file and sends SIGHUP -- and a startup-only check
+    // is silent on exactly the path #384 exists to close
+    // ([#753](https://github.com/LASTRADA-Software/fastcached/issues/753)). One call
+    // rather than a second check written here: two copies of one rule is the shape
+    // #396 and #726 already paid for, and the startup answer is what seeds the memory
+    // the reload compares against.
     FastCache::ConfigReloader reloader { effective, effective.configPath, sources };
+
+    // After the reloader and before anything that can return, because the startup
+    // observation happens inside this call. `logger` outlives `reloader` -- it names
+    // `consoleLogger` or `eventLogger`, both declared above it, so both are destroyed
+    // after it -- which is what the subscriber's capture requires.
+    FastCache::WatchSecretExposure(reloader, sources.cli, [&logger](std::string_view warning) {
+        logger.Logf(FastCache::LogLevel::Warn, "{}", warning);
+    });
+
     FastCache::SteadyClock steadyClock;
     // The engine reads the clock once per command, and on Windows that is a
     // QueryPerformanceCounter — ~16 ns, which measured as roughly a third of the

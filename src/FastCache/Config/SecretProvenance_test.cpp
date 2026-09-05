@@ -15,8 +15,8 @@
 
 using FastCache::CliResult;
 using FastCache::Config;
+using FastCache::DaemonSecretFiles;
 using FastCache::SecretCameFromConfigFile;
-using FastCache::SecretFileWarning;
 using FastCache::SecretFileWarnings;
 using FastCache::SecretProvenanceFacts;
 
@@ -128,11 +128,21 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         return path;
     };
 
-    auto const warningFor = [](std::filesystem::path const& path) {
+    // The daemon's whole startup answer, exactly as `DaemonBody` composes it: the
+    // subject list, then the renderer. Written out here rather than behind a
+    // one-shot helper, because the helper would be a second production path nothing
+    // calls -- and a function with no production caller is the defect it was written
+    // to fix.
+    auto const daemonWarning = [](Config const& cfg, CliResult const& cli) {
+        auto const warnings = SecretFileWarnings(DaemonSecretFiles(cfg, cli));
+        return warnings.empty() ? std::string {} : warnings.front();
+    };
+
+    auto const warningFor = [&daemonWarning](std::filesystem::path const& path) {
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        return SecretFileWarning(cfg, CliResult {});
+        return daemonWarning(cfg, CliResult {});
     };
 
     SECTION("a world-readable file warns, and says what to do")
@@ -162,7 +172,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         cfg.configPath = path.string();
         CliResult cli {};
         cli.requirePassExplicit = true;
-        CHECK(SecretFileWarning(cfg, cli).empty());
+        CHECK(daemonWarning(cfg, cli).empty());
     }
 
     SECTION("a file with no secret in force says nothing, whatever its mode")
@@ -170,7 +180,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         auto const path = configAt("nosecret.yaml", S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
         Config cfg {};
         cfg.configPath = path.string();
-        CHECK(SecretFileWarning(cfg, CliResult {}).empty());
+        CHECK(daemonWarning(cfg, CliResult {}).empty());
     }
 
     SECTION("every exposed file is named, not just the first")
@@ -219,7 +229,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        auto const warning = SecretFileWarning(cfg, CliResult {});
+        auto const warning = daemonWarning(cfg, CliResult {});
         REQUIRE_FALSE(warning.empty());
         CHECK_FALSE(warning.contains("hunter2"));
     }

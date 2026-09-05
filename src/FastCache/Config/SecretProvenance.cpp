@@ -32,23 +32,23 @@ bool SecretCameFromConfigFile(Config const& cfg, CliResult const& cli)
     });
 }
 
-std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path const> files)
+std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::path const> files)
 {
-    std::vector<std::string> warnings;
-    std::vector<std::filesystem::path> reported;
+    std::vector<SecretFileFinding> findings;
+    std::vector<std::filesystem::path> asked;
     for (auto const& path: files)
     {
         if (path.empty())
             continue;
 
-        // One sentence per FILE, not per setting that named it. A single-machine
+        // One finding per FILE, not per setting that named it. A single-machine
         // deployment legitimately points two settings at one file -- the cluster key
         // and the scheduler token, say -- and an operator handed the same remedy for
         // the same path twice reads the second copy as a second problem, which is the
         // alarm-fatigue failure this whole check is trying not to be.
-        if (std::ranges::find(reported, path) != reported.end())
+        if (std::ranges::find(asked, path) != asked.end())
             continue;
-        reported.push_back(path);
+        asked.push_back(path);
 
         // `status` rather than `exists`, because the two answers this has to keep
         // apart are exactly the ones `exists` folds: a file that is not there
@@ -63,22 +63,25 @@ std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path cons
         if (exposure == SecretExposure::None)
             continue;
 
-        warnings.push_back(SecretExposureHint(path, exposure));
+        findings.push_back(SecretFileFinding { .path = path, .exposure = exposure });
     }
+    return findings;
+}
+
+std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path const> files)
+{
+    std::vector<std::string> warnings;
+    for (auto const& finding: SecretFileExposures(files))
+        warnings.push_back(SecretExposureHint(finding.path, finding.exposure));
     return warnings;
 }
 
-std::string SecretFileWarning(Config const& cfg, CliResult const& cli)
+std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, CliResult const& cli)
 {
     if (!SecretCameFromConfigFile(cfg, cli))
         return {};
 
-    // Through the aggregate rather than beside it: how a path becomes a sentence is
-    // one function, so the daemon's config file and the worker's four key files
-    // cannot come to disagree about what an exposure reads like.
-    std::array<std::filesystem::path, 1> const files { std::filesystem::path { cfg.configPath } };
-    auto const warnings = SecretFileWarnings(files);
-    return warnings.empty() ? std::string {} : warnings.front();
+    return { std::filesystem::path { cfg.configPath } };
 }
 
 } // namespace FastCache
