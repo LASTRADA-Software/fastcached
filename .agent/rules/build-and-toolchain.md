@@ -3268,6 +3268,7 @@ are recorded together because the shape is one shape.
   was in fact RED with four cases named. The phrase it matched on,
   `did not behave as claimed`, straddled the wrap point. Measured:
 
+  <!-- table-total: none -->
   | message type | matches for a phrase crossing column 74 |
   |---|---|
   | `message(STATUS)` | **1** — does not wrap |
