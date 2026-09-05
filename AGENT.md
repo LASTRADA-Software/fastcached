@@ -1489,6 +1489,18 @@ what differs between compilers, standard libraries, hosts and tool versions.
   two numbers get compared that should not be.** The symptom does not reproduce on
   Linux in either cache state — three builds, three suites, all five passing — so
   #626's Windows/MSVC/sccache reproduction stands unexecuted, stated as an analogue.
+- **A diagnostic that never RAN and one that ran and found nothing are the same green.**
+  `continue-on-error` is RIGHT for a probe — one that can redden a packaging job teaches
+  people to ignore packaging reds — and it is also exactly what hides a probe that could
+  not start. A `#376` probe staged its helper with a here-document that had to survive
+  YAML's literal scalar AND bash's parser, lost on both, printed three lines and stopped,
+  and the job reported **SUCCESS**. Keep the flag; add the missing half — **assert the
+  classifier was REACHED** (a verdict as `::notice`, its absence as `::warning`), and give
+  it **three** outcomes, since a probe that can only answer the two you expect will answer
+  one of them whatever it sees. And **proving the CLASSIFIER is not proving the ARTIFACT**:
+  that version's decision logic had been driven against three fake `xcrun`s and was correct
+  the whole time — **what was tested was not what shipped**. Extract the step's own `run:`
+  block from the workflow and execute THAT.
 - `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag
   and the suppressions it makes necessary are governed by ONE condition — split, a
   build directory reused across presets holds `PEDANTIC_COMPILER` ON with `WERROR`

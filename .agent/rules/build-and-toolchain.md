@@ -3898,6 +3898,35 @@ carries: two empty lists agree perfectly, so a `## Open Work` or a heading with
 nothing under it would take one file's entries out of the scanned set forever while
 the total stayed healthy.
 
+## A diagnostic that never RAN and one that ran and found nothing are the same green
+
+**`continue-on-error` is right for a diagnostic and is exactly what hides one that could
+not start.** A probe added to `Package (macOS .pkg)` to settle #376 staged its helper with
+a here-document, which had to survive YAML's literal scalar **and** bash's parser. It lost
+on both -- the delimiter carried shell-escaping that means nothing inside `run: |`, and it
+was indented, which `<<` does not strip. Bash never matched the delimiter, swallowed the
+rest of the script as heredoc body, and the step printed three lines and stopped.
+
+**The job reported SUCCESS.** Which is the defect #376 and #682 are both about, reproduced
+inside the probe written to settle one of them.
+
+- **Keep `continue-on-error`.** The flag is not the defect and removing it breaks the
+  pattern: a diagnostic that can redden a packaging job teaches people to ignore packaging
+  reds. What was missing is the **assertion that the classifier was reached at all** --
+  a verdict surfaced as `::notice`, its absence as `::warning`, so *answered nothing* is
+  visible in the UI rather than buried in a green log.
+- **Three outcomes, never two.** A probe that can only answer the two you expect will
+  answer one of them whatever it sees. `INCONCLUSIVE` is a verdict.
+- **Proving the CLASSIFIER is not proving the ARTIFACT.** The broken version's decision
+  logic had been driven against three fake `xcrun`s and was correct throughout -- the
+  logic was never what failed. **What was tested was not what shipped.** The repair is to
+  extract the step's own `run:` block out of the workflow YAML and execute *that*, so the
+  thing under test is the thing that runs. A reconstruction tests your understanding of the
+  artifact, which is the part that was already right.
+
+This is the same family as the entry below, one layer out: there the local run and CI read
+different **trees**; here the tested script and the shipped script were different **text**.
+
 ## A green local gate says NOTHING when the subject under test is the build environment
 
 **Measured across one change, in one afternoon: three platforms, three defects, none of
