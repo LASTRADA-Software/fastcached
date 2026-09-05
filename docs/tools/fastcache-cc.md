@@ -61,7 +61,7 @@ fastcached --storage-max-value=512M
 |--------|---------------|-------------|--------------|
 | `gcc`, `g++`, `cc`, `c++` | GNU | `-o` | `-MD -MF <path>` depfile |
 | `clang`, `clang++` | GNU | `-o` | `-MD -MF <path>` depfile |
-| `cl` | MSVC | `/Fo` | `/showIncludes` on **stderr** |
+| `cl` | MSVC | `/Fo` | `/showIncludes` on **stderr** — *unverified, [#825](https://github.com/LASTRADA-Software/fastcached/issues/825)* |
 | `clang-cl` | MSVC | `/Fo` | `/showIncludes` on **stdout** |
 
 The stream column describes a *compile* run, which is what the replay path
