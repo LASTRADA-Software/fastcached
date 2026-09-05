@@ -2682,13 +2682,30 @@ carriage return, so such a script does not misbehave — it fails to start at al
   Two conditions naming one diagnostic *is* the defect; the second copy is a second
   thing to keep in step. Move the flag.
 
-- The `-Wno-error=` half is **belt-and-braces, not dead code by proof**. A
-  diagnostic disabled by `-Wno-X` can never be an error, so each `-Wno-error=X`
-  matters only on a compiler where the `-Wno-X` probe fails while its own succeeds.
-  Measured on clang 22.1.8 and GCC 16.2.1, the two halves of every pair succeed and
-  fail **together** — clang rejects both spellings of `class-memaccess`, GCC rejects
-  both of `c2y-extensions` — so on those two compilers they are currently inert.
-  That is a property of two compilers, not of the flags, which is why they stay.
+- The `-Wno-error=` half is **belt-and-braces WHERE IT IS PAIRED, not dead code by
+  proof**. A diagnostic disabled by `-Wno-X` can never be an error, so a paired
+  `-Wno-error=X` matters only on a compiler where the `-Wno-X` probe fails while its
+  own succeeds. Measured on clang 22.1.8 and GCC 16.2.1, the two halves of every
+  PAIR succeed and fail **together** — clang rejects both spellings of
+  `class-memaccess`, GCC rejects both of `c2y-extensions` — so those four are
+  currently inert. That is a property of two compilers, not of the flags, which is
+  why they stay.
+  - **An UNPAIRED `-Wno-error=X` is the opposite: load-bearing by construction**, and
+    reading the paragraph above as covering the whole family is how it goes stale.
+    `-Wno-error=array-bounds` and `-Wno-error=maybe-uninitialized` have no `-Wno-`
+    half and are what lets GCC 16.2.1 build this tree at all
+    ([#805](https://github.com/LASTRADA-Software/fastcached/issues/805)): both fire
+    inside libstdc++'s headers, from inlining, on code with no defect to fix, and
+    g++-13/g++-14 report neither. They are gated to `GNU` — only GCC produces them,
+    and ungated they would cost clang `-Werror` on two diagnostics that name real
+    bugs. Deleting one as belt-and-braces takes `gate-gcc-release` red on every
+    branch at once, which is the state #805 exists to have ended.
+  - Retiring them is a MEASUREMENT, never a guess: a later GCC fixing the false
+    positive is what makes them inert, and the check is that the tree still builds
+    with the row removed. Three source rewrites of `EncodeCompileValue` were each
+    measured to silence one compiler and break another — one of them shipped
+    (166880b6) and took `Linux-gcc-release` red — so **the source is not the place**,
+    and a fourth attempt needs a GCC 16 AND a g++-13/14 before it lands.
 
 - **`ctest -R pedantic-suppressions` is the reader, and it DRIVES the file rather
   than scanning it.** It includes `PedanticCompiler.cmake` twice per compiler
