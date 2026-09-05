@@ -239,6 +239,25 @@ foreach(registration IN LISTS scriptRegistrations)
 endforeach()
 
 # ---------------------------------------------------------------------------
+# The declaration test, once, because pass 3 and pass 3b have two different
+# subjects and one rule. A macro rather than a function so the append lands in
+# the caller's scope -- the alternative is a PARENT_SCOPE dance around a list,
+# which is more moving parts for the same effect.
+#
+# Anchored at line start, so the COMMENT explaining an absence is not read as a
+# presence, and `LIMIT_COUNT 1` bounds MATCHES rather than `LIMIT_INPUT`, which
+# bounds BYTES -- a declaration below a byte bound would be scored as absent.
+macro(fastcached_require_cmake_minimum resolvedPath shownPath runBy)
+    file(STRINGS "${resolvedPath}" _declaration
+         REGEX "^cmake_minimum_required\\(" LIMIT_COUNT 1)
+    if(NOT _declaration)
+        set(sawMissingDeclaration TRUE)
+        list(APPEND violations
+             "`${shownPath}`, ${runBy}, declares no cmake_minimum_required, so every policy is unset in it and a policy-gated construct will mean different things on 3.28 and on 4.x")
+    endif()
+endmacro()
+
+# ---------------------------------------------------------------------------
 # Pass 3: each of those scripts must declare a CMake minimum.
 #
 # Script mode has no project, so every policy starts UNSET, and a policy-gated
@@ -302,12 +321,7 @@ foreach(registration IN LISTS scriptRegistrations)
     # compliant file stops reading at its declaration and only a violating one
     # is read to the end. Correctness is why this line reads as it does, not
     # the 10 ms.
-    file(STRINGS "${resolved}" declaration REGEX "^cmake_minimum_required\\(" LIMIT_COUNT 1)
-    if(NOT declaration)
-        set(sawMissingDeclaration TRUE)
-        list(APPEND violations
-             "`${scriptPath}`, run by `${check}`, declares no cmake_minimum_required, so every policy is unset in it and a policy-gated construct will mean different things on 3.28 and on 4.x")
-    endif()
+    fastcached_require_cmake_minimum("${resolved}" "${scriptPath}" "run by `${check}`")
 
     # -----------------------------------------------------------------------
     # Pass 4, folded into pass 3 because it needs the same resolved path: a
@@ -343,6 +357,96 @@ foreach(registration IN LISTS scriptRegistrations)
                  "`${check}` is registered WILL_FAIL and its script exits ${canaryStatus} -- ctest's verdict is `non-zero OR pattern`, so WILL_FAIL inverts a pass it got from the exit code alone, and the canary would stay green with every FAIL_REGULAR_EXPRESSION in this file deleted")
         endif()
     endif()
+endforeach()
+
+# ---------------------------------------------------------------------------
+# Pass 3b: and the `cmake -P` scripts CPack runs, which no ctest registration
+# names (#680).
+#
+# `cmake/MacOSSignBinaries.cmake` and `cmake/MacOSNotarizePkg.cmake` are
+# CPACK_PRE_BUILD_SCRIPTS / CPACK_POST_BUILD_SCRIPTS. CPack executes them in
+# script mode exactly as ctest executes a check, so every policy is unset in them
+# for the same reason -- but they are reached through `cmake/Packaging.cmake`
+# rather than through a registration, so pass 3 walked straight past them.
+#
+# They are the WORSE case rather than the lesser one. A policy misread in a check
+# is a red test; here it is an unsigned or unnotarized package on the release leg,
+# discovered by whoever installs it. And the release leg is the one place in this
+# project where a defect is most expensive to find.
+#
+# DISCOVERED from `cmake/Packaging.cmake`, never listed here. A second copy of the
+# hook paths would be a second thing to be wrong, and it would go stale in the
+# direction that reports green -- the same argument pass 1 makes for reading the
+# registrations out of the tree.
+#
+# ## What this does NOT cover, said plainly so the next reader does not assume it
+#
+# Two more `cmake -P` scripts in this tree are GENERATED at run time by
+# `scripts/check-fetch-transfer-bound.py`. They do not exist when this check runs
+# and no static scan can reach them. That is a limit of this check, not a claim
+# that every `cmake -P` script in the repository is covered. It is stated because
+# #497 counted them and left them out deliberately, and a reader who finds them
+# later would otherwise conclude this scan had missed them silently.
+set(packagingFile "${FASTCACHED_SOURCE_DIR}/cmake/Packaging.cmake")
+set(cpackHookCount 0)
+
+# ONE finding for one cause. Without the `else()` the loop below still runs, each
+# read comes back empty, and a single missing file reports as three violations --
+# a count that overstates what is wrong is the same defect as one that
+# understates it, and this pass has already been caught miscounting once.
+set(cpackHookVars "")
+if(NOT EXISTS "${packagingFile}")
+    list(APPEND violations
+         "cmake/Packaging.cmake is not there, so the CPack hook scripts cannot be discovered and this pass would vouch for nothing while reporting nothing")
+else()
+    set(cpackHookVars CPACK_PRE_BUILD_SCRIPTS CPACK_POST_BUILD_SCRIPTS)
+endif()
+
+foreach(hookVar IN LISTS cpackHookVars)
+    # `LIMIT_COUNT 1`, which is the one `file(STRINGS)` shape that cannot merge
+    # elements: with a single element there is nothing for an unbalanced `[` in a
+    # neighbouring line to merge WITH. Every other reader in this tree that skips
+    # it is bracket-vulnerable, and two of them fail SILENTLY when it bites.
+    file(STRINGS "${packagingFile}" hookLine
+         REGEX "^[ \t]*set\\(${hookVar}[ \t]" LIMIT_COUNT 1)
+
+    # An empty scan is a REFUSAL, not a pass. Two empty lists agree perfectly, and
+    # a hook variable that was renamed would otherwise take this whole pass quietly
+    # out of service -- which is `node-config-reference`'s rule and the failure this
+    # check would reproduce without it.
+    if(NOT hookLine)
+        list(APPEND violations
+             "no `set(${hookVar} ...)` in cmake/Packaging.cmake -- either the hook is gone or it is spelled in a way this scan does not recognise, and in both cases the script it names is no longer checked")
+        continue()
+    endif()
+
+    if(NOT hookLine MATCHES "\"([^\"]+)\"")
+        # Escaped BEFORE it is interpolated, for the reason this file's header
+        # gives about `file(STRINGS)`: a `;` reaching `list(APPEND)` becomes an
+        # ELEMENT BOUNDARY, so one violation prints as two lines and is COUNTED
+        # as two. Measured while writing this pass -- a literal `;` in the message
+        # above made a single finding report as "2 finding(s)", a check
+        # miscounting its own output. The convention in this file is that a
+        # violation string carries no raw semicolon, and anything interpolated out
+        # of a file has to be made to obey it.
+        string(REPLACE ";" "\\;" shownHookLine "${hookLine}")
+        list(APPEND violations
+             "`set(${hookVar} ...)` in cmake/Packaging.cmake names no quoted path this scan can read: ${shownHookLine}")
+        continue()
+    endif()
+    set(hookPath "${CMAKE_MATCH_1}")
+    string(REGEX REPLACE "^\\$\\{[A-Za-z_0-9]+\\}/" "" hookPath "${hookPath}")
+
+    set(resolvedHook "${FASTCACHED_SOURCE_DIR}/${hookPath}")
+    if(NOT EXISTS "${resolvedHook}")
+        string(REPLACE ";" "\\;" shownHookPath "${hookPath}")
+        list(APPEND violations
+             "cmake/Packaging.cmake sets ${hookVar} to `${shownHookPath}`, which is not there")
+        continue()
+    endif()
+
+    math(EXPR cpackHookCount "${cpackHookCount} + 1")
+    fastcached_require_cmake_minimum("${resolvedHook}" "${hookPath}" "run by CPack as ${hookVar}")
 endforeach()
 
 if(violations)
@@ -401,4 +505,5 @@ message(STATUS
     "script-check signals: ${scriptCheckCount} `cmake -P` registration(s), all able to "
     "report failure and all running a script that declares a CMake minimum; "
     "${willFailCount} WILL_FAIL canary/canaries, all exiting 0 so the pattern is what "
-    "decides them")
+    "decides them; plus ${cpackHookCount} CPack hook script(s) discovered from "
+    "cmake/Packaging.cmake")
