@@ -1000,6 +1000,72 @@ set_tests_properties("vslang-probe-only" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# `PEDANTIC_COMPILER_WERROR` decides whether warnings are FATAL, and may not
+# decide which warnings EXIST.
+#
+# `-pedantic` was added under `PEDANTIC_COMPILER` while the suppressions it makes
+# necessary sat inside the `PEDANTIC_COMPILER_WERROR` block, so the four presets
+# that inherit `PEDANTIC_COMPILER=ON` from `base` and leave `WERROR` off --
+# clang-coverage, clang-asan-ubsan, clang-tsan, clang-tracy -- got the warnings
+# and none of the suppressions: 7049 `-Wc2y-extensions` each, measured (#611).
+#
+# Nothing could have reported it. Those presets have `WERROR` off, so the builds
+# exit 0; the preset people actually run has `WERROR` on and is therefore correct;
+# and the one place it becomes visible is a clang-tidy database from a build
+# directory configured that way, where it reads as a stale cache rather than as a
+# rule -- which is how #454 came to be believed unreproducible.
+#
+# The check includes `cmake/portable/PedanticCompiler.cmake` at both `WERROR`
+# settings and refuses any difference that is not purely about fatality. Driving
+# the file rather than scanning it, because the defect was never a spelling: it was
+# which `if()` a line sat inside, and a hand-written model of CMake's nesting would
+# fail in the confident direction.
+add_test(
+    NAME "pedantic-suppressions"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-pedantic-suppressions.cmake"
+)
+set_tests_properties("pedantic-suppressions" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And the half that proves the above can refuse. It was watched failing on
+# 0db96dc8, naming exactly the four suppressions once per GNU-style persona -- but
+# that is a fact about one commit and stops reproducing the moment the fix lands.
+# This runs ten cases instead -- eight synthetic subjects plus two absent inputs --
+# and names each one on every run, because a stated figure that disagrees with what
+# the tool prints is the defect #723 exists to prevent. Three are shapes an
+# unwatched guard accepts: the suppression COPIED outside rather than moved, a
+# subject that no longer adds `-pedantic`, and an MSVC arm that adds nothing.
+#
+# The copied one is why the check compares flag COUNTS rather than membership: a
+# suppression added outside AND left inside is present at both settings, so a set
+# difference is empty and it passes, while the refusal it would have shown says
+# "move the flag, do not copy it". A guard that reads as enforcing something it
+# cannot is worse than no guard.
+#
+# `FASTCACHED_SCRIPT_CHECK_FAILED` is handed over rather than respelled in the
+# script, so the selftest judges a refusal by the same pattern ctest does. A second
+# spelling of it could drift from the property that actually decides these tests,
+# and this file would then certify a verdict nobody reads.
+add_test(
+    NAME "pedantic-suppressions-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SELFTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pedantic-suppressions-selftest"
+        "-DFASTCACHED_SCRIPT_CHECK_FAILED=${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-pedantic-suppressions-selftest.cmake"
+)
+set_tests_properties("pedantic-suppressions-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # The shared e2e helper library. Fails when `scripts/lib/e2e-common.sh` stops
 # drawing ports the way it says, stops distinguishing a dead process from a slow
 # one, stops keeping an HTTP body's last chunk, or stops ending the run from

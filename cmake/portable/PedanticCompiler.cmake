@@ -69,25 +69,78 @@ if(${PEDANTIC_COMPILER})
         #try_add_compile_options(-Wsign-conversion)
         try_add_compile_options(-Wsuggest-destructor-override)
         try_add_compile_options(-pedantic)
+
+        # The suppressions, under the SAME condition as the flags that make them
+        # necessary -- which is `PEDANTIC_COMPILER`, not `PEDANTIC_COMPILER_WERROR`.
+        #
+        # `PEDANTIC_COMPILER_WERROR` decides whether a warning is FATAL. It must not
+        # decide whether a warning EXISTS. These four sat inside the `WERROR` block
+        # while `-pedantic` and `-Wmissing-declarations` were added outside it, so
+        # every preset that inherits `PEDANTIC_COMPILER=ON` from `base` and leaves
+        # `WERROR` off got the warnings and none of the suppressions -- that is
+        # `clang-coverage`, `clang-asan-ubsan`, `clang-tsan` and `clang-tracy`, four
+        # of the twelve.
+        #
+        # Measured on 0db96dc8, each in its own fresh build directory against
+        # `/usr/bin/clang++` with no compiler-cache launcher: **7049
+        # `-Wc2y-extensions` warnings across 195 translation units, the same number
+        # in all four**. Nothing failed, because those presets have `WERROR` off --
+        # which is why this survived: the only place it becomes visible is a
+        # clang-tidy database from a build directory configured that way, where it
+        # reads as a stale cache rather than as a rule
+        # ([#454](https://github.com/LASTRADA-Software/fastcached/issues/454),
+        # [#611](https://github.com/LASTRADA-Software/fastcached/issues/611)).
+        #
+        # `ctest -R pedantic-suppressions` is what holds this, by including this
+        # file at both `WERROR` settings and refusing any difference that is not
+        # purely about fatality. Copying the suppressions out while leaving them in
+        # would NOT close it: two conditions naming one diagnostic is the defect.
+        #
+        # That guard lives in the repository this file came from. A project that
+        # vendored this module has the flags and not the check, so the paragraph
+        # above is the whole of what travels with it.
+
+        # Don't complain here. That's needed for bitpacking (codepoint_properties) in libunicode dependency.
+        try_add_compile_options(-Wno-c++20-extensions)
+
+        # __COUNTER__ is a long-standing vendor extension used by LIGHTWEIGHT_SQL_RELEASE;
+        # Clang 22 newly classifies it as a C2y extension. This is the one that fired:
+        # every `TEST_CASE` expands to it, so the count is a function of how many
+        # tests there are.
+        try_add_compile_options(-Wno-c2y-extensions)
+
+        # Not sure how to work around these.
+        try_add_compile_options(-Wno-class-memaccess)
+
+        # TODO: Should be addressed.
+        #
+        # This one cancels the `-Wmissing-declarations` added a few lines up, and
+        # deliberately: the pair is how "we want this warning, we are not ready for
+        # it" is spelled, so turning it on again is deleting ONE line rather than
+        # adding one. That was already true for every `WERROR` preset; what changed
+        # is that the other four now agree, and they lose nothing by it -- measured
+        # zero `-Wmissing-declarations` diagnostics across all four before the move.
+        try_add_compile_options(-Wno-missing-declarations)
+
         if(${PEDANTIC_COMPILER_WERROR})
             try_add_compile_options(-Werror)
 
-            # Don't complain here. That's needed for bitpacking (codepoint_properties) in libunicode dependency.
+            # Fatality only. `-Wno-error=X` says "keep X visible, do not fail on
+            # it", which is a statement about `-Werror` and belongs here; the
+            # `-Wno-X` above says "never show me X", which is not.
+            #
+            # These are belt-and-braces rather than load-bearing: a diagnostic
+            # disabled by `-Wno-X` can never be an error, so each of these matters
+            # only on a compiler where the `-Wno-X` probe fails while its own
+            # succeeds. Measured on clang 22.1.8 and GCC 16.2.1, the two halves of
+            # every pair succeed and fail TOGETHER -- clang rejects both spellings
+            # of `class-memaccess`, GCC rejects both of `c2y-extensions` -- so on
+            # those two compilers they are currently inert. Kept because that is a
+            # property of two compilers rather than of the flags.
             try_add_compile_options(-Wno-error=c++20-extensions)
-            try_add_compile_options(-Wno-c++20-extensions)
-
-            # __COUNTER__ is a long-standing vendor extension used by LIGHTWEIGHT_SQL_RELEASE;
-            # Clang 22 newly classifies it as a C2y extension.
             try_add_compile_options(-Wno-error=c2y-extensions)
-            try_add_compile_options(-Wno-c2y-extensions)
-
-            # Not sure how to work around these.
             try_add_compile_options(-Wno-error=class-memaccess)
-            try_add_compile_options(-Wno-class-memaccess)
-
-            # TODO: Should be addressed.
             try_add_compile_options(-Wno-error=missing-declarations)
-            try_add_compile_options(-Wno-missing-declarations)
         endif()
     else()
         message(STATUS "Enabling pedantic compiler options: unsupported platform")
