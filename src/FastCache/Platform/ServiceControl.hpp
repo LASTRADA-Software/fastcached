@@ -6,6 +6,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -604,6 +605,151 @@ struct ServiceSpec
 /// @param which The default in question.
 /// @return True when the shared clauses all hold.
 [[nodiscard]] bool ScopeDefaultApplies(ServiceSpec const& spec, ServiceScope scope, ScopeDefault which);
+
+// ---------------------------------------------------------------------------
+// What a bounded `launchctl` call cost (#535)
+//
+// The bound itself was never in doubt; what it REPORTED about itself was. It
+// rendered the configured ceiling rather than the measured elapsed, carried no
+// evidence about the process it killed, and the caller then told an operator the
+// job "will start at the next login or boot" -- advice that is true when the host
+// was merely busy and false when the binary wedges, with nothing able to tell
+// those apart.
+//
+// The readings and the verdict live HERE, outside the `__APPLE__` branch that
+// acquires them, and that placement is the point rather than tidiness.
+//
+// The reason is the absence of a SEAM, not the absence of a machine -- an earlier
+// draft of this comment said "testable on no machine this project builds on" and
+// that is false: CI builds and runs `ctest` on macOS. What there is no way to
+// reach is a decision buried in a file-local function that spawns a real process
+// and waits on it. Lifting the decision out over a record gives it one, and it is
+// the same shape `_e2e_verdict` takes in `scripts/lib/e2e-common.sh`, for the
+// same reason.
+// ---------------------------------------------------------------------------
+
+/// How a bounded `launchctl` call ended.
+enum class LaunchctlOutcome : std::uint8_t
+{
+    Exited,     ///< It returned a status of its own, zero or not.
+    NotStarted, ///< It could not be spawned, or could not be waited for.
+    Signalled,  ///< It ran and was killed by a signal rather than exiting.
+    TimedOut,   ///< The deadline passed and WE killed it.
+};
+
+/// What one bounded `launchctl` call actually cost.
+///
+/// `elapsed` is MEASURED. The message this feeds used to interpolate the
+/// configured ceiling, so it read `60s` whatever the call really took -- and a
+/// polled wait overshoots its deadline by up to one poll interval, on a loaded
+/// host by more. A number that cannot be wrong is not a measurement.
+struct LaunchctlReadings
+{
+    /// How it ended.
+    LaunchctlOutcome outcome { LaunchctlOutcome::Exited };
+
+    /// The call's own exit status. Meaningful only for `Exited`.
+    int exitStatus { 0 };
+
+    /// The signal that killed it. Meaningful only for `Signalled`.
+    ///
+    /// Its own field rather than folded into `exitStatus` as `128 + signal`:
+    /// that encoding is a shell convention, and a struct that has room to say
+    /// which fact it holds should say it. `NotStarted` used to cover this case,
+    /// so a `launchctl` that started and crashed was reported as one that
+    /// "could not be started" -- a diagnostic naming the wrong cause, which is
+    /// the class of defect this whole change is about.
+    int terminatingSignal { 0 };
+
+    /// Measured wall time, never the configured ceiling.
+    std::chrono::milliseconds elapsed { 0 };
+
+    /// The ceiling it was allowed, so a message can report both.
+    std::chrono::milliseconds budget { 0 };
+
+    /// CPU the killed child consumed, or `nullopt` when nothing could read it.
+    ///
+    /// A disengaged optional is "no reading", which is NOT the same fact as a
+    /// reading of zero -- zero says the process never ran, and that is the one
+    /// calibrated point on this axis. Collapsing them would let a platform that
+    /// cannot sample CPU report every timeout as "it never ran".
+    std::optional<std::chrono::microseconds> cpu {};
+};
+
+/// What a timed-out `launchctl` call's readings do and do not establish.
+///
+/// **Calibrated on measurements, and the first draft of this enum was wrong.** It
+/// read zero cpu as "it never ran", on the reasoning that zero is the one point
+/// that does not vary. Measured by driving the acquisition loop over a parked
+/// process and a spinning one: a `sleep` that does nothing at all still consumes
+/// **665us** -- exec, dynamic linking and entering the sleep are not free -- so
+/// zero essentially never occurs and the interesting difference is a RATIO. The
+/// same run put a busy loop at **846448us** against 1012ms of ELAPSED: 0.07% duty
+/// against 83.6%, three orders apart. Elapsed rather than budget throughout, in a
+/// header whose whole subject is that those two differ.
+enum class LaunchctlFinding : std::uint8_t
+{
+    /// Not a timeout at all; there is nothing here to diagnose.
+    NotATimeout,
+
+    /// It was burning cpu when the budget ran out. Whatever it was doing, it will
+    /// do again -- this is the one reading that rules a slow host OUT.
+    BurningCpu,
+
+    /// It consumed barely any cpu: it was waiting on something. That covers a
+    /// loaded host AND a lock it will never get, which these readings cannot
+    /// separate -- so this names what was seen rather than what caused it.
+    Waiting,
+
+    /// The duty cycle fell between the two, or no reading could be taken. Said
+    /// out loud rather than resolved towards whichever is convenient.
+    Inconclusive,
+};
+
+/// Whether a launchctl call did what was asked.
+///
+/// One spelling, because "exited zero" is the only success and four call sites
+/// comparing fields for themselves is four places for the answer to drift apart.
+/// No site ever got this wrong -- the previous code compared an int against 0 and
+/// every sentinel was negative -- so this preserves a correct answer rather than
+/// repairing a broken one.
+/// @param readings What the call cost.
+/// @return True when it exited with status zero.
+[[nodiscard]] bool LaunchctlSucceeded(LaunchctlReadings const& readings) noexcept;
+
+/// How to name a launchctl call's failure in a sentence.
+///
+/// "failed" only where something actually refused. A wait that ran out refused
+/// nothing, and calling it a failure sends an operator looking for a rejection
+/// that never happened (#535). BOTH failing call sites use this rather than the
+/// kickstart one alone: they are byte-identical defects, and the one that was not
+/// observed is the one that survives a fix aimed at the one that was.
+/// @param readings What the call cost.
+/// @return "timed out" or "failed".
+[[nodiscard]] std::string_view LaunchctlFailureVerb(LaunchctlReadings const& readings) noexcept;
+
+/// Read a launchctl timeout's readings as a finding.
+///
+/// Two bands with a deliberate gap, because the gap is the honest part. The
+/// anchors are measured (0.07% parked, 83.6% spinning) and everything between is
+/// `Inconclusive` rather than assigned to the nearer edge -- which is the rule
+/// `.agent/rules/testing.md` states for the scratch-isolation classifier, where
+/// "no magnitude bar calibrates" and the band between idle and clearly-working is
+/// reported as neither.
+/// @param readings What the call cost.
+/// @return The finding.
+[[nodiscard]] LaunchctlFinding LaunchctlFindingOf(LaunchctlReadings const& readings) noexcept;
+
+/// Render a launchctl outcome for an operator, naming the KIND of failure and
+/// what its readings do and do not establish.
+///
+/// It deliberately makes no claim about what happens next. The sentence this
+/// replaces ended "it will start at the next login or boot", emitted for every
+/// failure -- a prediction true only when the host was busy, and these readings
+/// cannot establish that case (#535).
+/// @param readings What the call cost.
+/// @return A phrase that reads correctly after "kickstart timed out (".
+[[nodiscard]] std::string LaunchctlStatusText(LaunchctlReadings const& readings);
 
 /// Outcome of a service-control operation.
 struct ServiceControlResult

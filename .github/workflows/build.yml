@@ -2239,9 +2239,33 @@ jobs:
           # costs the job's whole 30 minutes.
           sudo pkill -9 XProtect >/dev/null 2>&1 || true
           while pgrep XProtect >/dev/null; do sleep 3; done
+
+          # `set -m` so the reaper becomes a PROCESS GROUP LEADER, and the trap
+          # then signals the group rather than the subshell (#516).
+          #
+          # `$!` is the subshell, and killing it leaves the `sleep 5` it has
+          # already spawned running -- reparented, and still holding this step's
+          # stdout. A step is not finished until every descriptor on its output
+          # pipe closes, so the step hung on a process its own cleanup was
+          # written to remove.
+          #
+          # MEASURED with a stand-in over a real pipe, five runs each: the step
+          # body returned at ~301ms and the pipe stayed open until ~5036ms
+          # before, and ~302ms after. So the exposure was one `sleep` interval,
+          # about 4.7s -- BOUNDED, and worth stating plainly because this was
+          # once mistaken for a 30-minute wedge. That wedge is #376, an unbounded
+          # `notarytool --wait`, and it is a different defect in the same step;
+          # fixing this one does not shorten it, and attributing a future wedge
+          # to this would send somebody to the wrong place.
+          #
+          # `set +m` immediately after, because job control is wanted for the
+          # fork and nowhere else. The group is fixed at fork time, so the
+          # already-started reaper keeps its own group afterwards.
+          set -m
           ( while :; do sudo pkill -9 XProtect >/dev/null 2>&1 || true; sleep 5; done ) &
           reaper=$!
-          trap 'kill "$reaper" 2>/dev/null || true' EXIT
+          set +m
+          trap 'kill -- -"$reaper" 2>/dev/null || true' EXIT
           cd out/build/macos-package && cpack -G "productbuild;TGZ"
 
       - name: "Inspect the .pkg payload"
