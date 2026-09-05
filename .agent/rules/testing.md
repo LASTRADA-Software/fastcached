@@ -732,6 +732,69 @@ status from the **process**, never from a pipe; and confirms the failure is the
 fails for another reason proves nothing about the guard. Where it cannot establish
 those, it reports INCONCLUSIVE and names the reading it is missing.
 
+## Assert what DISTINGUISHES, not what both sides produce
+
+In one evening four lanes found **five** tests that could not fail for the reason
+they existed ([#355](https://github.com/LASTRADA-Software/fastcached/issues/355)).
+Not the same mistake in the same place — the same mistake in five shapes, and every
+one of them green.
+
+Two, which are enough to see the shape:
+
+- **[#286](https://github.com/LASTRADA-Software/fastcached/issues/286)'s acceptance
+  did `REQUIRE(held)` on a bind** (implemented by pull request #348).
+  `BlockingListener::Bind` returns a **non-null pointer in an errored state**, so a
+  failed bind passes it. Both sections — a named port that must refuse, a defaulted
+  one that must warn and continue — would then have passed on a `ParseTcpPort`
+  refusal rather than on the port conflict they existed to prove.
+- **#288's pinned raft test asserted that a refusal happened and that the message
+  names `--listen-raft`.** *Both* the old cross-flag rule and the new grammar rule
+  name that flag, so it pinned the flag rather than which rule answered — and a
+  relocation could land, or be reversed, in silence.
+
+The other three: a reproduction whose fixture **supplied its own refusal** and so
+never drove the production validator; an acceptance that passes under a digest taken
+at the **wrong layer**, so it would have blessed a fix that catches nothing; and a
+progress check using **log growth**, where the include-tree walk logs nothing while
+it runs and a slow walk is character-for-character identical to a wedge.
+
+**The shared shape: each asserts something both the healthy and the broken state
+produce.** The test is not weak — it is measuring a quantity that does not vary with
+the defect. And because it passes in both states nothing ever draws attention to it,
+so it reads as coverage forever. A refusal test asserts *which* refusal; a
+relocation test asserts the message only the new site emits.
+
+**Prove the test can fail.** Neuter the fix, run it, and check that the failures are
+the ones you expect *and only those*. Two of the five were caught exactly that way.
+The clearest demonstration of the technique is elsewhere — pull request #353, which is
+**not** one of the five — where neutering made the two positive cases fail while three
+negative ones correctly still passed: **the asymmetry is the evidence**, since an
+all-red run would equally be a harness that had stopped working. A green test nobody
+has watched fail is an untested test — the sentence `compile-cache.md` applies to a
+guard, applied here to the thing the guard is made of.
+
+**Three of the five were acceptance criteria**, written by the person who understood
+the defect best, at the moment they understood it best. That is not carelessness.
+*What would prove this fixed* and *what would fail if it were not* are different
+questions, and only the second one tests anything — so an acceptance criterion is a
+hypothesis, and it is worth asking the second question separately before writing the
+test that satisfies it.
+
+Three entries in this file are instances of it: a bounded wait that must say which
+KIND of failure it was, a fixture that states which PATH it exercised, and `SUCCEED`
+standing in for a skip. **A harness earns its place by asserting something that can be
+shown red** above is a fourth, and it already cites this ticket — it is where the rule
+was applied before it was stated, including the asymmetry (four assertions failed while
+the straight case correctly stayed green). Each was found on its own; none stated the
+general form, which is why the fifth still had to be found by whoever happened to be
+careful that day.
+
+`Unwrap(x)` after `REQUIRE(x.has_value())` is deliberately **not** in that list. It
+looks like one and is not: it exists because clang-tidy cannot see the guard through
+`REQUIRE`, so a bare `*x` fails the build. That is a build-guard rule, and folding it
+in would put one rule under two headings — which is what the census entry below means
+by an instance filed where nobody looking for it will read it.
+
 ## A query that FAILED is not an observation about the subject
 
 A required-context checker was written for the shape
@@ -769,6 +832,34 @@ This is the third shape of one family, and the other two are recorded in
 `pipefail` reports absence *because* the symbol is present, and `| tail` returns the
 pipe's status so a failed build reads as a passing one. There the query ran and its
 status was misread; here **the query never ran at all**.
+
+**And a failed query does not only MISS a finding — it can invent one, which is the
+worse direction and the one that gets acted on.** Measured on `gh issue view`, which a
+rulebook-staleness checker would resolve entries with:
+
+```
+number resolves to nothing   exit=1  stdout=0B   stderr: Could not resolve to an issue ...
+repository does not exist    exit=1  stdout=0B   stderr: Could not resolve to a Repository ...
+not a number at all          exit=1  stdout=0B   stderr: invalid issue format: "not-a-number"
+a real issue (control)       exit=0  stdout=29B  stderr: —
+```
+
+Three faults, one exit status, one empty stdout — and **two of the three are faults in
+the checker's own invocation**: a wrong `--repo`, a network failure, an expired
+credential. A checker reading `exit != 0` as *this entry names a dead issue* therefore
+reports a stale rulebook entry when its own argument was wrong, and somebody then
+**edits a correct entry to satisfy a broken check**. Missing a finding costs a defect;
+inventing one costs a correct file.
+
+So such a checker has **four** outcomes, not two — pass, stale, bad reference, and
+*could not run* — which is *skipped, absent, unstarted and failed* arriving inside the
+tool written to enforce this rulebook. Prefer a route whose transport separates them:
+`gh api repos/{owner}/{repo}/issues/N` answers with an HTTP status and hands back the
+`pull_request` key in the same call, which also settles *is this number an issue or a
+pull request* without a second request. And the suite needs a case for it: **a
+deliberately broken invocation that must report `could not run` and must NOT report a
+stale entry.** Nothing else proves the checker does not blame its subject for its own
+faults.
 
 The same rule reaches a measurement, where its direction is worth stating because it
 is not symmetric. A counted loop that reports *N failures out of N* may be measuring

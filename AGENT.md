@@ -146,6 +146,15 @@ distributes anything and goes green anyway.
 tripwires, not summaries: they are there so a rule fires even in a session that
 never opens the file, and none of them carries the reasoning that makes it stick.
 
+**So a rule landed in `.agent/rules/` without a bullet here fires in no session that
+does not open its file** — which is the population the rule was written for. #355
+shipped that way: a rule stating that a test asserting what both sides produce is no
+test, with no tripwire, so it would have applied to nobody who had not already gone
+looking for it. Caught by a review, not by the author. It is not one of the
+state-collapse instances the observability rules catalogue — nothing failed to tell
+two things apart. It is a rule that did not apply itself, and the reason it is easy
+is that writing the rule feels like the work.
+
 > Link these as plain markdown, never as an `@`-prefixed path. Claude Code resolves
 > `@` imports recursively out of `CLAUDE.md`, so `@`-importing a rule file would
 > pull every one of them back into every session and put the context cost straight
@@ -848,12 +857,26 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
   illegal in an SVG.
 - **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five times in four
-  instruments in one session, none of them a coding mistake, all of them a representation that could not tell
+  instruments in one session, twelve across eight once a later session's are counted, none of them a coding mistake, all of them a representation that could not tell
   two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
   true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
-  a separate assertion that the good things exist. Where the answer cannot be determined, report that as its own
-  outcome rather than the nearest neighbour.
+  a separate assertion that the good things exist. **That reaches any probe you TYPE — a `grep`, a `find`, a
+  `gh api --jq`, a throwaway script — which is where it is skipped**: ask it for something it must find before
+  believing what it did not find, and read its exit status — and note **134** is not `2`, so anything neither `0`
+  nor `1` is the instrument failing (`grep -c -i -F` aborted, no stdout, and read as dropped hunks in a merge
+  just declared clean). Where the answer cannot be determined, report that as
+  its own outcome rather than the nearest neighbour.
+- **A state-collapsing bug is likeliest in the tool whose JOB is that state distinction** — a watcher that
+  exited on any red without asking whether it was a REQUIRED context, a checker that folded SKIPPED then
+  CANCELLED into `fail`. Its author is thinking about the subject's states, not the instrument's. And the repair
+  is not "stop exiting": it must report the unrequired red by name AND KEEP WATCHING, or it looks identical to
+  the broken one on every green run. **The repair for one collapse is the prime site for the next, and the
+  location is the `*)` arm** — splitting `pending` out of `fail` left a default that swallowed `cancelled` and
+  invented a red. Enumeration does not save you there; you enumerate the states you are thinking about. **A
+  `case` with a `*)` is an unguarded table** — the `EnumTable`/`RowsInEnumeratorOrder` argument, never yet made
+  for a shell script. And a verdict computed from a SUMMARY while the evidence sits in the same output is its own
+  defect, more durable because the output looks thorough.
 - Absent is not zero: a process with no cache reports no cache, and *names* the
   field to do it.
 - Its converse: an absence must not be counted as an event. `NoUpstream`'s honest
@@ -1239,6 +1262,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
+- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found FIVE tests that
+  could not fail for the reason they existed — five shapes, all green, three of them acceptance criteria written by
+  whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
+  as coverage forever: `REQUIRE(held)` on a bind whose failure returns a non-null pointer in an ERRORED state, and
+  a refusal test pinning a flag BOTH the old and the new rule name. A refusal test asserts WHICH refusal. **Prove
+  the test can fail** — neuter the fix and check the failures are the ones you expect AND ONLY THOSE; the
+  asymmetry is the evidence. "What would prove this fixed" and "what would fail if it were not" are different
+  questions, and only the second one tests anything.
 - Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone

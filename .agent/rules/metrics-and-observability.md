@@ -444,7 +444,8 @@ fault.
 metrics. In one working session this project's own tooling collapsed at least two
 of these four states **five separate times, in four different instruments** — none
 of them a coding mistake, all of them a representation that could not tell two
-things apart:
+things apart. The last three rows are from a later session and are counted
+separately, so the table now stands at **twelve collapses across eight instruments**:
 
 | instrument | what it reported | what was true |
 |---|---|---|
@@ -453,6 +454,60 @@ things apart:
 | the required-checks reading | a skipped required check passes | a skipped **matrix** job never reports at all |
 | `pr-labels.yml`'s gate | skipped, therefore green | the labeller had **failed** |
 | a CI watcher (twice) | "settled", then "25 of 26 green" | the list was still being built; the 26th was correctly skipped |
+| a merge watcher (twice) | stop watching, on **any** red; then `RED`, from a `*)` | the red was an *unrequired* packaging leg, so ten required contexts went unwatched — and the repair's own default arm then swallowed `cancelled` |
+| a merge-readiness checker (three times) | `fail` | `SKIPPED`, then `CANCELLED`, then *pending* — the last inventing a red that did not exist |
+| a rule-vs-tripwire cross-check | `0`, read as *the two files disagree* | the phrase was present and **wrapped across a line** |
+
+**An instrument answers the question it was given, and its author's confidence comes
+from the question they meant.** The last row is the smallest instance and the clearest
+statement of that: `grep -c` was asked whether a phrase occurs *on one line*, answered
+`0` correctly, and was read as *the two files disagree* — by the author of the rule
+about probes, minutes after writing it. No state was collapsed inside the tool at all;
+the collapse was between the question asked and the question meant.
+
+**Five of these were found in somebody else's tool; two were found by an author in their
+own, within an hour of writing the rule against them.** That second group is the whole
+argument for this being a check rather than better prose: the people who wrote it down
+were the next to do it.
+
+**Two rows are sharper still, because in them the collapsed distinction is the very one
+the instrument existed to report.** A watcher built to tell required from unrequired
+stopped at the first red without asking which it was; a checker built to keep `ABSENT`
+distinct from pending folded `SKIPPED`, then `CANCELLED`, into `fail`. Neither author was
+careless — a red is a red is the obvious reading, and it is wrong in exactly the domain
+each tool was written for. So the sharper form of the observation that closes this
+section: **a state-collapsing bug is likeliest in the tool whose job is that state
+distinction**, because its author is thinking about the subject's states and not about the
+instrument's. Every row above was written by somebody who had the distinction fully in
+mind, and the last two by authors who had just been told about the others.
+
+**The repair for one collapse is a prime site for the next, and the location is the
+default arm.** A sixth followed within the hour: splitting `pending` out of `fail`, in
+that same edit, left a `*)` that swallowed `cancelled` — so a superseded label run was
+reported as `1 required context RED` on a pull request that had no red. Enumeration would
+not have prevented it, which is what separates it from the row above: there `cancelled`
+was **never enumerated**, an omission; here the arm was written **deliberately**, and the
+author would have enumerated exactly the states they were thinking about and defaulted the
+rest. The remedy is therefore not a longer list but **no default arm at all** — a `case`
+with a `*)` is an unguarded table, and this is the `EnumTable` + `RowsInEnumeratorOrder`
+argument the C++ side of this repository has made for years and has never once made for a
+shell script.
+
+**And a verdict computed from a summary, while the evidence sits in the same output, is a
+separate defect from one computed from bad evidence.** That run printed
+`PR labels  completed  cancelled` two lines above its own wrong conclusion; the tool had
+gathered and displayed the disproof and then never consulted it. It is the more durable of
+the two, because the output *looks* thorough.
+
+What bounded the damage is worth naming, since every instance here is a tool that reported
+*something* where it should have reported *nothing*: run from the wrong directory that same
+script failed **closed** — `could not read the pull request head` — instead of reporting
+zeros. That is *zero rows is not a verdict, it is the absence of one*, obeyed, and it is
+the design decision that made the sixth the least bad of the six.
+
+The fixed watcher shows the other half of a repair, usually left out: it reports an
+unrequired red by name **and keeps watching**. One that had merely stopped exiting would be
+indistinguishable from the broken one on any green run.
 
 The four states, and why each pair is dangerous:
 
@@ -465,7 +520,7 @@ The four states, and why each pair is dangerous:
   a sum is how "we could not tell" becomes "there was nothing there".
 - **Observed and failed.** The only one anybody designs for.
 
-Three consequences worth applying before writing the check rather than after:
+Four consequences worth applying before writing the check rather than after:
 
 **A count cannot carry this and neither can a `bool`.** `25 of 26 green` is
 arithmetic that is true and useless. An outcome that can be *not attempted* is an
@@ -478,6 +533,27 @@ concludes from a count of *bad* things needs a separate assertion that the good
 things exist — which is why `tsan-gate.sh` proves the sanitizer is live before it
 believes a clean run, and why `merge-queue-contexts` counts total references as
 well as safe ones.
+
+**And it applies to a probe somebody types, where the cheap half gets skipped.** The
+must-find control is already carried to a typed search — `testing.md`'s *a census
+that returns zero gets a positive control* — so what is missing is not that half but
+the other: **read the probe's exit status too, and do not assume a non-match is the
+only way to get nothing.** A content probe once returned empty for *every* string,
+including ones visible in the output two lines earlier, and read exactly like dropped
+hunks in a merge just declared clean. `grep -c -i -F` had **aborted: exit 134,
+SIGABRT, no stdout** — and note it is not `2`, so a reader checking `status == 2` for
+"error" misses precisely this case. Treat anything that is neither `0` nor `1` as the
+instrument failing.
+
+Which signal survives depends on the invocation, and getting that wrong argues for
+throwing away the cheap one. A bare `grep` prints nothing whether it matched nothing
+or died, so its stdout genuinely cannot separate them; `grep -c` prints `0` on a
+non-match and printed nothing here. **Two independent signals were available and
+neither was read.** The control is the stronger of the two — it survives a tool that
+lies about its status as well as one that crashes — but it is not a substitute for
+reading the number the tool already handed you. `build-and-toolchain.md` carries the
+pipeline-corruption forms of the same family (`producer | grep -q`, `| tail`), which
+are a different mechanism: there the query ran and its status was misread.
 
 **Ask which state a silent tool is in, and make it say so.** Where the answer
 genuinely cannot be determined, report that as its own outcome rather than picking
