@@ -775,6 +775,31 @@ determinism rests on.
     and both rows stand. Attach the interval, and say what it is an interval on --
     "P is small" without naming the hypothesis it is small under is the same
     omission wearing a number.
+  - **A flag combination that cannot express the question still returns an answer.**
+    The species `pkill -f`, `grep -c` read as a position and `grep -q` under
+    `pipefail` all belong to: **the shell obliges regardless, and none of them
+    errors.** The cleanest specimen is `grep -Lq`, where the contradiction is
+    INTERNAL — `-L` lists files WITHOUT a match, `-q` suppresses output and exits at
+    the first match, and the two cannot both be honoured. Instead of complaining it
+    picks one, and it named two files as lacking a symbol they contain.
+
+    Three things make that the worst of the family, and the second is the one to lead
+    with.
+
+    **It was a POSITIVE CONTROL** — the instrument added specifically to stop a wrong
+    conclusion. A broken control is worse than no control, because its presence is
+    what licenses the confidence. And it generalises past shells: **a control is the
+    one instrument nobody checks, because checking it is what it was for.** Anybody
+    instructing a team to add positive controls owes them that caveat.
+
+    **Its error pointed at refuting a claim**, which is the direction that gets acted
+    on — *because refuting feels like diligence*. It was one step from a correct rule
+    being reported as overstated.
+
+    **And nothing about the output looked wrong.** Two files is a plausible answer;
+    unlike a wrapped message or an empty capture there is no tell. The only defence is
+    re-deriving the control by a different construction — here an explicit loop, which
+    gave **0 files lacking it** and turned "consistent with" into "confirmed".
   - **`producer | grep -q` is a false NEGATIVE under `set -o pipefail`, and it fails
     on the SUCCESS path.** `grep -q` exits the instant it matches, which closes the
     pipe; the producer is killed by SIGPIPE; `pipefail` then takes the producer's
@@ -943,6 +968,20 @@ The specific traps are examples. The rule is the mechanism.
   phases can judge different trees. An accurate verdict about something nobody asked
   about. Name the commit before starting, re-check it at the end, and refuse when the
   tree is dirty.
+  - **An intermediate reading is BIASED, not noisy, and that is why the remedy cannot
+    be "read it carefully".** A tree sampled mid-build can only be MISSING artefacts —
+    never carrying extra ones — so its error is one-sided by construction: always
+    toward failure, never toward success. Measured twice in one task: `ctest -L hygiene`
+    at 235 of 429 build edges reported 2 failures where the settled tree reports
+    **60/60**, and an earlier sample at 330 of 429 reported 1.
+    The consequence is the part that changes behaviour. A mid-build failure is exactly
+    what a real regression looks like, so the natural response — investigate it — is
+    the wasted motion, and no amount of care in INTERPRETING the reading recovers
+    anything, because the reading contains no information about the finished tree. So
+    the discipline is **do not take the reading**: wait for the build's completion
+    signal rather than sampling a tree that is still being written. Both hits above
+    were caught only by re-measuring afterwards, and in both the alarming number came
+    first.
 - **The log under `/tmp`.** `wsl -e bash` detaches, so a build outlives the wrapper
   that reports on it — and the wrapper is what keeps the WSL session alive, so
   *killing it to tidy up* starts an idle countdown that takes the VM, the orphaned
@@ -2858,6 +2897,33 @@ wrong move: the caveat rule is right and the prose was wrong.
   context is read as passing. The `name:` is a wire constant; renaming it renames
   a required context.
 - **No new job**, for `check-release-gate`'s reason above.
+- **A check that reads BOTH SIDES is the answer when a diagnostic is unreachable
+  by unit test.** `docs/operations/corrupt-store.md` quotes startup diagnostics
+  verbatim and exactly one of them was asserted anywhere (#633) — because the
+  daemon's `StorageOpenFailure` sits in an ANONYMOUS NAMESPACE in `main.cpp`,
+  behind `add_executable(fastcached main.cpp)` with no test target, and the node's
+  sentence is composed in a third file in a different binary. Asserting them by
+  unit test needs the app restructured; a `docs-subject` check reading the page
+  AND the composing sources needs no linkage at all, and covers both binaries.
+  The page's usefulness *is* that an operator recognises their own console output
+  in it, so the thing to pin is that the source can still compose what the page
+  shows.
+  - **Assert PRESENCE in the composing source, never equality with a formatted
+    line** — the latter is a change-detector that fails on every wording tweak,
+    which is what #633 exists to avoid. The shard sentence's field-level
+    assertion is the `'{}'` that carries the path.
+  - **The exception proves it rather than breaking it**: for the
+    `StorageError(code={} system={} context={})` rendering the WHOLE format string
+    is pinned, because that rendering *is* the verbatim quote. A change-detector
+    is exactly right where the literal is what moved onto the page.
+  - **A sentence composed in three places needs a per-FRAGMENT table, not a
+    per-sentence one.** The node's refusal is `--cache-dir {}` and
+    `cannot open {}` in `CacheTier.cpp` plus `refusing to start` in its own
+    `main.cpp`; a check reading only the tier misses the suffix and reports clean.
+  - And the set is derived from the PAGE, so **a quoted diagnostic no row covers
+    is REFUSED**, never passed over. An uncovered quote is precisely the silent
+    gap the check exists to close, and a table that quietly ignores one is the
+    check vouching for something it never read.
 - **The set is the `docs-subject` ctest LABEL**, read out of
   `src/tests/CMakeLists.txt` along with each check's `-D` arguments, its
   `SKIP_REGULAR_EXPRESSION` and the one `FASTCACHED_SCRIPT_CHECK_FAILED` spelling.
@@ -2882,7 +2948,7 @@ wrong move: the caveat rule is right and the prose was wrong.
   a `--self-test` that drives all three rules against generated workflows. They
   had only ever been seen to pass.
 
-### Six ways an instrument reported on something other than its subject, in one branch
+### Seven ways an instrument reported on something other than its subject
 
 Every one of these was written by somebody who had just read this file, and every
 one produced a green or a red that was about the tool rather than the tree. They
@@ -2943,6 +3009,53 @@ are recorded together because the shape is one shape.
   the self-test GREEN. The mode under test was not the mode in use. There is now a
   fixture per arm: one that prints the failure text and exits 0, one that exits
   non-zero with clean output.
+- **CMake WRAPS its diagnostic messages, so a phrase you grep for may exist in the
+  output and in no single LINE of it.** A mutation harness reported all three of its
+  arms as `SELFTEST STAYED GREEN -- this mutation is NOT covered` while the self-test
+  was in fact RED with four cases named. The phrase it matched on,
+  `did not behave as claimed`, straddled the wrap point. Measured:
+
+  | message type | matches for a phrase crossing column 74 |
+  |---|---|
+  | `message(STATUS)` | **1** — does not wrap |
+  | `message(WARNING)` | **0** |
+  | `message(FATAL_ERROR)` | **0** |
+  | any of them, whitespace flattened first | **1** |
+
+  **The `STATUS` row is the trap inside the trap, and there are TWO ways to write the
+  negative test wrong.** It does not wrap, so a test written with `STATUS` reproduces
+  nothing and reads as a refutation of the whole claim; and in a file emitting BOTH, the
+  unwrapped `STATUS` copy satisfies the grep and masks the wrapped one — which is what
+  the first attempt here did, returning 1 match. Both failure modes read as a
+  refutation, so a reader who tests only the first still concludes the rule is false.
+  Same structure as *a green probe of the wrong shape is not a refutation*, in a
+  different tool.
+
+  **And this is a property of every verdict this repository reads, not a trap somebody
+  might hit.** A `cmake -P` script cannot fail by exit code — `message(FATAL_ERROR)`
+  prints and exits 0 on 3.28 — so the verdict travels through the diagnostic channel by
+  construction. Measured: **37 of 37** `scripts/check-*.cmake` report through
+  `message(FATAL_ERROR)` — on the branch that added this entry; **35 of 35** on the
+  master it branched from, the two extra being that change's own. Both figures are
+  right for the tree they were taken on, which is the census rule arriving a third
+  time: not a different pattern here, the *same* pattern on a different tree. State
+  which tree, or the next person measures 35 and concludes the rule overstates itself.
+  Every one of them is a check whose verdict cannot be read by a substring match that
+  crosses column 74. So flatten (`tr '\n' ' ' | tr -s ' '`)
+  before matching any verdict text, or match a phrase short enough that it cannot
+  straddle the wrap.
+
+  This is not any of the six above. Those are wrong buckets, wrong populations, a
+  substring of a count, a comment matching itself. **This one is: the text you are
+  matching does not exist in the form you are matching it in, and the tool that
+  printed it is what changed the form.** The subject was fine and the reading was
+  fabricated by the formatter in between.
+
+  The tell is the one worth keeping: **three arms agreeing perfectly is what a broken
+  instrument looks like as well as what a real pattern looks like.** Refusing "all
+  three uncovered" and printing the raw output is what found it — the same move as
+  treating two legs disagreeing at 3220/3216 as evidence about the instrument rather
+  than about the tree.
 - **A self-test that stops early must not look like one that judged something.**
   A generator ending in `[[ ... ]] && echo` returns 1 when the condition is false;
   under `set -e` a plain call to it took the whole self-test down after eight
