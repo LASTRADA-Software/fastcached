@@ -279,9 +279,8 @@ namespace
                 // `IsDeadlineExpiry` is what knows that the two platforms spell it
                 // differently.
                 if (buffer.empty())
-                    co_return RequestHead { .outcome = IsDeadlineExpiry(result.error().code)
-                                                ? AdminHeadOutcome::Idle
-                                                : AdminHeadOutcome::PeerGone };
+                    co_return RequestHead { .outcome = IsDeadlineExpiry(result.error().code) ? AdminHeadOutcome::Idle
+                                                                                             : AdminHeadOutcome::PeerGone };
                 break;
             }
             if (*result == 0)

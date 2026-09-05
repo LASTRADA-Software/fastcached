@@ -6,8 +6,6 @@
 #include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
-#include <tests/SocketDecorator.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -19,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/SocketDecorator.hpp>
 
 namespace
 {
@@ -402,7 +402,6 @@ TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact
     CHECK(ExchangeWithRoutes("GET /fleetx HTTP/1.1\r\n\r\n", routes).starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
-
 // ---------------------------------------------------------------------------
 // #824: four outcomes behind one `bool ok`, all of them answered `400`.
 //
@@ -413,8 +412,7 @@ TEST_CASE("AdminHttp: a prefix route answers its tail and never shadows an exact
 // each other, or one passing test covers both and proves neither.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, not refused",
-          "[metrics][http][admin][idle]")
+TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, not refused", "[metrics][http][admin][idle]")
 {
     // The reported bug, at the seam: Chrome opens a preconnect socket, sends
     // nothing, and the request deadline expires. Nothing was asked, so nothing is
