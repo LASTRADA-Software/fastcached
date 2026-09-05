@@ -191,6 +191,30 @@ endif()
 # `script-check-warning-canary` below is the matching must-be-seen-to-warn half.
 set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 
+# ---------------------------------------------------------------------------
+# The interpreter every script-driven test runs under (#379).
+#
+# `/bin/bash` and never a bare `bash`, because a bare one resolves through PATH.
+# On GitHub's macOS image Homebrew's bash 5.x sits ahead of Apple's 2007
+# `/bin/bash`, so every script test there ran under bash 5 -- and
+# `.agent/rules/build-and-toolchain.md` requires these scripts to work on bash
+# **3.2**, which is what `/bin/bash` on macOS is. The rule had no executor: it was
+# enforced by careful reading, and a `mapfile` had already taken
+# `merge-queue-contexts` red on `macOS-clang-release` once before anyone noticed.
+#
+# Windows has no `/bin/bash`, so it keeps the PATH lookup -- Git for Windows'
+# bash is the only one there and nothing is being selected between. The rule is
+# about macOS's system interpreter, and this is the one place that says so.
+#
+# One variable rather than twenty-nine literals, and `check-script-interpreter`
+# asserts every registration uses it. A literal `/bin/bash` is refused too: it
+# would be correct today and break the Windows rows the day somebody adds one.
+if(WIN32)
+    set(FASTCACHED_BASH bash)
+else()
+    set(FASTCACHED_BASH /bin/bash)
+endif()
+
 # The canary: a check that must be seen to fail. See scripts/script-check-canary.cmake
 # for why a property needs one. WILL_FAIL inverts the verdict, so this reports
 # green exactly while the mechanism above works, and red the moment it does not.
@@ -350,6 +374,64 @@ set_tests_properties("script-check-signals-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 180
+)
+
+# Every script-driven test runs through `${FASTCACHED_BASH}` (#379).
+#
+# The rule requiring bash 3.2 compatibility had nothing running it -- or so #379
+# said. Measured, it did: on `macOS-clang-release` a bare `bash` and `/bin/bash`
+# are the SAME 3.2.57 interpreter, so the constraint was already enforced and the
+# premise does not reproduce. What this pins is that it stays that way: CMake
+# leaves a bare command name unresolved in `CTestTestfile.cmake`, so the
+# interpreter comes from PATH at RUN time and would move the day the image gains
+# a newer bash.
+#
+# The set of sites is DERIVED here rather than listed anywhere. #379's body named
+# six; the tree has thirty, and one of them is not a `COMMAND` at all --
+# `sccache-smoke.sh` is reached through a `set(_smoke_driver ...)`, which is the
+# form a reader scanning for `COMMAND bash` walks past, and it backs three
+# REQUIRED contexts. Converting the six and reporting the rule enforced would
+# have left twenty-four sites untouched with every test green.
+add_test(
+    NAME "script-interpreter"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-script-interpreter.cmake"
+)
+set_tests_properties("script-interpreter" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check watched refusing, in BOTH directions (#379's acceptance).
+#
+# Six synthesised trees: a control that is the REAL registration file copied
+# unmodified and must PASS, then a bare `bash`, a literal `/bin/bash` (correct
+# today and wrong on Windows the day a row moves, so what is pinned is the
+# VARIABLE), a site with no interpreter token at all, the definition removed, and
+# a scan matching nothing.
+#
+# The control is not decoration: a check that refused everything would also
+# refuse a bare `bash`, and only a case that must pass separates a guard from a
+# tripwire. It is the real file rather than a fixture because the site this check
+# exists for -- `set(_smoke_driver ...)`, backing three required contexts -- is
+# exactly what a hand-written fixture would not have thought to include.
+#
+# Every arm asserts the finding COUNT. A defect reported as several findings is
+# the check miscounting its own output (#796), and this check's own violation
+# strings did it once already.
+add_test(
+    NAME "script-interpreter-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/script-interpreter-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-script-interpreter-selftest.cmake"
+)
+set_tests_properties("script-interpreter-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
 )
 
 # ---------------------------------------------------------------------------
@@ -942,7 +1024,7 @@ set_tests_properties("vslang-probe-only" PROPERTIES
 if(NOT WIN32)
     add_test(
         NAME "e2e-helpers-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
     )
     # It stages several deliberate timeouts of a couple of seconds each and one
     # four-second wait that must really take four seconds -- the check that the
@@ -1386,7 +1468,7 @@ set_tests_properties("tsan-scope-hygiene" PROPERTIES
 if(NOT WIN32)
     add_test(
         NAME "ci-scope"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh"
     )
     set_tests_properties("ci-scope" PROPERTIES
         LABELS "hygiene"
@@ -1415,7 +1497,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "merge-queue-contexts"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh"
     )
     set_tests_properties("merge-queue-contexts" PROPERTIES
         LABELS "hygiene"
@@ -1436,7 +1518,7 @@ if(NOT WIN32)
     # own parser tests the parser it ships with, not the one that runs.
     add_test(
         NAME "merge-queue-contexts-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh" --self-test
     )
     set_tests_properties("merge-queue-contexts-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1465,7 +1547,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "gated-jobs-fail-safe"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh"
     )
     set_tests_properties("gated-jobs-fail-safe" PROPERTIES
         LABELS "hygiene"
@@ -1485,7 +1567,7 @@ if(NOT WIN32)
     # argument for a baseline case rather than only negative ones.
     add_test(
         NAME "gated-jobs-fail-safe-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh" --self-test
     )
     set_tests_properties("gated-jobs-fail-safe-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1518,7 +1600,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "merge-group-report"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh"
     )
     set_tests_properties("merge-group-report" PROPERTIES
         LABELS "hygiene"
@@ -1527,7 +1609,7 @@ if(NOT WIN32)
 
     add_test(
         NAME "merge-group-report-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh" --self-test
     )
     set_tests_properties("merge-group-report-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1566,7 +1648,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "doc-subject-checks-derivation"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --list
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --list
     )
     set_tests_properties("doc-subject-checks-derivation" PROPERTIES
         LABELS "hygiene"
@@ -1586,7 +1668,7 @@ if(NOT WIN32)
     # one.)
     add_test(
         NAME "doc-subject-checks-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/doc-subject-checks.sh" --self-test
     )
     set_tests_properties("doc-subject-checks-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1620,7 +1702,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-sweep-scope"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh"
     )
     set_tests_properties("tidy-sweep-scope" PROPERTIES
         LABELS "hygiene"
@@ -1629,7 +1711,7 @@ if(NOT WIN32)
 
     add_test(
         NAME "tidy-sweep-scope-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh" --self-test
     )
     set_tests_properties("tidy-sweep-scope-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1666,7 +1748,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-sweep-database"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh"
     )
     set_tests_properties("tidy-sweep-database" PROPERTIES
         LABELS "hygiene"
@@ -1694,7 +1776,7 @@ if(NOT WIN32)
     # refuses).
     add_test(
         NAME "tidy-sweep-database-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test
     )
     set_tests_properties("tidy-sweep-database-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1736,7 +1818,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "local-gate-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/local-gate.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/local-gate.sh" --self-test
     )
     set_tests_properties("local-gate-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1784,7 +1866,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tsan-gate-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tsan-gate.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/tsan-gate.sh" --self-test
     )
     set_tests_properties("tsan-gate-selftest" PROPERTIES
         LABELS "hygiene"
@@ -1832,7 +1914,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-sweep-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
     )
     set_tests_properties("tidy-sweep-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2316,7 +2398,7 @@ elseif(WIN32)
 else()
     add_test(
         NAME "node-config-file-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/node-config-file-e2e.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/node-config-file-e2e.sh"
             "$<TARGET_FILE:fastcache-compile-node>"
     )
     set_tests_properties("node-config-file-e2e" PROPERTIES
@@ -2353,7 +2435,7 @@ else()
     # ran in so a green run is never silently the skip.
     add_test(
         NAME "node-socket-activation-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/node-socket-activation-e2e.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/node-socket-activation-e2e.sh"
             --node "$<TARGET_FILE:fastcache-compile-node>"
     )
     # Serial for `fleet-dashboard-e2e`'s reason: it starts a real node and reads a
@@ -2367,7 +2449,7 @@ else()
 
     add_test(
         NAME "fleet-dashboard-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
             --node "$<TARGET_FILE:fastcache-compile-node>"
     )
     # Starts a real node with three listeners, so it must not race the other
@@ -2388,7 +2470,7 @@ else()
     if(FASTCACHED_ENABLE_TLS)
         add_test(
             NAME "fleet-dashboard-tls-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
                 --node "$<TARGET_FILE:fastcache-compile-node>"
                 --tls-cert "${CMAKE_SOURCE_DIR}/testdata/tls/server.crt"
                 --tls-key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
@@ -2408,7 +2490,7 @@ else()
         # different things reports which one broke by not saying.
         add_test(
             NAME "fleet-dashboard-self-signed-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fleet-dashboard-e2e.sh"
                 --node "$<TARGET_FILE:fastcache-compile-node>"
                 --tls-self-signed
         )
@@ -2540,7 +2622,7 @@ else()
     endif()
     add_test(
         NAME "compile-cache-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/compile-cache-e2e.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/compile-cache-e2e.sh"
             --fastcached "$<TARGET_FILE:fastcached>"
             --launcher "$<TARGET_FILE:fastcache-cc>"
             --compiler "${CMAKE_CXX_COMPILER}"
@@ -2581,7 +2663,7 @@ else()
         )
         add_test(
             NAME "dist-compile-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
                 ${_fc_dist_e2e_args} --case suite
         )
     endif()
@@ -2630,7 +2712,7 @@ else()
     if(NOT WIN32)
         add_test(
             NAME "dist-compile-membership-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
                 ${_fc_dist_e2e_args} --case membership
         )
         # RUN_SERIAL for CPU rather than for ports: `free_port` and its ledger
@@ -2706,7 +2788,7 @@ if(NOT WIN32)
     else()
         add_test(
             NAME "cluster-e2e"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/cluster-e2e.sh"
                 --node "$<TARGET_FILE:fastcache-compile-node>"
         )
         # Starts three nodes that hold six ports between them and drives an
@@ -2741,7 +2823,7 @@ endif()
 if(NOT WIN32 AND TARGET fastcached AND TARGET fastcache-cc)
     add_test(
         NAME "compile-cache-daemon-start"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-start.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-start.sh"
             --fastcached "$<TARGET_FILE:fastcached>"
             --launcher "$<TARGET_FILE:fastcache-cc>"
             --compiler "${CMAKE_CXX_COMPILER}"
@@ -2795,7 +2877,7 @@ elseif(FASTCACHED_ENABLE_TLS)
     else()
         add_test(
             NAME "tls-smoke"
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/tls-smoke.sh"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/tls-smoke.sh"
                 --fastcached "$<TARGET_FILE:fastcached>"
                 --cert "${CMAKE_SOURCE_DIR}/testdata/tls/server.crt"
                 --key "${CMAKE_SOURCE_DIR}/testdata/tls/server.key"
@@ -2819,7 +2901,7 @@ elseif(SCCACHE)
     if(WIN32)
         set(_smoke_driver pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.ps1")
     else()
-        set(_smoke_driver bash "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.sh")
+        set(_smoke_driver ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.sh")
     endif()
 
     foreach(_proto IN ITEMS memcached redis)
@@ -2863,7 +2945,7 @@ elseif(WIN32)
 else()
     add_test(
         NAME "migrate-storage-e2e"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/migrate-storage-e2e.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/migrate-storage-e2e.sh"
             --fastcached "$<TARGET_FILE:fastcached>"
     )
     # Starts a real daemon to create the stores, so it must not race the other
