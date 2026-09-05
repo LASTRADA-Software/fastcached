@@ -1411,6 +1411,30 @@ gets a positive control**: find one instance by other means, and check the censu
 sees it. Otherwise "there are none" and "I did not look where they are" are the same
 output.
 
+## A check that asserts WHICH refusal beats one that asks only whether it refused
+
+**Measured, on Windows.** `reactor-teardown-gate-selftest` stages its stand-in canaries as
+`#!/bin/sh` scripts, and CMake's `execute_process` is `CreateProcess` there, which **cannot
+start a shebang script** -- ENOEXEC, *"inappropriate file type or format"*. So every case
+refused, for a reason having nothing to do with the guard under test.
+
+Four cases reported **"right verdict for the wrong reason"** and went red. A check asking
+only *did it refuse* would have gone **green on Windows forever**, certifying a guard it had
+never once exercised.
+
+Two rules fall out of the same fixture:
+
+- **A probe must use the EXECUTOR UNDER TEST.** Its "can this stub start" probe ran the stub
+  through **Git Bash**, which handles a shebang fine -- not through the launcher that would
+  actually run it. It answered a question nobody had asked. Same species as the
+  mode-under-test rule: a guard that passes because it is testing something else.
+- **A fixture that cannot BUILD on the only leg that runs it has never run.** That canary is
+  registered `if(CMAKE_BUILD_TYPE STREQUAL "Debug")` -- correctly, since the assert compiles
+  out of Release -- and three `fprintf` sites failed clang-tidy, so the branch did not build
+  on Debug at all. It passed `gcc-release` **because there the fixture does not exist**. So
+  build `gate-clang-debug` before gating anything that ADDS a file: it is the only leg that
+  tidies, and otherwise you learn it twice from a 25-minute gate.
+
 ## Open work
 
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two

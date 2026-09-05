@@ -393,6 +393,18 @@ here ran `pgrep -f 'IO::Socket::INET'` around a run, got 12 survivors, and nearl
 them — they belonged to other lanes, betrayed by a variable name the file under test never
 uses. Attribution by cwd is what makes a before/after number mean anything.
 
+### Green and mergeable are different facts, and neither reading is authoritative alone
+
+**`gh pr checks` reported 13 of 13 while GitHub refused the merge on conflicts.** A checks
+verdict describes a SHA; mergeability describes that SHA against the current base. Ask for
+both, and let `mergeStateStatus` answer "can this land".
+
+**And `ls-remote` is authoritative about the REF, not about the checks.** Checks attach to a
+SHA, so a fresh `ls-remote` paired with a stale checks reading is exactly as wrong as the
+reverse -- **both directions happened here within one hour**. Read the API head and
+`ls-remote` at the same instant and refuse to conclude when they disagree: a merge-readiness
+tool should report SKEW rather than a verdict.
+
 ### Pairwise clean is not serially clean
 
 **Before sequencing two PRs that touch the same file, merge-tree the second onto a
