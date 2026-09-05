@@ -1805,6 +1805,70 @@ set_tests_properties("service-accounts" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The shipped systemd units start somewhere, and for the compile worker that is
+# not a cosmetic question. systemd starts a service in `/` when the unit names no
+# `WorkingDirectory=`, and a dispatched compile builds
+# `-fdebug-prefix-map=<the worker's directory>=<what the client asked for>`. A
+# prefix-map rule appends the unmatched tail, so a `<from>` of `/` matches EVERY
+# absolute path in the object and keeps the rest of it -- `/usr/include/stdio.h`
+# becomes `.usr/include/stdio.h`. The cache key is correct, so the object is
+# stored and shared: a wrong object under a right key. Issue #674.
+#
+# Registered here rather than left to the packaging job for the reason
+# service-accounts above is: the failure is only reachable where the real unit
+# runs, which needs root and a live systemd, and a job only one arrangement can
+# run is a job that reports after the mistake has been pushed -- worse here,
+# because the packaging job is not a required context and so reports to nobody
+# (#684). No end-to-end fixture substitutes either: every one of them starts the
+# node from the fixture's own working directory, which is exactly how #674 reached
+# master with a dispatch e2e already green.
+#
+# Not labelled "smoke", for the reason node-config-reference is not: it reads
+# three shipped files and compares strings, so it belongs in the default `ctest`
+# set and must survive `ctest -LE smoke`. Every file it reads ships in an exported
+# tarball, so it has no skip path.
+add_test(
+    NAME "node-working-directory"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-working-directory.cmake"
+)
+set_tests_properties("node-working-directory" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# The check above must be SEEN to refuse each thing it claims, and seen to stay
+# quiet on the shapes that only look like violations.
+#
+# It is registered because that check looks for the ABSENCE of a directive, and
+# every way of getting such a check wrong makes it pass MORE often rather than
+# less: a pattern that also matches a commented-out line, a reader that takes the
+# first assignment where systemd takes the last, a specifier left unresolved. All
+# three are cases, and each was confirmed to take exactly the case that names it
+# red -- reading the first assignment takes `reset` and `last-wins` red in
+# opposite directions, which is what a count alone could not have told anybody.
+#
+# Two cases exist to stop the opposite defect: a unit that spawns no compiler and
+# names no working directory must PASS, and a later assignment overriding an
+# earlier `/` must PASS. Without them a check that objected unconditionally would
+# satisfy every other case.
+add_test(
+    NAME "node-working-directory-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/node-working-directory-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-node-working-directory-selftest.cmake"
+)
+set_tests_properties("node-working-directory-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A non-ASCII argument, from the command line into main(). Runs each executable
 # that has an option table with an unrecognised flag spelled with U+00FC, and
 # requires the diagnostic to echo those exact UTF-8 bytes back.

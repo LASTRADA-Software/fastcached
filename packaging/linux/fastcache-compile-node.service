@@ -68,6 +68,44 @@ RestartSec=1
 User=fastcache-node
 Group=fastcache-node
 
+# A directory of this worker's OWN, and deliberately not `/`.
+#
+# systemd starts a service in `/` when it is given no WorkingDirectory, and on
+# THIS unit that is not cosmetic. A dispatched compile is told the client's
+# compilation directory and what to replace it with, and the worker spells that
+# as `-fdebug-prefix-map=<directory>=<replacement>` for both its own directory
+# and the client's -- because gcc records the client's and clang records this
+# machine's, so mapping both gives one answer either way.
+#
+# A prefix-map rule appends the unmatched tail. So `<from>` = `/` matches EVERY
+# absolute path in the object and keeps the rest of it: `/usr/include/stdio.h`
+# becomes `.usr/include/stdio.h`. Measured on gcc 14.2.0 against a node running
+# in `/`, `DW_AT_comp_dir` came back `.tmp/.../client` and every system header
+# read `.usr/include/...`. The cache KEY is correct, so that object is stored and
+# shared -- a wrong object under a right key, which is the failure this project
+# is most careful about. Issue #674.
+#
+# `WorkerPrefixMapRules` in CompileJob.cpp drops the worker's own rule when this
+# directory contains the client's, so a node installed from a package that
+# predates this line does not produce that object. That guard is not a substitute
+# for this line: it costs the clang half, leaving such a node's objects with this
+# machine's absolute path in `DW_AT_comp_dir`. A WorkingDirectory is the only
+# thing that buys that back.
+#
+# RuntimeDirectory= rather than a path the package installs: systemd creates it
+# at start, owned by the account below, and removes it at stop -- so there is no
+# directory to install, chown, migrate or clean up, and it is writable even under
+# the ProtectSystem=strict further down. It is also somewhere no build tree ever
+# lives, which matters because a worker directory that CONTAINED a client's build
+# directory would drop the rule exactly as `/` does. That rules out the other
+# obvious candidate, /tmp: continuous-integration builds run there.
+#
+# 0700 rather than the 0755 default. Nothing but this worker has any business in
+# it, and UMask=0077 below says the same thing about what it writes.
+RuntimeDirectory=fastcache-node
+RuntimeDirectoryMode=0700
+WorkingDirectory=/run/fastcache-node
+
 # --- Hardening -------------------------------------------------------------
 # This block is deliberately NOT a copy of fastcached's, and the difference is
 # the whole point of the service: fastcached executes nothing, while this

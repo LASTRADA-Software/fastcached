@@ -220,10 +220,16 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     ride in `args` (which refuse a path separator, and `:` is a path character), and a
     worker that cannot spell the rules REFUSES. **A prefix-map rule appends the
     unmatched tail**, so the worker's own rule is DROPPED when its directory contains
-    the client's: `/` is the shipped unit's working directory and `/=.` rewrites every
-    absolute path in the object — measured, a `comp_dir` of `.tmp/…/client` and system
-    headers reading `.usr/include/...`, worse than the bug. Read `comp_dir`, never
-    compare objects. **And the directory each end predicts from is `$PWD`, not
+    the client's: `/=.` rewrites every absolute path in the object — measured, a
+    `comp_dir` of `.tmp/…/client` and system headers reading `.usr/include/...`, worse
+    than the bug. `/` was the SHIPPED value until #674 gave the unit a
+    `WorkingDirectory=` naming its own `RuntimeDirectory=`; the drop STAYS, for the
+    routes a unit does not reach — `--daemon` still `chdir("/")`s (#784), and a
+    hand-written unit still may. That a compiler-spawning unit names a directory it
+    CREATES is `ctest -R node-working-directory`, and it has to be a scan: running the
+    real unit needs root and a live systemd, and every fixture starts the node from the
+    FIXTURE's directory, which is how #674 reached master behind a green dispatch e2e.
+    Read `comp_dir`, never compare objects. **And the directory each end predicts from is `$PWD`, not
     `getcwd(3)`** — `CompilerWorkingDirectory`, on both sides. Both drivers record, and
     byte-compare `<from>` against, `PWD` when it is absolute and names the SAME directory
     as `.` (a `stat` test, so `equivalent`), falling back to `getcwd(3)` for unset, a
