@@ -105,6 +105,17 @@ _is_duration_reading() {
 # is LOCALE-DEPENDENT -- measured, `de_DE.UTF-8` yields `0,255` and the arithmetic
 # below then fails -- so the substitution exports `LC_ALL=C` rather than hoping.
 #
+# `lib/e2e-common.sh` REFUSES this same construct and is right to (#851): a
+# `0,243` reaching `$(( 10# ... ))` is a wrong SMALL number rather than an error,
+# because bash arithmetic reads `,` as the comma operator, and integer `SECONDS`
+# has no such path. The two files are not in disagreement -- the library needs
+# only whole-second resolution and takes the option with no failure mode, while
+# this check is discriminating 0.5s from 4.1s and cannot. What buys the exception
+# is that BOTH hazards are closed here and watched: `LC_ALL=C` for the separator,
+# `_is_duration_reading` for anything that still arrives malformed, and
+# `duration-reading-shape` asserting that predicate refuses AND accepts. Sub-second
+# timing without those three is the library's rule, and it stands.
+#
 # The loop's own output is closed off because the SUBSTITUTION is reading stderr,
 # which is where `time` reports. A stray diagnostic from `run_bounded` would
 # otherwise land in `elapsed` and corrupt the parse. It fails closed when it does,

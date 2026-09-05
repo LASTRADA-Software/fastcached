@@ -1106,8 +1106,17 @@ if(NOT WIN32)
     # alone). On a 32-core Linux host, local ext4:
     #
     #     1-min load 5.04 -> 1.90     37.2s / 37.0s / 37.0s   (three runs, 172 checks)
-    #     1-min load MEASURED_LOW     MEASURED_LOW_TIMES
-    #     1-min load MEASURED_HIGH    MEASURED_HIGH_TIMES
+    #     1-min load 1.65 -> 7.42     40.6-41.1s              (six runs,   174 checks)
+    #     1-min load 55.0 -> 57.8     42.9-44.3s              (four runs,  174 checks)
+    #
+    # The check COUNT is part of each row for the reason the load is: 172 and 174 are
+    # different trees, and 37s against 41s is mostly that difference rather than the
+    # host. A total is comparable only against the same tree.
+    #
+    # The stray-listener floor was `pgrep -x perl` = 0 at BOTH ends of both batches,
+    # so these readings are not sitting on accumulated orphans from earlier runs --
+    # `pgrep -x`, never `pgrep -f`, which matches the shell running the census and
+    # reports a non-zero floor on a host with no perl at all.
     #
     # **The load is part of the reading, and an earlier version of this block got
     # that wrong in the direction that matters.** It recorded the same shape as
@@ -1142,9 +1151,10 @@ if(NOT WIN32)
     # So the cost is almost entirely the deliberate SLEEPS rather than CPU work,
     # which is the REASON to expect contention to move it little -- an argument from
     # what the run spends its time on, and one the loaded row now supports rather
-    # than merely asserting. MEASURED_HEADROOM headroom against this bound at the
-    # worst reading; a run approaching 120s means something other than a busy
-    # machine. A figure
+    # than merely asserting: eight times the load average cost about 3s. 2.7x
+    # headroom against this bound at the worst reading of 44.3s -- taken from the
+    # slowest run of the loaded band, not the typical of the quiet one; a run
+    # approaching 120s means something other than a busy machine. A figure
     # here rather than "well inside": #665 is the same shape, a registration's
     # stated cost against its measured one.
     set_tests_properties("e2e-helpers-selftest" PROPERTIES
