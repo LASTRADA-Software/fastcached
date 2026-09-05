@@ -140,12 +140,14 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
 {
     // **#401's acceptance clause, asserted at the production seam.**
     //
-    // That ticket says a worker "pins the first identity it authenticates", leaving a
+    // That ticket said a worker "pins the first identity it authenticates", leaving a
     // window in which one that has verified nothing accepts whichever fleet reaches it
-    // first. It is not so at this ref, and this case is what says so rather than a
-    // reading of the code: the worker is TOLD its fleet by `--cluster-id`, that value
-    // reaches `LeaseExpectation::clusterId` through the factory `main.cpp` calls, and
-    // `VerifyLeaseToken` compares it before it looks at anything else.
+    // first. That was never so: the worker was TOLD its fleet, and `VerifyLeaseToken`
+    // compared it before anything else. What has changed is WHERE it is told -- since
+    // #401 the identity comes from the REGISTER reply rather than from `--cluster-id`,
+    // so this case pins it the way a completed registration round does. The property
+    // under test is unchanged: having verified NO grant is not the same as being
+    // unpinned, and a worker that has verified nothing still refuses a foreign fleet.
     //
     // Written through `MakeWorkerLeaseValidator` rather than `VerifyLeaseToken`,
     // because the primitive already had a case and the primitive is not where the
@@ -162,6 +164,11 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+
+    // What a completed registration round does, and the only way this worker learns a
+    // fleet since #401. Before this line it refuses everything as `Unregistered`, which
+    // is a different case and has its own.
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     // Nothing has been verified. Asserted, because if the worker had already learnt
     // something this case would be about the term rather than the fleet.
@@ -216,6 +223,8 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+    // Registered, as every case here but the unregistered one assumes (#401).
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     // Nothing learned yet, so this is honoured -- and honouring it is what teaches the
     // term and spends the grant. All three are asserted: without the first, the case
@@ -287,9 +296,49 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     auto validator = MakeWorkerLeaseValidator(
         cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
+    // Registered, as every case here but the unregistered one assumes (#401).
+    state.lease.fleet.Pin(std::string { ThisCluster });
 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
     CHECK_FALSE(state.lease.term.Known().has_value());
     CHECK(state.lease.spent.Size() == 0);
+}
+
+TEST_CASE("The --cluster-id flag asserts the fleet rather than choosing it", "[node][lease][fleet]")
+{
+    using FastCache::Node::FleetAssertionHolds;
+
+    // The flag is an ASSERTION since #401: registration decides which fleet this node
+    // serves, and `--cluster-id` says which one the operator expected to be admitted
+    // to. The three rows below are the whole contract.
+
+    SECTION("nothing asserted, so nothing to check")
+    {
+        // The default is a real fleet name (`fastcache`), so this is asked on
+        // PROVENANCE and not by comparing against it -- an operator who types the
+        // default has still asserted it, and one who types nothing has not.
+        CHECK(FleetAssertionHolds(/*asserted=*/false, "fastcache", "some-other-fleet"));
+        CHECK(FleetAssertionHolds(/*asserted=*/false, "", "some-other-fleet"));
+    }
+
+    SECTION("asserted and agreed, so the node serves")
+    {
+        CHECK(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-a"));
+        // A scheduler that names no fleet, asserted as such. This is the one-machine
+        // deployment and must keep working.
+        CHECK(FleetAssertionHolds(/*asserted=*/true, "", ""));
+    }
+
+    SECTION("asserted and contradicted, so the node refuses")
+    {
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", "fleet-b"));
+        // The two asymmetric cases, which are the ones a substring or prefix test
+        // would let through: asserted a fleet and got none, asserted none and got one.
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fleet-a", ""));
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "", "fleet-a"));
+        // And the default is not special: a node left on `fastcache` that is admitted
+        // to a fleet naming itself is exactly the cross-fleet accept #401 closes.
+        CHECK_FALSE(FleetAssertionHolds(/*asserted=*/true, "fastcache", "production"));
+    }
 }

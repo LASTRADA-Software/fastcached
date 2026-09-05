@@ -34,6 +34,11 @@ namespace
 CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1" };
 
 /// A scheduler that already leads, plus the protocol in front of it.
+/// The fleet this fixture's scheduler leads. Named rather than empty so the
+/// end-to-end case can assert the identity survives the framing; empty is separately
+/// legal and means the one-machine deployment.
+constexpr std::string_view FleetIdentity = "fleet-a";
+
 struct Fixture
 {
     Fixture()
@@ -45,7 +50,7 @@ struct Fixture
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, FleetIdentity };
     SchedulerProtocol protocol { service, metrics };
 };
 
@@ -281,8 +286,15 @@ TEST_CASE("A whole register-heartbeat-lease-release exchange crosses the wire", 
         Wire::RegisterRequest { .fingerprint = "gcc-14", .endpoint = "10.0.0.2:7100", .slots = 2, .acceptedCodecs = {} });
     auto const admitted = fixture.protocol.Answer(registration, Insider);
     REQUIRE(StatusOf(admitted) == Wire::Status::Ok);
-    auto const workerId = std::string { Wire::AsStringView(PayloadOf(admitted)) };
+    // Decoded as the record it is since version 4, and every field is checked here
+    // rather than only the id: this is the one case that drives the reply through the
+    // real framing, so it is where a field read out of order would show (#401).
+    auto const record = Wire::DecodeRegisterReply(PayloadOf(admitted));
+    REQUIRE(record.has_value());
+    auto const workerId = Unwrap(record).workerId;
     REQUIRE_FALSE(workerId.empty());
+    CHECK(Unwrap(record).clusterId == FleetIdentity);
+    CHECK(Unwrap(record).epoch == StandaloneSchedulerTerm);
 
     auto const beat = Wire::EncodeHeartbeat(workerId, /*inFlight=*/0);
     CHECK(StatusOf(fixture.protocol.Answer(beat, Insider)) == Wire::Status::Ok);

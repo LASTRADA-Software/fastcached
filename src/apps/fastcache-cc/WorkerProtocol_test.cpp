@@ -188,8 +188,11 @@ constexpr std::uint64_t GrantTerm = 4;
 {
     if (policy == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
-    return SignedLeaseValidator(
-        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, lease, metrics);
+    // Pinned here rather than named at construction: since #401 the fleet is what the
+    // REGISTER reply said, so a validator built for a test has to be told the same way
+    // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
+    lease.fleet.Pin(std::string { ThisCluster });
+    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
 }
 
 struct Fixture
@@ -1580,6 +1583,21 @@ namespace
     return WorkerRegistrar { Unwatched(), "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
 }
 
+/// A successful REGISTER reply, in the shape wire version 4 gives it.
+///
+/// Built through `EncodeRegisterReply` rather than as a hand-written byte string, so
+/// these cases keep testing the registrar rather than a second implementation of the
+/// record. The byte-level shape is pinned once, in `CompileCacheWire_test.cpp`.
+/// @param workerId The id to assign.
+/// @param clusterId The fleet to name; empty is what an unpinned worker would get.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> RegisterOk(std::string_view workerId, std::string_view clusterId = "fleet-a")
+{
+    auto const payload = Wire::EncodeRegisterReply(
+        { .workerId = std::string { workerId }, .clusterId = std::string { clusterId }, .epoch = 1 });
+    return Wire::EncodeReply(Wire::Status::Ok, payload);
+}
+
 } // namespace
 
 TEST_CASE("A NotLeader refusal reaches the node as an endpoint, not as prose", "[cc][registrar][notleader]")
@@ -1640,8 +1658,7 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     // conflated: one is "go elsewhere", the other "start again".
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Testing::Replies(
-        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
-          Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
+        { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.7:6676") }) };
 
     REQUIRE(registrar.Register(scheduler).has_value());
     REQUIRE(registrar.WorkerId() == "w-1");
@@ -1657,8 +1674,7 @@ TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no l
 {
     auto registrar = MakeRegistrar();
     Testing::ScriptedSocket scheduler { Testing::Replies(
-        { Wire::EncodeReply(Wire::Status::Ok, AsBytes(std::string_view { "w-1" })),
-          Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
+        { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownLease, {}) }) };
 
     REQUIRE(registrar.Register(scheduler).has_value());
     auto const beat = registrar.Heartbeat(scheduler, 0);
@@ -1995,4 +2011,69 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
     REQUIRE(result.status == DispatchStatus::Compiled);
     CHECK(result.exitCode == 0);
     CHECK_FALSE(result.object.empty());
+}
+
+TEST_CASE("A worker that has not registered honours no grant, however authentic", "[cc][lease][fleet]")
+{
+    // The acceptance clause of #401, at the seam the ticket is about.
+    //
+    // The ticket's own clause -- "shown red by removing the identity from the
+    // registration reply" -- could not be written before this change, because the
+    // REGISTER reply was a bare worker id and had no identity to remove. It has one
+    // now, and an unpinned worker is what "the reply carried none" produces.
+    //
+    // What makes this a test rather than a restatement is the THIRD case below. The
+    // first two would both pass against a validator that simply refused everything,
+    // which is the shape a "harden the fleet check" change actually ships as -- and
+    // refusing everything is not a narrower window, it is a worker that compiles
+    // nothing. `SchedulerService`'s constructor states that an empty cluster id is
+    // legal and is the one-machine deployment, so the empty case is the control that
+    // has to stay GREEN while the others go red.
+    AtomicMetricsSink metrics;
+
+    SECTION("unregistered refuses an otherwise perfect grant")
+    {
+        Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+        // Deliberately NOT pinned: this is a worker whose first registration round has
+        // not completed, which is every worker for the first moments of its life.
+        auto const validator =
+            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+
+        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13");
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::Unregistered);
+        // Not ClusterMismatch: the two call for opposite operator actions, and a worker
+        // that has not registered would otherwise report a key-provisioning fault on
+        // every start.
+        CHECK(Unwrap(refusal).reason != Distributed::LeaseRefusalReason::ClusterMismatch);
+    }
+
+    SECTION("registered into this fleet accepts the same grant")
+    {
+        Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+        lease.fleet.Pin(std::string { ThisCluster });
+        auto const validator =
+            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+
+        CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").has_value());
+    }
+
+    SECTION("registered into a fleet that names none still compiles, and only for grants naming none")
+    {
+        // The control. A scheduler with no `--cluster-id` sends an empty identity, and
+        // an engaged-but-empty pin is a fleet that names none -- which is why this is
+        // an optional rather than a string. A change that refused it would pass both
+        // SECTIONs above and break every single-machine install.
+        Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+        lease.fleet.Pin(std::string {});
+        auto const validator =
+            SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+
+        CHECK_FALSE(validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").has_value());
+
+        auto const foreign =
+            validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 7, "18"), "gcc-13");
+        REQUIRE(foreign.has_value());
+        CHECK(Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
+    }
 }

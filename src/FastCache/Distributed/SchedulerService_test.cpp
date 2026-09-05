@@ -42,6 +42,19 @@ CallerContext const Outsider { .membership = Membership::Outsider, .peerId = "st
     return WorkerRegistration { .fingerprint = fingerprint, .endpoint = endpoint, .slots = 1, .codecs = {} };
 }
 
+/// The worker id out of a REGISTER reply.
+///
+/// The reply is a record since wire version 4, not a bare id (#401), so reading the
+/// payload as a string would name a worker after the serialized bytes. Decoded
+/// through the shared codec so these cases keep testing the scheduler.
+/// @param reply What `Register` answered.
+/// @return The assigned id, or empty when the payload is not a registration record.
+[[nodiscard]] std::string AssignedId(SchedulerReply const& reply)
+{
+    auto const decoded = Wire::DecodeRegisterReply(reply.payload);
+    return decoded.has_value() ? decoded->workerId : std::string {};
+}
+
 /// A lease request for one key against one toolchain.
 [[nodiscard]] Wire::LeaseRequest Ask(std::string_view fingerprint, std::string_view key)
 {
@@ -281,7 +294,7 @@ TEST_CASE("A member registers, heartbeats and is leased", "[distributed][schedul
     auto const admitted = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100"));
     REQUIRE(admitted.status == Wire::Status::Ok);
     REQUIRE_FALSE(admitted.payload.empty());
-    auto const workerId = std::string { Wire::AsStringView(admitted.payload) };
+    auto const workerId = AssignedId(admitted);
 
     CHECK(fleet.service.Heartbeat(Insider, workerId, NodeLoad {}).status == Wire::Status::Ok);
 
@@ -311,8 +324,7 @@ TEST_CASE("A heartbeat's history is routed under the machine, not the worker id"
 
     auto const batch = std::array { Testing::ClosedBucket(60'000), Testing::ClosedBucket(120'000) };
     for (auto const& reply: { first, second })
-        CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(reply.payload) }, NodeLoad {}, batch).status
-              == Wire::Status::Ok);
+        CHECK(fleet.service.Heartbeat(Insider, AssignedId(reply), NodeLoad {}, batch).status == Wire::Status::Ok);
 
     REQUIRE(sink.calls.size() == 2);
     for (auto const& call: sink.calls)
@@ -340,8 +352,7 @@ TEST_CASE("History from a worker the scheduler does not know is not routed", "[d
     // not a machine reporting an empty window.
     auto const admitted = fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100"));
     REQUIRE(admitted.status == Wire::Status::Ok);
-    CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(admitted.payload) }, NodeLoad {}).status
-          == Wire::Status::Ok);
+    CHECK(fleet.service.Heartbeat(Insider, AssignedId(admitted), NodeLoad {}).status == Wire::Status::Ok);
     CHECK(sink.calls.empty());
 }
 
@@ -354,8 +365,7 @@ TEST_CASE("A scheduler with no history sink still heartbeats", "[distributed][sc
     REQUIRE(admitted.status == Wire::Status::Ok);
 
     auto const batch = std::array { Testing::ClosedBucket(60'000) };
-    CHECK(fleet.service.Heartbeat(Insider, std::string { Wire::AsStringView(admitted.payload) }, NodeLoad {}, batch).status
-          == Wire::Status::Ok);
+    CHECK(fleet.service.Heartbeat(Insider, AssignedId(admitted), NodeLoad {}, batch).status == Wire::Status::Ok);
 }
 
 TEST_CASE("A worker that names no slot count is sized from its own hardware", "[distributed][scheduler]")
