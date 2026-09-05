@@ -15,8 +15,44 @@
 
 using FastCache::CliResult;
 using FastCache::Config;
+using FastCache::DaemonSecretFiles;
 using FastCache::SecretCameFromConfigFile;
-using FastCache::SecretFileWarning;
+using FastCache::SecretFileWarnings;
+using FastCache::SecretProvenanceFacts;
+
+TEST_CASE("SecretProvenance: the rule over the facts is one function both executables reach", "[config][secret]")
+{
+    // The DECISION half of the acquisition/decision split. `fastcached` reads the
+    // three facts off `Config` and `CliResult`, `fastcache-compile-node` reads them
+    // off `NodeConfig` and a command-line-only parse -- and neither writes the rule.
+    // Asserted as a truth table, because what makes a shared rule worth having is
+    // that every combination has ONE answer rather than two that agree today.
+    struct Case
+    {
+        SecretProvenanceFacts facts;
+        bool expected;
+        char const* what;
+    };
+    static constexpr auto cases = std::to_array<Case>({
+        { { .secretInForce = true, .namedOnCommandLine = false, .fileWasRead = true }, true, "a secret out of a file" },
+        { { .secretInForce = false, .namedOnCommandLine = false, .fileWasRead = true },
+          false,
+          "no secret, so no file to protect it" },
+        { { .secretInForce = true, .namedOnCommandLine = true, .fileWasRead = true },
+          false,
+          "argv supplied it, so the exposure is ps" },
+        { { .secretInForce = true, .namedOnCommandLine = false, .fileWasRead = false },
+          false,
+          "no file was read, so there is none to name" },
+        { { .secretInForce = false, .namedOnCommandLine = true, .fileWasRead = false }, false, "nothing at all" },
+    });
+
+    for (auto const& c: cases)
+    {
+        INFO(c.what);
+        CHECK(SecretCameFromConfigFile(c.facts) == c.expected);
+    }
+}
 
 TEST_CASE("SecretProvenance: a secret came from a file only when nothing else supplied it", "[config][secret]")
 {
@@ -92,11 +128,21 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         return path;
     };
 
-    auto const warningFor = [](std::filesystem::path const& path) {
+    // The daemon's whole startup answer, exactly as `DaemonBody` composes it: the
+    // subject list, then the renderer. Written out here rather than behind a
+    // one-shot helper, because the helper would be a second production path nothing
+    // calls -- and a function with no production caller is the defect it was written
+    // to fix.
+    auto const daemonWarning = [](Config const& cfg, CliResult const& cli) {
+        auto const warnings = SecretFileWarnings(DaemonSecretFiles(cfg, cli));
+        return warnings.empty() ? std::string {} : warnings.front();
+    };
+
+    auto const warningFor = [&daemonWarning](std::filesystem::path const& path) {
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        return SecretFileWarning(cfg, CliResult {});
+        return daemonWarning(cfg, CliResult {});
     };
 
     SECTION("a world-readable file warns, and says what to do")
@@ -126,7 +172,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         cfg.configPath = path.string();
         CliResult cli {};
         cli.requirePassExplicit = true;
-        CHECK(SecretFileWarning(cfg, cli).empty());
+        CHECK(daemonWarning(cfg, cli).empty());
     }
 
     SECTION("a file with no secret in force says nothing, whatever its mode")
@@ -134,7 +180,44 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         auto const path = configAt("nosecret.yaml", S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
         Config cfg {};
         cfg.configPath = path.string();
-        CHECK(SecretFileWarning(cfg, CliResult {}).empty());
+        CHECK(daemonWarning(cfg, CliResult {}).empty());
+    }
+
+    SECTION("every exposed file is named, not just the first")
+    {
+        // #752's whole shape: a worker holds FIVE secret-bearing files where the
+        // daemon holds one, and an operator handed the first exposure and none of
+        // the others fixes one file and believes they are done. A `std::string`
+        // return could not carry this, which is why the aggregate exists.
+        auto const first = configAt("first.key", S_IRUSR | S_IWUSR | S_IROTH);
+        auto const safe = configAt("safe.key", S_IRUSR | S_IWUSR);
+        auto const last = configAt("last.key", S_IRUSR | S_IWUSR | S_IROTH);
+        std::array<std::filesystem::path, 3> const files { first, safe, last };
+
+        auto const warnings = SecretFileWarnings(files);
+        REQUIRE(warnings.size() == 2);
+        CHECK(warnings[0].contains(first.string()));
+        CHECK(warnings[1].contains(last.string()));
+        // Order is the caller's, so an operator reads them in the order the rows
+        // were declared rather than in whatever order the filesystem answered.
+        CHECK_FALSE(warnings[0].contains(last.string()));
+    }
+
+    SECTION("one file named twice is one sentence")
+    {
+        // A single-machine deployment legitimately points two settings at one file --
+        // the cluster key and the scheduler token, say. The same remedy for the same
+        // path twice reads as two problems, which is the alarm fatigue this check
+        // exists to avoid rather than cause. Asserted on the COUNT and not merely on
+        // "a warning arrived": both the deduplicating and the repeating version warn.
+        auto const shared = configAt("shared.key", S_IRUSR | S_IWUSR | S_IROTH);
+        auto const other = configAt("other.key", S_IRUSR | S_IWUSR | S_IROTH);
+        std::array<std::filesystem::path, 3> const files { shared, other, shared };
+
+        auto const warnings = SecretFileWarnings(files);
+        REQUIRE(warnings.size() == 2);
+        CHECK(warnings[0].contains(shared.string()));
+        CHECK(warnings[1].contains(other.string()));
     }
 
     SECTION("the warning never contains the secret")
@@ -146,10 +229,38 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        auto const warning = SecretFileWarning(cfg, CliResult {});
+        auto const warning = daemonWarning(cfg, CliResult {});
         REQUIRE_FALSE(warning.empty());
         CHECK_FALSE(warning.contains("hunter2"));
     }
 }
 
 #endif
+
+TEST_CASE("SecretProvenance: which paths are never asked about at all", "[config][secret]")
+{
+    // Outside the POSIX guard deliberately. Neither case reaches a mode bit, and both
+    // guard a branch of `SecretFileWarnings` that exists precisely so the platform is
+    // NOT asked -- so running them only where `chmod` exists would leave the two skips
+    // untested on the platform whose answer for a file it cannot inspect
+    // (`Undetermined`, from an unreadable security descriptor) is the one that would
+    // turn a mistyped `--cluster-key-file` into a sentence about permissions.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-skips" };
+
+    SECTION("a path that is not there says nothing")
+    {
+        // Distinct from "the platform would not say who may read this", which IS
+        // reported. `SecretFileExposure` answers `Undetermined` for a failed `stat`,
+        // so asking it unconditionally would answer a mistyped `--cluster-key-file`
+        // with a sentence about permissions -- while whoever loads the file answers
+        // with the real diagnosis a line later.
+        std::array<std::filesystem::path, 1> const files { scratch / "never-written.key" };
+        CHECK(SecretFileWarnings(files).empty());
+    }
+
+    SECTION("an unnamed setting names no file")
+    {
+        std::array<std::filesystem::path, 1> const files { std::filesystem::path {} };
+        CHECK(SecretFileWarnings(files).empty());
+    }
+}
