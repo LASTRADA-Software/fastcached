@@ -874,6 +874,17 @@ _selftest_listener() {
     #
     # Only ever called with `&`. In the FOREGROUND this would replace the calling
     # shell, so a new call site backgrounds it or does not use it.
+    #
+    # That sentence is the ONLY guard, and it is worth saying why rather than
+    # leaving the next reader to wonder whether one was forgotten. Enforcing it
+    # means asking "am I in a subshell", which needs `BASHPID` -- bash 4.0+, and
+    # UNSET on the macOS 3.2 this script also runs under, so the check would hold
+    # on Linux and be silently inert on the platform it matters on. That is the
+    # exact trap this file already records in its own bash 3.2 table, where
+    # `BASHPID` is a banned construct for the same reason: a guard that cannot
+    # fire everywhere is worse than a comment, because it reads as enforcement.
+    # A rule nothing can express is a rule nothing can be held to, so this one is
+    # written down instead of pretended at.
     exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile) = @ARGV;
