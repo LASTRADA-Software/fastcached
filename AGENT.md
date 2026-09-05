@@ -1122,6 +1122,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
   identity, and it routes the gate's objects through the change being gated. Passing the
   flag is not the fact: `CompileCache.cmake` leaves an externally-set launcher untouched,
   so the refusal reads `build.ninja`, never `CMakeCache.txt`, which never holds it.
+- **sccache is never selected AUTOMATICALLY** (`ALLOW_SCCACHE_FALLBACK`, default OFF). Being
+  the unasked-for answer to `fastcache-cc` being unusable is how this project built through
+  sccache for weeks while believing it dogfooded its own launcher: an 0.1.0 daemon refused a
+  wire-3 launcher, everything degraded exactly as designed, and the only trace was a `STATUS`
+  line and a `--show-stats` tally nobody reads (#815). The three Windows jobs opt in — miss one
+  and it compiles cold, which their `compile_requests -eq 0` assertion is what catches. Gating
+  the ROW, never having CI set `CMAKE_CXX_COMPILER_LAUNCHER`: the module returns early on an
+  external launcher and would take #170's `/showIncludes` caveat warning out of the log with it.
+  **And dropping sccache RELOCATES the silence to ccache rather than ending it** — so a rejection
+  matching its row's `predicts` column is a WARNING whatever replaced it, *including nothing*,
+  which is the loudest case and was the one emitting nothing at all. #658 conditioned that
+  warning on the winner's caveat, which exists only on MSVC/clang-cl, so it was silent by
+  construction on the host that filed the bug. A WARNING, never `SEND_ERROR`: this module may
+  not fail a configure, and a stale daemon is the normal state during a rollout. The refusal's
+  wording comes from the DAEMON, so an old one sends the old sentence forever and the direction
+  (*your daemon is the older one*) is named in the module's `predicts_detail`, not at the source.
 - A `cmake -P` check is judged by its OUTPUT, never by its exit code
   (`FAIL_REGULAR_EXPRESSION`, one spelling defined once). Two reasons, and the one
   this bullet used to give was neither: `message(WARNING)` exits **0** on every
@@ -1936,7 +1952,9 @@ compiler with `fastcache-cc` when it is on `PATH` and a daemon answers — at
 `127.0.0.1:6674`, or wherever `FASTCACHE_ADDR=host:port` points. Configure *proves*
 the cache works by compiling one tiny file through it, because a launcher that
 cannot reach its daemon still compiles fine and would otherwise cost every TU a
-failed connect in silence. Falls back to `sccache`. With either launcher active the
+failed connect in silence. Falls through to `ccache`; `sccache` sits above it in
+preference order but is never selected automatically (`ALLOW_SCCACHE_FALLBACK`,
+default OFF, #815). With either launcher active the
 module scan and PCH are turned off and MSVC debug info is forced to `/Z7`, because
 a hit reproduces only the object file. Full behaviour, including
 `FASTCACHE_AUTO_INSTALL`, is in

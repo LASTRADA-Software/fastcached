@@ -133,15 +133,34 @@ through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
 otherwise leave every TU paying a failed connect with nothing to show for it.
 That costs about 0.1 s against a daemon that answers, runs on every configure so
 that starting the daemon and reconfiguring is enough, and any other outcome —
-`connect failed`, a version mismatch, no daemon at all — falls back to `sccache`
+`connect failed`, a version mismatch, no daemon at all — falls through to `ccache`
 naming the address it tried; `-DUSE_COMPILER_CACHE=OFF` disables both.
 
-The fallback is not equivalent, and the configure says so: selecting sccache
-under MSVC or clang-cl emits a `CMake Warning` naming the hazard below, because a
-build opted into it in silence is one whose symptom arrives hours later and
-somewhere else. `-DUSE_COMPILER_CACHE=OFF` opts out of caching entirely, and
-`ctest -R compile-cache-caveat` pins both the warning and the silence for the
-launchers that have no hazard.
+**A version mismatch is announced, not merely reported.** It is the one rejection
+reason that says a daemon *is* answering and *is* one you installed — so it is a
+`CMake Warning` rather than a status line, and it says which end is behind:
+`unsupported wire version 3; this server speaks 1..1` means this launcher speaks 3
+and the daemon accepts 1 at most, so the daemon is the older of the two. Every
+other reason (not installed, no answer, an uncacheable probe) describes a cache
+nobody set up and stays at `STATUS`, because a warning that fires for all of them
+is one everybody learns to skip. Issue
+[#815](https://github.com/LASTRADA-Software/fastcached/issues/815) is what that
+warning is for: a packaged daemon a release behind a hand-built launcher, refusing
+every exchange, with the build silently going through a different cache for weeks.
+
+**`sccache` is never selected automatically.** It stays supported and keeps its
+place ahead of `ccache`, but only when a build asks for it with
+`-DALLOW_SCCACHE_FALLBACK=ON`; without that flag the module says `Not using
+sccache` and moves on. Being the unasked-for answer to `fastcache-cc` not working
+is exactly what made #815 invisible. (Pointing sccache *at* a `fastcached` daemon
+as its storage backend is a different thing entirely and is unaffected — see
+below.) Where it is asked for, the fallback is still not equivalent, and the
+configure says so: selecting sccache under MSVC or clang-cl emits a `CMake
+Warning` naming the hazard below, because a build opted into it in silence is one
+whose symptom arrives hours later and somewhere else. `-DUSE_COMPILER_CACHE=OFF`
+opts out of caching entirely, and `ctest -R compile-cache-caveat` pins the
+warning, the silence for launchers that have no hazard, and both directions of the
+sccache gate.
 
 --8<-- "sccache-backend-caveat.md"
 
@@ -155,8 +174,9 @@ per configure here, but once per translation unit in a build.
 
 All of the above assumes `fastcache-cc` is already on `PATH`, which on a new
 repository or a fresh machine is a manual step someone has to remember.
-`-DFASTCACHE_AUTO_INSTALL=ON` removes it: when *no* launcher is installed —
-neither `fastcache-cc` nor `sccache` nor `ccache` — the module downloads a
+`-DFASTCACHE_AUTO_INSTALL=ON` removes it: when no launcher the build could
+actually use is installed — no `fastcache-cc`, no `ccache`, and no `sccache` that
+`-DALLOW_SCCACHE_FALLBACK=ON` has opted into — the module downloads a
 prebuilt `fastcache-cc` for the host's OS and architecture from the latest
 stable release, checks the SHA-256 the release publishes, confirms the binary
 runs here, and uses it.
@@ -166,8 +186,8 @@ different thing from using what is installed. It fires only when nothing else is
 available: a launcher you installed is a decision already made. And it cannot
 fail a configure — an unreachable network, an unpublished platform, a download
 that arrives corrupt each end in one status line and the same fall-through to
-`sccache`, `ccache` or plain compilation that a missing launcher has always
-produced.
+`ccache` (or `sccache`, where it was asked for) or plain compilation that a missing
+launcher has always produced.
 
 The binary is staged per user, under version and platform, so every repository
 and build tree on the machine shares one copy and later configures neither

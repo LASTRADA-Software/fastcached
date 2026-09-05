@@ -124,7 +124,11 @@ Each of these is a scar, not a preference.
   `reset --soft`, the merge base *is* the new master, so the deletions show up either way.
 - **New build directories need `--fresh`.** Existing trees can have `FASTCACHE_CC-NOTFOUND`
   baked into `CMakeCache`, and `find_program` never revisits a filled entry — they fall
-  back to sccache silently. Confirm the `[cache] Enabling fastcache-cc` configure line.
+  through to whatever else is installed, silently. Confirm the
+  `[cache] Enabling fastcache-cc` configure line. (Since #815 that fall-through is ccache
+  or nothing rather than sccache, which is now opt-in — the tree is no *less* silent about
+  a stale `NOTFOUND`, because that is a launcher that was never found rather than one that
+  answered and was refused, and only the second is warned about.)
 - **Local gate caveat.** A worktree created from Windows is unreadable by WSL git, so
   `scripts/local-gate.sh` dies at step one and `repository-hygiene` silently *skips*.
   Create worktrees from **inside WSL**, or rely on CI as the gate — and say which you did.

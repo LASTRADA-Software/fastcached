@@ -1545,11 +1545,27 @@ jobs:
       # TLS on, against the OpenSSL preinstalled on the GitHub Windows runner
       # (vcpkg is the local-dev path; CI uses the runner's OpenSSL to avoid a
       # from-source build). Quoted because the path contains a space.
+      #
+      # `ALLOW_SCCACHE_FALLBACK=ON` is what makes the launcher above reachable at
+      # all. `cmake/portable/CompileCache.cmake` stopped selecting sccache
+      # automatically in #815: on the host that filed it, a daemon older than the
+      # launcher refused every exchange, sccache took over unannounced, and the
+      # project spent weeks believing it dogfooded its own cache. A launcher
+      # nobody chose is a launcher nobody checks, so it is opt-in — and THIS is a
+      # place that has chosen it, deliberately, for the reasons in the `env:` block
+      # above. All three Windows jobs that front the compiler with sccache pass it;
+      # the two below say so by pointing here.
+      #
+      # A job that lost the flag would compile cold rather than break, which is why
+      # the assertion below reads `compile_requests -eq 0` as an ERROR: the measured
+      # hit rate on these legs is 80–99%, and "slow" is the failure mode CI is worst
+      # at noticing.
       - name: "Configure"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: >
           cmake --preset ${{ matrix.preset }}
           -DFASTCACHED_ENABLE_TLS=ON
+          -DALLOW_SCCACHE_FALLBACK=ON
           "-DOPENSSL_ROOT_DIR=C:/Program Files/OpenSSL"
 
       - name: "Build"
@@ -1754,8 +1770,11 @@ jobs:
         with:
           toolset: "14.44"
 
+      # -DALLOW_SCCACHE_FALLBACK=ON for the reason written out at the `windows`
+      # job's configure step: sccache is opt-in since #815, and without it this job
+      # would front the compiler with nothing and pay a cold build in silence.
       - name: "Configure"
-        run: cmake --preset cl-release
+        run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc
@@ -2510,7 +2529,7 @@ jobs:
       - name: "Configure"
         # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
         # which is where the "only on a tag run" reasoning is written down.
-        run: cmake --preset cl-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
+        run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
         run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node
