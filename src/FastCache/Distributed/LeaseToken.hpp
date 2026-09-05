@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -308,6 +307,42 @@ inline constexpr std::chrono::seconds LeaseTokenClockSkewSlack { 300 };
 namespace Detail
 {
 
+    /// Whether a grant that expires at @p expiresAt is still good at @p now.
+    ///
+    /// **The acceptance window, in one expression, because two things depend on it and
+    /// they must not be able to disagree** ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)).
+    /// `VerifyLeaseToken` asks it to decide whether to accept a grant; `SpentLeases`
+    /// asks it to decide how long to remember one. Written twice, the second copy is
+    /// free to prune at `expiresAt` while the first goes on accepting for another five
+    /// minutes -- and a spend that expires before the thing it is spending leaves a
+    /// captured grant replayable again for the rest of that window. A shared CONSTANT
+    /// would not have been enough: both sites would still spell the comparison, and the
+    /// comparison is the part that is easy to get wrong.
+    ///
+    /// **The arithmetic, which is not obvious.** Not `now > expiresAt + slack`: that sum
+    /// pushes an already-large instant past the tick count's ceiling, and `expiresAt` is
+    /// attacker-chosen up to `MaxExpiryMillis`. The difference is not unconditionally
+    /// safe either -- `max - min` overflows like any other, and while `expiresAt` is
+    /// non-negative by construction (it decodes from an unsigned millisecond count),
+    /// `now` is whatever this host's wall clock says, including a pre-epoch instant on a
+    /// machine with a dead RTC. So the ordering is established with a COMPARISON first,
+    /// which cannot overflow, and the subtraction only ever runs on
+    /// `now > expiresAt >= epoch`, where the result is bounded by `now` and therefore
+    /// representable.
+    ///
+    /// @param expiresAt When the grant stops being good, from its own claims.
+    /// @param now This machine's wall clock.
+    /// @param slack How far this clock may trail the minting scheduler's.
+    /// @return True while the grant is still worth anything to anybody.
+    [[nodiscard]] constexpr bool WithinAcceptanceWindow(std::chrono::system_clock::time_point expiresAt,
+                                                        std::chrono::system_clock::time_point now,
+                                                        std::chrono::seconds slack) noexcept
+    {
+        if (now <= expiresAt)
+            return true;
+        return now - expiresAt <= slack;
+    }
+
     /// The claim fields, in wire order, ready to be packed or MACed.
     ///
     /// One function rather than one per direction, because a minter and a verifier
@@ -592,7 +627,9 @@ class KnownSchedulerTerm
 ///
 /// ## Bound
 ///
-/// One entry per grant, dropped once its own `expiresAt` has passed -- so the set holds
+/// One entry per grant, dropped once `Detail::WithinAcceptanceWindow` -- the verifier's
+/// own predicate -- says the grant could no longer be accepted at all. That is
+/// `expiresAt` plus the clock-skew slack and never `expiresAt` alone, so the set holds
 /// what the scheduler issued inside one lease lifetime and nothing older. Pruning is
 /// amortized onto `Spend`, which runs once per dispatched compile: there is no timer,
 /// because a worker with no traffic has nothing to prune and one with traffic prunes on
@@ -621,20 +658,30 @@ class SpentLeases
     /// @param expiresAt When the grant stops being good, from its own claims. What
     ///        bounds how long this entry is kept.
     /// @param now This machine's wall clock.
+    /// @param slack How far this clock may trail the minting scheduler's -- the same
+    ///        value the verifier allows, through the same predicate. **Retention window
+    ///        and acceptance window are ONE window**: `VerifyLeaseToken` accepts a grant
+    ///        for `slack` past its own expiry, so an entry dropped at `expiresAt` would
+    ///        leave the token acceptable AND unspent for the rest of that window --
+    ///        replayable again, five minutes at a time. A spend that expires before the
+    ///        thing it is spending is not a spend.
     /// @return True when this call spent it, false when it had already been spent.
     [[nodiscard]] bool Spend(std::string_view token,
                              std::chrono::system_clock::time_point expiresAt,
-                             std::chrono::system_clock::time_point now)
+                             std::chrono::system_clock::time_point now,
+                             std::chrono::seconds slack = LeaseTokenClockSkewSlack)
     {
-        auto const fingerprint = Sha256::Hash(std::as_bytes(std::span { token }));
+        auto const fingerprint = Sha256::Hash(WireFields::AsBytes(token));
 
         std::scoped_lock const guard { _mutex };
 
-        // Before the lookup, not after: an entry whose grant has expired describes a
-        // token nothing would accept anyway, so keeping it would only grow the map.
-        // `Expired` is checked by the verifier above this, so a token reaching here is
-        // unexpired and cannot be pruned by its own arrival.
-        std::erase_if(_spent, [now](auto const& entry) { return entry.second <= now; });
+        // Before the lookup, not after: an entry the verifier would no longer accept
+        // describes a token nothing can spend, so keeping it would only grow the map.
+        // The SAME predicate the verifier uses, so the two cannot disagree about the
+        // window -- and a token reaching here is inside it by construction, so nothing
+        // can be pruned by its own arrival.
+        std::erase_if(_spent,
+                      [now, slack](auto const& entry) { return !Detail::WithinAcceptanceWindow(entry.second, now, slack); });
 
         return _spent.emplace(fingerprint, expiresAt).second;
     }
@@ -669,8 +716,13 @@ class SpentLeases
     std::unordered_map<Sha256::Digest, std::chrono::system_clock::time_point, DigestHash> _spent;
 };
 
-/// Says once, per reset, that this worker has adopted a scheduler term that went
+/// Says, once per reset, that this worker has adopted a scheduler term that went
 /// BACKWARDS.
+///
+/// Named for what it reports rather than for what it used to refuse: it was
+/// `LeaseEpochNotice` when the condition was a refusal on the lease's epoch, and #614
+/// deleted that refusal. A name describing what a thing no longer does is how the next
+/// reader learns the wrong mechanism.
 ///
 /// **The signal it replaces was not missing, it was WRONG**
 /// ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Three ordinary
@@ -699,14 +751,14 @@ class SpentLeases
 /// would need a new `_fc_cc_core` row and this needs none. It takes a SINK rather than
 /// an `ILogger` for the same reason -- and it is the shape `Cc::CredentialNotice`
 /// already uses to say a thing once.
-class LeaseEpochNotice
+class SchedulerTermResetNotice
 {
   public:
     /// Where the line goes. Empty means say nothing.
     using Sink = std::function<void(std::string_view)>;
 
     /// @param sink Where to report; may be empty.
-    explicit LeaseEpochNotice(Sink sink) noexcept:
+    explicit SchedulerTermResetNotice(Sink sink) noexcept:
         _sink { std::move(sink) }
     {
     }
@@ -717,21 +769,26 @@ class LeaseEpochNotice
     /// defaulted parameter is how a diagnostic comes to be dropped at six call sites. A
     /// caller with nowhere to report has to say so.
     /// @return A notice with no sink.
-    [[nodiscard]] static LeaseEpochNotice Silent()
+    [[nodiscard]] static SchedulerTermResetNotice Silent()
     {
-        return LeaseEpochNotice { Sink {} };
+        return SchedulerTermResetNotice { Sink {} };
     }
 
     /// Report, if this change was a scheduler term going backwards.
     ///
+    /// **The return value is the answer, and there is no tally beside it.** This owns
+    /// the predicate "is this reportable"; a caller that tested `transition == Reset`
+    /// itself and then called this would decide it twice, and a counter kept in here
+    /// would be a second tally of what `WorkerSchedulerTermResets` already counts. So
+    /// the one call site drives its metric off this, and a silent notice answers the
+    /// same question a speaking one does.
     /// @param change What `KnownSchedulerTerm::Learn` reported, from the caller that
     ///        performed the transition.
-    /// @return True when this call reported.
+    /// @return True when this change was a reset -- reported, if there is a sink.
     bool Observe(TermChange const& change)
     {
         if (change.transition != TermTransition::Reset)
             return false;
-        _seen.fetch_add(1, std::memory_order_relaxed);
         if (_sink)
             _sink(std::format("this scheduler's term went BACKWARDS, from {} to {}: it has been reset -- its Raft "
                               "directory wiped, the cluster re-bootstrapped, or consensus turned off. Adopting the "
@@ -743,15 +800,39 @@ class LeaseEpochNotice
         return true;
     }
 
-    /// @return How many resets this notice has reported.
-    [[nodiscard]] std::size_t Seen() const noexcept
-    {
-        return _seen.load(std::memory_order_relaxed);
-    }
-
   private:
     Sink _sink;
-    std::atomic<std::size_t> _seen { 0 };
+};
+
+/// Everything a worker's lease check keeps between requests.
+///
+/// **One object rather than three references threaded through two factories.** All
+/// three are per-worker mutable state, all three are borrowed for the life of the
+/// process, and they are written in one order by one function -- spend, then learn,
+/// then report -- so they are one thing. Passed separately they were three chances for
+/// a caller to declare two and dangle on the third, which is not hypothetical: the test
+/// that drives the production factory had already invented this struct for itself,
+/// with that reason written in its comment, while production went on passing them
+/// apart.
+///
+/// The clock and the metrics sink are deliberately NOT members. Those are process-wide
+/// collaborators every layer already holds; these three exist only because a worker
+/// checks leases.
+struct WorkerLeaseState
+{
+    /// @param reported Where a scheduler term going backwards is reported. Taken as the
+    ///        whole notice rather than as a sink, so a caller with nowhere to report
+    ///        still has to say `SchedulerTermResetNotice::Silent()` by name -- which is
+    ///        that type's own rule, and a defaulted sink here would have quietly
+    ///        undone it.
+    explicit WorkerLeaseState(SchedulerTermResetNotice reported) noexcept:
+        notice { std::move(reported) }
+    {
+    }
+
+    SpentLeases spent;               ///< The grants already run here, so none runs twice.
+    KnownSchedulerTerm term;         ///< The term the last authentic grant named.
+    SchedulerTermResetNotice notice; ///< Where a term going backwards is said.
 };
 
 /// What a verifier expects a grant to say about itself.
@@ -827,30 +908,19 @@ struct LeaseExpectation
     if (authentic->fingerprint != expected.fingerprint)
         return std::unexpected { LeaseRefusal { .reason = LeaseRefusalReason::FingerprintMismatch, .detail = {} } };
 
-    // Not `now > expiresAt + slack`: that sum pushes an already-large instant past
-    // the tick count's ceiling, and `expiresAt` is attacker-chosen up to
-    // `MaxExpiryMillis`.
-    //
-    // The difference is not unconditionally safe either, which is what the earlier
-    // spelling of this comment claimed. `max - min` overflows like any other, and
-    // `expiresAt` is non-negative by construction (it decodes from an unsigned
-    // millisecond count) while `now` is whatever this host's wall clock says --
-    // including a pre-epoch instant on a machine with a dead RTC. So the ordering is
-    // established with a COMPARISON first, which cannot overflow, and the subtraction
-    // only ever runs on `now > expiresAt >= epoch`, where the result is bounded by
-    // `now` and therefore representable.
-    if (now <= authentic->expiresAt)
+    // Through the SHARED predicate, which owns the overflow reasoning and is the same
+    // window `SpentLeases` keeps an entry for. Two spellings of it would let a grant be
+    // acceptable here and forgotten there -- replayable again for the difference.
+    if (Detail::WithinAcceptanceWindow(authentic->expiresAt, now, slack))
         return std::move(*authentic);
 
+    // Safe because the predicate above only answers false on `now > expiresAt`.
     auto const age = now - authentic->expiresAt;
-    if (age > slack)
-        return std::unexpected { LeaseRefusal {
-            .reason = LeaseRefusalReason::Expired,
-            .detail = std::format("this lease expired {} seconds ago, allowing {} seconds of clock skew",
-                                  std::chrono::duration_cast<std::chrono::seconds>(age).count(),
-                                  slack.count()) } };
-
-    return std::move(*authentic);
+    return std::unexpected { LeaseRefusal {
+        .reason = LeaseRefusalReason::Expired,
+        .detail = std::format("this lease expired {} seconds ago, allowing {} seconds of clock skew",
+                              std::chrono::duration_cast<std::chrono::seconds>(age).count(),
+                              slack.count()) } };
 }
 
 } // namespace FastCache::Distributed

@@ -116,16 +116,22 @@ namespace
 {
 /// Everything `MakeWorkerLeaseValidator` borrows for the life of a worker.
 ///
-/// One struct rather than four locals per case, because they must all outlive the
-/// validator and a case that declares three of them and forgets the fourth does not
-/// fail to compile -- it dangles.
+/// The lease state is `Distributed::WorkerLeaseState` -- production's own aggregate,
+/// not a stand-in for it. This struct is where that grouping was first written, for
+/// the reason it still carries: they must all outlive the validator, and a case that
+/// declares three of them and forgets the fourth does not fail to compile, it dangles.
+/// The sink and the logger join it here because a test wants one of each per case.
 struct WorkerState
 {
-    Distributed::SpentLeases spent;                                                   ///< Grants already run.
-    Distributed::KnownSchedulerTerm term;                                             ///< The last term learned.
-    Distributed::LeaseEpochNotice notice { Distributed::LeaseEpochNotice::Silent() }; ///< Where a reset is said.
-    AtomicMetricsSink metrics;                                                        ///< Where refusals are counted.
-    NullLogger logger;                                                                ///< Where startup lines go.
+    /// @param reported Where a term going backwards is said; silent unless a case cares.
+    explicit WorkerState(Distributed::SchedulerTermResetNotice reported = Distributed::SchedulerTermResetNotice::Silent()):
+        lease { std::move(reported) }
+    {
+    }
+
+    Distributed::WorkerLeaseState lease; ///< Spent grants, learned term, reset notice.
+    AtomicMetricsSink metrics;           ///< Where refusals are counted.
+    NullLogger logger;                   ///< Where startup lines go.
 };
 } // namespace
 
@@ -152,20 +158,13 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     auto const cfg = ConfigWithKey(keyFile);
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(cfg,
-                                              ThisWorker,
-                                              SocketActivation::No,
-                                              LeaseClock,
-                                              state.spent,
-                                              state.term,
-                                              state.notice,
-                                              state.metrics,
-                                              state.logger);
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     // Nothing has been verified. Asserted, because if the worker had already learnt
     // something this case would be about the term rather than the fleet.
-    REQUIRE_FALSE(state.term.Known().has_value());
+    REQUIRE_FALSE(state.lease.term.Known().has_value());
 
     // And the foreign fleet is refused anyway -- on the identity, not the term.
     auto const foreign = (*validator)(ForeignGrantUnder(CurrentTerm), "gcc-13");
@@ -174,13 +173,13 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
 
     // Still nothing learnt: a refused grant must teach this worker nothing, or anybody
     // holding the wire could move its expectation by sending one.
-    CHECK_FALSE(state.term.Known().has_value());
+    CHECK_FALSE(state.lease.term.Known().has_value());
 
     // **And nothing was SPENT either**, which is the same rule one layer down: a grant
     // refused on a reading of its claims has not been consumed, so a client whose
     // fleet was misconfigured for one job still holds a usable grant. Only a grant
     // that was about to be compiled is spent.
-    CHECK(state.spent.Size() == 0);
+    CHECK(state.lease.spent.Size() == 0);
 
     // The control, and it is what stops this passing against a validator that refuses
     // everything: this node's OWN fleet is served, first grant and all.
@@ -205,16 +204,16 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     WriteClusterKey(keyFile);
 
     auto const cfg = ConfigWithKey(keyFile);
-    WorkerState state;
 
-    // Recording rather than silent, because the notice's WIRING is the half no unit
-    // test of the notice itself can see: a `LeaseEpochNotice` that works perfectly and
+    // Recording rather than silent, because the notice's WIRING is the half no unit test
+    // of the notice itself can see: a `SchedulerTermResetNotice` that works perfectly and
     // is never reached is the defect it was written to fix (#614).
     std::vector<std::string> said;
-    Distributed::LeaseEpochNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
+    WorkerState state { Distributed::SchedulerTermResetNotice {
+        [&said](std::string_view line) { said.emplace_back(line); } } };
 
     auto validator = MakeWorkerLeaseValidator(
-        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.spent, state.term, notice, state.metrics, state.logger);
+        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     // Nothing learned yet, so this is honoured -- and honouring it is what teaches the
@@ -223,8 +222,8 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // against one that accepts everything and enforces nothing.
     auto const first = GrantUnder(CurrentTerm, "l1");
     CHECK_FALSE((*validator)(first, "gcc-13").has_value());
-    CHECK(state.term.Known() == std::optional<std::uint64_t> { CurrentTerm });
-    CHECK(state.spent.Size() == 1);
+    CHECK(state.lease.term.Known() == std::optional<std::uint64_t> { CurrentTerm });
+    CHECK(state.lease.spent.Size() == 1);
     CHECK(said.empty());
 
     // **The same grant again is a replay**, refused by name and counted under its own
@@ -249,7 +248,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // was too, until the process restarted. The fleet keeps working.
     auto const afterReset = GrantUnder(DeposedTerm, "l1-again");
     CHECK_FALSE((*validator)(afterReset, "gcc-13").has_value());
-    CHECK(state.term.Known() == std::optional<std::uint64_t> { DeposedTerm });
+    CHECK(state.lease.term.Known() == std::optional<std::uint64_t> { DeposedTerm });
     CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
 
     // **And the worker said so.** Without this the notice could be correct in isolation
@@ -282,19 +281,12 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     NodeConfig cfg;
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(cfg,
-                                              ThisWorker,
-                                              SocketActivation::No,
-                                              LeaseClock,
-                                              state.spent,
-                                              state.term,
-                                              state.notice,
-                                              state.metrics,
-                                              state.logger);
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
-    CHECK_FALSE(state.term.Known().has_value());
-    CHECK(state.spent.Size() == 0);
+    CHECK_FALSE(state.lease.term.Known().has_value());
+    CHECK(state.lease.spent.Size() == 0);
 }

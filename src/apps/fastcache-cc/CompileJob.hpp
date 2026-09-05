@@ -516,6 +516,11 @@ class CompileJobRunner final: public ICompileJobRunner
 ///         a property of this machine is `SpawnFailed`. A caller reconstructing that
 ///         from which field is empty names the wrong half whenever the REPLACEMENT was
 ///         the offender.
+[[nodiscard]] std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::string_view workerDirectory,
+                                                                                     std::string_view clientDirectory,
+                                                                                     std::string_view replacement,
+                                                                                     DriverFamily family);
+
 /// The rule that makes a dispatched object record the CLIENT's source spelling.
 ///
 /// A compiler with debug info on records the name of the file it was handed. gcc takes
@@ -556,10 +561,5 @@ class CompileJobRunner final: public ICompileJobRunner
 [[nodiscard]] std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePath,
                                                               std::string_view clientSourceName,
                                                               DriverFamily family);
-
-[[nodiscard]] std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::string_view workerDirectory,
-                                                                                     std::string_view clientDirectory,
-                                                                                     std::string_view replacement,
-                                                                                     DriverFamily family);
 
 } // namespace FastCache::Cc

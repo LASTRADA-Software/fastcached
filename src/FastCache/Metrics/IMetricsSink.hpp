@@ -462,7 +462,7 @@ class IMetricsSink
         /// invisible on the machine it happened to.
         ///
         /// Not a refusal, so it is deliberately not in `LeaseRefusalTable`. It is the
-        /// scrapeable half of the log line `LeaseEpochNotice` prints: an operator who
+        /// scrapeable half of the log line `SchedulerTermResetNotice` prints: an operator who
         /// did the reset sees it confirmed, and one who did not sees the first news
         /// that a scheduler lost its state. Expected to read zero except on the day
         /// somebody resets a cluster.

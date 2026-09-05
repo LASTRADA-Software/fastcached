@@ -129,18 +129,14 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     std::string clusterId,
                                     IWallClock const& clock,
-                                    Distributed::SpentLeases& spent,
-                                    Distributed::KnownSchedulerTerm& term,
-                                    Distributed::LeaseEpochNotice& epochNotice,
+                                    Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics)
 {
     return [key = std::move(signingKey),
             endpoint = std::move(advertisedEndpoint),
             cluster = std::move(clusterId),
             &clock,
-            &spent,
-            &term,
-            &epochNotice,
+            &lease,
             &metrics](std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
@@ -176,7 +172,7 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // only a grant that has never been used can move it, which is what makes a
             // lower term unambiguously a scheduler that was legitimately reset rather
             // than a replay.
-            if (!spent.Spend(token, verified->expiresAt, now))
+            if (!lease.spent.Spend(token, verified->expiresAt, now))
                 return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Replayed,
                                                    .detail = "this lease has already been spent at this worker; a "
                                                              "grant authorizes exactly one compile" };
@@ -193,19 +189,18 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // It also makes the refusal in test terms observable at all: without
             // adoption, a validator that accepted everything and one that adopts
             // forward are indistinguishable from outside.
-            auto const change = term.Learn(verified->epoch);
-
             // A term that went BACKWARDS is a scheduler somebody reset -- its Raft
             // directory wiped, the cluster re-bootstrapped, consensus turned off -- and
             // it is ADOPTED rather than refused since #614. Reported both ways round,
             // because the two audiences differ: the line is for whoever is reading this
-            // worker's log after a fleet stopped behaving, the counter is for whoever
-            // is looking at a dashboard and never reads a log.
-            if (change.transition == Distributed::TermTransition::Reset)
-            {
+            // worker's log after a fleet stopped behaving, the counter is for whoever is
+            // looking at a dashboard and never reads a log.
+            //
+            // ONE predicate, and it belongs to the notice. Testing the transition here
+            // and again inside `Observe` would be one decision made in two places, and
+            // whichever copy is edited next is the one that stops agreeing.
+            if (lease.notice.Observe(lease.term.Learn(verified->epoch)))
                 metrics.Increment(IMetricsSink::Counter::WorkerSchedulerTermResets);
-                (void) epochNotice.Observe(change);
-            }
             return std::nullopt;
         }
 

@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -175,24 +176,20 @@ constexpr std::uint64_t GrantTerm = 4;
 }
 
 /// Build one of the two production lease validators.
-/// @param lease Which policy.
-/// @param spent The grants already run, which is what makes a lease single-use; the
-///        unchecked one ignores it.
-/// @param term What the verifying one borrows; the unchecked one ignores it.
+/// @param policy Which policy.
+/// @param lease What the verifying one borrows -- the spent grants, the learned term and
+///        the reset notice. Borrowed, so it outlives the validator; the unchecked one
+///        ignores it.
 /// @param metrics Where a term reset is counted; refusals are counted by the surface.
-/// @param notice Where an epoch refusal would be reported; borrowed like `term`, and
-///        for the same reason -- both outlive the validator and both are written by it.
 /// @return The validator.
-[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease,
-                                                Distributed::SpentLeases& spent,
-                                                Distributed::KnownSchedulerTerm& term,
-                                                Distributed::LeaseEpochNotice& notice,
+[[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy policy,
+                                                Distributed::WorkerLeaseState& lease,
                                                 IMetricsSink& metrics)
 {
-    if (lease == LeasePolicy::Unchecked)
+    if (policy == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
     return SignedLeaseValidator(
-        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, spent, term, notice, metrics);
+        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, lease, metrics);
 }
 
 struct Fixture
@@ -202,30 +199,24 @@ struct Fixture
     CompileJobRunner jobs;
     AtomicMetricsSink metrics;
 
-    /// What this worker has been told about the scheduler's term.
+    /// What this worker keeps between lease checks: the spent grants, the term it has
+    /// learned, and where a reset would be said.
     ///
     /// Declared BEFORE `worker` on purpose: the validator borrows it, so member order
-    /// is what guarantees it outlives the thing holding the reference. The epoch cases
-    /// teach it and then read what the worker does about it.
-    Distributed::KnownSchedulerTerm term;
-
-    /// The grants this worker has already run. Declared beside `term` and before
-    /// `worker` for the same reason: the validator borrows it.
-    Distributed::SpentLeases spent;
-
-    /// Silent, because these cases assert on the REPLY rather than on the log. Named
-    /// through `Silent()` rather than defaulted, which is that factory's own rule.
-    Distributed::LeaseEpochNotice epochNotice { Distributed::LeaseEpochNotice::Silent() };
+    /// is what guarantees it outlives the thing holding the reference. Silent, because
+    /// these cases assert on the REPLY rather than on the log -- named through
+    /// `Silent()` rather than defaulted, which is that notice's own rule.
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermResetNotice::Silent() };
 
     WorkerProtocol worker;
 
     /// @param codecs What this worker can produce and decode; the production node
     ///        passes `AvailableCodecs()`, and a case can narrow it to assert what a
     ///        worker without a codec answers.
-    /// @param lease Which production lease policy to build; see `LeasePolicy`.
-    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
+    /// @param policy Which production lease policy to build; see `LeasePolicy`.
+    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy policy = LeasePolicy::Unchecked):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(lease, spent, term, epochNotice, metrics), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(policy, lease, metrics), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -1395,7 +1386,7 @@ TEST_CASE("A grant refused on its claims is not thereby spent", "[worker-protoco
 
     // Nothing was spent, so nothing is remembered -- and a grant that WAS unspendable
     // would show up here as a replay refusal rather than as this.
-    CHECK(fix.spent.Size() == 0);
+    CHECK(fix.lease.spent.Size() == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 0);
 }
 
@@ -1409,7 +1400,7 @@ TEST_CASE("A grant from a term this worker has not heard of is honoured", "[work
     // election.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
-    fix.term.Learn(4);
+    fix.lease.term.Learn(4);
 
     auto const answer = fix.worker.Answer(FrameGrantedUnder(9));
     REQUIRE(answer.has_value());
@@ -1435,7 +1426,7 @@ TEST_CASE("A scheduler reset is adopted, and the fleet keeps compiling", "[worke
     auto const newer = fix.worker.Answer(FrameGrantedUnder(9, "l1"));
     REQUIRE(newer.has_value());
     REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
-    REQUIRE(fix.term.Known() == std::optional<std::uint64_t> { 9 });
+    REQUIRE(fix.lease.term.Known() == std::optional<std::uint64_t> { 9 });
 
     // The reset scheduler's first grant: served, where it used to be refused.
     auto const afterReset = fix.worker.Answer(FrameGrantedUnder(GrantTerm, "l2"));
@@ -1444,7 +1435,7 @@ TEST_CASE("A scheduler reset is adopted, and the fleet keeps compiling", "[worke
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 2);
 
     // And it STUCK, which is what says the term was adopted rather than merely ignored.
-    CHECK(fix.term.Known() == std::optional<std::uint64_t> { GrantTerm });
+    CHECK(fix.lease.term.Known() == std::optional<std::uint64_t> { GrantTerm });
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
 
     // Once per reset, not once per grant: the fleet is steady at the lower term now.
@@ -1469,15 +1460,68 @@ TEST_CASE("A replayed grant cannot walk this worker's term backwards", "[worker-
 
     auto const newer = fix.worker.Answer(FrameGrantedUnder(9, "l2"));
     REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
-    REQUIRE(fix.term.Known() == std::optional<std::uint64_t> { 9 });
+    REQUIRE(fix.lease.term.Known() == std::optional<std::uint64_t> { 9 });
 
     // The replay: refused, and it teaches nothing.
     auto const replayed = fix.worker.Answer(older);
     REQUIRE(replayed.has_value());
     CHECK(ErrorOf(Unwrap(replayed)) == Wire::ErrorCode::LeaseUnauthorized);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 1);
-    CHECK(fix.term.Known() == std::optional<std::uint64_t> { 9 });
+    CHECK(fix.lease.term.Known() == std::optional<std::uint64_t> { 9 });
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
+}
+
+TEST_CASE("No grant is refused on its term, whatever this worker has learned", "[worker-protocol][lease][epoch]")
+{
+    // **The unreachability of a term refusal, ASSERTED rather than argued** (#614).
+    //
+    // Retiring `EpochMismatch` rests on an argument: every grant that reaches what used
+    // to be the epoch check is unspent, so a lower term is a scheduler that was
+    // legitimately reset rather than a replay, and the check could never fire. The
+    // argument is sound and an argument about unreachability is exactly the shape this
+    // repository has been burned by -- so a future change that reintroduces a refusing
+    // path has to fail HERE, rather than silently resurrect a refusal with no counter
+    // and no name.
+    //
+    // Type-level there is already nothing to compare against: `LeaseExpectation` carries
+    // no term member, so a verifier has no argument to be told one through. This is the
+    // behavioural half, and it is driven through the PRODUCTION validator rather than
+    // through `VerifyLeaseToken` -- the pure function is not where a term could be
+    // reintroduced, because it is not where the term is known. `SignedLeaseValidator` is.
+    //
+    // Exhaustive over the cross-product INCLUDING both boundaries, because the defect
+    // this replaces was a comparison (`claimed >= expected`) and a comparison mistake
+    // lives at a boundary. Zero is in the set twice over: it is
+    // `StandaloneSchedulerTerm`, and it is what a reset scheduler states.
+    constexpr std::array Terms { std::uint64_t { 0 },
+                                 std::uint64_t { 1 },
+                                 std::uint64_t { 7 },
+                                 std::uint64_t { 9'999 },
+                                 std::numeric_limits<std::uint64_t>::max() };
+
+    for (auto const learned: Terms)
+    {
+        // A fixture per learned term, so each inner loop starts from a worker that knows
+        // exactly that and nothing else.
+        Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+        fix.lease.term.Learn(learned);
+
+        for (auto const granted: Terms)
+        {
+            INFO("worker learned " << learned << ", grant names " << granted);
+
+            // A serial per pair, because a grant is spendable once: reusing one would
+            // refuse the second pair as a replay and this case would then be asserting
+            // the wrong thing while looking correct.
+            auto const answer = fix.worker.Answer(FrameGrantedUnder(granted, std::format("l{}-{}", learned, granted)));
+            REQUIRE(answer.has_value());
+            CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
+        }
+
+        // Every one of them compiled, which is what says the acceptances above are real
+        // rather than a reply this fixture would have produced anyway.
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == Terms.size());
+    }
 }
 
 TEST_CASE("A worker that has never learned a term refuses nothing for it", "[worker-protocol][lease][epoch]")

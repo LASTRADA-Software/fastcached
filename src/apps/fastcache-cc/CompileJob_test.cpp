@@ -4,6 +4,7 @@
 #include "StubObjectTestSupport.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -431,6 +432,71 @@ TEST_CASE("A dispatched object records the client's source spelling, not the wor
     // LAST gives `../src/tu.cpp` with `DW_AT_comp_dir` still `.`.
     CHECK(rule > std::ranges::find_if(
               argv, [](std::string const& a) { return a.starts_with("-fdebug-prefix-map=") && a.ends_with("=."); }));
+}
+
+TEST_CASE("A source name no rule can spell emits no rule, and the compile still runs",
+          "[compile-job][prefix-map][source-name]")
+{
+    // **The asymmetry that justifies two rule builders, asserted.** `WorkerPrefixMapRules`
+    // REFUSES a value it cannot spell, because it is honouring a mapping the client asked
+    // for and silently skipping it returns an object whose compilation directory
+    // disagrees with a locally built one -- #506 itself. `WorkerSourceNameRule` emits
+    // NOTHING, because nothing asked for it: it repairs a name this worker's own scratch
+    // layout put into the object, and a source file with a space in its name is
+    // completely ordinary. Refusing those would stop distributing them to improve a debug
+    // record.
+    //
+    // Untested, a later refactor routing this through the refusing path leaves every
+    // other case green while the fleet quietly stops distributing whole translation
+    // units.
+    auto const unspellable = GENERATE(as<std::string> {},
+                                      "../src/my file.cpp",   // a space: cannot go on a command line
+                                      "../src/a=b.cpp",       // the rule's own separator, read differently by two drivers
+                                      "../src/tab\there.cpp", // control characters
+                                      "../src/quote\".cpp");
+    INFO("source name: " << unspellable);
+
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.sourceName = unspellable;
+
+    // It COMPILES -- the assertion this case exists for.
+    REQUIRE(jobs.Run(job).has_value());
+
+    // And no rule was invented for it. Checked by `<from>`, because a build asking for a
+    // compilation-directory mapping would legitimately put other rules on this line;
+    // this job asks for none, so the source rule is the only one that could appear.
+    CHECK(std::ranges::none_of(runner.Argv(), [](std::string const& a) { return a.starts_with("-fdebug-prefix-map="); }));
+
+    // The control, so this cannot pass because the rule is never emitted at all: the
+    // same job with a spellable name gets one.
+    job.sourceName = "../src/ordinary.cpp";
+    REQUIRE(jobs.Run(job).has_value());
+    CHECK(std::ranges::any_of(runner.Argv(), [](std::string const& a) {
+        return a.starts_with("-fdebug-prefix-map=") && a.ends_with("=../src/ordinary.cpp");
+    }));
+}
+
+TEST_CASE("A worker whose driver has no path-mapping switch still compiles", "[compile-job][prefix-map][source-name]")
+{
+    // The same policy reached the other way, and it is why this is not a refusal: `cl`
+    // has no path-map switch and clang-cl's CodeView records are not remapped by one, so
+    // the row is GNU-only. An MSVC worker therefore records its own scratch path and
+    // that is an accepted residual -- refusing instead would stop MSVC distributing
+    // anything at all, to improve a debug record on the platform where it cannot be
+    // improved.
+    //
+    // Driven at the function rather than through `Run`, because which family a worker
+    // has is its `--toolchain`, not something a job can vary.
+    CHECK_FALSE(WorkerSourceNameRule("/scratch/job-1/tu.cpp", "../src/tu.cpp", DriverFamily::Msvc).has_value());
+    CHECK_FALSE(WorkerSourceNameRule("/scratch/job-1/tu.cpp", "../src/tu.cpp", DriverFamily::None).has_value());
+
+    // The control: the family that HAS a row gets a rule, so this cannot pass by the
+    // function returning nothing for everything.
+    CHECK(WorkerSourceNameRule("/scratch/job-1/tu.cpp", "../src/tu.cpp", DriverFamily::Gnu).has_value());
 }
 
 TEST_CASE("Two dispatches of one translation unit record the same source name", "[compile-job][prefix-map][source-name]")

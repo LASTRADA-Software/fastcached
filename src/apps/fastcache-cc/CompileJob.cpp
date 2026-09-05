@@ -758,6 +758,12 @@ namespace
 
     /// Whether @p value can be spelled inside a rule built from @p row.
     ///
+    /// **Length as well as shape**, and both callers rely on that -- the ceiling used to
+    /// be an explicit check beside each caller's own, which is one rule in two places
+    /// and left the two callers disagreeing about which came first. A value too long is
+    /// unspellable for the same reason a value carrying the separator is: it cannot go
+    /// on a command line as this rule.
+    ///
     /// The shape rule, spelled the way `IsSafeStem` above spells its own: an explicit
     /// alphabet read from a capturing lambda, and no `<cctype>`. `std::isalnum` is
     /// locale-dependent, which is the exact hazard the note under `IsSafeStem` records
@@ -865,14 +871,6 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
                                           .detail = "a compilation-directory replacement needs the directory it "
                                                     "replaces" });
 
-    // The ceiling and the shape rule are shared with `WorkerSourceNameRule` above --
-    // both build a rule for the same flag out of values a peer sent, and two copies of
-    // one alphabet is two chances to diverge.
-    if (replacement.size() > MaxRuleValue)
-        return std::unexpected(JobError::RejectedArgumentNaming(replacement));
-    if (clientDirectory.size() > MaxRuleValue)
-        return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
-
     // A family with no row is a worker that cannot honour the request at all. Refused
     // rather than skipped, unlike the source-name rule: a mapping the client ASKED for
     // and did not get is #506, an object whose compilation directory disagrees with a
@@ -884,10 +882,11 @@ std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::stri
                        .detail = "this worker's driver family has no path-mapping switch, so a dispatched object "
                                  "cannot record the compilation directory the client asked for" });
 
-    // ALL THREE values, and the two halves are attributed differently on purpose: a
-    // value the client sent is the CLIENT's fault, this worker's own directory is the
-    // WORKER's. Blaming a client for a property of the machine it was sent to sends an
-    // operator to the wrong end of the fleet.
+    // ALL THREE values, through the same predicate `WorkerSourceNameRule` uses -- two
+    // copies of one alphabet is two chances to diverge -- and the two halves are
+    // attributed differently on purpose: a value the client sent is the CLIENT's fault,
+    // this worker's own directory is the WORKER's. Blaming a client for a property of
+    // the machine it was sent to sends an operator to the wrong end of the fleet.
     if (!SpellableInRule(clientDirectory, *row))
         return std::unexpected(JobError::RejectedArgumentNaming(clientDirectory));
     if (!SpellableInRule(replacement, *row))
@@ -1153,7 +1152,8 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // compile is actually handed, which is the sanitized one. `SafeSourceName` may have
     // renamed it, and mapping the whole path rather than the directory is what makes
     // that irrelevant -- the recorded name is the client's spelling either way.
-    if (auto rule = WorkerSourceNameRule(source.string(), job.sourceName, family); rule.has_value())
+    auto const sourcePath = source.string();
+    if (auto rule = WorkerSourceNameRule(sourcePath, job.sourceName, family); rule.has_value())
         argv.push_back(*std::move(rule));
 
     // The compile action and the output are the worker's to name, which is why the
@@ -1171,7 +1171,7 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // never from anything the client sent -- the same rule that governs which program
     // runs, and which vetted the arguments above.
     argv.emplace_back("-c");
-    argv.push_back(source.string());
+    argv.push_back(sourcePath);
     // Fused, which both families accept and which is the only form MSVC documents
     // for `/Fo`.
     argv.push_back(std::string { ObjectOutputPrefixFor(family) } + object.string());

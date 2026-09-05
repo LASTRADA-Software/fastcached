@@ -475,6 +475,42 @@ TEST_CASE("A grant is spendable exactly once", "[distributed][lease][token][repl
     CHECK(spent.Size() == 2);
 }
 
+TEST_CASE("A spent grant stays spent for as long as it stays acceptable", "[distributed][lease][token][replay]")
+{
+    // **The retention window and the acceptance window are ONE window.**
+    //
+    // `VerifyLeaseToken` accepts a grant for `LeaseTokenClockSkewSlack` PAST its own
+    // expiry -- five minutes, because a fleet's machines are not all NTP-managed and an
+    // unsynchronised clock is minutes out. So an entry dropped at `expiresAt` would
+    // leave the token acceptable AND unspent for the rest of that window: five minutes
+    // of replay, per grant, on exactly the machines nobody is watching. A spend that
+    // expires before the thing it is spending is not a spend.
+    //
+    // Found reviewing the first version of this file, which pruned on `expiresAt` alone.
+    SpentLeases spent;
+    auto const key = Key();
+    auto const grant = MintLeaseToken(key, Grant());
+    auto const expiry = Noon() + 10min;
+
+    REQUIRE(spent.Spend(grant, expiry, Noon()));
+
+    // Past the expiry and inside the slack: the verifier still accepts it, so the spend
+    // must still hold. Both halves asserted -- without the first, this would pass
+    // against a verifier that had stopped accepting it, which is a different fix.
+    REQUIRE(VerifyLeaseToken(key, grant, Worker(), expiry + 1min).has_value());
+    CHECK_FALSE(spent.Spend(grant, expiry, expiry + 1min));
+
+    // At the far edge, where `age > slack` is still false.
+    REQUIRE(VerifyLeaseToken(key, grant, Worker(), expiry + LeaseTokenClockSkewSlack).has_value());
+    CHECK_FALSE(spent.Spend(grant, expiry, expiry + LeaseTokenClockSkewSlack));
+
+    // One second past it the verifier refuses the token outright, so the entry has no
+    // work left to do and is dropped. That is the BOUND rather than a hole, and
+    // asserting it is what stops the fix above from becoming "keep everything forever".
+    REQUIRE_FALSE(VerifyLeaseToken(key, grant, Worker(), expiry + LeaseTokenClockSkewSlack + 1s).has_value());
+    CHECK(spent.Spend(grant, expiry, expiry + LeaseTokenClockSkewSlack + 1s));
+}
+
 TEST_CASE("The spent set is bounded by the grants' own expiry", "[distributed][lease][token][replay]")
 {
     // The bound, and the reason there is no timer: an entry describes a token that
@@ -632,7 +668,7 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
     // condition is gone: the worker adopts the lower term and goes on compiling. So the
     // line reports a TRANSITION, which happens once by construction and needs no latch.
     std::vector<std::string> said;
-    LeaseEpochNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
+    SchedulerTermResetNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
 
     SECTION("a reset is reported, and it names both terms and what it did")
     {
@@ -645,7 +681,6 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
         // is worth saying rather than leaving them to infer from silence.
         CHECK(said.front().contains("from 7 to 0"));
         CHECK(said.front().contains("Adopting"));
-        CHECK(notice.Seen() == 1);
     }
 
     SECTION("nothing else reaches it, however many compiles arrive")
@@ -659,7 +694,6 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
             CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 7, .current = 8 }));
         }
         CHECK(said.empty());
-        CHECK(notice.Seen() == 0);
     }
 
     SECTION("a scheduler that flaps is reported once per flap")
@@ -673,18 +707,20 @@ TEST_CASE("The worker says once, per reset, that a scheduler term went backwards
         CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 7 }));
         CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
         CHECK(said.size() == 2);
-        CHECK(notice.Seen() == 2);
     }
 
-    SECTION("a silent notice reports nowhere and still counts")
+    SECTION("a silent notice reports nowhere and still answers")
     {
         // `Silent()` is named rather than defaulted, which is `CredentialNotice`'s rule
         // and the reason is the same: a defaulted sink is how a diagnostic comes to be
-        // dropped at every call site at once. It still answers whether it WOULD have
-        // spoken, so a caller can assert the decision without a sink.
-        auto quiet = LeaseEpochNotice::Silent();
+        // dropped at every call site at once.
+        //
+        // It answers through its RETURN VALUE, which is the whole interface: the notice
+        // owns the predicate "is this reportable", so a caller with nowhere to report
+        // still gets the decision -- and the one production call site drives its counter
+        // off exactly this, rather than testing the transition a second time itself.
+        auto quiet = SchedulerTermResetNotice::Silent();
         CHECK(quiet.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
-        CHECK(quiet.Seen() == 1);
         CHECK_FALSE(quiet.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 1 }));
     }
 }

@@ -790,57 +790,43 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // node's life, and `DefaultSystemWallClock()` is the lifetime that argument
     // wants -- a local here was one more object whose outliving had to be reasoned
     // about, for no gain.
-    // What this worker has learned about the scheduler's term (#421). Declared here
-    // because the validator below borrows it for the rest of this node's life.
+    // What this worker keeps between lease checks: the grants it has already run
+    // (#614), the scheduler term the last authentic grant named (#421), and where a
+    // term going BACKWARDS is reported.
+    //
+    // ONE object rather than three locals, because the validator below borrows all
+    // three for the rest of this node's life and three separate locals is three chances
+    // to declare two and dangle on the third. Declared here for that lifetime.
     //
     // Written by nothing but the validator itself: a grant that has passed its MAC
-    // teaches the term inside it. The first shape of #421 also had the heartbeat reply
-    // state it, and review found that channel is unauthenticated -- anything able to
-    // answer this node's `--scheduler` dial could push the expectation to `UINT64_MAX`
-    // and make this worker refuse every honest grant until it restarted. So the
-    // channel was deleted rather than defended, which is what `CacheResponder` taking
-    // no membership oracle already records as this repository's preference.
+    // teaches the term inside it, and since #614 it must also have been unspent. #421's
+    // first shape also had the heartbeat reply state the term, and review found that
+    // channel is unauthenticated -- anything able to answer this node's `--scheduler`
+    // dial could push the expectation to `UINT64_MAX` and make this worker refuse every
+    // honest grant until it restarted. So the channel was deleted rather than defended,
+    // which is what `CacheResponder` taking no membership oracle already records as this
+    // repository's preference.
     //
-    // Empty at this point, and that is a state rather than a gap: a worker that
-    // refused before it had ever seen a grant could not cold-start, so
-    // `KnownSchedulerTerm` reports `NotKnownHere` and accepts everything until an
-    // authentic grant has taught it something.
-    Distributed::KnownSchedulerTerm schedulerTerm;
-
-    // The grants this worker has already run, which is what makes a lease single-use
-    // (#614). Beside the term and owned by the same scope, because the validator
-    // borrows both for the rest of this node's life -- and because the order matters:
-    // a grant is spent BEFORE its term is learned, so a replayed one cannot walk the
-    // term above backwards.
+    // Empty at this point, and both halves of that are states rather than gaps. A worker
+    // that has learned no term reports none, which is what keeps its first grant from
+    // reading as a scheduler reset; and a restart is what empties the spent set, which
+    // reopens a captured grant's window for whatever is left of its expiry -- stated on
+    // `Distributed::SpentLeases` rather than left to be discovered, and the same window
+    // the term expectation has always had across a restart.
     //
-    // Empty at this point, and a restart is what empties it. That reopens a captured
-    // grant's window for whatever is left of its expiry, which is stated on
-    // `Distributed::SpentLeases` rather than left to be discovered -- and is the same
-    // window the term expectation has always had across a restart.
-    Distributed::SpentLeases spentLeases;
-
-    // Beside the term, because it is the same kind of thing: per-worker mutable state
-    // the validator writes and this scope owns. It says once, per reset, that this
-    // worker has adopted a scheduler term that went BACKWARDS -- a scheduler whose Raft
-    // directory was wiped, whose cluster was re-bootstrapped, or which had consensus
-    // turned off (#614).
-    //
-    // `Warn` rather than `Error`: the worker is healthy and goes on compiling, because
-    // the term is a diagnostic rather than a gate since #614. What may have changed
-    // under it is the operator's own configuration, which is exactly what one line is
-    // for.
-    Distributed::LeaseEpochNotice epochNotice { [&logger](std::string_view line) {
-        logger.Logf(LogLevel::Warn, "{}", line);
-    } };
+    // `Warn` rather than `Error` on the reset line: the worker is healthy and goes on
+    // compiling, because the term is a diagnostic rather than a gate since #614. What
+    // may have changed under it is the operator's own configuration, which is exactly
+    // what one line is for.
+    Distributed::WorkerLeaseState leaseState { Distributed::SchedulerTermResetNotice {
+        [&logger](std::string_view line) { logger.Logf(LogLevel::Warn, "{}", line); } } };
 
     auto validator =
         Node::MakeWorkerLeaseValidator(cfg,
                                        advertise,
                                        activated.has_value() ? Node::SocketActivation::Yes : Node::SocketActivation::No,
                                        DefaultSystemWallClock(),
-                                       spentLeases,
-                                       schedulerTerm,
-                                       epochNotice,
+                                       leaseState,
                                        metrics,
                                        logger);
     if (!validator.has_value())

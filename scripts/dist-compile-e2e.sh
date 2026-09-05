@@ -1735,8 +1735,13 @@ case13_at() {
         -c "$src" -o "${mapdir}/thirteen-${label}-ref.o") \
         || fail "the case 13 reference compile failed (${label})"
 
+    # Dumped ONCE per object and read twice, which is how the reader-selection loop
+    # below already does it. Two attributes read out of one dump are also provably two
+    # attributes of one reading of one file, where two dumps are two.
+    local reference_dump
+    reference_dump="$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}-ref.o")"
     local reference_comp_dir
-    reference_comp_dir="$(comp_dir_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}-ref.o")")"
+    reference_comp_dir="$(comp_dir_of "$reference_dump")"
 
     (
         export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
@@ -1752,8 +1757,10 @@ case13_at() {
             fail "case 13 (${label}) was not dispatched, so it says nothing about a dispatched object"
         }
 
+    local remote_dump
+    remote_dump="$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}.o")"
     local remote_comp_dir
-    remote_comp_dir="$(comp_dir_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}.o")")"
+    remote_comp_dir="$(comp_dir_of "$remote_dump")"
 
     # THE assertion, and it is the ticket's own clause: the two objects must record
     # the SAME compilation directory. The reference cannot be empty here -- a reader
@@ -1806,8 +1813,8 @@ case13_at() {
     # why this must not be read as covering both drivers equally: on gcc it is a
     # regression guard, on clang it is the ticket.
     local reference_source_name remote_source_name
-    reference_source_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}-ref.o")")"
-    remote_source_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}.o")")"
+    reference_source_name="$(source_name_of "$reference_dump")"
+    remote_source_name="$(source_name_of "$remote_dump")"
 
     [[ -n "$reference_source_name" ]] || fail "the case 13 reference object records no source name (${label})"
     [[ "$remote_source_name" == "$reference_source_name" ]] \
