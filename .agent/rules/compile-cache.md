@@ -1888,6 +1888,12 @@ was MEASURED and what was INFERRED, separately, every time.** The receiver canno
 recover the distinction at any price, and the sender can state it for free. A claim
 worth acting on is worth one clause saying which of the two it is.
 
+**And where a question can be settled by ATTEMPTING THE ACTION rather than by reading
+the state and reporting it, attempt it:** a claim freezes the read permanently, carries
+no timestamp and cannot be refused by anything downstream, whereas a request against the
+live system -- `gh pr merge --auto`, a write that can conflict, a `cancel` -- is refused
+with current truth at the moment the staleness would otherwise have done harm.
+
 ## Open work
 
 - **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
