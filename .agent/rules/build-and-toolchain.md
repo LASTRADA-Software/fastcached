@@ -2369,6 +2369,14 @@ makes it anyway and says so there.
   The noisy direction wastes a cycle; the blind direction ships to CI, and both read
   like a clean tree.
 
+  That is one of #454's two halves. The other is below, under
+  "`PEDANTIC_COMPILER_WERROR` decides fatality, not which warnings exist": the
+  three `clang-diagnostic-c2y-extensions` findings it reported are what a database
+  with `PEDANTIC_COMPILER` **ON** and `WERROR` **OFF** produces, which is what a
+  build directory reused across presets holds — and which no correction to the
+  configure line could have explained. A symptom with two mechanisms reads as
+  unreproducible the moment either one alone is ruled out.
+
   It is also how the target-set bullet above gets violated by the very page that
   states it: the old line omitted the two default-OFF app targets, so four
   first-party translation units were absent from the database rather than clean.
@@ -2584,6 +2592,101 @@ committed, only what lands on disk at checkout. `*.sh` keeps a row of its own ev
 though the general rule covers it, because the consequence there is specific: a
 CRLF shebang makes the kernel look for an interpreter whose name ends in a
 carriage return, so such a script does not misbehave — it fails to start at all.
+## `PEDANTIC_COMPILER_WERROR` decides fatality, not which warnings exist
+
+- **A flag and the suppressions it makes necessary are governed by ONE condition.**
+  `cmake/portable/PedanticCompiler.cmake` added `-pedantic` and
+  `-Wmissing-declarations` under `PEDANTIC_COMPILER`, and the suppressions those
+  make necessary — `-Wno-c2y-extensions`, `-Wno-c++20-extensions`,
+  `-Wno-missing-declarations`, `-Wno-class-memaccess` — inside the
+  `PEDANTIC_COMPILER_WERROR` block. Two conditions over one concern, so **the four
+  presets that inherit `PEDANTIC_COMPILER=ON` from `base` and leave `WERROR` off
+  got the warnings and none of the suppressions**: `clang-coverage`,
+  `clang-asan-ubsan`, `clang-tsan`, `clang-tracy`
+  ([#611](https://github.com/LASTRADA-Software/fastcached/issues/611)).
+
+  Measured on `0db96dc8`, each preset in its OWN fresh build directory against
+  `/usr/bin/clang++` pinned by absolute path with zero `LAUNCHER =` edges: **7049
+  `-Wc2y-extensions` warnings across 195 translation units, the same number in all
+  four**, every one of them `'__COUNTER__' is a C2y extension` out of Catch2's
+  `TEST_CASE` — so the count is a function of how many tests exist. The other three
+  suppressions cover diagnostics that fire **zero** times on this tree at clang
+  22.1.8: three suppress nothing and one suppresses everything, which is why
+  nobody's intuition about which flag mattered would have been right.
+
+  **Nothing could have reported it, in any direction somebody would look.** Those
+  four presets have `WERROR` off, so 7049 warnings are 7049 warnings and every
+  build exits 0. The preset people actually run — `clang-debug` — has `WERROR` on
+  and is therefore correct. And the one place it becomes *visible* is a clang-tidy
+  database from a build directory configured that way, where it reads as a stale
+  cache rather than as a rule. That is exactly how
+  [#454](https://github.com/LASTRADA-Software/fastcached/issues/454) came to be
+  filed and then believed unreproducible: its three `clang-diagnostic-c2y-extensions`
+  findings are this, and `-Wc2y-extensions` being pedantic-only in clang 22 made the
+  hand-rolled configure line look like the whole story when it was half of it.
+
+- **Split by what a flag DOES, never by where it happened to live.** `-Wno-X`
+  selects a *diagnostic* and belongs beside the flag that makes it necessary;
+  `-Werror` and `-Wno-error=X` decide *fatality* and belong under `WERROR`.
+  `-Wno-error=X` says "keep X visible, do not fail on it", so a preset without
+  `-Werror` that SEES X is getting precisely what that flag asks for — it is not
+  this defect, and a rule that refused it would be turned off rather than obeyed.
+
+- **Copying a suppression outward while leaving it inward does not close this.**
+  Two conditions naming one diagnostic *is* the defect; the second copy is a second
+  thing to keep in step. Move the flag.
+
+- The `-Wno-error=` half is **belt-and-braces, not dead code by proof**. A
+  diagnostic disabled by `-Wno-X` can never be an error, so each `-Wno-error=X`
+  matters only on a compiler where the `-Wno-X` probe fails while its own succeeds.
+  Measured on clang 22.1.8 and GCC 16.2.1, the two halves of every pair succeed and
+  fail **together** — clang rejects both spellings of `class-memaccess`, GCC rejects
+  both of `c2y-extensions` — so on those two compilers they are currently inert.
+  That is a property of two compilers, not of the flags, which is why they stay.
+
+- **`ctest -R pedantic-suppressions` is the reader, and it DRIVES the file rather
+  than scanning it.** It includes `PedanticCompiler.cmake` twice per compiler
+  persona — the pair `CMAKE_CXX_COMPILER_ID`/`CMAKE_CXX_COMPILER_FRONTEND_VARIANT`,
+  because `clang-cl` has clang's ID and MSVC's frontend and takes the other branch —
+  with `add_compile_options` replaced by a recorder and `check_cxx_compiler_flag`
+  stubbed through `CMAKE_MODULE_PATH`, and refuses any difference between the two
+  `WERROR` settings that is not fatality-only. A text scan would have to model
+  `if`/`elseif`/`else`/`endif` nesting to answer *which condition is this line
+  under*, which is the one question that matters here, and a model of CMake that is
+  subtly wrong fails in the confident direction. Including the file uses CMake's own
+  answer. The stub answers **yes to every probe** deliberately: a probe that failed
+  would drop a flag for a reason unrelated to the rule, and a dropped flag cannot
+  violate it — so a real compiler would weaken the check on exactly the hosts where
+  a flag is unavailable, invisibly.
+
+- A guard nobody has watched refuse is not a guard, and *"it was seen failing before
+  the fix"* is a fact about one commit that stops reproducing the moment the fix
+  lands. `ctest -R pedantic-suppressions-selftest` runs **ten cases** -- eight
+  synthetic subjects plus two absent inputs -- and names every one on every run,
+  because a figure that disagrees with what the tool prints is the defect #723
+  exists to prevent. Three are shapes an unwatched guard accepts: the suppression
+  **copied** outward rather than moved, a subject that no longer adds `-pedantic`,
+  and an MSVC arm that adds nothing.
+
+- **The copied case is why the difference is a COUNT and not a set.** A suppression
+  added outside the block *and* left inside it is present at both `WERROR`
+  settings, so as sets the difference is empty and the check passes -- permanently
+  and by construction -- while its own refusal says *"move the flag, do not copy
+  it"*. A guard that reads as enforcing something it cannot is worse than no guard,
+  because the trailer sends people at the one shape it does not catch. Measured on
+  the real subject with the copy planted: the membership form reports success, the
+  counting form refuses by name.
+
+- **And a selftest that matches a `FATAL_ERROR` must flatten its whitespace first.**
+  CMake word-wraps that message at about 76 columns with indented continuations, so
+  where a line breaks depends on the length of whatever is interpolated into it --
+  and two of these messages begin with a PATH. Measured: with the selftest's scratch
+  directory 17-24 characters one case failed, at 28-48 a different one failed, and
+  at 52 or more both passed. `cmake -B /tmp/b` would have failed the test on a clean
+  tree while this repository's own deep `out/build/<preset>` path passes, so CI
+  stays green and only some developers see the red -- and what it prints accuses the
+  check of drift when the only variable is `$PWD`.
+
 ## The portable compile-cache module
 
 - **`cmake/portable/CompileCache.cmake` must stay stock-CMake-only, and must never fail a

@@ -25,6 +25,13 @@ configuration that happens to have no tie to this project — they are here
 because they are copyable, not because anything about them is promised to stay
 still.
 
+`PedanticCompiler.cmake` is covered too, by `ctest -R pedantic-suppressions`,
+which asserts that `PEDANTIC_COMPILER_WERROR` decides only whether warnings are
+FATAL and never which warnings EXIST. That guard lives in this repository and a
+vendored copy does not get it — the module still works anywhere, but the property
+it relies on is checked only here. Whoever copies it inherits the flags and not
+the check.
+
 ## `CompileCache.cmake`
 
 Picks a compiler-cache launcher — `fastcache-cc`, `sccache` or `ccache` — and,
