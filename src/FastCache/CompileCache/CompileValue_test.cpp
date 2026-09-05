@@ -210,6 +210,10 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
         // key every machine computes. Before this outcome existed the two SECTIONs
         // below were one `std::nullopt` and no caller could separate them.
         auto foreign = wire;
+        // `wire` is encoded above, so it is never empty; GCC cannot see that through
+        // the copy and reads `foreign[0]` as a null dereference (#805). Stating it
+        // also keeps the SECTION honest if the encoder above ever returns nothing.
+        REQUIRE_FALSE(foreign.empty());
         foreign[0] = std::byte { CompileValueVersion + 1 };
 
         auto const canonical = CanonicalStoredValue(foreign, "/home/dev/proj", "/home/dev/proj/build");
@@ -222,6 +226,12 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
 
     SECTION("bytes that are not a value at all stay the caller's own policy")
     {
+        // The same emptiness the SECTION above states, and here it matters more:
+        // `wire.size() - 1` on an empty vector is a size_t UNDERFLOW, so the span
+        // would be 2^64-1 bytes long and `CanonicalStoredValue` would read off the
+        // end of the world rather than answering `NotACompileValue`. Stated, not
+        // assumed, because the encoder is what the whole case is built on.
+        REQUIRE_FALSE(wire.empty());
         auto truncated = std::span<std::byte const> { wire.data(), wire.size() - 1 };
         auto const canonical = CanonicalStoredValue(truncated, "/home/dev/proj", "/home/dev/proj/build");
         CHECK(canonical.outcome == CanonicalizationOutcome::NotACompileValue);

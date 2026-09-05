@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <concepts>
@@ -100,6 +101,26 @@ namespace
     template <std::integral T>
     void StoreLe(std::span<std::byte> dst, T value) noexcept
     {
+        // The documented precondition, enforced rather than assumed and checked
+        // FIRST, as the sibling `ReadLe` below checks the same one. Beneath
+        // `sizeof(T)` the memcpy was already undefined -- an empty span's `data()`
+        // may be null -- which is what GCC 16 reports as -Wnull-dereference, fatal
+        // under PEDANTIC_COMPILER_WERROR (#805).
+        //
+        // No caller can reach the early return: every one writes into the first 16
+        // bytes of a page, and `CowTree::MinPageSize` is 512, enforced by
+        // `FilePageStore` at open and against the live header. So this is the
+        // undefined case removed, not a silent-write path added.
+        //
+        // The `assert` is the half the early return cannot carry. This function is
+        // `void` and `noexcept`, so a caller learns nothing from it, and the last
+        // of the three writes in `WriteOverflowChain` is the page CRC -- a return
+        // there would put a zero-CRC page on disk with no error, which
+        // `ReadOverflowPage` then reports as `Corrupt` against a store that is
+        // healthy. A precondition worth enforcing is worth SAYING when it breaks.
+        assert(dst.size() >= sizeof(T));
+        if (dst.size() < sizeof(T))
+            return;
         if constexpr (std::endian::native != std::endian::little)
             value = std::byteswap(value);
         std::memcpy(dst.data(), &value, sizeof(T));

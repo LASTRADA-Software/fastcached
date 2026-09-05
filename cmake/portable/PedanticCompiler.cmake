@@ -129,18 +129,74 @@ if(${PEDANTIC_COMPILER})
             # it", which is a statement about `-Werror` and belongs here; the
             # `-Wno-X` above says "never show me X", which is not.
             #
-            # These are belt-and-braces rather than load-bearing: a diagnostic
-            # disabled by `-Wno-X` can never be an error, so each of these matters
-            # only on a compiler where the `-Wno-X` probe fails while its own
-            # succeeds. Measured on clang 22.1.8 and GCC 16.2.1, the two halves of
-            # every pair succeed and fail TOGETHER -- clang rejects both spellings
-            # of `class-memaccess`, GCC rejects both of `c2y-extensions` -- so on
-            # those two compilers they are currently inert. Kept because that is a
-            # property of two compilers rather than of the flags.
+            # These FOUR -- and only these four, each PAIRED with a `-Wno-X` above
+            # -- are belt-and-braces rather than load-bearing. The scope is the
+            # whole claim: the two GNU-gated rows further down are UNPAIRED and are
+            # what lets GCC 16 build this tree at all, so "these are inert" read as
+            # covering the family is how one of them gets deleted and takes
+            # `gate-gcc-release` red.
+            #
+            # A diagnostic disabled by `-Wno-X` can never be an error, so each of
+            # these four matters only on a compiler where the `-Wno-X` probe fails
+            # while its own succeeds. Measured on clang 22.1.8 and GCC 16.2.1, the
+            # two halves of every PAIR succeed and fail TOGETHER -- clang rejects
+            # both spellings of `class-memaccess`, GCC rejects both of
+            # `c2y-extensions` -- so on those two compilers these four are
+            # currently inert. Kept because that is a property of two compilers
+            # rather than of the flags.
             try_add_compile_options(-Wno-error=c++20-extensions)
             try_add_compile_options(-Wno-error=c2y-extensions)
             try_add_compile_options(-Wno-error=class-memaccess)
             try_add_compile_options(-Wno-error=missing-declarations)
+
+            # The two below are NOT belt-and-braces: they are load-bearing, and
+            # deliberately NOT paired with a `-Wno-` above. The diagnostics stay
+            # VISIBLE -- they are worth reading -- they merely stop being fatal.
+            #
+            # GCC ONLY, because only GCC produces them. Ungated, clang would lose
+            # `-Werror` on two diagnostics that name real bugs, to unblock a
+            # compiler clang is not. The gate costs nothing: `pedantic-suppressions`
+            # still reports both rows under its GNU persona.
+            #
+            # Both fire inside libstdc++'s own headers, from inlining, on code that
+            # has no defect to fix. GCC 16.2.1 reports them and g++-13/g++-14 do not
+            # ([#805](https://github.com/LASTRADA-Software/fastcached/issues/805)):
+            #
+            #   * `-Warray-bounds=` in `EncodeCompileValue`
+            #     (`src/FastCache/CompileCache/CompileValue.cpp`), out of
+            #     `stl_uninitialized.h`.
+            #   * `-Wmaybe-uninitialized` in
+            #     `src/FastCache/Server/AdminHttpServer_test.cpp`, inside libstdc++'s
+            #     own `_Any_data` union, when an `AdminRoute` is copied out of an
+            #     `initializer_list`.
+            #
+            # This is here rather than at the source because THREE separate source
+            # formulations of `EncodeCompileValue` were each measured to silence one
+            # compiler and invent a fresh `-Werror` diagnostic on another, which is
+            # strictly worse than the warning:
+            #
+            #   * `reserve()` before the first insert -- silences GCC 16's
+            #     `-Warray-bounds=`, produces `-Wfree-nonheap-object` out of
+            #     `new_allocator.h` on g++-14. This one SHIPPED, as 166880b6, and
+            #     took `Linux-gcc-release` red; bc207960 reverted it.
+            #   * grow-then-copy in place of the `insert` -- GCC 16 moves the same
+            #     `-Warray-bounds=` onto the `memset` `resize` emits.
+            #   * constructing `out` at its full header+blob size -- silences GCC 16
+            #     AND g++-14, produces `-Wnull-dereference` out of `stl_algobase.h`
+            #     on g++-13.
+            #
+            # The belief GCC 16 holds is about the five-byte buffer the header alone
+            # leaves, not about any particular write, so every spelling of "append to
+            # this vector" meets it. `out.insert(out.end(), first, last)` is
+            # unconditionally correct and there is no way to write it wrong.
+            #
+            # A `-Wno-error=` row is additive and cannot invent a diagnostic on a
+            # compiler that is not tested here -- clang and MSVC also build these two
+            # translation units -- which a fourth source rewrite could.
+            if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
+                try_add_compile_options(-Wno-error=array-bounds)
+                try_add_compile_options(-Wno-error=maybe-uninitialized)
+            endif()
         endif()
     else()
         message(STATUS "Enabling pedantic compiler options: unsupported platform")
