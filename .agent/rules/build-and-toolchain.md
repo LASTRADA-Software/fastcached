@@ -510,6 +510,80 @@ determinism rests on.
   reports nothing and a run that found nothing render identically.** Read the raw log
   the message names, or filter on `FAILED:` as well.
 
+- **A run that never concluded is the fifth state, and a trap cannot report it here.**
+  The verdict came from `fail()` and from the green path, and NEITHER runs when the
+  process is killed -- so a run terminated by a signal ended with no `GATE FAILED`, no
+  `LOCAL GATE PASSED` and, after #501, no leg block either. The only thing separating
+  it from a completed run was the ABSENCE of both lines, and absence is equally what a
+  scrolled-past line, a truncated log and a lost terminal look like
+  ([#584](https://github.com/LASTRADA-Software/fastcached/issues/584)). It is not
+  hypothetical: every lane on a shared machine runs these script names out of different
+  worktrees, so a name-matched `pkill -f local-gate.sh` in one lane hits every other
+  lane's run -- the worktree path appears nowhere in the pattern. Twice in one night.
+
+  **The trap route was measured and rejected, and the measurement is the entry.** Bash
+  defers a TRAPPED signal until the running foreground command returns, and this gate's
+  foreground commands are `cmake`, `ninja` and `ctest`. On bash 5.3, a SIGTERM sent at
+  **t=2s** into a 6s foreground command ran the handler at **t=6s** -- a trap that fires
+  only after `ninja` finishes is close to no trap at all. The standard workaround,
+  backgrounding the command and `wait`ing for it, does fire immediately (**t=2s**,
+  measured) and is **worse**: the child is orphaned and reparented, so the gate would
+  print a tidy `did-not-conclude` while leaving `ninja` still writing into the build
+  directory. Measured on a real killed run of this gate mid-build-leg: **34 descendant
+  processes** left alive under the worktree, which had to be cleaned up by matching
+  `/proc/<pid>/cwd`. A developer's re-run then races an orphaned build in the same
+  `binaryDir` -- the two-gates-in-one-build-directory defect already listed above. So
+  the deferral is not a detail to work around; it is the argument for the other route.
+
+  The route is a **start marker plus a rule**, and the rule is: *a log with a start
+  marker and no terminal line DID NOT CONCLUDE -- re-run it, never interpret it, and
+  never read it as a red gate.* `did-not-conclude` is a distinct outcome from `failed`
+  because they are fixed in different places: one is somebody else's `pkill`, the other
+  is your code. Four things make that more than prose:
+  - **The marker names its own subject** -- pid, worktree and commit. A verdict that
+    does not say what it is a verdict about has already cost a run here, when a `/tmp`
+    wipe left one gate's log where another's goes and it reported a failure that was
+    already fixed. The pid is there because the cause is a name-matched kill, and the
+    tree because that is the field such a kill does not look at.
+  - **The rule is a function, not prose**: `local-gate.sh --classify=<log>` answers
+    `passed` / `failed` / `did-not-conclude` / `no-gate-run`, each with an exit status
+    of its own, so the tooling around a run can tell. Pure -- log text in, one word out
+    -- which is the standing answer above applied once more. `passed` and `failed` keep
+    the gate's own `0` and `1`; `2` is skipped because it is the script's USAGE status,
+    and `--classify=$LOG` with an unset `LOG` lands there -- a caller reading only the
+    status would take *you typed that wrong* for *the run was killed*. Those two are not
+    commensurable, so the self-test asserts no outcome sits on it, and the constant is
+    defined once and read by both the argument loop and the table rather than spelled
+    twice.
+  - **The LAST marker wins, and a terminal line counts only after one.** A log file
+    gets reused, so a green run followed by a killed one is `did-not-conclude`, which
+    `grep -c PASSED` gets backwards; and a terminal line with no marker before it is
+    `no-gate-run` rather than the verdict it resembles, because it cannot be attributed
+    to a run the log can show. Both escalate not-knowing to *re-run it*, which is the
+    only direction that cannot silently vouch for a tree.
+  - **Capture both streams.** The failure line goes to stderr and the pass line to
+    stdout, so a log holding one of them can answer half the question.
+
+  Watched refusing, which for this one takes two forms because the mechanism has two
+  halves. The classifier: four breaks -- `did-not-conclude` given `failed`'s status, the
+  first marker winning instead of the last, substring matching instead of line-anchored,
+  and a terminal line counting with no marker before it -- each reddened a named case.
+  The marker: a **real** SIGTERM to a **real** run mid-build-leg, by pid and never by
+  name match, which exited 143, left a log with a start marker and zero terminal lines,
+  and classified `did-not-conclude` at exit 3. A start-marker scheme never interrupted
+  is untested in the only case it exists for.
+
+  And the self-test gained a `N checks ran, M failed` line in the same change, because
+  without it none of the four breaks above could be believed: `expect` is silent when
+  it passes, so a run that died half way through is indistinguishable from one where
+  everything passed, and *no failures printed* reads as *the guard did not fire*. That
+  is this ticket's own confusion one level down. It immediately earned itself -- one of
+  the new checks claimed to assert that `did-not-conclude` and `failed` have different
+  exit statuses and actually compared whole table ROWS, whose sentences differ whatever
+  the statuses do. It read green for exactly the collapse it names, and only watching it
+  fail to fire found it. **A signal that cannot be false in the failing case is not
+  evidence**, and a check is not evidence that it fires until it has been seen to.
+
 - **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
   `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
   so both its configurations were fronted by whichever launcher happened to be installed, at

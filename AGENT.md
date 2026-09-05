@@ -997,7 +997,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   stops at the first failing leg — correct, and it now NAMES the legs it skipped, because
   "GATE FAILED: clang-debug tests" alone read as "the rest passed" and two `-Werror`
   defects hid behind five red runs that never reached `gcc-release` (#501). Read the
-  per-leg block, not just the reason. A GREEN run is silent in the OTHER
+  per-leg block, not just the reason. A run printing NEITHER terminal line did not
+  CONCLUDE — a fifth state beside skipped/absent/unstarted/failed, never a red gate,
+  because a `pkill -f local-gate.sh` in another lane's worktree is fixed somewhere
+  else entirely. Every run opens with a start marker naming its pid, tree and commit,
+  and `--classify=<log>` reads the rule back with an exit status per outcome. A trap
+  cannot do this job: bash DEFERS one until `ninja` returns (measured, 2 s in and 6 s
+  late), and the `wait` workaround fires on time only by orphaning the build — 34 live
+  descendants, measured (#584). A GREEN run is silent in the OTHER
   direction: four defects in four tickets were reachable only by the analyser or a
   sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
   them. A platform's leg answers a different question, not a weaker version of the same one.
