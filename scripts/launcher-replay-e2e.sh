@@ -82,16 +82,37 @@ top_pid=$$
 # explains: a configure error was followed by `no build.ninja` and `produced
 # no binary`, which names the wrong thing twice and buries the cause.
 #
-# So a stop is a stop wherever it is raised. `$$` is no help: bash keeps it at
-# the parent's value inside a subshell, and the comparison would silently
-# always hold. `BASHPID` is the running shell's own pid, which is the whole
-# point of the check.
+# So a stop is a stop wherever it is raised, and the signal is sent
+# UNCONDITIONALLY. There is no way to detect which shell we are in that works
+# on the shells this has to run on. `$$` cannot: bash keeps it at the parent's
+# value inside a subshell, so the comparison always holds. `BASHPID` looks like
+# the answer and is the trap -- it is bash 4.0+, macOS ships 3.2, and there
+# `[ "${BASHPID:-$$}" = "$top_pid" ]` degrades to exactly the `$$` comparison
+# that does nothing. That guard stood here for two tickets, with a comment
+# above it arguing it was correct, and it was silently inert on the one
+# platform this fixture is never run on locally (#627).
+#
+# Unconditional costs nothing. At the top level it is a self-signal, taken by
+# the TERM trap below, which exits 1 and runs the EXIT trap; in a subshell the
+# parent takes it and does the same while the subshell exits on its own. Both
+# paths end at status 1 with cleanup run, and neither asks which shell it is
+# in. `scripts/lib/e2e-common.sh` reaches the same shape from the same
+# argument, and `check-e2e-helpers.sh` exercises all three contexts.
 fail() {
     echo "launcher-replay-e2e FAILED: $*" >&2
-    [ "${BASHPID:-$$}" = "$top_pid" ] || kill -TERM "$top_pid" 2>/dev/null
+    kill -TERM "$top_pid" 2>/dev/null || true
     exit 1
 }
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
+# A private copy of `e2e_note`, deliberately, and this is the whole of the
+# reason: this fixture does not source `lib/e2e-common.sh` at all. It draws no
+# port (ctest hands it one), polls no HTTP surface, and its `skip` predates and
+# outnumbers everything the library would give it -- so sourcing it to reach one
+# three-word function would put the library's `fail`, `e2e_begin` and TERM trap
+# into a fixture whose own equivalents are already correct, in a change no test
+# here can run to completion locally. Taking the shared helpers wholesale is
+# worth doing and is its own ticket (#813); it is not this one, whose subject is
+# a guard that does nothing on macOS.
 note() { echo "   $*"; }
 
 for pair in "fastcached:$fastcached" "launcher:$launcher"; do

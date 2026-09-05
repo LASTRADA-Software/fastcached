@@ -1355,6 +1355,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   sits next to the implementation, so a report that counts it measures the tests
   testing themselves. A compiler cache and coverage cannot be combined — a
   replayed object's embedded mapping names the tree it was built in.
+- A rulebook `## Open work` entry names an OPEN issue, or it is a rule that has gone
+  false — the expensive shape being an entry saying something *cannot* be done, which
+  instructs the next session not to try (#395). `ctest -R rulebook-open-work`. The ENTRY
+  is a bullet's LEADING reference; a citation in its prose names the landed change that
+  produced the residual and is correctly closed — #619's own body called two of those
+  stale. `gh` falls back to PULL REQUESTS, asymmetrically: a merged one answers `closed`
+  and looks like the check working, an **open** one answers `open` and PASSES while
+  naming no issue — so the KIND is asserted too. FOUR outcomes, not two, and of the
+  three that share exit 1 with an empty result, **two are the checker's own fault** —
+  read as *stale* they invent a finding somebody then edits a correct entry to satisfy,
+  so the verdict is the HTTP status behind a `rate_limit` liveness anchor. A self-test
+  whose only negative case is a closed issue passes under all three. Grammar in the
+  default set, resolution in `smoke`; only a PREREQUISITE missing before any entry
+  resolved may skip.
 - A branch BEHIND master is unverified, and only a build says otherwise: its green
   checks are a true statement about the tree it was branched from, and stay one however
   often they are re-read. Neither shortcut works. **How far behind is not a measure of
@@ -1537,7 +1551,21 @@ and what they may assume.
   observed — the one reading that says whether the machine was slow, derived from
   assuming it was fast. A bespoke condition is a predicate passed to `wait_until`,
   never a new loop. And `fail` signals the top-level shell unconditionally rather than
-  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2.
+  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2 — **every**
+  script under `scripts/`, since the scan that enforces that read only the library for
+  two tickets while `launcher-replay-e2e.sh` carried the banned guard under a comment
+  arguing it was correct (#627). The file set is WALKED, refuses when it matches
+  nothing and when the token table empties, and a tracked `*.sh` outside `scripts/` is
+  refused by name rather than quietly excluded — ONE enumeration for all three scans in
+  that file, since the `timeout` scan's own glob could not read the file defining the
+  `run_bounded` its failure message names. A file that matches its own scan by
+  construction exempts a REGION (`# bash32-scan: data-begin`), never itself: a
+  whole-file row would blind the scan to the 1700-line script ctest runs on macOS, and a
+  planted `local -n` proves the difference. `BASHPID` is one of three doors to
+  *inside a `want-fail` assertion, any failure to run is indistinguishable from the
+  rule firing* — a mode bit is #723, an empty array under `set -u` is #793/#794 — and
+  the empty array is deliberately NOT scanned: measured ~110 sites across 22 scripts,
+  essentially all never-empty, and no regex can tell the two apart.
 - A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
   `OnCompile` places the interleaving rather than waiting for one. It is in
   `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library
