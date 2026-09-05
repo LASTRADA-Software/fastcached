@@ -352,6 +352,21 @@ set_tests_properties("script-check-signals-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# TEMPORARY (#379): which interpreter does a script registration actually get?
+# Registered twice on purpose -- `bash` (PATH) and `/bin/bash` (the system one).
+# Both exit 1 so ctest prints their output; a passing test's stdout is swallowed.
+# REMOVE BEFORE MERGE.
+add_test(
+    NAME "bash32-probe-path"
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/bash32-probe.sh"
+)
+set_tests_properties("bash32-probe-path" PROPERTIES LABELS "hygiene" TIMEOUT 60)
+add_test(
+    NAME "bash32-probe-system"
+    COMMAND /bin/bash "${CMAKE_SOURCE_DIR}/scripts/bash32-probe.sh"
+)
+set_tests_properties("bash32-probe-system" PROPERTIES LABELS "hygiene" TIMEOUT 60)
+
 # ---------------------------------------------------------------------------
 # The read-slot canary: the third program in this file that MUST die.
 #
