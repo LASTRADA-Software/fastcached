@@ -1704,7 +1704,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "table-totals"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh"
                 "${CMAKE_SOURCE_DIR}"
     )
     set_tests_properties("table-totals" PROPERTIES
@@ -1720,7 +1720,7 @@ if(NOT WIN32)
     # unreadable multiplier and a mode it cannot name.
     add_test(
         NAME "table-totals-selftest"
-        COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh" --self-test
     )
     set_tests_properties("table-totals-selftest" PROPERTIES
         LABELS "hygiene"
