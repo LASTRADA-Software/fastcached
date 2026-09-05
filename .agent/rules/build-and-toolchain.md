@@ -3904,13 +3904,13 @@ the total stayed healthy.
 them visible locally.** A check that measures which translation units the analyser sees
 went green on the local gate and then failed CI three times running:
 
+<!-- table-total: none -->
 | platform | defect |
 |---|---|
 | Linux (`clang-asan-ubsan`) | the third-party filter was a **denylist** naming `/_deps/`, and CI caches CPM sources under `.cache/CPM/` **inside the repository**, so ~40 vendored units read as analysed-by-nothing and the check refused a healthy tree |
 | Windows | the selftest's fake `nm` was a POSIX shell stub spawned through Python -- `CreateProcess`, **ENOEXEC** |
 | macOS | **bash 3.2 cannot parse a here-document inside a command substitution**, so the check died at PARSE time and all eight selftest cases refused for a reason unrelated to what they test |
 
-<!-- table-total: none -->
 
 **They are one failure, not three.** The subject under test was the build environment, and
 that is the one variable a local run holds fixed. So the rule is stronger than "a local
@@ -3995,15 +3995,14 @@ Three rules fall out, each generalising past this change:
   of #684: that step is inside a REQUIRED context and is reachable only on a
   master push whose sweep has already failed, so editing its YAML to remove a
   duplication risks every lane's pull request for no gain #684 needs.
-- **[#682](https://github.com/LASTRADA-Software/fastcached/issues/682)** — nothing
-  runs clang-tidy over a `_WIN32` branch, and three `Net`/`Async` translation units
-  are analysed on no platform. Untouched by the #684/#687 work and deliberately so,
-  stated here rather than left to look like an omission: the ticket's own
-  acceptance clause makes fixing `IocpSocket.cpp`'s fifteen pre-existing
-  diagnostics part of turning the leg on, and a Windows analyser leg landed without
-  them is a permanently RED context — a worse instrument than the blind spot. It
-  also cannot be developed from a Linux host, so it would be a leg that has never
-  completed anywhere.
+- **[#858](https://github.com/LASTRADA-Software/fastcached/issues/858)** — the eleven
+    translation units no analyser sees are GATED but still unanalysed. #682 is CLOSED:
+    #857 measures the set, refuses in both directions and pins the configuration in its
+    verdict, so a unit going blind can no longer pass unnoticed. What remains is giving
+    them an analyser — six Iocp need a Windows tidy leg, five kqueue a macOS one — and
+    the caution that made #682 sit still applies: the ticket's fifteen pre-existing
+    diagnostics would land a permanently RED context, a worse instrument than the gap,
+    and neither leg can be developed from a Linux host.
 - **[#589](https://github.com/LASTRADA-Software/fastcached/issues/589)** — the sweep
   now reports which files produced no code (#466), and that is the half that only
   *reports*: a green job's log is not read. Nothing asserts that a file guarded out
