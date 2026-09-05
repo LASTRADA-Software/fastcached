@@ -245,6 +245,7 @@ RequiredContexts=(
     "Linux-gcc-release|.github/workflows/build.yml"
     "macOS-clang-release|.github/workflows/build.yml"
     "clang-tidy|.github/workflows/build.yml"
+    "clang-tidy-windows|.github/workflows/build.yml"
     "clang-asan-ubsan|.github/workflows/build.yml"
     "clang-tsan|.github/workflows/build.yml"
     "sccache smoke (memcached text)|.github/workflows/build.yml"

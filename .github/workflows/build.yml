@@ -837,6 +837,90 @@ jobs:
   # PEDANTIC_COMPILER_WERROR, and trading the sanitizer job's warnings-as-errors
   # for a tidier preset name is not a trade. `-DENABLE_TIDY=OFF` is the only
   # difference from what this job used to be.
+  # The analyser leg for the `_WIN32` half of this tree.
+  #
+  # `clang-tidy` above runs on `ubuntu-24.04`, so six translation units wholly
+  # inside `#if defined(_WIN32)` preprocess to nothing there and are read by no
+  # analyser this project runs
+  # ([#858](https://github.com/LASTRADA-Software/fastcached/issues/858)).
+  #
+  # **This closes six of eleven, not eleven.** The other five are behind
+  # `#if defined(__APPLE__)` and need a macOS leg; `scripts/tidy-blind-spots.txt`
+  # names them and the check prints the remainder, so a green run here cannot read
+  # as "the hole is closed".
+  #
+  # A STANDALONE job rather than a leg of the `windows` matrix, deliberately. A
+  # skipped matrix job never expands, so its per-leg contexts never exist and
+  # nothing reports -- which hangs a queued pull request rather than failing it. A
+  # standalone job skips and REPORTS, which reads as passing, so it carries
+  # `!cancelled()` and a real verdict rather than a dependency-driven skip.
+  #
+  # `clangcl-debug` rather than `cl-debug`: `tidy-sweep.sh` drives clang-tidy off
+  # the compile database, and a database written by `clang-cl` is one clang-tidy
+  # can parse -- argv[0] is a cl-style driver it recognises. An MSVC database
+  # would need a driver mode it has to be told about and MSVC intrinsics it does
+  # not implement.
+  clang-tidy-windows:
+    name: "clang-tidy-windows"
+    runs-on: windows-2025
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The sweep computes its scope from a diff, so it needs history.
+          fetch-depth: 0
+
+      - name: "Cache CPM packages"
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/CPM
+          key: cpm-windows-clangcl-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+          restore-keys: cpm-windows-clangcl-
+
+      - name: "Install ninja"
+        run: choco install ninja --no-progress
+
+      - name: "Setup MSVC dev environment"
+        # For the Windows SDK headers and libraries. `clang-cl` needs them exactly
+        # as `cl` does; what differs is the compiler, not the platform headers.
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: "Install LLVM ${{ env.CLANG_TOOLS_VERSION }}"
+        # The analyser is pinned to the version CI names, for the reason the
+        # rulebook gives: successive LLVM releases disagree, so a tree clean under
+        # whichever binary happens to be on PATH is clean in the way that means
+        # nothing. The COMPILER comes from the same install, so the database and
+        # the analyser cannot disagree about what a flag means.
+        run: |
+          choco install llvm --version=${{ env.CLANG_TOOLS_VERSION }}.1.0 --no-progress --allow-downgrade
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: "Confirm the analyser is the pinned one"
+        # Stated before the sweep so a version mismatch names itself rather than
+        # surfacing as findings that differ from the Linux leg's for no visible
+        # reason.
+        run: |
+          clang-tidy --version
+          clang-cl --version
+
+      - name: "Configure"
+        run: >-
+          cmake --preset clangcl-debug -DENABLE_TIDY=OFF
+          -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON
+          -DFASTCACHED_BUILD_BENCHMARKS=ON -DFASTCACHED_BUILD_TESTCLIENT=ON
+
+      - name: "Self-test the sweep's scope computation"
+        shell: bash
+        run: bash scripts/tidy-sweep.sh --self-test
+
+      - name: "Sweep"
+        shell: bash
+        env:
+          TIDY: clang-tidy
+          DB: out/build/clangcl-debug
+        run: bash scripts/tidy-sweep.sh --ci
+
   clang-asan-ubsan:
     name: "clang-asan-ubsan"
     runs-on: ubuntu-24.04
@@ -2914,6 +2998,7 @@ jobs:
       - sccache-smoke-redis
       - fastcache-cc-smoke
       - windows
+      - clang-tidy-windows
       - compile-cache-e2e-linux
       - compile-cache-e2e-windows
       - package-linux
