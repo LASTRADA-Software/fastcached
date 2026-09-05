@@ -848,12 +848,29 @@ Every rule below has already been a bug.
     silently wrong on the other. It was open-coded at three sites in two subsystems;
     it is `Net::IsDeadlineExpiry` now, beside the enum, which is a dependency-free
     leaf and so costs nothing at the `net-boundary` line.
-    **`FrameEndpoint`'s accept loop tests `WouldBlock` ALONE and is right to** —
-    that listener has no poll timeout, so the other code cannot arrive there, and its
-    own comment says so. A narrower test with a stated reason is not the same finding
-    as a narrower test by omission, and reading the first as the second is the easy
-    mistake here, because the grep looks identical. This one was reported as a defect
-    by two reviewers and repeated once before anybody opened the file.
+    **`FrameEndpoint`'s accept loop tests `WouldBlock` ALONE and is right to** — that
+    listener arms no poll timeout, so `Timeout` cannot arrive there and the second
+    operand would be dead. A narrower test with a stated reason is not the same
+    finding as a narrower test by omission, and reading the first as the second is
+    the easy mistake here, because the grep looks identical. It was reported as a
+    defect by two reviewers and repeated once before anybody opened the file, so the
+    reason is now recorded AT the site as well as beside the predicate.
+    **The reason is REACHABILITY, and calling it semantic is a defect that was
+    written into this file and then had to be taken out again.** "On an accept,
+    `WouldBlock` is not a deadline expiring" sounds better — it survives a rewiring
+    where a reachability claim does not — and it is FALSE. The predicate's other two
+    callers are accept loops whose listeners *do* arm a poll timeout, and there
+    `WouldBlock` (POSIX) and `Timeout` (Winsock) are one event under two names: *the
+    poll ticked, re-check the stop flag, accept again*. Believe the semantic version
+    and the invited edit is to drop `WouldBlock` from `IsDeadlineExpiry` — which
+    makes `AdminHttpServer::Run` and `RaftPeerServer::Run` treat every POSIX poll
+    tick as a fatal accept error and `co_return`, so both surfaces stop accepting
+    about a quarter of a second after they start, with one `Debug` line as the only
+    symptom. **A reason that generalises further than the fact it was drawn from is
+    worse than the narrow one**, because it reads as licence somewhere it was never
+    measured. The maintenance cost of the true reason is real and is the price: give
+    that listener a poll timeout and the site must move to `IsDeadlineExpiry` in the
+    same change.
   - **The reported shape cannot be asserted on, and its deterministic twin can.**
     *Connect, wait, then ask* is a RACE to observe: an unfixed server answers and
     closes at the deadline, the client's late write then draws an RST, and the RST

@@ -67,15 +67,32 @@ struct NetError
 /// It lives here, beside the enum, because the question was open-coded
 /// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)) at TWO sites
 /// in two subsystems -- `Server/AdminHttpServer.cpp` and
-/// `Consensus/RaftPeerServer.cpp`. A third,
-/// `apps/fastcache-compile-node/FrameEndpoint.cpp`, tests `WouldBlock` alone and is
-/// RIGHT to -- on an ACCEPT, `WouldBlock` means *no connection is ready yet, retry*,
-/// which is not a deadline expiring. **That reason is recorded at the site, not only
-/// here**: while it lived only here, three reviewers in a row filed the narrow test
-/// as a defect without opening the file. A note the next editor must already know
-/// about is a note in the wrong place. It is also the SEMANTIC reason rather than
-/// the reachability one -- "that listener has no poll timeout" is a fact about
-/// today's wiring and would stop being true the day one is injected.
+/// `Consensus/RaftPeerServer.cpp`.
+///
+/// **BOTH operands are load-bearing at every caller, and neither may be dropped.**
+/// Both existing callers are accept loops whose listener arms a poll timeout, and
+/// that timeout is reported as `WouldBlock` on POSIX and `Timeout` on Winsock. Both
+/// mean the same thing there -- *the poll ticked; re-check the stop flag and accept
+/// again*. Narrow this to `Timeout` alone and both loops treat every POSIX poll tick
+/// as a fatal accept error, log once and `co_return`: the admin surface and the Raft
+/// peer server stop accepting about a quarter of a second after they start, with a
+/// single `Debug` line as the only symptom.
+///
+/// That is worth spelling out because the obvious mental model invites exactly that
+/// edit. "A deadline expiring" sounds like a *timeout*, and `WouldBlock` sounds like
+/// *would have blocked, try again* -- so the two look like different questions and
+/// are not. On a socket with a deadline armed they are one event under two names,
+/// which is the whole reason this predicate exists.
+///
+/// A third site, `apps/fastcache-compile-node/FrameEndpoint.cpp`, tests `WouldBlock`
+/// alone and is RIGHT to, for a REACHABILITY reason and not a semantic one: that
+/// listener arms no poll timeout, so `Timeout` cannot arrive there at all. An earlier
+/// version of this comment claimed the semantic reason instead -- that on an accept
+/// `WouldBlock` is not a deadline expiring -- and that was simply wrong, and wrong in
+/// the direction that argues for narrowing the two callers above. The reachability
+/// reason is narrower and true; it is recorded AT that site as well, because while it
+/// lived only here three reviewers in a row filed the narrow test as a defect without
+/// opening the file.
 ///
 /// The census travels with the pattern that produced it, because a number nobody can
 /// reproduce is one the next person re-derives differently. Re-run it rather than

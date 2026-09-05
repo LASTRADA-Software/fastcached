@@ -193,8 +193,9 @@ struct AdminBindFailureReport
 ///   - `GET /metrics` — Prometheus text exposition of the counters + storage
 ///     snapshot (see RenderPrometheus).
 ///   - `GET /healthz` — `200 OK` liveness probe for containers / k8s.
-///   - anything else — `404`; non-GET — `405`; a bad request line — `400`; a
-///     request head over the byte cap — `431`.
+///   - anything else — `404`; non-GET — `405`; a bad request line, or a head the
+///     peer stopped sending mid-way — `400`; a head this server gave up waiting
+///     for at its read deadline — `408`; a request head over the byte cap — `431`.
 /// A peer that sends NOTHING before the request deadline is closed without any
 /// response at all: it asked nothing, so it is owed nothing, and answering it is
 /// what made a browser's speculative preconnect render `400` (#824). See

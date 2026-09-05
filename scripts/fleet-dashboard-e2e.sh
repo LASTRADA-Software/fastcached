@@ -292,14 +292,24 @@ else
     # Refuses rather than answering when its own read bound is what ended the
     # read, so a green line here cannot be a question that went unasked.
     unasked="$(http_response_to_silence 127.0.0.1 "$admin_port")" && probe_rc=0 || probe_rc=$?
-    # The NAMES, not `0`/`2`: these two arms print opposite diagnoses about
+    # The NAMES, not `0`/`1`/`2`: these arms print opposite diagnoses about
     # different machines, so a transposed literal sends somebody to debug a node
     # that is fine. Quoted, so each pattern is the variable's value and not a glob;
-    # unbound under `set -u` if either name is ever mistyped.
+    # unbound under `set -u` if any name is ever mistyped.
+    #
+    # And ALL THREE are named, `*)` carrying none of them. Leaving the inconclusive
+    # verdict on the default arm is the same fail-open one level up: a FOURTH status
+    # added to `http_response_to_silence` would land there and be reported as "the
+    # surface would not answer", which is a diagnosis this fixture has not
+    # established -- the exact mis-bucketing the three named statuses exist to stop.
     case "$probe_rc" in
         "$E2eSilenceAnswered") ;;
         "$E2eSilenceRefused") fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
-        *) fail "the silence probe could not decide: the admin surface neither answered nor closed within its bound" ;;
+        "$E2eSilenceInconclusive")
+            fail "the silence probe could not decide: the admin surface neither answered nor closed within the" \
+                 "probe's read bound. Either the node is wedged, or AdminHttpServer::RequestTimeout has been" \
+                 "raised to or past _e2e_http_read_bound in scripts/lib/e2e-common.sh -- those two are a pair" ;;
+        *) fail "the silence probe returned an unknown status ${probe_rc}; http_response_to_silence grew an outcome this leg does not classify" ;;
     esac
     [[ -z "$unasked" ]] \
         || fail "the admin surface answered a peer that said nothing: ${unasked%%$'\n'*}"

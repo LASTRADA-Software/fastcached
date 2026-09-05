@@ -21,8 +21,9 @@ namespace FastCache::Testing
 /// write that reports a partial count -- wants to change one method and leave the
 /// rest alone. Written by hand each time, that is eight forwarding bodies per
 /// decorator, of which seven are noise, and the copies then diverge in the part
-/// nobody looked at. `AdminHttpServer_test.cpp` had two such decorators whose
-/// `Write`, `WriteVectored`, `Close` and `IsClosed` were byte-identical.
+/// nobody looked at. `AdminHttpServer_test.cpp`'s `ShortReadSocket` was one such
+/// hand-written copy, and `FailingReadSocket` below would have been a second whose
+/// `Write`, `WriteVectored`, `Close` and `IsClosed` were byte-identical to it.
 ///
 /// **What the hand-written copies both got wrong is the part they did not write.**
 /// `ISocket` has four virtuals with default implementations -- `HandshakeIfNeeded`,

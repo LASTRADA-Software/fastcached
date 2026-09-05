@@ -746,6 +746,15 @@ stop_and_require_exit() {
 # Named once so the read and the code that INTERPRETS the read cannot disagree
 # about it. A bound in one place and a threshold in another is two numbers that
 # have to stay equal forever.
+#
+# IT IS ALSO COUPLED TO A NUMBER IN THE DAEMON, and nothing checks that. It must
+# stay STRICTLY ABOVE `AdminHttpServer::RequestTimeout`
+# (`src/FastCache/Server/AdminHttpServer.hpp`, 2000 ms today), because
+# `http_response_to_silence` reads a silent server's CLOSE as its answer: if the
+# server's deadline ever reaches this bound, the probe returns
+# `$E2eSilenceInconclusive` and `fleet-dashboard-e2e.sh` FAILS rather than skips.
+# #828 proposes splitting that deadline and is exactly the change that would do it,
+# so raise this number in the same commit -- the two files are a pair.
 _e2e_http_read_bound=5
 
 # Did the bound end that read, or did the peer?

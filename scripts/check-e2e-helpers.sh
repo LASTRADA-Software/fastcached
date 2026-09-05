@@ -2073,13 +2073,46 @@ fi
 # `banned` table's own rows, which are data rather than uses -- the "a comment is not
 # a call site" problem in a form a comment filter cannot solve. That gap is real and
 # is not closed here; see the reported findings.
+#
+# THREE CLAUSES, because a literal scan alone could not see the very call it was
+# written for. #824's `read -t` takes `"$_e2e_http_read_bound"`, so a pattern looking
+# for a digit after `-t` matched nothing on the fixed tree AND would match nothing on
+# a tree that set that bound to `0.5` -- the regression this exists to catch, passing
+# in silence. So the bound is followed through the variable, and the scan asserts it
+# saw at least one `read -t` at all: zero is the spelling of "this stopped reading
+# what it thinks it reads", which is the same fail-closed clause the `note_failure`
+# census below uses on itself.
 echo "== bash 3.2: a fractional read -t"
 ran=$(( ran + 1 ))
-fractional="$(grep -nE 'read [^;|&]*-t *[0-9]*\.' "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+bash32_read_uses="$(grep -nE 'read [^;|&]*-t' "$library" | grep -v '^[0-9][0-9]*: *#' || true)"
+
+# (1) the bound written as a literal.
+fractional="$(printf '%s\n' "$bash32_read_uses" | grep -E -- '-t *[0-9]*\.' || true)"
+
+# (2) the bound written as a variable whose value is fractional. The name is read
+#     off the call site rather than remembered, so a second bound gets checked too.
+for bound_var in $(printf '%s\n' "$bash32_read_uses" \
+    | grep -oE -- '-t[[:space:]]*"?\$\{?[A-Za-z_][A-Za-z0-9_]*' \
+    | sed -E 's/.*\$\{?//' | sort -u); do
+    frac_assign="$(grep -nE "^[[:space:]]*(local[[:space:]]+)?${bound_var}=[^#]*[0-9]\." "$library" || true)"
+    if [ -n "$frac_assign" ]; then
+        fractional="${fractional}${fractional:+
+}${frac_assign}"
+    fi
+done
+
 if [ -n "$fractional" ]; then
     echo "FAIL bash32: ${library} uses a fractional 'read -t' (bash 4.0+; 3.2 rejects it)" >&2
     printf '%s\n' "$fractional" | sed 's/^/     | /' >&2
     note_failure "bash32-fractional-read"
+elif [ -z "$bash32_read_uses" ]; then
+    # (3) the positive control. A clean verdict is only worth something if the scan
+    #     can still find the construct it is judging.
+    echo "FAIL bash32: the fractional-'read -t' scan found no 'read -t' in ${library} at all," >&2
+    echo "     so its clean verdict describes nothing. Fix the pattern, not the library." >&2
+    note_failure "bash32-fractional-read"
+else
+    echo "   bash 3.2: every 'read -t' bound in ${library##*/} is a whole number (literals and variables)"
 fi
 
 # --- every failure is recorded BY NAME ------------------------------------

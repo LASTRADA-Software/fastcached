@@ -710,8 +710,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   half-closes* are one passing test. Neither silent outcome is counted, deliberately — a healthy
   browser produces them by the minute. A
   deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
-  never one operand — except where a listener has no poll timeout and says so, which two reviewers
-  read as the same defect. **The reported shape cannot be asserted on** — connect-wait-send is a race,
+  never one operand — except at a listener that arms NO poll timeout, where `Timeout` cannot arrive
+  and the operand is dead; recorded at the site, because two reviewers read the narrow test as the
+  same defect. That exception is REACHABILITY, never semantics, and the distinction is load-bearing:
+  the predicate's own two callers are accept loops whose listeners DO poll, where `WouldBlock` IS the
+  expiry, so "on an accept WouldBlock is not an expiry" invites dropping it and stops the admin and
+  Raft surfaces accepting on POSIX with one `Debug` line as the symptom. **A reason that generalises
+  further than the fact it was drawn from is worse than the narrow one** — this exact upgrade was
+  written into the rulebook and had to be taken out again. **The reported shape cannot be asserted on** — connect-wait-send is a race,
   because the late write draws an RST that destroys the very response being asserted on (measured:
   python saw the `400`, bash saw nothing) — so the probe never writes. And a probe reporting
   silence must be able to say it observed none, or an expired `read -t` reads as the answer.
