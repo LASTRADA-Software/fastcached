@@ -1711,9 +1711,19 @@ exposition cannot drift apart again without a red build.
 | `fastcache_worker_jobs_refused_envelope_corrupt_total` | Jobs refused because the payload did not expand to its declared size. The only envelope refusal that implicates the transport: a codec version skew, or a link damaging payloads. |
 | `fastcache_worker_jobs_refused_lease_unauthorized_total` | Jobs refused because the lease was not signed by this cluster. A security signal, not a capacity one -- or a launcher predating signed leases, which presents a token that cannot authenticate. |
 | `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | Jobs refused because an authentic lease was issued by a different fleet. A rise means two clusters are running from the same --cluster-key-file, which is what copying a working configuration to a second site produces. |
-| `fastcache_worker_jobs_refused_lease_stale_epoch_total` | Jobs refused because an authentic lease named a scheduler term that is no longer current. A replay window across a leadership change, not a provisioning mistake; zero on a fleet that is not electing. |
+| `fastcache_worker_jobs_refused_lease_replayed_total` | Jobs refused because an authentic, unexpired lease had **already been spent** at this worker. A lease authorizes exactly one compile, so nothing honest produces this and it should read zero forever; any rise is a captured grant presented a second time. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | Jobs refused because an authentic lease named a different worker. Usually a registered endpoint that is not the one clients dial, not a replay. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | Jobs refused because an authentic lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases. |
+| `fastcache_worker_scheduler_term_regressions_total` | Times this worker adopted a scheduler term that went **backwards**. Not a refusal — the grant is served. Two causes look identical here and the rate separates them: a grant minted before a leadership change and delivered after one is ordinary and appears as occasional counts tracking elections; a scheduler that was reset repeats until somebody stops it. |
+
+> One lease-refusal series was **retired** by
+> [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) — the refusal it
+> counted can no longer happen, because a worker now adopts a scheduler term that went
+> backwards instead of refusing it. It is named, with what to point its alerts at
+> instead, under "Retired series" in
+> [Distributed compilation](../getting-started/distributed-compilation.md). It is
+> deliberately not spelled here: every name on this page is a series you can scrape, and
+> `ctest -R metrics-documentation` enforces that in both directions.
 
 
 **Frames the compile surface would not read.** Decided before or during framing, so none of these reached a verb.

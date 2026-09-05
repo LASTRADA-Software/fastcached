@@ -1476,8 +1476,9 @@ TEST_CASE("No grant is refused on its term, whatever this worker has learned", "
     // **The unreachability of a term refusal, ASSERTED rather than argued** (#614).
     //
     // Retiring `EpochMismatch` rests on an argument: every grant that reaches what used
-    // to be the epoch check is unspent, so a lower term is a scheduler that was
-    // legitimately reset rather than a replay, and the check could never fire. The
+    // to be the epoch check is unspent, so a lower term is not a replay -- whether it is
+    // a reset or a grant that arrived late across a leadership change, neither is a
+    // reason to refuse it -- and the check could never fire. The
     // argument is sound and an argument about unreachability is exactly the shape this
     // repository has been burned by -- so a future change that reintroduces a refusing
     // path has to fail HERE, rather than silently resurrect a refusal with no counter

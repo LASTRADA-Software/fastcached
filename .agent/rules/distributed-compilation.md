@@ -831,8 +831,11 @@ Consequences that are each load-bearing:
   So the comparison is gone, `LeaseEpochCheck` with it, and `KnownSchedulerTerm` adopts
   whatever an authentic, unspent grant names, in either direction. **The monotonic term
   was standing in for replay protection all along**; once the spend provides that
-  directly, a lower term is a scheduler that was legitimately reset and the downward path
-  falls out rather than needing to be designed.
+  directly, a lower term no longer has to be refused and the downward path falls out
+  rather than needing to be designed. Note what that sentence may NOT say: *not* "a lower
+  term is a scheduler that was legitimately reset". It is a term that REGRESSED, which is
+  a reset **or** a grant that arrived late across a leadership change, and the bullet
+  below is there because an earlier draft of this one made exactly that claim.
   **The trade is real and is stated rather than hidden**: an unspent grant captured
   before an election used to stop being good at the next one, and now stops being good at
   its expiry. That is the weaker of the two bounds and it is the one the expiry already
