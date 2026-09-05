@@ -798,37 +798,72 @@ Consequences that are each load-bearing:
   own slot accounting and its in-flight byte budget, never the lease. Anything built
   on "an unexpired lease implies the scheduler still holds capacity" is built on a
   guarantee that does not exist.
-- **The term check is ONE-SIDED, and that is what stops it causing the outage it
-  prevents.** A grant carries the Raft term it was issued under, inside the MAC since
-  #322 — but the scheduler was the only thing that could enforce it, and the scheduler
-  is not where a replayed grant is spent. #421 gave the worker a channel: the
-  **heartbeat reply** states the term, and any authentic grant naming a later one
-  states it too. What matters is the comparison. A grant from a term **below** what
-  the worker has learned came from a deposed scheduler and is refused; one from a term
-  **above** it is accepted, and adopted. Refusing the second direction is the obvious
-  reading, is what `MustEqual` would have spelled, and would have made a worker that
-  missed a single heartbeat reject the new leader — the fleet ceasing to distribute
-  for one heartbeat interval after every election, which is worse than the replay
-  window it closes and is the failure the check exists to prevent, produced by the
-  check. Under the one-sided rule **a worker's own staleness can never cause a
-  refusal**, which is why the availability trade the ticket expected to have to make
-  does not exist. It is this file's caching principle in another setting: staleness is
-  safe to hold when it fails closed and self-heals, and adopting forward is the
-  self-healing half.
-- **Adoption happens after the MAC verified, never before.** The grant is a learning
-  channel precisely because `VerifyLeaseToken` authenticates before it reports on any
-  claim. Reading a term off a *refused* token would let anybody who can reach the port
-  push a worker's expectation arbitrarily high and make it refuse every honest grant
-  afterwards — a denial of service built out of the anti-replay measure. Same ordering
-  rule as the oracle argument above, reached from the other end.
+- **A lease is single-use, and until [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) nothing enforced it.** The scheduler mints
+  one grant per lease, the client presents it in exactly one COMPILE frame with no retry
+  (`Dispatch::CompileOnWorker`), and a RELEASE goes to the SCHEDULER rather than to a
+  worker. So a token arriving twice at one worker is a replay and never an honest
+  client — and for the whole of #281, #322 and #421 it was served every time it arrived.
+  A captured grant was replayable at its granted worker, at will, until it expired.
+  `SpentLeases` closes that: an authentic, unexpired grant is spendable once, a second
+  presentation is refused as `Replayed` with a counter of its own.
+  **The spend runs LAST, after every reading of the token**, because it is the one step
+  with a side effect: a grant declined for a wrong toolchain, a wrong endpoint or an
+  expiry has not been consumed, and the client still holds something legitimate.
+  **The bound is the grants' own `expiresAt`**, pruned amortized onto the next spend —
+  no timer, because a worker with no traffic has nothing to prune. Keyed by a digest of
+  the token, not by the serial: `LeaseTable::_nextToken` restarts at 1 with the
+  scheduler process, so serials repeat across a restart while tokens do not.
+  **What it does not close, stated rather than discovered**: a worker restart empties the
+  set, so a token captured and withheld before the restart is spendable once afterwards.
+  That is the residual the expiry is documented to bound, and it is not a regression —
+  the term expectation had the identical hole for the identical duration, since a
+  restarted worker had learned nothing and accepted every term.
+- **The learned term is a DIAGNOSTIC, not a gate — and the gate it replaced was exactly
+  inverted.** #421 made a worker refuse any grant naming a term below the one it had
+  learned, taking the maximum so a late message could not walk it backwards. Measured on
+  the tree before [#614](https://github.com/LASTRADA-Software/fastcached/issues/614), with a worker holding term 7 and a scheduler whose Raft
+  directory had been wiped truthfully stating term 0: the **honest fresh grant was
+  REFUSED** (0 < 7) and a **token captured under term 7 was ACCEPTED** (7 >= 7). The rule
+  written to stop replay refused every legitimate grant and admitted the replayed one, in
+  precisely the scenario it existed for — and it stayed that way until every worker in the
+  fleet was restarted, with only `..._lease_stale_epoch_total` climbing to say so, which
+  reads as an election storm.
+  So the comparison is gone, `LeaseEpochCheck` with it, and `KnownSchedulerTerm` adopts
+  whatever an authentic, unspent grant names, in either direction. **The monotonic term
+  was standing in for replay protection all along**; once the spend provides that
+  directly, a lower term is a scheduler that was legitimately reset and the downward path
+  falls out rather than needing to be designed.
+  **The trade is real and is stated rather than hidden**: an unspent grant captured
+  before an election used to stop being good at the next one, and now stops being good at
+  its expiry. That is the weaker of the two bounds and it is the one the expiry already
+  documented; the stronger bound could not be kept, because a lower term and a replayed
+  older grant are indistinguishable inside a token, and refusing them together is what
+  stopped the fleet.
+- **`WorkerJobsRefusedLeaseStaleEpoch` was RETIRED, not left reading zero.** The refusal it
+  named can no longer happen. A series reading zero because its event is impossible and
+  one reading zero because the event did not happen are two facts nobody can tell apart
+  from a graph — which is this file's *skipped, absent, unstarted and failed are four
+  states* rule, one level up. Its replacements are
+  `fastcache_worker_jobs_refused_lease_replayed_total` (the new refusal) and
+  `fastcache_worker_scheduler_term_resets_total` (the adoption, which is not a refusal and
+  so is deliberately not in `LeaseRefusalTable`).
+- **Adoption happens after the MAC verified AND after the spend, never before either.**
+  The grant is a learning channel precisely because `VerifyLeaseToken` authenticates
+  before it reports on any claim; reading a term off a *refused* token would let anybody
+  who can reach the port move a worker's expectation at will. The spend ordering is the
+  second half and it is what makes the downward path safe: a captured grant naming an old
+  term, replayed, would otherwise teach a worker a term the fleet has moved on from, on
+  demand, as often as somebody sent it. Spending first means only a grant nobody has used
+  can move the number.
 - **Never-learned is a state, not a term value.** `StandaloneSchedulerTerm` is
   literally `0` — the term of a node leading alone — and its own declaration warns
   that "a literal at a call site is exactly how somebody later reads it as unknown and
   starts treating it as one". So `KnownSchedulerTerm` carries a flag beside the
-  number, and a worker that has learned term 0 is checking while one that has learned
-  nothing is not. A worker that refused before its first heartbeat could not
-  cold-start and every restart would be an outage, so *accept everything* is the right
-  answer in that state and `LeaseEpochCheck::NotKnownHere` stays a real answer.
+  number. It still matters with nothing refusing on the term: it is what keeps the FIRST
+  grant from reading as a reset. Term 0 arriving into a worker that has learned nothing is
+  an advance; the same 0 arriving into a worker that knows 7 is a reset. Collapsed to a
+  zero sentinel, every cold worker's first job would announce a scheduler reset that did
+  not happen.
 - **The grant is the ONLY channel that teaches a term, and the heartbeat reply was
   deleted rather than defended.** #421's first shape had the scheduler state its term
   in the HEARTBEAT reply — fast, scheduler-driven, on a reply that was empty and whose
@@ -838,33 +873,21 @@ Consequences that are each load-bearing:
   plaintext, and a reply carries no integrity protection at all. So anything able to
   answer a worker's `--scheduler` dial — on-path, a spoofed name, or an operator who
   typos the flag at another fleet's scheduler — hands it `UINT64_MAX` once, and that
-  worker refuses **every authentic grant** until its process restarts while
-  `..._lease_stale_epoch_total` climbs like an election storm. One packet, and the
-  fleet stops distributing: the exact failure the check exists to prevent, caused by
-  the check.
+  worker refuses **every authentic grant** until its process restarts.
   **Deleting the surface beats defending it**, which is the choice `CacheResponder`
   already records by taking no membership oracle — its absence IS the fix. Signing the
   term with the cluster key would have worked too, and would have been more code
-  guarding more attack surface. What deletion costs is a weaker bound, taken
-  knowingly: a token captured before an election stays spendable at a given worker
-  until that worker sees its first grant from the new leader. An idle worker is not
-  compiling anything to protect, and a busy one learns almost at once.
-  The reusable half: **a value that can only be raised, never lowered, must not be
-  writable by an unauthenticated peer.** Monotonic state is a ratchet, and a ratchet an
-  attacker can turn is a permanent denial of service rather than a transient one.
-- **Learning only from grants does not fix what the scheduler MINTS, and two known
-  residuals say so.** Authenticity is not the property in question in either.
-  [#613](https://github.com/LASTRADA-Software/fastcached/issues/613): the scheduler
-  binds its lease surface before `ConsensusTier` exists, so a restarting leader serves
-  `Lease` while `SchedulerTier`'s constructor value of `StandaloneSchedulerTerm` (`0`)
-  is still current, and every worker that has learned a real term refuses those
-  perfectly authentic grants — compiles that worked before the term was enforced.
-  [#614](https://github.com/LASTRADA-Software/fastcached/issues/614): the learned term
-  has no downward path, so a wiped Raft directory, a re-bootstrap, or consensus turned
-  off legitimately drops the scheduler to a lower term and every long-running worker
-  refuses everything until restarted. The minimum acceptable outcome for both is a
-  **named, visible refusal** — a fleet that stops distributing and cannot say why is
-  what this file keeps being written about.
+  guarding more attack surface.
+  The reusable half was written as **a value that can only be raised, never lowered, must
+  not be writable by an unauthenticated peer** — a ratchet an attacker can turn is a
+  permanent denial of service rather than a transient one. #614 is the sharper version of
+  the same lesson and is worth reading beside it: **that ratchet was a permanent denial of
+  service with no attacker at all.** An operator wiping a Raft directory turned it, and
+  the mechanism could not distinguish them because nothing in the design could. A value
+  that can only be raised needs a way DOWN, or the legitimate reset and the attack are one
+  case — and the way down is not a permission, it is a different mechanism answering the
+  question the ratchet was standing in for.
+
 - **A scheduler with no `--cluster-key-file` signs nothing, and says so.** Refusing
   to schedule without a key would break every single-machine install, which is what
   most people run; doing it quietly is the failure class this repository keeps

@@ -561,7 +561,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_envelope_corrupt_total` | Bytes that parsed and then did not expand to their declared size. The one refusal here that implicates the **transport**. |
 | `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by this cluster. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating signed leases, which is told apart by whether the rise tracks a rollout. |
 | `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | An **authentic** lease was signed by a different fleet. Never sum it with `..._unauthorized_total` beside it: that one is a bad signature, this one is a good signature from somebody else. A rise here is a provisioning mistake — two sites built from one copied `--cluster-key-file` — and the fix is a second key, not a firewall. |
-| `fastcache_worker_jobs_refused_lease_stale_epoch_total` | An **authentic** lease named a scheduler term that is no longer current: a grant minted before an election and spent after it. Zero on a fleet that is not electing, so a sustained rise means leadership is moving and grants are outliving it. Do not sum it with `..._wrong_cluster_total` either — they share a wire code and nothing else, and they send you to opposite places. |
+| `fastcache_worker_jobs_refused_lease_replayed_total` | An **authentic**, unexpired lease that this worker had **already run**. A lease authorizes exactly one compile — one grant per lease, presented once, with no retry — so nothing honest produces this and it should read zero forever. Any rise is somebody presenting a captured grant a second time. Do not sum it with `..._wrong_cluster_total` either: they share a wire code and nothing else, and they send you to opposite places. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
 | `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
@@ -578,12 +578,12 @@ another machine could dial is refused outright without the key
 ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)).
 
 **Three** of them — `..._unauthorized_total`, `..._wrong_cluster_total` and
-`..._stale_epoch_total` — share the wire code `lease-unauthorized`, because a client's
+`..._replayed_total` — share the wire code `lease-unauthorized`, because a client's
 answer to all three is the same, compile it locally, and a code it does not recognise
 would be worse than one it does. **Your** answer is different for each, which is why
 they are three series rather than one: a bad signature is a security question, a good
-signature from another fleet is a provisioning one, and a superseded term is an
-election.
+signature from another fleet is a provisioning one, and a grant presented twice is
+somebody replaying a credential.
 
 The other two carry codes of their own — `..._endpoint_mismatch_total` answers
 `lease-endpoint-mismatch` and `..._expired_total` answers `lease-expired` — so an alert
@@ -591,36 +591,53 @@ written against `lease-unauthorized` will not see them. That is deliberate and i
 `LeaseRefusalTable` in `LeaseToken.hpp` that decides it: a client can act differently
 on those two, and a code it can act on is worth minting.
 
-`..._lease_stale_epoch_total` could not rise at all before
-[#421](https://github.com/LASTRADA-Software/fastcached/issues/421). A worker had no
-way to learn which term was current — the only term it ever saw was the one inside the
-token it was checking — so the series was exported and permanently zero.
+### A grant is spendable once, and the scheduler's term is only a diagnostic
 
-A worker now learns the term from **authentic grants only**: a grant that has passed
-its signature check teaches the term inside it, and a later grant naming an older term
-is refused. Nothing else teaches it, and in particular the scheduler does not announce
-it — that channel would be unauthenticated, and anything able to answer a worker's
-`--scheduler` dial could then push it to a term no scheduler is in and make it refuse
-every honest grant until restarted.
+A lease authorizes exactly one compile. The scheduler mints one grant per lease, the
+launcher presents it in exactly one request with no retry, and it hands the lease back
+to the *scheduler* rather than to the worker — so a grant arriving twice at one worker
+is a replay and never an honest client. Since
+[#614](https://github.com/LASTRADA-Software/fastcached/issues/614) a worker enforces
+that: the second presentation is refused and
+`fastcache_worker_jobs_refused_lease_replayed_total` moves. Before it, a captured grant
+could be replayed at its worker until it expired.
 
-The bound that buys is weaker than announcing the term would be, and it is worth
-knowing which way: **a token captured before an election stays spendable at a given
-worker until that worker sees its first grant from the new leader.** An idle worker is
-not compiling anything worth protecting, and a busy one learns almost immediately, so
-the exposure tracks how little the machine is being used. A worker that is merely
-behind refuses nothing at all — only an *older* term is turned away, so a machine
-catching up accepts the new leader's grants and learns from them.
+A grant refused for anything else — a wrong toolchain, a wrong endpoint, an expiry — is
+**not** consumed, so a client whose job was declined for a configuration mistake still
+holds a usable lease.
 
-Two known cases where a rise here is **not** a replay and the fleet is the thing that
-is wrong: a scheduler restarting can serve grants under term `0` before its consensus
-layer has published the real one
-([#613](https://github.com/LASTRADA-Software/fastcached/issues/613)), and a cluster
-that has been re-bootstrapped — or had consensus turned off — genuinely drops to a
-lower term, which a worker will not accept until it is restarted
-([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Both predate the
-term check in their causes and are made visible by it. If this counter rises across
-the whole fleet at once rather than on one machine, look there before looking for an
-attacker.
+The one thing this does not cover is a worker **restart**, which forgets what it has
+spent. A grant captured and withheld across a restart is usable once afterwards, for
+whatever is left of its expiry. That is the same window the lease expiry has always
+bounded.
+
+**The scheduler term inside a grant no longer decides anything.** It is carried, it is
+signed, and a worker adopts it — but it is a diagnostic rather than a check. Until
+#614 a worker refused any grant naming a term below the one it had learned, and three
+ordinary operator actions break that: wiping a scheduler's Raft directory,
+re-bootstrapping the cluster, or turning consensus off all drop it to a lower term
+truthfully. Every worker then refused **every** grant until its process was restarted,
+with nothing but a climbing counter to say why — which read like an election storm.
+
+Worse, the rule was backwards in exactly that case. With a worker at term 7 and a
+scheduler honestly reset to term 0, it refused the fresh grant and *accepted* a token
+captured under term 7. The check written to stop replay refused every legitimate grant
+and admitted the replayed one. Grants being spendable once is what actually answers that
+question, so the term check is gone and
+`fastcache_worker_jobs_refused_lease_stale_epoch_total` was **retired** — the refusal it
+named can no longer happen, and a series reading zero because its event is impossible
+looks exactly like one reading zero because the event did not happen.
+
+What you watch instead is `fastcache_worker_scheduler_term_resets_total`, which counts a
+worker adopting a term that went backwards, alongside one `WARN` line per reset naming
+both terms. It should read zero except on the day somebody resets a cluster. If it rises
+across the fleet at once and nobody reset anything, a scheduler has lost its state.
+
+The trade, stated plainly because it is real: a grant captured *before* it ever reached
+its worker used to stop being good at the next election, and now stops being good at its
+expiry. That is the weaker of the two bounds. It could not be kept — a scheduler that was
+legitimately reset and a replayed older grant look identical inside a token, and refusing
+them together is what stopped the fleet.
 
 The worker also reports what the machine **is** — `fastcache_node_logical_cores`,
 `fastcache_node_memory_total_bytes`, `fastcache_node_disk_capacity_bytes`,

@@ -420,13 +420,21 @@ class IMetricsSink
         /// else produces this. Before #322 the token bound no cluster identity, so
         /// those grants verified and the other fleet's workers simply compiled them.
         WorkerJobsRefusedLeaseWrongCluster,
-        /// Jobs refused because an AUTHENTIC lease named a superseded scheduler term.
+        /// Jobs refused because an AUTHENTIC lease had ALREADY BEEN SPENT here.
         ///
-        /// Again its own, and again because the action differs: this says grants are
-        /// outliving elections, which is a replay window rather than a provisioning
-        /// mistake. Expected to read zero on a fleet that is not electing, so any
-        /// sustained rise is worth looking at even when it is small.
-        WorkerJobsRefusedLeaseStaleEpoch,
+        /// Again its own, and again because the action differs: a lease is single-use
+        /// by construction -- one grant per lease, presented in one COMPILE frame with
+        /// no retry -- so a token arriving twice at one worker is a replay and never an
+        /// honest client. Expected to read exactly zero, which makes any rise at all
+        /// worth looking at.
+        ///
+        /// It replaces `WorkerJobsRefusedLeaseStaleEpoch`, retired with
+        /// [#614](https://github.com/LASTRADA-Software/fastcached/issues/614): the
+        /// refusal that counter described can no longer happen, because a worker now
+        /// ADOPTS a scheduler term that went backwards instead of refusing it. A series
+        /// reading zero because its event is impossible and one reading zero because
+        /// the event did not happen are two facts nobody can tell apart from a graph.
+        WorkerJobsRefusedLeaseReplayed,
         /// Jobs refused because an AUTHENTIC lease named a different worker.
         ///
         /// Almost never a replay and almost always a fleet whose registered endpoint
@@ -442,6 +450,23 @@ class IMetricsSink
         /// and nowhere else is that machine's clock drifting, which is why the check
         /// carries skew slack and why this is worth seeing per node.
         WorkerJobsRefusedLeaseExpired,
+
+        /// Times this worker adopted a scheduler term that went BACKWARDS.
+        ///
+        /// A scheduler whose Raft directory was wiped, whose cluster was
+        /// re-bootstrapped, or which had consensus turned off states a lower term than
+        /// this worker last saw. Since
+        /// [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) that is
+        /// ADOPTED rather than refused -- replay is closed by grants being spendable
+        /// once -- so it costs the fleet nothing and the event would otherwise be
+        /// invisible on the machine it happened to.
+        ///
+        /// Not a refusal, so it is deliberately not in `LeaseRefusalTable`. It is the
+        /// scrapeable half of the log line `LeaseEpochNotice` prints: an operator who
+        /// did the reset sees it confirmed, and one who did not sees the first news
+        /// that a scheduler lost its state. Expected to read zero except on the day
+        /// somebody resets a cluster.
+        WorkerSchedulerTermResets,
 
         /// Scratch roots this worker took over from a node that died without
         /// cleaning up.

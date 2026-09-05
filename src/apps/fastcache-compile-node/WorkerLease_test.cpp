@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -66,13 +67,20 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
 }
 
 /// A grant, signed the way a scheduler signs one.
+///
+/// **The serial is a parameter and it has to be** (#614). A grant is spendable exactly
+/// once at a worker, so two calls to this that produced identical bytes would make the
+/// second look like a replay -- which is what a real `LeaseTable` never does either:
+/// `_nextToken` advances per acquisition, so no two grants a scheduler mints share a
+/// serial.
 /// @param epoch The scheduler term it is issued under.
+/// @param serial What distinguishes this issuance from the last.
 /// @return The token, as a client would present it.
-[[nodiscard]] std::string GrantUnder(std::uint64_t epoch)
+[[nodiscard]] std::string GrantUnder(std::uint64_t epoch, std::string_view serial = "17")
 {
     return Distributed::MintLeaseToken(
         TestClusterKey(),
-        Distributed::LeaseClaims { .serial = "17",
+        Distributed::LeaseClaims { .serial = std::string { serial },
                                    .endpoint = std::string { ThisWorker },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
@@ -87,12 +95,13 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
 /// what copying a working configuration or cloning staging from production gives you.
 /// The MAC verifies; only the fleet differs.
 /// @param epoch The scheduler term it is issued under.
+/// @param serial What distinguishes this issuance from the last; see `GrantUnder`.
 /// @return The token, as a client would present it.
-[[nodiscard]] std::string ForeignGrantUnder(std::uint64_t epoch)
+[[nodiscard]] std::string ForeignGrantUnder(std::uint64_t epoch, std::string_view serial = "17")
 {
     return Distributed::MintLeaseToken(
         TestClusterKey(),
-        Distributed::LeaseClaims { .serial = "17",
+        Distributed::LeaseClaims { .serial = std::string { serial },
                                    .endpoint = std::string { ThisWorker },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
@@ -101,6 +110,23 @@ void WriteClusterKey(std::filesystem::path const& keyFile)
                                    .epoch = epoch });
 }
 
+} // namespace
+
+namespace
+{
+/// Everything `MakeWorkerLeaseValidator` borrows for the life of a worker.
+///
+/// One struct rather than four locals per case, because they must all outlive the
+/// validator and a case that declares three of them and forgets the fourth does not
+/// fail to compile -- it dangles.
+struct WorkerState
+{
+    Distributed::SpentLeases spent;                                                   ///< Grants already run.
+    Distributed::KnownSchedulerTerm term;                                             ///< The last term learned.
+    Distributed::LeaseEpochNotice notice { Distributed::LeaseEpochNotice::Silent() }; ///< Where a reset is said.
+    AtomicMetricsSink metrics;                                                        ///< Where refusals are counted.
+    NullLogger logger;                                                                ///< Where startup lines go.
+};
 } // namespace
 
 TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "[node][lease][epoch]")
@@ -124,21 +150,22 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     WriteClusterKey(keyFile);
 
     auto const cfg = ConfigWithKey(keyFile);
-    Distributed::KnownSchedulerTerm term;
-    NullLogger logger;
+    WorkerState state;
 
-    // This case is about the fleet check and says nothing about the epoch notice, so
-    // the notice is inert here rather than absent -- the parameter is a reference and
-    // there is no "no notice" to pass.
-    Distributed::LeaseEpochNotice epochNotice { [](std::string_view) {} };
-
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              ThisWorker,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.spent,
+                                              state.term,
+                                              state.notice,
+                                              state.metrics,
+                                              state.logger);
     REQUIRE(validator.has_value());
 
-    // Nothing has been verified: the epoch check is `NotKnownHere` and accepts any
-    // term. Asserted, because if the worker had already learnt something this case
-    // would be about the epoch rather than the fleet.
-    REQUIRE_FALSE(term.Check().Checked());
+    // Nothing has been verified. Asserted, because if the worker had already learnt
+    // something this case would be about the term rather than the fleet.
+    REQUIRE_FALSE(state.term.Known().has_value());
 
     // And the foreign fleet is refused anyway -- on the identity, not the term.
     auto const foreign = (*validator)(ForeignGrantUnder(CurrentTerm), "gcc-13");
@@ -147,24 +174,29 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
 
     // Still nothing learnt: a refused grant must teach this worker nothing, or anybody
     // holding the wire could move its expectation by sending one.
-    CHECK_FALSE(term.Check().Checked());
+    CHECK_FALSE(state.term.Known().has_value());
+
+    // **And nothing was SPENT either**, which is the same rule one layer down: a grant
+    // refused on a reading of its claims has not been consumed, so a client whose
+    // fleet was misconfigured for one job still holds a usable grant. Only a grant
+    // that was about to be compiled is spent.
+    CHECK(state.spent.Size() == 0);
 
     // The control, and it is what stops this passing against a validator that refuses
     // everything: this node's OWN fleet is served, first grant and all.
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
 }
 
-TEST_CASE("The production factory wires the term through, grant to refusal", "[node][lease][epoch]")
+TEST_CASE("The production factory wires the spend and the term through", "[node][lease][epoch][replay]")
 {
-    // **The wiring, and it is the acceptance clause for #421.**
+    // **The wiring, and it is the acceptance clause for #421 and again for #614.**
     //
-    // `WorkerProtocol_test` covers each half: that `LeaseEpochCheck` compares the way
-    // it should, and that a validator handed a `KnownSchedulerTerm` taught by hand
-    // refuses a stale grant. Neither says anything about the PATH between them. Drop
-    // the `term` argument `MakeWorkerLeaseValidator` forwards and every one of those
-    // cases stays green while `..._lease_stale_epoch_total` returns to the permanent
-    // zero this ticket exists to fix -- `PurgeExpired` exactly: correct, tested, and
-    // reachable from nothing.
+    // `WorkerProtocol_test` and `LeaseToken_test` cover each half: that a grant is
+    // spendable once, that a term is adopted in either direction, that a reset is
+    // said. Neither says anything about the PATH between them. Drop the `spent` or
+    // `term` argument `MakeWorkerLeaseValidator` forwards and every one of those cases
+    // stays green while the production worker enforces nothing -- `PurgeExpired`
+    // exactly: correct, tested, and reachable from nothing.
     //
     // So this drives the factory `main.cpp` actually calls, with a real key file, and
     // asserts the whole chain in one case.
@@ -173,67 +205,96 @@ TEST_CASE("The production factory wires the term through, grant to refusal", "[n
     WriteClusterKey(keyFile);
 
     auto const cfg = ConfigWithKey(keyFile);
-    Distributed::KnownSchedulerTerm term;
-    NullLogger logger;
+    WorkerState state;
 
     // Recording rather than silent, because the notice's WIRING is the half no unit
     // test of the notice itself can see: a `LeaseEpochNotice` that works perfectly and
-    // is never reached is the defect it was written to fix (#614). This case already
-    // drives the factory `main.cpp` calls, with a real key file and a real refusal, so
-    // it is the one place the whole chain is observable.
+    // is never reached is the defect it was written to fix (#614).
     std::vector<std::string> said;
-    Distributed::LeaseEpochNotice epochNotice { [&said](std::string_view line) { said.emplace_back(line); } };
+    Distributed::LeaseEpochNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
 
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, ThisWorker, SocketActivation::No, LeaseClock, state.spent, state.term, notice, state.metrics, state.logger);
     REQUIRE(validator.has_value());
 
     // Nothing learned yet, so this is honoured -- and honouring it is what teaches the
-    // term. Both halves are asserted: without the first, the case would pass against a
-    // validator that refuses everything; without the second, against one that accepts
-    // everything.
-    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
-    CHECK(term.Check().Checked());
-    CHECK(term.Check().Expected() == CurrentTerm);
-
-    // An accepted grant leaves nothing to report -- and clears the latch, which is what
-    // lets a reset AFTER a period of healthy service still be reported.
+    // term and spends the grant. All three are asserted: without the first, the case
+    // would pass against a validator that refuses everything; without the others,
+    // against one that accepts everything and enforces nothing.
+    auto const first = GrantUnder(CurrentTerm, "l1");
+    CHECK_FALSE((*validator)(first, "gcc-13").has_value());
+    CHECK(state.term.Known() == std::optional<std::uint64_t> { CurrentTerm });
+    CHECK(state.spent.Size() == 1);
     CHECK(said.empty());
 
-    auto const stale = (*validator)(GrantUnder(DeposedTerm), "gcc-13");
-    REQUIRE(stale.has_value());
-    CHECK(Testing::Unwrap(stale).reason == Distributed::LeaseRefusalReason::EpochMismatch);
+    // **The same grant again is a replay**, refused by name and counted under its own
+    // row. This is the check that used to not exist at all: the grant authenticated,
+    // named this worker and this toolchain, and had not expired, so it was served
+    // every time it arrived.
+    auto const replay = (*validator)(first, "gcc-13");
+    REQUIRE(replay.has_value());
+    CHECK(Testing::Unwrap(replay).reason == Distributed::LeaseRefusalReason::Replayed);
+
+    // The COUNTER is not read here, and that is the contract rather than a gap: a
+    // refusal on this surface is counted by `WorkerProtocol::Compile`, which converts
+    // one `LeaseRefusalTable` row into the wire code and the counter together. So the
+    // row is what this asserts -- `WorkerProtocol_test` asserts the counter actually
+    // rising, at the layer that raises it.
+    CHECK(Distributed::DescribeLeaseRefusal(Distributed::LeaseRefusalReason::Replayed).workerCounter
+          == IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed);
+    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 0);
+
+    // **And a legitimate scheduler reset is ADOPTED**, which is the property #614
+    // exists for: before it, this grant was refused and every honest grant after it
+    // was too, until the process restarted. The fleet keeps working.
+    auto const afterReset = GrantUnder(DeposedTerm, "l1-again");
+    CHECK_FALSE((*validator)(afterReset, "gcc-13").has_value());
+    CHECK(state.term.Known() == std::optional<std::uint64_t> { DeposedTerm });
+    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
 
     // **And the worker said so.** Without this the notice could be correct in isolation
     // and reached by nothing, which is exactly the shape of a guard nothing constructs.
     // Asserted on the CONTENT as well as the count: the line's whole value is that it
-    // carries both terms, so an operator reading it knows the scheduler went backwards
-    // rather than that the cluster is unstable.
+    // carries both terms and says what it did about them.
     REQUIRE(said.size() == 1);
-    CHECK(said.front().contains(std::to_string(DeposedTerm)));
     CHECK(said.front().contains(std::to_string(CurrentTerm)));
-    CHECK(said.front().contains("restart"));
+    CHECK(said.front().contains(std::to_string(DeposedTerm)));
+    CHECK(said.front().contains("Adopting"));
 
-    // Still once, however many more arrive -- a worker refusing every compile must not
-    // fill its log with the same paragraph.
-    CHECK((*validator)(GrantUnder(DeposedTerm), "gcc-13").has_value());
+    // Once per reset, not once per grant: the fleet is now steady at the lower term and
+    // every compile learns it again.
+    CHECK_FALSE((*validator)(GrantUnder(DeposedTerm, "l2"), "gcc-13").has_value());
     CHECK(said.size() == 1);
+    CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
 }
 
-TEST_CASE("A node with no cluster key builds a validator that learns nothing", "[node][lease][epoch]")
+TEST_CASE("A node with no cluster key builds a validator that learns and spends nothing", "[node][lease][epoch]")
 {
-    // The other production path through the same factory, asserted because the term
-    // argument is taken on BOTH and a reader should not have to guess whether the
-    // unchecked one quietly learns. It refuses nothing and teaches nothing: a node
-    // admitting only its own machine has no signature to check and therefore no
-    // authentic term to believe.
+    // The other production path through the same factory, asserted because the term and
+    // the spent set are taken on BOTH and a reader should not have to guess whether the
+    // unchecked one quietly uses them. It refuses nothing and remembers nothing: a node
+    // admitting only its own machine has no signature to check, so it has no authentic
+    // term to believe and no authentic grant to spend.
+    //
+    // The second half matters on its own: a spend here would make a keyless node refuse
+    // the second compile of any TU whose token bytes repeated, which for an unsigned
+    // grant is a bare `LeaseTable` serial that restarts at 1 with the scheduler.
     NodeConfig cfg;
-    Distributed::KnownSchedulerTerm term;
-    Distributed::LeaseEpochNotice epochNotice { Distributed::LeaseEpochNotice::Silent() };
-    NullLogger logger;
+    WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(cfg, ThisWorker, SocketActivation::No, LeaseClock, term, epochNotice, logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              ThisWorker,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.spent,
+                                              state.term,
+                                              state.notice,
+                                              state.metrics,
+                                              state.logger);
     REQUIRE(validator.has_value());
 
     CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
-    CHECK_FALSE(term.Check().Checked());
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
+    CHECK_FALSE(state.term.Known().has_value());
+    CHECK(state.spent.Size() == 0);
 }

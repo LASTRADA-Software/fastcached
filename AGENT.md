@@ -333,6 +333,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The MAC is checked before any other claim is reported on, or a named refusal is an
   oracle. The expiry bounds how long a *captured* token is useful and is **not** a
   capacity bound — slots are.
+- A grant is spendable **once**, at the worker it names, and nothing enforced that until
+  #614 — a captured token was replayable there until it expired. The spend runs LAST, so
+  a grant refused on a reading of its claims is not consumed; the set is bounded by the
+  grants' own `expiresAt` and keyed by a DIGEST, since `LeaseTable::_nextToken` restarts
+  at 1 with the scheduler and serials repeat across a restart while tokens do not.
+- The learned scheduler term is a DIAGNOSTIC, never a gate. As a monotonic maximum it was
+  **exactly inverted** across a legitimate reset — measured: worker at term 7, scheduler
+  truthfully reset to 0, the honest grant REFUSED and a captured term-7 token ACCEPTED,
+  for every worker until every one of them restarted. The monotonic term was standing in
+  for replay protection; once the spend provides that, a lower term is a reset and is
+  adopted. `WorkerJobsRefusedLeaseStaleEpoch` is RETIRED rather than left reading zero —
+  impossible and did-not-happen are one number otherwise. A ratchet is a permanent denial
+  of service **with no attacker at all**: an operator turns it too.
 - No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
   never a silent fallback. Its startup refusal is still open (#303) and must take the
   worker's shape above, or it breaks every single-machine install.

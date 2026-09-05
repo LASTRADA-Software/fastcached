@@ -15,12 +15,16 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <expected>
 #include <format>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -156,14 +160,19 @@ enum class LeaseRefusalReason : std::uint8_t
     Unauthorized,
     /// An authentic lease, issued by a different fleet that shares this key.
     ClusterMismatch,
-    /// An authentic lease, issued under a scheduler term that is no longer current.
-    EpochMismatch,
     /// An authentic lease, for a different worker.
     EndpointMismatch,
     /// An authentic lease, for a different toolchain.
     FingerprintMismatch,
     /// An authentic lease, past its expiry and the skew slack.
     Expired,
+    /// An authentic, unexpired lease this worker has already spent.
+    ///
+    /// LAST because it is the last check, and it is last because spending is the one
+    /// step with a side effect: a grant consumed on the way to being refused for some
+    /// other reason would be a grant nobody got to use. Everything above it is a pure
+    /// reading of the token.
+    Replayed,
     Last, ///< Not a reason, and has no row: the length of a table keyed by one.
 };
 
@@ -199,13 +208,22 @@ struct LeaseRefusalDescriptor
 /// one: a client already answers it correctly, and a second spelling of one fact
 /// is how two peers come to disagree about what happened.
 ///
-/// `ClusterMismatch` and `EpochMismatch` share `LeaseUnauthorized` too, and each
-/// keeps a counter of its own. The wire code is the same because the client's answer
-/// is the same -- compile it locally -- and a code it does not know would be worse
-/// than one it does. The counters are separate because the OPERATOR's answer is not:
-/// a rise in the first says two fleets are sharing a key file, which is a
-/// provisioning mistake, and a rise in the second says grants are outliving
-/// elections, which is not. Summing them would send somebody to the wrong one.
+/// `ClusterMismatch` and `Replayed` share `LeaseUnauthorized` too, and each keeps a
+/// counter of its own. The wire code is the same because the client's answer is the
+/// same -- compile it locally -- and a code it does not know would be worse than one
+/// it does. The counters are separate because the OPERATOR's answer is not: a rise in
+/// the first says two fleets are sharing a key file, which is a provisioning mistake,
+/// and a rise in the second says somebody is presenting a grant that has already been
+/// spent, which is not. Summing them would send somebody to the wrong one.
+///
+/// There used to be an `EpochMismatch` row here, refusing an authentic grant that named
+/// a superseded scheduler term, and it is gone rather than merely unused
+/// ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). `Replayed` is
+/// what stops a captured grant being spent twice, and once that is enforced a lower term
+/// is a scheduler that was legitimately reset -- see `KnownSchedulerTerm`, which now
+/// adopts one instead of refusing it. Keeping the row would have left a refusal nothing
+/// can reach and a series that reads zero because the event is impossible rather than
+/// because it did not happen: two facts an operator cannot tell apart.
 inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefusalTable { {
     { .reason = LeaseRefusalReason::Malformed,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
@@ -216,9 +234,6 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::ClusterMismatch,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster },
-    { .reason = LeaseRefusalReason::EpochMismatch,
-      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
-      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch },
     { .reason = LeaseRefusalReason::EndpointMismatch,
       .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseEndpointMismatch },
@@ -228,6 +243,9 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::Expired,
       .code = CompileCacheWire::ErrorCode::LeaseExpired,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired },
+    { .reason = LeaseRefusalReason::Replayed,
+      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed },
 } };
 
 static_assert(RowsInEnumeratorOrder(LeaseRefusalTable, &LeaseRefusalDescriptor::reason),
@@ -444,200 +462,237 @@ namespace Detail
                          .epoch = *epoch };
 }
 
-/// Whether this verifier knows which scheduler term is current.
+/// What learning a scheduler term did to a worker's picture of the fleet.
 ///
-/// A type rather than an `std::optional<std::uint64_t>`, and the difference is that
-/// this one cannot be defaulted. An omitted optional value-initializes to "no
-/// expectation", so a verifier added later would silently accept a grant from any
-/// term -- which is the hole this class exists to close, reopened by saying nothing.
-/// `PreAuth` and `PayloadCap` in the wire table are spelled the same way for the same
-/// reason.
-///
-/// **`NotKnownHere` is a real answer and not a placeholder**, and it stayed the only
-/// answer until #421 gave a worker somewhere to learn the term FROM -- the heartbeat
-/// reply, plus any authentic grant naming a newer one. A verifier that has never
-/// learned one still says so here, because a worker that refused everything before
-/// its first heartbeat could not cold-start and every fleet would deadlock on
-/// restart. So the states are three, not two: never learned, learned, and a refusal
-/// reachable only from the second.
-///
-/// **`NotOlderThan`, not `MustEqual`, and the asymmetry is the design.** A grant
-/// naming a term BELOW the one this worker knows was issued by a scheduler that has
-/// since been deposed: that is what the epoch is for, and it is refused. A grant
-/// naming a term ABOVE it is accepted, because the worker is the one that is behind
-/// -- the scheduler is authoritative about its own term and the MAC has already
-/// proved the grant authentic. Refusing that direction would make a worker which
-/// missed one heartbeat reject the new leader, which is the fleet quietly ceasing to
-/// distribute right after an election: the exact failure #421 exists to prevent,
-/// produced by #421.
-///
-/// The consequence worth stating plainly is that **a worker's own staleness can never
-/// cause a refusal.** That is what removes the availability trade the ticket expected
-/// to have to make, and it is this project's caching rule in another setting:
-/// staleness is safe to hold when it fails closed and self-heals, and adopting
-/// forward is the self-healing half.
-class LeaseEpochCheck
+/// Three outcomes and not a `bool`, because the one that matters is the one a boolean
+/// cannot name: a term going BACKWARDS is a scheduler that was reset, and it is the
+/// only condition here worth telling an operator about.
+enum class TermTransition : std::uint8_t
 {
-  public:
-    /// Deleted on purpose: a verifier states what it knows. See the class comment.
-    LeaseEpochCheck() = delete;
+    Unchanged, ///< The same term this worker already knew.
+    Advanced,  ///< A newer term -- an election, or the first one ever learned.
+    Reset,     ///< A term BELOW the one this worker knew: the scheduler was reset.
+};
 
-    /// This verifier cannot know the current term, so it does not check one.
-    /// @return The check.
-    [[nodiscard]] static constexpr LeaseEpochCheck NotKnownHere() noexcept
-    {
-        return LeaseEpochCheck { false, 0 };
-    }
-
-    /// This verifier knows a term, and refuses any grant issued STRICTLY BEFORE it.
-    ///
-    /// Named for what it does rather than for the field it holds: `MustEqual` was the
-    /// obvious spelling and would have been a lie, since a grant from a later term is
-    /// accepted. See the class comment for why that direction has to be accepted.
-    /// @param epoch The most recent term this verifier has learned.
-    /// @return The check.
-    [[nodiscard]] static constexpr LeaseEpochCheck NotOlderThan(std::uint64_t epoch) noexcept
-    {
-        return LeaseEpochCheck { true, epoch };
-    }
-
-    /// @param claimed The term the grant names.
-    /// @return True when this verifier accepts it.
-    [[nodiscard]] constexpr bool Accepts(std::uint64_t claimed) const noexcept
-    {
-        return !_checked || claimed >= _epoch;
-    }
-
-    /// @return The most recent term this verifier has learned; meaningless when it
-    ///         has learned none.
-    [[nodiscard]] constexpr std::uint64_t Expected() const noexcept
-    {
-        return _epoch;
-    }
-
-    /// @return Whether this verifier checks the term at all.
-    [[nodiscard]] constexpr bool Checked() const noexcept
-    {
-        return _checked;
-    }
-
-  private:
-    constexpr LeaseEpochCheck(bool checked, std::uint64_t epoch) noexcept:
-        _checked { checked },
-        _epoch { epoch }
-    {
-    }
-
-    bool _checked;
-    std::uint64_t _epoch;
+/// What a `Learn` call did, and what it did it to.
+///
+/// The previous value travels because only the caller that performed the transition
+/// can report it truthfully -- re-reading the member afterwards races another thread's
+/// grant and would report a step that never happened.
+struct TermChange
+{
+    TermTransition transition { TermTransition::Unchanged }; ///< Which way it moved.
+    std::uint64_t previous {};                               ///< What this worker knew before.
+    std::uint64_t current {};                                ///< What it knows now.
 };
 
 /// The most recent scheduler term a worker has been told about, if any.
 ///
-/// The mutable companion of `LeaseEpochCheck`, which is a value: this is the thing a
-/// worker LEARNS into and the check is the immutable reading it hands the verifier.
-/// It lives beside that type rather than beside the worker because both binaries
-/// compile `WorkerProtocol.cpp` and only one of them links `FastCache` -- a seam with
-/// a `.cpp` would need a new `_fc_cc_core` row, and this needs none.
+/// **It is a diagnostic now, and it used to be a gate.** Until
+/// [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) this was a
+/// monotonic maximum and a verifier refused any grant naming a lower term
+/// (`LeaseEpochCheck`, deleted with that ticket). The monotonic rule was standing in
+/// for replay protection, and `SpentLeases` below now provides that directly -- so the
+/// term no longer decides anything, and a lower one is adopted rather than refused.
 ///
-/// **One channel writes it: an authentic grant.** #421's first shape also had the
-/// HEARTBEAT reply state the term, which was faster and scheduler-driven, and it was
-/// deleted before it shipped. That reply is unauthenticated -- `Credential` is
-/// client-to-server and the frame surface is plaintext -- so anything able to answer a
-/// worker's `--scheduler` dial could write `UINT64_MAX` here once and the worker would
-/// refuse every authentic grant until it restarted. A value that only ever rises is a
-/// ratchet, and a ratchet an unauthenticated peer can turn is a permanent denial of
-/// service rather than a transient one. The grant channel has no such problem: the MAC
-/// is verified first, so only the scheduler can move this number.
+/// **Why the gate could not stay, measured rather than argued.** Three ordinary
+/// operator actions drop a scheduler's term back to 0: wiping the Raft directory,
+/// re-bootstrapping the cluster, turning consensus off. With a worker holding term 5
+/// and a reset scheduler truthfully stating term 0, the old check was exactly
+/// INVERTED -- the honest fresh grant was REFUSED and a term-5 token captured before
+/// the reset was ACCEPTED, because the check asks `claimed >= expected` and 5 passes
+/// where 0 does not. So the rule refused every legitimate grant, until every worker in
+/// the fleet was restarted, while admitting the one thing it existed to stop.
 ///
-/// **Monotonic, so a late writer cannot walk it backwards.** Raft terms only ever
-/// increase within a cluster, and the MAC binds the cluster -- so a lower number
-/// reaching `Learn` is a stale message overtaking a fresh one, not a demotion, and
-/// taking the maximum is what makes the order two threads happen to write in
-/// irrelevant.
+/// **One channel writes it: an authentic grant that was also SPENT.** #421's first
+/// shape also had the heartbeat reply state the term, which was deleted before it
+/// shipped: that reply is unauthenticated, so anything able to answer a worker's
+/// `--scheduler` dial could have written into this. The grant channel has no such
+/// problem -- the MAC is verified first -- and since #614 the spend check runs before
+/// this is written too, so a replayed grant cannot move the number either.
+///
+/// **Latest wins, not the maximum**, which is what makes a reset expressible at all.
+/// Two threads writing concurrently may leave either value here, and that is harmless
+/// in a way it would not have been before: nothing refuses on this number any more, so
+/// the only consequence of landing on the older of two is one diagnostic line.
 ///
 /// **Never-learned is a flag, not a term value.** `StandaloneSchedulerTerm` is
 /// literally `0`, so a zero sentinel would make a single-node fleet's real term
 /// indistinguishable from "nobody has told me anything" -- two states, one
-/// representation, which is the collapse this project keeps paying for. The cost is a
-/// second atomic and an ordering that has to be stated: `_term` is published first
-/// and `_learned` released after it, so a reader that acquires `_learned == true`
-/// sees a `_term` at least as new. A reader that sees `false` accepts everything,
-/// which is the safe direction.
-///
-/// A term learned too LATE costs nothing at all: the check accepts anything not older,
-/// so a worker that is behind refuses nothing and catches up from the next grant.
-///
-/// The sentence that used to sit here claimed a term could never be learned too EARLY,
-/// "because there is no channel that reports a term before a scheduler has entered
-/// it". It was written beside a channel for which it was false, and is recorded as
-/// deleted rather than quietly dropped: what makes the remaining channel safe is the
-/// MAC, not the absence of a way to lie.
+/// representation, which is the collapse this project keeps paying for. It is also what
+/// keeps the FIRST grant from reading as a reset: 0 arriving into an unlearned worker
+/// is `Advanced`, and into a worker that knows 5 it is `Reset`.
 class KnownSchedulerTerm
 {
   public:
-    /// Record a term this worker has been told about, keeping the highest seen.
-    /// @param term The scheduler term.
-    void Learn(std::uint64_t term) noexcept
+    /// Adopt the term an authentic, unspent grant named.
+    ///
+    /// @param term The scheduler term the grant carried.
+    /// @return What this call changed, for the one caller that changed it.
+    TermChange Learn(std::uint64_t term) noexcept
     {
-        auto seen = _term.load(std::memory_order_relaxed);
-        while (term > seen && !_term.compare_exchange_weak(seen, term, std::memory_order_relaxed))
-        {
-        }
+        std::scoped_lock const guard { _mutex };
+        auto const previous = _term;
+        auto const known = _learned;
+        _term = term;
+        _learned = true;
 
-        // Guarded, because this runs on every dispatched compile and publishes a
-        // transition that happens once per process. The two members share a cache
-        // line, so an unconditional release store took it exclusive per compile and
-        // forced every other worker thread's next `Check()` to re-acquire it -- a
-        // coherence round trip to republish a flag that has been true since the first
-        // heartbeat. The relaxed load reads the line without invalidating it.
-        //
-        // What the guard gives up, stated because it is the half that is not obvious:
-        // a LATER `Learn` that raises `_term` no longer carries a release edge. Nothing
-        // races -- `_term` is atomic — and the only reachable effect is a reader seeing
-        // an older term, which accepts more and never refuses. That is the direction
-        // this class is safe in by design.
-        if (!_learned.load(std::memory_order_relaxed))
-            _learned.store(true, std::memory_order_release);
+        if (!known)
+            return TermChange { .transition = TermTransition::Advanced, .previous = term, .current = term };
+        if (term == previous)
+            return TermChange { .transition = TermTransition::Unchanged, .previous = previous, .current = term };
+        return TermChange { .transition = term > previous ? TermTransition::Advanced : TermTransition::Reset,
+                            .previous = previous,
+                            .current = term };
     }
 
-    /// @return What a verifier should expect of a grant's term right now.
-    [[nodiscard]] LeaseEpochCheck Check() const noexcept
+    /// @return The most recent term this worker has been told about, or nullopt when
+    ///         it has been told none.
+    [[nodiscard]] std::optional<std::uint64_t> Known() const
     {
-        if (!_learned.load(std::memory_order_acquire))
-            return LeaseEpochCheck::NotKnownHere();
-        return LeaseEpochCheck::NotOlderThan(_term.load(std::memory_order_relaxed));
+        std::scoped_lock const guard { _mutex };
+        return _learned ? std::optional { _term } : std::nullopt;
     }
 
   private:
-    std::atomic<std::uint64_t> _term { 0 };
-    std::atomic<bool> _learned { false };
+    // A mutex rather than the pair of atomics this held before #614. The read-then-
+    // decide-then-write is one transaction now -- a `TermChange` computed from a value
+    // another thread has already overwritten describes a step nothing took -- and the
+    // cost is a lock per dispatched compile, which is a lock per multi-second process
+    // spawn. The atomics were justified by `Check()` running on every compile against a
+    // shared cache line; nothing reads this on the hot path any more.
+    mutable std::mutex _mutex;
+    std::uint64_t _term { 0 };
+    bool _learned { false };
 };
 
-/// Says once, per condition, that this worker is refusing grants because its learned
-/// term is higher than the ones arriving.
+/// The grants this worker has already spent, so no grant is spent twice.
 ///
-/// **The signal it replaces is not missing, it is WRONG**
+/// **A lease is single-use by construction, and until
+/// [#614](https://github.com/LASTRADA-Software/fastcached/issues/614) nothing enforced
+/// it.** The scheduler mints one grant per lease and the client presents it exactly
+/// once -- `Dispatch::CompileOnWorker` sends one COMPILE frame with no retry, and a
+/// RELEASE goes to the scheduler rather than to a worker -- so a token arriving twice at
+/// one worker is a replay and never an honest client. Measured before the fix: the same
+/// captured token presented a second time was accepted, and would go on being accepted
+/// until its expiry.
+///
+/// **This is what replaces the monotonic term**, and it is strictly finer than what it
+/// replaces: the term bounded a captured grant to the leadership era it was minted in,
+/// this bounds it to one use.
+///
+/// ## What it does NOT close, stated rather than discovered
+///
+/// A worker restart empties this set, so a token captured and withheld before the
+/// restart is spendable once afterwards, for whatever is left of its `expiresAt` plus
+/// `LeaseTokenClockSkewSlack`. That is not a regression: `KnownSchedulerTerm` starts
+/// unlearned after a restart and the old check accepted every term, so the ratchet had
+/// the identical hole for the identical duration. It is the residual the expiry is
+/// documented to bound, and closing it needs durable state a worker does not have.
+///
+/// ## Bound
+///
+/// One entry per grant, dropped once its own `expiresAt` has passed -- so the set holds
+/// what the scheduler issued inside one lease lifetime and nothing older. Pruning is
+/// amortized onto `Spend`, which runs once per dispatched compile: there is no timer,
+/// because a worker with no traffic has nothing to prune and one with traffic prunes on
+/// its own.
+///
+/// Entries are keyed by a SHA-256 of the token rather than by the token: it is 32 bytes
+/// against a few hundred, it is fixed-width, and a credential that has been spent has no
+/// business staying resident. The serial alone would not do -- `LeaseTable::_nextToken`
+/// restarts at 1 with the scheduler process, so serials repeat across a restart while
+/// tokens do not.
+///
+/// Header-only and beside `KnownSchedulerTerm` for that class's reason: both binaries
+/// compile `WorkerProtocol.cpp` and only one links `FastCache`, so a seam with a `.cpp`
+/// would need a new `_fc_cc_core` row and this needs none.
+class SpentLeases
+{
+  public:
+    /// Spend a grant, if it has not been spent already.
+    ///
+    /// **Thread-safe, and it has to be**: a worker answers compiles on a pool sized to
+    /// its slot cap, so two threads can present one captured token at once. The whole
+    /// read-and-insert is one critical section, which is what makes exactly one of them
+    /// the spender -- a check followed by a separate insert would let both through.
+    ///
+    /// @param token The grant, exactly as it was presented.
+    /// @param expiresAt When the grant stops being good, from its own claims. What
+    ///        bounds how long this entry is kept.
+    /// @param now This machine's wall clock.
+    /// @return True when this call spent it, false when it had already been spent.
+    [[nodiscard]] bool Spend(std::string_view token,
+                             std::chrono::system_clock::time_point expiresAt,
+                             std::chrono::system_clock::time_point now)
+    {
+        auto const fingerprint = Sha256::Hash(std::as_bytes(std::span { token }));
+
+        std::scoped_lock const guard { _mutex };
+
+        // Before the lookup, not after: an entry whose grant has expired describes a
+        // token nothing would accept anyway, so keeping it would only grow the map.
+        // `Expired` is checked by the verifier above this, so a token reaching here is
+        // unexpired and cannot be pruned by its own arrival.
+        std::erase_if(_spent, [now](auto const& entry) { return entry.second <= now; });
+
+        return _spent.emplace(fingerprint, expiresAt).second;
+    }
+
+    /// @return How many spent grants are currently remembered. For tests and for the
+    ///         one question an operator asks about a set like this.
+    [[nodiscard]] std::size_t Size() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return _spent.size();
+    }
+
+  private:
+    /// Hashes a digest that is already a hash.
+    ///
+    /// The first eight bytes, read as an integer, rather than a second pass of anything:
+    /// SHA-256's output is uniform, so any slice of it is as good a bucket index as a
+    /// rehash and costs nothing.
+    struct DigestHash
+    {
+        /// @param digest The token's digest.
+        /// @return Its hash.
+        [[nodiscard]] std::size_t operator()(Sha256::Digest const& digest) const noexcept
+        {
+            std::size_t value = 0;
+            std::memcpy(&value, digest.data(), sizeof(value));
+            return value;
+        }
+    };
+
+    mutable std::mutex _mutex;
+    std::unordered_map<Sha256::Digest, std::chrono::system_clock::time_point, DigestHash> _spent;
+};
+
+/// Says once, per reset, that this worker has adopted a scheduler term that went
+/// BACKWARDS.
+///
+/// **The signal it replaces was not missing, it was WRONG**
 /// ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Three ordinary
 /// operator actions drop a scheduler's term back to 0 -- wiping the Raft directory,
-/// re-bootstrapping the cluster, turning consensus off -- and every worker that has
-/// learned a higher term then refuses every grant until its process restarts. On the
-/// worker that shows only as `WorkerLeaseStaleEpoch` climbing, which reads like an
-/// election storm: an operator whose fleet stopped distributing is pointed at consensus
-/// instability when the cause is a reset they performed themselves.
+/// re-bootstrapping the cluster, turning consensus off -- and before #614 every worker
+/// that had learned a higher term then refused every grant until its process restarted.
+/// On the worker that showed only as `WorkerLeaseStaleEpoch` climbing, which reads like
+/// an election storm: an operator whose fleet stopped distributing was pointed at
+/// consensus instability when the cause was a reset they performed themselves.
 ///
-/// **It settles nothing about the downward path**, which is still open: an authentic,
-/// unexpired grant naming a lower term is either a fresh grant from a reset scheduler
-/// or a captured one replayed inside its expiry window, and nothing in the token
-/// separates them. This is the observability half, and it is true under every shape
-/// that question could be answered with -- which is why it can land before the answer.
+/// **What it says changed with what happens.** #768 shipped this as the observability
+/// half of a refusal, latched and cleared by an accepted grant, because the downward
+/// path was still open and the condition persisted until a restart. The condition is
+/// gone: the worker adopts the lower term and goes on compiling. So the line reports a
+/// TRANSITION rather than a state, and needs no latch -- a transition happens once by
+/// construction, and a scheduler that flaps says it once per flap, which is the right
+/// number.
 ///
-/// **Latched, and cleared by an accepted grant rather than never.** Once per PROCESS
-/// would spend the one line on the first stale token to arrive and leave a real reset
-/// an hour later silent, which is the failure this exists to prevent, reached by the
-/// mechanism meant to prevent it. Cleared on acceptance, the line marks each entry into
-/// the condition: a lone blip says it once, a reset says it once, and a worker refusing
-/// thousands of compiles still says it once.
+/// It is still worth a line rather than only a counter. A term going backwards is either
+/// something an operator did on purpose, in which case one line confirms it took effect,
+/// or something nobody did, in which case it is the first news of a scheduler that lost
+/// its Raft directory.
 ///
 /// Header-only and beside `KnownSchedulerTerm` for that class's reason: both binaries
 /// compile `WorkerProtocol.cpp` and only one links `FastCache`, so a seam with a `.cpp`
@@ -667,51 +722,36 @@ class LeaseEpochNotice
         return LeaseEpochNotice { Sink {} };
     }
 
-    /// Report, if this refusal is an epoch mismatch and nothing has said so since the
-    /// last accepted grant.
+    /// Report, if this change was a scheduler term going backwards.
     ///
-    /// **Thread-safe, unlike `CredentialNotice`, and it has to be**: a worker answers
-    /// compiles on a pool sized to its slot cap, so this runs concurrently. The
-    /// `exchange` is what makes exactly one caller the reporter -- a plain read-then-set
-    /// would let every thread in flight print the same paragraph.
-    /// @param refusal Why the grant was refused.
-    /// @return True when this call was the one that reported.
-    bool Observe(LeaseRefusal const& refusal)
+    /// @param change What `KnownSchedulerTerm::Learn` reported, from the caller that
+    ///        performed the transition.
+    /// @return True when this call reported.
+    bool Observe(TermChange const& change)
     {
-        if (refusal.reason != LeaseRefusalReason::EpochMismatch)
+        if (change.transition != TermTransition::Reset)
             return false;
-        if (_said.exchange(true, std::memory_order_relaxed))
-            return false;
+        _seen.fetch_add(1, std::memory_order_relaxed);
         if (_sink)
-            _sink(std::format(
-                "refusing every lease: {}. A scheduler whose term went BACKWARDS has been reset -- its Raft "
-                "directory wiped, the cluster re-bootstrapped, or consensus turned off -- and a worker cannot tell "
-                "that from a captured grant being replayed, so it goes on refusing until this process restarts. If "
-                "the reset was intentional, restart this worker; if it was not, the fleet has a scheduler it did "
-                "not mean to reset",
-                refusal.detail));
+            _sink(std::format("this scheduler's term went BACKWARDS, from {} to {}: it has been reset -- its Raft "
+                              "directory wiped, the cluster re-bootstrapped, or consensus turned off. Adopting the "
+                              "new term and continuing to compile; a captured grant cannot be replayed through it, "
+                              "because a grant is spendable exactly once. If the reset was not intentional, the "
+                              "fleet has a scheduler it did not mean to reset",
+                              change.previous,
+                              change.current));
         return true;
     }
 
-    /// Note that a grant was accepted, so the next entry into the condition speaks.
-    ///
-    /// Relaxed, and the race is benign: an accept concurrent with a refusal may let one
-    /// extra line through. That is the direction to be wrong in -- the alternative is a
-    /// reset going unreported because a blip spent the latch.
-    void Accepted() noexcept
+    /// @return How many resets this notice has reported.
+    [[nodiscard]] std::size_t Seen() const noexcept
     {
-        _said.store(false, std::memory_order_relaxed);
-    }
-
-    /// @return Whether the condition is currently reported.
-    [[nodiscard]] bool Reported() const noexcept
-    {
-        return _said.load(std::memory_order_relaxed);
+        return _seen.load(std::memory_order_relaxed);
     }
 
   private:
     Sink _sink;
-    std::atomic<bool> _said { false };
+    std::atomic<std::size_t> _seen { 0 };
 };
 
 /// What a verifier expects a grant to say about itself.
@@ -727,10 +767,6 @@ struct LeaseExpectation
     /// and it must keep working -- while a node that names one refuses a grant from a
     /// fleet that names another, or none.
     std::string_view clusterId;
-
-    /// Whether this verifier knows the current term. No default: see
-    /// `LeaseEpochCheck`.
-    LeaseEpochCheck epoch;
 };
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
@@ -742,11 +778,17 @@ struct LeaseExpectation
 /// granted `10.0.0.7:6675` is told precisely that. Checking the plaintext endpoint
 /// first would be cheaper and would turn a diagnostic into an oracle.
 ///
-/// The cluster and the epoch are checked FIRST, ahead of the endpoint and the
-/// fingerprint, because they answer a different question: those two ask "is this
-/// grant for me", these ask "is it from anybody I take orders from" (#322). Both
-/// still sit below the MAC, so neither is an oracle -- everything they report is
-/// already in the token the caller is holding.
+/// The cluster is checked FIRST, ahead of the endpoint and the fingerprint, because it
+/// answers a different question: those two ask "is this grant for me", it asks "is it
+/// from anybody I take orders from" (#322). It still sits below the MAC, so it is not
+/// an oracle -- everything it reports is already in the token the caller is holding.
+///
+/// **`Replayed` is not decided here, and that is deliberate.** Spending a grant is the
+/// one step with a side effect, and this function is a pure transform that both a
+/// worker and a test call freely -- so the spend lives at the worker's seam
+/// (`Cc::SignedLeaseValidator`), which owns the `SpentLeases` and calls this first.
+/// Every refusal below is a reading of the token; a grant refused for one of them has
+/// not been consumed, so nothing here can burn a lease on its way to declining it.
 ///
 /// @param signingKey The cluster's pre-shared key.
 /// @param token The token the client presented.
@@ -775,13 +817,6 @@ struct LeaseExpectation
             .detail = std::format("this lease was issued by cluster '{}'; this worker belongs to '{}'",
                                   authentic->clusterId,
                                   expected.clusterId) } };
-
-    if (!expected.epoch.Accepts(authentic->epoch))
-        return std::unexpected { LeaseRefusal {
-            .reason = LeaseRefusalReason::EpochMismatch,
-            .detail = std::format("this lease was issued under scheduler term {}; this worker has seen term {}",
-                                  authentic->epoch,
-                                  expected.epoch.Expected()) } };
 
     if (authentic->endpoint != expected.endpoint)
         return std::unexpected { LeaseRefusal {

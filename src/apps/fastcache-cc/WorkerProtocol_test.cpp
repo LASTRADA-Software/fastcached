@@ -148,16 +148,24 @@ constexpr std::uint64_t GrantTerm = 4;
 /// @param validFor How long past `LeaseClock()` it lasts; negative for an expired one.
 /// @param cluster Which fleet mints it; defaults to the one the worker belongs to.
 /// @param epoch The scheduler term it is issued under.
+/// @param serial What distinguishes this issuance from the last.
+///
+/// **The serial is a parameter and it has to be** (#614). A grant is spendable exactly
+/// once at a worker, so two calls to this that produced identical bytes would make the
+/// second a replay -- which is what a real scheduler never mints either, since
+/// `LeaseTable::_nextToken` advances per acquisition. A case presenting two grants
+/// therefore names two serials, and a case presenting one need not care.
 /// @return The token, as a client would present it.
 [[nodiscard]] std::string GrantFor(std::string_view endpoint,
                                    std::string_view fingerprint = "gcc-13",
                                    std::chrono::seconds validFor = std::chrono::minutes { 10 },
                                    std::string_view cluster = ThisCluster,
-                                   std::uint64_t epoch = GrantTerm)
+                                   std::uint64_t epoch = GrantTerm,
+                                   std::string_view serial = "17")
 {
     return FastCache::Distributed::MintLeaseToken(
         TestClusterKey(),
-        FastCache::Distributed::LeaseClaims { .serial = "17",
+        FastCache::Distributed::LeaseClaims { .serial = std::string { serial },
                                               .endpoint = std::string { endpoint },
                                               .fingerprint = std::string { fingerprint },
                                               .key = "obj-abc",
@@ -168,18 +176,23 @@ constexpr std::uint64_t GrantTerm = 4;
 
 /// Build one of the two production lease validators.
 /// @param lease Which policy.
+/// @param spent The grants already run, which is what makes a lease single-use; the
+///        unchecked one ignores it.
 /// @param term What the verifying one borrows; the unchecked one ignores it.
+/// @param metrics Where a term reset is counted; refusals are counted by the surface.
 /// @param notice Where an epoch refusal would be reported; borrowed like `term`, and
 ///        for the same reason -- both outlive the validator and both are written by it.
 /// @return The validator.
 [[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy lease,
+                                                Distributed::SpentLeases& spent,
                                                 Distributed::KnownSchedulerTerm& term,
-                                                Distributed::LeaseEpochNotice& notice)
+                                                Distributed::LeaseEpochNotice& notice,
+                                                IMetricsSink& metrics)
 {
     if (lease == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
     return SignedLeaseValidator(
-        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, term, notice);
+        TestClusterKey(), std::string { ThisWorker }, std::string { ThisCluster }, LeaseClock, spent, term, notice, metrics);
 }
 
 struct Fixture
@@ -196,6 +209,10 @@ struct Fixture
     /// teach it and then read what the worker does about it.
     Distributed::KnownSchedulerTerm term;
 
+    /// The grants this worker has already run. Declared beside `term` and before
+    /// `worker` for the same reason: the validator borrows it.
+    Distributed::SpentLeases spent;
+
     /// Silent, because these cases assert on the REPLY rather than on the log. Named
     /// through `Silent()` rather than defaulted, which is that factory's own rule.
     Distributed::LeaseEpochNotice epochNotice { Distributed::LeaseEpochNotice::Silent() };
@@ -208,7 +225,7 @@ struct Fixture
     /// @param lease Which production lease policy to build; see `LeasePolicy`.
     explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy lease = LeasePolicy::Unchecked):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(lease, term, epochNotice), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(lease, spent, term, epochNotice, metrics), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -1305,55 +1322,91 @@ TEST_CASE("An authentic grant naming this worker compiles", "[worker-protocol][l
 /// reaches a different refusal with a different counter.
 /// @param epoch The scheduler term the grant names.
 /// @return The frame.
-[[nodiscard]] std::vector<std::byte> FrameGrantedUnder(std::uint64_t epoch)
+/// @param serial What distinguishes this issuance; see `GrantFor`.
+[[nodiscard]] std::vector<std::byte> FrameGrantedUnder(std::uint64_t epoch, std::string_view serial = "17")
 {
     return CompileFrame("gcc-13",
                         DefaultSource,
                         { Wire::IdentityCodec },
-                        GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, epoch));
+                        GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, epoch, serial));
 }
 
-TEST_CASE("A grant from a deposed scheduler is refused, and the counter for it finally moves",
-          "[worker-protocol][lease][epoch]")
+TEST_CASE("A grant already spent here is refused as a replay, and the counter moves", "[worker-protocol][lease][replay]")
 {
-    // The whole of #421 in one case. `WorkerJobsRefusedLeaseStaleEpoch` has been
-    // defined, catalogued and exported the whole time, and could never rise: the
-    // validator passed `LeaseEpochCheck::NotKnownHere()` because a worker learned the
-    // current term from nowhere, and the only term it ever saw was the one inside the
-    // token it was checking. An operator scraping the series read a permanent zero.
+    // **The check that used to not exist at all** (#614). Until now a grant that
+    // authenticated, named this worker and this toolchain and had not expired was
+    // served every single time it arrived -- so a captured token was replayable at its
+    // granted worker, at will, for the whole of its expiry. A lease is single-use by
+    // construction: one grant per lease, presented in exactly one COMPILE frame with no
+    // retry, and a RELEASE goes to the SCHEDULER rather than here. A second arrival is
+    // a replay and never an honest client.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
-    // What a heartbeat reply teaches it. Term 9 is current; the grant below names 4.
-    fix.term.Learn(9);
+    auto const frame = FrameGrantedUnder(GrantTerm);
 
-    auto const answer = fix.worker.Answer(FrameGrantedUnder(GrantTerm));
-    REQUIRE(answer.has_value());
+    // The honest use, which is also what spends it. Asserted, or this case would pass
+    // against a validator that refuses everything.
+    auto const first = fix.worker.Answer(frame);
+    REQUIRE(first.has_value());
+    REQUIRE(Decode(Unwrap(first)).status == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
+
+    auto const again = fix.worker.Answer(frame);
+    REQUIRE(again.has_value());
 
     // `LeaseUnauthorized` rather than a code of its own, because the client's answer
     // is the same -- compile it locally -- and a code it does not know would be worse
     // than one it does.
-    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseUnauthorized);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+    CHECK(ErrorOf(Unwrap(again)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 1);
+
+    // And no compiler ran for it, which is the point: the refusal is checked before the
+    // payload is decompressed, let alone spawned.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
 
     // BOTH halves. The wire code is shared with two other refusals and the counters
     // deliberately are not, because a rise in `WrongCluster` says two fleets share a
-    // key file -- a provisioning mistake -- while a rise here says grants are
-    // outliving elections, which is not. A test asserting only that the stale-epoch
-    // counter moved would pass just as happily if this refusal had also been billed
-    // to its neighbours.
+    // key file -- a provisioning mistake -- while a rise here says somebody is
+    // replaying a captured grant, which is not. A test asserting only that the replay
+    // counter moved would pass just as happily if this refusal had also been billed to
+    // its neighbours.
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized) == 0);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseWrongCluster) == 0);
 }
 
+TEST_CASE("A grant refused on its claims is not thereby spent", "[worker-protocol][lease][replay]")
+{
+    // The ordering, asserted by CONSEQUENCE because it cannot be seen any other way.
+    // Spending is the one step here with a side effect, so it runs last: a grant
+    // declined for a toolchain this worker does not serve has not been consumed, and
+    // the client still holds something it could legitimately use. Spend first and a
+    // worker would burn a lease every time it answered a question about one.
+    //
+    // Driven through the FINGERPRINT rather than the endpoint, because the endpoint
+    // refusal and the spend both concern "is this grant mine" and a case using it would
+    // not separate them.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    auto const wrongToolchain =
+        CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker, "clang-19"));
+    auto const refused = fix.worker.Answer(wrongToolchain);
+    REQUIRE(refused.has_value());
+    REQUIRE(ErrorOf(Unwrap(refused)) == Wire::ErrorCode::FingerprintMismatch);
+
+    // Nothing was spent, so nothing is remembered -- and a grant that WAS unspendable
+    // would show up here as a replay refusal rather than as this.
+    CHECK(fix.spent.Size() == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 0);
+}
+
 TEST_CASE("A grant from a term this worker has not heard of is honoured", "[worker-protocol][lease][epoch]")
 {
-    // The direction that must NOT refuse, and it is the one the ticket expected to
-    // have to trade availability for. A worker whose heartbeat is stale is the one
-    // that is behind; the scheduler is authoritative about its own term and the MAC
-    // has already proved this grant authentic. Refusing here would make a worker that
-    // missed one heartbeat reject the new leader -- the fleet ceasing to distribute
-    // right after an election, which is the failure #421 exists to prevent.
+    // The direction that must NOT refuse, and it is the one #421 expected to have to
+    // trade availability for. A worker whose heartbeat is stale is the one that is
+    // behind; the scheduler is authoritative about its own term and the MAC has already
+    // proved this grant authentic. Refusing here would make a worker that missed one
+    // heartbeat reject the new leader -- the fleet ceasing to distribute right after an
+    // election.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     fix.term.Learn(4);
@@ -1363,51 +1416,85 @@ TEST_CASE("A grant from a term this worker has not heard of is honoured", "[work
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
 }
 
-TEST_CASE("A newer term is ADOPTED, so the grant it arrived on is a learning channel", "[worker-protocol][lease][epoch]")
+TEST_CASE("A scheduler reset is adopted, and the fleet keeps compiling", "[worker-protocol][lease][epoch]")
 {
-    // Proved by CONSEQUENCE, which is the only way it can be. The case above accepts a
-    // newer grant, and so would a validator that accepts everything -- the two are
-    // indistinguishable from outside until the newer term is shown to have STUCK. So
-    // this compiles under term 9 and then presents a grant from term 4, which was
-    // acceptable a moment ago and must not be now.
+    // **The property #614 exists for, at the production surface.** Wiping the Raft
+    // directory, re-bootstrapping, or turning consensus off drops a scheduler's term
+    // back to 0, and that answer is genuine, signed and from the right scheduler.
+    // Before #614 this worker refused it -- and every honest grant after it -- until
+    // the process restarted, while a token captured under the OLD term was accepted,
+    // because the check asked `claimed >= expected`. Exactly inverted.
     //
-    // This is also what keeps the mechanism working when heartbeats are failing: the
-    // grant is the second learning channel, and it is safe to learn from because
-    // adoption happens after `VerifyLeaseToken` returned success. Reading a term off a
-    // REFUSED token would let anybody holding the wire push a worker's expectation up
-    // and make it refuse every honest grant afterwards.
+    // Proved by CONSEQUENCE, which is the only way: a validator that accepts everything
+    // would pass the first half, so the reset has to be shown STICKING.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
-    auto const newer = fix.worker.Answer(FrameGrantedUnder(9));
+    auto const newer = fix.worker.Answer(FrameGrantedUnder(9, "l1"));
     REQUIRE(newer.has_value());
     REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
+    REQUIRE(fix.term.Known() == std::optional<std::uint64_t> { 9 });
 
-    auto const older = fix.worker.Answer(FrameGrantedUnder(GrantTerm));
-    REQUIRE(older.has_value());
+    // The reset scheduler's first grant: served, where it used to be refused.
+    auto const afterReset = fix.worker.Answer(FrameGrantedUnder(GrantTerm, "l2"));
+    REQUIRE(afterReset.has_value());
+    CHECK(Decode(Unwrap(afterReset)).status == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 2);
 
-    CHECK(ErrorOf(Unwrap(older)) == Wire::ErrorCode::LeaseUnauthorized);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 1);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
+    // And it STUCK, which is what says the term was adopted rather than merely ignored.
+    CHECK(fix.term.Known() == std::optional<std::uint64_t> { GrantTerm });
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+
+    // Once per reset, not once per grant: the fleet is steady at the lower term now.
+    auto const steady = fix.worker.Answer(FrameGrantedUnder(GrantTerm, "l3"));
+    REQUIRE(steady.has_value());
+    CHECK(Decode(Unwrap(steady)).status == Wire::Status::Ok);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 1);
+}
+
+TEST_CASE("A replayed grant cannot walk this worker's term backwards", "[worker-protocol][lease][replay][epoch]")
+{
+    // **The reason the spend runs BEFORE the term is learned**, and the case that
+    // would go red if the two were swapped. A captured grant naming an old term is the
+    // one thing that could make the reset above a lie: replayed, it would teach this
+    // worker a term the fleet has moved on from, on demand, as often as somebody sent
+    // it. Spending first means only a grant nobody has used can move the number, which
+    // is what makes a lower term a scheduler that was legitimately reset.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
+
+    auto const older = FrameGrantedUnder(GrantTerm, "l1");
+    REQUIRE(Decode(Unwrap(fix.worker.Answer(older))).status == Wire::Status::Ok);
+
+    auto const newer = fix.worker.Answer(FrameGrantedUnder(9, "l2"));
+    REQUIRE(Decode(Unwrap(newer)).status == Wire::Status::Ok);
+    REQUIRE(fix.term.Known() == std::optional<std::uint64_t> { 9 });
+
+    // The replay: refused, and it teaches nothing.
+    auto const replayed = fix.worker.Answer(older);
+    REQUIRE(replayed.has_value());
+    CHECK(ErrorOf(Unwrap(replayed)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseReplayed) == 1);
+    CHECK(fix.term.Known() == std::optional<std::uint64_t> { 9 });
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
 }
 
 TEST_CASE("A worker that has never learned a term refuses nothing for it", "[worker-protocol][lease][epoch]")
 {
-    // Cold start. A worker that refused before its first heartbeat could not join a
-    // fleet at all, and every restart would be an outage -- so `NotKnownHere` stays a
-    // real answer rather than becoming a sentinel term. `StandaloneSchedulerTerm` is
-    // literally `0`, so a zero standing in for "never learned" would have made a
-    // single-node fleet's real term mean "unknown", which `SchedulerService.hpp:40`
-    // warns about in as many words.
+    // Cold start. A worker that refused before its first grant could not join a fleet
+    // at all, and every restart would be an outage. `StandaloneSchedulerTerm` is
+    // literally `0`, so a zero standing in for "never learned" would make a single-node
+    // fleet's real term mean "unknown" -- which `SchedulerService.hpp:40` warns about in
+    // as many words, and which after #614 would announce a scheduler reset on every
+    // cold worker's first job.
     Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying };
 
     auto const answer = fix.worker.Answer(FrameGrantedUnder(0));
     REQUIRE(answer.has_value());
 
     CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
-    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseStaleEpoch) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermResets) == 0);
 }
 
 TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole policy", "[worker-protocol][lease]")

@@ -71,14 +71,12 @@ inline constexpr std::string_view OtherCluster = "fleet-beta";
 /// @param endpoint The address this worker answers on.
 /// @param fingerprint The toolchain it is about to run.
 /// @param cluster The fleet it belongs to.
-/// @param epoch What it knows about the current scheduler term.
 /// @return The expectation.
 [[nodiscard]] LeaseExpectation Worker(std::string_view endpoint = "10.0.0.7:6675",
                                       std::string_view fingerprint = "clang-19-x86_64",
-                                      std::string_view cluster = TestCluster,
-                                      LeaseEpochCheck epoch = LeaseEpochCheck::NotKnownHere())
+                                      std::string_view cluster = TestCluster)
 {
-    return LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster, .epoch = epoch };
+    return LeaseExpectation { .endpoint = endpoint, .fingerprint = fingerprint, .clusterId = cluster };
 }
 
 /// Where the version byte sits in a decoded envelope.
@@ -396,88 +394,110 @@ TEST_CASE("Two nodes that name no cluster still agree", "[distributed][lease][to
     CHECK(VerifyLeaseToken(key, grant, Worker("10.0.0.7:6675", "clang-19-x86_64", ""), Noon()).has_value());
 }
 
-TEST_CASE("A scheduler reset is refused permanently and the refusal says so", "[distributed][lease][token]")
+TEST_CASE("A legitimate scheduler reset is adopted rather than refused", "[distributed][lease][token][epoch]")
 {
-    // **What a legitimate reset looks like from a worker**
-    // ([#614](https://github.com/LASTRADA-Software/fastcached/issues/614)). Wiping the
-    // Raft directory, re-bootstrapping, or turning consensus off drops a scheduler's
-    // term back to 0. The term-0 answer is then genuine, signed and from the right
-    // scheduler -- authenticity is not the issue -- but a monotonic maximum has no way
-    // to express it, so every worker that has learned a higher term refuses every
-    // grant until its process is restarted.
-    //
-    // This case pins the two halves separately, because the ticket is right about one
-    // and out of date about the other.
+    // **The property [#614](https://github.com/LASTRADA-Software/fastcached/issues/614)
+    // exists for.** Wiping the Raft directory, re-bootstrapping, or turning consensus
+    // off drops a scheduler's term back to 0. That answer is genuine, signed, and from
+    // the right scheduler -- authenticity was never the issue -- and until #614 a
+    // monotonic maximum had no way to express it, so every worker that had learned a
+    // higher term refused every grant until its process was restarted.
     auto const key = Key();
 
     KnownSchedulerTerm term;
-    term.Learn(7);
+    REQUIRE(term.Learn(7).transition == TermTransition::Advanced);
 
     // A scheduler that has genuinely reset mints at term 0. `StandaloneSchedulerTerm`
     // is literally 0, so this is also exactly what turning consensus OFF produces.
     auto const afterReset = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
-    auto const refusal =
-        VerifyLeaseToken(key, afterReset, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, term.Check()), Noon());
+    CHECK(VerifyLeaseToken(key, afterReset, Worker(), Noon()).has_value());
 
-    REQUIRE_FALSE(refusal.has_value());
-    CHECK(refusal.error().reason == LeaseRefusalReason::EpochMismatch);
-
-    // **The diagnostic the ticket says is missing is already here**, and it names both
-    // numbers -- which is what turns "the fleet stopped distributing" into "the
-    // scheduler was reset and these workers need restarting". It reaches the operator
-    // through the client: `WorkerProtocol` returns the refusal whole, deliberately, and
-    // the launcher renders it in the decline line. Asserted so a later edit cannot
-    // quietly drop it back to the bare reason.
-    CHECK(refusal.error().detail.contains("term 0"));
-    CHECK(refusal.error().detail.contains("term 7"));
-
-    // **And there is no downward path, which is the half that stands.** Learning the
-    // reset term changes nothing: `Learn` takes the maximum, so the worker goes on
-    // expecting 7 and refusing every honest grant. This is monotonicity working as
-    // designed -- it is what stops a captured token talking a worker backwards -- and
-    // it is also why a legitimate reset has no expression. Pinned rather than
-    // corrected: which shape closes it is a design decision the ticket declines to
-    // make, and a test that quietly permitted a lower term would make that decision by
-    // accident.
-    term.Learn(0);
-    CHECK(term.Check().Expected() == 7);
-
-    auto const stillRefused =
-        VerifyLeaseToken(key, afterReset, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, term.Check()), Noon());
-    REQUIRE_FALSE(stillRefused.has_value());
-    CHECK(stillRefused.error().reason == LeaseRefusalReason::EpochMismatch);
+    // And the worker ADOPTS it, so the fleet keeps working with no restart anywhere.
+    // The transition is reported to the caller that performed it, which is what makes
+    // the condition sayable at all -- re-reading the member afterwards would race
+    // another compile thread's grant.
+    auto const change = term.Learn(0);
+    CHECK(change.transition == TermTransition::Reset);
+    CHECK(change.previous == 7);
+    CHECK(change.current == 0);
+    CHECK(term.Known() == std::optional<std::uint64_t> { 0 });
 }
 
-TEST_CASE("A grant from a superseded scheduler term is refused where the term is known", "[distributed][lease][token]")
+TEST_CASE("The term check that used to stand here was exactly inverted across a reset", "[distributed][lease][token][epoch]")
 {
-    // The second half of #322: the cluster id closes the door between two FLEETS, the
-    // epoch closes it between two leaders of the same fleet. Without it a token
-    // captured before an election stays good after one, because nothing in the grant
-    // said which term issued it.
+    // **Measured on the tree before #614, and it is the argument for deleting the
+    // check rather than repairing it.** The old rule was `claimed >= expected`, so with
+    // a worker holding term 7 and a scheduler reset to term 0 it refused the honest
+    // fresh grant (0 < 7) while ACCEPTING a token captured under term 7 (7 >= 7). The
+    // rule that existed to stop replay refused every legitimate grant and admitted the
+    // replayed one, in precisely the scenario it was written for.
+    //
+    // Pinned as the pair, because either half alone reads as an ordinary policy choice
+    // and only together do they show the inversion. Both are now decided by
+    // `SpentLeases`, which answers the question the term was standing in for.
     auto const key = Key();
-    auto const old = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 6));
+    auto const fresh = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
+    auto const captured = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
 
-    auto const refusal = VerifyLeaseToken(
-        key, old, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon());
-    REQUIRE_FALSE(refusal.has_value());
-    CHECK(refusal.error().reason == LeaseRefusalReason::EpochMismatch);
+    // Both authenticate; the term decides nothing here any more.
+    CHECK(VerifyLeaseToken(key, fresh, Worker(), Noon()).has_value());
+    CHECK(VerifyLeaseToken(key, captured, Worker(), Noon()).has_value());
 
-    // And the current term is served.
-    auto const current = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
-    CHECK(
-        VerifyLeaseToken(
-            key, current, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon())
-            .has_value());
+    // What separates them now is whether they have been spent, and that is a property
+    // of the token rather than of the era it was minted in.
+    SpentLeases spent;
+    CHECK(spent.Spend(captured, Noon() + 10min, Noon()));
+    CHECK_FALSE(spent.Spend(captured, Noon() + 10min, Noon()));
+    CHECK(spent.Spend(fresh, Noon() + 10min, Noon()));
+}
 
-    // And a LATER term is served too, which is the half #421 added and the half a
-    // `MustEqual` reading would have refused. A worker whose heartbeat is stale is the
-    // one that is behind; refusing here would make it reject the new leader, which is
-    // the fleet ceasing to distribute right after an election. Pinned one term either
-    // side of the boundary, because that is where a comparison mistake lives.
-    auto const later = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 8));
-    CHECK(VerifyLeaseToken(
-              key, later, Worker("10.0.0.7:6675", "clang-19-x86_64", TestCluster, LeaseEpochCheck::NotOlderThan(7)), Noon())
-              .has_value());
+TEST_CASE("A grant is spendable exactly once", "[distributed][lease][token][replay]")
+{
+    // A lease is single-use by construction: the scheduler mints one grant per lease,
+    // `Dispatch::CompileOnWorker` presents it in exactly one COMPILE frame with no
+    // retry, and a RELEASE goes to the scheduler rather than to a worker. So a second
+    // arrival at one worker is a replay and never an honest client -- and until #614
+    // nothing said so, which meant a captured grant was replayable at its worker until
+    // it expired.
+    SpentLeases spent;
+    auto const key = Key();
+    auto const grant = MintLeaseToken(key, Grant());
+    auto const other = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-def"));
+
+    CHECK(spent.Spend(grant, Noon() + 10min, Noon()));
+    CHECK_FALSE(spent.Spend(grant, Noon() + 10min, Noon()));
+    CHECK_FALSE(spent.Spend(grant, Noon() + 10min, Noon() + 1min));
+
+    // A DIFFERENT grant is unaffected, which is the half a set keyed too coarsely
+    // would break: two grants sharing a key, a worker and a toolchain differ in their
+    // serial, and `LeaseTable` mints a fresh one per acquisition.
+    CHECK(spent.Spend(other, Noon() + 10min, Noon()));
+    CHECK(spent.Size() == 2);
+}
+
+TEST_CASE("The spent set is bounded by the grants' own expiry", "[distributed][lease][token][replay]")
+{
+    // The bound, and the reason there is no timer: an entry describes a token that
+    // nothing would accept once its expiry has passed, so it is dropped on the next
+    // `Spend` rather than kept. A worker with no traffic has nothing to prune, and one
+    // with traffic prunes as it goes.
+    SpentLeases spent;
+    auto const key = Key();
+
+    for (auto const index: std::views::iota(0, 8))
+    {
+        auto claims = Grant();
+        claims.serial = std::format("l{}", index);
+        CHECK(spent.Spend(MintLeaseToken(key, claims), Noon() + 10min, Noon()));
+    }
+    CHECK(spent.Size() == 8);
+
+    // One more, well past every entry's expiry: the arrival prunes the lot.
+    auto later = Grant();
+    later.serial = "l99";
+    later.expiresAt = Noon() + 1h;
+    CHECK(spent.Spend(MintLeaseToken(key, later), Noon() + 1h, Noon() + 30min));
+    CHECK(spent.Size() == 1);
 }
 
 TEST_CASE("What a worker knows about the term is three states, and zero is not one of them",
@@ -486,58 +506,69 @@ TEST_CASE("What a worker knows about the term is three states, and zero is not o
     // `SchedulerService::StandaloneSchedulerTerm` IS `0` -- the term of a node leading
     // alone -- and its own declaration warns that "a literal at a call site is exactly
     // how somebody later reads it as unknown and starts treating it as one". So
-    // never-learned is a FLAG on `KnownSchedulerTerm` rather than a term value, and
-    // this pins the difference the warning is about: a worker that has learned term 0
-    // is checking, and one that has learned nothing is not. The two differ in
-    // `Checked()` and in nothing else a caller can see.
+    // never-learned is a FLAG on `KnownSchedulerTerm` rather than a term value.
+    //
+    // It still matters after #614, even though nothing refuses on the term any more:
+    // it is what keeps the FIRST grant from reading as a reset. Term 0 arriving into a
+    // worker that has learned nothing is `Advanced`; the same 0 arriving into a worker
+    // that knows 7 is `Reset`. Collapsed to a zero sentinel, every cold worker's first
+    // grant would announce a scheduler reset that did not happen.
     //
     // Named rather than included: `SchedulerService.hpp` is a scheduler header and
     // this is a token test, and reaching for it here collides with an unrelated
     // `Detail` namespace. The zero below is the constant's value, which is the case's
     // input -- writing it is not the mistake, reading it as "unknown" would be.
     KnownSchedulerTerm fresh;
-    CHECK_FALSE(fresh.Check().Checked());
-    CHECK(fresh.Check().Accepts(0));
-    CHECK(fresh.Check().Accepts(9'999));
+    CHECK_FALSE(fresh.Known().has_value());
 
     KnownSchedulerTerm standalone;
-    standalone.Learn(0);
-    CHECK(standalone.Check().Checked());
-    CHECK(standalone.Check().Expected() == 0);
-    CHECK(standalone.Check().Accepts(0));
+    auto const first = standalone.Learn(0);
+    CHECK(first.transition == TermTransition::Advanced);
+    CHECK(standalone.Known() == std::optional<std::uint64_t> { 0 });
+
+    KnownSchedulerTerm elected;
+    REQUIRE(elected.Learn(7).transition == TermTransition::Advanced);
+    CHECK(elected.Learn(0).transition == TermTransition::Reset);
 }
 
-TEST_CASE("A worker's knowledge of the term only ever moves forward", "[distributed][lease][token][epoch]")
+TEST_CASE("A worker adopts the term of the last authentic grant, in either direction", "[distributed][lease][token][epoch]")
 {
-    // Monotonic, so the order two channels happen to write in cannot matter: a
-    // heartbeat reply and an authentic grant both teach this, on different threads,
-    // and a stale message overtaking a fresh one must not walk the expectation
-    // backwards. Raft terms only increase within a cluster and the MAC binds the
-    // cluster, so a lower number arriving is late rather than authoritative.
+    // Latest wins since #614, not the maximum. The maximum was standing in for replay
+    // protection -- `SpentLeases` provides that directly now -- and it was what made a
+    // legitimate reset inexpressible.
+    //
+    // Every step is asserted through the RETURNED change rather than by re-reading the
+    // member, because that is the only reading a caller may act on: two compile threads
+    // learn concurrently, and a value read back afterwards may be the other thread's.
     KnownSchedulerTerm term;
-    term.Learn(7);
-    CHECK(term.Check().Expected() == 7);
+    CHECK(term.Learn(7).transition == TermTransition::Advanced);
 
-    term.Learn(4);
-    CHECK(term.Check().Expected() == 7);
-    CHECK_FALSE(term.Check().Accepts(6));
+    auto const backwards = term.Learn(4);
+    CHECK(backwards.transition == TermTransition::Reset);
+    CHECK(backwards.previous == 7);
+    CHECK(backwards.current == 4);
+    CHECK(term.Known() == std::optional<std::uint64_t> { 4 });
 
-    term.Learn(9);
-    CHECK(term.Check().Expected() == 9);
-    CHECK_FALSE(term.Check().Accepts(8));
-    CHECK(term.Check().Accepts(9));
-    CHECK(term.Check().Accepts(10));
+    // The same term twice is neither, which is what keeps a steady fleet silent: every
+    // dispatched compile learns, and a line per compile is not a diagnostic.
+    CHECK(term.Learn(4).transition == TermTransition::Unchanged);
+
+    auto const forwards = term.Learn(9);
+    CHECK(forwards.transition == TermTransition::Advanced);
+    CHECK(forwards.previous == 4);
+    CHECK(term.Known() == std::optional<std::uint64_t> { 9 });
 }
 
-TEST_CASE("A verifier that cannot know the term accepts any of them", "[distributed][lease][token]")
+TEST_CASE("A verifier accepts a grant from any term", "[distributed][lease][token]")
 {
-    // `NotKnownHere` is an answer rather than a placeholder, and this pins what it
-    // means so that changing it is a decision somebody makes rather than a default
-    // somebody inherits. A worker learns the current term from nowhere -- the only
-    // term it sees is the one inside the token it is checking. #421 gave it a channel
-    // -- the heartbeat reply, and any authentic grant naming a later term -- but a
-    // worker that has used neither yet is in exactly this state, and a worker that
-    // refused here could not cold-start.
+    // The term decides nothing at verification since #614. It is carried, it is inside
+    // the MAC, and it is adopted -- but a worker never refuses on it, because a lower
+    // term is a scheduler that was legitimately reset and nothing in a token can tell
+    // that from a replay. What tells them apart is whether the grant has been spent.
+    //
+    // Pinned across the whole range rather than at one value, because the defect this
+    // replaces was a COMPARISON (`claimed >= expected`) and a comparison mistake lives
+    // at a boundary.
     auto const key = Key();
     for (auto const epoch: { std::uint64_t { 0 }, std::uint64_t { 1 }, std::uint64_t { 9'999 } })
     {
@@ -589,87 +620,72 @@ TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][tok
     CHECK(refusal.error() == LeaseRefusalReason::Malformed);
 }
 
-TEST_CASE("The worker says once that it is refusing every grant on the term", "[distributed][lease][token]")
+TEST_CASE("The worker says once, per reset, that a scheduler term went backwards", "[distributed][lease][token][epoch]")
 {
-    // **The signal this replaces is WRONG, not missing** (#614). On the worker a
+    // **The signal this replaces was WRONG, not missing** (#614). On the worker a
     // scheduler reset showed only as `WorkerLeaseStaleEpoch` climbing, which reads like
     // an election storm -- so an operator whose fleet stopped distributing was pointed
     // at consensus instability when the cause was a reset they performed themselves.
     //
-    // It settles nothing about the downward path, which is still open. This is the
-    // observability half, true under every shape that question could be answered with.
+    // #768 shipped this as the observability half of a REFUSAL, latched and cleared by
+    // an accepted grant, because the condition then persisted until a restart. The
+    // condition is gone: the worker adopts the lower term and goes on compiling. So the
+    // line reports a TRANSITION, which happens once by construction and needs no latch.
     std::vector<std::string> said;
     LeaseEpochNotice notice { [&said](std::string_view line) { said.emplace_back(line); } };
 
-    auto const reset = LeaseRefusal { .reason = LeaseRefusalReason::EpochMismatch,
-                                      .detail = "this lease was issued under scheduler term 0; this worker has "
-                                                "seen term 7" };
-
-    SECTION("it reports once, however many compiles arrive")
+    SECTION("a reset is reported, and it names both terms and what it did")
     {
-        // A worker refusing thousands of compiles must say this once. The whole point
-        // is a line an operator reads, and a line per refused compile is not one.
-        CHECK(notice.Observe(reset));
-        for (auto attempt = 0; attempt < 500; ++attempt)
-            CHECK_FALSE(notice.Observe(reset));
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
 
         REQUIRE(said.size() == 1);
-
-        // It carries the refusal's own numbers -- which is what turns "the fleet
-        // stopped" into "the scheduler was reset" -- and names the remedy, because an
-        // operator who has just learned the condition still needs to be told that it
-        // clears on a restart and not on its own.
-        CHECK(said.front().contains("term 0"));
-        CHECK(said.front().contains("term 7"));
-        CHECK(said.front().contains("restart"));
+        // Both numbers, because that is what turns "the fleet stopped behaving" into
+        // "somebody reset the scheduler". And the ACTION, because the reader's next
+        // question is whether they have to do anything -- since #614 they do not, which
+        // is worth saying rather than leaving them to infer from silence.
+        CHECK(said.front().contains("from 7 to 0"));
+        CHECK(said.front().contains("Adopting"));
+        CHECK(notice.Seen() == 1);
     }
 
-    SECTION("an accepted grant re-arms it, so a later reset is not silent")
+    SECTION("nothing else reaches it, however many compiles arrive")
     {
-        // **Latched per CONDITION, not per process**, and this is the case that
-        // separates the two. Once-per-process would spend the line on the first stale
-        // token to arrive and leave a real reset an hour later unreported -- the exact
-        // failure the notice exists to prevent, reached by the mechanism meant to
-        // prevent it.
-        CHECK(notice.Observe(reset));
-        CHECK(said.size() == 1);
-
-        notice.Accepted();
-        CHECK_FALSE(notice.Reported());
-
-        CHECK(notice.Observe(reset));
-        CHECK(said.size() == 2);
-    }
-
-    SECTION("no other refusal reaches it")
-    {
-        // Every other refusal here is about ONE grant and is already answered per
-        // request. This one is a condition that persists until the process restarts,
-        // which is what makes it worth a line -- so a notice that spoke for all of them
-        // would be back to noise.
-        for (auto const reason: { LeaseRefusalReason::Malformed,
-                                  LeaseRefusalReason::Unauthorized,
-                                  LeaseRefusalReason::ClusterMismatch,
-                                  LeaseRefusalReason::EndpointMismatch,
-                                  LeaseRefusalReason::FingerprintMismatch,
-                                  LeaseRefusalReason::Expired })
+        // Every dispatched compile learns a term, so `Unchanged` is what a healthy
+        // fleet produces on every single job. A notice that spoke for those would be
+        // noise, and noise is how the one line that matters gets missed.
+        for (auto attempt = 0; attempt < 500; ++attempt)
         {
-            INFO("reason " << static_cast<int>(reason));
-            CHECK_FALSE(notice.Observe(LeaseRefusal { .reason = reason, .detail = "irrelevant" }));
+            CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Unchanged, .previous = 7, .current = 7 }));
+            CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 7, .current = 8 }));
         }
         CHECK(said.empty());
+        CHECK(notice.Seen() == 0);
     }
 
-    SECTION("a silent notice reports nowhere and still latches")
+    SECTION("a scheduler that flaps is reported once per flap")
+    {
+        // **Per transition, not per process.** Once-per-process would spend the line on
+        // the first reset and leave a second one an hour later silent -- the failure the
+        // notice exists to prevent, reached by the mechanism meant to prevent it. A
+        // transition cannot repeat without the term moving back first, so this needs no
+        // latch to be re-armed: the arithmetic is the latch.
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK_FALSE(notice.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 7 }));
+        CHECK(notice.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK(said.size() == 2);
+        CHECK(notice.Seen() == 2);
+    }
+
+    SECTION("a silent notice reports nowhere and still counts")
     {
         // `Silent()` is named rather than defaulted, which is `CredentialNotice`'s rule
         // and the reason is the same: a defaulted sink is how a diagnostic comes to be
         // dropped at every call site at once. It still answers whether it WOULD have
         // spoken, so a caller can assert the decision without a sink.
         auto quiet = LeaseEpochNotice::Silent();
-        CHECK(quiet.Observe(reset));
-        CHECK(quiet.Reported());
-        CHECK_FALSE(quiet.Observe(reset));
+        CHECK(quiet.Observe(TermChange { .transition = TermTransition::Reset, .previous = 7, .current = 0 }));
+        CHECK(quiet.Seen() == 1);
+        CHECK_FALSE(quiet.Observe(TermChange { .transition = TermTransition::Advanced, .previous = 0, .current = 1 }));
     }
 }
 
