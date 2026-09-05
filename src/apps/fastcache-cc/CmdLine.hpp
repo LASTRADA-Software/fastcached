@@ -372,7 +372,19 @@ enum class SourceLanguage : std::uint8_t
 /// One driver's spelling of "this input is preprocessed <language>".
 struct PreprocessedInputSpelling
 {
-    SourceLanguage language;
+    /// The initialiser is there to remove INDETERMINACY, not to supply a
+    /// meaningful default (#697). Every row of both driver tables designates this
+    /// member, and there is no language it would be right to fall back to -- `{}`
+    /// lands on `C` because it is enumerator zero, which is a value rather than an
+    /// answer. What it buys is that a future default-initialisation reads `C`
+    /// deterministically instead of whatever the stack held, and the neighbouring
+    /// `PathValueFlag` initialises both of its enum members for the same reason.
+    ///
+    /// Left bare it was also a `cppcoreguidelines-pro-type-member-init` error under
+    /// `WarningsAsErrors: "*"` -- but only for an analyser run whose standard
+    /// library ODR-uses the implicit default constructor somewhere, which is why no
+    /// Linux run has ever reported it. The measurement is on the issue.
+    SourceLanguage language {};
     std::span<std::string_view const> flags;
 };
 
