@@ -2592,6 +2592,52 @@ committed, only what lands on disk at checkout. `*.sh` keeps a row of its own ev
 though the general rule covers it, because the consequence there is specific: a
 CRLF shebang makes the kernel look for an interpreter whose name ends in a
 carriage return, so such a script does not misbehave — it fails to start at all.
+## A reference build that is not one is wrong in BOTH directions
+
+- **The gate REFUSES a launcher-fronted build rather than warning about it, and the
+  reason is the direction nobody investigates.** The observed case
+  ([#626](https://github.com/LASTRADA-Software/fastcached/issues/626)) was five
+  metrics counter tests failing in four files the branch never touched, on a
+  launcher-fronted MSVC build, all clearing with `-DUSE_COMPILER_CACHE=OFF` — a
+  false alarm, which costs somebody an investigation. **The same substituted object
+  can equally HIDE a real failure, and nothing would say so.** A verdict about a
+  tree that was not built cannot be read in either direction, so there is no safe
+  way to continue past it — which is what makes it a refusal. That sentence lives
+  in the refusal's own text, because a developer who meets it should learn why it
+  is not a warning.
+
+- **The guard was already there and the ticket did not know.** `launcher_verdict`
+  in `scripts/local-gate.sh` reads `build.ninja`, refuses rather than warns, states
+  its count, and separates `unknown` and `unreadable` from `0` — all of it landed
+  under #319/#368, citing neither #626 nor #454. Check a ticket's premise against
+  the tree before building to it; a body describing a solved half is #779's shape.
+
+- **The count is LAUNCHER BINDINGS, not edges, and it was called edges.** Ninja
+  emits one `LAUNCHER = ` line per RULE where the value is uniform, so this tree on
+  Linux reads **5, covering 501 compile edges**, while #626's Windows reproduction
+  recorded **669**. Those are not comparable and nothing said so. The verdict is
+  unaffected — any count above zero refuses — but a refusal message is read by
+  somebody holding another platform's number, which is the whole reason it exists.
+  **A unit error in a refusal message is how two numbers get compared that should
+  not be.**
+
+- **And the guard is blind to a compiler that IS a cache.** Measured on
+  `gate-clang-debug`, the gate's own preset with the gate's own pin: `launcher_verdict`
+  answers **0** — correctly, there is no `LAUNCHER` binding — while
+  `CMAKE_CXX_COMPILER` resolves to `/usr/lib64/ccache/clang++`, because the preset
+  spells a bare `clang++` and `/usr/lib64/ccache` precedes `/usr/bin` on that host's
+  `PATH`. The blind spot is **total**, not partial, and it is
+  [#804](https://github.com/LASTRADA-Software/fastcached/issues/804).
+
+- On Linux the #626 symptom **does not reproduce** in either cache state: three full
+  builds of one tree — populated shared caches, cold caches, and a reference build —
+  and three full suites, with all five metrics tests passing in every arm. Stated as
+  an analogue: #626's reproduction is Windows/MSVC/sccache and was not executed.
+  **And the populated arm is weaker than it looks** — the cold build recorded exactly
+  131 ccache hits, which is exactly the number of duplicate compilations in the tree,
+  so every hit was intra-build and the populated one replayed only a handful more.
+  A cache keyed per build directory is [#816](https://github.com/LASTRADA-Software/fastcached/issues/816).
+
 ## `PEDANTIC_COMPILER_WERROR` decides fatality, not which warnings exist
 
 - **A flag and the suppressions it makes necessary are governed by ONE condition.**

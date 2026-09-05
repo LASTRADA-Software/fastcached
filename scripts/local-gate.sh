@@ -541,9 +541,17 @@ cached_entry() {
 # The match is deliberately NOT anchored to ninja's two-space indent. Anchoring
 # would fail OPEN if that spelling ever changed -- a count of zero reads as a clean
 # build -- and this is a gate, so the loose match is the safe direction: it can
-# only over-count. `CMAKE_<LANG>_LINKER_LAUNCHER` emits the same binding, which is
-# why the number is reported as launcher-fronted EDGES rather than as compile
-# edges; a linker cache in a reference build is a thing to refuse too.
+# only over-count. `CMAKE_<LANG>_LINKER_LAUNCHER` emits the same binding, and a
+# linker cache in a reference build is a thing to refuse too.
+#
+# The number is reported as LAUNCHER BINDINGS, which is what it counts, and NOT as
+# edges -- it was called edges and that was a unit error. Ninja emits one `LAUNCHER
+# = ` line per RULE where the value is uniform, so a Linux measurement of this tree
+# reads **5, covering 501 compile edges**, while #626's Windows reproduction
+# recorded **669**. Those two numbers are not comparable and nothing said so. The
+# verdict itself is unaffected -- any count above zero refuses -- but a refusal
+# message is read by somebody comparing it with another platform, which is the
+# whole reason this one exists.
 # @param 1 Path to a generated build.ninja.
 launcher_verdict() {
     if [[ ! -f "$1" ]]; then
@@ -636,7 +644,7 @@ configure_reason() {
     case "$fronted" in
         0|unreadable) ;;
         unknown) reasons="${reasons:+$reasons; }there is no build.ninja to check" ;;
-        *)       reasons="${reasons:+$reasons; }the generated build is launcher-fronted (edges: $fronted)" ;;
+        *)       reasons="${reasons:+$reasons; }the generated build is launcher-fronted (LAUNCHER bindings: $fronted)" ;;
     esac
 
     # Several clauses can hold at once, and a run that re-configures for more than
@@ -792,10 +800,10 @@ if [[ "$self_test" -eq 1 ]]; then
         "there is no build.ninja to check" \
         "$(configure_reason "$scratch/no-ninja" tidy /usr/bin/clang-tidy-22)"
     expect "a correct cache beside a launcher-fronted build is re-configured" \
-        "the generated build is launcher-fronted (edges: 1)" \
+        "the generated build is launcher-fronted (LAUNCHER bindings: 1)" \
         "$(configure_reason "$scratch/stale-fronted" tidy /usr/bin/clang-tidy-22)"
     expect "a no-tidy preset is re-configured over a stale fronted build too" \
-        "the generated build is launcher-fronted (edges: 1)" \
+        "the generated build is launcher-fronted (LAUNCHER bindings: 1)" \
         "$(configure_reason "$scratch/stale-fronted" no-tidy /usr/bin/clang-tidy-22)"
 
     # The refusal. `-DUSE_COMPILER_CACHE=OFF` does not settle this on its own --
@@ -1202,7 +1210,7 @@ run_preset() {
             fail "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
             ;;
         *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (launcher-fronted edges: $verdict), so its objects need not match this tree (#319, #368); something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (LAUNCHER bindings: $verdict), so its objects need not match this tree (#319, #368). This REFUSES rather than warns because it is wrong in BOTH directions: the observed case (#626) was five metrics tests failing in files the branch never touched, which costs somebody an investigation -- and the same substituted object can equally HIDE a real failure, with nothing to say so. A verdict about a tree that was not built cannot be read in either direction, so there is no safe way to continue past it. Something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
             ;;
     esac
 
