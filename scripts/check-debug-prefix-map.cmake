@@ -11,9 +11,11 @@
 #
 # Neither is visible in the layout a developer has. Both are one row here.
 #
-# Verdict is read from the output, not the exit code: `message(FATAL_ERROR)`
-# exits 0 on CMake 3.28, this project's declared minimum. See
-# src/tests/CMakeLists.txt, which registers this with FAIL_REGULAR_EXPRESSION.
+# Verdict is read from the output, not the exit code, because that is the contract
+# every `cmake -P` check here is registered under: see src/tests/CMakeLists.txt,
+# which registers this with FAIL_REGULAR_EXPRESSION, and the measurement and the
+# reasons live in `scripts/check-script-check-signals.cmake` and are deliberately
+# not restated here (#565).
 
 cmake_minimum_required(VERSION 3.28)
 

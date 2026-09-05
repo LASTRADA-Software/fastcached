@@ -1037,14 +1037,27 @@ what differs between compilers, standard libraries, hosts and tool versions.
   identity, and it routes the gate's objects through the change being gated. Passing the
   flag is not the fact: `CompileCache.cmake` leaves an externally-set launcher untouched,
   so the refusal reads `build.ninja`, never `CMakeCache.txt`, which never holds it.
-- A `cmake -P` check **cannot fail its own test**: `message(FATAL_ERROR)` prints
-  `CMake Error` and exits **0** on 3.28, this project's declared minimum. Thirteen
-  hygiene checks reported PASSED whatever they found. The verdict is read from the
-  output (`FAIL_REGULAR_EXPRESSION`), one spelling defined once — and a failure
-  signal that is a *property* needs both `script-check-canary` (a script that must
-  be seen to fail, `WILL_FAIL`) and `script-check-signals` (no registration omits
-  it). The fact was already written down for the SKIP direction and never carried
-  to the FAIL one.
+- A `cmake -P` check is judged by its OUTPUT, never by its exit code
+  (`FAIL_REGULAR_EXPRESSION`, one spelling defined once). Two reasons, and the one
+  this bullet used to give was neither: `message(WARNING)` exits **0** on every
+  CMake while printing `CMake Warning`, and a check that shells out to another
+  `cmake -P` without reading `RESULT_VARIABLE` exits 0 with its child's error on
+  the output. It said `message(FATAL_ERROR)` exits **0** on 3.28, this project's
+  declared minimum; that does not reproduce — exit **1** on 3.22.6 through 4.3.0,
+  six script shapes — so `ctest -R fatal-error-exit` now ASKS on every platform CI
+  builds rather than restating a sentence (#565). The likely mechanism is a true
+  neighbouring fact carried one clause too far: a `-P` script cannot *choose* its
+  exit code before 3.29, which decides the SKIP direction and was read as *cannot
+  signal failure by exit code*.
+  - A failure signal that is a *property* needs both `script-check-canary` (a
+    script that must be seen to fail, `WILL_FAIL`) and `script-check-signals` (no
+    registration omits it). And **`WILL_FAIL` inverts the WHOLE verdict**, so a
+    canary carried by its exit code is vacuous: exiting 1 it passed on the status
+    alone and would have gone on reporting green with `FAIL_REGULAR_EXPRESSION`
+    deleted from every registration in the tree. It therefore exits **0** and
+    prints a real `CMake Error` from a nested `cmake -P`, which leaves the pattern
+    as the only thing that can fail it. Fixing a wrong *reason* without
+    re-deriving what it justified is how a guard survives as decoration.
 - Never silence clang-tidy with `NOLINT` — fix the source.
 - A return type is not part of a function's mangled name on Linux, so two
   functions differing only in return type silently collide.
@@ -1179,9 +1192,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   row is the trap inside the trap — a negative test written with it reproduces nothing and reads as a
   refutation, and in mixed output the unwrapped copy hides the wrapped one. It is the DIAGNOSTIC types
   that wrap — and that is a property of every verdict this repository reads rather than a trap somebody
-  might hit: a `-P` script cannot fail by exit code, so **37 of 37** `scripts/check-*.cmake` report through
-  `message(FATAL_ERROR)` (35 of 35 on the master this branched from — same pattern, different tree, so say
-  which). There are also TWO ways to write the negative test wrong — use `STATUS`, or emit
+  might hit: a check's verdict travels through the DIAGNOSTIC channel because `FAIL_REGULAR_EXPRESSION`
+  must also hear one that merely WARNS, and a warning exits 0 on every CMake. (This said *a `-P` script
+  cannot fail by exit code*; it can — exit **1** on 3.22.6 through 4.3.0, #565 — and the conclusion never
+  needed it.) **43 of 44** `scripts/check-*.cmake` carry `message(FATAL_ERROR)` (37 of 37 on the branch that
+  added this entry, 35 of 35 on the master it branched from — same pattern, different tree, so say which),
+  and the 44th reports through `message("CMake Error: …")` instead, so the count is a PROXY for the property
+  and has now parted company with it. There are also TWO ways to write the negative test wrong — use `STATUS`, or emit
   both and let the unwrapped copy mask the wrapped one — and both read as a refutation. Flatten
   (`tr '\n' ' ' | tr -s ' '`) before matching, or match a phrase that cannot straddle 74 columns. Distinct
   from every other entry here: **the text does not exist in the form you are matching it in, and the tool
@@ -1199,7 +1216,9 @@ what differs between compilers, standard libraries, hosts and tool versions.
   firing. Name the interpreter regardless.
   **`IFS=$'\t' read` does not read TSV**: tab is IFS whitespace, so an empty field collapses and shifts every
   field after it. **A fixture built on `message(FATAL_ERROR)` cannot test that verdicts are read from OUTPUT** —
-  it exits 0 on 3.28 and 1 on 4.x, so the rule's own test passed with the rule deleted. And **a self-test that
+  it exits **1** everywhere measured (#565), so the status alone is sufficient and the rule's own test passed
+  with the rule deleted; the correction makes the finding stronger, the fixture having been insufficient on
+  every machine rather than only a modern one. And **a self-test that
   stops early must not look like one that judged something**: `set -e` plus a generator ending in
   `[[ ... ]] && echo` truncated a run at eight cases with no case named, so the self-tests print how many cases
   they ran.

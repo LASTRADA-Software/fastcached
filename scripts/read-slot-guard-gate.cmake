@@ -28,9 +28,11 @@ cmake_minimum_required(VERSION 3.28)
 #   * it died without the guard's diagnostic          -> it died of something else, FAIL
 #   * it died AND named the read-op slot              -> the guard refused, PASS
 #
-# Reports failure by printing `CMake Error`, because `message(FATAL_ERROR)` in
-# script mode exits 0 on CMake 3.28 -- see `src/tests/CMakeLists.txt` for the
-# measurement and for the one spelling of the pattern that reads it.
+# Reports failure by printing `CMake Error`, because that is the contract every
+# `cmake -P` check here is registered under -- see `src/tests/CMakeLists.txt` for
+# the one spelling of the pattern that reads it, and the measurement and the
+# reasons live in `scripts/check-script-check-signals.cmake` and are deliberately
+# not restated here (#565).
 #
 # Usage:
 #   cmake -DFASTCACHED_CANARY=<path> -P scripts/read-slot-guard-gate.cmake

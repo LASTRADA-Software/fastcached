@@ -110,10 +110,16 @@ function(fastcached_run_check tree outObjected outOutput)
         RESULT_VARIABLE ignored)
     set(combined "${captured}${capturedErrors}")
 
-    # The verdict is read from the OUTPUT, never from the exit code: a `cmake -P`
-    # script's `message(FATAL_ERROR)` exits 0 on CMake 3.28, this project's declared
-    # minimum, and 1 on 4.x. Reading the status here would make this selftest agree
-    # with the check on one host and disagree on the other.
+    # The verdict is read from the OUTPUT, never the exit code, and the reason is
+    # the CHECK's registration rather than any CMake version: ctest judges it by
+    # `FAIL_REGULAR_EXPRESSION`, which also has to hear a check that merely WARNS
+    # -- and `message(WARNING)` exits 0 on every CMake. Judging by status here
+    # would make this selftest apply a different rule than ctest does.
+    #
+    # This comment used to say `message(FATAL_ERROR)` exits 0 on 3.28 and 1 on
+    # 4.x. It does not; it exits 1 on every version measured, and the measurement
+    # now lives in `scripts/check-script-check-signals.cmake` rather than in ten
+    # copies of this paragraph (#565).
     string(FIND "${combined}" "CMake Error" position)
     if(position EQUAL -1)
         set(${outObjected} FALSE PARENT_SCOPE)

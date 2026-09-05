@@ -26,8 +26,10 @@
 # is that the reason is remembered as a VARIABLE rather than parsed back out of the
 # display sentence, so a rewording of the status line cannot silently disarm it.
 #
-# Verdict is read from the OUTPUT, not the exit code: `message(FATAL_ERROR)` exits 0
-# on CMake 3.28, this project's declared minimum.
+# Verdict is read from the OUTPUT, not the exit code, because that is the contract
+# every `cmake -P` check here is registered under -- the measurement and the
+# reasons live in `scripts/check-script-check-signals.cmake` and are deliberately
+# not restated here (#565).
 
 cmake_minimum_required(VERSION 3.28)
 

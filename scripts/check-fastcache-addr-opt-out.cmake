@@ -28,9 +28,11 @@
 # acquisition — `if(DEFINED ENV{FASTCACHE_ADDR})` — is what this cannot cover, and
 # that is stated rather than implied.
 #
-# Verdict is read from the OUTPUT, not the exit code: `message(FATAL_ERROR)` exits
-# 0 on CMake 3.28, this project's declared minimum. See src/tests/CMakeLists.txt,
-# which registers this with FAIL_REGULAR_EXPRESSION.
+# Verdict is read from the OUTPUT, not the exit code, because that is the contract
+# every `cmake -P` check here is registered under. See src/tests/CMakeLists.txt,
+# which registers this with FAIL_REGULAR_EXPRESSION; the measurement and the
+# reasons live in `scripts/check-script-check-signals.cmake` and are deliberately
+# not restated here (#565).
 
 cmake_minimum_required(VERSION 3.28)
 
