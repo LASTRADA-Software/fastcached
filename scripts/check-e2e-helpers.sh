@@ -38,14 +38,67 @@ set -uo pipefail
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 library="${source_dir}/scripts/lib/e2e-common.sh"
 
-# What twenty immediate commands may cost before `run_bounded` is judged to be
-# sleeping through them. Shared by the two cases that measure it: the healthy one
-# asserts UNDER this, the staged-defect one asserts OVER it, so the number cannot
-# drift into meaning nothing without one of the two failing.
+# How many immediate commands `fast_path_ms` puts through `run_bounded`.
+#
+# LOAD-BEARING, and therefore a NAME rather than a literal in the loop with the
+# word "twenty" retyped in three comments and two messages. The ceiling below is
+# `FastPathCommands` x `_e2e_poll_pause` (0.2s) at twenty; halving the count
+# halves the separation and NOTHING goes red -- the staged flat-pause defect
+# would then cost ~2.05s, still over a 2000ms ceiling, so `bounded-fast-path-bites`
+# still passes while the gap it certifies has collapsed from 4058-vs-927 to
+# ~2050-vs-500. The figure the two cases PRINT is this variable for the same
+# reason: prose reading "twenty" beside a loop of ten is a check reporting on
+# work it did not do.
+FastPathCommands=20
+
+# What `FastPathCommands` immediate commands may cost before `run_bounded` is
+# judged to be sleeping through them. Shared by the two cases that measure it: the
+# healthy one asserts UNDER this, the staged-defect one asserts OVER it, so the
+# number cannot drift into meaning nothing without one of the two failing.
 FastPathCeilingMs=2000
 
-# Run twenty commands that finish immediately through `run_bounded`, and echo how
-# many milliseconds they took.
+# What the STAGED defect must measure for the ceiling above to be said to
+# separate anything.
+#
+# `bounded-fast-path-bites` used to assert only that the defect came in OVER the
+# ceiling, and "over" is not "separated": at ten commands the flat-pause defect
+# is 2050ms against a 2000ms ceiling, a 2.5% margin on an instrument whose
+# HEALTHY end has been measured spread over 700ms. That case would have passed
+# and certified nothing. The floor is 1.5x the ceiling, which the real defect
+# clears by construction -- twenty `sleep`s of `_e2e_poll_pause` cannot come back
+# in under 4000ms, and the best defective reading on the host in the table below
+# was 4058ms, so 3000ms leaves 35% headroom at the tight end and every reading
+# above it is further away.
+#
+# DERIVED from the ceiling rather than written out as 3000, because the sentence
+# above is the whole point of the constant and a literal states it in prose while
+# implementing nothing. Written out, the two numbers are independent: raising
+# `FastPathCeilingMs` past the defect -- which is precisely the way this ceiling
+# stops separating -- leaves the floor at 3000, the staged defect still clears it,
+# and `bounded-fast-path-bites` goes on passing while certifying a ceiling that
+# has stopped meaning anything. Measured, staging exactly that: with the floor
+# written out, a ceiling of 10000ms was caught by nothing.
+FastPathDefectFloorMs=$(( FastPathCeilingMs * 3 / 2 ))
+
+# Is a timer reading the `<seconds>.<three digits>` shape `%3R` produces?
+#
+# PURE, and lifted out of `fast_path_ms` for the reason this file's header gives
+# for `_e2e_verdict` being pure: a refusal nobody has watched fire is not a
+# refusal, and this one cannot be staged THROUGH `fast_path_ms` without a hook
+# into `TIMEFORMAT` that would exist only for the test. As a predicate it is one
+# case row per arm, driven against readings rather than against a clock.
+#
+# @param 1 the reading, as `time` printed it.
+# @return 0 when it is a duration this file can convert.
+_is_duration_reading() {
+    case "$1" in
+        [0-9]*.[0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Run `FastPathCommands` commands that finish immediately through `run_bounded`,
+# and echo how many milliseconds they took.
 #
 # `%3R` through bash's own `time`, because `date +%s%N` is GNU-only (BSD `date`
 # prints a literal `N`) and bash 3.2 has no `EPOCHREALTIME`. The decimal separator
@@ -54,15 +107,16 @@ FastPathCeilingMs=2000
 #
 # The loop's own output is closed off because the SUBSTITUTION is reading stderr,
 # which is where `time` reports. A stray diagnostic from `run_bounded` would
-# otherwise land in `elapsed` and corrupt the parse. It fails closed when it does:
-# the arithmetic aborts the case and the driver reports a non-zero exit, rather
-# than a number nobody measured.
+# otherwise land in `elapsed` and corrupt the parse. It fails closed when it does,
+# at two layers: `_is_duration_reading` refuses the reading BY NAME, and anything
+# that slips past it aborts the case in the arithmetic below. Either way the
+# driver reports a non-zero exit rather than a number nobody measured.
 #
-# @return The elapsed time of the twenty calls, in whole milliseconds.
+# @return The elapsed time of the `FastPathCommands` calls, in whole milliseconds.
 fast_path_ms() {
     local elapsed
     elapsed="$( export LC_ALL=C; TIMEFORMAT='%3R'
-        { time { for _ in $(seq 1 20); do run_bounded 5 true >/dev/null 2>&1; done; }; } 2>&1 )"
+        { time { for _ in $(seq 1 "$FastPathCommands"); do run_bounded 5 true >/dev/null 2>&1; done; }; } 2>&1 )"
     # REFUSED unless the reading has the shape `%3R` produces. Measured, and this
     # is the fail-OPEN direction rather than a tidiness check:
     #
@@ -76,13 +130,10 @@ fast_path_ms() {
     # Both would report a healthy bound over a broken one, which is the one
     # outcome this check exists to prevent. `%3R` cannot produce either; a future
     # `TIMEFORMAT` edit can, and it would look like nothing had happened.
-    case "$elapsed" in
-        [0-9]*.[0-9][0-9][0-9]) ;;
-        *)
-            echo "the fast-path timer read '${elapsed}' rather than a duration" >&2
-            return 1
-            ;;
-    esac
+    if ! _is_duration_reading "$elapsed"; then
+        echo "the fast-path timer read '${elapsed}' rather than a duration" >&2
+        return 1
+    fi
     # `%3R` is always `<seconds>.<three digits>`, so DELETING the separator is the
     # millisecond count -- no multiply to keep in step with the width. `10#`
     # because `0.060` would otherwise be read as octal.
@@ -685,7 +736,8 @@ run_case() {
     # TWENTY and not ten, and the count is load-bearing: at ten, the flat-pause
     # defect costs 2.05s, which is too close to the ceiling to separate from a
     # healthy run. The guard written to prove the fixture bites did not bite, on
-    # the first thing it was pointed at.
+    # the first thing it was pointed at. It is `FastPathCommands` and not a
+    # literal in the loop, for the reason stated at that constant.
     #
     # TIMED HERE, not by the driver, which is #678. The driver used to wrap the
     # whole `--case` process in a `SECONDS` delta, and `SECONDS` is a whole
@@ -737,7 +789,7 @@ run_case() {
         # fires on the 3 alone, so it caught a REAL regression about half the
         # time. This one fires on it every time.
         fast_ms="$(fast_path_ms)"
-        echo "twenty immediate commands ran in ${fast_ms}ms (measured, ceiling ${FastPathCeilingMs}ms)"
+        echo "${FastPathCommands} immediate commands ran in ${fast_ms}ms (measured, ceiling ${FastPathCeilingMs}ms)"
         if [ "$fast_ms" -gt "$FastPathCeilingMs" ]; then
             echo "BUG: the bound is sleeping through commands that have already finished"
         fi
@@ -761,16 +813,58 @@ run_case() {
     # an empty array is already the case `run_bounded` handles by falling through
     # to `${...:-$_e2e_poll_pause}`.
     #
+    # It asserts against `FastPathDefectFloorMs` and not against the ceiling
+    # itself, for the reason stated at that constant: a defect that clears the
+    # ceiling by 2.5% has demonstrated no separation, and that is exactly what a
+    # halved `FastPathCommands` would produce.
+    #
     # An ORDINARY ROW rather than a second bespoke block: it asserts a threshold
     # and prints nothing anyone needs on the passing path, so `expect` covers it.
     bounded-fast-path-bites)
         _e2e_bounded_pauses=()
         fast_ms="$(fast_path_ms)"
-        echo "the staged flat-pause defect measured ${fast_ms}ms (ceiling ${FastPathCeilingMs}ms)"
-        if [ "$fast_ms" -le "$FastPathCeilingMs" ]; then
-            echo "BUG: the staged defect came in UNDER the ceiling, so the ceiling"
+        echo "the staged flat-pause defect measured ${fast_ms}ms over ${FastPathCommands} commands (ceiling ${FastPathCeilingMs}ms, floor ${FastPathDefectFloorMs}ms)"
+        if [ "$fast_ms" -le "$FastPathDefectFloorMs" ]; then
+            echo "BUG: the staged defect came in under ${FastPathDefectFloorMs}ms, so the ceiling"
             echo "BUG: no longer separates a healthy run from a broken one"
         fi
+        ;;
+
+    # THE SHAPE GUARD IN `fast_path_ms`, WATCHED REFUSING -- and watched
+    # ACCEPTING, because a predicate that refuses everything passes the refusing
+    # half on its own.
+    #
+    # Every rejected reading here is a WRONG SMALL NUMBER rather than an error:
+    # `0,243` evaluates to 243 through bash's comma operator, and a separatorless
+    # `4` becomes 4ms for four seconds of sleeping. Both would report a healthy
+    # bound over a broken one, which is this check's one intolerable outcome, so
+    # the arm that stops them is asserted rather than assumed. `%3R` produces none
+    # of them today; a `TIMEFORMAT` edit is what produces them tomorrow, and it
+    # would look like nothing had happened.
+    duration-reading-shape)
+        # A TALLY and not a fixed sentence, so the summary line is a second
+        # signal rather than a marker that prints whatever the arms did: a
+        # predicate stuck on one answer moves the count as well as raising
+        # `BUG:`, and the record below asserts both.
+        accepted=0
+        refused=0
+        for reading in 0.000 0.243 12.345; do
+            if _is_duration_reading "$reading"; then
+                accepted=$(( accepted + 1 ))
+            else
+                echo "BUG: '${reading}' is what %3R produces and was refused"
+            fi
+        done
+        # In order: the de_DE separator, no separator at all, nothing at all, two
+        # fractional digits, four of them, a leading diagnostic, a trailing one.
+        for reading in "0,243" "4" "" "0.24" "0.2431" "x0.243" "0.243 stray"; do
+            if _is_duration_reading "$reading"; then
+                echo "BUG: '${reading}' is not a duration and was accepted"
+            else
+                refused=$(( refused + 1 ))
+            fi
+        done
+        echo "the timer shape guard accepted ${accepted} readings and refused ${refused}"
         ;;
 
     # And the child is DEAD, not merely abandoned. A helper that returns 124
@@ -1467,6 +1561,7 @@ cases=(
     "bounded-expires|0|an expired bound exited 124, outcome exceeded"
     "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"
+    "duration-reading-shape|0|accepted 3 readings and refused 7|!BUG:"
     "bounded-fast-path-bites|0|the staged flat-pause defect measured|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
@@ -1625,22 +1720,42 @@ fi
 #                             does NOT use it. Its one `SECONDS` is a comment
 #                             about `wait_until`'s bound; the script itself polls
 #                             through the shared helper.
+#   * `lib/e2e-common.sh`     the library this whole file guards, and the biggest
+#                             match count of any of them -- thirteen. Every one is
+#                             a clock read INSIDE the loop it bounds:
+#                             `deadline=$(( SECONDS + seconds ))` in `run_bounded`,
+#                             `elapsed=$(( SECONDS - started ))` reported by
+#                             `wait_until` and `stop_and_require_exit` and judged
+#                             by `_e2e_verdict` with a second of slack. Not one
+#                             wraps a whole process from outside, which is the
+#                             defect; listed anyway, because "the file with the
+#                             most matches is absent from the survey" is not a
+#                             thing a reader should have to re-derive.
+#   * `tsan-gate.sh`, `node-socket-activation-e2e.sh`, `doc-subject-checks.sh`
+#                             matched by the WORD and not by the idiom: a comment
+#                             about `run_bounded`'s integer `SECONDS`, a
+#                             `READY_SECONDS` budget handed to `wait_until`, and a
+#                             `..._SECONDS` CMake variable named in prose.
 #
 # The scan behind those rows is `grep -rn SECONDS scripts/ --include=*.sh`, which
 # also matches `deadline=$(( SECONDS + N ))` -- the CORRECT idiom, reading a clock
 # rather than timing a process from outside. State the pattern with the count: the
-# two are not distinguishable by grepping for the word.
+# two are not distinguishable by grepping for the word, and the pattern matches
+# SIX files under `scripts/` where the idiom this block is about lives in one.
+# Enumerating three of the six and stopping is the shape this repository already
+# has a rule about -- a list is exact about what it names and silent about what it
+# does not, and silence reads identically to complete coverage.
 echo "== run_bounded does not sleep away the fast path"
 out="$( bash "${BASH_SOURCE[0]}" --case bounded-fast-path 2>&1 )"
 status=$?
 ran=$(( ran + 1 ))
-expect "bounded-fast-path|0|twenty immediate commands ran in|!BUG:" "$out" "$status" \
+expect "bounded-fast-path|0| immediate commands ran in |!BUG:" "$out" "$status" \
     || note_failure "bounded-fast-path"
 # UNCONDITIONALLY, pass included. A bound that prints its figure only when it
 # breaks cannot show its margin eroding until the day it fails -- the same shape
 # as a counter this project exports and nobody scrapes. The number is the
 # evidence; `PASSED` on its own is not.
-sed -n 's/^twenty immediate/   &/p' <<< "$out"
+sed -n 's/^[0-9][0-9]* immediate/   &/p' <<< "$out"
 
 # --- no fixture spells `timeout` again -------------------------------------
 #
