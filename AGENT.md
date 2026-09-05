@@ -799,6 +799,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   absent, unreadable or untrusted.
 - A machine-wide config is obeyed only when only an administrator could have
   written it (`Platform/FileTrust`).
+- That is INTEGRITY. Secrecy is a second question and the same access list cannot
+  answer it: `%ProgramData%\fastcached` grants `BUILTIN\Users` read *inheritably*
+  because the daemon's virtual account is one, and `OICI` handed that read to the
+  one file `InlineCredentialRejection` tells operators to move `requirepass:` into
+  — so the documented remedy relocated the secret (#741). `--seed-config` gives the
+  FILE a protected list of its own (SYSTEM, Administrators, `NT AUTHORITY\SERVICE`
+  read), not the MSI, which cannot reach a file that is not payload. An existing
+  file is repaired only when it is *currently* broadly readable, never by content.
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
 - Which flags carry text *other machines* will read is a column of that table
   (`ParseUtf8Text`). `--cluster-forget` is deliberately out of it, or a bad member

@@ -172,20 +172,31 @@ On **Linux and macOS**, give the file mode `0640` and make it readable by the
 account the service runs as — which is what the macOS installer does to
 `/opt/fastcached/etc/fastcached.yaml`.
 
-On **Windows** the shipped permissions are the other way round: the installer
-locks `C:\ProgramData\fastcached` so that only `SYSTEM` and `Administrators` can
-*write* it, but leaves `Users` able to read, which is the convention for
-`%ProgramData%` and what the daemon's own trust check requires. A `requirepass:`
-written there is therefore readable by every local account. If that matters,
-remove the read entry once the config is in place:
+On **Windows** the installer does it for you, and the directory and the file are
+deliberately different. `C:\ProgramData\fastcached` is locked so that only
+`SYSTEM` and `Administrators` can *write* it — which is what the daemon's own
+trust check requires — while `Users` may still read it, the convention for
+`%ProgramData%`. The **file** does not inherit that: seeding gives
+`fastcached.yaml` an access list of its own, granting `SYSTEM` and
+`Administrators` full control and `NT AUTHORITY\SERVICE` read, and nothing else.
+The service reads it through that last entry.
+
+Upgrading from a version that did not do this repairs the file, but only if it
+is still readable by every local account — a narrower grant you added yourself is
+left alone. Your edits are never touched either way. To check, or to repair a
+file you have re-created by hand:
 
 ```powershell
+icacls C:\ProgramData\fastcached\fastcached.yaml
 icacls C:\ProgramData\fastcached\fastcached.yaml /inheritance:r `
-       /grant *S-1-5-18:F /grant *S-1-5-32-544:F
+       /grant *S-1-5-18:F /grant *S-1-5-32-544:F /grant *S-1-5-6:R
 ```
 
-The daemon runs as `LocalSystem`, so it keeps its access; only the directory,
-not the file, has to stay readable for the trust check.
+Raw SIDs rather than account names, because names are localised: `S-1-5-18` is
+`SYSTEM`, `S-1-5-32-544` is `Administrators`, and `S-1-5-6` is
+`NT AUTHORITY\SERVICE`. Dropping that last grant leaves a file the service cannot
+read, and a daemon that cannot read its configuration starts on built-in defaults
+rather than failing.
 
 ## Editing the installed file
 

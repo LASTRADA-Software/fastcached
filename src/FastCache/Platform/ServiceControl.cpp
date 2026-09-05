@@ -410,13 +410,24 @@ ServiceSpec MakeDaemonServiceSpec(std::filesystem::path const& exePath, CliResul
                          // daemon listening on a socket has no use for any of it.
                          //
                          // The account costs nothing to create because the SCM
-                         // derives it from the service name and manages it itself,
-                         // and it can already read what it needs: the
-                         // %ProgramData%\fastcached access list grants BUILTIN\Users
-                         // read and execute, and a virtual account is an
-                         // Authenticated User. What it cannot do is WRITE there,
-                         // which is the point -- a service that cannot rewrite its
-                         // own configuration cannot be made to load a different one.
+                         // derives it from the service name and manages it itself.
+                         // What it cannot do is WRITE its configuration, which is
+                         // the point -- a service that cannot rewrite its own
+                         // configuration cannot be made to load a different one.
+                         //
+                         // How it READS it has moved. This used to say the account
+                         // "can already read what it needs" because the
+                         // %ProgramData%\fastcached list grants BUILTIN\Users read
+                         // and a virtual account is an Authenticated User -- true,
+                         // and it was also the reason `requirepass:` in that file
+                         // was readable by every local account (#741). The seeded
+                         // config now carries a protected list of its own naming
+                         // NT AUTHORITY\SERVICE, which is what this account reads
+                         // through; see Platform/FileTrust's SecureSecretFileForServices. The
+                         // directory's BUILTIN\Users read stays, and stays for the
+                         // reason it was added -- it is what makes the directory
+                         // traversable at all -- but nothing depends on it for the
+                         // config file any more.
                          .windowsLogon = WindowsLogonAccount::VirtualAccount };
 }
 
