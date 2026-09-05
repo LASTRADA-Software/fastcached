@@ -195,17 +195,20 @@ constexpr std::string_view Worker = "worker:6676";
                                  .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs) }));
 }
 
-/// The base name of `path`, as the client sends it and the worker digests it.
+/// The source name as the client sends it and the worker digests it: the WHOLE path.
 ///
-/// Deliberately restated here rather than reached from `Dispatch.cpp`, so that a
-/// change to which part of the path travels shows up as a failing test instead of
-/// being mirrored automatically into the expectation.
+/// Deliberately restated here rather than reached from `Dispatch.cpp`, so that a change
+/// to which part of the path travels shows up as a failing test instead of being
+/// mirrored automatically into the expectation. It did exactly that at
+/// [#660](https://github.com/LASTRADA-Software/fastcached/issues/660): this used to
+/// return the final component, and the two cases that broke are the two that say what
+/// changed. It is an identity now and stays a named function for that reason -- the next
+/// change to the rule has to come through here too.
 /// @param path The source path as a case spelled it.
-/// @return Its final component.
+/// @return What travels, which is all of it.
 [[nodiscard]] std::string_view SentSourceName(std::string_view path)
 {
-    // `npos + 1 == 0`, so a path with no separator yields the whole string.
-    return path.substr(path.find_last_of("/\\") + 1);
+    return path;
 }
 
 /// What a COMPILE reply says, with every field a case might want to make dishonest.
@@ -765,20 +768,29 @@ TEST_CASE("The arguments the worker receives are the ones it was given", "[dispa
     CHECK(DecodeArgs(Unwrap(compile).args) == args);
 }
 
-TEST_CASE("The worker is told what to call its scratch file, and not where it came from", "[dispatch]")
+TEST_CASE("The client's whole source spelling reaches the worker", "[dispatch]")
 {
-    // A compiler records the name of the file it was handed, so an object built
-    // from a worker-invented name differs from a locally built one in that name
-    // and nothing else -- seven bytes on clang-cl, and none once they agree.
+    // A compiler records the name of the file it was handed, so an object built from a
+    // worker-invented name differs from a locally built one in that name and nothing
+    // else -- seven bytes on clang-cl, and none once they agree.
     //
-    // The DIRECTORY is deliberately not sent. The worker has no use for it and no
-    // business learning where a client's checkout lives, and it could not honour it
-    // if it wanted to: the file it creates is inside its own scratch directory.
+    // **The directory travels too, since #660.** It used to be truncated here, on the
+    // reasoning that a worker "has no use for the client's directory and no business
+    // learning it" -- already inconsistent with the two fields beside it, which carry
+    // exactly that directory and have since #506. What the truncation cost is that
+    // clang takes `DW_AT_name` from the input path rather than from the `#line` marker,
+    // so a dispatched object recorded the worker's per-job scratch: a directory on no
+    // developer's machine, and one that differs between two dispatches of the same
+    // translation unit under one cache key.
+    //
+    // The worker maps its scratch path back to this spelling with a rule. It never
+    // opens it -- `CompileJob_test` is where that is asserted, on the paths the worker
+    // creates.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
     std::vector<std::string> const args { "-O2" };
     auto request = Request(args);
-    request.sourceName = "/home/dev/checkout/src/Widget.cpp";
+    request.sourceName = "../../src/Widget.cpp";
     fleet.Serve(std::string { Worker }, CompileReply(request, "OBJ"));
 
     REQUIRE(Dispatch(fleet, request).Ran());
@@ -787,7 +799,7 @@ TEST_CASE("The worker is told what to call its scratch file, and not where it ca
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
-    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "Widget.cpp");
+    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "../../src/Widget.cpp");
 }
 
 TEST_CASE("The worker is told what this compile records as its compilation directory", "[dispatch]")
@@ -837,8 +849,13 @@ TEST_CASE("A reply about a compile mapped somewhere else is refused", "[dispatch
     CHECK(outcome.status == DispatchStatus::Mismatched);
 }
 
-TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dispatch]")
+TEST_CASE("A Windows-spelled source path travels whole too", "[dispatch]")
 {
+    // Unchanged by this client, separators and drive letter included. What a Windows
+    // spelling means for the FILE the worker creates is `SafeSourceName`'s question,
+    // and it treats `\\` and `:` as separators for exactly that reason -- but that is a
+    // decision made where the string becomes a path, not here, where it is a record of
+    // what the build system wrote.
     ScriptedFleet fleet;
     fleet.Serve(std::string { Scheduler }, GrantReply());
     std::vector<std::string> const args { "-O2" };
@@ -852,7 +869,7 @@ TEST_CASE("A Windows-spelled source path is reduced to its base name too", "[dis
     auto const compile =
         Wire::DecodeCompilePayload(std::span<std::byte const> { toWorker }.subspan(Wire::RequestHeaderSize));
     REQUIRE(compile.has_value());
-    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == "Widget.cpp");
+    CHECK(Wire::AsStringView(Unwrap(compile).sourceName) == R"(D:\checkout\src\Widget.cpp)");
 }
 
 TEST_CASE("The preprocessed source reaches the worker intact", "[dispatch]")

@@ -297,9 +297,15 @@ struct DispatchRequest
     std::string_view objectKey;         ///< The cache key, for duplicate suppression.
     std::span<std::string const> args;  ///< Already filtered by `RemoteCompileArgs`.
     std::string_view preprocessed;      ///< The translation unit, preprocessed.
-    /// The translation unit's path, as the build system spelled it. Only its base
-    /// name travels -- see `Dispatch`, which takes it -- because that is what a
-    /// compiler records in the object and the worker has no use for the rest.
+    /// The translation unit's path, as the build system spelled it, and it travels
+    /// WHOLE (#660).
+    ///
+    /// A compiler with debug info on records the name of the file it was handed, and
+    /// clang takes that from the input path rather than from the `#line` marker -- so
+    /// truncating this to a base name left a dispatched object recording the worker's
+    /// per-job scratch directory, which differs between two dispatches of one
+    /// translation unit under one cache key. The worker maps its scratch path back to
+    /// this spelling; it never opens it and never joins it to a path.
     std::string_view sourceName;
     /// The directory this client's own compile runs in, and what its own
     /// `-fdebug-prefix-map` rules spell that as -- from `MappedCompileDirectory`. Both

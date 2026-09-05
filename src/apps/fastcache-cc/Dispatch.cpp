@@ -15,23 +15,6 @@ namespace
 {
     namespace Wire = CompileCacheWire;
 
-    /// The final component of a path, in either separator style.
-    ///
-    /// The worker is told what to CALL its scratch file, not where the client keeps
-    /// its sources: a compiler records the name it was handed (clang-cl and gcc in
-    /// the `.file` symbol, MSVC in its compiland record), so matching the base name
-    /// is what makes a dispatched object byte-identical to a locally compiled one --
-    /// measured at seven bytes' difference on clang-cl before this, and none after.
-    /// The directory buys none of that and would tell a worker where a client's
-    /// checkout lives.
-    /// @param path The source path as the build system spelled it.
-    /// @return Its final component.
-    [[nodiscard]] std::string_view BaseName(std::string_view path)
-    {
-        auto const slash = path.find_last_of("/\\");
-        return slash == std::string_view::npos ? path : path.substr(slash + 1);
-    }
-
     /// How to name the correlation a worker sent back, in a message an operator reads.
     ///
     /// **The peer's bytes are never echoed unless they are a correlation.** Text a
@@ -127,11 +110,25 @@ namespace
     [[nodiscard]] DispatchResult CompileOnWorker(IEndpointExchange& exchange, LeasedJob const& job)
     {
         auto const argsField = EncodeArgs(job.request.args);
-        // Derived ONCE and used for both the request and the correlation below. The
-        // worker digests the name it was SENT, so a client that sent one spelling and
-        // verified another would refuse every honest reply -- and two `BaseName` calls
-        // beside each other is exactly how that comes about.
-        auto const sourceName = BaseName(job.request.sourceName);
+        // **The client's WHOLE spelling travels, not its base name** (#660). It used to
+        // be truncated here, on the reasoning that a worker "has no use for the client's
+        // directory and no business learning it" -- which was already inconsistent with
+        // its own struct, since `compileDir` and `compileDirReplacement` beside it carry
+        // exactly that directory and have since #506.
+        //
+        // What the truncation cost: clang takes `DW_AT_name` from the input file path,
+        // so a dispatched object recorded the WORKER's scratch, complete with the per-job
+        // counter -- two dispatches of one translation unit giving two different objects
+        // under one cache key. The worker maps that path back to this spelling with a
+        // `-fdebug-prefix-map` rule; it never opens it, and `SafeSourceName` still
+        // decides the file the worker creates.
+        //
+        // No wire change: this is the same field, carrying more of the same fact, and a
+        // worker predating #660 sanitizes what arrives exactly as before. Read ONCE and
+        // used for both the request and the correlation below -- the worker digests the
+        // name it was SENT, so a client that sent one spelling and verified another would
+        // refuse every honest reply.
+        auto const sourceName = job.request.sourceName;
         // Compressed against the WORKER's codecs, which the grant relayed -- not
         // against this client's. The two need not agree, and guessing wrong would
         // only be discovered after the whole preprocessed payload had crossed the

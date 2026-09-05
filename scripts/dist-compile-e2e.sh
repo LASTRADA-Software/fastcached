@@ -1695,14 +1695,31 @@ dwarf_dump_with() {
     printf '%s\n' "$dump"
 }
 
+# The FIRST attribute matching a pattern, in whichever of the three renderings this
+# platform's reader produces.
+#
 # The dump arrives as an ARGUMENT, never on a pipe: `producer | awk` with an exiting
 # awk is a false negative under `set -o pipefail`, and it fails on the success path.
-comp_dir_of() {
-    awk '/comp_dir/ {
+# $1 is the dump, $2 an awk pattern.
+dwarf_attr_of() {
+    awk -v want="$2" '$0 ~ want {
              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
              line = $0; sub(/.*: */, "", line)
              gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
          }' <<< "$1"
+}
+
+comp_dir_of() {
+    dwarf_attr_of "$1" "comp_dir"
+}
+
+# The compile unit's `DW_AT_name`: the source file as the compiler recorded it.
+#
+# The FIRST `AT_name` in the dump, which is the compile unit's -- every function and
+# type carries one too, and the CU DIE is emitted first in all three renderings. It
+# cannot collide with `comp_dir`, which no reader spells with `name` in it.
+source_name_of() {
+    dwarf_attr_of "$1" "AT_name"
 }
 
 # One spelling of the launcher's directory, compiled both ways and compared.
@@ -1775,6 +1792,41 @@ case13_at() {
             cat "${workdir}/worker.log" >&2 || true
             fail "the dispatched object records '${remote_comp_dir}', the local one '${reference_comp_dir}' (${label})"
         }
+
+    # **And the SOURCE NAME the two objects record**
+    # ([#660](https://github.com/LASTRADA-Software/fastcached/issues/660)). A separate
+    # attribute answering a separate question, asserted here because this is the one
+    # place a REAL dispatched object exists to read it out of.
+    #
+    # clang takes `DW_AT_name` from the input file path, so before #660 a dispatched
+    # object recorded the worker's per-job scratch -- `<scratch>/job-N/tu.cpp`, a
+    # directory on no developer's machine, and one whose counter advances between two
+    # dispatches of the same translation unit, giving two byte-differing objects under
+    # one cache key. gcc takes it from the `#line` marker and already agreed, which is
+    # why this must not be read as covering both drivers equally: on gcc it is a
+    # regression guard, on clang it is the ticket.
+    local reference_source_name remote_source_name
+    reference_source_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}-ref.o")")"
+    remote_source_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/thirteen-${label}.o")")"
+
+    [[ -n "$reference_source_name" ]] || fail "the case 13 reference object records no source name (${label})"
+    [[ "$remote_source_name" == "$reference_source_name" ]] \
+        || {
+            echo "--- spelling: ${label}" >&2
+            echo "--- reader: ${dwarf_reader}" >&2
+            echo "--- reference DW_AT_name: '${reference_source_name}'" >&2
+            echo "--- dispatched DW_AT_name:'${remote_source_name}'" >&2
+            # A dispatched name containing `job-` is the pre-#660 shape exactly: the
+            # worker's scratch reached the object because no mapping rule covered the
+            # input path. Named, because the alternative -- some other disagreement --
+            # is a different fault in a different place.
+            case "$remote_source_name" in
+                *job-*) echo "--- this is the pre-#660 shape: the worker's per-job scratch reached the object" >&2 ;;
+            esac
+            cat "${workdir}/case13-${label}.log" >&2 || true
+            fail "the dispatched object records source '${remote_source_name}', the local one '${reference_source_name}' (${label})"
+        }
+    echo "   ${label}: both objects record source '${reference_source_name}' (${dwarf_reader})"
 
     # And the VALUE, where this platform's driver maps the way the rules assume.
     # Separate from the agreement above on purpose: agreement is the ticket's clause

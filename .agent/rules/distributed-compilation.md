@@ -2353,11 +2353,13 @@ covered **raw**, before `SafeSourceName`, so the client is not made a second aut
 of the sanitization rule; that makes the digest finer than strictly required, which
 is safe, where coarser would be a hole.
 
-**The base name is derived once on the client.** The worker digests the name it was
+**The source name is read once on the client.** The worker digests the name it was
 SENT, so a client that sent one spelling and verified another would refuse every
 honest compile -- a fleet that silently stops distributing rather than one that
 mis-serves, which is harder to notice and reads as "distribution just is not
-helping". Two `BaseName` calls beside each other is exactly how that arises.
+helping". Two derivations beside each other is exactly how that arises, which is why
+the field is read once into a local and used twice. Since #660 there is no derivation
+at all: the client's whole spelling travels.
 
 **The refusal is a refusal.** `DispatchStatus::Mismatched` is its own enumerator and
 is checked before the object envelope is opened -- a correlation is a string

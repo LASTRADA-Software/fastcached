@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <latch>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,12 @@ class ScriptedRunner final: public IProcessRunner
     CompileRun RunCaptureSplit(std::span<std::string const> argv) override
     {
         _argv.assign(argv.begin(), argv.end());
+        // Before the stub object is written, so an observer sees exactly what the WORKER
+        // created rather than what this fake added. The scratch directory is removed
+        // when `Run` returns, so a test that looked afterwards would find nothing and
+        // pass whatever the worker had done.
+        if (_onSpawn)
+            _onSpawn();
         if (_exitCode == 0 && _writeObject)
         {
             Test::WriteStubObject(_argv);
@@ -72,6 +79,16 @@ class ScriptedRunner final: public IProcessRunner
     {
         _stderrText = std::move(text);
     }
+    /// Look at the world at the moment the compiler would have been spawned.
+    ///
+    /// The only point at which what the worker WROTE is observable: `ScratchGuard`
+    /// removes the directory however `Run` returns, so a test inspecting the filesystem
+    /// afterwards finds an empty parent and passes regardless.
+    /// @param observer Called with no arguments, before the stub object is written.
+    void ScriptOnSpawn(std::function<void()> observer)
+    {
+        _onSpawn = std::move(observer);
+    }
 
   private:
     int _exitCode { 0 };
@@ -79,6 +96,7 @@ class ScriptedRunner final: public IProcessRunner
     std::string _stdoutText;
     std::string _stderrText;
     std::vector<std::string> _argv;
+    std::function<void()> _onSpawn;
 };
 
 /// A runner that echoes each invocation's own SOURCE back as its object, and does
@@ -302,20 +320,163 @@ TEST_CASE("The worker decides where a byte lands, whatever the client asked to c
 
     auto job = Job();
     job.sourceName = "../../../etc/passwd.cpp";
+
+    // Everything the worker created, captured while the directory still exists:
+    // `ScratchGuard` removes it however `Run` returns, so a test looking afterwards
+    // finds an empty parent and passes whatever happened.
+    std::vector<std::string> created;
+    runner.ScriptOnSpawn([&] {
+        for (auto const& entry: std::filesystem::recursive_directory_iterator { scratch.Path() })
+            created.push_back(std::filesystem::weakly_canonical(entry.path()).generic_string());
+    });
+
     REQUIRE(jobs.Run(job).has_value());
 
-    // The LEAF may be what the client asked for -- that is the feature -- and the
-    // directory may not. So the assertion is containment, not absence: every path
-    // on the command line lies under this worker's own scratch root, and no
-    // parent-directory segment survived to take one back out of it.
     auto const root = std::filesystem::weakly_canonical(scratch.Path()).generic_string();
+
+    // **What the worker WROTE, which is the guarantee.** Every path it created lies
+    // under its own scratch root and carries no parent-directory segment that could
+    // take one back out. This is the assertion the invariant is about: the client may
+    // decide a NAME, and may never decide a directory.
+    REQUIRE_FALSE(created.empty());
+    for (auto const& path: created)
+    {
+        INFO("created: " << path);
+        CHECK(path.starts_with(root));
+        CHECK_FALSE(path.contains(".."));
+    }
+
+    // And the traversal target does not exist, which is the same statement said the
+    // other way round -- a check that would still pass if the worker had created
+    // nothing at all, which is why it stands beside the one above rather than instead
+    // of it.
+    CHECK_FALSE(std::filesystem::exists(std::filesystem::path { root }.parent_path().parent_path() / "etc" / "passwd.cpp"));
+
+    // **The paths on the command line, told apart from the strings on it.** An operand
+    // is a path the compiler opens; a `-fdebug-prefix-map` rule's right-hand side is a
+    // string it records, and since #660 that side carries the client's own spelling --
+    // `../../../etc/passwd.cpp` and all. The two are not the same kind of thing, and a
+    // blanket "no argv entry contains `..`" cannot tell them apart: it passed before
+    // #660 only because nothing yet put a client-sent string on the line.
     for (auto const& arg: runner.Argv())
     {
         INFO("argv entry: " << arg);
-        CHECK_FALSE(arg.contains(".."));
-        if (arg.contains("passwd"))
-            CHECK(std::filesystem::weakly_canonical(arg).generic_string().starts_with(root));
+        auto const rule = arg.starts_with("-fdebug-prefix-map=");
+        if (!rule)
+        {
+            CHECK_FALSE(arg.contains(".."));
+            if (arg.contains("passwd"))
+                CHECK(std::filesystem::weakly_canonical(arg).generic_string().starts_with(root));
+            continue;
+        }
+
+        // The rule's LEFT-hand side is the path the compiler matches, and the worker
+        // derives it from its own scratch. Only the right-hand side is the client's.
+        auto const body = std::string_view { arg }.substr(std::string_view { "-fdebug-prefix-map=" }.size());
+        auto const split = body.find('=');
+        REQUIRE(split != std::string_view::npos);
+        auto const from = body.substr(0, split);
+        INFO("rule <from>: " << from);
+        CHECK_FALSE(from.contains(".."));
+        CHECK(std::filesystem::weakly_canonical(from).generic_string().starts_with(root));
     }
+}
+
+TEST_CASE("A dispatched object records the client's source spelling, not the worker's scratch",
+          "[compile-job][prefix-map][source-name]")
+{
+    // **[#660](https://github.com/LASTRADA-Software/fastcached/issues/660).** clang takes
+    // `DW_AT_name` from the input file path, so a dispatched object recorded
+    // `<scratch>/job-N/tu.cpp` -- a directory on no developer's machine, and one whose
+    // counter advances between two dispatches of the SAME translation unit, giving two
+    // byte-differing objects under one cache key. gcc is unaffected: it takes the name
+    // from the `#line` marker and already records what a local compile does.
+    //
+    // Measured on clang 22.1.8 and gcc 16.2.1, ELF, `readelf --debug-dump=info`: with
+    // this rule the recorded name is the client's spelling exactly, and two dispatches
+    // under different job numbers produce byte-identical objects. Unmapped they differ
+    // at byte 280.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.sourceName = "../../src/Widget.cpp";
+    // A build that also asked for a compilation-directory mapping, because the ORDER
+    // against that rule is what this case is here to pin and there is nothing to order
+    // against without it.
+    job.compileDir = "/home/ci/build";
+    job.compileDirReplacement = ".";
+    REQUIRE(jobs.Run(job).has_value());
+
+    auto const& argv = runner.Argv();
+    auto const rule = std::ranges::find_if(argv, [](std::string const& a) {
+        return a.starts_with("-fdebug-prefix-map=") && a.ends_with("=../../src/Widget.cpp");
+    });
+    REQUIRE(rule != argv.end());
+
+    // **The WHOLE path is mapped, not the directory**, which is the narrowest rule that
+    // works: it matches exactly one path, so it cannot reach `DW_AT_comp_dir` or
+    // anything else, and it survives `SafeSourceName` having renamed the scratch file.
+    // The left-hand side is therefore the input operand, byte for byte.
+    auto const input =
+        std::ranges::find_if(argv, [](std::string const& a) { return a.ends_with("Widget.cpp") && !a.starts_with("-"); });
+    REQUIRE(input != argv.end());
+    CHECK(*rule == std::format("-fdebug-prefix-map={}=../../src/Widget.cpp", *input));
+
+    // **LAST, and the order is what makes it work at all.** Both drivers honour the last
+    // matching rule, and the worker's own directory rule matches the scratch path
+    // whenever the scratch root lies under it. Measured on clang 22.1.8 with both rules
+    // present: this one FIRST gives `./scratch/job-7/tu.cpp`, still broken; this one
+    // LAST gives `../src/tu.cpp` with `DW_AT_comp_dir` still `.`.
+    CHECK(rule > std::ranges::find_if(
+              argv, [](std::string const& a) { return a.starts_with("-fdebug-prefix-map=") && a.ends_with("=."); }));
+}
+
+TEST_CASE("Two dispatches of one translation unit record the same source name", "[compile-job][prefix-map][source-name]")
+{
+    // The ticket's second consequence, which is the one that matters: the scratch
+    // directory carries a per-job counter, so before #660 two dispatches of the same
+    // translation unit to the same worker produced objects differing in their recorded
+    // name -- stored under one cache key, so which bytes won was a race and a rebuild
+    // that ought to be a no-op was not.
+    //
+    // It falls out of the rule above rather than needing a mechanism of its own:
+    // mapping the scratch path away removes `job-N` from the recorded name entirely.
+    // Asserted on the RULE rather than by comparing objects, which is this repository's
+    // standing instruction -- every MSVC driver stamps the clock into the COFF header,
+    // so a byte comparison reports a wrong object on every hit.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.sourceName = "../../src/Widget.cpp";
+
+    auto const recordedNameOf = [&](std::vector<std::string> const& argv) {
+        auto const rule =
+            std::ranges::find_if(argv, [](std::string const& a) { return a.starts_with("-fdebug-prefix-map="); });
+        REQUIRE(rule != argv.end());
+        return rule->substr(rule->find_last_of('=') + 1);
+    };
+
+    REQUIRE(jobs.Run(job).has_value());
+    auto const first = runner.Argv();
+    REQUIRE(jobs.Run(job).has_value());
+    auto const second = runner.Argv();
+
+    // The counter DID advance, or this case proves nothing: two runs that happened to
+    // share a scratch directory would agree for the wrong reason.
+    auto const scratchOf = [](std::vector<std::string> const& argv) {
+        auto const input = std::ranges::find_if(
+            argv, [](std::string const& a) { return a.ends_with("Widget.cpp") && !a.starts_with("-"); });
+        REQUIRE(input != argv.end());
+        return std::filesystem::path { *input }.parent_path().filename().string();
+    };
+    REQUIRE(scratchOf(first) != scratchOf(second));
+
+    CHECK(recordedNameOf(first) == recordedNameOf(second));
+    CHECK(recordedNameOf(first) == "../../src/Widget.cpp");
 }
 
 TEST_CASE("The worker gives its scratch file the name the client asked for", "[compile-job]")
@@ -1287,22 +1448,42 @@ TEST_CASE("A run appends both mappings after the client's own arguments", "[comp
     CHECK(atOwn < std::ranges::find(argv, "-c"));
 }
 
-TEST_CASE("A run asked for no mapping puts no such flag on the line", "[compile-job][prefix-map]")
+TEST_CASE("A run asked for no mapping gets no DIRECTORY rule on the line", "[compile-job][prefix-map]")
 {
-    // The spelling comes off the table rather than a literal, so this negative stays
-    // true of a second prefix-map row rather than passing because it is looking for the
-    // wrong flag.
+    // The subject is the compilation-directory pair: a build that asked for no mapping
+    // must not have one invented for it, or a worker hands a client that requested
+    // nothing an object recording a directory neither machine has -- #506 pointing the
+    // other way.
+    //
+    // **The source-name rule is a different question and is expected here** (#660). It
+    // repairs a name this worker's own scratch layout put into the object rather than
+    // honouring anything the client asked for, so it is emitted for a build that maps
+    // nothing at all -- which is exactly the build whose dispatched object was recording
+    // `job-N`. Told apart by its `<from>`, which is a path under this worker's scratch;
+    // a directory rule's is the client's.
+    //
+    // The spelling comes off the table rather than a literal, so this stays true of a
+    // second prefix-map row rather than passing because it is looking for the wrong flag.
     ScriptedRunner runner;
     ScratchDirectory scratch { "fc-jobtest" };
     CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
 
     REQUIRE(jobs.Run(Job()).has_value());
+    auto const root = std::filesystem::weakly_canonical(scratch.Path()).generic_string();
     for (PathValueFlag const& row: PathValueFlags())
     {
         if (row.role != PathValueRole::PrefixMap)
             continue;
         INFO("row: " << row.spelling);
-        CHECK(std::ranges::none_of(runner.Argv(), [&](std::string const& arg) { return arg.starts_with(row.spelling); }));
+        for (auto const& arg: runner.Argv())
+        {
+            if (!arg.starts_with(row.spelling))
+                continue;
+            INFO("argv entry: " << arg);
+            auto const body = std::string_view { arg }.substr(std::string_view { row.spelling }.size() + 1);
+            auto const from = body.substr(0, body.find(row.valueTailSeparator));
+            CHECK(std::filesystem::weakly_canonical(from).generic_string().starts_with(root));
+        }
     }
 }
 
