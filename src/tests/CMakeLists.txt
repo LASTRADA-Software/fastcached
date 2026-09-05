@@ -688,7 +688,21 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 #
 # Not labelled "smoke", for the reason the checks above are not: it reads source
 # files and reports, so it belongs in the default `ctest` set and must survive
-# `ctest -LE smoke`. It starts nothing and finishes in well under a second.
+# `ctest -LE smoke`. It starts nothing.
+#
+# WHAT IT COSTS IS A PROPERTY OF THE FILESYSTEM, NOT OF THIS CHECK, so no number
+# lives here (#665). This comment used to say it "finishes in well under a
+# second", which is true on ext4 and on CI and is two orders of magnitude wrong on
+# a 9p checkout, where it has been measured at 60.9 s against this 60 s budget --
+# and only ever exceeds it while a SECOND lane's gate runs, which is ordinary
+# practice here. A reader meeting a timeout was then told by the most confident
+# statement in the tree that the duration they had just observed was impossible,
+# and went looking at the machine.
+#
+# The conditions and the figures are one table, in
+# `.agent/rules/build-and-toolchain.md` under "Read that figure with its
+# conditions". Point at it; never copy a number out of it, which is what produced
+# three live figures for one check in #479 and this comment in #665.
 add_test(
     NAME "byte-order-qualifier"
     COMMAND ${CMAKE_COMMAND}

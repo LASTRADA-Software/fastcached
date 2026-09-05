@@ -63,13 +63,14 @@ determinism rests on.
   is per `stat` on a filesystem where each crosses a translation layer, so it is
   invisible on CI and on ext4 and it varies with page-cache warmth:
 
-  | check | standalone | single gate | two lanes | budget |
-  |---|---|---|---|---|
-  | `sccache-backend-caveat`, before #502 | 78.7 s | 60.0 s (timeout) | -- | 60 s |
-  | `sccache-backend-caveat`, after #502 | 4.0-5.1 s | -- | **53-57 s** (#479, three or four lanes) | 180 s |
-  | `byte-order-qualifier` | 19.6 s | 28.6 s | **60.9 s** | 60 s |
-  | `worker-refusals-counted` | 5.5 s | 9.7 s | -- | 60 s |
-  | `net-boundary` | 4.0 s | 8.6 s | -- | 60 s |
+  | check | filesystem | standalone | single gate | two lanes | budget |
+  |---|---|---|---|---|---|
+  | `sccache-backend-caveat`, before #502 | 9p | 78.7 s | 60.0 s (timeout) | -- | 60 s |
+  | `sccache-backend-caveat`, after #502 | 9p | 4.0-5.1 s | -- | **53-57 s** (#479, three or four lanes) | 180 s |
+  | `byte-order-qualifier` | 9p | 19.6 s | 28.6 s | **60.9 s** | 60 s |
+  | `byte-order-qualifier` (#665) | **local ext4** | **0.217 s** | -- | **0.837 s** worst under load | 60 s |
+  | `worker-refusals-counted` | 9p | 5.5 s | 9.7 s | -- | 60 s |
+  | `net-boundary` | 9p | 4.0 s | 8.6 s | -- | 60 s |
 
   The two `sccache-backend-caveat` rows are the same check on the same filesystem with
   the redundant traversals removed in between, and they are the argument for reading the
@@ -79,6 +80,25 @@ determinism rests on.
   read the one whose conditions you are in, which is what the header row is for. The
   53-57 s column is the one figure here neither lane could afterwards reproduce, the
   machine having gone quiet — so it is DERIVED conditions, recorded as such.
+
+  **The ext4 row is the falsification the model wanted, and it is why a filesystem
+  column now exists.** Same check, same 645 files, same day: **0.217 s** quiet (8 runs,
+  worst 0.223 s) and **0.655 s** average under load with a worst of **0.837 s** (8 runs,
+  load average bracketed at 6.8 rising to 9.7). Both MEASURED, not derived. Against the
+  9p row's 60.9 s that is a factor of roughly 280 for the standalone figure — and the
+  check, the corpus and the code are identical, so **every one of these numbers is a
+  reading of a filesystem and none is a property of a check.** A reader on ext4 who
+  measures 0.2 s and concludes the budget is generous has made the same mistake as one
+  on 9p who measures 28.6 s single-gate and concludes it is comfortable; both read a row
+  that was not theirs.
+
+  That is also why `byte-order-qualifier`'s registration comment said *"finishes in well
+  under a second"* and went unchallenged for so long
+  ([#665](https://github.com/LASTRADA-Software/fastcached/issues/665)): on the author's
+  filesystem it was **true**, and it is true on CI. An assertion that is correct
+  everywhere its author can run it, and two orders of magnitude wrong where the gate
+  actually fails, has nothing that can falsify it from the inside — which is the same
+  observation #479 made about the number it replaced.
 
   One traversal of `src/` is **2.09 s** (stable to 16 ms over five runs), and
   38 x 2.09 = 79 s predicted 78.7 s measured -- the model is falsifiable, which is what

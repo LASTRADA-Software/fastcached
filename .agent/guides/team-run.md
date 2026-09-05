@@ -77,6 +77,23 @@ Each of these is a scar, not a preference.
 
 - **Nobody touches `D:/fastcached`.** It is the main checkout and other sessions hold
   uncommitted work in it.
+- **`Closes #A and #B` closes only `#A`.** GitHub needs the keyword before *each*
+  number, so `and #B` parses as a plain reference and that ticket stays open after its
+  fix has merged. Write `Closes #A, closes #B`.
+
+  It went unnoticed on #757 through both a self-review and a manager review, because
+  **the sentence reads as if it closed both** — the same shape as a fabricated SHA:
+  right form, plausible, and nothing in the PR, the merge or the ticket disagrees. Only
+  counting the closed issues afterwards does.
+
+  And when a ticket is found still open after its PR merged, **establish which of three
+  it is before acting**: already fixed and merely not auto-closed, deliberately out of
+  that PR's scope, or a genuine remainder. #337 was the first, and saying so took two
+  checks — that the delivered text is in master, *and* that nothing else the ticket asks
+  for is missing. There the second check was a `grep` of `scripts/` and `.github/`
+  proving no committed watcher carried the bad predicate, which is what established that
+  the guide entry was the whole fix rather than the documentation half of one. **A ticket
+  closed on "the docs landed" when code was also needed is a hole with a green tick.**
 - **Nobody restarts the local `FastCacheCompileNode` service.** Every developer's build
   goes through it. A ticket needing a restart or reinstall goes back to the manager, who
   serialises it.
