@@ -63,6 +63,26 @@ fast_path_ms() {
     local elapsed
     elapsed="$( export LC_ALL=C; TIMEFORMAT='%3R'
         { time { for _ in $(seq 1 20); do run_bounded 5 true >/dev/null 2>&1; done; }; } 2>&1 )"
+    # REFUSED unless the reading has the shape `%3R` produces. Measured, and this
+    # is the fail-OPEN direction rather than a tidiness check:
+    #
+    #   * a comma reading -- `0,243`, what a `de_DE.UTF-8` that survived the
+    #     `LC_ALL=C` above would give -- evaluates to **243**, because bash's
+    #     arithmetic reads `,` as the COMMA OPERATOR and yields its right-hand
+    #     side. Not an error. A wrong small number that passes the ceiling.
+    #   * a reading with no separator at all -- `4` -- becomes 4 milliseconds
+    #     for four seconds of sleeping, and also passes.
+    #
+    # Both would report a healthy bound over a broken one, which is the one
+    # outcome this check exists to prevent. `%3R` cannot produce either; a future
+    # `TIMEFORMAT` edit can, and it would look like nothing had happened.
+    case "$elapsed" in
+        [0-9]*.[0-9][0-9][0-9]) ;;
+        *)
+            echo "the fast-path timer read '${elapsed}' rather than a duration" >&2
+            return 1
+            ;;
+    esac
     # `%3R` is always `<seconds>.<three digits>`, so DELETING the separator is the
     # millisecond count -- no multiply to keep in step with the width. `10#`
     # because `0.060` would otherwise be read as octal.
