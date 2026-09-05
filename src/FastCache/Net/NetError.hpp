@@ -65,14 +65,19 @@ struct NetError
 /// only the obvious one is correct on one platform and silently wrong on the other.
 ///
 /// It lives here, beside the enum, because the question was open-coded
-/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)). It was open-coded at TWO sites in two subsystems -- `Server/AdminHttpServer.cpp` and
-/// `Consensus/RaftPeerServer.cpp` -- with a third, `apps/fastcache-compile-node/FrameEndpoint.cpp`,
-/// testing `WouldBlock` alone and RIGHT to: that listener has no poll timeout, so
-/// the other code cannot arrive there, and its own comment says so. The pattern is
-/// `git grep -nE '(==|!=) *(NetErrorCode::)?(WouldBlock|Timeout)\b' -- src/`, stated
-/// because a census without its pattern is a number nobody can reproduce.
-/// A dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary`
-/// line.
+/// ([#824](https://github.com/LASTRADA-Software/fastcached/issues/824)) at TWO sites
+/// in two subsystems -- `Server/AdminHttpServer.cpp` and
+/// `Consensus/RaftPeerServer.cpp`. A third,
+/// `apps/fastcache-compile-node/FrameEndpoint.cpp`, tests `WouldBlock` alone and is
+/// RIGHT to: that listener has no poll timeout, so the other code cannot arrive
+/// there, and its own comment says so.
+///
+/// The census travels with the pattern that produced it, because a number nobody can
+/// reproduce is one the next person re-derives differently:
+///
+///     git grep -nE '(==|!=) *(NetErrorCode::)?(WouldBlock|Timeout)\b' -- src/
+///
+/// A dependency-free leaf in `Net/`, so it costs nothing at the `net-boundary` line.
 ///
 /// It says nothing about *whose* deadline: a caller that must tell "I gave up" from
 /// "the peer went away" asks its own timer, which is what `SocketDeadlineTarget`

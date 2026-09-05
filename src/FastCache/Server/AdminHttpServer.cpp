@@ -168,9 +168,8 @@ namespace
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Complete, .status = {}, .body = {} },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Idle, .status = {}, .body = {} },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::PeerGone, .status = {}, .body = {} },
-        AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Truncated,
-                              .status = "408 Request Timeout",
-                              .body = "request timed out\n" },
+        AdminHeadOutcomeRow {
+            .outcome = AdminHeadOutcome::Truncated, .status = "408 Request Timeout", .body = "request timed out\n" },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::Malformed, .status = "400 Bad Request", .body = "bad request\n" },
         AdminHeadOutcomeRow { .outcome = AdminHeadOutcome::TooLarge,
                               .status = "431 Request Header Fields Too Large",
@@ -318,8 +317,7 @@ namespace
                 // oversize client.
                 if (!IsDeadlineExpiry(result.error().code))
                     co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
-                co_return RequestHead { .outcome = buffer.empty() ? AdminHeadOutcome::Idle
-                                                                  : AdminHeadOutcome::Truncated };
+                co_return RequestHead { .outcome = buffer.empty() ? AdminHeadOutcome::Idle : AdminHeadOutcome::Truncated };
             }
             if (*result == 0)
                 break;

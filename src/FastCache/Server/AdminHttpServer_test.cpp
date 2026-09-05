@@ -446,8 +446,7 @@ TEST_CASE("AdminHttp: a peer that closed without sending is closed, not refused"
     REQUIRE(ExchangeMaybeSilent({}).empty());
 }
 
-TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served truncated",
-          "[metrics][http][admin][idle]")
+TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served truncated", "[metrics][http][admin][idle]")
 {
     // The second route to the defect the 431 closes, and the more reachable one: a
     // prefix whose request line has arrived parses and routes, so the head is served
