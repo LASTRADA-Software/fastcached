@@ -1896,14 +1896,6 @@ worth acting on is worth one clause saying which of the two it is.
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
-- **[#200](https://github.com/LASTRADA-Software/fastcached/issues/200)** — `cl`
-  localizes its banner, and since [#195](https://github.com/LASTRADA-Software/fastcached/issues/195)
-  that banner is the compiler's identity, so two machines holding one toolset under
-  different Visual Studio language packs share nothing and match nothing. Correct but
-  needlessly conservative. The fix is `VSLANG=1033` on the PROBE alone, which needs
-  per-spawn environment on `IProcessRunner` -- setting it process-wide would change the
-  language of the diagnostics the operator sees. Not token extraction: no rule over
-  "the version-looking word and the last one" survives a locale nobody has read.
 - **[#800](https://github.com/LASTRADA-Software/fastcached/issues/800)** — a client
   whose source argument is ABSOLUTE and whose line carries a matching
   `-fdebug-prefix-map` records the mapped spelling locally, while the dispatched object
@@ -1915,10 +1907,6 @@ worth acting on is worth one clause saying which of the two it is.
   documented for the working directory only -- and the reason it was not folded into
   #660 is that its only call site is `main.cpp`, which no test can reach. No wire field
   either way.
-- **[#64](https://github.com/LASTRADA-Software/fastcached/issues/64)** — a
-  relative include-dir argument still reaches the key verbatim through
-  `RelativizeArgs`, so two build trees at different depths key apart on the
-  arguments even though their dependency sets now agree.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

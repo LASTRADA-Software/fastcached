@@ -3677,6 +3677,90 @@ inspected; `gh pr update-branch --rebase` is what converges a queue. And where t
 branches are in flight at once, the second one's green is provisional until it has
 been built on the first.
 
+## A rulebook entry that has gone false instructs the next person
+
+Every `## Open work` entry in this directory names an issue that is still open, and
+`ctest -R rulebook-open-work` is what says so. Seven of thirty-nine did not when the
+check was written (#619) -- and the cost is not the minute a reader spends on a
+finished residual. It is the shape #395 found: an entry asserting that a field's
+borrow *"cannot be tested"*, with a plausible short-string-optimisation argument
+attached, in a file `AGENT.md` routes every session to before they touch `Net/` or
+`Protocol/`. The rulebook was telling the next person **not to attempt** the guard,
+in the register of a current argument rather than a stale one. An ASan trace
+disproved it directly: allocated, freed, read, three lines apart.
+
+Four things about that check are load-bearing, and three of them are the difference
+between a check and a check-shaped thing that passes:
+
+- **An entry is the bullet's LEADING reference; a citation in its prose is not one.**
+  #619's own measurement named `#195` twice as a stale entry. Both are citations
+  inside *another* bullet -- "#200 … since #195 that banner is the compiler's
+  identity" -- naming the landed change that CREATED the residual, and both are
+  correct as written. A check built to that description invents findings on a correct
+  rulebook, somebody edits a correct entry to satisfy it, and it gets disabled for
+  noise. What makes the narrow reading safe is the refusal beside it: a top-level
+  bullet in such a section that opens with no issue link is `unparsed-entry`, so a
+  reformatted bullet cannot quietly leave the scanned set.
+- **The object's KIND is asserted, not only its state.** `gh issue view <n>` falls
+  back to pull requests and so does `repos/{owner}/{repo}/issues/N`. The failure is
+  asymmetric: a MERGED pull request answers `closed`, fails a `state == open` test,
+  and *looks like the check working* -- while an OPEN one answers `open` and passes
+  while naming no issue at all. Resolving to the wrong kind of object is a way of not
+  having resolved it.
+- **There are FOUR outcomes: pass, stale, bad-reference, could-not-run.** Measured:
+  a nonexistent issue, a repository that is not there, and a bad token all exit 1
+  with an empty result, and **two of those three are faults in the checker's own
+  invocation**. Reading `exit != 0` as *this entry names a dead issue* makes the
+  check blame its subject for its own fault -- it invents a finding, and the repair
+  is somebody editing a correct entry. The verdict comes from the HTTP status, and
+  `gh api rate_limit` is asked first as a liveness anchor, so a broken checker is
+  told from a broken rulebook before either could be blamed. Without that anchor one
+  typo in a repository slug is a 404 on every entry: thirty-nine findings from one
+  mistake, each of them saying the wrong thing.
+- **A self-test whose only negative case is a closed issue passes under all three of
+  those bugs.** `rulebook-open-work-selftest` drives a case per outcome against a
+  stub `gh`, plus the open-PR and merged-PR cases, plus a control that must PASS and
+  a citation-of-a-closed-issue case that must also pass.
+
+And the markdown side is where a narrow pattern hides, which is the same defect one
+layer down. Four shapes were measured passing a closed issue or refusing a correct
+file before they were fixed, none of them exotic: a `*` or `+` bullet, or a
+one-space-indented `-`, was not a *bullet* at all — so it became no entry AND reached
+no refusal, and simply vanished; a fenced markdown SAMPLE containing `## Open work`
+opened a real section, so the check reported `stale` about a documentation example
+and told the reader to delete it (`README.md` carries such a sample); a fenced repro
+block inside a real section was refused as `unparsed-entry`; and a heading test of
+`^#` rather than `^#+ ` refused wrapped prose beginning `#340; …`, of which this
+rulebook has four lines. An emptied section was also only refused when the whole FILE
+emptied. The lesson is the one the refusal was written for: **a refusal is only as
+wide as the pattern that feeds it**, and every one of these was found by constructing
+the input and running it rather than by reading.
+
+The network decision is explicit rather than implied. `rulebook-open-work` is the
+grammar and opens no socket, so it is in the default set; `rulebook-open-work-state`
+resolves and is `smoke`. Folding the first into the second would make a machine
+without `gh` skip the assertions that need nothing. What may skip is bounded to a
+missing PREREQUISITE detected BEFORE any entry is resolved; a fault appearing
+mid-run, with some entries already resolved, is a FAILURE, because a partial answer
+over a set is not an answer about the set. A repository probe that fails on anything
+but 404 is the prerequisite case and not a finding — it shares a rate limit and a
+transport with every query behind it, so treating it as one is a new way for a
+healthy rulebook to go red.
+
+And the GRAMMAR half carries the `docs-subject` label, which is load-bearing rather
+than tidy: `ci-scope.sh` classifies `.agent/**` as docs-only, every `linux` job is
+gated on that, so a pull request editing only `.agent/rules/*.md` runs **no ctest at
+all** — the ungated doc-subject step is the only thing that runs. Unlabelled, this
+check would be green-by-absence on exactly the change class that edits an Open work
+entry. The resolving half stays out, because that step is inside the required
+`Check C++ style` context and a required context that needs credentials and a network
+fails for reasons that are not about the tree.
+
+An emptied or renamed heading is refused for the reason `node-config-reference`
+carries: two empty lists agree perfectly, so a `## Open Work` or a heading with
+nothing under it would take one file's entries out of the scanned set forever while
+the total stayed healthy.
+
 ## Open work
 
 - **[#723](https://github.com/LASTRADA-Software/fastcached/issues/723)** — nothing

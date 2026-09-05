@@ -1355,6 +1355,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   sits next to the implementation, so a report that counts it measures the tests
   testing themselves. A compiler cache and coverage cannot be combined — a
   replayed object's embedded mapping names the tree it was built in.
+- A rulebook `## Open work` entry names an OPEN issue, or it is a rule that has gone
+  false — the expensive shape being an entry saying something *cannot* be done, which
+  instructs the next session not to try (#395). `ctest -R rulebook-open-work`. The ENTRY
+  is a bullet's LEADING reference; a citation in its prose names the landed change that
+  produced the residual and is correctly closed — #619's own body called two of those
+  stale. `gh` falls back to PULL REQUESTS, asymmetrically: a merged one answers `closed`
+  and looks like the check working, an **open** one answers `open` and PASSES while
+  naming no issue — so the KIND is asserted too. FOUR outcomes, not two, and of the
+  three that share exit 1 with an empty result, **two are the checker's own fault** —
+  read as *stale* they invent a finding somebody then edits a correct entry to satisfy,
+  so the verdict is the HTTP status behind a `rate_limit` liveness anchor. A self-test
+  whose only negative case is a closed issue passes under all three. Grammar in the
+  default set, resolution in `smoke`; only a PREREQUISITE missing before any entry
+  resolved may skip.
 - A branch BEHIND master is unverified, and only a build says otherwise: its green
   checks are a true statement about the tree it was branched from, and stay one however
   often they are re-read. Neither shortcut works. **How far behind is not a measure of

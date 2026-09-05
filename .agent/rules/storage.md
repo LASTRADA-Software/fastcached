@@ -309,20 +309,3 @@ describes stops at the first commit that reclaims a page.
 
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
-
-## Open work
-
-- [#135](https://github.com/LASTRADA-Software/fastcached/issues/135) — a store
-  file takes no inter-process lock, so nothing stops a conversion running against
-  a store a daemon has open. Both `--migrate-storage` and `--migrate-cache`
-  document "run it stopped"; that is documentation standing in for a guard.
-- [#633](https://github.com/LASTRADA-Software/fastcached/issues/633) — the
-  startup diagnostics `docs/operations/corrupt-store.md` quotes verbatim. The
-  half this layer composes is pinned: `CowTreeStorage_test` asserts a
-  `Corrupt`-at-open carries `context=FilePageStore::Open` and renders as the
-  exact line the page quotes. The sentences that WRAP it are built in `src/apps/`
-  and are asserted by nothing — **three** spellings, not two, and the page's own
-  headline example is one of them: `failed to open storage '<path>'` and
-  `failed to open shard '<path>'` (both from `StorageOpenFailure`, which takes the
-  noun as a parameter) plus the node's `--cache-dir cannot open ...; refusing to
-  start`.

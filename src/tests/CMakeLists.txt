@@ -1795,6 +1795,101 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# A rulebook `## Open work` entry still names OPEN work.
+#
+# `.agent/rules/` exists because every rule in it has already been a bug, so an
+# entry that has gone false is a rule that has gone false. The cheap version costs
+# a reader a minute; the expensive one is #395, where the entry asserted a borrow
+# "cannot be tested" with a plausible argument attached, in a file `AGENT.md`
+# routes every session to before they touch `Net/`. Seven of thirty-nine entries
+# named closed issues when this was written.
+#
+# THREE registrations, because they answer three different questions and one of
+# them needs the network:
+#
+#   * `rulebook-open-work` is the GRAMMAR -- the sections, the bullets, the
+#     link/URL agreement, the renamed-heading and emptied-section refusals and the
+#     non-empty assertions. It opens no socket, so it is in the default set.
+#   * `rulebook-open-work-state` RESOLVES each entry, and is the only part that
+#     can skip. Folding it into the one above would make a machine without `gh`
+#     skip the assertions that need nothing -- a skipped required thing reading as
+#     a passed one.
+#   * `rulebook-open-work-selftest` drives a case per outcome against a stub `gh`.
+#     A suite whose only negative case is a closed issue passes under all three of
+#     the bugs this check is built around (the pull-request fallback, three faults
+#     sharing one exit status, and the checker blaming its subject for its own
+#     fault), so the cases are per OUTCOME and two of them must PASS.
+#
+# The GRAMMAR half is labelled `docs-subject` and the RESOLVING half is not, and
+# the split is the point rather than a compromise.
+#
+# `ci-scope.sh` classifies `.agent/**` as docs-only and every `linux` job is
+# gated on that, so a pull request editing only `.agent/rules/*.md` runs no ctest
+# at all -- the ungated `doc-subject-checks.sh` step is the only thing that runs.
+# This check's subject IS `.agent/rules/*.md`, so without the label it would be
+# green-by-absence on exactly the change class that edits an Open work entry,
+# which is #687 word for word.
+#
+# `rulebook-open-work-state` must NOT join it: that step is inside the required
+# `Check C++ style` context, and a required context that needs `gh`, credentials
+# and a network is a required context that fails for reasons unrelated to the
+# tree. The grammar half opens no socket, which is what makes it eligible.
+#
+# This is the first check in that set whose subject is prose AND whose
+# implementation is bash. That combination was impossible until #812 taught
+# `doc-subject-checks.sh` the `bash <script>` spelling alongside `cmake -P`;
+# #814 was filed for it here and #812 closed it first.
+#
+# `if(NOT WIN32)` for the reason `ci-scope` and `e2e-helpers-selftest` carry it:
+# the script is POSIX, and a Windows counterpart would be a translation rather
+# than new coverage.
+if(NOT WIN32)
+    add_test(
+        NAME "rulebook-open-work"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --extract
+    )
+    set_tests_properties("rulebook-open-work" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # `smoke`, because it is the one registration that needs `gh`, credentials and
+    # a network, and it must survive `ctest -LE smoke` being unavailable to it.
+    #
+    # `SKIP_RETURN_CODE 77` is load-bearing rather than copied from its
+    # neighbours: without it ctest scores the missing-prerequisite exit as a
+    # FAILURE, which is a false RED on exactly the constrained runners where the
+    # prerequisite is absent -- and whoever meets it deletes the skip rather than
+    # suspecting the registration (#499).
+    #
+    # MEASURED: 39 entries, one repository probe and one liveness anchor cost
+    # 19s wall on a warm connection from this host on 2026-09-05, almost all of it
+    # round-trip latency rather than CPU (2.4s user). The bound is 5x that, since
+    # the quantity that varies is the network and not the tree.
+    add_test(
+        NAME "rulebook-open-work-state"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --resolve
+    )
+    set_tests_properties("rulebook-open-work-state" PROPERTIES
+        LABELS "hygiene;smoke"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 100
+    )
+
+    add_test(
+        NAME "rulebook-open-work-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --self-test
+    )
+    set_tests_properties("rulebook-open-work-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+
+# ---------------------------------------------------------------------------
 # A full clang-tidy sweep still happens somewhere, and it still reaches a person.
 #
 # Since #554 a pull request and a merge-queue entry both diff-scope, and the

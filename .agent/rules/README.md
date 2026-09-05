@@ -56,6 +56,23 @@ file's `## Open work` section — a residual recorded only in prose is one nobod
 diffs. An *accepted trade-off* is different and does belong here, under
 `## Accepted trade-offs`, so that nobody "fixes" it without reopening the argument.
 
+An entry there is a top-level bullet whose **leading** reference is the issue:
+
+```
+- **[#123](https://github.com/LASTRADA-Software/fastcached/issues/123)** — what is left.
+```
+
+`ctest -R rulebook-open-work` reads that grammar and `rulebook-open-work-state`
+resolves each one, because an entry whose issue has since closed is a rule that has
+gone false — and the expensive version of that is an entry saying something *cannot*
+be done, which instructs the next session not to try. Further issue links inside a
+bullet's prose are citations and are deliberately not resolved: naming the closed
+change that produced the residual is correct. The heading is spelled `## Open work`
+exactly, and a section with no entries under it is refused rather than tolerated —
+delete the heading when the last entry goes, or the file leaves the scanned set
+without anything saying so. The reasoning is in
+[`build-and-toolchain.md`](build-and-toolchain.md).
+
 ## Do not `@`-import these
 
 `CLAUDE.md` imports `AGENT.md`, and Claude Code resolves `@` imports recursively.

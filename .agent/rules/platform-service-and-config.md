@@ -821,22 +821,6 @@ boot, silently, because a registration replays its command line forever. So:
 
 ## Open work
 
-- **[#384](https://github.com/LASTRADA-Software/fastcached/issues/384)** — the
-  worker's configuration file is obeyed whatever its mode, so anyone who can write
-  it decides what the worker runs and which compilers it serves. `Platform/FileTrust`
-  already answers this question for the daemon's machine-wide file and is not
-  consulted here. Stated in the flag's own help text, in the shipped reference and in
-  the operator docs rather than left to be discovered.
-- **[#396](https://github.com/LASTRADA-Software/fastcached/issues/396)** —
-  `WithScopeDefaults` decides two things from one bit. `ServiceSpec::applicationName`
-  means both "this service keeps files" and "it takes `--config` AND `--storage`", and
-  the worker is the first service that is file-configured with no `--storage`. It
-  therefore leaves the field empty — naming an application would bake a `--storage=`
-  into every user-scope registration, and the job would answer its own command line
-  with "unrecognised argument" at every start. What that costs is the system-scope
-  `--config=` default (emitted by `MakeNodeServiceSpec` itself instead) and the
-  install-time `ServiceAccountReadDenial` check on it, which nothing now performs for
-  the worker.
 - **[#397](https://github.com/LASTRADA-Software/fastcached/issues/397)** — the
   worker's configuration file is packaged on Linux only. A `.pkg` and an MSI
   have no conffile mechanism, so their equivalent is a `.default` plus a postinstall

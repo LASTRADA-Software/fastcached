@@ -1358,8 +1358,3 @@ output.
   correct on bash 4, silently inert on macOS 3.2, where a `fail` inside `( ... )`
   then ends only the subshell. Allowlisted in `check-e2e-helpers.sh`'s
   helper-collision scan until it takes the shared `fail`.
-- **[#628](https://github.com/LASTRADA-Software/fastcached/issues/628)** —
-  `migrate-storage-e2e.sh` keeps its own `fail` and, worse, spells `free_port` as
-  `port` and draws 40000–59999, entirely inside Linux's default ephemeral range.
-  The name scan cannot see the second one, which is why its allowlist row says so
-  in prose.
