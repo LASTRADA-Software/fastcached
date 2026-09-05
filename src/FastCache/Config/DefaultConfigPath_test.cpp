@@ -2,6 +2,7 @@
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
+#include <FastCache/Platform/FileTrust.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -631,6 +632,76 @@ TEST_CASE("SeedConfigFile: AdministratorsOnly either secures the directory or re
     FastCache::SystemConfigPathProbe const probe;
     REQUIRE(probe.IsReadableFile(destination));
     REQUIRE(probe.IsTrustedSystemLocation(destination));
+
+    // Integrity is not secrecy, and the directory's list cannot answer the second:
+    // it has to grant read broadly so the service account can read at all, and a
+    // file left to inherit that is the file `requirepass:` is told to live in
+    // (#741). So the seeded config is asserted for BOTH -- trusted to obey, and
+    // unreadable by anyone else.
+    REQUIRE(FastCache::SecretFileExposure(destination) == FastCache::SecretExposure::None);
+}
+
+TEST_CASE("SeedConfigFile: an upgrade repairs a config an older installer left world-readable", "[config][seed][trust]")
+{
+    // The other half of #741's decision, and the one the ticket asks for by name:
+    // seed-once means an upgrade finds a file already there, and a file seeded by
+    // an older build inherited the directory's read for every local account.
+    // Keeping its CONTENT is the rule; keeping its PERMISSIONS is the bug.
+    TempDir const dir { "seed-repairs" };
+
+    auto const source = dir / "fastcached.yaml.default";
+    auto const destination = dir / "live" / "fastcached.yaml";
+    WriteFile(source, "#port: 6674\n");
+    std::filesystem::create_directories(destination.parent_path());
+
+    // The arrangement is STAGED before the file is written, and it cannot be
+    // staged without administrative rights -- so a host that lacks them reports
+    // SKIPPED rather than passing on a branch that never reached the subject.
+    // (The sibling case above can take its refusal branch as a real assertion,
+    // because its destination does not exist and the refusal it asserts is the
+    // one it names. Here the same shape would swallow a DIFFERENT refusal.)
+    if (!FastCache::IsPrivilegedProcess())
+        SKIP("needs administrative rights to stage an administrator-only config directory");
+
+    // Two things, both load-bearing, and neither is optional on Windows:
+    //
+    //  - The tree has to pass the seed's own "could somebody else have written
+    //    this" test. A scratch directory under the system temp location is owned
+    //    by whoever ran the suite, so without this the seed refuses the existing
+    //    config as unattributable -- a different refusal, with a different
+    //    message, reached long before any permission is looked at.
+    //  - Securing the PARENT is what puts the inheritable `BUILTIN\Users` read on
+    //    it that `%ProgramData%\fastcached` carries, so the file created NEXT
+    //    inherits it. That inheritance IS the state #741 repairs, and it can only
+    //    be arranged before the file exists.
+    REQUIRE(FastCache::SecureDirectoryForAdministrators(dir.Path()));
+    REQUIRE(FastCache::SecureDirectoryForAdministrators(destination.parent_path()));
+
+    WriteFile(destination, "requirepass: hunter2 # operator edit\n");
+
+#if !defined(_WIN32)
+    // The state an older installer left. On Windows the file has just inherited
+    // the directory's read for every local account, which is that state exactly;
+    // POSIX has no inheritance, so the mode is set directly.
+    REQUIRE(::chmod(destination.string().c_str(), 0644) == 0);
+#endif
+
+    // Asserted BEFORE the seed runs, or a later green could come from a file that
+    // was never exposed and a repair that never happened.
+    REQUIRE(FastCache::SecretFileExposure(destination) == FastCache::SecretExposure::AnyLocalAccount);
+
+    auto const result = SeedConfigFile(source, destination, DirectoryPolicy::AdministratorsOnly);
+    REQUIRE(result.has_value());
+
+    // Named its own outcome rather than folded into AlreadyPresent: this run DID
+    // modify something, and an operator hears about it.
+    REQUIRE(*result == SeedOutcome::AlreadyPresentRestricted);
+    REQUIRE(FastCache::SecretFileExposure(destination) == FastCache::SecretExposure::None);
+
+    // And seed-once still holds for the thing seed-once is about. A repair that
+    // reached the content would be an upgrade discarding operator configuration,
+    // which is worse than the exposure it set out to close.
+    REQUIRE(ReadFile(destination) == "requirepass: hunter2 # operator edit\n");
 }
 
 // The production probe. Everything above runs against FakeProbe, which is what

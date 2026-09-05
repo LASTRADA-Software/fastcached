@@ -256,6 +256,55 @@ struct SecretFileFacts
 /// @return true when the directory is administrator-only writable afterwards.
 [[nodiscard]] bool SecureDirectoryForAdministrators(std::filesystem::path const& directory);
 
+/// Make @p file readable by nobody but the administrative accounts and the
+/// machine's own services.
+///
+/// The secrecy counterpart of `SecureDirectoryForAdministrators`, and it exists
+/// because the directory's list cannot answer this question. A machine-wide
+/// config directory has to grant read broadly -- the daemon runs as a virtual
+/// account, which is an ordinary `BUILTIN\Users` member -- and that grant is
+/// inherited by everything created inside it, including the one file
+/// `InlineCredentialRejection` tells operators to put `requirepass:` in
+/// ([#741](https://github.com/LASTRADA-Software/fastcached/issues/741)). So the
+/// FILE carries a list of its own, protected against that inheritance, rather
+/// than the directory being narrowed for every reader at once.
+///
+/// **The Windows grant is `NT AUTHORITY\SERVICE` (S-1-5-6) and deliberately not
+/// `NT SERVICE\<service>`.** The per-service trustee resolves only once the
+/// service exists (see `Platform/ServiceControl`'s `GrantPathAccess`), and the
+/// MSI seeds the config BEFORE it registers anything -- so naming it would grant
+/// nothing at all on the one path this exists for. `SERVICE` is every principal
+/// logged on as a service, which needs an administrator to arrange and excludes
+/// every interactive account; it also survives `--service-name`, which the
+/// per-service SID would not. It is deliberately not one of the broad principals
+/// `SecretFileExposure` scans for, so a file secured here reports `None` rather
+/// than the check being taught an exception.
+///
+/// On POSIX it removes every group and other bit, leaving the owner's. A package
+/// that wants to delegate read to a service account chowns and chmods afterwards
+/// -- which is what the macOS postinstall does to reach `0640 root:_fastcached`,
+/// and it stays that package's decision rather than this function guessing a
+/// group name.
+///
+/// **State the consequence rather than leave it to be discovered:** a
+/// `sudo fastcached --seed-config=...` run by hand on Linux therefore leaves
+/// `0600 root:root`, which the packaged unit's `User=fastcached` cannot read --
+/// and an unreadable machine-wide candidate is skipped in SILENCE by
+/// `ResolveDefaultConfigPath`, so the daemon would start on built-in defaults
+/// with nothing said. Nothing in the shipped Linux packaging reaches this (the
+/// config is a dpkg conffile / rpm `%config`, written by the package manager and
+/// never by this call), so the exposure is to hand-seeding only; whoever does it
+/// owes the `chown root:<service group>` and `chmod 0640` the documentation asks
+/// for.
+///
+/// Does not create the file: the caller has just written it, or found it.
+///
+/// @param file An existing file.
+/// @return true when nothing outside those accounts can read it afterwards --
+///         the property, asked back through `SecretFileExposure`, rather than
+///         whether the call that set it returned success.
+[[nodiscard]] bool SecureSecretFileForServices(std::filesystem::path const& file);
+
 /// The command that would make @p directory administrator-only writable,
 /// spelled for the platform this build targets.
 ///

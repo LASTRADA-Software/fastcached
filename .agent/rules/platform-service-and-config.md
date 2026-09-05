@@ -87,11 +87,14 @@ readable and silently ignored. Every rule below has already been one of them.
     unprivileged account for the same binary. It names
     `WindowsLogonAccount::VirtualAccount` now: `NT SERVICE\<serviceName>`, created by
     the SCM itself, no account to make and no password to keep. **Both** services name
-    one; neither has any use for the local Administrators group. The daemon can still
-    read what it needs, because the `%ProgramData%\fastcached` access list grants
-    `BUILTIN\Users` read and execute and a virtual account is an Authenticated User --
-    and what it can no longer do is WRITE there, which is the point: a service that
-    cannot rewrite its own configuration cannot be made to load a different one.
+    one; neither has any use for the local Administrators group. What the daemon can no
+    longer do is WRITE its configuration, which is the point: a service that cannot
+    rewrite its own configuration cannot be made to load a different one. How it READS
+    it has moved -- this used to say the `%ProgramData%\fastcached` access list grants
+    `BUILTIN\Users` read and a virtual account is an Authenticated User, which was true
+    and was also why `requirepass:` in that file was readable by every local account
+    (#741). The seeded config carries a protected list of its own naming
+    `NT AUTHORITY\SERVICE`; see the secrecy rule under *Finding and trusting a configuration file*.
   - **The daemon's storage is granted from the MERGED config, and that is not the
     `--install-service` rule below being broken.** `storage_path` is read from YAML at
     every start, so a registration built from the command line cannot see it -- and the
@@ -518,6 +521,50 @@ readable and silently ignored. Every rule below has already been one of them.
   it has the rights for none of this, and deletes a directory it created but
   could not secure — which would otherwise be the very shape being defended
   against, authored by the defence.
+- **The directory answers integrity; the FILE has to answer secrecy, and the
+  directory's list cannot.** `%ProgramData%\fastcached` grants `BUILTIN\Users`
+  read *inheritably* and must — the daemon runs as the virtual account
+  `NT SERVICE\FastCached`, an ordinary `BUILTIN\Users` member, and that grant is
+  how it reached its own configuration. `OICI` then handed the same read to the one
+  file `InlineCredentialRejection` tells operators to move `requirepass:` into,
+  *because* a command line is world-readable — so the documented remedy relocated
+  the secret rather than protecting it, and #384's readability check correctly fires
+  on the shipped default (#741). The file therefore carries a **protected** list of
+  its own: SYSTEM and Administrators in full, `NT AUTHORITY\SERVICE` read. Five
+  things follow and each was a wrong turn first.
+  - **Not `PermissionEx` in the MSI**, which is what the ticket proposed:
+    `PermissionEx` targets a component the installer *installs*, and the live config
+    is deliberately not payload. `--seed-config` writes it, so that is the only place
+    the list can be applied — and it is one implementation for the custom action and
+    a hand-run seed alike.
+  - **`SU` (S-1-5-6, every service logon), not `NT SERVICE\<name>`.** The
+    per-service trustee resolves only once the service exists — `GrantPathAccess`
+    says so at its own call site — and the MSI seeds *before* it registers anything,
+    so naming it would grant nothing on the one path this exists for. It also
+    survives `--service-name`. It is a real widening over the per-service SID and is
+    written down as one rather than presented as the tight answer: `SERVICE` is every
+    principal logged on as a service, which takes an administrator to arrange and
+    excludes every interactive account, but it is not only this daemon.
+  - **Repair on upgrade only when the file is currently broadly readable.**
+    Seed-once finds an existing file, and one seeded by an older build carries the
+    inherited grant; a narrower delegation is an administrator's own and an
+    undetermined answer is not an exposure anybody established. The repair is its own
+    `SeedOutcome`, because a seed-once action modifying something silently is what it
+    exists to avoid. Content is never touched.
+  - **A comment that vouches for a grant moves with it, and it had TWO homes.**
+    `MakeDaemonServiceSpec` cited the `BU` ACE as how the account reads its config —
+    true when written, and this change deletes exactly that ACE's role. The
+    `windowsLogon` bullet in *this file* said the same sentence, and was found only
+    because #867's `## Open work` entry was being added a few lines below it. **A
+    claim with two homes is corrected once and survives**, which is worse than one
+    that is simply wrong: the surviving copy reads as independent corroboration. It
+    is also #860's whole shape — a sentence outliving the change that falsified it —
+    so when a comment vouches for something, grep the rulebook for it too.
+  - Windows is the platform this is *about* and no test on a POSIX host can
+    construct a DACL, so the evidence is the `package-windows` job asserting the
+    installed file's access list — no broad principal may read, `S-1-5-6` may, and
+    the list is protected. **Both directions**: a config nothing can read is not a
+    fix, it is a daemon that silently starts on built-in defaults.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
@@ -820,6 +867,19 @@ boot, silently, because a registration replays its command line forever. So:
   neighbour's emission covers it.
 
 ## Open work
+
+- **[#867](https://github.com/LASTRADA-Software/fastcached/issues/867)** — the seeded
+  config grants read to `NT AUTHORITY\SERVICE` (S-1-5-6), which is every principal
+  logged on as a service and not only this daemon. It is far narrower than the
+  `BUILTIN\Users` grant it replaced and is what the seed can name — the per-service
+  trustee `NT SERVICE\<name>` resolves only once the service exists, and the MSI
+  seeds before it registers anything. Tightening it means granting at
+  `--install-service` time, after `CreateService`, the way `GrantPathAccess` already
+  does for `ownedPaths`; the obstacle is that the MSI passes no `--config`, so
+  `ServiceSpec::configPath` is empty there and the machine-wide path would have to be
+  resolved from `applicationName`. **After #860**: if that holds, nothing reads this
+  file on Windows today, so a narrower grant can be observed neither to work nor to
+  break.
 
 - **[#397](https://github.com/LASTRADA-Software/fastcached/issues/397)** — the
   worker's configuration file is packaged on Linux only. A `.pkg` and an MSI

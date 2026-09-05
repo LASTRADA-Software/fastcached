@@ -269,12 +269,21 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
     // The MSI cannot close it either — its PermissionEx replaces the access
     // list but not the owner.
     auto const parent = destination.parent_path();
-    auto const repair = policy == DirectoryPolicy::AdministratorsOnly && !parent.empty();
+
+    // Two questions, two names, because the header says they are separate and a
+    // single flag would make that untrue. The DIRECTORY clause carries
+    // `!parent.empty()` since there is nothing to create or restrict without a
+    // parent; the FILE's secrecy does not depend on the destination having one,
+    // and gating it on a directory-shaped condition would silently leave a
+    // bare-named config unprotected under a policy that asked for protection.
+    auto const secureDirectory = policy == DirectoryPolicy::AdministratorsOnly && !parent.empty();
+    auto const secureFile = policy == DirectoryPolicy::AdministratorsOnly;
 
     // Whether the location could already have been written by somebody else.
     // Asked before the repair, because afterwards the answer is always no — and
     // what it decides is the standing of a file found sitting there.
-    auto const wasUnattributable = repair && std::filesystem::exists(parent, ec) && !IsAdministratorOnlyWritable(parent);
+    auto const wasUnattributable =
+        secureDirectory && std::filesystem::exists(parent, ec) && !IsAdministratorOnlyWritable(parent);
 
     if (!parent.empty())
     {
@@ -285,7 +294,7 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
 
         // SecureDirectoryForAdministrators reports the resulting property
         // rather than the syscall, so this both sets and confirms it.
-        if (repair && !SecureDirectoryForAdministrators(parent))
+        if (secureDirectory && !SecureDirectoryForAdministrators(parent))
         {
             // Leave nothing squattable behind. A directory this call created and
             // could not secure is one owned by whoever ran it, sitting at the
@@ -325,6 +334,24 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
                                                 "review this file and delete it to seed a fresh one.",
                                                 parent.string())));
 
+        // Seed-once keeps the file's CONTENT; it says nothing about who may read
+        // it. A config seeded by an older installer inherited the directory's read
+        // for every local account, and that is the file `requirepass:` is told to
+        // live in (#741) -- so an upgrade repairs it. Only an established broad
+        // exposure: a narrower grant is an administrator's own delegation, and an
+        // undetermined answer is not an exposure anybody has shown.
+        if (secureFile && SecretFileExposure(destination) == SecretExposure::AnyLocalAccount)
+        {
+            if (!SecureSecretFileForServices(destination))
+                return std::unexpected(
+                    MakeConfigPathError(ConfigErrorCode::WriteFailed,
+                                        destination,
+                                        std::format("the permissions of this config could not be tightened. {}",
+                                                    SecretExposureHint(destination, SecretExposure::AnyLocalAccount))));
+
+            return SeedOutcome::AlreadyPresentRestricted;
+        }
+
         return SeedOutcome::AlreadyPresent;
     }
 
@@ -333,10 +360,61 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
 
     // copy_file rather than a rename: the template stays in place as package
     // payload, to be replaced wholesale by the next upgrade.
-    std::filesystem::copy_file(templatePath, destination, std::filesystem::copy_options::skip_existing, ec);
+    auto const copied =
+        std::filesystem::copy_file(templatePath, destination, std::filesystem::copy_options::skip_existing, ec);
     if (ec)
         return std::unexpected(MakeConfigPathError(
             ConfigErrorCode::WriteFailed, destination, std::format("cannot write config: {}", ec.message())));
+
+    // `skip_existing` answers false, with no error, for a destination that
+    // appeared between the check above and this call. That file is somebody
+    // else's: this run wrote none of it, so it is reported as found rather than
+    // written -- and, crucially, the branch below must not delete it. Taking back
+    // what this call could not secure is only defensible for a file this call
+    // authored.
+    if (!copied)
+        return SeedOutcome::AlreadyPresent;
+
+    // The file's own access list, and it has to be its own: `copy_file` carries the
+    // template's permissions across, and on Windows the destination additionally
+    // inherits the directory's read for BUILTIN\Users -- which is the grant that
+    // made the file `requirepass:` is told to live in readable by every local
+    // account (#741).
+    if (secureFile && !SecureSecretFileForServices(destination))
+    {
+        // Take back what could not be secured. The same rule the directory branch
+        // above follows, for the same reason: a config sitting at the machine-wide
+        // location with permissions this call could not establish is the state the
+        // action exists to prevent, authored by the action. Nothing is lost -- the
+        // template is still on disk and the seed is re-runnable -- and a daemon
+        // that finds no machine-wide config falls back to built-in defaults, which
+        // is exactly what the Windows installer already degrades to when the seed
+        // does not happen.
+        std::error_code removeError;
+        std::filesystem::remove(destination, removeError);
+
+        // The removal is REPORTED, not assumed. A message claiming a file is gone
+        // when it is still sitting there is the confident-wrong-signal shape: it
+        // tells an operator there is nothing to clean up, so the one thing that
+        // would close the exposure is the thing they do not do.
+        //
+        // No `icacls`/`chmod` line in the first arm, unlike every other refusal in
+        // this function: the remedy those print names a path, and that one has
+        // just been removed. What is left to say is what happened and what it
+        // needs.
+        return std::unexpected(MakeConfigPathError(
+            ConfigErrorCode::WriteFailed,
+            destination,
+            removeError ? std::format("the config was written and its permissions could not be tightened, "
+                                      "and it could not be removed either ({}), so it is still there and "
+                                      "readable by every account on this machine. Delete it, then re-run "
+                                      "the seed with administrative rights.",
+                                      removeError.message())
+                        : std::string { "the config was written and its permissions could not be "
+                                        "tightened, so it has been removed rather than left readable by "
+                                        "every account on this machine. Seeding the machine-wide config "
+                                        "needs administrative rights; re-run it with them." }));
+    }
 
     return SeedOutcome::Written;
 }

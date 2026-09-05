@@ -28,6 +28,7 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Profiling.hpp>
@@ -117,8 +118,24 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
         return EXIT_FAILURE;
     }
 
-    std::println(
-        "fastcached: {} {}", *seeded == FastCache::SeedOutcome::Written ? "wrote" : "kept existing", destination->string());
+    // A table rather than a ternary, because there are now three outcomes and the
+    // third is the one an operator most needs to hear: an upgrade that repaired a
+    // config's permissions did MODIFY something, where the other two did not.
+    struct SeedVerb
+    {
+        FastCache::SeedOutcome outcome;
+        std::string_view text;
+    };
+
+    static constexpr FastCache::EnumTable<FastCache::SeedOutcome, SeedVerb> seedVerbs { {
+        { .outcome = FastCache::SeedOutcome::Written, .text = "wrote" },
+        { .outcome = FastCache::SeedOutcome::AlreadyPresent, .text = "kept existing" },
+        { .outcome = FastCache::SeedOutcome::AlreadyPresentRestricted,
+          .text = "kept existing, and restricted to the administrative accounts and this machine's services," },
+    } };
+    static_assert(FastCache::RowsInEnumeratorOrder(seedVerbs, &SeedVerb::outcome));
+
+    std::println("fastcached: {} {}", seedVerbs[static_cast<std::size_t>(*seeded)].text, destination->string());
     return EXIT_SUCCESS;
 }
 

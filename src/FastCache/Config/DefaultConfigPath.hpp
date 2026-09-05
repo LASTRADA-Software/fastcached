@@ -230,6 +230,17 @@ enum class SeedOutcome : std::uint8_t
 {
     Written,        ///< The destination did not exist and now holds a copy of the template.
     AlreadyPresent, ///< The destination existed and was left untouched.
+
+    /// The destination existed, was readable by every account on the machine, and
+    /// its permissions were tightened.
+    ///
+    /// Its own outcome rather than folded into `AlreadyPresent`, because an
+    /// upgrade repairing a file's exposure is a thing an operator has to be told
+    /// about: it is the one case where seed-once did modify something, and the
+    /// state it repaired is one a previous version of this installer created.
+    AlreadyPresentRestricted,
+
+    Last
 };
 
 /// What a directory SeedConfigFile has to create should end up permitting.
@@ -259,6 +270,24 @@ enum class DirectoryPolicy : std::uint8_t
 /// to write to the real filesystem, and a faked version of it would assert
 /// nothing worth knowing.
 ///
+/// **`AdministratorsOnly` also restricts the FILE, and that is a separate
+/// question from the directory's.** The directory has to grant read broadly — on
+/// Windows the daemon runs as a virtual account, an ordinary `BUILTIN\Users`
+/// member — and files created in it inherit that grant, so the config the
+/// product tells operators to move `requirepass:` into was readable by every
+/// local account
+/// ([#741](https://github.com/LASTRADA-Software/fastcached/issues/741)). The file
+/// therefore gets an access list of its own, protected against that inheritance;
+/// see `Platform/FileTrust`'s `SecureSecretFileForServices`.
+///
+/// A destination that is already there is **repaired only when it is currently
+/// readable by every local account**, which is the state an older installer left
+/// behind. A narrower delegation an administrator chose is left alone, and so is
+/// a platform that would not say — an established exposure is the trigger, never
+/// a failure to establish one. The repair is its own `SeedOutcome`, because
+/// seed-once modifying something silently is the shape this whole action exists
+/// to avoid.
+///
 /// @param templatePath The shipped, replaceable copy.
 /// @param destination Where the live config belongs.
 /// @param policy What a directory created on the way should permit. With
@@ -267,7 +296,8 @@ enum class DirectoryPolicy : std::uint8_t
 ///        caller without administrative rights fails here rather than planting a
 ///        machine-wide config it would still own.
 /// @return What happened, or a ConfigError when the template is missing, the
-///         directory cannot be restricted, or the copy fails.
+///         directory cannot be restricted, the file cannot be restricted, or the
+///         copy fails.
 [[nodiscard]] std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path const& templatePath,
                                                                      std::filesystem::path const& destination,
                                                                      DirectoryPolicy policy);
