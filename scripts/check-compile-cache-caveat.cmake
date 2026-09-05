@@ -28,6 +28,16 @@
 # as well as the noise: ccache selected says nothing, and neither does caching
 # switched off while sccache sits right there.
 #
+# Since #815 the rows also pin the GATE, in both directions, because the caveat and
+# the gate are one mechanism read from two ends: sccache is opt-in
+# (`-DALLOW_SCCACHE_FALLBACK=ON`), so a row that asserts the caveat must now opt in
+# to reach it -- and a row that does not opt in must see sccache passed over, said
+# out loud, and no caveat, since a caveat about a launcher this build did not pick
+# is noise. Which makes the opt-in row the one that keeps #170's warning alive: the
+# alternative remedy for #815 was to have CI set `CMAKE_CXX_COMPILER_LAUNCHER`
+# externally, which this module honours by returning EARLY -- taking the caveat out
+# of the log with it, silently, on the platform where the hazard exists.
+#
 # Written as a `cmake -P` script for the reasons check-repository-hygiene.cmake
 # gives at length: the rule is identical everywhere, so a .sh and a .ps1 would be
 # two implementations of one rule, each free to rot without the other noticing.
@@ -83,11 +93,17 @@ set(FastCachedCaveatElements
 # asserting the severity alone would pass on any warning at all. <expected> is
 # therefore free to name which launcher won, which every row does.
 #
-# <stand-in launcher> is one of sccache, ccache or none, and names which of the
-# module's launcher variables is pointed at a real program; the others are forced
-# empty so the outcome does not depend on what the host happens to have
-# installed. fastcache-cc is always forced empty — its own row is conditional on
-# a daemon answering, which is a different property with its own test.
+# <stand-in launcher> is one of sccache, ccache, sccache-and-ccache or none, and
+# names which of the module's launcher variables are pointed at a real program; the
+# others are forced empty so the outcome does not depend on what the host happens
+# to have installed. fastcache-cc is always forced empty — its own row is
+# conditional on a daemon answering, which is a different property with its own
+# test.
+#
+# `sccache-and-ccache` is the reporting host of #815 exactly: both installed, and
+# the question is which one a build gets when nobody said. "Nothing is selected"
+# and "the next launcher is selected" are two different proofs that sccache was not
+# taken automatically, and only the second one is the situation people are in.
 #
 # The stand-in is never run: selection records a path and wires it as a compiler
 # launcher, and nothing here builds. Passing it out of band rather than in the
@@ -112,7 +128,9 @@ else()
 endif()
 
 set(FastCachedCaveatRows
-    "sccache-row|Enabling sccache|${sccacheForbidden}|sccache|${sccacheSeverity}|"
+    "sccache-row|Enabling sccache|${sccacheForbidden}|sccache|${sccacheSeverity}|-DALLOW_SCCACHE_FALLBACK=ON"
+    "sccache-not-auto|Not using sccache|Enabling sccache|sccache||"
+    "sccache-not-preferred|Enabling ccache|Enabling sccache|sccache-and-ccache||"
     "ccache-is-silent|Enabling ccache|${FastCachedCaveatMarker}|ccache||"
     "disabled-is-silent|disabled by USE_COMPILER_CACHE=OFF|${FastCachedCaveatMarker}|sccache||-DUSE_COMPILER_CACHE=OFF"
     "nothing-installed|No compiler-cache launcher found|${FastCachedCaveatMarker}|none||"
@@ -199,11 +217,21 @@ foreach(row IN LISTS FastCachedCaveatRows)
     # is also what a `none` row leaves all three as.
     set(sccachePath "")
     set(ccachePath "")
-    if(standIn STREQUAL "sccache")
-        set(sccachePath "${standInProgram}")
-    elseif(standIn STREQUAL "ccache")
-        set(ccachePath "${standInProgram}")
-    endif()
+    # Exact names, never a substring match: "sccache" CONTAINS "ccache", so a
+    # `MATCHES` would point BOTH variables at a program for the sccache row and
+    # quietly test a different situation than the row says it does. An unknown name
+    # is refused rather than silently behaving like `none`, which would be a row
+    # that configures, asserts and proves nothing.
+    string(REPLACE "-and-" ";" standInNames "${standIn}")
+    foreach(standInName IN LISTS standInNames)
+        if(standInName STREQUAL "sccache")
+            set(sccachePath "${standInProgram}")
+        elseif(standInName STREQUAL "ccache")
+            set(ccachePath "${standInProgram}")
+        elseif(NOT standInName STREQUAL "none")
+            message(FATAL_ERROR "row ${name}: unknown stand-in launcher '${standInName}'")
+        endif()
+    endforeach()
     set(launcherArguments "-DFASTCACHE_CC=" "-DSCCACHE=${sccachePath}" "-DCCACHE=${ccachePath}")
 
     set(rowBinaryDir "${FASTCACHED_WORK_DIR}/${name}/build")

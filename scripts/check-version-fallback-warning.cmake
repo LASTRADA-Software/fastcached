@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# When a version-mismatched `fastcache-cc` hands the build to sccache, the operator
-# is told both facts in one place — checked as a pure computation, over the
-# combinations a configure cannot be made to produce.
+# When a version-mismatched `fastcache-cc` hands the build to somebody else, the
+# operator is told so — and told what took over — in one place, checked as a pure
+# computation over the combinations a configure cannot be made to produce.
 #
 # `cmake/portable/CompileCache.cmake` prints a rejected launcher at `STATUS` and,
 # eighty lines later, warns about the correctness hazard the replacement carries.
@@ -10,6 +10,14 @@
 # is exactly the one that predicts the hazard: a daemon IS running, the operator
 # installed it, and it is out of step with the launcher
 # ([#658](https://github.com/LASTRADA-Software/fastcached/issues/658)).
+#
+# **And the winner decides a paragraph, not whether there is a message**
+# ([#815](https://github.com/LASTRADA-Software/fastcached/issues/815)). #658 warned
+# only when the winner carried a caveat, which is a property of the COMPILER — true
+# on MSVC and clang-cl, false on GCC and Clang. The host that filed #815 is Linux
+# with ccache installed, so it satisfied every clause and heard nothing above
+# `STATUS` while its own cache went unused for weeks. Three replacements, three
+# wordings, one warning: a safe launcher, a hazardous one, and none at all.
 #
 # ## Why a pure function
 #
@@ -39,9 +47,9 @@ endif()
 
 include("${FASTCACHED_SOURCE_DIR}/cmake/portable/CompileCache.cmake")
 
-if(NOT COMMAND _fc_cache_predicted_hazard)
+if(NOT COMMAND _fc_cache_rejection_warning)
     message(FATAL_ERROR
-        "_fc_cache_predicted_hazard is not defined. Either the define-only guard in "
+        "_fc_cache_rejection_warning is not defined. Either the define-only guard in "
         "cmake/portable/CompileCache.cmake returned before the function, or it was renamed and "
         "this check now proves nothing.")
 endif()
@@ -88,6 +96,18 @@ endfunction()
 set(_caveat "sccache replays a hit's /showIncludes stream")
 set(_detail "Rebuild or reinstall whichever is older.")
 
+# What the message must SAY beyond naming the launchers, per replacement case.
+# Presence rather than wording, and defined once here so a rewording moves in one
+# place -- the sibling `check-compile-cache-caveat.cmake` keeps its caveat marker
+# the same way, and for the same reason: a fragment restated in two files is a
+# fragment one of them can stop matching in silence.
+#
+# The uncached marker is the load-bearing one. "Nothing replaced it" is the case
+# #815 was silent for, and a message that warns without saying the build has NO
+# cache leaves the reader assuming the usual fall-through happened.
+set(_uncachedMarker "no compiler cache at all")
+set(_hazardMarker "correctness hazard")
+
 set(_checked 0)
 set(_failures 0)
 set(_warned 0)
@@ -95,25 +115,29 @@ set(_quiet 0)
 
 # reason | predicts | rejected | winner | caveat-present | expect | what this row is about
 #
-# The property is winner-AGNOSTIC: whoever won, if they carry a hazard and somebody
-# was rejected for a reason their own row says predicts it, both are said in one
-# place. An earlier version of this table asserted that a caveat-carrying `ccache`
-# must NOT warn -- a state the candidate table makes impossible, and the wrong
-# answer if it ever became possible. A test that enshrines a special case is one
-# that has to be rewritten to generalise the code, which is the wrong way round.
+# The property is winner-AGNOSTIC in BOTH directions. Whoever won -- or nobody --
+# a rejection for a reason its own row says is worth saying gets said, and what
+# replaced it only chooses the wording. An earlier version of this table asserted
+# that a caveat-carrying `ccache` must NOT warn -- a state the candidate table makes
+# impossible, and the wrong answer if it ever became possible. A test that enshrines
+# a special case is one that has to be rewritten to generalise the code, which is
+# the wrong way round; the two rows below that #815 flipped from `no` to `yes` were
+# the same mistake made once more, in the other column.
 #
 # No ';' in any field: the row LIST splits on it before `fastcached_row_fields`
 # ever runs. '|' in the LAST field is fine -- that is what the house splitter buys.
 set(_rows
     "rejected (unsupported-version)|unsupported-version|fastcache-cc|sccache|yes|yes|the whole ticket: a reason that predicts, into a winner that carries the hazard"
     "rejected (unsupported-version)|unsupported-version|fastcache-cc|ccache|yes|yes|winner-agnostic: any winner carrying a caveat gets the same treatment"
-    "rejected (unsupported-version)|unsupported-version|fastcache-cc|sccache|no|no|the winner carries no hazard, so there is nothing to predict"
+    "rejected (unsupported-version)|unsupported-version|fastcache-cc|ccache|no|yes|#815: a SAFE replacement is still a build not using the cache it was told it had"
+    "rejected (unsupported-version)|unsupported-version|fastcache-cc|sccache|no|yes|the same, whichever launcher carries no hazard on this compiler"
+    "rejected (unsupported-version)|unsupported-version|fastcache-cc||no|yes|#815, loudest case: nothing replaced it, so the build compiles uncached"
     "no answer within 10s|unsupported-version|fastcache-cc|sccache|yes|no|no daemon answered -- predicts nothing about versions"
     "probe compile failed (1)|unsupported-version|fastcache-cc|sccache|yes|no|a broken probe is not a version mismatch"
     "not caching (uncacheable)|unsupported-version|fastcache-cc|sccache|yes|no|a deliberately uncacheable probe says nothing about the daemon"
     "rejected (unsupported-version)||fastcache-cc|sccache|yes|no|a row that declares no prediction stays silent whatever its reason"
     "|unsupported-version|fastcache-cc|sccache|yes|no|nothing was rejected at all"
-    "rejected (unsupported-version)|unsupported-version|fastcache-cc||yes|no|no launcher won, so there is no fallback to warn about"
+    "no answer within 10s|unsupported-version|fastcache-cc||yes|no|and no winner does not make a non-predicting reason worth saying"
 )
 
 foreach(_row IN LISTS _rows)
@@ -126,7 +150,7 @@ foreach(_row IN LISTS _rows)
         set(_thisCaveat "")
     endif()
 
-    _fc_cache_predicted_hazard(
+    _fc_cache_rejection_warning(
         "${_reason}" "${_predicts}" "${_rejectedName}" "${_winner}" "${_thisCaveat}" "${_detail}" _got)
     math(EXPR _checked "${_checked} + 1")
 
@@ -135,10 +159,25 @@ foreach(_row IN LISTS _rows)
         if(_got STREQUAL "")
             message(WARNING "no warning where one is required -- ${_about}")
             math(EXPR _failures "${_failures} + 1")
-        elseif(NOT _got MATCHES "${_rejectedName}" OR NOT _got MATCHES "${_winner}")
+        elseif(NOT _got MATCHES "${_rejectedName}")
+            message(WARNING "the warning does not name the rejected launcher -- ${_about}")
+            math(EXPR _failures "${_failures} + 1")
+        elseif(NOT _winner STREQUAL "" AND NOT _got MATCHES "${_winner}")
             # It has to name BOTH launchers: joining the two facts is the entire
             # point, and a sentence naming one of them is the status quo.
-            message(WARNING "the warning does not name both launchers -- ${_about}")
+            message(WARNING "the warning does not name what replaced it -- ${_about}")
+            math(EXPR _failures "${_failures} + 1")
+        elseif(_winner STREQUAL "" AND NOT _got MATCHES "${_uncachedMarker}")
+            # A warning that does not say the build has NO cache reads exactly like
+            # the ordinary fall-through, which is the reading #815 was filed against.
+            # `MATCHES "${_winner}"` cannot stand in for this: an empty pattern
+            # matches everything, so the clause above passes vacuously here.
+            message(WARNING "the warning does not say the build is uncached -- ${_about}")
+            math(EXPR _failures "${_failures} + 1")
+        elseif(_hasCaveat STREQUAL "yes" AND NOT _winner STREQUAL "" AND NOT _got MATCHES "${_hazardMarker}")
+            # #658's half, still required: a hazardous replacement is pointed at
+            # from the same sentence rather than eighty lines further down.
+            message(WARNING "the warning does not point at the winner's hazard -- ${_about}")
             math(EXPR _failures "${_failures} + 1")
         endif()
     else()
@@ -217,7 +256,7 @@ endif()
 # And it must be NARROW. A column matching everything warns on "not installed" and
 # "no answer", which is the alarm nobody reads -- and no row above can see it,
 # because they supply their own pattern.
-_fc_cache_predicted_hazard(
+_fc_cache_rejection_warning(
     "no answer within 10s" "${_declared}" "fastcache-cc" "sccache" "${_caveat}" "${_detail}" _wide)
 if(NOT _wide STREQUAL "")
     message(FATAL_ERROR
@@ -230,4 +269,4 @@ if(NOT _failures EQUAL 0)
 endif()
 
 message(STATUS
-    "check-version-fallback-warning: ${_checked} rows; a predicting rejection into a hazardous winner warns, nothing else does")
+    "check-version-fallback-warning: ${_checked} rows; a predicting rejection warns whatever replaced it -- including nothing -- and no other reason does")

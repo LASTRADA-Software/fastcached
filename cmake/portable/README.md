@@ -55,7 +55,11 @@ It picks the first launcher that is both installed and usable:
 1. **`fastcache-cc`**, but only when a `fastcached` daemon actually answers.
    Its cache entries are keyed independently of the checkout path, so a CI
    runner and a developer working from different directories share hits.
-2. **`sccache`**
+2. **`sccache`**, but only with `-DALLOW_SCCACHE_FALLBACK=ON`. It is never picked
+   for you: a launcher nobody chose is a launcher nobody checks, and it silently
+   standing in for a `fastcache-cc` that could not talk to its daemon is how a
+   project stops noticing that its own cache is not in use. Opted into, it keeps
+   this position, ahead of `ccache`.
 3. **`ccache`**
 4. none — the build simply compiles.
 
@@ -63,6 +67,17 @@ It picks the first launcher that is both installed and usable:
 one small file through the launcher and accepts only a reported cache outcome.
 A launcher whose daemon is down still compiles fine, so without that check every
 translation unit would pay a failed connection attempt in silence.
+
+The check tests **acceptance, not merely reachability**, and one rejection reason
+is reported louder than the rest. A daemon that answers but refuses the launcher's
+**wire version** is a daemon somebody installed, running, and out of step — the
+only reason that says the cache exists and is not being used — so it is a
+`CMake Warning` naming which end is behind, whatever launcher (if any) takes over.
+Every other reason — not installed, no answer, a probe that was not cacheable —
+describes a cache nobody set up and stays a status line, because a warning that
+fires for all of them is one everybody learns to skip. It is never fatal: a daemon
+out of step with a launcher is the normal state during a rollout, and this module
+does not fail configures.
 
 ### Installing the launcher automatically
 
@@ -81,14 +96,18 @@ and stages it in a per-user directory shared by every repository and build tree
 on the machine — so it is fetched once per machine and version, not once per
 build.
 
-It only does this when **none** of the three launchers is installed. A launcher
-you installed yourself is a decision already made, and this will not override it.
+It only does this when **none** of the launchers this build could actually use is
+installed. A launcher you installed yourself is a decision already made, and this
+will not override it — but an `sccache` that `ALLOW_SCCACHE_FALLBACK` has not opted
+into is not a decision anybody made about this build, so it does not count as one
+here.
 
 #### Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `USE_COMPILER_CACHE` | `ON` | Use a launcher at all. |
+| `ALLOW_SCCACHE_FALLBACK` | `OFF` | Let `sccache` be selected automatically. Off, it is skipped with a status line saying so. |
 | `FASTCACHE_ADDR` | `127.0.0.1:6674` | Where the daemon is. Empty opts out of `fastcache-cc` entirely. |
 | `FASTCACHE_AUTO_INSTALL` | `OFF` | Fetch `fastcache-cc` when no launcher is installed. |
 | `FASTCACHE_AUTO_INSTALL_VERSION` | *(empty)* | Install this exact version instead of resolving the latest. |
@@ -157,11 +176,13 @@ It is a separate opt-in from `FASTCACHE_AUTO_INSTALL`, and defaults `OFF`
 independently, for two reasons. Starting a long-lived background process is a
 materially bigger side effect than downloading a file, so wanting one must not
 imply wanting the other. And several projects rely on CI having **no**
-`fastcached` reachable, so a build transparently falls back to `sccache` —
-`FASTCACHE_AUTO_START` would remove that boundary if it defaulted on for
-everyone rather than only those who ask for it. There is no CI-environment
-detection backing this up; an explicit `-DFASTCACHE_AUTO_START=ON` is trusted
-exactly like every other flag here.
+`fastcached` reachable, so a build transparently falls through to whatever else
+is installed and usable — `FASTCACHE_AUTO_START` would remove that boundary if it
+defaulted on for everyone rather than only those who ask for it. (Which launcher
+it lands on does not enter into that: `ccache`, an `sccache` that
+`ALLOW_SCCACHE_FALLBACK` opted into, or nothing at all.) There is no
+CI-environment detection backing this up; an explicit `-DFASTCACHE_AUTO_START=ON`
+is trusted exactly like every other flag here.
 
 Two configures racing on the same `FASTCACHE_ADDR` — two build trees on one
 machine, say — do not both try to start one: before starting anything, the

@@ -13,16 +13,21 @@
 #      127.0.0.1:6674, and the two roots are injected here via `cmake -E env`,
 #      because CMake already knows them. Selecting it is conditional on a daemon
 #      actually answering there — see the probe below.
-#   2. sccache — the usual third-party launcher, used when fastcache-cc is
-#      unavailable or unconfigured. Supports shared (Redis/S3/...) caches.
-#      **Under MSVC or clang-cl, selecting it emits a warning**, and the warning
-#      is the point: there sccache replays a hit's /showIncludes stream with the
-#      absolute paths of the build that stored it, so two checkouts sharing one
-#      cache stop rebuilding on a header change while the build stays green. GCC
-#      and Clang are unaffected. It is a caveat rather than a `check` that skips
-#      the row, because nothing here can tell whether the cache is shared and the
-#      choice belongs to whoever is building. See the row below.
-#   3. ccache — the classic local cache, used when neither of the above applies.
+#   2. sccache — the usual third-party launcher, supporting shared (Redis/S3/...)
+#      caches. **Never selected automatically**: it is opt-in behind
+#      `-DALLOW_SCCACHE_FALLBACK=ON`, because being the silent answer to
+#      fastcache-cc being unusable is exactly how a project stops noticing that
+#      its own cache is not in use (#815). Opted into, it keeps its rank above
+#      ccache — "explicitly requested" means requested. **Under MSVC or clang-cl,
+#      selecting it emits a warning**, and the warning is the point: there sccache
+#      replays a hit's /showIncludes stream with the absolute paths of the build
+#      that stored it, so two checkouts sharing one cache stop rebuilding on a
+#      header change while the build stays green. GCC and Clang are unaffected. It
+#      is a caveat rather than a `check` that skips the row, because nothing here
+#      can tell whether the cache is shared and the choice belongs to whoever is
+#      building. See the row below.
+#   3. ccache — the classic local cache, used when fastcache-cc is unavailable or
+#      unconfigured and sccache has not been asked for.
 #
 # Launchers are wired in as compiler launchers, so CPM-/FetchContent-fetched
 # dependencies get cached too. If a launcher is already set (e.g. via the
@@ -166,14 +171,14 @@ function(_fc_resolve_addr present value outWanted)
     endif()
 endfunction()
 
-# Does a launcher's REJECTION predict the hazard the winning launcher carries?
+# What does a launcher's REJECTION deserve to be said about it, and what replaced it?
 #
 # **Two facts this file already prints, eighty lines apart, neither mentioning the
 # other** (#658). A `fastcache-cc` row rejected for a WIRE VERSION mismatch reports
 # at `STATUS` -- correctly for most reasons, since "falling through in silence looks
 # exactly like it never being installed" -- and configure then falls through to
-# sccache, whose caveat this file spends a paragraph on. The operator is left to
-# join them.
+# another launcher, whose caveat this file may spend a paragraph on. The operator is
+# left to join them.
 #
 # A version rejection says something the other reasons do not: a daemon **is**
 # running, it is one the operator installed, and it is out of step with the
@@ -182,20 +187,28 @@ endfunction()
 # produce a wrong object. Observed on a real machine with a service 591 commits
 # behind master answering on the port.
 #
-# **Which reasons predict a hazard is a COLUMN of the candidate table, not a
-# condition in here.** The first version hardcoded `unsupported-version` and
+# **Which reasons are worth saying out loud is a COLUMN of the candidate table, not
+# a condition in here.** The first version hardcoded `unsupported-version` and
 # `chosen STREQUAL "sccache"`, which is a special case layered on a file that is
 # otherwise strictly table-driven -- and the second clause was already implied by
 # the first guard below, so it could only ever matter by going SILENT if a caveat
 # ever moved to another row. A migration that quietly disables a warning while
 # nothing fails is this project's #447, and it is not worth re-earning.
 #
-# So the rule here is winner-agnostic: whoever won, if they carry a hazard and
-# somebody was rejected for a reason their own row says predicts it, say both in
-# one place.
+# **And the WINNER decides a paragraph, never whether there is a message** (#815).
+# #658 returned empty unless the winner carried a caveat, which is a property of the
+# COMPILER: true on MSVC and clang-cl, false on GCC and Clang. So the host that
+# actually reported this -- Linux, ccache installed, daemon older than the launcher
+# -- hit every clause of #658 and was told nothing louder than a `STATUS` line among
+# a hundred others. The three cases the operator can be in are a safe replacement, a
+# hazardous replacement, and NO replacement at all, and the last is the loudest of
+# the three: the build compiles uncached. All three warn; only the wording differs.
 #
-# Not a refusal to configure: a stale daemon is a normal state during a rollout,
-# and refusing would be worse than caching through sccache.
+# Not a refusal to configure: a stale daemon is a normal state during a rollout, the
+# module's contract is that it may never fail a configure (see the file header), and
+# a `SEND_ERROR` here would turn "your cache is not the one you think" into "you
+# cannot build". A `message(WARNING)` is the loudest level that leaves the build
+# buildable, which is the whole of what this decision is.
 #
 # @param reason     why the rejected row was rejected; empty when nothing was.
 # @param predicts   that row's `predicts` pattern; empty when it predicts nothing.
@@ -204,7 +217,7 @@ endfunction()
 # @param caveat     the winner's caveat; empty when it carries none.
 # @param detail     what to say about fixing the rejected one.
 # @param outVar     the warning text, or empty when this is not that situation.
-function(_fc_cache_predicted_hazard reason predicts rejected winner caveat detail outVar)
+function(_fc_cache_rejection_warning reason predicts rejected winner caveat detail outVar)
     set(${outVar} "" PARENT_SCOPE)
 
     # Nothing rejected, or this row's rejection predicts nothing.
@@ -215,19 +228,26 @@ function(_fc_cache_predicted_hazard reason predicts rejected winner caveat detai
         return()
     endif()
 
-    # "The winner carries a hazard" is the caveat being non-empty, and that is the
-    # WHOLE of it -- naming a launcher here would be a second copy of the identity
-    # the caveat already implies.
-    if(winner STREQUAL "" OR caveat STREQUAL "")
-        return()
+    # What replaced it is a THIRD state and not a boolean: another launcher that is
+    # safe, another launcher that carries a hazard, or nothing at all. #658 folded
+    # the first and the third into "say nothing", which is why the host that filed
+    # #815 -- Linux, so no caveat, and ccache installed -- was told nothing above
+    # `STATUS` while its first-party cache went unused for weeks. The caveat now
+    # only decides a PARAGRAPH; the rejection alone decides that there is a message.
+    if(winner STREQUAL "")
+        set(_replacement "and nothing has replaced it: this build compiles with no compiler cache at all.")
+    elseif(caveat STREQUAL "")
+        set(_replacement "and this build has fallen through to ${winner}.")
+    else()
+        set(_replacement "and this build has fallen through to ${winner} -- which carries the correctness hazard warned about below.")
     endif()
 
     set(${outVar}
-"[cache] ${rejected} was refused, and this build has fallen through to ${winner} -- which carries the correctness hazard warned about below.
+"[cache] ${rejected} was refused, ${_replacement}
 
 ${detail}
 
-It is called out here because THIS rejection reason predicts that hazard, where the others -- not installed, no answer, an uncacheable probe -- do not."
+It is called out here because THIS rejection reason means a daemon is there and answering, so the cache you installed is not the one this build is using. The others -- not installed, no answer, an uncacheable probe -- describe a cache nobody set up, and warning on them is how a warning becomes one people learn to skip."
         PARENT_SCOPE)
 endfunction()
 
@@ -242,8 +262,30 @@ if(CMAKE_SCRIPT_MODE_FILE)
 endif()
 
 option(USE_COMPILER_CACHE
-       "Use a compiler-cache launcher when one is available (fastcache-cc when a daemon answers, else sccache, else ccache) [default: ON]"
+       "Use a compiler-cache launcher when one is available (fastcache-cc when a daemon answers, else ccache; sccache only with ALLOW_SCCACHE_FALLBACK=ON) [default: ON]"
        ON)
+
+# sccache is never chosen FOR you.
+#
+# It is a good launcher and this project uses it deliberately on Windows CI. What
+# it must not be is the automatic answer to fastcache-cc being unusable: on the
+# host that filed #815 the daemon was an old package while the launcher was a
+# current build, every exchange was refused on the wire version, sccache took over,
+# and the project spent weeks believing it dogfooded its own cache. Every part of
+# that mechanism worked. Nobody was told, because a fallback nobody chose is a
+# fallback nobody looks at.
+#
+# So it is opt-in, and the opt-in is the announcement. The ROW is gated rather than
+# having callers set `CMAKE_C/CXX_COMPILER_LAUNCHER` themselves, which would also
+# work: this module returns early when a launcher is already set, so an external
+# one takes the `/showIncludes` caveat warning below out of the log with it -- and
+# that warning is the whole subject of #170. Gating the row keeps it.
+#
+# Unprefixed, like `USE_COMPILER_CACHE`: this file is vendored into other
+# repositories verbatim and names nothing of the project it sits in.
+option(ALLOW_SCCACHE_FALLBACK
+       "Allow sccache to be selected automatically as a compiler-cache launcher [default: OFF]"
+       OFF)
 
 # Respect a launcher provided externally (command line, preset, toolchain).
 # Check both C and CXX: a toolchain may set only one of them, and we must not
@@ -385,7 +427,10 @@ set(FASTCACHE_AUTO_INSTALL_TTL_HOURS "24" CACHE STRING
 #
 # Defaulting OFF is what keeps CI's existing, relied-upon behaviour intact:
 # several downstream projects run CI with no fastcached daemon reachable on
-# purpose, so a build transparently falls through to sccache. A default of ON
+# purpose, so a build transparently falls through to whatever else is installed
+# and usable -- which since #815 means ccache, or sccache where it was asked
+# for, or nothing. The boundary is unaffected by which of those it lands on;
+# what matters is that nothing gets started here. A default of ON
 # would remove that boundary for everyone who has not opted out, rather than
 # adding it only for those who opt in. No CI-environment sniffing backs this
 # up — an explicit -DFASTCACHE_AUTO_START=ON is trusted at face value, the
@@ -1100,13 +1145,23 @@ function(_fc_auto_start_fastcached)
     endif()
 endfunction()
 
+# sccache counts as "already installed" here only when it could actually be
+# selected. It is opt-in since #815, so an installed-but-not-opted-into sccache is
+# not a decision anybody made about this build -- and reading it as one would leave
+# a machine that explicitly asked for auto-install with no cache at all, which is
+# the opposite of what the flag is for.
+set(_fc_sccache_selectable OFF)
+if(SCCACHE AND ALLOW_SCCACHE_FALLBACK)
+    set(_fc_sccache_selectable ON)
+endif()
+
 # Only when there is nothing else to use. A launcher the user installed is a
 # decision already made, and preempting it would be the behaviour change this is
 # careful not to be.
 if(USE_COMPILER_CACHE
    AND FASTCACHE_AUTO_INSTALL
    AND NOT FASTCACHE_CC
-   AND NOT SCCACHE
+   AND NOT _fc_sccache_selectable
    AND NOT CCACHE)
     _fc_auto_install_fastcache_cc(_fc_auto_installed _fc_auto_why_not)
     if(_fc_auto_installed)
@@ -1204,6 +1259,12 @@ endfunction()
 #   _fc_cache_<id>_label     human-readable name for the status message
 #   _fc_cache_<id>_program   the found program (empty when not installed)
 #   _fc_cache_<id>_requires  extra condition; the row is skipped when falsy
+#   _fc_cache_<id>_requires_note  what to say when `requires` is falsy while the
+#                            program IS installed -- a launcher sitting right
+#                            there and not being used is the silence #815 is
+#                            about. Empty for a row whose absence explains
+#                            itself, which is why fastcache-cc has none: an
+#                            emptied FASTCACHE_ADDR is a documented opt-out (#372)
 #   _fc_cache_<id>_env       NAME=VALUE pairs to inject around the invocation
 #   _fc_cache_<id>_check     function deciding usability at configure time
 #                            (empty when being installed is enough); called as
@@ -1213,12 +1274,14 @@ endfunction()
 #   _fc_cache_<id>_caveat    a correctness hazard this launcher carries, warned
 #                            about when it is the row that WINS (empty for none)
 #   _fc_cache_<id>_predicts  a regex over THIS row's rejection reason; when it
-#                            matches and the winner carries a caveat, the two are
-#                            reported together (empty when no reason predicts
-#                            anything) -- see `_fc_cache_predicted_hazard` (#658)
+#                            matches, the rejection is warned about rather than
+#                            merely reported, and the winner's caveat -- if it has
+#                            one -- is folded into the same message (empty when no
+#                            reason predicts anything) -- see
+#                            `_fc_cache_rejection_warning` (#658, #815)
 #   _fc_cache_<id>_predicts_detail  what to tell the operator about fixing this
 #                            row, printed with that warning
-# Supporting a fourth launcher is adding an id here plus its nine variables.
+# Supporting a fourth launcher is adding an id here plus its ten variables.
 set(_fc_cache_candidates fastcache_cc sccache ccache)
 
 # Render "<label>[ <detail>]" for a row, so a launcher and where it points are
@@ -1237,6 +1300,9 @@ endfunction()
 set(_fc_cache_fastcache_cc_label "fastcache-cc")
 set(_fc_cache_fastcache_cc_program "${FASTCACHE_CC}")
 set(_fc_cache_fastcache_cc_requires "${FASTCACHE_ADDR}")
+# No note: an empty FASTCACHE_ADDR is the documented way to opt out of this row
+# (#372), so a machine that took it does not need telling what it just asked for.
+set(_fc_cache_fastcache_cc_requires_note "")
 set(_fc_cache_fastcache_cc_env ${_fc_fastcache_env})
 set(_fc_cache_fastcache_cc_check _fc_probe_fastcache_cc)
 # A WIRE VERSION mismatch, and only that. "not installed", "no answer" and "the
@@ -1248,14 +1314,25 @@ set(_fc_cache_fastcache_cc_check _fc_probe_fastcache_cc)
 # disarms this silently -- narrower than the display-sentence parsing it replaced,
 # and recorded rather than hidden.
 set(_fc_cache_fastcache_cc_predicts "unsupported-version")
+# Names the remedy, and names the DIRECTION, which is the step #815's acceptance
+# clause 2 says the refusal stops short of. `unsupported wire version 3; this
+# server speaks 1..1` is accurate and leaves the reader to work out which end is
+# behind -- and the sentence is written by the DAEMON, so an old daemon will go on
+# sending the old wording forever and cannot be fixed there. It is read here.
 set(_fc_cache_fastcache_cc_predicts_detail
-    "A daemon IS running at ${FASTCACHE_ADDR} and it is one you installed; it is simply out of step with this fastcache-cc. Rebuild or reinstall whichever is older and the safe launcher comes back. This is a normal state during a rollout, which is why it is a warning and not a refusal to configure.")
+    "A daemon IS answering at ${FASTCACHE_ADDR} and it is one you installed; it is simply out of step with this fastcache-cc, so this build is not using the cache you think it is. Read the refusal above as `unsupported wire version <N>; this server speaks <lo>..<hi>`: <N> is what this launcher speaks and <lo>..<hi> is what the daemon accepts, so an <hi> below <N> means the DAEMON is the older of the two and is the one to replace. Compare `fastcache-cc --version` against the daemon's, and check which binary the service actually starts -- a packaged daemon on PATH ahead of a hand-built launcher is how #815 was found. This is a normal state during a rollout, which is why it is a warning and not a refusal to configure.")
 set(_fc_cache_fastcache_cc_detail "at ${FASTCACHE_ADDR}")
 set(_fc_cache_fastcache_cc_caveat "")
 
 set(_fc_cache_sccache_label "sccache")
 set(_fc_cache_sccache_program "${SCCACHE}")
-set(_fc_cache_sccache_requires ON)
+# Opt-in, never automatic (#815). The column already existed, so this is a value
+# and not a branch: the row is skipped exactly as any other unsatisfied row is,
+# and opting in restores it in its original position -- above ccache, because
+# asking for sccache is asking for sccache.
+set(_fc_cache_sccache_requires "${ALLOW_SCCACHE_FALLBACK}")
+set(_fc_cache_sccache_requires_note
+    "not selected automatically; sccache is opt-in here, so pass -DALLOW_SCCACHE_FALLBACK=ON to use it (#815)")
 set(_fc_cache_sccache_env "")
 set(_fc_cache_sccache_check "")
 set(_fc_cache_sccache_predicts "")
@@ -1295,7 +1372,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC
 
 It bites an INCREMENTAL build across two checkouts sharing one sccache cache. A clean build has no dependency graph to corrupt, and checkouts that all sit at the same absolute path replay paths that are correct -- CI is normally both, and unaffected. GCC and Clang are unaffected everywhere: their preprocessed output carries the paths, so the two checkouts do not share entries in the first place.
 
-To avoid it: install fastcache-cc and run a fastcached daemon, which rewrites a hit's paths into the consuming checkout and so does not have this failure mode; or pass -DSCCACHE= to fall through to ccache, which is unaffected; or configure with -DUSE_COMPILER_CACHE=OFF.")
+To avoid it: drop -DALLOW_SCCACHE_FALLBACK, which is the only reason sccache was selected here at all -- it is opt-in since #815 and this build asked for it; or install fastcache-cc and run a fastcached daemon, which rewrites a hit's paths into the consuming checkout and so does not have this failure mode; or pass -DSCCACHE= to fall through to ccache, which is unaffected; or configure with -DUSE_COMPILER_CACHE=OFF.")
 else()
     set(_fc_cache_sccache_caveat "")
 endif()
@@ -1303,6 +1380,7 @@ endif()
 set(_fc_cache_ccache_label "ccache")
 set(_fc_cache_ccache_program "${CCACHE}")
 set(_fc_cache_ccache_requires ON)
+set(_fc_cache_ccache_requires_note "")
 set(_fc_cache_ccache_env "")
 set(_fc_cache_ccache_check "")
 set(_fc_cache_ccache_predicts "")
@@ -1318,7 +1396,18 @@ set(_fc_cache_chosen "")
 set(_fc_cache_rejected "")
 if(USE_COMPILER_CACHE)
     foreach(_id IN LISTS _fc_cache_candidates)
-        if(NOT _fc_cache_${_id}_program OR NOT _fc_cache_${_id}_requires)
+        if(NOT _fc_cache_${_id}_program)
+            continue()
+        endif()
+        # A row whose `requires` is falsy while its PROGRAM is right there is a
+        # launcher present and not used, and saying nothing about it would rebuild
+        # #815's shape one row over. Rows whose absence explains itself carry no
+        # note and stay silent.
+        if(NOT _fc_cache_${_id}_requires)
+            if(_fc_cache_${_id}_requires_note)
+                _fc_cache_describe("${_id}" _fc_cache_desc)
+                list(APPEND _fc_cache_rejected "${_fc_cache_desc}: ${_fc_cache_${_id}_requires_note}")
+            endif()
             continue()
         endif()
         if(_fc_cache_${_id}_check)
@@ -1345,6 +1434,41 @@ endif()
 # through in silence looks exactly like it never being installed.
 foreach(_rejection IN LISTS _fc_cache_rejected)
     message(STATUS "[cache] Not using ${_rejection}")
+endforeach()
+
+# ...and WARN about the ones whose reason says a warning is warranted.
+#
+# **Outside `if(_fc_cache_chosen)`, and that placement is the #815 half.** This
+# loop used to live inside it, so the case where NOTHING replaced the rejected
+# launcher -- the build compiles uncached, which is the loudest of the three --
+# produced no message at all. The winner is now an INPUT to the decision rather
+# than a precondition for reaching it: see `_fc_cache_rejection_warning`.
+#
+# Over the CANDIDATES rather than one named row, so a launcher that gains a
+# `predicts` column is covered without editing this.
+if(_fc_cache_chosen)
+    _fc_cache_describe("${_fc_cache_chosen}" _fc_cache_winner_desc)
+    set(_fc_cache_winner_caveat "${_fc_cache_${_fc_cache_chosen}_caveat}")
+else()
+    set(_fc_cache_winner_desc "")
+    set(_fc_cache_winner_caveat "")
+endif()
+foreach(_id IN LISTS _fc_cache_candidates)
+    if(NOT DEFINED _fc_cache_${_id}_rejected_why)
+        continue()
+    endif()
+    _fc_cache_describe("${_id}" _fc_cache_rejected_desc)
+    _fc_cache_rejection_warning(
+        "${_fc_cache_${_id}_rejected_why}"
+        "${_fc_cache_${_id}_predicts}"
+        "${_fc_cache_rejected_desc}"
+        "${_fc_cache_winner_desc}"
+        "${_fc_cache_winner_caveat}"
+        "${_fc_cache_${_id}_predicts_detail}"
+        _fc_cache_rejection_text)
+    if(_fc_cache_rejection_text)
+        message(WARNING "${_fc_cache_rejection_text}")
+    endif()
 endforeach()
 
 if(_fc_cache_chosen)
@@ -1374,31 +1498,11 @@ if(_fc_cache_chosen)
     # Never fatal, and never a `check` that skips the row: which launcher to run
     # is the developer's call, and a module vendored into other repositories does
     # not get to make it for them. It only has to make it an informed one.
-    # BEFORE the caveat, and that ordering is the whole point: this line says why
-    # the safe launcher is not being used, and the caveat immediately under it says
-    # what the replacement costs. Two messages eighty lines apart were the defect.
     #
-    # Over the CANDIDATES rather than one named row, so a launcher that gains a
-    # `predicts` column is covered without editing this.
-    _fc_cache_describe("${_fc_cache_chosen}" _fc_cache_winner_desc)
-    foreach(_id IN LISTS _fc_cache_candidates)
-        if(NOT DEFINED _fc_cache_${_id}_rejected_why)
-            continue()
-        endif()
-        _fc_cache_describe("${_id}" _fc_cache_rejected_desc)
-        _fc_cache_predicted_hazard(
-            "${_fc_cache_${_id}_rejected_why}"
-            "${_fc_cache_${_id}_predicts}"
-            "${_fc_cache_rejected_desc}"
-            "${_fc_cache_winner_desc}"
-            "${_fc_cache_${_fc_cache_chosen}_caveat}"
-            "${_fc_cache_${_id}_predicts_detail}"
-            _fc_cache_predicted_warning)
-        if(_fc_cache_predicted_warning)
-            message(WARNING "${_fc_cache_predicted_warning}")
-        endif()
-    endforeach()
-
+    # It is the SECOND warning, not the first: the rejection warnings above have
+    # already said why the safe launcher is not being used, and this says what the
+    # replacement costs. Two messages eighty lines apart were #658's defect and
+    # that ordering is what fixed it.
     if(_fc_cache_${_fc_cache_chosen}_caveat)
         message(WARNING "[cache] ${_fc_cache_${_fc_cache_chosen}_caveat}")
     endif()
@@ -1556,8 +1660,12 @@ else()
     if(NOT USE_COMPILER_CACHE)
         message(STATUS "[cache] Compiler caching disabled by USE_COMPILER_CACHE=OFF")
     elseif(_fc_cache_rejected)
-        message(STATUS "[cache] No other compiler-cache launcher found (sccache, ccache); caching disabled "
-                       "(start a daemon with `fastcached` to cache through fastcache-cc)")
+        # Something WAS found and passed over, and the `Not using` line(s) above
+        # have already named which and why -- so this must not claim nothing was
+        # found. It used to name sccache and ccache outright, which stopped being
+        # true the moment sccache could be installed and merely not opted into.
+        message(STATUS "[cache] No compiler-cache launcher was usable; caching disabled "
+                       "(the `Not using` line(s) above say why each was passed over)")
     else()
         message(STATUS "[cache] No compiler-cache launcher found (fastcache-cc, sccache, ccache); caching disabled")
     endif()

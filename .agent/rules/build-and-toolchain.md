@@ -2798,9 +2798,9 @@ with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
 trees. Configure proves the cache works by compiling one tiny file through the
 launcher (~0.1 s) and requiring a `HIT`/`MISS`, because a launcher that cannot
 reach its daemon still compiles fine and would otherwise cost every TU a failed
-connect in silence. When nothing answers it falls back to `sccache` — which is
-not free, see below. When
-*nothing* is installed, `-DFASTCACHE_AUTO_INSTALL=ON` (default OFF) fetches a
+connect in silence. When nothing answers it falls through to `ccache`; `sccache`
+sits between the two in preference order but is **opt-in**, see below. When
+*nothing usable* is installed, `-DFASTCACHE_AUTO_INSTALL=ON` (default OFF) fetches a
 prebuilt `fastcache-cc` for the host from the latest stable release instead,
 staged per user so a machine downloads it once; `cmake/README.md` is the note
 for projects vendoring the module. A cache hit reproduces only the object file,
@@ -2837,9 +2837,10 @@ PDB is a second artefact no hit can reproduce).
 
   **It bites an incremental build across two checkouts that share one cache.** A
   clean build has no dependency graph to corrupt, and checkouts that all sit at the
-  same absolute path replay paths that are correct — CI is normally both, which is
-  why the fallback stays automatic rather than becoming opt-in: downstream projects
-  run CI with no daemon reachable on purpose and are not exposed. Passing
+  same absolute path replay paths that are correct — CI is normally both, and
+  downstream projects run CI with no daemon reachable on purpose. That used to be
+  the argument for the fallback staying automatic; **#815 overturned it, for a
+  reason the hazard analysis could not see** — see the next entry. Passing
   `-DSCCACHE=` falls through to ccache, whose default empty `base_dir` means it
   does not rewrite absolute paths and so does not share entries between checkouts.
 
@@ -2853,6 +2854,77 @@ PDB is a second artefact no hit can reproduce).
   not an `if` on its name, and `ctest -R compile-cache-caveat` asserts both halves —
   that sccache warns, and that the launchers without a hazard stay silent. A warning
   that fired for every launcher would be one nobody reads.
+
+- **sccache is never selected automatically, and a version refusal is announced
+  rather than reported (#815).** Two rules, one defect, and the second is the half
+  that survives the first.
+
+  The reporting host ran a packaged `/usr/bin/fastcached` 0.1.0 while
+  `/usr/local/bin/fastcache-cc` was a current build. Wire 3 against a server
+  speaking 1..1 — correct on both sides, a deployment mismatch and not a bug — so
+  every exchange was refused, `CompileCache.cmake` fell through, and the project
+  built through sccache for weeks while believing it dogfooded its own launcher.
+  **Every mechanism worked.** The launcher degraded exactly as designed, recorded
+  the refusal, and tallied it in `--show-stats` (1003 compiles, 2.1%, reaching no
+  cache). The configure's own probe passed the fallback silently because it tests
+  **reachability, not acceptance** — it accepts a `HIT`/`MISS` and a refusal is
+  neither, so the row was skipped at `STATUS` among a hundred other status lines.
+
+  - **The gate.** `_fc_cache_sccache_requires` is `${ALLOW_SCCACHE_FALLBACK}`,
+    default OFF — a value in a column that already existed, not a branch. Opted
+    into, sccache keeps its rank above ccache, because asking for it is asking for
+    it. The alternative remedy — have CI set `CMAKE_C/CXX_COMPILER_LAUNCHER`
+    externally — would have worked and is **wrong**: this module returns early when
+    a launcher is already set, so it would have taken the `/showIncludes` caveat
+    warning above out of the log with it, silently, on exactly the platform where
+    that hazard exists. Gating the row keeps the warning. The option name carries no
+    project prefix, like `USE_COMPILER_CACHE`, because the file is vendored verbatim.
+  - **The three Windows jobs opt in**, and that is a hard requirement rather than a
+    convenience: `windows`, `compile-cache-e2e-windows` and `package-windows` front
+    the compiler with sccache and measured 80–99% hit rates. A job that lost the flag
+    would compile *cold*, not break — which is the failure CI is worst at noticing —
+    so the existing `compile_requests -eq 0` assertion in all three is what catches
+    it. That assertion is the guard; there is no separate check.
+  - **Dropping sccache does not end the silence, it RELOCATES it.** On the reporting
+    host ccache is installed, so the same refusal now falls through to ccache with
+    the same absence of announcement. So the second rule: a rejection whose reason
+    matches the row's `predicts` column is a `message(WARNING)` **whatever replaced
+    it, including nothing**. #658 had already built the machinery and conditioned it
+    on the winner carrying a caveat — which is a property of the COMPILER, true on
+    MSVC and clang-cl and false on GCC and Clang — so on the host that filed #815 it
+    was silent by construction. Three replacements, three wordings, one warning:
+    safe, hazardous, and none at all. The last is the loudest, because the build then
+    compiles uncached, and it is the one that used to emit nothing at all: the loop
+    lived inside `if(_fc_cache_chosen)`.
+  - **A `message(WARNING)`, never `SEND_ERROR`.** The module may not fail a
+    configure (its own header, and `check-compile-cache-caveat`'s "a caveat must
+    never fail a configure" row), and a daemon out of step with a launcher is the
+    normal state during a rollout. A warning is the loudest level that leaves the
+    build buildable, and that is the whole of the decision.
+  - **The remedy names the direction**, which is #815's clause 2. `unsupported wire
+    version 3; this server speaks 1..1` is accurate and stops one step short of
+    *your daemon is older than your launcher* — and it cannot be fixed where it is
+    written, because the sentence comes from the **daemon**
+    (`CompileCacheHandler.cpp`), so an old daemon goes on sending the old wording
+    forever. It is read at `_fc_cache_fastcache_cc_predicts_detail` instead.
+  - **A launcher installed and not used is announced too.** A row skipped because
+    its `requires` is falsy used to print nothing, which would have rebuilt #815's
+    shape one row over the moment sccache became opt-in. `_fc_cache_<id>_requires_note`
+    is the column; a row whose absence explains itself carries none, which is why
+    `fastcache_cc` has none — an emptied `FASTCACHE_ADDR` is a documented opt-out
+    (#372).
+  - **Auto-install had to move with it.** `FASTCACHE_AUTO_INSTALL` fires only when
+    nothing else is installed, on the reasoning that "a launcher the user installed
+    is a decision already made". An installed-but-not-opted-into sccache is not that
+    decision, and counting it as one would leave a machine that explicitly asked for
+    auto-install with no cache at all.
+  - Coverage: `ctest -R version-fallback-warning` drives the decision as a pure
+    function over eleven rows (the situation needs two binaries at disagreeing wire
+    versions, so it cannot be staged), and `ctest -R compile-cache-caveat` drives the
+    gate through real configures in both directions — opt-in absent and sccache
+    passed over even with ccache present beside it, opt-in set and sccache selected
+    with the caveat still printed. Both were shown failing against the pre-#815
+    module before being believed.
 
 - **The same hazard has a second audience, and that warning cannot reach it.**
   Pointing sccache at a fastcached daemon — `SCCACHE_MEMCACHED` / `SCCACHE_REDIS`,
