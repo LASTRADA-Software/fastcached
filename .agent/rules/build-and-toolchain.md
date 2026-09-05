@@ -1537,23 +1537,40 @@ makes it anyway and says so there.
   translation units — the failure `tidy-sweep.sh` exists to prevent one level down,
   reached one level up. Delete the report step and the full sweep still runs, still
   fails and still reaches nobody. So the check reads the workflow for four things:
-  that `--all` is passed, and that its guard **EXCLUDES the two diff-scoped events**
-  rather than NAMING the event that gets the full sweep; that a queue entry diffs
-  against its own `base_sha`; that some step reads the sweep STEP's conclusion for
-  `refs/heads/master`; and that the job grants the `issues: write` without which
-  that reader is decorative.
+  that the sweep step **consults the mapping** (`--ci`) and restates none of it;
+  that the queue entry's own `base_sha` reaches that mapping **under the
+  environment name `tidy-sweep.sh` reads it from**, which the check takes from that
+  script rather than restating — matching only the expression cannot see a rename,
+  and a rename is the one edit that breaks the wiring while leaving the expression
+  in place, silently, in the direction where the queue diffs against master; that
+  some step reads
+  the sweep STEP's conclusion for `refs/heads/master`; and that the job grants the
+  `issues: write` without which that reader is decorative.
 
-  The first of those is a spelling, and the spelling is the whole rule.
-  `event_name == 'push'` and `event_name != 'pull_request' && event_name !=
-  'merge_group'` select the same events today and fall opposite ways tomorrow: a
-  trigger added to `on:` later diff-scopes under the first and sweeps everything
-  under the second, and on master a diff-scoped run has an EMPTY diff, so
-  `tidy-sweep.sh` prints `no source changed` and exits 0 having analysed nothing.
-  Narrowing silently is the failure; re-widening is merely slow. The check
-  therefore refuses the inclusive spelling outright — this paragraph said the
-  reverse until the review caught it, which is worth leaving recorded, because an
-  agent reading this file before touching the area would have rewritten the guard
-  on its authority and been failed by the check.
+  **The mapping itself is one table**, `CiScopeTable` in `scripts/tidy-sweep.sh`,
+  driven by that script's own `--self-test` (#570). It was three expressions in two
+  languages — a `BASE:` env expression, an `--all` argument expression and the
+  reader's `if:` — so "what happens on event X" had to be composed out of GitHub
+  expression syntax and shell across three places, and nothing stated it. The
+  workflow now hands over the three FACTS its context holds
+  (`GITHUB_EVENT_NAME`, `GITHUB_BASE_REF`, `MERGE_GROUP_BASE_SHA`) and decides
+  nothing, which is why the check's first rule is now *do not decide here* rather
+  than *spell the guard this way*.
+
+  That respelling is not a tidy-up, and what it preserves is worth keeping written
+  down. The old guard had to EXCLUDE the two diff-scoped events rather than NAME
+  the event that gets the full sweep: `event_name == 'push'` and `event_name !=
+  'pull_request' && event_name != 'merge_group'` select the same events today and
+  fall opposite ways tomorrow — a trigger added to `on:` later diff-scopes under
+  the first and sweeps everything under the second, and on master a diff-scoped run
+  has an EMPTY diff, so `tidy-sweep.sh` prints `no source changed` and exits 0
+  having analysed nothing. Narrowing silently is the failure; re-widening is merely
+  slow. A table with a **default row** is that property made structural: the events
+  that diff-scope are listed, everything else falls to `all`, and there is no
+  spelling left to get backwards. The paragraph this replaces said the reverse of
+  the old rule until a review caught it, which is worth leaving recorded, because
+  an agent reading this file before touching the area would have rewritten the
+  guard on its authority and been failed by the check.
 
   Each rule is driven red on a GENERATED workflow by `--self-test`, in both
   directions, because a guard nobody has seen bite has told you nothing. Generated
