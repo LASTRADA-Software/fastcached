@@ -2425,6 +2425,19 @@ only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
 
+- **[#868](https://github.com/LASTRADA-Software/fastcached/issues/868)** — #753 made the
+  DAEMON re-ask about its secret's file at every reload; the worker still has the
+  startup-only version, and it holds five such files rather than one. Only half of #753
+  is reachable here — none of the five settings is `Reloadable::Yes`, so a node file
+  cannot GAIN a secret across a reload — but the other half is the one a snapshot cannot
+  answer: a mode is in no configuration, so an operator who loosens
+  `--cluster-key-file` an hour after the node started gets silence for the rest of the
+  process's life, and that key MACs discovery proofs and lease grants.
+  `SecretExposureWatcher` is already generic over a path list, so no second copy of the
+  RULE is wanted; what is daemon-shaped is `WatchSecretExposure`, which names the
+  concrete `ConfigReloader` and `DaemonSecretFiles`. Any fix must answer
+  `ApplyReloadRequest`'s own stated reason for declining `Subscribe` — the reloader
+  outlives `WorkerBody` and `Subscribe` has no unsubscribe — rather than route around it.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was

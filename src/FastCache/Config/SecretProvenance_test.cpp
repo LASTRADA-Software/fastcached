@@ -6,6 +6,7 @@
 #include <array>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
@@ -13,10 +14,9 @@
     #include <sys/stat.h>
 #endif
 
-using FastCache::CliResult;
 using FastCache::Config;
+using FastCache::DaemonSecretFiles;
 using FastCache::SecretCameFromConfigFile;
-using FastCache::SecretFileWarning;
 using FastCache::SecretFileWarnings;
 using FastCache::SecretProvenanceFacts;
 
@@ -58,37 +58,39 @@ TEST_CASE("SecretProvenance: the rule over the facts is one function both execut
     }
 }
 
-TEST_CASE("SecretProvenance: a secret came from a file only when nothing else supplied it", "[config][secret]")
+TEST_CASE("SecretProvenance: the daemon's subject list is what the gate lets through", "[config][secret]")
 {
-    // The gate on the whole of #384's startup check. Asked as PROVENANCE, because
-    // a value comparison cannot tell an operator who typed `--requirepass=` --
-    // asking for no authentication -- from one who typed nothing at all.
+    // The gate on the whole of #384's startup check, asserted where production asks
+    // it. Asked as PROVENANCE, because a value comparison cannot tell an operator who
+    // typed `--requirepass=` -- asking for no authentication -- from one who typed
+    // nothing at all; the bit comes from the parse (`CliResult::requirePassExplicit`)
+    // and is passed as the fact it is.
+    std::filesystem::path const configFile { "/etc/fastcached/fastcached.yaml" };
+
     SECTION("no secret in force")
     {
         Config cfg {};
-        cfg.configPath = "/etc/fastcached/fastcached.yaml";
-        CHECK_FALSE(SecretCameFromConfigFile(cfg, CliResult {}));
+        cfg.configPath = configFile.string();
+        CHECK(DaemonSecretFiles(cfg, false).empty());
     }
 
     SECTION("a secret from a file")
     {
         Config cfg {};
         cfg.requirePass = "hunter2";
-        cfg.configPath = "/etc/fastcached/fastcached.yaml";
-        CHECK(SecretCameFromConfigFile(cfg, CliResult {}));
+        cfg.configPath = configFile.string();
+        CHECK(DaemonSecretFiles(cfg, false) == std::vector<std::filesystem::path> { configFile });
     }
 
     SECTION("a secret the command line supplied is a different exposure")
     {
         // It is in `ps`, which is what `InlineCredentialRejection` refuses to bake
         // into a registration -- a different problem with a different answer, and
-        // answering false here is not a claim that it is safe.
+        // answering "no file" here is not a claim that it is safe.
         Config cfg {};
         cfg.requirePass = "hunter2";
-        cfg.configPath = "/etc/fastcached/fastcached.yaml";
-        CliResult cli {};
-        cli.requirePassExplicit = true;
-        CHECK_FALSE(SecretCameFromConfigFile(cfg, cli));
+        cfg.configPath = configFile.string();
+        CHECK(DaemonSecretFiles(cfg, true).empty());
     }
 
     SECTION("a secret typed at the flag's own empty default is no secret")
@@ -97,10 +99,8 @@ TEST_CASE("SecretProvenance: a secret came from a file only when nothing else su
         // authentication whatever the file says". The bit is set and the value is
         // empty, and it is the VALUE that decides there is nothing to protect.
         Config cfg {};
-        cfg.configPath = "/etc/fastcached/fastcached.yaml";
-        CliResult cli {};
-        cli.requirePassExplicit = true;
-        CHECK_FALSE(SecretCameFromConfigFile(cfg, cli));
+        cfg.configPath = configFile.string();
+        CHECK(DaemonSecretFiles(cfg, true).empty());
     }
 
     SECTION("no file was read")
@@ -111,7 +111,7 @@ TEST_CASE("SecretProvenance: a secret came from a file only when nothing else su
         // teaches people to ignore it.
         Config cfg {};
         cfg.requirePass = "hunter2";
-        CHECK_FALSE(SecretCameFromConfigFile(cfg, CliResult {}));
+        CHECK(DaemonSecretFiles(cfg, false).empty());
     }
 }
 
@@ -132,11 +132,21 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         return path;
     };
 
-    auto const warningFor = [](std::filesystem::path const& path) {
+    // The daemon's whole startup answer, exactly as `DaemonBody` composes it: the
+    // subject list, then the renderer. Written out here rather than behind a
+    // one-shot helper, because the helper would be a second production path nothing
+    // calls -- and a function with no production caller is the defect it was written
+    // to fix.
+    auto const daemonWarning = [](Config const& cfg, bool secretNamedOnCommandLine) {
+        auto const warnings = SecretFileWarnings(DaemonSecretFiles(cfg, secretNamedOnCommandLine));
+        return warnings.empty() ? std::string {} : warnings.front();
+    };
+
+    auto const warningFor = [&daemonWarning](std::filesystem::path const& path) {
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        return SecretFileWarning(cfg, CliResult {});
+        return daemonWarning(cfg, false);
     };
 
     SECTION("a world-readable file warns, and says what to do")
@@ -164,9 +174,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        CliResult cli {};
-        cli.requirePassExplicit = true;
-        CHECK(SecretFileWarning(cfg, cli).empty());
+        CHECK(daemonWarning(cfg, true).empty());
     }
 
     SECTION("a file with no secret in force says nothing, whatever its mode")
@@ -174,7 +182,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         auto const path = configAt("nosecret.yaml", S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
         Config cfg {};
         cfg.configPath = path.string();
-        CHECK(SecretFileWarning(cfg, CliResult {}).empty());
+        CHECK(daemonWarning(cfg, false).empty());
     }
 
     SECTION("every exposed file is named, not just the first")
@@ -223,7 +231,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
         Config cfg {};
         cfg.requirePass = "hunter2";
         cfg.configPath = path.string();
-        auto const warning = SecretFileWarning(cfg, CliResult {});
+        auto const warning = daemonWarning(cfg, false);
         REQUIRE_FALSE(warning.empty());
         CHECK_FALSE(warning.contains("hunter2"));
     }

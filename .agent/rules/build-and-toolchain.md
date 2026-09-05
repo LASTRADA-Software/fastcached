@@ -3632,9 +3632,12 @@ file records against the store lane's insert.
 is the easiest one to write and the likeliest to be invalid.** Removing the branch
 under test is the obvious way to show a guard bites, and it changes two things at
 once: the behaviour, and whether the tree still compiles. `SecretCameFromConfigFile`'s
-provenance branch is the whole use of its `cli` parameter, so deleting it left the
-parameter unused, `-Werror` refused the build, and the arm went red for a
-COMPILATION reason while claiming to demonstrate the rule
+provenance branch WAS the whole use of its `cli` parameter — #752 moved the rule onto a
+`SecretProvenanceFacts` both executables build, and #753 then deleted the
+`(Config, CliResult)` adapter that was left, so the signature named here no longer
+exists — and deleting the branch left the parameter unused, `-Werror` refused the
+build, and the arm went red for a COMPILATION reason while claiming to demonstrate
+the rule
 ([#384](https://github.com/LASTRADA-Software/fastcached/issues/384)). Nothing in the
 red output says which of the two it was.
 
