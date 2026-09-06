@@ -578,6 +578,41 @@ void RecordFallback(Fallback kind, std::string_view reason)
         std::cerr << "fastcache-cc: " << row.leadIn << " (" << reason << "); " << row.continuation << '\n';
 }
 
+/// **The question both spellings answer: does the cache now hold a value that must
+/// be REPLACED?**
+///
+/// That is the whole distinction, and it is a property of the OUTCOME rather than a
+/// preference of the call site (#910):
+///
+///   * **Nothing to replace** -> `Warn`. The cache was never reached, or reached and
+///     holds nothing this build must overwrite. Returning `std::nullopt` reaches
+///     `RunPassthrough`: a plain compile with NO STORE, which is correct precisely
+///     because there is nothing to store over.
+///   * **An unusable value is sitting under this key** -> `WarnAndCarryOn`. Falling
+///     through to the MISS path is what lets its STORE overwrite the bad value.
+///
+/// Getting it backwards once cost a **permanently dead cache**: a
+/// `CompileValueVersion` bump does not move the key, so a foreign-generation value
+/// stays under the key the new build computes -- fetched, refused, and with
+/// `Warn` never overwritten. After a bump that is every key in the cache, presenting
+/// as a slow build with a `--show-stats` reason nobody reads.
+///
+/// The audit that made this a rule rather than one line, over every call site:
+///
+/// | site                        | cache holds        | spelling         |
+/// |-----------------------------|--------------------|------------------|
+/// | cache not configured        | nothing            | `Warn`           |
+/// | preprocess failed           | nothing (no key)   | `Warn`           |
+/// | object could not be written | a GOOD entry       | `Warn`           |
+/// | daemon refused the fetch    | unknown, unreached | `WarnAndCarryOn` |
+/// | fetch exchange failed       | unknown, unreached | `WarnAndCarryOn` |
+/// | fetched value undecodable   | an UNUSABLE value  | `WarnAndCarryOn` |
+///
+/// Neither the compiler nor the suite can check this -- both spellings type-check,
+/// and `main.cpp` is in no test target (#909). `check-cache-flow-continuations.sh`
+/// therefore requires every call site to be CLASSIFIED, so a new outcome cannot
+/// choose by omission.
+
 /// Report that the cache could not serve this compile, and end the cache flow.
 ///
 /// **The return value is the continuation, so the line cannot lie about it.** The

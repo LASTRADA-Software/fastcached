@@ -3894,3 +3894,36 @@ set_tests_properties("pr-closing-keywords" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# Every cache-flow fall-back names which continuation it takes (#910).
+#
+# `Warn` returns nullopt -> a plain compile with NO STORE; `WarnAndCarryOn` falls
+# through to the MISS path, whose STORE REPAIRS the entry. The question both answer
+# is "does the cache now hold a value that must be REPLACED?", and getting it
+# backwards once cost a permanently dead cache: a `CompileValueVersion` bump does
+# not move the key, so a foreign-generation value stays under the key the new build
+# computes and is never overwritten.
+#
+# Nothing else can catch it -- both spellings type-check, `main.cpp` is in no test
+# target (#909), and the symptom is a slow build rather than a failure.
+add_test(
+    NAME "cache-flow-continuations"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh"
+)
+set_tests_properties("cache-flow-continuations" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Six cases, including the defect itself (the undecodable arm choosing no-STORE)
+# and the two ways this check could pass while guarding nothing: the helpers
+# renamed away so it matches nothing, and its subject file gone.
+add_test(
+    NAME "cache-flow-continuations-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh" --self-test
+)
+set_tests_properties("cache-flow-continuations-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
