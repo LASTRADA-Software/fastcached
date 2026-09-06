@@ -156,6 +156,24 @@ struct Config
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
 
+    /// Whether the operator NAMED `showIncludesMarker`, rather than getting the default.
+    ///
+    /// Provenance, recorded by the read -- never recovered by comparing the value to
+    /// the default, which cannot see the operator who typed the default. That is the
+    /// config rule from `AGENT.md`, and the cost of breaking it here is specific: an
+    /// English toolchain being explicit, or a value correctly copied out of an English
+    /// `build.ninja`, would be told "the default; set FASTCACHE_MSVC_DEPS_PREFIX" --
+    /// advice they have already followed, on the one line this whole setting exists to
+    /// emit.
+    ///
+    /// "Named" means named a USABLE value: a set-but-empty variable collapses to the
+    /// default here as it does everywhere else in this file, because an empty prefix is
+    /// not one Ninja could match a note against.
+    ///
+    /// In this run of bools deliberately -- one placed between two 8-aligned members
+    /// costs seven bytes of padding and fails the analyser's budget.
+    bool showIncludesMarkerNamed { false };
+
     /// Verify one hit in every this many, or `VerificationOff` to verify none.
     ///
     /// Off by default and deliberately so: a verified hit costs a whole compile, so
@@ -197,20 +215,14 @@ struct Config
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
     std::size_t maxStoreBytes { Cc::DefaultMaxStoreBytes };
 
-    /// The prefix a DISPATCHED compile's synthesised `/showIncludes` notes carry.
-    ///
-    /// This is the build's `msvc_deps_prefix` and NOT the launcher's own reading
-    /// marker, which is the whole of #700: Ninja matches this string literally, CMake
-    /// took it from the actual compiler, and a Visual Studio carrying a language pack
-    /// makes it a localized sentence. Emitting the English one there records no
-    /// dependencies for the translation unit and stops rebuilding it when its headers
-    /// change -- a wrong build under a zero exit code.
+    /// The prefix a DISPATCHED compile's synthesised `/showIncludes` notes carry --
+    /// the build's `msvc_deps_prefix`, not the launcher's own reading marker. Why
+    /// those are different questions, and what emitting the wrong one costs, is on
+    /// `Cc::RenderShowIncludes`.
     ///
     /// Defaulted to `Cc::IncludeNoteMarker` HERE, which is the only place the two
-    /// values ever meet. That keeps one definition of the literal in the tree while
-    /// letting the writing side answer a question the reading side does not ask; see
-    /// `RenderShowIncludes` for why the renderer takes it as a required parameter
-    /// rather than defaulting it itself.
+    /// values ever meet: that keeps one definition of the literal in the tree while
+    /// letting the renderer take the marker as a required, undefaulted parameter.
     ///
     /// The launcher CANNOT derive this. It is a value the build holds and never tells
     /// anybody, so an operator names it or the launcher guesses English. Discovering
@@ -326,11 +338,21 @@ struct Config
     c.schedulerAddr = EnvOr(Cc::EnvName::Scheduler, "");
     c.credential.username = EnvOr(Cc::EnvName::User, "");
     c.credential.secret = EnvOr(Cc::EnvName::Token, "");
+    // Read ONCE, and the provenance recorded rather than inferred later by comparing
+    // the value to the default -- which cannot see the operator who typed the default,
+    // and would tell an English build that explicitly named the English prefix to go
+    // and set the variable it had just set.
+    //
     // Set-but-empty collapses to the default, as everywhere else here, and that is
-    // right rather than merely consistent: an empty `msvc_deps_prefix` is not a
-    // prefix Ninja could match a note against -- it would match every line -- so
-    // there is no reading of the empty value that is better than the default.
-    c.showIncludesMarker = EnvOr(Cc::EnvName::MsvcDepsPrefix, Cc::IncludeNoteMarker);
+    // right rather than merely consistent: an empty `msvc_deps_prefix` is not a prefix
+    // Ninja could match a note against -- it would match every line -- so there is no
+    // reading of the empty value that is better than the default. Assigning only when
+    // it is named also leaves the member's own initializer to supply the default,
+    // instead of building a second copy of it to move over the first.
+    auto named = EnvOr(Cc::EnvName::MsvcDepsPrefix, "");
+    c.showIncludesMarkerNamed = !named.empty();
+    if (c.showIncludesMarkerNamed)
+        c.showIncludesMarker = std::move(named);
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
     // be, and a truncating cast turns a ceiling somebody raised into a tiny one
     // that silently stops caching almost everything.
@@ -2082,35 +2104,33 @@ void RecordManifest(Config const& cfg,
                                "could not write the depfile for a dispatched compile; compiling locally");
     if (cmd.wantShowIncludes)
     {
-        // Said on every dispatched compile that synthesises notes, because this is
-        // the one line that answers "why did my build stop rebuilding this file".
+        // Said on every dispatched compile that synthesises notes, because this is the
+        // one line that answers "why did my build stop rebuilding this file".
         //
-        // The launcher is GUESSING here whenever nothing named the prefix, and it
-        // cannot do better: `msvc_deps_prefix` is a value the build holds and never
-        // exports. The guess is right on an English toolchain and wrong on a
-        // localized one, and #700's whole character is that being wrong is SILENT --
-        // Ninja does not complain about a note it fails to match, it prints it as
-        // ordinary compiler output and records nothing. So the guess is stated
-        // rather than merely made.
+        // The launcher is GUESSING whenever nothing named the prefix, and it cannot do
+        // better: `msvc_deps_prefix` is a value the build holds and never exports. Being
+        // wrong is SILENT -- Ninja does not complain about a note it fails to match, it
+        // prints it as ordinary compiler output and records nothing -- so the guess is
+        // stated rather than merely made. What it costs is on `RenderShowIncludes`.
         //
-        // Verbose rather than unconditional: an English toolchain is the common case
-        // and would get this line on every dispatched translation unit, which is how
-        // a diagnostic becomes noise nobody reads. FASTCACHE_VERBOSE is exactly the
-        // switch somebody investigating an under-rebuild turns on.
+        // Verbose rather than unconditional: an English toolchain is the common case and
+        // would get this on every dispatched translation unit, which is how a diagnostic
+        // becomes noise nobody reads. It carries the prefix and where that came from and
+        // nothing else -- what the prefix has to equal is one `--help` away, and the note
+        // COUNT would be the pre-dedup figure, since `RenderShowIncludes` uniques them.
         //
-        // Deliberately NOT keyed on `ProbedDependencies::unreadable`. That predicate
-        // feeds a message and nothing else by contract, and #825 records the claim
-        // underneath it -- which stream `cl` writes its notes to -- as unmeasured and
-        // stated two ways in this tree. A guard resting on it may not fire for `cl`
-        // at all, which is what #821 was reverted for: it read in the source like a
-        // safety net and was close to dead for its stated purpose.
-        Note(std::format("/showIncludes: writing {} note(s) with prefix \"{}\" ({}); it must equal this build's "
-                         "msvc_deps_prefix or no dependencies are recorded for this TU",
-                         dependencyPaths.size(),
+        // Deliberately NOT keyed on `ProbedDependencies::unreadable`. That predicate feeds
+        // a message and nothing else by contract, and #825 records the claim underneath it
+        // -- which stream `cl` writes its notes to -- as unmeasured and stated two ways in
+        // this tree. A guard resting on it may not fire for `cl` at all, which is what
+        // #821 was reverted for: it read in the source like a safety net and was close to
+        // dead for its stated purpose.
+        // Both arms name the variable, so it is spelled once and an operator reading
+        // either sentence learns what to reach for.
+        Note(std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
                          cfg.showIncludesMarker,
-                         cfg.showIncludesMarker == Cc::IncludeNoteMarker
-                             ? std::format("the default; set {} if this build expects another", Cc::EnvName::MsvcDepsPrefix)
-                             : std::format("from {}", Cc::EnvName::MsvcDepsPrefix)));
+                         cfg.showIncludesMarkerNamed ? "named by" : "the default; override with",
+                         Cc::EnvName::MsvcDepsPrefix));
         // Prepended, not appended: `cl` emits its notes before its diagnostics, and
         // the stored value's region ordering is what a later hit replays verbatim.
         run.out = Cc::RenderShowIncludes(dependencyPaths, cfg.showIncludesMarker) + run.out;

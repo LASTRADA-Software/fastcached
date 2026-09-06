@@ -117,11 +117,11 @@ TEST_CASE("showIncludes notes carry the marker the CALLER named, not the reader'
 
     auto const localized = RenderShowIncludes(deps, LocalizedMarker);
     CHECK(localized.starts_with(LocalizedMarker));
-    CHECK(localized.find(R"(C:\src\inc\a.hpp)") != std::string::npos);
+    CHECK(localized.contains(R"(C:\src\inc\a.hpp)"));
     // ...and the English literal is nowhere in it. Without this the case would pass
     // against a writer that emitted both, or that appended the caller's marker to
     // its own -- neither of which Ninja could match either.
-    CHECK(localized.find(IncludeNoteMarker) == std::string::npos);
+    CHECK_FALSE(localized.contains(IncludeNoteMarker));
 
     // The control that makes the above mean something: the same call with the
     // default marker still produces the English form. A writer that ignored its
@@ -150,14 +150,16 @@ TEST_CASE("A localized note is invisible to the English reader, which IS the def
     CHECK(ParseIncludePaths(RenderShowIncludes(deps, IncludeNoteMarker)).size() == deps.size());
 }
 
-TEST_CASE("An empty dependency set renders no notes at all, whatever the marker", "[dependency-output]")
+TEST_CASE("An empty dependency set renders no notes at all", "[dependency-output]")
 {
     // Not a blank line, not a header -- nothing. A stray line would be replayed
     // onto the compiler's real stdout and could be parsed as a note with an empty
     // path.
     //
-    // Asked of the localized marker too: emptiness must come from the path set, not
-    // from the marker happening to be the default one.
+    // Asked of the default marker only. The same call with `LocalizedMarker` looks
+    // like a second case and is not one: with an empty span the loop body never runs,
+    // so the marker is unreachable by construction and the assertion holds for any
+    // value whatsoever. That is a property of the signature rather than of a code
+    // path, which is the shape this repository's testing rule warns about.
     CHECK(RenderShowIncludes({}, IncludeNoteMarker).empty());
-    CHECK(RenderShowIncludes({}, LocalizedMarker).empty());
 }

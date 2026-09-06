@@ -82,18 +82,14 @@ namespace FastCache::Cc
 /// through the cache — which is why it is the opposite direction from
 /// [#692](https://github.com/LASTRADA-Software/fastcached/issues/692) and worse.
 ///
-/// Measured, `ninja 1.13.2` on Linux, `deps = msvc`, one note naming one header —
-/// see `scripts/probes/ninja-msvc-deps-prefix.sh`, which is where that table lives
-/// so it is re-run rather than re-argued:
-///
-///     msvc_deps_prefix   note emitted       deps recorded   rebuilds on header edit
-///     English            English            1               yes
-///     German             English            0               NO
-///     German             German             1               yes
-///
-/// Ninja matches the literal string and knows nothing about languages. So the
-/// third row is the fix and the second is the bug, and neither needs a localized
-/// compiler to reach.
+/// **Ninja matches the literal string and knows nothing about languages**, and it
+/// takes a localized prefix as readily as the English one — so neither the bug nor
+/// the fix needs a localized compiler to reach. That is measured rather than
+/// assumed, over three cases (matching, mismatched, localized-matching), by
+/// `scripts/probes/ninja-msvc-deps-prefix.sh`. The figures live there and only
+/// there: the probe ASSERTS its own recorded table, so it is the one copy that
+/// cannot go stale unnoticed, and restating it here would be a second thing to be
+/// wrong.
 ///
 /// The marker is therefore **required and undefaulted**. A default argument would
 /// let the next call site omit the build's prefix and silently reintroduce exactly

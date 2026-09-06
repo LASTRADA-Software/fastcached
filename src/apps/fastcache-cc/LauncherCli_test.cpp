@@ -330,7 +330,17 @@ TEST_CASE("the help text documents every environment variable the launcher reads
     // The hardcoded list is a deliberate independent oracle: help is rendered
     // from LauncherEnvironment(), so checking it against that table would be
     // tautological, while this fails if a row is ever dropped.
+    //
+    // What it could NOT catch is a row ARRIVING -- a list is exact about the names it
+    // knows and silent about the ones it does not, and silence reads identically to
+    // complete coverage. `FASTCACHE_VERIFY` sat outside it for exactly that reason and
+    // was found by accident. So the COUNT is asserted below against
+    // `LauncherEnvironment().size()`, which is not tautological the way reading the
+    // names from it would be: it says "this oracle knows about as many variables as
+    // the launcher has", and a new row with no entry here fails without the oracle
+    // ever learning what that row is called.
     auto const help = HelpText();
+    auto fastcacheNames = std::size_t { 0 };
     for (auto const* name: { "FASTCACHE_ADDR",
                              "FASTCACHE_SOURCE_DIR",
                              "FASTCACHE_BINARY_DIR",
@@ -372,13 +382,27 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              // else, so the summary carrying the recipe is load-bearing
                              // rather than decorative -- asserted separately below.
                              "FASTCACHE_MSVC_DEPS_PREFIX",
+                             // The three below are not the launcher's own -- they are
+                             // the usual per-user state locations, documented as
+                             // `UsageEntry` rows rather than `EnvVarSpec` ones -- so
+                             // they are deliberately outside the count asserted after
+                             // the loop.
                              "LOCALAPPDATA",
                              "XDG_STATE_HOME",
                              "HOME" })
     {
         INFO("variable " << name);
         CHECK(help.contains(name));
+        if (std::string_view { name }.starts_with("FASTCACHE_"))
+            ++fastcacheNames;
     }
+
+    // Counted from the loop rather than written down, so this cannot drift from the
+    // list it describes -- a hand-maintained number beside a hand-maintained list is
+    // two sources of truth wearing one hat.
+    INFO("oracle knows " << fastcacheNames << " FASTCACHE_* names; LauncherEnvironment() has "
+                         << LauncherEnvironment().size());
+    CHECK(fastcacheNames == LauncherEnvironment().size());
 }
 
 TEST_CASE("the help text tells an operator where to find their msvc_deps_prefix")

@@ -50,7 +50,6 @@
 # answered to fix #700 or to test the fix.
 set -u
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/ninja-msvc-deps-prefix.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
@@ -74,8 +73,11 @@ run_case() {
     local name="$1" expect_prefix="$2" emit_prefix="$3" want_deps="$4" want_rebuild="$5"
     local d="$work/$name"
     mkdir -p "$d"
-    printf '#define A 1\n' > "$d/dep.h"
-    printf 'int main(void){return 0;}\n' > "$d/tu.c"
+    # Empty on purpose. No compiler runs here, so nothing ever reads these -- `dep.h`
+    # only has to EXIST so it can be touched, and `tu.c` only has to exist so ninja has
+    # an input. Plausible C in them would imply a compilation that does not happen.
+    : > "$d/dep.h"
+    : > "$d/tu.c"
 
     # A stand-in for a compiler: prints one /showIncludes-shaped note naming the
     # header, one line of ordinary output, and touches the object. Nothing here is a

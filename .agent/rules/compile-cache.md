@@ -1195,13 +1195,14 @@ same on both — the same defect with no MSVC anywhere near it.
     constructor one file away.
   - **The ticket was recorded as blocked on a localized `cl` and was not.**
     `msvc_deps_prefix` is a string the BUILD holds, so both the defect and its repair
-    are reachable with no language pack and no MSVC at all.
-    `scripts/probes/ninja-msvc-deps-prefix.sh` is the measurement — ninja 1.13.2,
-    Linux, three cases: English/English records 1 dependency and rebuilds,
-    German/English records **0** and does **not** rebuild, German/German records 1 and
-    rebuilds. Ninja matches the literal string and knows nothing about languages.
-    Reproducing a defect proves it is real; the third row is what proves the FIX is
-    observable, and without it this ticket stalls again on "how would we know".
+    are reachable with no language pack and no MSVC at all — ninja matches the literal
+    string and knows nothing about languages.
+    `scripts/probes/ninja-msvc-deps-prefix.sh` is the measurement and the only place
+    its figures live, because it ASSERTS its own recorded table rather than printing
+    one. Three cases, and the third is the load-bearing one: matching, mismatched, and
+    **localized-matching**. Reproducing a defect proves it is real; only feeding the
+    right prefix and watching the dependency come back proves the FIX is observable,
+    and without that this ticket stalls again on "how would we know".
   - That asymmetry is why **discovery** was split out rather than chosen
     ([#878](https://github.com/LASTRADA-Software/fastcached/issues/878)): the escape
     hatch's input IS the prefix string, so a test supplies it, while discovery's input
