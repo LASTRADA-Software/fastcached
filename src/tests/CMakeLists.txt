@@ -904,6 +904,33 @@ set_tests_properties("version-fallback-warning" PROPERTIES
 #
 # It reads the INDEX, not the filesystem: the checked-in mode is what a fresh
 # clone gets, and a local chmod that was never staged is not a fix.
+# `mkdocs build --strict` must be able to fail the way two files promise it does
+# (#560).
+#
+# mkdocs 1.6 defaults `validation.nav.omitted_files` to `info`, so a page left out
+# of `nav:` was reported at INFO and the build SUCCEEDED -- while `mkdocs.yml` and
+# `.github/workflows/docs.yml` both said `--strict` fails on exactly that. Two
+# files stating the same wrong thing in almost the same sentence is how it stayed
+# wrong for as long as it did.
+#
+# This asserts the PARSED configuration and not a grep, and it asserts the
+# `not_in_nav` exemption too -- without that clause the validation fails the build
+# on three snippets that are correctly absent from nav, which is how a validation
+# flag gets turned back off by whoever meets it.
+#
+# It does not RUN mkdocs: that is the docs workflow's job and needs an install this
+# suite cannot assume. What it guards is the configuration that makes that job able
+# to fail at all. It SKIPs when PyYAML is absent rather than passing quietly.
+add_test(
+    NAME "mkdocs-validation"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-mkdocs-validation.sh"
+)
+set_tests_properties("mkdocs-validation" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 60
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

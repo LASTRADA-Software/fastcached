@@ -8,6 +8,33 @@
 # for now, a manual discipline — there is no automated docs/code check
 # wired into CI yet.
 
+# What `--strict` is actually able to fail on.
+#
+# mkdocs 1.6 defaults `validation.nav.omitted_files` to `info`, so a page added
+# under `docs/` and left out of `nav:` was reported at INFO and the build
+# SUCCEEDED -- while the comment above, and `.github/workflows/docs.yml`, both
+# promised that `--strict` fails on a missing nav entry. Two files stating the
+# same wrong thing in almost the same sentence is how it stayed wrong (#560).
+#
+# `warn` and not `error`: `--strict` is what promotes a warning to a failure, so
+# `warn` fails CI exactly as promised while leaving a local `mkdocs serve` usable.
+# Spelling `error` here would fail the non-strict build too, which neither comment
+# claimed and nobody asked for.
+#
+# `not_in_nav` exempts the snippets. They are INCLUDED into other pages by
+# pymdown-extensions rather than navigated to, so they are correctly absent from
+# `nav:` -- without this the change would fail the build on three files that are
+# right, which is how a validation flag gets turned back off.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+
+# Sibling of `nav:`, not a `validation:` sub-option -- mkdocs 1.6 rejects it there
+# by name, which is how this was found rather than guessed.
+not_in_nav: |
+  snippets/*
+
 site_name: fastcached
 site_description: A memcached- and Redis-compatible cache daemon, and a portable compile cache
 site_author: fastcached contributors
