@@ -465,13 +465,32 @@ AffectedTranslationUnits() {
 # the preprocessor run in `UnitContribution` is impure, and that half decides
 # nothing.
 #
+# TWO marker grammars, because a cl-style driver is asked for `/E` rather than
+# `-E` and answers in MSVC's spelling: `#line 1 "D:\\a\\src\\A.cpp"` against gcc's
+# `# 1 "src/A.cpp"`. Reading only the GNU form would leave `cur` unset for every
+# line of a clang-cl preprocess, so EVERY unit would classify `empty` -- the exact
+# "absence rendered as evidence of absence" this function exists to prevent, and
+# invisible on the platform anybody develops on. Separators are normalised for the
+# same reason: the suffix match is spelled with `/`, and a Windows marker is not.
+#
 # @param 1 The path lines must be attributed to.
 ProducedCode() {
     awk -v want="$1" '
     function isTarget(p) {
         return p == want || (length(p) > length(want) && substr(p, length(p) - length(want)) == "/" want)
     }
-    /^# / { if (match($0, /"[^"]*"/)) cur = substr($0, RSTART + 1, RLENGTH - 2); next }
+    function markerPath(line,   p) {
+        if (!match(line, /"[^"]*"/)) return ""
+        p = substr(line, RSTART + 1, RLENGTH - 2)
+        gsub(/\\\\/, "/", p)
+        gsub(/\\/, "/", p)
+        return p
+    }
+    # A marker carrying no path leaves the attribution ALONE rather than clearing
+    # it: MSVC emits a bare `#line 5` to resynchronise inside one file, and
+    # resetting `cur` there would unattribute every line after it.
+    /^#line [0-9]/ { p = markerPath($0); if (p != "") cur = p; next }
+    /^# / { p = markerPath($0); if (p != "") cur = p; next }
     NF > 0 && isTarget(cur) { found = 1; exit }
     END { print (found ? "produced" : "empty") }
     '
@@ -485,11 +504,23 @@ ProducedCode() {
 # not in the database, which the caller reads as `unknown`: "we could not tell" must
 # never render as a verdict.
 #
+# A cl-style driver spells all three differently -- `/c`, `/Fo<obj>`, and `/E` -- so
+# a clang-cl database run through the GNU spellings keeps `/c` and `/Fo`, and the
+# preprocessed text lands in the OBJECT FILE while stdout stays empty. That is not
+# an `unknown`: the compiler succeeds, the classifier honestly reads an empty stream
+# and answers `empty`, and six units the leg exists to cover are reported as
+# legitimately contributing nothing. The strip is therefore chosen by the DRIVER,
+# whose name is the one thing in the entry that says which grammar the rest is
+# written in -- never by sniffing for a leading `/`, which on POSIX starts a path.
+#
+# A cl grammar reaching a non-cl driver keeps its `/c` and fails LOUD (`unknown`,
+# reason kept), which is the direction to be wrong in.
+#
 # @param 1 Directory holding compile_commands.json.
 # @param 2 Repo-relative path of the unit.
 PreprocessArgv() {
     python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
-import json, shlex, sys
+import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
 try:
     entries = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -500,6 +531,8 @@ for entry in entries:
     path = entry.get("file", "").replace("\\", "/")
     if path == target or path.endswith("/" + target):
         argv = shlex.split(entry.get("command") or "") or list(entry.get("arguments", []))
+        driver = re.sub(r"\.exe$", "", (argv[0] if argv else "").replace("\\", "/").rsplit("/", 1)[-1], flags=re.I)
+        clStyle = re.match(r"^(.*-)?(clang-)?cl(-[0-9.]+)?$", driver, re.I) is not None
         out, skip = [], False
         for a in argv:
             if skip:
@@ -510,8 +543,13 @@ for entry in entries:
                 continue
             if a == "-c":
                 continue
+            if clStyle and (a == "/c" or re.match(r"^[-/]F[od]", a)):
+                continue
             out.append(a)
-        out.append("-E")
+        # `/E` for a cl driver: it is the only preprocess-to-stdout spelling BOTH
+        # `cl` and `clang-cl` are certain to accept, and it keeps the line markers
+        # `ProducedCode` attributes by (`/EP` suppresses exactly those).
+        out.append("/E" if clStyle else "-E")
         print(entry.get("directory", "."))
         for a in out:
             print(a)
@@ -590,7 +628,18 @@ UnitContribution() {
         return
     fi
 
-    if ( cd "$directory" && "${argv[@]}" ) > "$preprocessed" 2>"${preprocessed}.err"; then
+    # MSYS ARGUMENT CONVERSION IS OFF FOR THIS SPAWN, and it is not optional.
+    # Git Bash rewrites any argument that looks like a POSIX path before handing it
+    # to a NATIVE Windows binary, so a clang-cl command line arrives as
+    #   clang-cl: error: no such file or directory: 'C:/Program Files/Git/nologo'
+    # -- measured, on this leg's first run. Every `/`-spelled option is affected,
+    # `/E` included, so without this the cl branch above could never work. The two
+    # variables are the MSYS2 and the Git-for-Windows spellings of one switch; both
+    # are inert everywhere else, which is why they are set unconditionally rather
+    # than behind a platform test nothing here could exercise.
+    if ( cd "$directory" \
+         && MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 "${argv[@]}" \
+       ) > "$preprocessed" 2>"${preprocessed}.err"; then
         verdict="$(ProducedCode "$2" < "$preprocessed")"
         [[ -n "$verdict" ]] || UnknownUnit "$2" "$3" "the classifier produced no verdict"
     else
@@ -604,6 +653,21 @@ UnitContribution() {
     printf '%s\n' "${verdict:-unknown}"
 }
 
+
+# `ok` or `refuse`: may a run of `$1` mode print a clean verdict when `$2` of its
+# files folded to `empty` and `$3` to `unknown`?
+#
+# Pure, and split out for exactly that reason -- the refusal it drives lives in the
+# script's top-level flow, where nothing could reach it without a compile database
+# and a real clang-tidy, so it would have shipped asserted by nothing.
+#
+# @param 1 Sweep mode (`all`, `ci` or `only`).
+# @param 2 Number of files that produced no code.
+# @param 3 Number of files nothing could be learned about.
+OnlyCoverageVerdict() {
+    [[ "$1" == only && $(( $2 + $3 )) -gt 0 ]] && { echo refuse; return; }
+    echo ok
+}
 
 # ---------------------------------------------------------------------------
 # Self-test
@@ -749,6 +813,27 @@ SelfTest() {
            "empty" \
            "$(printf '' | ProducedCode src/A.cpp)"
 
+    # The MSVC marker grammar. A cl-style driver is asked for `/E` and answers in
+    # `#line` with backslash separators, so reading only the GNU form leaves `cur`
+    # unset for the whole stream and EVERY unit folds to `empty` -- a clean verdict
+    # over files nothing read. Reachable here from synthesised text, which is the
+    # only place it is reachable at all from a machine without clang-cl.
+    Expect "an MSVC #line marker attributes the file's own code" \
+           "produced" \
+           "$(printf '#line 1 "D:\\a\\src\\A.cpp"\nint a;\n' | ProducedCode src/A.cpp)"
+    Expect "an MSVC #line marker naming a header does not" \
+           "empty" \
+           "$(printf '#line 1 "C:\\VC\\include\\xstring"\nint h;\n' | ProducedCode src/A.cpp)"
+    Expect "a doubled backslash in an MSVC marker still matches" \
+           "produced" \
+           "$(printf '#line 1 "D:\\\\a\\\\src\\\\A.cpp"\nint a;\n' | ProducedCode src/A.cpp)"
+    # MSVC resynchronises inside one file with a bare `#line N`. Clearing the
+    # attribution there would unattribute every line after it -- `empty` again, and
+    # only on Windows.
+    Expect "a bare #line does not unattribute what follows" \
+           "produced" \
+           "$(printf '#line 1 "D:\\a\\src\\A.cpp"\n#line 7\nint a;\n' | ProducedCode src/A.cpp)"
+
     # `UnitContribution`, against a STUB COMPILER (#466).
     #
     # The classifier checks above prove the decision and say nothing about whether
@@ -774,6 +859,15 @@ SelfTest() {
     # it, so the stub refuses the flags rather than ignoring them.
     cat > "$scratch/stub-cc" <<'STUB'
 #!/bin/sh
+# The spawn must disable MSYS argument conversion, or Git Bash rewrites every
+# `/`-spelled option into a path under the Git installation before a native
+# Windows compiler ever sees it. Nothing on a POSIX host can observe that, so the
+# stub asserts the WIRING: delete the two variables from `UnitContribution` and
+# the three cases below go red naming this line.
+[ "${MSYS2_ARG_CONV_EXCL:-}" = "*" ] \
+    || { echo "MSYS argument conversion was not disabled for the spawn" >&2; exit 9; }
+[ "${MSYS_NO_PATHCONV:-}" = "1" ] \
+    || { echo "MSYS_NO_PATHCONV was not set for the spawn" >&2; exit 9; }
 mode=none
 onlyList=""
 src=""
@@ -829,6 +923,40 @@ STUB
     Expect "and that unknown records why as well" \
            "yes" \
            "$( grep -q 'no compile command' "$scratch/slotD.unknown" 2>/dev/null && echo yes || echo no )"
+
+    # `PreprocessArgv` against a CL-STYLE database (#858). The GNU strip leaves `/c`
+    # and `/Fo<obj>` standing, so the preprocessed text goes to the OBJECT FILE and
+    # stdout is empty -- the compiler SUCCEEDS, so this is not an `unknown`, it is a
+    # confident `empty` over a file the leg exists to cover. Asserted as the whole
+    # argv, because which flags survive IS the property.
+    mkdir -p "$scratch/cldb"
+    printf '[{"directory":"%s","file":"%s/src/Has.cpp","command":"C:/LLVM/bin/clang-cl.exe /nologo /TP /c /FoCMakeFiles/x.obj /Fdx.pdb %s/src/Has.cpp"}]\n' \
+        "$scratch" "$scratch/tree" "$scratch/tree" > "$scratch/cldb/compile_commands.json"
+    Expect "a clang-cl command loses /c, /Fo and /Fd and gains /E" \
+           "C:/LLVM/bin/clang-cl.exe /nologo /TP ${scratch}/tree/src/Has.cpp /E" \
+           "$(PreprocessArgv "$scratch/cldb" src/Has.cpp | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
+    # And the direction that keeps the driver test from being a licence: a GNU
+    # driver's `/`-spelled argument is a PATH, not an option, so nothing is dropped
+    # and `-E` is what gets appended.
+    mkdir -p "$scratch/gnudb"
+    printf '[{"directory":"%s","file":"%s/src/Has.cpp","command":"/usr/bin/g++ -DX /opt/include/forced.h -c -o x.o %s/src/Has.cpp"}]\n' \
+        "$scratch" "$scratch/tree" "$scratch/tree" > "$scratch/gnudb/compile_commands.json"
+    Expect "a GNU command keeps a /-spelled path and gains -E" \
+           "/usr/bin/g++ -DX /opt/include/forced.h ${scratch}/tree/src/Has.cpp -E" \
+           "$(PreprocessArgv "$scratch/gnudb" src/Has.cpp | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
+
+    # `--only` may not print a clean verdict over files it could not cover (#858).
+    # The caller NAMED this set, so `empty` and `unknown` both mean the sweep read
+    # nothing there -- unlike `--all`, where an empty unit is the guard working.
+    # This is what stops the Windows leg going green while blind once its findings
+    # are fixed, which is exactly the state its first real run was in.
+    Expect "--only refuses a clean verdict over an empty file"   "refuse" "$(OnlyCoverageVerdict only 1 0)"
+    Expect "--only refuses a clean verdict over an unknown file" "refuse" "$(OnlyCoverageVerdict only 0 1)"
+    Expect "--only is content when every named file contributed" "ok"     "$(OnlyCoverageVerdict only 0 0)"
+    # And the modes that CHOSE their own set are unaffected: an empty unit there is
+    # a platform-gated file on the other platform, which is the guard working.
+    Expect "--all tolerates an empty unit"   "ok" "$(OnlyCoverageVerdict all 3 0)"
+    Expect "--ci tolerates an unknown unit"  "ok" "$(OnlyCoverageVerdict ci 0 3)"
     # NOT asserted here, deliberately: that the preprocessed dump is created inside
     # $scratch rather than $TMPDIR. Both paths delete it on the way out, so the
     # difference is visible only when the process is INTERRUPTED -- and a check that
@@ -1386,6 +1514,28 @@ if [[ "$unknownCount" -gt 0 ]]; then
     # The reasons, which is what makes a systematic `unknown` actionable rather than
     # a confident count over nothing.
     [[ "${#unknownMarks[@]}" -gt 0 ]] && grep -h '^    ' "${unknownMarks[@]}" | sort -u | head -5
+fi
+
+# `--only` NAMES its set, so anything but `produced` there is the run failing to do
+# what it was asked -- and it is the one mode where that can go GREEN while blind.
+# In `--all`/`--ci` an `empty` unit is the guard working (a platform-gated file on
+# the other platform) and an `unknown` is reported and survivable, because the sweep
+# chose the set itself. Here the caller chose it: the whole point of `--only` is
+# that these particular files ARE analysed on THIS platform, so a fold to `empty`
+# means the leg covered nothing and `TIDY SWEEP CLEAN` would say the opposite.
+#
+# That is not hypothetical. On this leg's first real run every one of the six came
+# back `unknown` (Git Bash had mangled the command line) while clang-tidy itself
+# produced findings -- so once those findings are fixed the leg would have printed
+# `CLEAN (0 of 6 file(s) contributed code)` and exited 0, over the exact blind spot
+# it was added to close.
+if [[ "$(OnlyCoverageVerdict "$mode" "$emptyCount" "$unknownCount")" == refuse ]]; then
+    echo "TIDY SWEEP: --only named $(( emptyCount + unknownCount )) file(s) this run could NOT cover." >&2
+    echo "            A named file must contribute code on this platform; 'empty' or" >&2
+    echo "            'unknown' means the sweep analysed nothing there, and a clean" >&2
+    echo "            verdict would be a claim about files it never read." >&2
+    { ListOf empty; ListOf unknown; } >&2
+    status=1
 fi
 
 if [[ "$status" -eq 0 ]]; then
