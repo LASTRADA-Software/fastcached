@@ -4026,16 +4026,6 @@ Three rules fall out, each generalising past this change:
   the tree and rejected rather than skipped. The measurement and the alternatives it
   rules out are on the ticket, and the rule it enforces is the
   *neither-the-set-nor-its-count* bullet above.
-- **[#723](https://github.com/LASTRADA-Software/fastcached/issues/723)** — nothing
-  checks that a workflow's script invocation agrees with that script's file mode.
-  The complement of [#720](https://github.com/LASTRADA-Software/fastcached/issues/720)
-  rather than a duplicate of it, and the more durable of the two: #720 makes the
-  mode consistent so a documented bare invocation works, which is what a HUMAN
-  hits; #723 is that a call site names its interpreter regardless, which is what a
-  HARNESS hits silently. A `chmod` does not close it, because a moved file, a
-  `noexec` mount or a later-lost mode bit each make a call fail to START, and
-  inside a `want-fail` assertion every one of those is indistinguishable from the
-  rule firing. Both instances are in the section above.
 - **[#724](https://github.com/LASTRADA-Software/fastcached/issues/724)** — a `gh`
   listing that came back AT its `--limit` is a real answer about a set that is not
   the whole set, and nothing distinguishes it, so the cap reads as the total.
