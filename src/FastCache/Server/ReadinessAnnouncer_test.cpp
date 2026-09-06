@@ -192,6 +192,11 @@ TEST_CASE("ReadinessAnnouncer says so when it ends without ever announcing", "[s
     REQUIRE(never.size() == 1);
     CHECK(records[never.front()].level == LogLevel::Warn);
     CHECK(records[never.front()].message.contains("1 of 4"));
+
+    // Distinguishing, not merely present: this state is "closed, and somebody did not
+    // arm", and it must not be reported in either of the other two wordings.
+    CHECK_FALSE(records[never.front()].message.contains("never closed"));
+    CHECK_FALSE(records[never.front()].message.contains("none registered"));
 }
 
 TEST_CASE("ReadinessAnnouncer stays silent about a run that did announce", "[server][readiness]")
@@ -227,5 +232,48 @@ TEST_CASE("ReadinessAnnouncer with no acceptors announces nothing", "[server][re
     }
 
     // And it explains itself on the way out rather than leaving an absence.
-    CHECK(IndicesContaining(logger.Snapshot(), "readiness was never announced").size() == 1);
+    auto const records = logger.Snapshot();
+    auto const never = IndicesContaining(records, "readiness was never announced");
+    REQUIRE(never.size() == 1);
+
+    // It names WHICH of the three un-announced states this is. The count alone would
+    // render this `0 of 0` -- arithmetically complete, and indistinguishable from a
+    // set that was never closed at all (#736). A refusal test asserts which refusal.
+    CHECK(records[never.front()].message.contains("closed with none registered"));
+    CHECK_FALSE(records[never.front()].message.contains("0 of 0"));
+}
+
+TEST_CASE("ReadinessAnnouncer distinguishes a set that was never closed", "[server][readiness]")
+{
+    // The third un-announced state, and the one the counts cannot carry. Registering
+    // participants without ever calling AcceptorsAllSpawned() is a spawn loop that did
+    // not finish -- a different fault, in a different place, from acceptors that were
+    // registered and failed to arm.
+    //
+    // Rendered as "{} of {}" the two are the same sentence: this case would read
+    // `1 of 3`, which is exactly what a CLOSED set with two unarmed acceptors reads
+    // as. So the seal is stated rather than left to be inferred.
+    CapturingLogger logger;
+    {
+        ReadinessAnnouncer announcer { logger, "3 bind(s)" };
+        announcer.ExpectAcceptor();
+        announcer.ExpectAcceptor();
+        announcer.ExpectAcceptor();
+        announcer.AcceptorArmed("bind 0");
+        // Deliberately no AcceptorsAllSpawned().
+        REQUIRE_FALSE(announcer.Announced());
+    }
+
+    auto const records = logger.Snapshot();
+    auto const never = IndicesContaining(records, "readiness was never announced");
+    REQUIRE(never.size() == 1);
+    CHECK(records[never.front()].level == LogLevel::Warn);
+    CHECK(records[never.front()].message.contains("never closed"));
+    CHECK(records[never.front()].message.contains("3 registered"));
+    CHECK(records[never.front()].message.contains("1 armed"));
+
+    // The control that makes this test distinguishing rather than merely present:
+    // the closed-and-partial wording must NOT appear, or this case and the "1 of 4"
+    // case above would pass under one implementation that says the same thing twice.
+    CHECK_FALSE(records[never.front()].message.contains("of 3 acceptor(s) armed"));
 }
