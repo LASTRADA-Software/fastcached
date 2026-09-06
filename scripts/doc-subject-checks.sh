@@ -527,6 +527,31 @@ cmake_language(EXIT 3)'
         # `check-gated-jobs.sh --self-test`, where it made eight negative cases
         # green while testing nothing.
         out="$(bash "$0" --source-dir "$tree" 2>&1)" || got=$?
+
+        # A spawn that never RAN is not a verdict, and it used to be read as one.
+        # `|| got=$?` captures ANY non-zero: 126 (not executable), 127 (not found),
+        # and the signal statuses 128+N -- 137 is SIGKILL, which the OOM killer
+        # hands out on a loaded box, and 139 is SIGSEGV. A `want-pass` arm then
+        # reported FAIL for an invocation that produced nothing, and the cost was a
+        # lane spending nine runs hunting a logic defect that was not there (#747).
+        #
+        # These statuses are INCONCLUSIVE, never FAIL, and the run says which
+        # observed status it saw so a reader can tell an OOM from a missing file.
+        # 128 itself is excluded: it is "invalid argument to exit", a real verdict
+        # from a script that ran, not a signal.
+        if [[ "$got" -eq 126 || "$got" -eq 127 || ("$got" -gt 128 && "$got" -le 165) ]]; then
+            echo "  INCONCLUSIVE ($want, exit $got) $what -- the invocation did not run" >&2
+            echo "        exit $got is not a verdict: 126=not executable, 127=not found, 128+N=killed by signal N" >&2
+            # A FILE and not a variable. Most call sites read this through `$( )`,
+            # which is a SUBSHELL -- an increment inside `Case` is discarded on the
+            # way out, so a counter would report zero for every arm that mattered.
+            # That is the same shape as the defect this arm exists to fix, and it
+            # was caught by the arm count reading 1 when several had run.
+            echo "$what" >> "${scratch}/.inconclusive"
+            printf '%s\n' "$out"
+            return 0
+        fi
+
         if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
             # Narration on stderr, the captured output on stdout: every call site
             # pipes or redirects stdout to assert on what the run printed, so an
@@ -696,11 +721,56 @@ set_tests_properties("epsilon-docs" PROPERTIES
     Expect "runs none of: -P bash" "the neither-spelling refusal did not name the runner set" \
         "a labelled check running none of the known runners is REFUSED" want-fail "$tree"
 
+    # An INCONCLUSIVE arm is neither a pass nor a failure, and it is REPORTED
+    # rather than folded into either. Folded into failure it sends the next reader
+    # hunting a rule regression that is not there -- the whole cost of the
+    # occurrence that prompted this was a lane spending nine runs on a phantom.
+    # Folded into success it hides that an arm never ran.
+    # The verdict's own proof, and it must run LAST: it deliberately makes the
+    # run inconclusive, so anything after it would be reported under that.
+    #
+    # 127 is staged by asking a non-existent interpreter to run the script -- an
+    # invocation guaranteed not to execute, which is what an OOM kill or a failed
+    # fork looks like from here. Asserted directly rather than through `Case`,
+    # because `Case` is the thing under test.
+    local probeStatus=0
+    /nonexistent-interpreter-for-747 "$0" --source-dir "${scratch}/t-baseline" >/dev/null 2>&1 || probeStatus=$?
+    if [[ "$probeStatus" -ne 126 && "$probeStatus" -ne 127 ]]; then
+        echo "  FAIL  a missing interpreter exited ${probeStatus}, expected 126 or 127; the INCONCLUSIVE arm is untested" >&2
+        status=1
+    else
+        echo "  ok    (verdict) exit ${probeStatus} from a missing interpreter is classified as INCONCLUSIVE, not FAIL" >&2
+    fi
+    # And the classifier itself, over every status this arm claims to own.
+    local st
+    for st in 126 127 137 139; do
+        if [[ "$st" -eq 126 || "$st" -eq 127 || ("$st" -gt 128 && "$st" -le 165) ]]; then
+            echo "  ok    (verdict) exit ${st} is INCONCLUSIVE" >&2
+        else
+            echo "  FAIL  exit ${st} should be INCONCLUSIVE and is not" >&2
+            status=1
+        fi
+    done
+    # 128 is a real verdict -- "invalid argument to exit" -- and must NOT be swallowed.
+    if [[ 128 -eq 126 || 128 -eq 127 || (128 -gt 128 && 128 -le 165) ]]; then
+        echo "  FAIL  exit 128 is a verdict, not a signal, and must not be INCONCLUSIVE" >&2
+        status=1
+    else
+        echo "  ok    (verdict) exit 128 stays a real verdict" >&2
+    fi
+
+    local inconclusive=0
+    [[ -s "${scratch}/.inconclusive" ]] && inconclusive=$(wc -l < "${scratch}/.inconclusive" | tr -d " ")
+    if [[ "$inconclusive" -ne 0 ]]; then
+        echo "${SelfName}: self-test INCONCLUSIVE -- at least one arm did not run" >&2
+        echo "${SelfName}: this is NOT a rule regression; re-run, and if it persists the spawn is the subject" >&2
+        exit 2
+    fi
     if [[ "$status" -ne 0 ]]; then
         echo "${SelfName}: self-test FAILED" >&2
         exit 1
     fi
-    echo "${SelfName}: self-test passed"
+    echo "${SelfName}: self-test passed, 0 inconclusive"
 }
 
 # ---------------------------------------------------------------------------
