@@ -242,7 +242,15 @@ function(pedantic_flags_for compilerId frontendVariant werror outVariable)
     # Normal variables, so the subject's `option()` calls are no-ops under CMP0077
     # and leave these standing. That is the whole reason both settings are reachable
     # in one process.
-    set(PEDANTIC_COMPILER ON)
+    # `PEDANTIC_COMPILER` is a parameter rather than a constant since #819: it was
+    # pinned ON here, so the one combination the defect lived in -- pedantic OFF,
+    # WERROR ON -- was unreachable by this check. ARGV4 keeps the existing two call
+    # sites unchanged.
+    if(DEFINED ARGV4)
+        set(PEDANTIC_COMPILER "${ARGV4}")
+    else()
+        set(PEDANTIC_COMPILER ON)
+    endif()
     set(PEDANTIC_COMPILER_WERROR "${werror}")
 
     set_property(GLOBAL PROPERTY FASTCACHED_PEDANTIC_RECORDED "")
@@ -392,3 +400,40 @@ list(JOIN gatedFlags "\n" gatedFlagBody)
 message("pedantic suppressions: ${personaCount} compiler persona(s) asked, "
         "${gatedFlagCount} flag(s) gated on PEDANTIC_COMPILER_WERROR, all of them fatality-only\n"
         "${gatedFlagBody}")
+
+
+# #819: fatality is independent of the pedantic warning SET.
+#
+# The whole table, not just the broken row. A check that asserted only
+# "OFF/ON adds -Werror" would pass a module that added it unconditionally, which
+# is a different defect with the same green.
+#
+# Asked of one persona: the nesting this guards is compiler-independent, and the
+# GNU/Clang branch is the only one that adds `-Werror` at all -- the MSVC arm's
+# `/WX` has been commented out since before this check existed.
+#
+# Asserted only against the REPOSITORY's own module. The selftest drives this same
+# script against synthetic subjects that exist to violate the SUPPRESSION-pairing
+# rule and add no `-Werror` at all, so asking them this question is asking about a
+# property they were never written to have. The subject is named in the status
+# line below, so a run that asserted nothing says whose module it did not ask.
+if(FASTCACHED_PEDANTIC_FILE STREQUAL "${FASTCACHED_SOURCE_DIR}/cmake/portable/PedanticCompiler.cmake")
+foreach(row IN ITEMS "ON;ON;1" "ON;OFF;0" "OFF;ON;1" "OFF;OFF;0")
+    list(GET row 0 wantPedantic)
+    list(GET row 1 wantWerror)
+    list(GET row 2 wantCount)
+    pedantic_flags_for("GNU" "GNU" "${wantWerror}" rowFlags "${wantPedantic}")
+    pedantic_count_flag(rowFlags "-Werror" seenCount)
+    if(NOT seenCount EQUAL wantCount)
+        message(FATAL_ERROR
+            "check-pedantic-suppressions: PEDANTIC_COMPILER=${wantPedantic} "
+            "PEDANTIC_COMPILER_WERROR=${wantWerror} added -Werror ${seenCount} time(s), expected ${wantCount}. "
+            "The row that motivated this is OFF/ON: `-Werror` used to be nested inside "
+            "`if(\${PEDANTIC_COMPILER})`, so an operator who asked for warnings to be fatal got a build "
+            "where they were not, and nothing said so (#819).")
+    endif()
+endforeach()
+message(STATUS "check-pedantic-suppressions: fatality is independent of the pedantic set (4 combinations)")
+else()
+    message(STATUS "check-pedantic-suppressions: fatality table NOT asserted -- the subject is ${FASTCACHED_PEDANTIC_FILE}, not this repository's module")
+endif()
