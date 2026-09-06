@@ -499,6 +499,89 @@ TEST_CASE("A worker whose driver has no path-mapping switch still compiles", "[c
     CHECK(WorkerSourceNameRule("/scratch/job-1/tu.cpp", "../src/tu.cpp", DriverFamily::Gnu).has_value());
 }
 
+TEST_CASE("A scratch root no mapping rule can name is reported once, and the report agrees with the rule builder",
+          "[compile-job][prefix-map][source-name][scratch-root]")
+{
+    // #810. `WorkerSourceNameRule` skips a left-hand side it cannot spell, which is
+    // right for the CLIENT's half and silent for the WORKER's: the scratch root is
+    // chosen once at startup, so a root carrying a space makes EVERY rule on that
+    // worker unspellable and every dispatched object goes back to recording
+    // `<scratch>/job-N/<name>` -- the #660 defect, restored, with nothing counting it.
+    //
+    // The two assertions are PAIRED on purpose. A warning that fires where the rule
+    // builder is perfectly happy is noise; silence where the builder skips is the
+    // defect. Asserting only one of them passes under a predicate that answers
+    // constantly, which is what this whole family of tickets keeps producing.
+    auto const jobPath = [](std::string_view root) {
+        return std::format("{}/job-1/tu.cpp", root);
+    };
+
+    SECTION("an ordinary root says nothing, and its rules are built")
+    {
+        CHECK(ScratchRootMappingWarnings("/tmp/fastcache-compile-node/0").empty());
+        CHECK(
+            WorkerSourceNameRule(jobPath("/tmp/fastcache-compile-node/0"), "../src/tu.cpp", DriverFamily::Gnu).has_value());
+    }
+
+    SECTION("a root that cannot be spelled is named, and its rules are not built")
+    {
+        // A space is the reachable one -- `/Users/john doe/...` is an ordinary macOS
+        // home -- and `=` is the rule's own separator, which the two drivers cut at
+        // opposite ends.
+        auto const root = GENERATE(as<std::string> {},
+                                   "/Users/john doe/tmp/fastcache-compile-node/0",
+                                   "/tmp/a=b/fastcache-compile-node/0",
+                                   "/tmp/tab\there/fastcache-compile-node/0");
+        INFO("scratch root: " << root);
+
+        auto const warnings = ScratchRootMappingWarnings(root);
+        REQUIRE(warnings.size() == 1);
+        // WHICH root and WHICH flag, or the sentence sends an operator looking for a
+        // setting it never names. The flag is read out of the table the rule is built
+        // from rather than restated here.
+        CHECK(warnings.front().contains(root));
+        CHECK(warnings.front().contains("-fdebug-prefix-map"));
+
+        // The pairing: exactly the roots that are reported are the roots whose rules
+        // are silently skipped.
+        CHECK_FALSE(WorkerSourceNameRule(jobPath(root), "../src/tu.cpp", DriverFamily::Gnu).has_value());
+    }
+
+    SECTION("a root the tail pushes past the ceiling is reported, though the root itself fits")
+    {
+        // The reason the question is asked about `<root>/job-<n>/<name>` and not about
+        // the root: a root a few bytes under the length ceiling is spellable while
+        // every path built beneath it is not. Checking the root alone would answer
+        // `fine` for a worker on which every rule is skipped -- an instrument reporting
+        // on something other than its subject.
+        auto const root = "/" + std::string(4090, 'a');
+        REQUIRE(root.size() < 4096);
+        CHECK(ScratchRootMappingWarnings(root).size() == 1);
+        CHECK_FALSE(WorkerSourceNameRule(jobPath(root), "../src/tu.cpp", DriverFamily::Gnu).has_value());
+    }
+
+    SECTION("everything the worker appends to a good root is spellable")
+    {
+        // The claim `LongestScratchSourcePath` rests on, pinned rather than left as a
+        // reading of two alphabets: the job counter and `SafeSourceName`'s output are
+        // drawn from a strict subset of the rule alphabet, so the ROOT is the only
+        // thing that can make the SHAPE unspellable. Driven through a client name that
+        // is itself hostile, since that is what `SafeSourceName` is for.
+        constexpr std::string_view Root = "/tmp/fastcache-compile-node/0";
+        auto const path = std::format("{}/job-18446744073709551615/{}", Root, SafeSourceName("../src/my file.cpp"));
+        CHECK(ScratchRootMappingWarnings(Root).empty());
+        CHECK(WorkerSourceNameRule(path, "../src/tu.cpp", DriverFamily::Gnu).has_value());
+    }
+
+    SECTION("no root is nothing to say")
+    {
+        // Not reachable from a claimed root; asserted because the alternative -- a
+        // sentence naming an empty path -- would send an operator hunting for a
+        // setting that is not the fault.
+        CHECK(ScratchRootMappingWarnings("").empty());
+    }
+}
+
 TEST_CASE("Two dispatches of one translation unit record the same source name", "[compile-job][prefix-map][source-name]")
 {
     // The ticket's second consequence, which is the one that matters: the scratch

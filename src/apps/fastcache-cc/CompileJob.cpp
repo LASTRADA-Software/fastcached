@@ -10,6 +10,7 @@
 #include <array>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -864,6 +865,72 @@ std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePa
         return std::nullopt;
 
     return PrefixMapRule(*row, scratchSourcePath, clientSourceName);
+}
+
+namespace
+{
+    /// The longest path `WorkerSourceNameRule` could ever be handed on a worker whose
+    /// scratch root is @p root.
+    ///
+    /// The rule's left-hand side is not the root: it is `<root>/job-<n>/<name>`, built
+    /// at `CompileJobRunner::Run` from the job counter and `SafeSourceName`. So the
+    /// question "can this root be spelled" is asked about the longest such path, from
+    /// the constants that build it, rather than about the root alone.
+    ///
+    /// It matters for the LENGTH ceiling only. Every byte the worker appends is an
+    /// alphanumeric, a `-`, a `.` or a separator, all of which `SpellableInRule`
+    /// accepts, so the ROOT is the only thing that can make the SHAPE unspellable --
+    /// `CompileJob_test` pins that rather than leaving it as a reading of two
+    /// alphabets. A root close enough to the ceiling that the tail crosses it is one
+    /// where SOME jobs degrade and others do not, which is worth a warning on its own
+    /// and is the conservative direction: warning where nothing would have degraded
+    /// costs a line, staying silent where something does is the defect itself.
+    /// @param root The claimed scratch root.
+    /// @return The longest scratch source path a job on this root could produce.
+    [[nodiscard]] std::string LongestScratchSourcePath(std::string_view root)
+    {
+        // `_nextJob` is a `std::uint64_t`, so twenty digits is the widest `job-<n>`
+        // this worker can reach; the longest name is a stem at the cap plus the
+        // longest extension the table holds.
+        constexpr std::size_t WidestJobNumber = std::numeric_limits<std::uint64_t>::digits10 + 1;
+        auto const longestExtension =
+            std::ranges::max(KnownExtensions, {}, [](std::string_view extension) { return extension.size(); }).size();
+        return std::format("{}/job-{}/{}{}",
+                           root,
+                           std::string(WidestJobNumber, '9'),
+                           std::string(MaxStemLength, 'a'),
+                           std::string(longestExtension, 'a'));
+    }
+} // namespace
+
+std::vector<std::string> ScratchRootMappingWarnings(std::string_view scratchRoot)
+{
+    std::vector<std::string> warnings;
+    if (scratchRoot.empty())
+        return warnings;
+
+    auto const longest = LongestScratchSourcePath(scratchRoot);
+    for (PathValueFlag const& row: PathValueFlags())
+    {
+        if (row.role != PathValueRole::PrefixMap || SpellableInRule(longest, row))
+            continue;
+
+        // The FLAG rather than the family, because the flag is what an operator can
+        // search for and it names the family unambiguously; there is no family-name
+        // table in this tree, and inventing one to render a warning would be a second
+        // place for the two to disagree. The separator comes off the row for the same
+        // reason every other consumer takes it from there.
+        warnings.push_back(
+            std::format("this worker's scratch root {} cannot be spelled inside a {} rule, so every object it "
+                        "dispatches for a driver taking that flag records the worker's own per-job scratch path "
+                        "instead of the client's source name -- different bytes for two dispatches of one "
+                        "translation unit, under one cache key. Compiles are unaffected. Point TMPDIR (TEMP on "
+                        "Windows) at a path carrying no whitespace, no '{}' and no control character.",
+                        scratchRoot,
+                        row.spelling,
+                        row.valueTailSeparator));
+    }
+    return warnings;
 }
 
 std::expected<std::vector<std::string>, JobError> WorkerPrefixMapRules(std::string_view workerDirectory,

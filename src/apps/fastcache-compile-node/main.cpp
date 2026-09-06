@@ -547,6 +547,20 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
                     "reclaimed the scratch root {} from a node that exited without cleaning up",
                     claim->Root().string());
     logger.Logf(LogLevel::Info, "scratch root {} claimed exclusively", claim->Root().string());
+
+    // **A root no mapping rule can name is said ONCE, here, in front of the operator.**
+    // The rule `WorkerSourceNameRule` builds has this root on its left-hand side, so a
+    // root carrying a space or an `=` makes every one of them unspellable and every
+    // dispatched object goes back to recording `<scratch>/job-N/<name>` -- silently,
+    // per job, with nothing counting it (#810). The root is chosen once, so the
+    // question is answered once: a startup property decided per request is the shape
+    // this repository already records for the worker's lease check.
+    //
+    // A warning and not a refusal: such a machine compiles perfectly well and only its
+    // dispatched objects' debug names degrade. The sentences are built by a pure
+    // function so what they SAY is testable; this file is in no test target.
+    for (auto const& warning: Cc::ScratchRootMappingWarnings(claim->Root().string()))
+        logger.Logf(LogLevel::Warn, "{}", warning);
     return claim;
 }
 

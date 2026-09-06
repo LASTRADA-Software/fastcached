@@ -562,4 +562,34 @@ class CompileJobRunner final: public ICompileJobRunner
                                                               std::string_view clientSourceName,
                                                               DriverFamily family);
 
+/// What an operator must be told about a scratch root no mapping rule can name.
+///
+/// `WorkerSourceNameRule` skips when its left-hand side cannot be spelled inside a
+/// rule, and skipping is right for the CLIENT's half — a source file called
+/// `my file.cpp` is ordinary. The worker's half is a different question with the same
+/// answer at the call site: `scratchSourcePath` lies under a root this process chose
+/// ONCE, so a root carrying a space or an `=` makes **every** rule this worker would
+/// build unspellable, and every dispatched object it produces silently goes back to
+/// recording `<scratch>/job-N/<name>` — nondeterministic between two dispatches of one
+/// translation unit, stored under one cache key
+/// ([#810](https://github.com/LASTRADA-Software/fastcached/issues/810)).
+///
+/// **A startup property is reported at startup, never decided per request.** That is
+/// this repository's own rule about the worker's lease check, for the same reason: a
+/// degradation decided per request leaves every counter reading zero and nothing said.
+/// It is a WARNING and not a refusal — such a machine compiles perfectly well and only
+/// its dispatched objects' debug names degrade, to exactly what they were before #660,
+/// so taking it out of the fleet would cost compiles to buy a debug record.
+///
+/// Asked of **every prefix-map row the table can hold**, rather than of the families
+/// this node actually serves. The served set exists only once the toolchain survey's
+/// first round lands on the heartbeat thread (#365), which is minutes after the
+/// operator stopped watching; a row the node serves nothing for costs one line naming
+/// a flag, where waiting costs the audience the warning exists for.
+///
+/// @param scratchRoot The root this worker has claimed, as `CompileJobRunner` holds it.
+/// @return One sentence per rule spelling this root cannot be written into; empty when
+///         every one of them can, which is every ordinary deployment.
+[[nodiscard]] std::vector<std::string> ScratchRootMappingWarnings(std::string_view scratchRoot);
+
 } // namespace FastCache::Cc
