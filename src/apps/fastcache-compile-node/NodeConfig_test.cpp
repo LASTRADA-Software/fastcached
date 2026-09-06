@@ -1054,6 +1054,39 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
         CHECK(Unwrap(refusal).contains("6675"));
     }
 
+    SECTION("a bare IPv6 loopback literal names no port, and is not refused for one")
+    {
+        // **Two parsers disagreed about `::1` and the refusal named a port nobody
+        // typed** (#822). The gate asks `HostOfEndpoint`, which declines to split an
+        // unbracketed IPv6 literal; `SplitHostPort` splits on the last colon anyway
+        // and yielded host `:` with port `1`. So this configuration -- a node
+        // advertising itself at a bare loopback literal, naming no port at all -- was
+        // refused for advertising port 1.
+        auto cfg = worker();
+        cfg.advertise = "::1";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        CHECK_FALSE(refusal.has_value());
+    }
+
+    SECTION("a bracketed IPv6 loopback at the wrong port is still refused, and names it")
+    {
+        // **The control that stops the fix above being a rule against judging IPv6 at
+        // all.** Bracketed, so there IS a port and both parsers agree on it -- and the
+        // refusal must still fire and must name 6675, the port this node serves.
+        // Without this, "declines to split a bare literal" and "never judges an IPv6
+        // advertise" are one passing test.
+        auto cfg = worker();
+        cfg.advertise = "[::1]:6674";
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--advertise"));
+        CHECK(Unwrap(refusal).contains("6675"));
+        // And it must not have invented the port-1 reading from the old split.
+        CHECK_FALSE(Unwrap(refusal).contains("port 1,"));
+    }
+
     SECTION("a remote host with any port is accepted, because NAT is legitimate")
     {
         // **The control that stops this being a rule against port forwarding.**
