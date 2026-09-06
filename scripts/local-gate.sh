@@ -572,6 +572,76 @@ launcher_verdict() {
     fi
 }
 
+# Whether the compiler the generated build will ACTUALLY execute is itself a
+# compiler cache, and which one.
+#
+# `launcher_verdict` above answers "is a launcher configured", which is a
+# DIFFERENT question and was the only one being asked. A distribution can put a
+# cache AHEAD of the real compiler on `PATH`: Fedora ships `/usr/lib64/ccache/`
+# populated with symlinks to `ccache` and puts it on `PATH` from a profile snippet
+# nobody opted into. Then there is no launcher, `build.ninja` holds zero LAUNCHER
+# bindings, the gate prints "no compiler-cache launcher in the generated build" --
+# and every compile still goes through ccache, because THE COMPILER IS THE CACHE.
+# Both statements are true and together they are misleading (#716, #804, #887).
+#
+# Measured on the host this was found on:
+#     g++     -> /usr/lib64/ccache/g++     -> /usr/bin/ccache
+#     clang++ -> /usr/lib64/ccache/clang++ -> /usr/bin/ccache
+#
+# Read out of `CMakeCXXCompiler.cmake` rather than `CMakeCache.txt`, because the
+# cache holds what was TYPED and that differs per preset -- `clang-debug` records
+# a bare `clang++`, `gcc-release` an absolute path -- while this file holds what
+# CMake RESOLVED, which is what ninja runs. One observable, both presets.
+#
+# States: a cache NAME, `none`, or `unknown` when the file is missing or
+# unreadable. `unknown` is not `none`: a gate that cannot check must not report.
+# @param 1 Path to the build directory.
+compiler_shim_verdict() {
+    local file compiler resolved base
+    file="$(ls "$1"/CMakeFiles/*/CMakeCXXCompiler.cmake 2>/dev/null | head -1)"
+    if [[ -z "$file" || ! -r "$file" ]]; then
+        echo "unknown"
+        return 0
+    fi
+    compiler="$(sed -n 's/^set(CMAKE_CXX_COMPILER "\(.*\)")$/\1/p' "$file" | head -1)"
+    if [[ -z "$compiler" ]]; then
+        echo "unknown"
+        return 0
+    fi
+
+    # `readlink -f` is GNU and macOS only grew it in 12.3, and this runs in the
+    # default ctest set. Fall back to python3, then to the raw path -- an
+    # unresolved path still gets the component check below, so the worst case is
+    # a symlinked shim going unnoticed rather than a wrong verdict.
+    resolved="$(readlink -f "$compiler" 2>/dev/null || true)"
+    if [[ -z "$resolved" ]]; then
+        resolved="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$compiler" 2>/dev/null || true)"
+    fi
+    [[ -n "$resolved" ]] || resolved="$compiler"
+
+    base="$(basename "$resolved")"
+    case "$base" in
+        ccache | sccache | distcc | icecc | fastcache-cc)
+            echo "$base"
+            return 0
+            ;;
+    esac
+
+    # A shim directory whose entries are wrapper SCRIPTS rather than symlinks
+    # resolves to itself, so the path component is the only thing left to read.
+    case "/$compiler/" in
+        */ccache/*)
+            echo "ccache"
+            return 0
+            ;;
+        */sccache/*)
+            echo "sccache"
+            return 0
+            ;;
+    esac
+    echo "none"
+}
+
 # Why this preset has to be configured, or empty when it does not.
 #
 # Split out because it is exactly what `--self-test` can check without a toolchain,
@@ -844,6 +914,48 @@ if [[ "$self_test" -eq 1 ]]; then
             "" "$(configure_reason "$scratch/denied" no-tidy /usr/bin/clang-tidy-22)"
     fi
     chmod 644 "$scratch/denied/build.ninja" 2>/dev/null
+
+    # `compiler_shim_verdict` -- the OTHER way a cache fronts a reference build,
+    # which no count of LAUNCHER bindings can see (#716, #804, #887).
+    #
+    # Both directions, and both SHAPES of shim: a symlink into `ccache` (what
+    # Fedora ships) and a wrapper the resolver cannot follow, where the directory
+    # NAME is the only evidence left. Without the second, a distro that ships
+    # scripts rather than symlinks passes a guard written against symlinks alone.
+    mk_compiler_fixture() {  # $1 = fixture name, $2 = compiler path to record
+        mkdir -p "$scratch/$1/CMakeFiles/3.28.0"
+        printf 'set(CMAKE_CXX_COMPILER "%s")\n' "$2" > "$scratch/$1/CMakeFiles/3.28.0/CMakeCXXCompiler.cmake"
+    }
+
+    mkdir -p "$scratch/shimdir/ccache" "$scratch/realbin"
+    printf '#!/bin/sh\nexit 0\n' > "$scratch/realbin/ccache"; chmod +x "$scratch/realbin/ccache"
+    printf '#!/bin/sh\nexit 0\n' > "$scratch/realbin/g++";    chmod +x "$scratch/realbin/g++"
+    ln -sf "$scratch/realbin/ccache" "$scratch/shimdir/ccache/clang++"
+
+    mk_compiler_fixture shim-symlink "$scratch/shimdir/ccache/clang++"
+    expect "a compiler that RESOLVES to ccache is named, not counted" \
+        "ccache" "$(compiler_shim_verdict "$scratch/shim-symlink")"
+
+    # A wrapper script in a `ccache` directory: it resolves to itself, so only the
+    # path component says what it is.
+    printf '#!/bin/sh\nexit 0\n' > "$scratch/shimdir/ccache/g++-wrapper"; chmod +x "$scratch/shimdir/ccache/g++-wrapper"
+    mk_compiler_fixture shim-wrapper "$scratch/shimdir/ccache/g++-wrapper"
+    expect "a wrapper inside a ccache directory is caught by the path component" \
+        "ccache" "$(compiler_shim_verdict "$scratch/shim-wrapper")"
+
+    mk_compiler_fixture real-compiler "$scratch/realbin/g++"
+    expect "a real compiler is none, so the guard does not refuse every host" \
+        "none" "$(compiler_shim_verdict "$scratch/real-compiler")"
+
+    # `unknown` is not `none`: a gate that cannot read the file must not report.
+    mkdir -p "$scratch/no-compiler-file"
+    expect "a build directory with no CMakeCXXCompiler.cmake is unknown, never none" \
+        "unknown" "$(compiler_shim_verdict "$scratch/no-compiler-file")"
+
+    mkdir -p "$scratch/empty-compiler-file/CMakeFiles/3.28.0"
+    : > "$scratch/empty-compiler-file/CMakeFiles/3.28.0/CMakeCXXCompiler.cmake"
+    expect "a file naming no compiler is unknown, never none" \
+        "unknown" "$(compiler_shim_verdict "$scratch/empty-compiler-file")"
 
     # The per-leg verdict (#501). The renderer is pure, so every state is reachable
     # here without a compiler -- which is the whole reason it takes its input as
@@ -1211,6 +1323,26 @@ run_preset() {
             ;;
         *)
             fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (LAUNCHER bindings: $verdict), so its objects need not match this tree (#319, #368). This REFUSES rather than warns because it is wrong in BOTH directions: the observed case (#626) was five metrics tests failing in files the branch never touched, which costs somebody an investigation -- and the same substituted object can equally HIDE a real failure, with nothing to say so. A verdict about a tree that was not built cannot be read in either direction, so there is no safe way to continue past it. Something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            ;;
+    esac
+
+    # And the OTHER way a cache fronts a reference build, which the check above
+    # cannot see: no launcher at all, because the resolved compiler IS the cache.
+    # Asked separately rather than folded into `launcher_verdict`, because they
+    # read different files and answer different questions -- and a single verdict
+    # would have to collapse "a launcher is configured" and "the compiler is a
+    # shim" into one word, which is how the first one came to stand for both.
+    local shim
+    shim="$(compiler_shim_verdict "$dir")"
+    case "$shim" in
+        none)
+            echo "== $preset: the resolved compiler is not a compiler cache"
+            ;;
+        unknown)
+            fail "$preset: the resolved compiler cannot be read from $dir/CMakeFiles/*/CMakeCXXCompiler.cmake, so whether a cache fronts this build cannot be answered; a gate that cannot check must not report"
+            ;;
+        *)
+            fail "$preset: the resolved C++ compiler IS $shim (a compiler cache), so this is not a reference build and its objects need not match this tree (#319, #368, #716, #804, #887). USE_COMPILER_CACHE=OFF and zero LAUNCHER bindings are both TRUE here and neither can see this: a distribution can put a cache ahead of the real compiler on PATH -- Fedora ships /usr/lib64/ccache/ with symlinks to ccache and puts it on PATH from a profile snippet nobody opted into -- and then there is no launcher to count. This REFUSES rather than warns for the same reason the launcher clause does: a verdict about a tree that was not built cannot be read in EITHER direction, so a substituted object can equally invent a failure or hide one. Point CMAKE_CXX_COMPILER at the real compiler (readlink -f will tell you where the shim goes), or take the shim directory off PATH for this run"
             ;;
     esac
 
