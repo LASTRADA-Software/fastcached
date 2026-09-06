@@ -3974,6 +3974,25 @@ Three rules fall out, each generalising past this change:
   is a distribution package on the developer host and a CPM checkout in CI, so its sources
   were never in the local compile database at all. Not a misconfiguration -- two
   environments answering honestly about themselves.
+- **A POSIX shell REWRITES the arguments it hands a native Windows tool**, and the check
+  that measures analyser coverage is a shell script driving a compiler. Measured on the
+  Windows leg's first real run: Git Bash turned `clang-cl ... /nologo` into
+  `clang-cl: error: no such file or directory: 'C:/Program Files/Git/nologo'`, so all six
+  units the leg exists to cover came back `unknown`. `MSYS2_ARG_CONV_EXCL='*'` and
+  `MSYS_NO_PATHCONV=1` are the MSYS2 and Git-for-Windows spellings of one switch; set
+  both, since nothing on a POSIX host can tell you which runtime is present. **The LOUD
+  half is the lucky half.** The same command line also kept `/c` and `/Fo<obj>`, because
+  the strip knew only the GNU spellings -- and that one SUCCEEDS: the preprocessed text
+  goes to the object file, stdout is empty, and the classifier honestly answers `empty`.
+  Not `unknown`. So the leg added to close a blind spot would have printed
+  `TIDY SWEEP CLEAN (0 of 6 file(s) contributed code)` and exited **0** over the exact
+  files it was added to read -- measured against the pre-change script, not argued. The
+  fix that makes that unreachable is not the strip: it is that **a mode which NAMES its
+  set may not report clean over a member it could not cover.** `--all` chose its own set,
+  so an empty unit there is the guard working; `--only` was handed one, so an empty unit
+  is the run failing to do what it was asked. Both spellings of a driver's flags are a
+  TABLE keyed on the driver NAME, never a sniff for a leading `/` -- on POSIX that starts
+  a path, which is the compile-cache rule arriving from the other direction.
 
 ## Open work
 
