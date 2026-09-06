@@ -484,7 +484,7 @@ jobs:
       - name: "Install build tools"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
@@ -616,7 +616,7 @@ jobs:
       # the configure it is meant to help.
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
@@ -1041,7 +1041,7 @@ jobs:
 
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
@@ -1177,7 +1177,7 @@ jobs:
 
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
@@ -1282,7 +1282,7 @@ jobs:
 
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       # llvm-${CLANG_TOOLS_VERSION} on top of clang, and the version has to be
@@ -1495,7 +1495,7 @@ jobs:
         run: chmod +x bin/fastcached
       - name: "Install sccache + a C++ compiler"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y sccache g++-14
       - name: "Smoke"
         run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
@@ -1518,7 +1518,7 @@ jobs:
         run: chmod +x bin/fastcached
       - name: "Install C++ compiler + libyaml-cpp runtime"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y g++-14 libyaml-cpp0.8
       # mozilla-actions/sccache-action ships sccache >= 0.8, which uses
       # OpenDAL >= 0.45 and speaks the memcached BINARY protocol; the apt
@@ -1551,7 +1551,7 @@ jobs:
         run: chmod +x bin/fastcached
       - name: "Install sccache + a C++ compiler"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y sccache g++-14
       - name: "Smoke"
         run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol redis --port 11611 --compiler g++-14
@@ -1581,7 +1581,7 @@ jobs:
         run: chmod +x bin/fastcached bin/fastcache-cc
       - name: "Install a C++ compiler + libyaml-cpp runtime"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y g++-14 libyaml-cpp0.8
       # Exit 77 means a prerequisite was missing and nothing was verified, which
       # must fail here rather than report green.
@@ -1840,7 +1840,7 @@ jobs:
       # fails to compile. Same symlink the Linux build matrix installs.
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev g++-14 clang
           sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
           sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
@@ -2018,7 +2018,7 @@ jobs:
       # otherwise resolve to the runner's GCC 13 — no <print>, no build.
       - name: "Install build tools"
         run: |
-          sudo apt-get update
+          bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev rpm systemd g++-14
           sudo ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc
           sudo ln -sf /usr/bin/g++-14 /usr/local/bin/g++
