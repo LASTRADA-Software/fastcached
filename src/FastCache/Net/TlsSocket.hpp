@@ -112,12 +112,18 @@ class TlsSocket final: public ISocket
     /// That is [#710](https://github.com/LASTRADA-Software/fastcached/issues/710) on
     /// the one transport where the plaintext reasoning does not carry.
     ///
-    /// Forwarding is sufficient rather than merely convenient, and the chain is worth
-    /// stating because it is not obvious: `_raw->CancelRead()` completes the parked raw
-    /// read with `Cancelled`, `FeedIncoming` propagates that as `unexpected`,
-    /// `PumpWaitReadable` returns it, and `DriveWaitReadable` completes the CALLER's
-    /// awaitable with it. So one forward retires both the raw operation and this
-    /// socket's own pump, and no frame is left parked at either layer.
+    /// Forwarding retires a pump parked on a raw READ, and the chain is worth stating
+    /// because it is not obvious: `_raw->CancelRead()` completes the parked raw read
+    /// with `Cancelled`, `FeedIncoming` propagates that as `unexpected`, the pump
+    /// returns it, and `DriveWaitReadable`/`DriveRead` completes the CALLER's awaitable
+    /// with it. That holds for a park inside `PumpWaitReadable` and inside `PumpRead`
+    /// alike.
+    ///
+    /// **It does NOT retire a pump parked in `FlushOutgoing`'s raw WRITE**, which this
+    /// paragraph used to claim by asserting that no frame is left parked at either
+    /// layer. There is no write-slot equivalent of `Detail::ClaimReadSlot` anywhere in
+    /// this library, so nothing here can take that operation back:
+    /// [#893](https://github.com/LASTRADA-Software/fastcached/issues/893).
     void CancelRead() noexcept override;
 
     /// @copydoc ISocket::ShutdownWrite

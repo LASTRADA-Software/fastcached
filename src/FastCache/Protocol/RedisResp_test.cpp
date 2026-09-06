@@ -3447,10 +3447,14 @@ TEST_CASE("RESP: a blocking read retires its readability watch instead of leavin
     // and `WatchesRetiredByCancel()` is 0.
     REQUIRE(watched.WatchesOrphaned() == 0);
     REQUIRE(watched.WatchesRetiredByCancel() == 1);
-    // WHICH route retired it is the whole claim, and the two are not interchangeable:
-    // the connection's teardown sweeps up a parked watch too, so a fix that only ever
-    // got there via `Close()` would leave the frame alive for the whole connection and
-    // still show one retirement. Zero here is what says the CALLER did it.
+    // A guard rather than the claim, and the difference is worth being honest about:
+    // nothing has called `Close()` on the decorator yet at this point -- `RunHandlerOn`
+    // only closes after the handler returns -- so BOTH the fixed and the broken build
+    // produce zero here. The discriminating assertion is `WatchesRetiredByCancel() == 1`
+    // on the line above. This one earns its place by keeping the two routes from ever
+    // being read as interchangeable if the case is later moved past `EndConnection()`,
+    // which is exactly when a fix that only ever retired via `Close()` would start
+    // passing.
     REQUIRE(watched.WatchesRetiredByClose() == 0);
     REQUIRE_FALSE(watched.IsWatchParked());
 

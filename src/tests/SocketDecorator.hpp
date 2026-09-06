@@ -275,6 +275,15 @@ class ParkingReadableSocket final: public SocketDecorator
     }
 
     /// @copydoc ISocket::CancelRead
+    ///
+    /// **Touches members after `Complete()` resumes a coroutine, which the real
+    /// transports must not do.** `RetireParked()` itself keeps the discipline -- detach,
+    /// complete, nothing after -- but the counter and the forward below run once the
+    /// awaiting coroutine has already resumed. Safe here only because this fake is a
+    /// test's stack local that no coroutine owns; a case where the resumed coroutine
+    /// owned the socket would get a use-after-free inside the instrument. Said out loud
+    /// because this class documents itself as modelling the transports' discipline, and
+    /// that is one place it deliberately does not.
     void CancelRead() noexcept override
     {
         if (RetireParked())

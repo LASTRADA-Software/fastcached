@@ -245,6 +245,12 @@ endif()
 #    load-bearing rather than realism: with both functions at the top of the file the
 #    over-advance is small enough to land inside the second signature and the check
 #    finds it anyway, which is a regression test that does not reproduce the regression.
+#    Do not "tidy" the filler away.
+#
+#    It asserts BOTH that the refusal names the second class AND that both
+#    implementations were seen, because **a refusal counting one of two is right by
+#    accident** -- and a failure message saying so is read by somebody debugging a red,
+#    not by somebody about to delete the padding.
 math(EXPR caseCount "${caseCount} + 1")
 set(paddedPair "")
 foreach(i RANGE 1 200)

@@ -707,6 +707,17 @@ namespace
         /// EOF -- which is what the in-memory transport does for a peer that has
         /// already half-closed -- finds no waiter to resolve and the loop parks
         /// forever. Folded, there is no way to spell it wrong.
+        ///
+        /// **A pass that DECLINES can be left unwatched if the live trampoline then
+        /// resolves `> 0`**: nothing is armed, `_watching` goes false, and the loop is
+        /// already parked on this pass's waiter, so a departure goes unobserved until
+        /// the next registry wake
+        /// ([#899](https://github.com/LASTRADA-Software/fastcached/issues/899)). Not a
+        /// regression -- reaching it needs pending bytes nothing consumes, which is the
+        /// case `ArmDisconnect` already documents as uncovered, and the unconditional
+        /// per-pass arming this replaced was equally blind there. **Do not close it by
+        /// looping the trampoline**: with bytes pending, `WaitReadable` answers `> 0`
+        /// immediately and forever, so looping spins and looping once changes nothing.
         /// @param waiter This pass's waiter.
         /// @return True when the caller should arm a trampoline; false when an earlier
         ///         one is still parked and will be re-targeted instead.
@@ -748,6 +759,16 @@ namespace
         /// already says it, and `ScopedDisconnectWatch` dropping its `shared_ptr`
         /// already says it a layer up -- and three guards for one condition is how two
         /// of them end up disagreeing.
+        ///
+        /// **UNTESTED, and stated rather than covered.** Delete this body and every case
+        /// in the suite still passes: at all five retire sites the pass's waiter is
+        /// either already resolved or never inspected again, so a spurious
+        /// `WakeDisconnect()` lands on a waiter nobody looks at. It is defence for the
+        /// IOCP timing -- where the trampoline resumes on a much later turn -- and for a
+        /// future arrangement that inspects the waiter after retiring. A test asserting
+        /// it would be green in both states, which is this project's own *assert what
+        /// distinguishes*: claiming a test that cannot fail is worse than naming the
+        /// gap.
         void Retire() noexcept
         {
             std::scoped_lock const lock { _mu };
@@ -764,11 +785,19 @@ namespace
         /// process-wide lock and walks its whole key map -- so it is unmeasurable in situ,
         /// on a path only a BLOCKing verb reaches.
         ///
-        /// **The reentrancy is safe by ORDERING, not by luck, and this mutex is not
-        /// recursive.** `ScopedDisconnectWatch::Retire()` releases `_mu` and drops its
-        /// `shared_ptr` BEFORE calling `CancelRead()`, which synchronously resumes the
-        /// trampoline into `Disconnect()` and `EndWatch()` -- both of which retake `_mu`.
-        /// Reverse that order and this self-deadlocks.
+        /// **The invariant is that `_mu` is never held across anything that can resume
+        /// the trampoline**, and it holds by construction: the lock lives inside this
+        /// class's own methods, `Disconnect()` copies `_current` under it and calls
+        /// `WakeDisconnect()` outside it, and nothing enters `EndWatch()` holding it.
+        ///
+        /// This paragraph used to say that reordering `ScopedDisconnectWatch::Retire()`
+        /// would SELF-DEADLOCK. It cannot: `_mu` is a `scoped_lock` local to
+        /// `DisconnectWatch::Retire()`, released at that function's own scope exit, so
+        /// no arrangement of the caller's three statements can hold it across
+        /// `CancelRead()`. Naming a deadlock the code cannot take is worse than naming
+        /// nothing -- it points the next reader at the wrong invariant, and would let a
+        /// refactor that runs `Retire` under a CALLER-held lock reintroduce the real
+        /// hazard while faithfully "preserving the documented order".
         std::mutex _mu;
         std::shared_ptr<StreamWaiter> _current {};
         bool _watching { false };

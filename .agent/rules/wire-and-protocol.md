@@ -1333,12 +1333,21 @@ Every rule below has already been a bug.
     legitimate and safe, and #673's pipelined-data case stages its whole distinction
     through that second watch -- so the simplification would leave a green test
     asserting nothing.
-  - **Retiring is not disconnecting, and that is the half that is easy to get
-    backwards.** `CancelRead` completes the parked watch with an ERROR, and
-    `ArmDisconnect` reads any error as a departure -- so what silences it must be the
-    watch being RETIRED, never the error code. Silence it by code and a genuine
-    abortive close stops being noticed; silence it by nothing and cancelling drops a
-    healthy client.
+  - **Retiring is not disconnecting, and that is the half that reads backwards.**
+    `CancelRead` completes the parked watch with an ERROR, and `ArmDisconnect` reads any
+    error as a departure -- so what silences it must be the watch being RETIRED, never
+    the error code. Silence it by code and a genuine abortive close stops being noticed;
+    silence it by nothing and cancelling drops a healthy client.
+    - **And it is UNTESTED, which is stated rather than covered.** Delete
+      `DisconnectWatch::Retire()`'s body and every case still passes: at all five retire
+      sites the pass's waiter is already resolved or never inspected again. It is defence
+      for the IOCP timing, where the trampoline resumes on a much later turn, and for a
+      future arrangement that inspects the waiter afterwards. A test asserting it would
+      be green in both states -- *assert what DISTINGUISHES* -- so claiming one would be
+      worse than naming the gap. The entry said "easy to get backwards", which implied
+      load-bearing NOW; that is the accurate claim's weaker form and it is corrected here
+      rather than only in the header, because a claim with two homes corrected once
+      survives in the other.
   - **Retirement is RAII and also explicit, and the pair is deliberate.** A destructor
     covers the four exits that exist and the ones added later; the explicit calls put
     the cancel BEFORE the reply write, which on IOCP -- where cancellation is
@@ -1437,6 +1446,25 @@ Every rule below has already been a bug.
       named, and all six the library hands out answer it in their own file --
       `BlockingSocket`'s answer is a written no-op WITH ITS REASON, which is the
       distinction that matters.
+    - **A `/simplify` finding is a change like any other and is not exempt from the
+      review its subject just had.** The cleanup that removed the hiding place created
+      the bug: the change moving every offset in `check-read-buffer-guard` into ONE
+      coordinate system was made precisely because an earlier off-by-one had hidden in
+      the three-origin arithmetic, and it left the cursor advance summing one term twice
+      -- over-advancing by a whole signature, so the walk SKIPPED any second definition
+      in a file. A false pass, in the instrument built to prevent false passes. **It
+      arrived after the four passes that would have caught it and before the correctness
+      pass that did**, which is the actionable half: a cleanup applied late lands in the
+      one window where nothing is looking, and it arrives wearing the authority of a
+      review rather than the suspicion of a change.
+    - **And a regression test can fail to reproduce its regression.** Six self-test cases
+      could not structurally see that bug -- each is a single implementation at offset
+      zero, so an over-advancing cursor still lands past the only match. Case 7 is two
+      implementations in one file with the second unguarded, and its PADDING is
+      load-bearing rather than realism: with both at the top of the file the over-advance
+      lands INSIDE the second signature and the check finds it anyway. It asserts both
+      that the refusal names the second class and that both were SEEN, because a refusal
+      counting one of two is right by accident.
     - **Pure virtual was proposed for it and rejected, and the reason generalises:
       reach for the type system when the obligation is DO SOMETHING; reach for a
       scan when the obligation is SAY WHY.** `ClaimReadSlot` and `SigningDomain` are

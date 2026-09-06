@@ -779,6 +779,18 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   reach for a scan when it is SAY WHY**; a pure virtual compels seven fakes to write
   `{}` with no reason beside it, which is *forgot* in the vocabulary of *decided*
   (#892).
+- **A `/simplify` finding is a change like any other and is not exempt from the review
+  its subject just had.** The cleanup that moved `check-read-buffer-guard`'s offsets into
+  ONE coordinate system — made precisely because an off-by-one had hidden in the
+  three-origin arithmetic — left the cursor advance summing one term twice, so the walk
+  SKIPPED any second definition in a file: a false pass in the instrument built to
+  prevent false passes. It landed AFTER the four passes that would have caught it and
+  BEFORE the correctness pass that did, which is the window: a late cleanup arrives
+  wearing the authority of a review rather than the suspicion of a change. And **a
+  regression test can fail to reproduce its regression** — six self-test cases could not
+  see it, being single-implementation files at offset zero, and case 7's PADDING is
+  load-bearing because without it the over-advance lands inside the second signature and
+  the check finds it anyway.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
