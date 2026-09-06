@@ -5,6 +5,7 @@
 
 #include <array>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -112,11 +113,13 @@ namespace
 /// The configuration a start would have assembled from @p path.
 /// @param path The file that was read.
 /// @param secret What `requirepass:` in it says, or empty for a file carrying none.
+/// @param tlsKey What `tls_key:` in it says, or empty for a file naming none.
 /// @return The snapshot a `ConfigReloader` is seeded with.
-Config InitialConfig(std::filesystem::path const& path, std::string_view secret)
+Config InitialConfig(std::filesystem::path const& path, std::string_view secret, std::string_view tlsKey = {})
 {
     Config initial {};
     initial.requirePass = std::string { secret };
+    initial.tlsKeyPath = std::string { tlsKey };
     initial.configPath = path.string();
     return initial;
 }
@@ -138,8 +141,13 @@ struct Watched
 
     /// @param path The configuration file to watch.
     /// @param secret What `requirepass:` in that file says, or empty for none.
-    Watched(std::filesystem::path const& path, std::string_view secret):
-        reloader { InitialConfig(path, secret), path, {} }
+    /// @param tlsKey What `tls_key:` in that file says, or empty for none. It must
+    ///        match the file, because `tls_key` is `Reloadable::No` and a seed that
+    ///        disagreed with it would make the FIRST reload refuse by name -- which
+    ///        looks nothing like the case under test and is why it is a parameter
+    ///        rather than something a case sets afterwards.
+    Watched(std::filesystem::path const& path, std::string_view secret, std::string_view tlsKey = {}):
+        reloader { InitialConfig(path, secret, tlsKey), path, {} }
     {
         // `false`: no case here supplies the secret on the command line. That the
         // provenance gate declines an argv-supplied secret is `SecretProvenance_test`'s
@@ -277,6 +285,35 @@ TEST_CASE("SecretExposureWatcher: a reload reports a transition into exposure, o
         CHECK(watched.said.size() == 2);
     }
 
+    SECTION("a --tls-key that loosens under an unchanged file is reported")
+    {
+        // **#864 reaching the reload for free, and that is the claim being tested.**
+        // The daemon's `--tls-key` row is a row of `DaemonSecretFileTable()`, which
+        // `DaemonSecretFiles` walks -- and `WatchSecretExposure` asks THAT at the start
+        // and at every reload. So a row added there is covered at both moments without
+        // a second wiring, and the way to show it is a mode change on the KEY while
+        // the configuration file itself never moves.
+        //
+        // The configuration file is mode 0600 and carries no secret throughout, so the
+        // only thing that can produce a warning here is the key.
+        auto const key = write("watched.key", "-----BEGIN PRIVATE KEY-----\n", privateMode);
+        auto const path = write("names-key.yaml", std::format("tls_key: {}\n", key.string()), privateMode);
+
+        Watched watched { path, "", key.string() };
+        REQUIRE(watched.said.empty());
+
+        REQUIRE(::chmod(key.c_str(), worldReadableMode) == 0);
+        REQUIRE(watched.reloader.Reload().has_value());
+
+        REQUIRE(watched.said.size() == 1);
+        CHECK(watched.said.front().contains(key.string()));
+        CHECK_FALSE(watched.said.front().contains(path.string()));
+
+        // Said once, like every other standing exposure.
+        REQUIRE(watched.reloader.Reload().has_value());
+        CHECK(watched.said.size() == 1);
+    }
+
     SECTION("a restricted file stays silent across reloads")
     {
         // The control. Without it, "report a transition" and "report at every reload"
@@ -287,6 +324,66 @@ TEST_CASE("SecretExposureWatcher: a reload reports a transition into exposure, o
 
         REQUIRE(watched.reloader.Reload().has_value());
         CHECK(watched.said.empty());
+    }
+}
+
+TEST_CASE("ReportSecretExposure: the arm for a process with no file to reload", "[config][secret]")
+{
+    // **The other half of #868's wiring, and the half only a source scan asserted.**
+    // `fastcache-compile-node` started entirely from argv still names four key files
+    // and takes this arm; a `main` reaching it against a function that reported
+    // nothing would pass every text scan there is. So the arm is driven here rather
+    // than left to the two call sites.
+    //
+    // The subject list is `DaemonSecretFiles` because that is the production one this
+    // test binary can reach, NOT because it is the one the arm is handed: the only
+    // production caller is `fastcache-compile-node`, which hands `NodeSecretFiles`. A
+    // real subject list rather than a bespoke lambda, since a lambda would test the
+    // loop and not the shape the loop exists for; that the WORKER reaches this arm at
+    // all is `NodeConfig_test`'s wiring scan.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-once" };
+    scratch.Write("tls.key", "not-a-real-key\n");
+    auto const key = scratch / "tls.key";
+
+    FastCache::SecretSubjectFiles<Config> const subjects { [](Config const& cfg) {
+        return FastCache::DaemonSecretFiles(cfg, /*secretNamedOnCommandLine*/ false);
+    } };
+
+    Config cfg {};
+    cfg.tlsKeyPath = key.string();
+
+    std::vector<std::string> said;
+    auto const report = [&said](std::string_view warning) {
+        said.emplace_back(warning);
+    };
+
+    SECTION("an exposed file is reported, with no watcher and no memory")
+    {
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
+
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+
+        REQUIRE(said.size() == 1);
+        CHECK(said.front().contains(key.string()));
+        CHECK(said.front().contains("chmod o-r"));
+
+        // **Asked twice on purpose.** There is no remembering here and there must not
+        // be: this arm exists because nothing will re-ask, so a second call answering
+        // silently would mean the say-once rule had leaked into the moment that has
+        // only one moment. Said once per call is what the two arms differ by.
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+        CHECK(said.size() == 2);
+    }
+
+    SECTION("a private file says nothing at all")
+    {
+        // The control: without it, "reports an exposure" and "reports whatever it is
+        // handed" are one passing test, and the rule would fire on every 0600 key
+        // every deployment ships.
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+        CHECK(said.empty());
     }
 }
 

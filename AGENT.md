@@ -391,6 +391,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
   never a silent fallback. Its startup refusal is still open (#303) and must take the
   worker's shape above, or it breaks every single-machine install.
+- The worker's five key files are asked about at the START **and at every accepted
+  reload**, from `main` and never from `WorkerBody`: `ApplyReloadRequest`'s decline of
+  `Subscribe` is about THAT frame's locals, not about the binary. A mode is in no
+  configuration, so the re-ask is of the FILESYSTEM and not of the reloader's two
+  snapshots. No configuration file means no second moment, so that arm reports once and
+  keeps no memory. The full rule, and why the resolved config path travels unguarded by
+  "was the file applied", is in the rule file.
 - A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
   was held against it. A node that restarts inside the heartbeat window is the second
   route to the same pin, and `Register` closes it.
@@ -912,6 +919,18 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   FILE a protected list of its own (SYSTEM, Administrators, `NT AUTHORITY\SERVICE`
   read), not the MSI, which cannot reach a file that is not payload. An existing
   file is repaired only when it is *currently* broadly readable, never by content.
+- A secret reached BY PATH is not provenance-gated — the path is not the secret and
+  the file is — so `--tls-key`, `--cluster-key-file` and the two token files are asked
+  about however their paths were named, while `--requirepass` out of a config file
+  still is. Which `=<path>` rows are which is a TABLE per binary and classification is
+  MANDATORY (`--tls-cert` is named PUBLIC, not left off), because an opt-in list reads
+  identically to complete coverage. One subject list per binary
+  (`DaemonSecretFiles`, `NodeSecretFiles`), so a row reaches every moment that reads it.
+  BOTH binaries ask at the start AND at every accepted reload, through one
+  `SecretExposureWatcher` that re-asks the FILESYSTEM: a mode is in no configuration,
+  so an implementation diffing the reloader's two snapshots covers half the rule and
+  looks right. A worker with no configuration file has no second moment and gets the
+  observation without the memory.
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
 - Which flags carry text *other machines* will read is a column of that table
   (`ParseUtf8Text`). `--cluster-forget` is deliberately out of it, or a bad member

@@ -3,7 +3,9 @@
 #include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -59,9 +61,52 @@ std::vector<std::string> SecretFileWarnings(std::span<std::filesystem::path cons
     return warnings;
 }
 
+std::span<SecretFileRow<Config, std::string> const> DaemonSecretFileTable() noexcept
+{
+    static constexpr auto table = std::to_array<SecretFileRow<Config, std::string>>({
+        // The private key terminating TLS on the CACHE port. World-readable, any
+        // local account can impersonate this daemon to its clients or decrypt a
+        // captured session -- and `--requirepass` travels over that same connection,
+        // so this exposure composes with the one #384 was written about.
+        { .flag = "--tls-key", .path = &Config::tlsKeyPath },
+    });
+    return table;
+}
+
+std::span<PublicPathFlag const> DaemonPublicPathFlags() noexcept
+{
+    static constexpr auto table = std::to_array<PublicPathFlag>({
+        { .flag = "--config",
+          .why = "the file itself holds no secret by construction; whether the secret IN it is exposed is the "
+                 "provenance-gated question DaemonSecretFiles asks separately" },
+        // Explicitly classified rather than left off, because it is the one an author
+        // would reach for by symmetry with `--tls-key`. A certificate is handed to
+        // every client during the handshake, so it is public BY CONSTRUCTION -- and
+        // warning about the mode of a file that is MEANT to be readable is the alarm
+        // that teaches operators to ignore the one that matters.
+        { .flag = "--tls-cert", .why = "a certificate is presented to every client during the handshake" },
+        // Not a credential: nothing in the store is a key or a token, and the check
+        // is about files that hold a SECRET rather than files that hold data. Its
+        // mode is the operator's to choose -- `--requirepass` gates the network
+        // surface, never the filesystem, and warning here would tell an operator to
+        // tighten a file this daemon has no rule about.
+        { .flag = "--storage", .why = "a store of cached values; data rather than a credential" },
+        { .flag = "--seed-config",
+          .why = "a template copied to the machine-wide location; --seed-config is what SECURES that "
+                 "destination, and the source it copies from carries no secret" },
+        { .flag = "--pidfile", .why = "a process id, which every process list already publishes" },
+    });
+    return table;
+}
+
 std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool secretNamedOnCommandLine)
 {
-    if (!SecretCameFromConfigFile(SecretProvenanceFacts {
+    std::vector<std::filesystem::path> files;
+
+    // First, because it is the one an operator most often has open. This half alone
+    // is provenance-gated: `--requirepass` typed in argv is a `ps` exposure, which is
+    // a different problem with a different owner.
+    if (SecretCameFromConfigFile(SecretProvenanceFacts {
             // No secret in force: nothing to protect, and a file's mode is not this
             // daemon's business.
             .secretInForce = !cfg.requirePass.empty(),
@@ -77,9 +122,16 @@ std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool sec
             // than warning about a file nothing read.
             .fileWasRead = !cfg.configPath.empty(),
         }))
-        return {};
+        files.emplace_back(cfg.configPath);
 
-    return { std::filesystem::path { cfg.configPath } };
+    // Not gated at all, and that is #752's rule rather than an omission of #384's:
+    // the path is not the secret and the file is, so a world-readable private key is
+    // exposed whether its path was typed or read out of a configuration file.
+    for (auto const& row: DaemonSecretFileTable())
+        if (auto const& path = cfg.*row.path; !path.empty())
+            files.emplace_back(path);
+
+    return files;
 }
 
 } // namespace FastCache

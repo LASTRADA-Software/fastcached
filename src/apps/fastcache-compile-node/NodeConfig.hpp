@@ -4,6 +4,7 @@
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -1013,31 +1014,20 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
 
-/// One path-valued flag whose file holds a secret.
+/// One path-valued worker flag whose file holds a secret.
 ///
-/// A row rather than a branch, so a fifth secret-bearing flag is a fifth row and
-/// the loop that asks about them is written once.
-struct NodeSecretFile
-{
-    std::string_view flag;                    ///< The `--flag` spelling, and the key the coverage guard joins on.
-    std::filesystem::path NodeConfig::* path; ///< Where the operator's answer lands.
-};
+/// The shared row type, spelled for this binary. It was a struct of its own until
+/// [#864](https://github.com/LASTRADA-Software/fastcached/issues/864) gave the daemon
+/// the same two tables and the two definitions differed only in a type -- so
+/// `Config/SecretProvenance.hpp` holds the one row and both binaries name it.
+using NodeSecretFile = SecretFileRow<NodeConfig, std::filesystem::path>;
 
-/// One path-valued flag whose file is deliberately NOT a secret.
+/// One path-valued worker flag whose file is deliberately NOT a secret.
 ///
-/// **Mandatory classification with a named opt-out, rather than an opt-in list.**
-/// An opt-in list is exact about the flags it knows and silent about the ones it
-/// does not, and silence reads identically to complete coverage -- which is #492,
-/// and which is precisely how #752 describes the narrow answer that "looks
-/// complete". `ctest -R "every path-valued flag is classified"` requires every
-/// `=<path>` row of `NodeOptions()` to appear in exactly one of the two tables, so
-/// a sixth path-valued flag does not compile into silence: its author has to say
-/// which kind it is.
-struct NodePublicPathFlag
-{
-    std::string_view flag; ///< The `--flag` spelling.
-    std::string_view why;  ///< Why its file holds no secret. A forcing function, not a dead field.
-};
+/// `PublicPathFlag` unchanged -- the daemon's rows are the same two fields for the
+/// same reason, and `ctest -R "every path-valued flag is classified"` requires every
+/// `=<path>` row of `NodeOptions()` to appear in exactly one of the two tables.
+using NodePublicPathFlag = PublicPathFlag;
 
 /// Every path-valued flag whose file holds a secret.
 /// @return The table; stable for the life of the process.

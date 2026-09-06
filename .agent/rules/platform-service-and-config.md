@@ -565,6 +565,43 @@ readable and silently ignored. Every rule below has already been one of them.
     installed file's access list — no broad principal may read, `S-1-5-6` may, and
     the list is protected. **Both directions**: a config nothing can read is not a
     fix, it is a daemon that silently starts on built-in defaults.
+- **A secret reached BY PATH is not provenance-gated, and which flags those are is a
+  TABLE on both binaries.** #384's rule asks whether the `--requirepass` in force came
+  out of the configuration file, because it can also arrive in argv — where the
+  exposure is `ps` and belongs to `InlineCredentialRejection`. A key FILE has no such
+  second route: the path is not the secret and the file is, so a world-readable key is
+  exposed however its path was named, and asking whether it was typed answers a
+  question nobody has (#752). That rule was never specific to the worker, and the
+  daemon went on carrying its own for one file
+  ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)): `--tls-key`,
+  the private key terminating TLS on the **cache** port — so a loose one lets any local
+  account impersonate the daemon to its clients or decrypt the session `--requirepass`
+  itself travels over, which is the earlier exposure composed with this one.
+  - **Classification is mandatory with a named opt-out**, never an opt-in list. Every
+    `=<path>` row of a binary's option table sits in exactly one of two tables — the
+    secret-file table or `PublicPathFlag`, which carries a per-row *why* — because a
+    list that is exact about the flags it knows and silent about the ones it does not
+    reads identically to complete coverage (#492). `--tls-cert` is classified as
+    PUBLIC by name rather than left off: a certificate goes to every client during the
+    handshake, and warning about a file that is *meant* to be readable is the alarm
+    that teaches operators to ignore the one that matters. Measured by
+    `grep -c 'operand = "=<path>"'`: **6** such rows in `CliOptions()`, one of them
+    secret, and **9** in `NodeOptions()`, four of them secret.
+  - **One join, asked of two option tables.** `Testing::ClassifyPathFlags` is the
+    guard, and it reports three lists rather than a verdict — unclassified, claimed by
+    both, and naming no row at all — because those are three different repairs. It
+    also returns how many `=<path>` rows it *saw*: with all three lists empty, a scan
+    that matched nothing is indistinguishable from complete coverage, so the caller
+    asserts the count is non-zero.
+  - **A named file is reported whether or not a tier reads it.** `--tls-key` with
+    `--tls` off is still a key on disk, and whether a surface exists is not a fact
+    about the configuration — a rule whose premise is "somebody will read this" cannot
+    state its premise without guessing. It is the same narrowing the worker's
+    `--cluster-key-file` refusal had to be talked out of twice.
+  - The subject list is one function per binary (`DaemonSecretFiles`,
+    `Node::NodeSecretFiles`) and **both moments read it**, so a row added there reaches
+    the start and every reload for free. That is what makes the guard worth having: the
+    thing an author must remember is a table row, not a call site.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
@@ -896,16 +933,3 @@ boot, silently, because a registration replays its command line forever. So:
   the failure the emptiness rule beside it was written to prevent. Deciding it needs
   a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
   `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".
-
-- **[#864](https://github.com/LASTRADA-Software/fastcached/issues/864)** — #752 wired
-  the worker's path-reached secrets and the daemon still has its own. The rule that a
-  secret reached BY PATH is not provenance-gated is not specific to a binary: the path
-  is not the secret and the file is. Measured over the six `=<path>` rows of
-  `CliOptions()`, the daemon's gap is exactly ONE — `--tls-key`, the private key
-  terminating TLS on the CACHE port, so a world-readable one lets any local account
-  impersonate the daemon to its clients or decrypt the session `--requirepass` travels
-  over. `--tls-cert` is public by construction, and the other four rows are a store, a
-  pid and two config paths. `DaemonSecretFiles` is already the daemon's subject list and
-  both the start and #753's reload subscriber read it, so the row reaches both moments
-  for free; what is missing beside it is the daemon's own mandatory classification, or a
-  seventh path-valued flag is covered by silence.

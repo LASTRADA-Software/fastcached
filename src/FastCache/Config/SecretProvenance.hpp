@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache
@@ -118,6 +119,60 @@ struct SecretFileFinding
 /// @return One finding per exposed file, in @p files order; empty when none is.
 [[nodiscard]] std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::path const> files);
 
+/// One path-valued flag whose file holds a secret.
+///
+/// A row rather than a branch, so a second secret-bearing flag is a second row and
+/// the loop that asks about them is written once.
+///
+/// **One row type for both executables**, because the two copies differed only in a
+/// type: `NodeConfig` spells a path as `std::filesystem::path` and `Config` spells it
+/// as `std::string`. Two structs of two fields each, differing by a type, is exactly
+/// the repetition a table exists to delete -- and it is what lets ONE coverage guard
+/// be written against both
+/// ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)).
+///
+/// @tparam ConfigT The configuration a flag's value lands in.
+/// @tparam PathT How that configuration spells a filesystem path.
+template <typename ConfigT, typename PathT = std::filesystem::path>
+struct SecretFileRow
+{
+    std::string_view flag; ///< The `--flag` spelling, and the key the coverage guard joins on.
+    PathT ConfigT::* path; ///< Where the operator's answer lands.
+};
+
+/// One path-valued flag whose file is deliberately NOT a secret.
+///
+/// **Mandatory classification with a named opt-out, rather than an opt-in list.**
+/// An opt-in list is exact about the flags it knows and silent about the ones it
+/// does not, and silence reads identically to complete coverage -- which is #492,
+/// and which is precisely how #752 describes the narrow answer that "looks
+/// complete". Each binary's coverage case requires every `=<path>` row of its own
+/// option table to appear in exactly one of its two tables, so a further
+/// path-valued flag does not compile into silence: its author has to say which kind
+/// it is.
+struct PublicPathFlag
+{
+    std::string_view flag; ///< The `--flag` spelling.
+    std::string_view why;  ///< Why its file holds no secret. A forcing function, not a dead field.
+};
+
+/// Every path-valued DAEMON flag whose file holds a secret.
+///
+/// One row, and the measurement is the point rather than the count: of the six
+/// `=<path>` rows of `CliOptions()`, `--tls-key` is the only one naming a
+/// credential. It is the private key terminating TLS on the CACHE port, so a
+/// world-readable one lets any local account impersonate this daemon to its clients
+/// or decrypt a captured session -- and `--requirepass` travels over that same
+/// connection, so the exposure composes with the one #384 was written about
+/// ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)).
+///
+/// @return The table; stable for the life of the process.
+[[nodiscard]] std::span<SecretFileRow<Config, std::string> const> DaemonSecretFileTable() noexcept;
+
+/// Every path-valued DAEMON flag whose file holds no secret, and why.
+/// @return The table; stable for the life of the process.
+[[nodiscard]] std::span<PublicPathFlag const> DaemonPublicPathFlags() noexcept;
+
 /// Every file the DAEMON's secrets live in, in the order to report them.
 ///
 /// The daemon's half of what `Node::NodeSecretFiles` is for the worker: which files
@@ -125,15 +180,30 @@ struct SecretFileFinding
 /// `SecretExposureWatcher`. Two callers ask it -- the start and every reload -- and a
 /// subject list each of them derived for itself is the shape #396 and #726 paid for.
 ///
-/// The whole of [#384](https://github.com/LASTRADA-Software/fastcached/issues/384)'s
-/// gate, composed from the two halves that can be tested separately:
-/// `SecretCameFromConfigFile` over the facts (provenance, pure) and
-/// `Platform/FileTrust`'s `SecretFileExposure` (the platform's answer about a mode or
-/// an access list), which whoever renders this list then asks.
+/// **Two rules, not one, and only the first is #384's.** The configuration file is
+/// provenance-gated: `--requirepass` can arrive in argv instead, where the exposure is
+/// `ps` rather than a mode, and that is a different problem with a different owner.
+/// Every file `DaemonSecretFileTable()` names is not gated at all -- the path is not
+/// the secret and the file is, so a world-readable TLS private key is exposed however
+/// its path was named
+/// ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)). That is #752's
+/// rule, and it was never specific to the worker.
 ///
-/// Empty when there is nothing to look at -- no secret, or a secret from argv, or no
-/// file read. **`Undetermined` is still reported** by the renderer, because a
-/// platform that would not answer is not a platform that answered "safe".
+/// **A named file is reported whether or not a tier reads it.** `--tls-key` with no
+/// `--tls` is a key sitting on disk, and whether a surface exists is not a fact about
+/// the configuration -- a rule whose premise is "somebody will read this" cannot state
+/// its premise without guessing.
+///
+/// The provenance half is the whole of
+/// [#384](https://github.com/LASTRADA-Software/fastcached/issues/384)'s gate, composed
+/// from the two halves that can be tested separately: `SecretCameFromConfigFile` over
+/// the facts (provenance, pure) and `Platform/FileTrust`'s `SecretFileExposure` (the
+/// platform's answer about a mode or an access list), which whoever renders this list
+/// then asks.
+///
+/// Empty when there is nothing to look at -- no secret named anywhere. **`Undetermined`
+/// is still reported** by the renderer, because a platform that would not answer is not
+/// a platform that answered "safe".
 ///
 /// **The provenance BIT rather than the whole `CliResult`**, which is exactly what
 /// `Node::NodeSecretFiles` takes and what the rule reads: one bool out of a 584-byte
@@ -146,11 +216,8 @@ struct SecretFileFinding
 /// @param cfg The merged configuration in force.
 /// @param secretNamedOnCommandLine Whether argv supplied `--requirepass`; the parse's
 ///        own `CliResult::requirePassExplicit`, never a value comparison.
-/// @return The configuration file when its mode is what protects the secret, else
-///         nothing. Never more than one element today; a list because the daemon has
-///         its own path-reached secret still to wire
-///         ([#864](https://github.com/LASTRADA-Software/fastcached/issues/864)), and
-///         because the shape is the worker's `NodeSecretFiles` so a reader meets one
+/// @return The paths, configuration file first when it qualifies; empties are kept
+///         out. The shape is the worker's `NodeSecretFiles`, so a reader meets one
 ///         answer twice.
 [[nodiscard]] std::vector<std::filesystem::path> DaemonSecretFiles(Config const& cfg, bool secretNamedOnCommandLine);
 

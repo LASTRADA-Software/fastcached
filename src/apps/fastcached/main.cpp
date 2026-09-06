@@ -698,6 +698,15 @@ int DaemonBody(FastCache::Config const& effective,
     // closed and breaks nothing that worked, while refusing an EXPOSED one breaks
     // something that did.)
     //
+    // **And it is no longer only that file.** `WatchSecretExposure` asks
+    // `DaemonSecretFiles`, which since
+    // [#864](https://github.com/LASTRADA-Software/fastcached/issues/864) also walks
+    // `DaemonSecretFileTable()` -- `--tls-key` today. Those are NOT provenance-gated:
+    // the path is not the secret and the file is, so a world-readable private key is
+    // exposed however its path was named. A further path-valued flag is a row there
+    // and reaches this call site for free, which is the point of asking through one
+    // function rather than deriving a subject list here.
+    //
     // **And again at every reload, through the same watcher.** `requirepass` is
     // `Reloadable::Yes`, so a file can GAIN a secret after startup -- an operator adds
     // `requirepass:` to a mode-0644 file and sends SIGHUP -- and a startup-only check

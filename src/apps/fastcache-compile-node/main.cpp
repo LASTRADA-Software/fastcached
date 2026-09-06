@@ -37,6 +37,7 @@
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
+#include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -597,6 +598,14 @@ using NodeReloader = ConfigReloaderOf<NodeConfig>;
 /// stylistic one -- the reloader is declared in `main` and outlives `WorkerBody`, and
 /// `Subscribe` has no unsubscribe, so a subscriber capturing this frame's locals would
 /// outlive them.
+///
+/// **That decline is about THIS frame, and `main` does subscribe.**
+/// `WatchSecretExposure` is attached beside the reloader's own declaration, capturing
+/// only what `main` owns and what outlives the reloader -- which is the arrangement
+/// the paragraph above describes as safe rather than an exception to it
+/// ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)). Read as "the
+/// worker cannot subscribe at all" the rule is one frame too wide, and it would leave
+/// the secret-file check startup-only on the binary that holds five such files.
 void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
 {
     if (reloader == nullptr)
@@ -1912,6 +1921,38 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
+    // Built only when there IS a file, and holding the SAME argv the startup parse
+    // used -- so a reload reproduces the startup order exactly: a fresh configuration,
+    // the file applied through the appliers argv reaches, then the command line second.
+    // "The command line wins" therefore stays a question of which loop ran last, never
+    // a per-field merge with per-field presence bits.
+    //
+    // **Declared before the secret-exposure watch below and before the daemon host**,
+    // which is what makes both safe. The watch subscribes to this object and its
+    // report closure refers to `logger`, declared further up, so the reloader is
+    // destroyed first -- the ordering `WatchSecretExposure` requires. And the host is
+    // chosen afterwards because the POSIX one redirects stdout to /dev/null inside
+    // `Run()`: every startup warning has to be emitted before that.
+    std::optional<NodeReloader> reloader;
+    if (!lookup.path.empty())
+        reloader.emplace(
+            cfg,
+            lookup.path,
+            [argvSpan](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+                // A FRESH configuration, never the live one. A file that fails halfway
+                // is then discarded whole rather than leaving the running worker
+                // holding part of a document nobody wrote.
+                NodeConfig candidate;
+                auto const loaded =
+                    ReadYamlSettings(path).and_then([&candidate, &path, argvSpan](std::vector<YamlSetting> const& settings) {
+                        return ApplyNodeConfiguration(settings, path, argvSpan.subspan(1), candidate);
+                    });
+                if (!loaded.has_value())
+                    return std::unexpected(loaded.error());
+                return candidate;
+            },
+            &ValidateNodeReloadable);
+
     // A secret is only as private as the file holding it, and this worker has FIVE
     // such files where the daemon has one. #384 landed that rule and wired only the
     // daemon; the exposure here is identical for `--requirepass` out of a
@@ -1920,11 +1961,30 @@ int main(int argc, char** argv)
     // and lease tokens, handed to every account on the machine
     // ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
     //
-    // `lookup.path` guarded by `fileApplied`, never `cfg.configPath`: the resolved
-    // path is what was actually opened, and a discovered machine-wide file is named
-    // by no flag at all -- so the flag's value would answer "no file" for the
-    // deployment the packaging ships. And a file that failed halfway was DECLINED,
-    // so its secret is not the one in force.
+    // **And re-asked at every accepted reload**, which is the half a snapshot cannot
+    // answer: a file's MODE is in no configuration, so an operator who loosens
+    // `--cluster-key-file` an hour after this worker started was met with silence for
+    // the rest of the process's life
+    // ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)).
+    //
+    // `lookup.path` UNGUARDED by `fileApplied`, and never `cfg.configPath`. The
+    // resolved path is what was opened, and a discovered machine-wide file is named by
+    // no flag at all -- so the flag's value would answer "no file" for the deployment
+    // the packaging ships. The `fileApplied` guard it used to carry is DROPPED because
+    // it can never decide anything, and that is the whole claim -- MEASURED against the
+    // control flow above rather than reasoned from what a reload might do. A non-empty
+    // `lookup.path` that would not load already exited `ExitUsage` far above, except
+    // under `fileIsAdvisory`, which is `--uninstall-service` and returns at the service
+    // block. So every run that reaches this line with a path either applied the file or
+    // never had one. Even in the unreachable case the gate answers the same: `cfg` IS
+    // `cliOnly` there, so either argv named the token (`namedOnCommandLine`) or no
+    // secret is in force (`secretInForce`).
+    //
+    // What it is NOT is a fix for a reload hole. `--requirepass` is `Reloadable::No`
+    // and carries a `same` comparator, so a SIGHUP that introduces a token is REFUSED
+    // by `ValidateNodeReloadable` and publishes nothing -- a node file cannot GAIN a
+    // secret across a reload the way the daemon's can, which is the half of #753 that
+    // does not exist here. The half that does is the FILESYSTEM re-ask below.
     //
     // **A warning and not a refusal**, for #384's reason: refusing a MISSING
     // credential fails closed and breaks nothing that worked, while refusing an
@@ -1950,9 +2010,22 @@ int main(int argc, char** argv)
     // means "named anywhere" and answers true for exactly the secret this warning
     // exists to report. Only a bit read off `cliOnly` would be right, which is the
     // same fact this expression already reads, one column and one bool later.
-    for (auto const& warning: SecretFileWarnings(
-             NodeSecretFiles(cfg, fileApplied ? lookup.path : std::filesystem::path {}, !cliOnly.token.empty())))
+    SecretSubjectFiles<NodeConfig> const secretFiles = [configFile = lookup.path,
+                                                        argvNamedSecret = !cliOnly.token.empty()](NodeConfig const& live) {
+        return NodeSecretFiles(live, configFile, argvNamedSecret);
+    };
+    SecretExposureReport report = [&logger](std::string_view warning) {
         logger.Logf(LogLevel::Warn, "{}", warning);
+    };
+
+    // Two arms, and the difference is whether there is a SECOND moment at all. A
+    // worker configured entirely from argv still names four key files and still has to
+    // be told about them; what it has no use for is the memory that keeps a standing
+    // exposure from being repeated, because nothing will re-ask.
+    if (reloader.has_value())
+        WatchSecretExposure<NodeConfig>(*reloader, secretFiles, std::move(report));
+    else
+        ReportSecretExposure<NodeConfig>(cfg, secretFiles, report);
 
     // The host is chosen last, so everything that can be reported to a terminal
     // already has been. `--daemon` is what a SUPERVISOR THAT WANTS BACKGROUNDING
@@ -2004,31 +2077,6 @@ int main(int argc, char** argv)
     }
     if (!host)
         host = std::make_unique<ForegroundHost>();
-
-    // Built only when there IS a file, and holding the SAME argv the startup parse
-    // used -- so a reload reproduces the startup order exactly: a fresh configuration,
-    // the file applied through the appliers argv reaches, then the command line second.
-    // "The command line wins" therefore stays a question of which loop ran last, never
-    // a per-field merge with per-field presence bits.
-    std::optional<NodeReloader> reloader;
-    if (!lookup.path.empty())
-        reloader.emplace(
-            cfg,
-            lookup.path,
-            [argvSpan](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
-                // A FRESH configuration, never the live one. A file that fails halfway
-                // is then discarded whole rather than leaving the running worker
-                // holding part of a document nobody wrote.
-                NodeConfig candidate;
-                auto const loaded =
-                    ReadYamlSettings(path).and_then([&candidate, &path, argvSpan](std::vector<YamlSetting> const& settings) {
-                        return ApplyNodeConfiguration(settings, path, argvSpan.subspan(1), candidate);
-                    });
-                if (!loaded.has_value())
-                    return std::unexpected(loaded.error());
-                return candidate;
-            },
-            &ValidateNodeReloadable);
 
     auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
     return host->Run([&cfg, &logger, reloaderPtr] { return WorkerBody(cfg, logger, reloaderPtr); });
