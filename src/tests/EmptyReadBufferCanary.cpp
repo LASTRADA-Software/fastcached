@@ -49,6 +49,7 @@
 #include <iostream>
 #include <print>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace

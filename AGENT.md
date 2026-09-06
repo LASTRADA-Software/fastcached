@@ -757,9 +757,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `Read`'s first statement by all six transports; a PROGRAMMER ERROR, so an assert and
   not an error code, since no result would be true. `RecvExactly` had already found it
   and answered it at ONE consumer, which is a contract no other consumer can see. The
-  census came FIRST and is what made the assert safe (3315 of 3315 with it live);
-  release still answers EOF, and that is a stated trade rather than an omission.
-  `empty-read-buffer-canary` hands a REAL transport an empty span and must die.
+  census came FIRST and is what made the assert safe (the whole suite green with it
+  live); release still answers EOF, and that is a stated trade rather than an
+  omission. `empty-read-buffer-canary` hands a REAL transport an empty span and must
+  die — but a canary aborts at the FIRST violation, so it watches one site and is
+  silent about five (deleting the call from `EpollSocket::Read` leaves it and the
+  whole suite GREEN, measured). `read-buffer-guard` DERIVES the set and requires the
+  call before the body's first `return`; `ClaimReadSlot` needs no such scan because
+  it IS the claim, and that difference is the whole reason this one does.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;

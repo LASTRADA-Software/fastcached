@@ -1323,8 +1323,11 @@ Every rule below has already been a bug.
     ticket's own acceptance put it first for that reason: an assert converts a
     silent wrong answer into a crashing suite, so *does anything read a zero-length
     span today* decides everything after it. Measured empirically rather than by
-    grep -- guard in place, whole suite -- **3315 of 3315 passing on
-    `clang-debug`**, so no production path and no fixture passes an empty span.
+    grep -- guard in place, whole suite, **3315 of 3315 passing on `clang-debug`
+    before this change registered its own tests** -- so no production path and no
+    fixture passes an empty span. The count travels with what it counted, because a
+    suite total is comparable only against the same tree, the same platform AND the
+    same target set, and this very figure was read back stale by one within the hour.
   - **Debug-only, and the release residual is a DECISION.** With assertions
     compiled out an empty read still answers EOF. Refusing it there costs a new
     enumerator in `Net`'s taxonomy plus a behaviour change on every shipped
@@ -1339,6 +1342,27 @@ Every rule below has already been a bug.
     be refused, no client thread to fail to arrive, and the same verdict on every
     platform. Shown red by removing the guard, where it reports `it answered 0 with
     7 bytes still pending` -- the defect observed, not merely a failure.
+  - **And a canary watching one site is not coverage of six**, which is the trap
+    this guard sets that `ClaimReadSlot` does not. That one IS the claim -- an arm
+    site cannot omit it without omitting the operation -- while `RequireReadBuffer`
+    is a line a transport may simply not have. Measured, twice and independently:
+    with the call deleted from `EpollSocket::Read`, the transport every Linux
+    deployment reads through, **the canary PASSES and the whole suite is green**.
+    That is #492's shape one level down: exact about the site it knows, silent about
+    the five it does not. `read-buffer-guard` closes it, and three things about it
+    are load-bearing. It **derives** the set (`Net/*.cpp`, every definition of the
+    signature) rather than tabulating six paths, so a seventh transport is caught by
+    construction rather than by somebody adding a row. It requires the call to stand
+    **before the body's first `return`**, because all six open with
+    `if (_closed) return ...` and a guard that drifts below that arm is skipped while
+    a presence-only scan reads green. And it reads whole files with `file(READ)` and
+    walks them with `FIND`/`SUBSTRING` rather than splitting a list, because C++ is
+    full of `[[nodiscard]]` and a bracket merges two elements silently (#518) --
+    `check-tsan-scope`'s answer, for the same reason its remedy could not be the
+    usual one. It runs on every platform because it reads TEXT, so a Linux run covers
+    the Windows and macOS transports; `read-buffer-guard-selftest` drives six
+    synthesised trees, including both emptiness refusals, which are different
+    questions and neither implies the other.
 
 - **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
   grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
