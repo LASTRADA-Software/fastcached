@@ -294,6 +294,36 @@ namespace
 
     // --- Region grammar --------------------------------------------------------
 
+    /// Where a `/showIncludes` note's marker ENDS on one line, or npos when the
+    /// line is not a note.
+    ///
+    /// The single recognition rule, because three things ask the question and they
+    /// must give one answer: `SplitLine`, which finds the path span to rewrite;
+    /// `RewriteIncludeNoteMarker`, which re-spells the prefix in front of it; and,
+    /// one layer up, the launcher's `IncludeNotePath`. A line one of them calls a
+    /// note and another does not is a stored region carrying a canonical token
+    /// under a prefix nobody can find, or the reverse.
+    ///
+    /// Anchored at the start of the line, and nothing may precede it but blanks.
+    /// That is load-bearing on the launcher's side of the same rule: the splitter
+    /// there runs over a stream that also carries preprocessed SOURCE, so a rule
+    /// matching the marker anywhere in a line would delete an ordinary line that
+    /// merely contains the text from the bytes the cache key is hashed over. Here
+    /// it is milder and still real — both regions the launcher stores are tagged
+    /// `ShowIncludes` and one of them is the diagnostic stream.
+    ///
+    /// @param body   One line, already stripped of its terminators.
+    /// @param marker The prefix a note begins with.
+    /// @return The offset just past `marker`, or npos when `body` is not a note.
+    [[nodiscard]] std::size_t IncludeNoteMarkerEnd(std::string_view body, std::string_view marker) noexcept
+    {
+        // An empty marker would otherwise match at the head of every line, which
+        // turns "this build does not know its own prefix" into "rewrite everything".
+        if (marker.empty() || !body.starts_with(marker))
+            return std::string_view::npos;
+        return marker.size();
+    }
+
     /// Split a line into (leading text kept verbatim, path span, trailing text kept
     /// verbatim) for the given grammar. Returns false when the line does not match
     /// the grammar's shape (then the whole line is preserved).
@@ -315,10 +345,13 @@ namespace
         switch (grammar)
         {
             case Grammar::ShowIncludes: {
-                constexpr std::string_view prefix = "Note: including file:";
-                if (!body.starts_with(prefix))
+                // `IncludeNoteMarker` rather than a literal of this file's own. A
+                // stored region carries the canonical marker BY CONTRACT -- the
+                // producer normalizes to it -- so the grammar and that contract are
+                // one constant, not two that happen to read alike.
+                std::size_t start = IncludeNoteMarkerEnd(body, IncludeNoteMarker);
+                if (start == std::string_view::npos)
                     return false;
-                std::size_t start = prefix.size();
                 while (start < body.size() && body[start] == ' ')
                     ++start;
                 if (start >= body.size())
@@ -606,6 +639,45 @@ std::string LocalizeRegion(std::string_view text, Grammar grammar, Layout const&
     if (grammar == Grammar::GccDepfile)
         return RewriteDepfile(text, xform);
     return RewriteRegion(text, grammar, xform);
+}
+
+std::string RewriteIncludeNoteMarker(std::string_view text, std::string_view from, std::string_view to)
+{
+    // Equal markers is the common case -- an English toolchain storing and an
+    // English toolchain replaying -- and it must be byte-exact rather than merely
+    // equivalent, so it returns the input instead of rebuilding it line by line.
+    if (from.empty() || from == to)
+        return std::string { text };
+
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t offset = 0; offset < text.size();)
+    {
+        auto const newline = text.find('\n', offset);
+        auto const past = newline == std::string_view::npos ? text.size() : newline + 1;
+        auto const line = text.substr(offset, past - offset);
+        offset = past;
+
+        // Matched against the body, emitted around the whole line: the terminators
+        // are part of what survives byte-for-byte, and a region legitimately ends
+        // without one.
+        auto body = line;
+        if (!body.empty() && body.back() == '\n')
+            body.remove_suffix(1);
+        if (!body.empty() && body.back() == '\r')
+            body.remove_suffix(1);
+
+        auto const markerEnd = IncludeNoteMarkerEnd(body, from);
+        if (markerEnd == std::string_view::npos)
+        {
+            out.append(line);
+            continue;
+        }
+        out.append(line.substr(0, markerEnd - from.size())); // whatever preceded the marker
+        out.append(to);
+        out.append(line.substr(markerEnd)); // the path, its blanks and the terminators
+    }
+    return out;
 }
 
 } // namespace FastCache::PathCanon

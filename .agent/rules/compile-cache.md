@@ -1752,6 +1752,51 @@ were open to breaking it, and neither needed anybody's install to be stale.
     the corpus yields one digest on Windows, Linux and macOS. A change that broke
     that would make a Windows server and a POSIX one disagree about a value they both
     hold — the same defect with no version skew anywhere near it.
+- **A THIRD route, and it needed no disagreement at all: the grammar found no span
+  to rewrite.** The two above are servers disagreeing about text they both recognise.
+  `Grammar::ShowIncludes` recognised a note only when the line began, at column zero,
+  with the literal English `Note: including file:` — so on a localized `cl`, and on any
+  note `cl` indented by inclusion depth, the region held nothing the canonicalizer
+  could see and was stored with the producing checkout's absolute paths in it. Every
+  server agreed perfectly, about nothing, and a replayed region becomes the object's
+  dependency record, so it never invalidates. Generation 3 closes both
+  ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879),
+  [#891](https://github.com/LASTRADA-Software/fastcached/issues/891)).
+  - **The MARKER is a canonical form, exactly as `<SRCROOT>` is.** The launcher
+    normalizes its own prefix to `PathCanon::IncludeNoteMarker` before a value is
+    stored and restores this build's prefix after a hit is localized, so the stored
+    bytes are locale-free and no server ever meets a prefix it does not know.
+    Labelling the region with the producer's prefix instead was the obvious
+    alternative and is worse: it puts a second variable into the one place two
+    machines must agree byte-for-byte, and it buys nothing, because a consumer has to
+    re-render into its OWN `msvc_deps_prefix` regardless.
+  - **The rewriting is the LAUNCHER's, and that is forced rather than chosen.** Only
+    the producing machine knows what language its own notes are in; a server
+    canonicalizing a STORE cannot recover it from the bytes, and an environment
+    variable on the CONSUMER answers a different question. So "every server
+    canonicalizes identically" keeps holding *by construction* — which is why closing
+    a fleet-wide value defect changed neither server and touched no 0xFC field.
+  - **Both marker rewrites are inside the conformance digest**, each with its own
+    effect column (`storeMarkerEffect`, `replayMarkerEffect`). They are separate calls
+    in separate places — the store side before a value leaves the launcher, the replay
+    side *after* the stale-hit guard, which reads the canonical marker through
+    `ParseIncludePaths` and would silently find nothing to check if the restore ran
+    first — so a fix to one says nothing about the other, and one shared column could
+    never fail for a value produced in German and replayed in English.
+  - **What it does not close**: a localized toolchain that has named no prefix. An
+    unmatched marker rewrites nothing, so such a machine is where it was rather than
+    worse, and [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) is
+    the remaining door. It needs **no further generation** — the stored form is
+    already locale-free, so #878 only supplies a better value to normalize with.
+  - **The anchor is the load-bearing half of the recognition rule**, and it is what
+    made the indentation defect a fix rather than a loosening. Both regions a launcher
+    stores are tagged `ShowIncludes` and one of them is the DIAGNOSTIC stream, so a
+    marker matched anywhere in a line rewrites a path a compiler merely quoted — and
+    one layer up, where `SplitIncludeNotes` runs over text that is also preprocessed
+    SOURCE, it deletes an ordinary line from the bytes the key is hashed over. Leading
+    blanks only, nothing else, through one `IncludeNoteMarkerEnd` that all three
+    readers share.
+
 - **The reader could not tell a foreign value from a damaged one.**
   `CanonicalStoredValue` returned `std::optional`, and its `nullopt` meant both "these
   bytes are not a stored value" and "this IS one, of a generation I do not
@@ -2012,12 +2057,6 @@ with current truth at the moment the staleness would otherwise have done harm.
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
   DIAGNOSTIC can also end in a known dependency path.
-- **[#879](https://github.com/LASTRADA-Software/fastcached/issues/879)** — a stored
-  value produced on a localized toolchain keeps the producing checkout's absolute paths
-  in its `/showIncludes` region, because `Grammar::ShowIncludes` matches the English
-  marker. Not fixable the way #700 was: a run-time prefix makes two nodes canonicalize
-  one value differently under one `CompileValueVersion`, so it is a generation bump plus
-  a corpus row, fleet-wide.
 - **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
   target-triple probe costs a driver spawn per translation unit on clang and
   clang-cl, hits included, because its answer is a cache key input. Memoizing it

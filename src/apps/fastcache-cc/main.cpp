@@ -1495,11 +1495,17 @@ struct MaterializedHit
 /// @param layout           This machine's roots.
 /// @param workingDirectory The directory this compile runs in, for resolving the
 ///                         relative dependency paths the value replays.
+/// @param showIncludesMarker The prefix THIS build's `/showIncludes` notes must
+///                         carry, i.e. its `msvc_deps_prefix`. A stored region
+///                         carries the canonical `Cc::IncludeNoteMarker`, so the
+///                         replay re-spells it; passing the canonical marker is a
+///                         byte-exact no-op and is what an English build does.
 /// @return What happened, plus the localized streams for the manifest backfill.
 [[nodiscard]] MaterializedHit MaterializeHit(Cc::ParsedCommand const& cmd,
                                              CompileValue const& decoded,
                                              PathCanon::Layout const& layout,
-                                             std::filesystem::path const& workingDirectory)
+                                             std::filesystem::path const& workingDirectory,
+                                             std::string_view showIncludesMarker)
 {
     // Localize everything the value carries. Region 2 is the depfile and is a
     // file, not a stream; regions beyond ReplayRegionCount must never be replayed,
@@ -1542,9 +1548,21 @@ struct MaterializedHit
     // Local to this function now, because replaying them is the whole of what they
     // are for -- `MaterializedHit` records what used to read them afterwards and why
     // it no longer does.
+    //
+    // The marker is restored HERE, and being the last step is the whole of it. A
+    // stored region carries the canonical `IncludeNoteMarker`; what the build system
+    // matches is `msvc_deps_prefix`, which is this machine's. Between the two sits
+    // `MissingReplayedDependency` above, whose extractor is `ParseIncludePaths` and
+    // reads the canonical marker -- restore before that and the stale-hit guard
+    // silently finds no dependencies to check, which is a guard that passes because
+    // it stopped looking.
+    //
+    // This is also the half of #879 that closes #700's peer edge: two machines in
+    // different UI languages now exchange values whose notes each of them can match,
+    // because neither ever sees the other's prefix.
     std::array<std::string, ReplayRegionCount> replayed;
     for (std::size_t idx = 0; idx < localized.size() && idx < replayed.size(); ++idx)
-        replayed[idx] = localized[idx].bytes;
+        replayed[idx] = PathCanon::RewriteIncludeNoteMarker(localized[idx].bytes, Cc::IncludeNoteMarker, showIncludesMarker);
     ReplayStreams(replayed[0], replayed[1]);
     return NotMaterialized(HitDisposition::Served);
 }
@@ -1583,7 +1601,8 @@ struct MaterializedHit
     // check and, if it also finds the value stale, recompiles and re-stores it.
     // Direct mode only ever declines to shortcut; repairing the entry is not its
     // job, and doing it here would duplicate the miss path.
-    if (MaterializeHit(cmd, *decoded, layout, workingDirectory).disposition != HitDisposition::Served)
+    if (MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker).disposition
+        != HitDisposition::Served)
         return std::nullopt;
 
     invocation.valueBytes = decoded->objectBlob.size();
@@ -2507,7 +2526,7 @@ void RecordManifest(Config const& cfg,
             // Reproducing the depfile is not optional: skipping it silently breaks
             // incremental builds, because Ninja/Make would see no header
             // dependencies for this TU and stop rebuilding it when they change.
-            auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory);
+            auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
             if (materialized.disposition == HitDisposition::Unusable)
                 return Warn("could not write object on hit");
             if (materialized.disposition == HitDisposition::Served)
@@ -2630,8 +2649,26 @@ void RecordManifest(Config const& cfg,
     // absolute paths in it. Reconciling here is what puts the two in one spelling;
     // sending the resolved roots instead would be the other way to do it, and it
     // is the way that breaks the replayed depfile (see RootReconciler).
-    auto const includeTextOut = reconciler.Region(run->out, IncludeGrammar());
-    auto const includeTextErr = reconciler.Region(run->err, IncludeGrammar());
+    //
+    // The MARKER is normalized before either of those, and it has to be first: the
+    // grammar finds a note by its prefix, so a region still carrying a localized one
+    // has no path spans as far as the reconciler or the daemon is concerned, and the
+    // value is stored with this machine's absolute paths in it -- #229 reached
+    // through a language pack rather than through a missing canonicalizer (#879).
+    // Normalizing here rather than on a server is forced: only this machine knows
+    // what language its own notes are in.
+    //
+    // `cfg.showIncludesMarker` is what this build believes its notes carry. On a
+    // dispatched compile that is a FACT -- the notes were synthesised with it a few
+    // hundred lines up -- and on a local one it is the operator's answer, or the
+    // English default when nobody said otherwise. The unset localized case is
+    // therefore still not canonicalized, and cannot be until the prefix is
+    // discovered from the compiler (#878); it is unchanged rather than worsened,
+    // because an unmatched marker rewrites nothing.
+    auto const storedOut = PathCanon::RewriteIncludeNoteMarker(run->out, cfg.showIncludesMarker, Cc::IncludeNoteMarker);
+    auto const storedErr = PathCanon::RewriteIncludeNoteMarker(run->err, cfg.showIncludesMarker, Cc::IncludeNoteMarker);
+    auto const includeTextOut = reconciler.Region(storedOut, IncludeGrammar());
+    auto const includeTextErr = reconciler.Region(storedErr, IncludeGrammar());
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextOut });
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextErr });
 

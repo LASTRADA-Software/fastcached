@@ -337,33 +337,40 @@ one line that answers *why did my build stop rebuilding this file*. Learning the
 prefix from the compiler instead is
 [#878](https://github.com/LASTRADA-Software/fastcached/issues/878).
 
-**Setting this on a machine that shares a cache with differently localized peers can
-make *those peers* under-rebuild.** The synthesised notes are stored with the object
-and replayed verbatim on a later hit, and the cache key does **not** fold the prefix —
-a German and an English Visual Studio of the same toolset key identically, deliberately,
-since the identity probe is forced to English
-([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). So a German
-machine that sets this variable fixes its own builds *and* begins storing values whose
-notes an English peer replays and cannot match. That peer was previously fine: before
-this setting existed every stored value carried the English marker, so English machines
-always matched and only localized ones were broken. This is new breakage on a machine
-that had none, not a relocation of the old breakage.
+**Sharing a cache across UI languages is safe from generation 3 onward**, and this
+paragraph records what it took, because the hazard was real and an operator running a
+mixed fleet on an older build still has it.
 
-What makes it safe to ship is that **it is opt-in**. The prefix defaults to the English
-`Note: including file:`, so no existing fleet changes behaviour until somebody sets the
-variable — and the person who sets it is exactly the person this paragraph is for. If
-your cache is shared across UI languages, weigh that before exporting it; a
-locale-homogeneous fleet, which is the usual case, is unaffected. The real fix is a key
-or value-format change, tracked on
-[#879](https://github.com/LASTRADA-Software/fastcached/issues/879).
+A note's prefix is now a *canonical form*, exactly as `<SRCROOT>` is a canonical form
+for a checkout root. The launcher rewrites its own prefix to the English
+`Note: including file:` before a value is stored, and rewrites it back to this build's
+prefix when a hit is replayed — so what crosses the wire is locale-free, and neither
+machine ever sees the other's prefix. That is why nothing on either server changed:
+they only ever canonicalize the one spelling. It is the launcher that does both
+rewrites, and it has to be, since only the producing machine knows what language its
+own notes are in.
 
-Two things this does **not** cover, deliberately. A *local* compile is unaffected: it
-emits the real compiler's own notes, which match by construction. And a stored value's
-`/showIncludes` region is still canonicalized against the English marker, so on a
-localized machine that region keeps the producing checkout's absolute paths — that
-half is a `CompileValueVersion` change affecting every server on the wire, and is
-[#879](https://github.com/LASTRADA-Software/fastcached/issues/879) rather than
-something folded in here.
+Before that, a German machine setting this variable fixed its own builds *and* began
+storing values whose notes an English peer replayed and could not match — new breakage
+on a machine that had none, since the cache key does **not** fold the prefix (a German
+and an English Visual Studio of the same toolset key identically, deliberately, because
+the identity probe is forced to English,
+[#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). Closing it moved
+`CompileValueVersion` to 3
+([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)), so a value written
+by a generation-2 build is refused rather than replayed. **Expect one cold cache on the
+upgrade**; that is the cost of retiring values whose regions were never canonicalized.
+
+What this still does **not** cover. A *local* compile on a localized toolchain that has
+**not** set this variable stores a region the launcher cannot normalize, because nothing
+has told it what prefix that compiler uses — an unmatched marker rewrites nothing, so
+such a machine is exactly where it was rather than worse. Discovering the prefix from
+the compiler is
+[#878](https://github.com/LASTRADA-Software/fastcached/issues/878), and it needs no
+further generation: the stored form is already locale-free, so #878 only supplies a
+better value to normalize with. Setting this variable is therefore the way to get a
+localized machine's regions canonicalized today, in addition to fixing its dispatched
+notes.
 
 ## How it works
 

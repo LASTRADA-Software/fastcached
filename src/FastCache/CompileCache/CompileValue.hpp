@@ -60,7 +60,34 @@ namespace FastCache
 /// becomes unreachable rather than servable under rules it was not written by. The
 /// consumer half is what genuinely needs this byte, since there the key is unchanged
 /// and only the localization moved.
-inline constexpr std::uint8_t CompileValueVersion = 2;
+///
+/// **Generation 3 retired generation 2 at
+/// [#879](https://github.com/LASTRADA-Software/fastcached/issues/879) and
+/// [#891](https://github.com/LASTRADA-Software/fastcached/issues/891), which are two
+/// ways for one grammar to find no path spans at all.** `Grammar::ShowIncludes`
+/// recognised a note only when the line began, at column zero, with the literal
+/// English `Note: including file:`. A localized `cl` prints a translated prefix
+/// (#879) and `cl` indents a note by inclusion depth whatever its language (#891), so
+/// in both cases the region was stored with the producing checkout's absolute paths
+/// in it — [#229](https://github.com/LASTRADA-Software/fastcached/issues/229) reached
+/// through the grammar rather than through a missing canonicalizer, and a replayed
+/// region becomes the object's dependency record, so those never invalidate.
+///
+/// Two things move with the byte. The marker becomes a CANONICAL FORM — see
+/// `PathCanon::IncludeNoteMarker`, and note that the producer normalizes to it, since
+/// only the producing machine knows what language its own notes are in — and the
+/// grammar skips leading blanks before matching. Both change what a value's bytes look
+/// like without changing the key, which is precisely the half the previous paragraph
+/// says needs this byte: a generation-2 value from either machine is unusable and is
+/// now refused rather than localized under rules it was not written by.
+///
+/// What it does NOT close: a localized toolchain whose prefix nothing has told this
+/// build about still stores an unnormalized region, because an unmatched marker
+/// rewrites nothing. Discovering that prefix from the compiler is
+/// [#878](https://github.com/LASTRADA-Software/fastcached/issues/878), and it needs no
+/// further generation — the stored form is already locale-free, so #878 only supplies
+/// a better value to normalize with.
+inline constexpr std::uint8_t CompileValueVersion = 3;
 
 /// The highest leading byte that will ever name a compile-value generation.
 ///

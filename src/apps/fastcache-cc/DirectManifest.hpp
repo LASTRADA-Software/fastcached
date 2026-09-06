@@ -326,14 +326,24 @@ enum class PathClass : std::uint8_t
 /// @return The hash as hex, or empty on any read failure.
 [[nodiscard]] std::string HashFileContents(std::string_view absolutePath);
 
-/// The text `cl` and `clang-cl` prefix every `/showIncludes` note with.
+/// The text `cl` and `clang-cl` prefix every `/showIncludes` note with, and the
+/// marker a note carries inside a STORED value whatever the producer's language.
 ///
-/// Spelled once because two readers need it and they must agree exactly:
-/// ParseIncludePaths, which collects the paths, and DependencyProbe's
+/// Spelled once because several readers need it and they must agree exactly:
+/// ParseIncludePaths, which collects the paths; DependencyProbe's
 /// SplitIncludeNotes, which removes those same lines from a stream that is also
-/// carrying preprocessed text. A note the splitter failed to recognise would be
-/// hashed into the cache key as if it were source.
-inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
+/// carrying preprocessed text (a note the splitter failed to recognise would be
+/// hashed into the cache key as if it were source); and the region grammar in
+/// `PathCanon`, which finds the path span to canonicalize.
+///
+/// An alias rather than a second definition, because that last reader is in the
+/// LIBRARY and this one is in the launcher, and the constant is a property of the
+/// stored-value contract rather than of either binary. `PathCanon::SplitLine`
+/// carried its own copy of the same literal until
+/// [#879](https://github.com/LASTRADA-Software/fastcached/issues/879) -- three
+/// spellings of one wire constant with nothing making them agree. See
+/// `PathCanon::IncludeNoteMarker` for why the stored form is normalized to it.
+inline constexpr std::string_view IncludeNoteMarker = PathCanon::IncludeNoteMarker;
 
 /// The path one line names, when that line is a `/showIncludes` note.
 ///
