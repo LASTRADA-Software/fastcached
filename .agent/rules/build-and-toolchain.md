@@ -636,6 +636,21 @@ determinism rests on.
   fail to fire found it. **A signal that cannot be false in the failing case is not
   evidence**, and a check is not evidence that it fires until it has been seen to.
 
+- **A green CI run under an active compiler cache proves the objects LINK, not that
+  the sources compile** — CI runs cached on every leg, and no leg builds cache-off.
+  So a `-Werror` defect in a translation unit whose object is replayed passes every
+  required context. That window is real and nothing closes it today.
+  **But it was not the mechanism the one time it was blamed, and the correction is
+  the more useful half.** A dead function template lived on master through full CI
+  (#539, #540) and the cache was the obvious suspect. Measured instead: the project
+  enabled `-Wunused-template` NOWHERE — neither `-Wall` nor `-Wextra` implies it —
+  so an UNCACHED build of that commit would have failed nothing either, and
+  clang-tidy did not catch it under this tree's `.clang-tidy`. Verified against the
+  exact `-W` set the compile database records, with a control: the same flags reject
+  an unused *variable*, so the set was live and `-Werror` was on. The flag is now
+  added and the whole tree builds clean under it. **Reach for the cache last**: it is
+  the explanation that needs no evidence, which is exactly why it wants some.
+
 - **A reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
   `local-gate.sh` invoked `cmake --preset` without it, and `USE_COMPILER_CACHE` defaults to ON,
   so both its configurations were fronted by whichever launcher happened to be installed, at

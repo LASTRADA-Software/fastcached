@@ -49,6 +49,13 @@ if(${PEDANTIC_COMPILER})
         try_add_compile_options(-Wduplicated-cond)
         try_add_compile_options(-Wextra)
         try_add_compile_options(-Wextra-semi)
+        # Neither `-Wall` nor `-Wextra` implies this one, so a dead function
+        # template compiled clean under every leg -- which is how one lived on
+        # master through full CI and surfaced only when somebody's build happened
+        # to be configured differently (#540). The cache was blamed and measured
+        # innocent: with the warning enabled nowhere, an UNCACHED build of that
+        # commit would have failed nothing either.
+        try_add_compile_options(-Wunused-template)
         try_add_compile_options(-Wfinal-dtor-non-final-class)
         try_add_compile_options(-Wimplicit-fallthrough)
         try_add_compile_options(-Wlogical-op)
