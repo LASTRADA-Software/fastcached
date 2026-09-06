@@ -4095,11 +4095,6 @@ Three rules fall out, each generalising past this change:
   deliberate, because the module is included before `project()` where `find_package` has
   no toolchain — or the check fails a correct file. Roughly 3x the diff it protects, so it
   is recorded rather than urgent.
-- **[#260](https://github.com/LASTRADA-Software/fastcached/issues/260)** — the one
-  entry in `.tsan-suppressions`: `AdminEndpoint` closes its listener from the main
-  thread while its own accept thread is still inside `Accept()`. Removing the entry
-  is part of closing the issue — with it gone the gate goes red on the real report,
-  which is what makes it a suppression rather than a hole.
 - **[#311](https://github.com/LASTRADA-Software/fastcached/issues/311)** — nothing in
   CI catches an uninitialised read, and no sanitizer that runs today can: ASan does
   not, UBSan does not, and neither does ThreadSanitizer. That is MemorySanitizer,
@@ -4107,13 +4102,16 @@ Three rules fall out, each generalising past this change:
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
 - **[#316](https://github.com/LASTRADA-Software/fastcached/issues/316)** — the TSan
-  gate **suppresses a known race in a module it does not scan.** Its scope is
-  three directories (`Async`, `Consensus`, `Distributed`), and the one entry in
-  `.tsan-suppressions` is `race_top:FastCache::BlockingListener::Close` — a `Net/`
-  class. The report only reaches the gate at all because the node binary happens
-  to be run whole; a regression of that race reached through a `Net/` unit test
-  would leave the job green while it carries a suppression naming the very thing
-  that broke. That is the gate's own failure mode, inside the gate. `Net/` and
+  gate **does not scan the module the race it knew about actually lived in.** Its
+  scope is three directories (`Async`, `Consensus`, `Distributed`), and the race
+  was in `BlockingListener::Close` — a `Net/` class. It reached the gate at all
+  only because the node binary happens to be run whole.
+  **`.tsan-suppressions` no longer carries it**, and no longer carries anything:
+  #260 fixed the race and deleting its entry was part of closing it, so the
+  original wording here — that the gate carries a suppression naming the very
+  thing that could break — has gone false. The SCOPE argument has not: a
+  regression reached through a `Net/` unit test in `FastCacheTest` is still
+  selected by no tag this gate uses. `Net/` and
   `Cache/` also spawn threads in `ThreadedAddressResolver_test.cpp`,
   `HealthProbe_test.cpp`, `EpollSocket_test.cpp`, `ShardedStorage_test.cpp`
   (`[sharded][concurrency][stress]`, the tree's one explicit concurrency stress
