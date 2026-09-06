@@ -4,6 +4,7 @@
 #if defined(__APPLE__)
 
     #include <FastCache/Async/KqueueReactor.hpp>
+    #include <FastCache/Async/ReactorTeardown.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
@@ -358,8 +359,36 @@ KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd, std::string peerAddre
     std::ignore = reactor.Attach(&_impl->handler);
 }
 
+// The teardown rule, asked of the reactor that owns this object.
+//
+// `IReactor::TeardownIsSerialisedWithDispatch()`: destroyed on that reactor's
+// worker thread, or with the reactor stopped, because clearing a pending
+// awaitable anywhere else races the completion dispatch
+// ([#668](https://github.com/LASTRADA-Software/fastcached/issues/668)).
+//
+// **Asserted here, and not only on IOCP, because the DEFECT is portable and only
+// the PREDICATE was Windows-only.** Until #668 the two facts behind the rule
+// existed on `IocpReactor` and nowhere else, so the same ordering violation in the
+// same calling code was unobservable on three of four reactors -- which is why the
+// class had exactly ONE observer in the whole CI matrix, on a leg that does not
+// gate, and why re-running cleared it
+// ([#737](https://github.com/LASTRADA-Software/fastcached/issues/737)).
+//
+// The consequence differs and the rule does not: `Close()` here completes a parked
+// awaitable by resuming its coroutine INLINE, so an off-reactor teardown runs that
+// coroutine -- and frees what it owns -- on the destroying thread while the reactor
+// is still dispatching. That is cheaper than IOCP's torn read, not absent.
+//
+// It could not be added until the two owners that broke it were fixed:
+// `~FrameEndpoint` ([#840](https://github.com/LASTRADA-Software/fastcached/issues/840))
+// and `RaftPeerServer::Shutdown`
+// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). Measured on
+// Linux before those: `cluster-e2e` was the only failure in the whole suite with
+// this live.
 KqueueSocket::~KqueueSocket()
 {
+    if (_impl)
+        Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
     KqueueSocket::Close();
 }
 
@@ -652,6 +681,10 @@ KqueueListener::~KqueueListener()
     // a connection arriving after the listener went away resumed through a
     // dangling handler. `Close()` is idempotent, so an explicit close first --
     // which is what every current owner does -- costs nothing here.
+    // See `~KqueueSocket` for the rule and why it is asked here as well as on IOCP.
+    if (_impl)
+        Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
+
     KqueueListener::Close();
 }
 

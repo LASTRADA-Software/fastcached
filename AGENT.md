@@ -741,7 +741,13 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   pending awaitable anywhere else races the completion dispatch. #668 landed the
   predicate, the shared assertion and a must-die canary and **wrote the rule down
   nowhere**, so it fired for nobody who had not already opened `IocpSocket.cpp` —
-  #737 and #840 are what that cost, and #885 is a second owner breaking it today.
+  #737, #840 and #875 are what that cost. It is now asked of EVERY reactor -- the
+  epoll and kqueue destructors call it too -- which needed both owners fixed first
+  (#840, and `RaftPeerServer::Shutdown` in #885, which closed its sockets on the
+  calling thread where `Close()` resumes a parked coroutine INLINE). **Match the
+  ASSERTION, never the case that happened to be running**: one site produced three
+  tickets in three test files, and #875's triage read "every teardown CASE passed"
+  as "the assertion did not fire" while its text sat in the log.
   The defect is PORTABLE and only the predicate was Windows-only. A drain that waits for the loops does not mean
   the reactor stopped — the last loop decrements before `NoteLoopFinished()`, and
   `Stop()` only posts a wakeup — which is the gap `~FrameEndpoint` freed its listener
