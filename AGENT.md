@@ -761,10 +761,15 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   live); release still answers EOF, and that is a stated trade rather than an
   omission. `empty-read-buffer-canary` hands a REAL transport an empty span and must
   die — but a canary aborts at the FIRST violation, so it watches one site and is
-  silent about five (deleting the call from `EpollSocket::Read` leaves it and the
-  whole suite GREEN, measured). `read-buffer-guard` DERIVES the set and requires the
-  call before the body's first `return`; `ClaimReadSlot` needs no such scan because
-  it IS the claim, and that difference is the whole reason this one does.
+  silent about five, and WHICH site is an accident of ordering (deleting the call from
+  `EpollSocket::Read` leaves it and the whole suite GREEN, measured). `read-buffer-guard`
+  DERIVES the set and requires the call before the body's first `return`.
+- **A guard folded INTO the operation is self-enforcing; a guard called ALONGSIDE one
+  needs a scan.** That is the general rule, and it decides the shape of the next guard
+  rather than only explaining these two: `ClaimReadSlot` takes the slot the arm site
+  must clear anyway, so there is no line to forget it on, while `RequireReadBuffer`
+  reads a parameter and changes nothing, so every site can omit it independently. Ride
+  the guard on something the site must do; where you cannot, the scan is not optional.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;

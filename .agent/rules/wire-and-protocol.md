@@ -1410,10 +1410,21 @@ Every rule below has already been a bug.
     be refused, no client thread to fail to arrive, and the same verdict on every
     platform. Shown red by removing the guard, where it reports `it answered 0 with
     7 bytes still pending` -- the defect observed, not merely a failure.
-  - **And a canary watching one site is not coverage of six**, which is the trap
-    this guard sets that `ClaimReadSlot` does not. That one IS the claim -- an arm
-    site cannot omit it without omitting the operation -- while `RequireReadBuffer`
-    is a line a transport may simply not have. Measured, twice and independently:
+  - **A GUARD FOLDED INTO THE OPERATION IS SELF-ENFORCING; A GUARD CALLED ALONGSIDE
+    ONE NEEDS A SCAN.** This is the general rule the pair of guards in this directory
+    happens to demonstrate, and it decides which shape the NEXT one should take,
+    which is worth more than either guard. `ClaimReadSlot` takes the slot the arm site
+    must clear anyway, so the check and the operation are one expression and there is
+    no line to forget it on -- the same construction as `SigningDomain` leaving no
+    argument to pass a bare label to. `RequireReadBuffer` is purely ADDITIVE: it reads
+    a parameter, changes nothing, and every site can therefore omit it independently.
+    Prefer the folded shape when the guard can ride on something the site must do;
+    when it cannot, the scan is not optional, because the alternative is a rule
+    enforced by everyone having remembered.
+  - **And a canary watching one site is not coverage of six**, which is the trap an
+    additive guard sets and a folded one does not. **A canary aborts at the FIRST
+    violation, so it watches ONE site whatever it picks -- and which site is an
+    accident of ordering.** Measured, twice and independently:
     with the call deleted from `EpollSocket::Read`, the transport every Linux
     deployment reads through, **the canary PASSES and the whole suite is green**.
     That is #492's shape one level down: exact about the site it knows, silent about
