@@ -447,6 +447,17 @@ class BlockingListener final: public IListener
     /// Receive/send timeout applied to accepted sockets (0 = none). Set via
     /// SetTimeouts; the accept-poll timeout is applied directly to _native there.
     std::chrono::milliseconds _ioTimeout { 0 };
+
+    /// How long `Accept()` waits for a connection before reporting a deadline
+    /// expiry, so an accept loop can wake and re-check a shutdown flag. Zero
+    /// means block indefinitely, which is the default and what every caller that
+    /// never calls `SetTimeouts` still gets.
+    ///
+    /// Enforced with a real `poll()` rather than only `SO_RCVTIMEO`: that socket
+    /// option does NOT apply to `accept()` on macOS and the BSDs, so the wake the
+    /// admin accept loop depends on never fired there -- and a teardown that waits
+    /// for the loop to leave hung until the test harness killed it.
+    std::chrono::milliseconds _acceptPoll { 0 };
 };
 
 } // namespace FastCache

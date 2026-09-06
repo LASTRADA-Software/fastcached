@@ -30,6 +30,7 @@
     #include <csignal>
 
     #include <fcntl.h>
+    #include <poll.h> // poll() -- SO_RCVTIMEO does not apply to accept() on the BSDs
     #include <unistd.h>
 
     #include <arpa/inet.h>
@@ -523,6 +524,7 @@ void BlockingSocket::SetReceiveDeadline(std::chrono::milliseconds deadline) noex
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept
 {
     _ioTimeout = ioTimeout;
+    _acceptPoll = acceptPoll;
     // A receive timeout on the listening socket makes ::accept() return
     // periodically (POSIX honours SO_RCVTIMEO for accept), so the accept loop can
     // wake to re-check a shutdown flag: POSIX does NOT unblock a parked accept()
@@ -541,6 +543,34 @@ AcceptAwaitable BlockingListener::Accept()
 
     // sockaddr_storage holds either an IPv4 or IPv6 peer address without
     // truncation, since the listener may be bound to either family.
+    // Wait for readability first when a poll was armed, so the loop can wake and
+    // re-check its shutdown flag.
+    //
+    // `SO_RCVTIMEO` alone is not enough and the comment that said it was covered
+    // only Linux: the option does NOT apply to `accept()` on macOS or the BSDs, so
+    // there the accept blocked forever and a teardown waiting for the loop to
+    // leave hung until something killed it. `poll()` is honoured for a listening
+    // socket everywhere, so the wake no longer depends on which POSIX this is.
+    if (_acceptPoll.count() > 0)
+    {
+#if defined(_WIN32)
+        WSAPOLLFD pfd {};
+        pfd.fd = static_cast<SOCKET>(_native);
+        pfd.events = POLLRDNORM;
+        auto const ready = ::WSAPoll(&pfd, 1, static_cast<INT>(_acceptPoll.count()));
+#else
+        pollfd pfd {};
+        pfd.fd = static_cast<int>(_native);
+        pfd.events = POLLIN;
+        auto const ready = ::poll(&pfd, 1, static_cast<int>(_acceptPoll.count()));
+#endif
+        if (ready == 0)
+            return AcceptAwaitable { std::unexpected(
+                NetError { .code = NetErrorCode::Timeout, .systemCode = 0, .context = "accept poll timed out" }) };
+        if (ready < 0)
+            return AcceptAwaitable { std::unexpected(MakeSystemError("poll")) };
+    }
+
     sockaddr_storage client {};
 #if defined(_WIN32)
     int addrLen = sizeof(client);

@@ -67,6 +67,40 @@ namespace
 
 } // namespace
 
+TEST_CASE("An armed listener's Accept wakes on its own poll, with nobody connecting", "[net][socket][listener]")
+{
+    // #260's portability half. The admin accept loop wakes to re-check a shutdown
+    // flag, and the wake used to be `SO_RCVTIMEO` on the LISTENING socket -- which
+    // Linux honours for `accept()` and macOS and the BSDs do NOT. There the accept
+    // blocked forever, so a teardown that waits for the loop to leave hung until
+    // the harness killed it: three fleet-dashboard e2e cases timed out on macOS and
+    // passed everywhere else.
+    //
+    // This asserts the mechanism rather than a teardown, because a teardown test
+    // passes on Linux under the bug -- the platform that has the bug is the one that
+    // cannot run this suite locally.
+    auto listener = BindEphemeral();
+    if (listener == nullptr)
+        SKIP("this platform would not bind a loopback listener");
+    listener->SetTimeouts(150ms, 1000ms);
+
+    auto const startedAt = std::chrono::steady_clock::now();
+    auto const accepted = SyncRun(AcceptOne(listener.get()));
+    auto const elapsed = std::chrono::steady_clock::now() - startedAt;
+
+    // It must REPORT rather than block, and it must report the state the accept
+    // loop steps over rather than a real failure.
+    REQUIRE_FALSE(accepted.has_value());
+    CHECK(IsDeadlineExpiry(accepted.error().code));
+
+    // Bounded on BOTH sides. Too fast means it did not wait at all -- an accept that
+    // returns instantly would spin the loop -- and too slow means the poll was not
+    // what returned it. Generous on the upper side: a loaded CI runner is slow, and
+    // what is being separated here is 150ms from FOREVER.
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < 10s);
+}
+
 TEST_CASE("A write to a peer that hung up fails instead of killing the process", "[net][socket]")
 {
     // The regression test for the process-wide SIGPIPE disposition this file used
