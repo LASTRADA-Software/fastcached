@@ -639,7 +639,9 @@ each, then exits without opening anything:
 
 ```console
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
-      --node-id n1 --listen-raft 6680 --discovery 255.255.255.255:6681
+      --scheduler 127.0.0.1:6675 --advertise 10.0.0.7:6675 --fleet-open \
+      --node-id n1 --listen-raft 6680 --raft-peer n1=10.0.0.7:6680 \
+      --discovery 255.255.255.255:6681 --cluster-key-file /etc/fastcached/cluster.key
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
@@ -648,6 +650,18 @@ discovery beacon  0.0.0.0:6681  UDP
 notes:
   …
 ```
+
+!!! note "Why the invocation carries more than the surfaces it prints"
+
+    `--print-surfaces` runs the **startup policy rules** before it prints, so the
+    command has to be one the node would actually accept. Five rules apply to the
+    flags above and each refuses a configuration that would start and silently not
+    work: `--serve-scheduler` needs a member set, `--node-id` needs a `--raft-peer`,
+    `--discovery` needs a `--cluster-key-file`, membership needs an `--advertise`
+    peers can dial, and a worker needs a `--scheduler`. An earlier version of this
+    transcript omitted all five and the binary refused it with exit 2 — the printed
+    table was right, the invocation was not
+    ([#807](https://github.com/LASTRADA-Software/fastcached/issues/807)).
 
 The node opens its ports from the same table that prints, so the list and the sockets
 cannot disagree — which is the point of generating a worksheet rather than
