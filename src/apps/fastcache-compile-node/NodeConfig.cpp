@@ -2343,6 +2343,32 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "the CALLER's own machine. This worker would register, heartbeat, be leased out and never be "
                      "reached, with no error at either end. Name --advertise, or drop the membership flags and serve "
                      "this machine alone." },
+
+        // `--advertise` is text CLIENTS DIAL, and nothing parsed it (#208).
+        //
+        // `--install-service --advertise=nope` installed cleanly: the worker registered,
+        // heartbeated, was leased out by the scheduler, and every client failed to reach
+        // it. Silent at BOTH ends -- the same failure the emptiness rule beside this one
+        // was written to prevent, reached by typing something instead of nothing.
+        //
+        // `ParseDialEndpoint` and not a second spelling: this is a "may I dial this?"
+        // question and that function is its one author. Its three refusals are each
+        // exactly the case here -- splitting is not parsing, an empty host names nobody,
+        // and a bare port would send the client back to itself.
+        //
+        // Non-empty only, so it COMPOSES with the two rules that already judge this
+        // flag rather than duplicating either: the emptiness refusal below, and
+        // `main.cpp`'s socket-activation rule making it mandatory there.
+        //
+        // A ROW rather than a check in a tier, for this table's standing reason:
+        // `--install-service` returns long before any tier exists, so a registration
+        // would otherwise bake the typo in and replay it at every boot.
+        { .refuses =
+              [](NodeConfig const& c) { return !c.advertise.empty() && !ParseDialEndpoint(c.advertise).has_value(); },
+          .message = "--advertise is not an address clients can dial: it must be host:port (or [v6]:port), with a "
+                     "host that names a machine and a port in range. A worker whose advertised address does not "
+                     "parse registers, heartbeats, is leased out, and is never reached -- with no error at either "
+                     "end." },
         // The wildcard row's sibling, and it must stay a SEPARATE row. Since the bind
         // merged, `--advertise` falls back to the `Node` surface, which defaults to
         // loopback on a node that does not schedule -- so the shape an operator now

@@ -3916,3 +3916,70 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         CHECK(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
     }
 }
+
+TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[node-config]")
+{
+    // #208. The flag is `host:port clients should reach this worker on`, and nothing
+    // parsed it: `--install-service --advertise=nope` installed cleanly, the worker
+    // registered, heartbeated, was leased out, and every client failed to dial it.
+    // Silent at BOTH ends -- the same failure the emptiness rule prevents, reached by
+    // typing something instead of nothing.
+    //
+    // Judged by `ParseDialEndpoint`, the one author of "may I dial this?", so the
+    // cases below are its three documented refusals rather than a second opinion.
+
+    SECTION("text that is not an endpoint at all")
+    {
+        auto cfg = Installable();
+        cfg.advertise = "nope";
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--advertise"));
+    }
+
+    SECTION("a bare port, which would send the client back to itself")
+    {
+        auto cfg = Installable();
+        cfg.advertise = "6675";
+        CHECK(StartupPolicyRejection(cfg).has_value());
+    }
+
+    // NOT here: `:6675`. `ParseDialEndpoint` refuses it, but the WILDCARD rule owns
+    // that case and says so in better words -- an empty host reaches `getaddrinfo` as
+    // nullptr, which is the wildcard. Asserting it here would pass for the wrong
+    // reason, and this row's own table warns about exactly that: one predicate
+    // widening to cover several passes every case individually and leaves the operator
+    // reading about something they did not write. This row is ordered AFTER the
+    // wildcard row so the specific message wins.
+
+    SECTION("a port out of range")
+    {
+        auto cfg = Installable();
+        cfg.advertise = "worker.example:70000";
+        CHECK(StartupPolicyRejection(cfg).has_value());
+    }
+
+    // The other direction, and it is the half that stops this becoming a refusal
+    // nobody can satisfy: every shape an operator legitimately types still starts.
+    SECTION("well-formed values are accepted")
+    {
+        for (auto const* good: { "worker.example:6675", "10.0.0.4:6675", "[::1]:6675" })
+        {
+            auto cfg = Installable();
+            cfg.advertise = good;
+            INFO("advertise = " << good);
+            CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+        }
+    }
+
+    // Composes rather than duplicates: an EMPTY value is judged by the rule beside
+    // this one, not by this one, so the two cannot disagree about the same flag.
+    SECTION("an empty value is left to the emptiness rule")
+    {
+        auto cfg = Installable();
+        cfg.advertise = {};
+        auto const refusal = StartupPolicyRejection(cfg);
+        if (refusal.has_value())
+            CHECK_FALSE(Unwrap(refusal).contains("clients can dial"));
+    }
+}
