@@ -522,6 +522,79 @@ PreprocessArgv() {
     python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
 import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
+
+
+def SplitWindowsCommand(command):
+    """Split a Windows command line the way the C runtime does.
+
+    `shlex` cannot do this, in either mode. POSIX mode treats a backslash as an
+    ESCAPE, so every path loses its separators; non-POSIX mode with
+    `whitespace_split` does not recognise a quote that BEGINS mid-token, so
+    `-I"C:\\Program Files\\..."` splits at the space and clang-cl reports
+    `no such file or directory` for half of it. Both were observed on this leg --
+    the second while fixing the first, which is why this is a parser and not a
+    third guess at a shlex flag.
+
+    The rules are the documented ones: 2n backslashes before a quote are n
+    backslashes and a quote toggle, 2n+1 are n backslashes and a literal quote,
+    and backslashes not before a quote are literal.
+    """
+    argv, cur, started, quoted, i, n = [], [], False, False, 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            run = 0
+            while i < n and command[i] == "\\":
+                run += 1
+                i += 1
+            if i < n and command[i] == '"':
+                cur.append("\\" * (run // 2))
+                started = True
+                if run % 2:
+                    cur.append('"')
+                else:
+                    quoted = not quoted
+                i += 1
+            else:
+                cur.append("\\" * run)
+                started = True
+            continue
+        if ch == '"':
+            quoted = not quoted
+            started = True
+            i += 1
+            continue
+        if not quoted and ch in " \t":
+            if started:
+                argv.append("".join(cur))
+                cur, started = [], False
+            i += 1
+            continue
+        cur.append(ch)
+        started = True
+        i += 1
+    if started:
+        argv.append("".join(cur))
+    return argv
+
+
+def SplitCommand(entry):
+    """Split a compile-database `command` string into an argv.
+
+    Which rule applies is a property of the DATABASE, not of the host running this
+    script, so it is read off the entry's own `directory`: a drive-letter root
+    means a Windows generator built the command. Sniffing the host would be wrong
+    for a database copied between machines, and sniffing for a leading `/` is the
+    mistake this file's own header warns about one function down.
+    """
+    command = entry.get("command") or ""
+    if not command:
+        return []
+    if re.match(r"^[A-Za-z]:[\\/]", entry.get("directory", "")):
+        return SplitWindowsCommand(command)
+    return shlex.split(command)
+
+
 try:
     entries = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
@@ -530,7 +603,11 @@ target = sys.argv[2].replace("\\", "/")
 for entry in entries:
     path = entry.get("file", "").replace("\\", "/")
     if path == target or path.endswith("/" + target):
-        argv = shlex.split(entry.get("command") or "") or list(entry.get("arguments", []))
+        # `arguments` first: it is already a list, so nothing has to be re-parsed.
+        # CMake's Ninja generator writes `command`, so the split below is the usual
+        # path -- but when a generator does provide `arguments`, splitting a string
+        # we did not have to build is pure risk.
+        argv = list(entry.get("arguments") or []) or SplitCommand(entry)
         driver = re.sub(r"\.exe$", "", (argv[0] if argv else "").replace("\\", "/").rsplit("/", 1)[-1], flags=re.I)
         clStyle = re.match(r"^(.*-)?(clang-)?cl(-[0-9.]+)?$", driver, re.I) is not None
         out, skip = [], False
@@ -549,7 +626,22 @@ for entry in entries:
         # `/E` for a cl driver: it is the only preprocess-to-stdout spelling BOTH
         # `cl` and `clang-cl` are certain to accept, and it keeps the line markers
         # `ProducedCode` attributes by (`/EP` suppresses exactly those).
-        out.append("/E" if clStyle else "-E")
+        #
+        # Placed BEFORE any `--`, not appended. CMake emits `--` ahead of the source
+        # file, and `--` means "everything after this is an INPUT FILE" -- so a flag
+        # appended at the end is read as a filename and clang-cl answers
+        #
+        #     clang-cl: error: no such file or directory: '/E'
+        #
+        # which is a true statement about a file that does not exist and says
+        # nothing about the flag. Six units reported UNKNOWN that way, and the
+        # message sent two rounds of investigation at the driver and at the argv
+        # encoding before the argv itself was printed and the `--` was simply there.
+        flag = "/E" if clStyle else "-E"
+        if "--" in out:
+            out.insert(out.index("--"), flag)
+        else:
+            out.append(flag)
         print(entry.get("directory", "."))
         for a in out:
             print(a)
@@ -647,7 +739,15 @@ UnitContribution() {
         # whose module-map files do not exist yet, a clang-cl database spelling `-c`
         # as `/c` -- otherwise prints "0 of N contributed" with nothing an operator
         # can act on, which is a confident count over nothing.
+        # The ARGV is recorded beside the message. Without it an `unknown` says what
+        # the compiler refused but not what it was handed, and the two are different
+        # questions: `no such file or directory: '/E'` is either a driver that does
+        # not take that spelling or an argv that never reached it in that shape, and
+        # nothing in the reason alone separates them. Costing a CI round to find that
+        # out is what this line replaces.
         UnknownUnit "$2" "$3" "$(head -1 "${preprocessed}.err")"
+        printf '    argv: %s\n' "$(printf '[%s] ' "${argv[@]}")" >> "${3}.unknown"
+        printf '    cwd:  %s\n' "$directory" >> "${3}.unknown"
     fi
     rm -f "$preprocessed" "${preprocessed}.err"
     printf '%s\n' "${verdict:-unknown}"
@@ -710,6 +810,47 @@ SelfTest() {
     }
 
     echo "TIDY SWEEP SELF-TEST"
+
+    # `PreprocessArgv` against a WINDOWS compile database. `shlex.split` defaults to
+    # POSIX rules where a backslash escapes the next character, so every path in a
+    # Windows `command` string came back with its separators eaten -- clang-cl then
+    # answered `no such file or directory` for a file that is plainly there, and the
+    # Windows leg reported on five units it had never opened.
+    #
+    # Both database shapes, because the fix must not change the POSIX one: the split
+    # rule is a property of the DATABASE and is read off its own `directory`.
+    mkdir -p "$scratch/wdb" "$scratch/pdb"
+    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo -I\"C:\\Program Files\\OpenSSL\\include\" /c /FoCMakeFiles\\x.obj D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
+        > "$scratch/wdb/compile_commands.json"
+    printf '%s' '[{"directory":"/home/u/build","command":"/usr/bin/clang++ -c -o CMakeFiles/x.o /home/u/src/N/P.cpp","file":"/home/u/src/N/P.cpp"}]' \
+        > "$scratch/pdb/compile_commands.json"
+
+    # The source path must survive intact, `/c` and `/Fo` must be gone with `/E`
+    # appended, and the QUOTED SPACE in `Program Files` must hold together -- that
+    # last is what broke the first attempt: a shlex lexer with `whitespace_split`
+    # does not recognise a quote that begins mid-token, so the include split at the
+    # space and clang-cl reported half of it missing. A fixture with no space in it
+    # passes under that bug.
+    Expect "a Windows database keeps its path separators and its quoted spaces" \
+           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"-IC:\\Program Files\\OpenSSL\\include"$'\n'"D:\\a\\proj\\src\\N\\W.cpp"$'\n'"/E" \
+           "$(PreprocessArgv "$scratch/wdb" src/N/W.cpp)"
+
+    Expect "a POSIX database is unchanged by the Windows rule" \
+           "/home/u/build"$'\n'"/usr/bin/clang++"$'\n'"/home/u/src/N/P.cpp"$'\n'"-E" \
+           "$(PreprocessArgv "$scratch/pdb" src/N/P.cpp)"
+
+    # CMake emits `--` before the source file, and `--` means "everything after
+    # this is an INPUT FILE". A preprocess flag APPENDED lands after it and is read
+    # as a filename -- clang-cl answers `no such file or directory: '/E'`, which is
+    # a true statement about a file that does not exist and says nothing about the
+    # flag. Six units reported UNKNOWN that way on the Windows leg, and the message
+    # sent two rounds of investigation at the driver and at the argv encoding.
+    mkdir -p "$scratch/sepdb"
+    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo /c /FoCMakeFiles\\x.obj -- D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
+        > "$scratch/sepdb/compile_commands.json"
+    Expect "the preprocess flag goes BEFORE a -- separator, never after it" \
+           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"/E"$'\n'"--"$'\n'"D:\\a\\proj\\src\\N\\W.cpp" \
+           "$(PreprocessArgv "$scratch/sepdb" src/N/W.cpp)"
     # A header two levels down still reaches the translation unit at the top --
     # and a `.c` unit is one of them, which is the assertion that stops the
     # translation-unit table from silently drifting back to "only `.cpp`".

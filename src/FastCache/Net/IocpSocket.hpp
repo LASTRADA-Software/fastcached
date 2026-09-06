@@ -17,6 +17,19 @@
 namespace FastCache
 {
 
+/// The invalid-socket sentinel, with the socket's own (unsigned) type.
+///
+/// `INVALID_SOCKET` expands to `(SOCKET)(~0)`, and the operand of that cast is a
+/// SIGNED `int`. clang-tidy's `modernize-use-integer-sign-comparison` sees through
+/// the cast, so every `sock != INVALID_SOCKET` in this module reads as a
+/// signed/unsigned comparison -- ten of them in `IocpSocket.cpp` alone, and the
+/// Windows analyser leg is the only thing that can see them.
+///
+/// Naming the sentinel once, with no signed subexpression anywhere in it, fixes
+/// those at the comparison instead of casting at each site. `IocpSocket.cpp`
+/// static_asserts that this is the platform's value, so the two cannot drift.
+constexpr std::uintptr_t InvalidSocketValue = ~std::uintptr_t {};
+
 /// IOCP-backed ISocket. Read/Write submit WSARecv/WSASend with an
 /// embedded OVERLAPPED; completions arrive on the reactor thread which
 /// resumes the suspended coroutine via the awaitable.

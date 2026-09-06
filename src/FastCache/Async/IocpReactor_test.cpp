@@ -31,23 +31,27 @@ struct YieldAwaitable
     void await_resume() const noexcept {}
 };
 
-FastCache::DetachedTask Worker(FastCache::IReactor& reactor, std::atomic<int>& counter, int yields)
+// Pointers, not references: a coroutine parameter that is a reference dangles
+// the moment the caller's object goes, and clang-tidy refuses it
+// (cppcoreguidelines-avoid-reference-coroutine-parameters). The rest of this tree
+// spells the same seam `ISocket*` / `IClock*` for the same reason.
+FastCache::DetachedTask Worker(FastCache::IReactor* reactor, std::atomic<int>* counter, int yields)
 {
     for (auto i = 0; i < yields; ++i)
     {
-        counter.fetch_add(1, std::memory_order_relaxed);
-        co_await YieldAwaitable { reactor };
+        counter->fetch_add(1, std::memory_order_relaxed);
+        co_await YieldAwaitable { *reactor };
     }
     co_return;
 }
 
-FastCache::DetachedTask TimerWorker(FastCache::IReactor& reactor,
+FastCache::DetachedTask TimerWorker(FastCache::IReactor* reactor,
                                     FastCache::TimePoint deadline,
-                                    std::atomic<bool>& fired,
+                                    std::atomic<bool>* fired,
                                     FastCache::IReactor* stopReactor)
 {
-    co_await FastCache::SleepUntil { .reactor = &reactor, .deadline = deadline };
-    fired.store(true, std::memory_order_release);
+    co_await FastCache::SleepUntil { .reactor = reactor, .deadline = deadline };
+    fired->store(true, std::memory_order_release);
     if (stopReactor)
         stopReactor->Stop();
     co_return;
@@ -61,7 +65,7 @@ TEST_CASE("IocpReactor::Submit resumes a coroutine on the reactor thread", "[rea
     FastCache::IocpReactor reactor { clock };
 
     std::atomic<int> counter { 0 };
-    Worker(reactor, counter, 3);
+    Worker(&reactor, &counter, 3);
 
     // The worker is now suspended on its first YieldAwaitable. Tell the
     // reactor to stop once the counter has reached 3 by polling on a
@@ -84,7 +88,7 @@ TEST_CASE("IocpReactor::Schedule fires a timer", "[reactor][iocp]")
     FastCache::IocpReactor reactor { clock };
 
     std::atomic<bool> fired { false };
-    TimerWorker(reactor, clock.Now() + 25ms, fired, &reactor);
+    TimerWorker(&reactor, clock.Now() + 25ms, &fired, &reactor);
     reactor.Run();
     REQUIRE(fired.load(std::memory_order_acquire));
 }

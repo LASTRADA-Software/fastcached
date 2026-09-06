@@ -173,7 +173,11 @@ namespace
                      SIO_GET_EXTENSION_FUNCTION_POINTER,
                      &guid,
                      sizeof(guid),
-                     &fn,
+                     // Explicit: `&fn` is a pointer to a FUNCTION pointer, and letting
+                     // that reach `LPVOID` implicitly is a multilevel conversion the
+                     // analyser refuses -- rightly, since the arity is easy to get
+                     // wrong here and WSAIoctl cannot check it.
+                     static_cast<void*>(&fn),
                      sizeof(fn),
                      &returned,
                      nullptr,

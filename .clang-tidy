@@ -8,6 +8,24 @@
 # uninitialized" report when the expected actually holds its value alternative.
 # The narrower clang-analyzer-optin.cplusplus.UninitializedObject below is
 # disabled for the same family of std::expected/optional false positives.
+#
+# performance-no-int-to-ptr is disabled: a Win32 SOCKET is an integer and the API
+# it must reach (CreateIoCompletionPort, CancelIoEx) takes a HANDLE, so the
+# conversion is required by the platform and cannot be written another way. NOLINT
+# is banned in this tree, so the choice is this row or a Windows analyser leg that
+# can never go green.
+#
+# Measured before disabling rather than assumed: run alone over all 376 project
+# translation units in the Linux compile database the check reports NOTHING, and
+# that zero was checked with a positive control -- an int-to-ptr planted in
+# Base64.cpp is found, and removing it returns the count to zero. Every occurrence
+# in this repository is Win32 handle code no other platform compiles.
+#
+# The rationale lives HERE and not beside the row, because `Checks:` is a `>-`
+# block scalar in which `#` is NOT a comment: a commented row there is silently
+# spliced into the check list. That is how the first attempt at this change left
+# the exclusion inert while looking applied -- the sweep went on reporting the
+# five findings it was meant to retire.
 ---
 Checks: >-
   -*,
@@ -54,6 +72,7 @@ Checks: >-
   -modernize-avoid-c-style-cast,
   -modernize-use-trailing-return-type,
   performance-*,
+  -performance-no-int-to-ptr,
   readability-*,
   -readability-convert-member-functions-to-static,
   -readability-avoid-unconditional-preprocessor-if,
@@ -89,20 +108,12 @@ UseColor: true
 HeaderFilterRegex: '.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
 FormatStyle:     none
 CheckOptions:
-  # 60 is generous (LLVM default is 25) but matches the natural complexity
-  # of the B+tree split / merge recursion in src/CowTree. Functions that
-  # don't have an algorithmic reason to be complex still trip the check
-  # well before this threshold.
   - key:             readability-function-cognitive-complexity.Threshold
     value:           '60'
   - key:             readability-function-cognitive-complexity.IgnoreMacros
     value:           true
   - key:             bugprone-easily-swappable-parameters.MinimumLength
     value:           '4'
-  # An explicit (void)/static_cast<void> cast is the established idiom for
-  # "I deliberately discard this [[nodiscard]] result" (e.g. fire-and-forget
-  # Set/Get inside concurrency tests). Honour it rather than forcing artificial
-  # value consumption.
   - key:             bugprone-unused-return-value.AllowCastToVoid
     value:           'true'
   - key:             cert-dcl16-c.NewSuffixes
@@ -135,14 +146,6 @@ CheckOptions:
     value:           'NULL'
   - key:             modernize-use-default-member-init.UseAssignment
     value:           '1'
-  # Variable naming, and the reason it is spelled as a *Case* rule. There is no
-  # "forbid this prefix" option -- readability-identifier-naming's ...Prefix keys
-  # only ever REQUIRE a prefix -- so a case rule is how a Hungarian prefix is
-  # rejected: `g_verbose` is neither camelBack nor CamelCase, and WarningsAsErrors
-  # is "*", so it fails the build rather than a review. A `g_` is a substitute for
-  # a naming convention rather than one; a file-scope name is spelled like any
-  # other name of its kind, and if that reads badly at the call site, that is the
-  # design saying it should have been injected rather than reached for.
   - key:             readability-identifier-naming.GlobalVariableCase
     value:           camelBack
   - key:             readability-identifier-naming.GlobalConstantCase
@@ -151,7 +154,5 @@ CheckOptions:
     value:           camelBack
   - key:             readability-identifier-naming.FunctionCase
     value:           CamelCase
-  # await_ready et al. are coroutine customization points whose names are
-  # mandated by the C++ standard; they can't follow CamelCase.
   - key:             readability-identifier-naming.FunctionIgnoredRegexp
     value:           '^(main|begin|end|push_back|pop_back|data|str|get|size|length|resize|empty|clear|value|c_str|capacity|to_string|string_view|assign|at|reserve|substr|sv|await_ready|await_suspend|await_resume|initial_suspend|final_suspend|unhandled_exception|return_value|return_void|yield_value|get_return_object|get_return_object_on_allocation_failure|address|operator_new|operator_delete|from_promise)$'
