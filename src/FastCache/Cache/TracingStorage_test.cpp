@@ -86,11 +86,11 @@ TEST_CASE("TracingStorage's source tag survives the frame that published it", "[
     // the size-dependence `.agent/rules/wire-and-protocol.md` records for #395.
     // An IPv6 peer is what getpeername returns on any v6 deployment, so this is
     // a REAL size rather than a large one.
-    static constexpr std::string_view Tag = "[2001:db8:85a3::8a2e:370:7334]";
-    static_assert(Tag.size() > 15, "must exceed the SSO buffer, or the use-after-free is unobservable");
+    static constexpr std::string_view tag = "[2001:db8:85a3::8a2e:370:7334]";
+    static_assert(tag.size() > 15, "must exceed the SSO buffer, or the use-after-free is unobservable");
 
     {
-        auto const frame = std::make_unique<std::string>(Tag);
+        auto const frame = std::make_unique<std::string>(tag);
         FastCache::Detail::storageSourceTag = *frame;
     } // the publishing frame is freed here, as Connection::Run()'s is
 
@@ -102,7 +102,7 @@ TEST_CASE("TracingStorage's source tag survives the frame that published it", "[
     // Asserts the CONTENT, not merely that a line was emitted: a borrowed tag
     // reads back as whatever the allocator left there, which both states
     // produce a line for.
-    REQUIRE(records[0].message.starts_with(std::string { Tag } + " storage: GET key=foo"));
+    REQUIRE(records[0].message.starts_with(std::string { tag } + " storage: GET key=foo"));
 }
 
 TEST_CASE("TracingStorage omits the prefix when no source tag is published", "[tracing][logsource]")
