@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DependencyOutput.hpp"
-#include "DirectManifest.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -65,15 +64,14 @@ std::string RenderDepFile(std::string_view target, std::span<std::string const> 
     return out;
 }
 
-std::string RenderShowIncludes(std::span<std::string const> dependencyPaths)
+// The marker is the CALLER's and this file spells none of its own, which is why it no
+// longer includes DirectManifest.hpp. See the header for why it is undefaulted (#700).
+std::string RenderShowIncludes(std::span<std::string const> dependencyPaths, std::string_view marker)
 {
     std::string out;
     for (auto const& dep: Unique(dependencyPaths))
     {
-        // The marker comes from DirectManifest, which is where the READING side
-        // gets it. A second spelling here is how a producer and its parser drift --
-        // and this pair has to agree byte-for-byte, since Ninja matches the prefix.
-        out += IncludeNoteMarker;
+        out += marker;
         out += ' ';
         out += dep;
         out += "\r\n";

@@ -166,6 +166,13 @@ namespace EnvName
     constexpr std::string_view Token = "FASTCACHE_TOKEN";
     constexpr std::string_view User = "FASTCACHE_USER";
     constexpr std::string_view Verify = "FASTCACHE_VERIFY";
+    /// Named after Ninja's own variable ON PURPOSE.
+    ///
+    /// The value an operator needs is sitting in their `build.ninja` under exactly
+    /// this word, and the recipe is `grep msvc_deps_prefix build.ninja`. A name of
+    /// our own invention would put a translation step between the value and the
+    /// place it has to be copied to, which is where a copy goes wrong.
+    constexpr std::string_view MsvcDepsPrefix = "FASTCACHE_MSVC_DEPS_PREFIX";
 } // namespace EnvName
 
 /// One environment variable the launcher reads.

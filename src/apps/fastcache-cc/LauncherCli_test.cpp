@@ -330,7 +330,17 @@ TEST_CASE("the help text documents every environment variable the launcher reads
     // The hardcoded list is a deliberate independent oracle: help is rendered
     // from LauncherEnvironment(), so checking it against that table would be
     // tautological, while this fails if a row is ever dropped.
+    //
+    // What it could NOT catch is a row ARRIVING -- a list is exact about the names it
+    // knows and silent about the ones it does not, and silence reads identically to
+    // complete coverage. `FASTCACHE_VERIFY` sat outside it for exactly that reason and
+    // was found by accident. So the COUNT is asserted below against
+    // `LauncherEnvironment().size()`, which is not tautological the way reading the
+    // names from it would be: it says "this oracle knows about as many variables as
+    // the launcher has", and a new row with no entry here fails without the oracle
+    // ever learning what that row is called.
     auto const help = HelpText();
+    auto fastcacheNames = std::size_t { 0 };
     for (auto const* name: { "FASTCACHE_ADDR",
                              "FASTCACHE_SOURCE_DIR",
                              "FASTCACHE_BINARY_DIR",
@@ -358,13 +368,58 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
                              "FASTCACHE_USER",
+                             // Was missing from this oracle while its row existed in
+                             // the table, so the row could have been dropped with
+                             // nothing failing -- the exact hole the oracle is for.
+                             // Found while adding the row below it; a hand-kept list
+                             // is exact about what it knows and silent about what it
+                             // does not.
+                             "FASTCACHE_VERIFY",
+                             // A build that reads this and documents nothing leaves an
+                             // operator no way to discover the one setting that can fix
+                             // a silent under-rebuild (#700). It is also the only row
+                             // here whose value an operator must copy from somewhere
+                             // else, so the summary carrying the recipe is load-bearing
+                             // rather than decorative -- asserted separately below.
+                             "FASTCACHE_MSVC_DEPS_PREFIX",
+                             // The three below are not the launcher's own -- they are
+                             // the usual per-user state locations, documented as
+                             // `UsageEntry` rows rather than `EnvVarSpec` ones -- so
+                             // they are deliberately outside the count asserted after
+                             // the loop.
                              "LOCALAPPDATA",
                              "XDG_STATE_HOME",
                              "HOME" })
     {
         INFO("variable " << name);
         CHECK(help.contains(name));
+        if (std::string_view { name }.starts_with("FASTCACHE_"))
+            ++fastcacheNames;
     }
+
+    // Counted from the loop rather than written down, so this cannot drift from the
+    // list it describes -- a hand-maintained number beside a hand-maintained list is
+    // two sources of truth wearing one hat.
+    INFO("oracle knows " << fastcacheNames << " FASTCACHE_* names; LauncherEnvironment() has "
+                         << LauncherEnvironment().size());
+    CHECK(fastcacheNames == LauncherEnvironment().size());
+}
+
+TEST_CASE("the help text tells an operator where to find their msvc_deps_prefix")
+{
+    // FASTCACHE_MSVC_DEPS_PREFIX is the only launcher variable whose value cannot be
+    // invented: it has to equal a string the build already holds, and getting it
+    // wrong is silent in exactly the way #700 is. So documenting the NAME is not
+    // enough -- the summary has to carry the recipe, and that is a property worth an
+    // assertion rather than a reviewer's memory.
+    //
+    // Matched on `msvc_deps_prefix` and `build.ninja` rather than on a whole
+    // sentence, so rewording the help does not fail this while dropping the recipe
+    // still does.
+    auto const help = HelpText();
+    INFO(help);
+    CHECK(help.contains("msvc_deps_prefix"));
+    CHECK(help.contains("build.ninja"));
 }
 
 TEST_CASE("the help text states the dispatch deadline the launcher actually uses")

@@ -187,6 +187,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
+- Reading `/showIncludes` and WRITING it are different questions and must not be
+  consolidated. The reader matches `IncludeNoteMarker`; a dispatched compile's
+  synthesised notes must match the BUILD's `msvc_deps_prefix`, which CMake took from
+  the actual — possibly localized — compiler, and which Ninja matches literally.
+  `RenderShowIncludes` therefore takes the marker as a REQUIRED, undefaulted parameter
+  and spells no literal of its own. Measured, no MSVC needed:
+  `scripts/probes/ninja-msvc-deps-prefix.sh`.
 - A compiler with debug info on records the WORKING DIRECTORY, which is on no command
   line, so no key can relativize it and a hit replays an object naming the producing
   checkout. Measured: `g++` 143 B, `clang++` 6 B, `clang-cl` 23 B, and `cl` **11 B with

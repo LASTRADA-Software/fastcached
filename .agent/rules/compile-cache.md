@@ -1174,13 +1174,55 @@ same on both — the same defect with no MSVC anywhere near it.
   well as `": "`, because MSVC's CJK catalogues use it and a fixture typed by hand
   will not discover that on its own.
 
-- **The reading side is fixed and the WRITING side is not.** `RenderShowIncludes`
-  emits the same English marker for Ninja, which matches `msvc_deps_prefix` — taken
-  by CMake from the actual localized compiler — so a localized build records no
-  dependencies for a dispatched compile and under-rebuilds. `VSLANG` cannot fix
-  that: you cannot produce a localized prefix by forcing English. See
-  [#700](https://github.com/LASTRADA-Software/fastcached/issues/700), which also
-  carries the stored-region half.
+- **The reading side and the WRITING side are different questions, and consolidating
+  them is the tempting wrong move.** `RenderShowIncludes` emitted the same English
+  `IncludeNoteMarker` under a comment saying a second spelling is how a producer and
+  its parser drift. That comment was right about the two parties it could see and
+  blind to the third: Ninja does not match `IncludeNoteMarker`, it matches
+  `msvc_deps_prefix`, which CMake took from the *actual* compiler. So a localized build
+  recorded **no dependencies** for a dispatched compile and stopped rebuilding it — a
+  wrong build under a zero exit code, reached through the build graph rather than the
+  cache, which is the opposite direction from #692 and worse
+  ([#700](https://github.com/LASTRADA-Software/fastcached/issues/700)). `VSLANG` cannot
+  fix it: you cannot produce a localized prefix by forcing English, and forcing it on
+  the real compile anglicizes every diagnostic a developer reads.
+  - The marker is now a **required, undefaulted parameter** of `RenderShowIncludes`,
+    fed from `FASTCACHE_MSVC_DEPS_PREFIX` at the one place the launcher reads its
+    environment. That is *stronger* than the invariant it replaces: the producer spells
+    no literal at all, so it cannot drift from its parser — there is nothing to drift
+    with. A default argument would let the next call site omit the build's prefix and
+    reintroduce this in silence, which is `ReportedDependencies`' deleted default
+    constructor one file away.
+  - **The ticket was recorded as blocked on a localized `cl` and was not.**
+    `msvc_deps_prefix` is a string the BUILD holds, so both the defect and its repair
+    are reachable with no language pack and no MSVC at all — ninja matches the literal
+    string and knows nothing about languages.
+    `scripts/probes/ninja-msvc-deps-prefix.sh` is the measurement and the only place
+    its figures live, because it ASSERTS its own recorded table rather than printing
+    one. Three cases, and the third is the load-bearing one: matching, mismatched, and
+    **localized-matching**. Reproducing a defect proves it is real; only feeding the
+    right prefix and watching the dependency come back proves the FIX is observable,
+    and without that this ticket stalls again on "how would we know".
+  - That asymmetry is why **discovery** was split out rather than chosen
+    ([#878](https://github.com/LASTRADA-Software/fastcached/issues/878)): the escape
+    hatch's input IS the prefix string, so a test supplies it, while discovery's input
+    is the compiler's output language — on an English `cl` you discover English and
+    prove nothing, and a stub asserts its own premise. Unexercisable here by
+    construction, and an unexercisable fix for a defect whose character is silence is
+    how this returns in a different costume.
+  - **The launcher cannot detect the unset case, and must not pretend to.** Do not build
+    a guard or a message on `probed.unreadable`: #821 was reverted for exactly that, and
+    #825 records the claim underneath it — which stream `cl` writes its notes on — as
+    unmeasured and stated two ways in the tree. #700's own floor is *discovered, never
+    inferred from a failed parse*. What ships instead is a `FASTCACHE_VERBOSE` line on
+    every dispatched compile that synthesises notes, naming the prefix and its
+    provenance, because that is the one line answering *why did my build stop rebuilding
+    this file*.
+  - The **stored-region** half is untouched and is
+    [#879](https://github.com/LASTRADA-Software/fastcached/issues/879), not a residual:
+    `Grammar::ShowIncludes` taking a run-time prefix would make two nodes canonicalize
+    one value differently under one `CompileValueVersion`, which is a fleet-wide
+    generation bump plus a corpus row and must not hide inside a build-correctness fix.
 
 ## An object file is not a byte string, and `FASTCACHE_VERIFY` is where that bites
 
@@ -1912,6 +1954,20 @@ with current truth at the moment the staleness would otherwise have done harm.
 
 ## Open work
 
+- **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
+  localized `/showIncludes` prefix is NAMED by an operator
+  (`FASTCACHE_MSVC_DEPS_PREFIX`) and not discovered from the compiler, so a build that
+  sets nothing gets the English marker on trust. Split from #700 on exercisability
+  rather than cost: discovery's input is the compiler's output language, so an English
+  `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
+  driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
+  DIAGNOSTIC can also end in a known dependency path.
+- **[#879](https://github.com/LASTRADA-Software/fastcached/issues/879)** — a stored
+  value produced on a localized toolchain keeps the producing checkout's absolute paths
+  in its `/showIncludes` region, because `Grammar::ShowIncludes` matches the English
+  marker. Not fixable the way #700 was: a run-time prefix makes two nodes canonicalize
+  one value differently under one `CompileValueVersion`, so it is a generation bump plus
+  a corpus row, fleet-wide.
 - **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
   target-triple probe costs a driver spawn per translation unit on clang and
   clang-cl, hits included, because its answer is a cache key input. Memoizing it

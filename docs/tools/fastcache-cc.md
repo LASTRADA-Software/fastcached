@@ -236,6 +236,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 | `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
+| `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the English `Note: including file:` |
 
 The statistics log is located from the usual per-user state variables rather than
 one of the launcher's own. These are read but never written:
@@ -292,6 +293,77 @@ defaults to the same address for exactly that reason. A *remote* default would b
 indefensible, since every translation unit on a machine with nothing listening
 would pay a connect timeout in silence; a closed loopback port refuses
 immediately, so a machine running neither pays microseconds per compile.
+
+### A localized MSVC toolchain
+
+A Visual Studio carrying a language pack prints `/showIncludes` notes in that
+language, and CMake records whatever it printed as Ninja's `msvc_deps_prefix`. Ninja
+then matches **that literal string**, so the prefix a note carries has to equal it
+byte for byte.
+
+That matters here on one path only: a **dispatched** compile. A worker compiles
+preprocessed text, which has no `#include` left in it, so the worker's compiler
+reports no dependencies and the launcher writes the record itself from what its own
+probe saw. Until
+[#700](https://github.com/LASTRADA-Software/fastcached/issues/700) it wrote the
+English `Note: including file:` unconditionally. On a localized build Ninja matched
+none of those lines, recorded **no dependencies** for the translation unit, printed
+the notes as ordinary compiler output, and stopped rebuilding it when its headers
+changed — a wrong build under a zero exit code, which persists until someone cleans.
+
+Set `FASTCACHE_MSVC_DEPS_PREFIX` to the value your build already holds:
+
+```pwsh
+Select-String msvc_deps_prefix build.ninja      # in your build directory
+$env:FASTCACHE_MSVC_DEPS_PREFIX = 'Hinweis: Einlesen der Datei:'
+```
+
+The line that comes back is the whole assignment — `msvc_deps_prefix = Hinweis:
+Einlesen der Datei:`. What goes in the variable is the text **after the `=`**: a
+prefix that carries the assignment matches no line Ninja ever sees, and fails in
+exactly the same silence as writing English.
+
+Ninja's behaviour here is measured rather than assumed, and the measurement is
+re-runnable: `scripts/probes/ninja-msvc-deps-prefix.sh` drives three cases (matching,
+mismatched, and localized-matching) and reports the dependency count and whether a
+header edit rebuilds. It needs no MSVC and no language pack, because the defect is a
+property of the *string*, not of any compiler's UI language.
+
+**The launcher cannot discover this for itself.** `msvc_deps_prefix` is a value the
+build holds and never exports, so an unset variable means the launcher writes English
+on trust. With `FASTCACHE_VERBOSE` it says so on every dispatched compile that
+synthesises notes, naming the prefix it used and where that came from — which is the
+one line that answers *why did my build stop rebuilding this file*. Learning the
+prefix from the compiler instead is
+[#878](https://github.com/LASTRADA-Software/fastcached/issues/878).
+
+**Setting this on a machine that shares a cache with differently localized peers can
+make *those peers* under-rebuild.** The synthesised notes are stored with the object
+and replayed verbatim on a later hit, and the cache key does **not** fold the prefix —
+a German and an English Visual Studio of the same toolset key identically, deliberately,
+since the identity probe is forced to English
+([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). So a German
+machine that sets this variable fixes its own builds *and* begins storing values whose
+notes an English peer replays and cannot match. That peer was previously fine: before
+this setting existed every stored value carried the English marker, so English machines
+always matched and only localized ones were broken. This is new breakage on a machine
+that had none, not a relocation of the old breakage.
+
+What makes it safe to ship is that **it is opt-in**. The prefix defaults to the English
+`Note: including file:`, so no existing fleet changes behaviour until somebody sets the
+variable — and the person who sets it is exactly the person this paragraph is for. If
+your cache is shared across UI languages, weigh that before exporting it; a
+locale-homogeneous fleet, which is the usual case, is unaffected. The real fix is a key
+or value-format change, tracked on
+[#879](https://github.com/LASTRADA-Software/fastcached/issues/879).
+
+Two things this does **not** cover, deliberately. A *local* compile is unaffected: it
+emits the real compiler's own notes, which match by construction. And a stored value's
+`/showIncludes` region is still canonicalized against the English marker, so on a
+localized machine that region keeps the producing checkout's absolute paths — that
+half is a `CompileValueVersion` change affecting every server on the wire, and is
+[#879](https://github.com/LASTRADA-Software/fastcached/issues/879) rather than
+something folded in here.
 
 ## How it works
 
