@@ -792,6 +792,31 @@ status from the **process**, never from a pipe; and confirms the failure is the
 fails for another reason proves nothing about the guard. Where it cannot establish
 those, it reports INCONCLUSIVE and names the reading it is missing.
 
+## `--repeat until-fail` reports the last iteration, so a flake reads as a pass
+
+`ctest --repeat until-fail:N` reports the **last** iteration's result, so a test that
+fails a small fraction of the time is reported `100% tests passed` whenever the final
+run happens to pass.
+
+Measured: a ~1% flake survived **six consecutive full-suite runs** qualified that way,
+every one printing `100% tests passed`. A loop that counted every outcome found it on
+the first try — `ran=200 pass=198 fail=2` (#735).
+
+It is the `| tail` trap with a loop counter instead of a pipe: **the wrong reading and
+the right one agree on every input except a flake**, which is precisely what you were
+using it to look for. And it is self-concealing in the worst direction — a tool used to
+*hunt* flakes that reports the last iteration reports success in proportion to how RARE
+the defect is, so the rarer it is the more confident the false clean.
+
+Use `scripts/flake-rate.sh`, which keeps a tally. Two things it deliberately keeps:
+
+- **The early stop.** `--until-fail` still halts at the first failure, because once you
+  have a reproduction the remaining runs teach you nothing. It says so on the way out:
+  a run that stopped early is not a rate, and must not be read as one.
+- **The N, on every line.** "Did not reproduce in 120 runs" does not disprove a 1% rate,
+  and a tool that printed only a verdict would invite exactly that inference. Even the
+  clean line states how many runs it is about.
+
 ## Assert what DISTINGUISHES, not what both sides produce
 
 In one evening four lanes found **five** tests that could not fail for the reason
