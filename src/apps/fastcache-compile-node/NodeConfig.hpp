@@ -1013,6 +1013,65 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
 
+/// One path-valued flag whose file holds a secret.
+///
+/// A row rather than a branch, so a fifth secret-bearing flag is a fifth row and
+/// the loop that asks about them is written once.
+struct NodeSecretFile
+{
+    std::string_view flag;                    ///< The `--flag` spelling, and the key the coverage guard joins on.
+    std::filesystem::path NodeConfig::* path; ///< Where the operator's answer lands.
+};
+
+/// One path-valued flag whose file is deliberately NOT a secret.
+///
+/// **Mandatory classification with a named opt-out, rather than an opt-in list.**
+/// An opt-in list is exact about the flags it knows and silent about the ones it
+/// does not, and silence reads identically to complete coverage -- which is #492,
+/// and which is precisely how #752 describes the narrow answer that "looks
+/// complete". `ctest -R "every path-valued flag is classified"` requires every
+/// `=<path>` row of `NodeOptions()` to appear in exactly one of the two tables, so
+/// a sixth path-valued flag does not compile into silence: its author has to say
+/// which kind it is.
+struct NodePublicPathFlag
+{
+    std::string_view flag; ///< The `--flag` spelling.
+    std::string_view why;  ///< Why its file holds no secret. A forcing function, not a dead field.
+};
+
+/// Every path-valued flag whose file holds a secret.
+/// @return The table; stable for the life of the process.
+[[nodiscard]] std::span<NodeSecretFile const> NodeSecretFileTable() noexcept;
+
+/// Every path-valued flag whose file holds no secret, and why.
+/// @return The table; stable for the life of the process.
+[[nodiscard]] std::span<NodePublicPathFlag const> NodePublicPathFlags() noexcept;
+
+/// Every file this worker's secrets live in, in the order to report them.
+///
+/// **Two rules, not one, and only the first is #384's.** The configuration file is
+/// provenance-gated: `--requirepass` can arrive in argv instead, where the exposure
+/// is `ps` rather than a mode, and that is a different problem with a different
+/// owner. The four files `NodeSecretFileTable()` names are not gated at all --
+/// the path is not the secret and the file is, so a world-readable cluster key is
+/// exposed however its path was named
+/// ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
+///
+/// **A named file is reported whether or not a tier reads it**, and that is the
+/// lesson the `--cluster-key-file` refusal in `StartupPolicyRejection` was narrowed
+/// twice to learn: whether a surface exists is not a fact about the configuration,
+/// so a rule whose premise is "somebody will read this" cannot state its premise
+/// without guessing. The file holds a secret on disk either way.
+///
+/// @param cfg The merged configuration.
+/// @param configFile The configuration file that was actually read, or empty when
+///        none was. The RESOLVED path, since a discovered file is named by no flag.
+/// @param secretNamedOnCommandLine Whether argv supplied `--requirepass`.
+/// @return The paths, config file first when it qualifies; empties are kept out.
+[[nodiscard]] std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
+                                                                 std::filesystem::path const& configFile,
+                                                                 bool secretNamedOnCommandLine);
+
 /// Why this worker's configuration cannot work, if it cannot.
 ///
 /// A *startup* rule rather than an install-time one, and the split is deliberate:
