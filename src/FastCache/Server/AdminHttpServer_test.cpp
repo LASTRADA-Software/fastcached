@@ -75,7 +75,7 @@ std::string ServeAndCollect(FastCache::ISocket* serveOn,
         return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
     FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, clock));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, &clock));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
@@ -270,7 +270,7 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
                                             .uptime = FastCache::Uptime { 7s } };
     };
     FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider, clock));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider, &clock));
 
     auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -303,7 +303,7 @@ std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::
                                             .uptime = FastCache::Uptime { 1s } };
     };
     FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, clock, routes));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, &clock, routes));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
@@ -592,7 +592,7 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 1s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, clock));
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, &clock));
     pair.server->Close();
     auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));

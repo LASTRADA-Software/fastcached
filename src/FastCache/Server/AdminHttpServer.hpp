@@ -325,7 +325,7 @@ class AdminHttpServer
 [[nodiscard]] Task<void> ServeAdminHttp(ISocket* socket,
                                         IMetricsSink const* metrics,
                                         AdminHttpServer::SnapshotProvider snapshotProvider,
-                                        IClock& clock,
+                                        IClock* clock,
                                         std::span<AdminRoute const> routes = {});
 
 } // namespace FastCache

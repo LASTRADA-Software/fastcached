@@ -365,7 +365,7 @@ namespace
     /// 60 KB head to `/healthz` are both answered `200 OK`, from a head this server
     /// only read the first 8,192 bytes of. That is the defect. A route reading no
     /// headers survives it by luck; `/fleet` reads a credential and does not.
-    Task<RequestHead> ReadRequestHead(ISocket* socket, IClock& clock)
+    Task<RequestHead> ReadRequestHead(ISocket* socket, IClock* clock)
     {
         std::string buffer;
         bool sawHeadEnd = false;
@@ -381,7 +381,7 @@ namespace
         // burn 10.00 s at 99% CPU. That is `waited += poll` inverted: refusing to COUNT
         // a sleep is the recorded rule; refusing to ASSUME one is the same rule.
         socket->SetReceiveDeadline(AdminHttpServer::FirstByteTimeout);
-        auto started = clock.Now();
+        auto started = clock->Now();
         while (!sawHeadEnd && buffer.size() < MaxRequestBytes)
         {
             std::array<std::byte, 1024> chunk {};
@@ -422,7 +422,7 @@ namespace
                 // accept -- a peer that thought for 20 s and then asked promptly is not
                 // slow, and charging it the wait would refuse the case #828 is about.
                 socket->SetReceiveDeadline(AdminHttpServer::RequestTimeout);
-                started = clock.Now();
+                started = clock->Now();
             }
             // Rescan from three bytes before the freshly-appended region: the
             // terminator is four bytes and may straddle a chunk boundary in any of
@@ -435,7 +435,7 @@ namespace
             // byte under each `RequestTimeout` never trips it and would otherwise hold a
             // slot for `MaxRequestBytes` reads. Checked after a SUCCESSFUL read, so it
             // costs nothing on the ordinary path and cannot spin.
-            if (!sawHeadEnd && clock.Now() - started >= AdminHttpServer::HeadTimeout)
+            if (!sawHeadEnd && clock->Now() - started >= AdminHttpServer::HeadTimeout)
                 co_return RequestHead { .outcome = AdminHeadOutcome::Truncated };
         }
 
@@ -579,7 +579,7 @@ namespace
 Task<void> ServeAdminHttp(ISocket* socket,
                           IMetricsSink const* metrics,
                           AdminHttpServer::SnapshotProvider snapshotProvider,
-                          IClock& clock,
+                          IClock* clock,
                           std::span<AdminRoute const> routes)
 {
     // TLS terminates here rather than in the accept loop, so a handshake failure
@@ -689,7 +689,7 @@ AdminHttpServer::AdminHttpServer(IListener& listener,
 static DetachedTask ServeAdminConnection(std::unique_ptr<ISocket> socket,
                                          IMetricsSink const* metrics,
                                          AdminHttpServer::SnapshotProvider snapshotProvider,
-                                         IClock& clock,
+                                         IClock* clock,
                                          std::span<AdminRoute const> routes,
                                          std::atomic<std::size_t>* inFlight)
 {
@@ -738,7 +738,8 @@ Task<void> AdminHttpServer::Run()
             (*accepted)->Close();
             continue;
         }
-        ServeAdminConnection(WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, _clock, _routes, &_inFlight);
+        ServeAdminConnection(
+            WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, &_clock, _routes, &_inFlight);
     }
     co_return;
 }
