@@ -626,7 +626,22 @@ for entry in entries:
         # `/E` for a cl driver: it is the only preprocess-to-stdout spelling BOTH
         # `cl` and `clang-cl` are certain to accept, and it keeps the line markers
         # `ProducedCode` attributes by (`/EP` suppresses exactly those).
-        out.append("/E" if clStyle else "-E")
+        #
+        # Placed BEFORE any `--`, not appended. CMake emits `--` ahead of the source
+        # file, and `--` means "everything after this is an INPUT FILE" -- so a flag
+        # appended at the end is read as a filename and clang-cl answers
+        #
+        #     clang-cl: error: no such file or directory: '/E'
+        #
+        # which is a true statement about a file that does not exist and says
+        # nothing about the flag. Six units reported UNKNOWN that way, and the
+        # message sent two rounds of investigation at the driver and at the argv
+        # encoding before the argv itself was printed and the `--` was simply there.
+        flag = "/E" if clStyle else "-E"
+        if "--" in out:
+            out.insert(out.index("--"), flag)
+        else:
+            out.append(flag)
         print(entry.get("directory", "."))
         for a in out:
             print(a)
@@ -823,6 +838,19 @@ SelfTest() {
     Expect "a POSIX database is unchanged by the Windows rule" \
            "/home/u/build"$'\n'"/usr/bin/clang++"$'\n'"/home/u/src/N/P.cpp"$'\n'"-E" \
            "$(PreprocessArgv "$scratch/pdb" src/N/P.cpp)"
+
+    # CMake emits `--` before the source file, and `--` means "everything after
+    # this is an INPUT FILE". A preprocess flag APPENDED lands after it and is read
+    # as a filename -- clang-cl answers `no such file or directory: '/E'`, which is
+    # a true statement about a file that does not exist and says nothing about the
+    # flag. Six units reported UNKNOWN that way on the Windows leg, and the message
+    # sent two rounds of investigation at the driver and at the argv encoding.
+    mkdir -p "$scratch/sepdb"
+    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo /c /FoCMakeFiles\\x.obj -- D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
+        > "$scratch/sepdb/compile_commands.json"
+    Expect "the preprocess flag goes BEFORE a -- separator, never after it" \
+           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"/E"$'\n'"--"$'\n'"D:\\a\\proj\\src\\N\\W.cpp" \
+           "$(PreprocessArgv "$scratch/sepdb" src/N/W.cpp)"
     # A header two levels down still reaches the translation unit at the top --
     # and a `.c` unit is one of them, which is the assertion that stops the
     # translation-unit table from silently drifting back to "only `.cpp`".
