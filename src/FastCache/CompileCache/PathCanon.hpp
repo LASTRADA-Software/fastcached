@@ -50,6 +50,18 @@ enum class Grammar : std::uint8_t
     ShowIncludes,    ///< MSVC/clang-cl `/showIncludes`: `Note: including file: <path>`.
     MsvcDiagnostics, ///< Diagnostics: `<path>(line[,col]): ...` — the leading path.
     GccDepfile,      ///< GCC/Clang `-MF` depfile: `target: dep dep \` continuation.
+
+    /// GCC/Clang diagnostics: `<path>:<line>:<col>: ...`, plus the
+    /// `In file included from <path>:<line>[,:]` header and its
+    /// `                 from <path>:<line>[,:]` continuations.
+    ///
+    /// **Anchored, and that is the whole design.** A GCC diagnostic embeds the
+    /// offending SOURCE LINE and a caret, so a rewrite that scanned for
+    /// path-shaped spans would corrupt a snippet that merely quotes a path — a
+    /// real possibility in this repository, whose tests carry path literals. Only
+    /// a path at one of the three positions above is a path; everything else on
+    /// the line is somebody's code.
+    GccDiagnostics,
 };
 
 /// The marker a `/showIncludes` note carries **in a stored value**.

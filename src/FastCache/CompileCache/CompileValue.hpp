@@ -87,7 +87,7 @@ namespace FastCache
 /// [#878](https://github.com/LASTRADA-Software/fastcached/issues/878), and it needs no
 /// further generation — the stored form is already locale-free, so #878 only supplies
 /// a better value to normalize with.
-inline constexpr std::uint8_t CompileValueVersion = 3;
+inline constexpr std::uint8_t CompileValueVersion = 4;
 
 /// The highest leading byte that will ever name a compile-value generation.
 ///

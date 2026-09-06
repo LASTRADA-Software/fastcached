@@ -34,6 +34,7 @@ namespace
             case PathCanon::Grammar::ShowIncludes:
             case PathCanon::Grammar::MsvcDiagnostics:
             case PathCanon::Grammar::GccDepfile:
+            case PathCanon::Grammar::GccDiagnostics:
                 return true;
         }
         return false;

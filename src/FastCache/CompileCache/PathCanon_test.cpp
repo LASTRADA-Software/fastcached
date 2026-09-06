@@ -698,3 +698,54 @@ TEST_CASE("RewritePaths with an identity transform is a byte-exact no-op")
     auto const notesOut = PathCanon::RewritePaths(notes, Grammar::ShowIncludes, identity);
     CHECK(notesOut == notes);
 }
+
+// ---------------------------------------------------------------------------
+// GccDiagnostics: anchored, because a diagnostic quotes the offending SOURCE LINE
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GccDiagnostics rewrites the diagnostic's own path and the include chain")
+{
+    Layout const producer { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    Layout const consumer { .sourceRoot = "/srv/ci/co", .buildTree = "/srv/ci/co/out" };
+
+    auto const text = std::string { "In file included from /home/dev/proj/inc/a.hpp:3,\n"
+                                    "                 from /home/dev/proj/src/a.cpp:1:\n"
+                                    "/home/dev/proj/src/a.cpp:12:5: warning: unused variable 'x'\n" };
+
+    auto const canonical = PathCanon::CanonicalizeRegion(text, Grammar::GccDiagnostics, producer);
+    CHECK_FALSE(canonical.contains("/home/dev/proj"));
+
+    auto const local = PathCanon::LocalizeRegion(canonical, Grammar::GccDiagnostics, consumer);
+    CHECK(local
+          == "In file included from /srv/ci/co/inc/a.hpp:3,\n"
+             "                 from /srv/ci/co/src/a.cpp:1:\n"
+             "/srv/ci/co/src/a.cpp:12:5: warning: unused variable 'x'\n");
+}
+
+TEST_CASE("GccDiagnostics leaves a path QUOTED inside the offending source line alone")
+{
+    // The anchoring guarantee, and the reason the grammar is not a scan for
+    // path-shaped spans. A GCC diagnostic embeds the source line and a caret, and
+    // this repository's own tests carry path literals -- rewriting one would turn
+    // a correct diagnostic into a wrong one, and it would look like a fix.
+    Layout const producer { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+
+    auto const text = std::string { "/home/dev/proj/src/a.cpp:12:5: warning: unused variable 'p'\n"
+                                    "   12 |     auto p = \"/home/dev/proj/keep/me.txt\";\n"
+                                    "      |          ^\n" };
+
+    auto const canonical = PathCanon::CanonicalizeRegion(text, Grammar::GccDiagnostics, producer);
+
+    // The anchored path went; the quoted one did not.
+    CHECK(canonical.starts_with("<SRCROOT>/src/a.cpp:12:5:"));
+    CHECK(canonical.contains("\"/home/dev/proj/keep/me.txt\""));
+    CHECK(canonical.contains("      |          ^\n"));
+}
+
+TEST_CASE("GccDiagnostics leaves a line that is not a diagnostic alone")
+{
+    Layout const producer { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    // No `:<line>:<col>:` anchor, so nothing here is a path span this grammar owns.
+    auto const text = std::string { "ld: cannot find -lfoo in /home/dev/proj/lib\n" };
+    CHECK(PathCanon::CanonicalizeRegion(text, Grammar::GccDiagnostics, producer) == text);
+}
