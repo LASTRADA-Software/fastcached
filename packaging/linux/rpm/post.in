@@ -14,6 +14,35 @@ if [ -x /usr/bin/systemd-tmpfiles ]; then
     systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true
 fi
 
+
+# **Restrict the machine-wide configs to their service accounts.**
+#
+# `install(FILES)` runs at PACKAGE-BUILD time when neither account exists, so it
+# cannot chown -- which is why the payload ships `0644 root:root` and why this is
+# the only place the mode can be set. Runs AFTER `systemd-sysusers` above for the
+# same reason.
+#
+# These are the files the product's guidance tells operators to put `requirepass`
+# into, and `Platform/FileTrust` already warns when a secret is read from a
+# broadly-readable file -- the daemon complained about the file its own package
+# shipped ([#861](https://github.com/LASTRADA-Software/fastcached/issues/861)).
+#
+# DIFFERENT groups: the two units run as `fastcached` and `fastcache-node`, and
+# `fastcache-compile-node.sysusers` says sharing an account would let a compromised
+# compile rewrite every cached object -- a shared group is that hole one notch
+# weaker. Repaired only when the file is CURRENTLY WORLD-readable, so a group an
+# operator chose is left alone -- and so this loop is idempotent, since the 0640 it
+# writes is not world-readable and no later upgrade re-asserts it.
+for _pair in "/@FASTCACHED_SYSCONF_DIR@/fastcached.yaml:fastcached" \
+             "/@FASTCACHED_SYSCONF_DIR@/fastcache-compile-node.yaml:fastcache-node"; do
+    _conf=${_pair%:*}
+    _grp=${_pair##*:}
+    [ -f "$_conf" ] || continue
+    [ -n "$(find "$_conf" -maxdepth 0 -perm /0004 2>/dev/null)" ] || continue
+    chgrp "$_grp" "$_conf" >/dev/null 2>&1 || continue
+    chmod 0640 "$_conf" >/dev/null 2>&1 || true
+done
+
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 

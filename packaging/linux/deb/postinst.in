@@ -22,6 +22,46 @@ case "$1" in
             systemd-tmpfiles --create "@FASTCACHED_TMPFILES_FILE@" >/dev/null 2>&1 || true
         fi
 
+
+        # **Restrict the machine-wide configs to their service accounts.**
+        #
+        # `install(FILES)` runs at PACKAGE-BUILD time, when neither account exists,
+        # so it cannot chown -- which is why the payload ships `0644 root:root` and
+        # why this is the only place the mode can be set. It runs AFTER
+        # `systemd-sysusers` above for the same reason.
+        #
+        # These are the files the product's own guidance tells operators to put
+        # `requirepass` into, and `Platform/FileTrust` already warns when a secret is
+        # read from a broadly-readable file -- so the daemon was built to complain
+        # about the file its own package shipped
+        # ([#861](https://github.com/LASTRADA-Software/fastcached/issues/861)).
+        #
+        # DIFFERENT groups, not one: `fastcached.service` runs as `fastcached` and
+        # `fastcache-compile-node.service` as `fastcache-node`, and
+        # `fastcache-compile-node.sysusers` states that sharing an account would let a
+        # compromised compile rewrite every cached object. A shared group is that hole
+        # one notch weaker. `fastcache-compile-node.yaml` already documents
+        # `0640 root:fastcache-node` as the intent; the packaging never did it.
+        #
+        # Repaired ONLY when the file is CURRENTLY WORLD-readable, so an
+        # operator who narrowed it further is left alone -- the same upgrade rule #741
+        # applies on Windows.
+        #
+        # `-perm /0004` is WORLD-readable specifically, not "anyone but the owner".
+        # `/0044` would also match the `0640 root:<svc>` this very loop produces, so
+        # every later upgrade would re-assert it and would overwrite a GROUP an operator
+        # had deliberately chosen. World-readable is the defect; a group arrangement is
+        # a decision.
+        for _pair in "/@FASTCACHED_SYSCONF_DIR@/fastcached.yaml:fastcached" \
+                     "/@FASTCACHED_SYSCONF_DIR@/fastcache-compile-node.yaml:fastcache-node"; do
+            _conf=${_pair%:*}
+            _grp=${_pair##*:}
+            [ -f "$_conf" ] || continue
+            [ -n "$(find "$_conf" -maxdepth 0 -perm /0004 2>/dev/null)" ] || continue
+            chgrp "$_grp" "$_conf" >/dev/null 2>&1 || continue
+            chmod 0640 "$_conf" >/dev/null 2>&1 || true
+        done
+
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi

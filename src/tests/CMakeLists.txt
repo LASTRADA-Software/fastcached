@@ -1638,6 +1638,25 @@ set_tests_properties("config-merge-covers-flags" PROPERTIES
 # source files and compares strings, so it belongs in the default `ctest` set and
 # must survive `ctest -LE smoke`. Both files ship in an exported tarball, so it
 # has no skip path.
+# `install(FILES)` cannot chown at package-build time -- neither service account
+# exists yet -- so the machine-wide configs ship 0644 root:root and the maintainer
+# scriptlets are the only place the mode can be set. Two files in two directories
+# with nothing connecting them, which is how a world-readable `requirepass` location
+# shipped for as long as it did (#861).
+#
+# Derived from the asset table, and refuses when either scan matches nothing.
+add_test(
+    NAME "config-permissions"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-config-permissions.cmake"
+)
+set_tests_properties("config-permissions" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 add_test(
     NAME "node-config-reference"
     COMMAND ${CMAKE_COMMAND}
