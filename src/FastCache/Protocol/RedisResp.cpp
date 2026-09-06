@@ -803,6 +803,77 @@ namespace
         bool _watching { false };
     };
 
+    /// Unregister a pass's stream waiter from the registry, exactly once, however
+    /// the pass ends -- including the one way it can end that no statement in the
+    /// loop covers.
+    ///
+    /// **The uncovered path is frame destruction while suspended at
+    /// `co_await waiter->Wait()`** -- a connection unwind rather than any of the
+    /// loop's own exits, which all unregister explicitly (#901).
+    ///
+    /// The registry storing `weak_ptr` is NOT sufficient on its own, and reading it
+    /// as sufficient is the trap here. It holds waiters by `weak_ptr` keyed on the
+    /// raw pointer and upgrades under its lock precisely so `Wake()` cannot land on
+    /// freed memory -- but `ArmTimeout` takes the waiter **by value as a
+    /// `shared_ptr`** and parks on the reactor's timer as a `DetachedTask`, so with a
+    /// deadline armed the `StreamWaiter` OUTLIVES the destroyed frame. The weak_ptr
+    /// then still upgrades, `NotifyAppended` wakes a live waiter, and the waiter
+    /// resumes a coroutine handle whose frame is gone.
+    ///
+    /// So the hazard needs both: a BLOCK with a timeout, and a teardown while parked.
+    /// Without the timeout the waiter dies with the frame and the weak_ptr expires,
+    /// which is why this reads as safe until `ArmTimeout` is followed.
+    ///
+    /// **NOT covered by a test, and that is measured rather than assumed.** Two
+    /// arrangements were built and both failed for reasons belonging to the harness
+    /// rather than to this guard, so neither would have been testing the fix:
+    ///
+    ///   * Destroying the frame by dropping `BlockingHarness` leaves `ArmTimeout`'s
+    ///     `DetachedTask` parked on `SleepUntil` with no reactor left to fire it --
+    ///     ASan reports it as a 72-byte leak from `ArmTimeout`. That frame is
+    ///     orphaned only because the reactor died first; in production the reactor
+    ///     outlives the connection and the timer always fires.
+    ///   * Destroying it through `IReactor::CancelPending` instead is a
+    ///     `heap-use-after-free`: the socket still holds a pointer to an
+    ///     `IoAwaitable` living IN that frame, so `~InMemorySocket` -> `Close()` ->
+    ///     `IoAwaitable::Complete` writes into freed storage.
+    ///
+    /// A counting `IStreamWaiterRegistry` DID distinguish the two states -- one
+    /// `Register` against zero `Unregister` without this destructor, one against one
+    /// with it -- so the fix is confirmed; what could not be made clean is the
+    /// teardown around it. Naming that is the point: an unstated impossibility is
+    /// indistinguishable from an unexamined one, and a test that leaks or faults is
+    /// not evidence, it is a second defect wearing a green tick.
+    ///
+    /// Idempotent, and the explicit `Unregister` calls STAY. `StreamWaiterRegistry::
+    /// Unregister` erases from every key set, so a second call is a no-op, and
+    /// keeping the explicit ones preserves the current ordering -- the waiter stops
+    /// being registered BEFORE the reply is written rather than after it.
+    class ScopedWaiterRegistration
+    {
+      public:
+        /// @param registry Where the waiter is registered; may be null.
+        /// @param waiter   The waiter to drop on scope exit.
+        ScopedWaiterRegistration(IStreamWaiterRegistry* registry, IStreamWaiter const* waiter) noexcept:
+            _registry { registry },
+            _waiter { waiter }
+        {
+        }
+        ScopedWaiterRegistration(ScopedWaiterRegistration const&) = delete;
+        ScopedWaiterRegistration(ScopedWaiterRegistration&&) = delete;
+        ScopedWaiterRegistration& operator=(ScopedWaiterRegistration const&) = delete;
+        ScopedWaiterRegistration& operator=(ScopedWaiterRegistration&&) = delete;
+        ~ScopedWaiterRegistration()
+        {
+            if (_registry != nullptr && _waiter != nullptr)
+                _registry->Unregister(_waiter);
+        }
+
+      private:
+        IStreamWaiterRegistry* _registry;
+        IStreamWaiter const* _waiter;
+    };
+
     /// Retire a blocking read's watch and hand the socket's read slot back, exactly
     /// once, however the read ends.
     ///
@@ -3344,6 +3415,9 @@ namespace
         {
             auto const waiter = std::make_shared<StreamWaiter>(session.reactor);
             session.streamWaiters->Register(waiter, keys);
+            // Covers the one exit no statement below reaches: this frame being
+            // destroyed while suspended at `co_await waiter->Wait()` (#901).
+            ScopedWaiterRegistration const registered { session.streamWaiters, waiter.get() };
             if (session.reactor != nullptr)
             {
                 if (deadline != TimePoint::max())
