@@ -40,7 +40,10 @@ namespace
         auto const millis = std::chrono::duration_cast<std::chrono::milliseconds>(nextDeadline - now).count();
         if (millis < 0)
             return 0;
-        if (millis > static_cast<std::int64_t>(INFINITE - 1))
+        // `std::cmp_greater` rather than a cast: `INFINITE` is an unsigned DWORD and
+        // `millis` is a signed count, and a cast only hides the mismatch from the
+        // reader while leaving it in the code.
+        if (std::cmp_greater(millis, INFINITE - 1))
             return INFINITE - 1;
         return static_cast<DWORD>(millis);
     }
@@ -48,11 +51,11 @@ namespace
 } // namespace
 
 IocpReactor::IocpReactor(IClock& clock):
-    _clock { clock }
-{
+    _clock { clock },
     // One worker thread per reactor instance — scaling is by running several
     // independent reactors, not by draining one port from many threads.
-    _iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, /*threads*/ 1);
+    _iocp { CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, /*threads*/ 1) }
+{
 }
 
 IocpReactor::~IocpReactor()
@@ -89,7 +92,7 @@ bool IocpReactor::AttachHandle(void* handle) noexcept
 {
     if (!_iocp || !handle)
         return false;
-    auto const result = CreateIoCompletionPort(
+    auto* const result = CreateIoCompletionPort(
         static_cast<HANDLE>(handle), static_cast<HANDLE>(_iocp), reinterpret_cast<ULONG_PTR>(handle), 0);
     return result == static_cast<HANDLE>(_iocp);
 }

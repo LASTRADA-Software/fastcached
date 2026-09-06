@@ -34,7 +34,7 @@ namespace
 std::uintptr_t ConnectClient(std::uint16_t port)
 {
     auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE(sock != INVALID_SOCKET);
+    REQUIRE(sock != InvalidSocketValue);
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -49,7 +49,7 @@ std::uintptr_t ConnectClient(std::uint16_t port)
 std::uint16_t FindFreePort()
 {
     auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE(sock != INVALID_SOCKET);
+    REQUIRE(sock != InvalidSocketValue);
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
@@ -62,18 +62,22 @@ std::uint16_t FindFreePort()
     return port;
 }
 
-FastCache::DetachedTask Echo(FastCache::IocpReactor& reactor, FastCache::IocpListener& listener, std::string& peerOut)
+// Pointers, not references: a coroutine parameter that is a reference dangles the
+// moment the caller's object goes, and clang-tidy refuses it
+// (cppcoreguidelines-avoid-reference-coroutine-parameters). The rest of this tree
+// spells the same seam `ISocket*` / `IClock*` for the same reason.
+FastCache::DetachedTask Echo(FastCache::IocpReactor* reactor, FastCache::IocpListener* listener, std::string* peerOut)
 {
-    auto accept = co_await listener.Accept();
+    auto accept = co_await listener->Accept();
     if (!accept.has_value())
     {
-        reactor.Stop();
+        reactor->Stop();
         co_return;
     }
     auto socket = std::move(*accept);
     // AcceptEx wrote the peer sockaddr into its output buffer; the IOCP listener
     // parses it out via GetAcceptExSockaddrs so the socket can report it.
-    peerOut = socket->PeerAddress();
+    *peerOut = socket->PeerAddress();
 
     // Read up to 64 bytes, then echo them back.
     std::array<std::byte, 64> buf {};
@@ -81,7 +85,7 @@ FastCache::DetachedTask Echo(FastCache::IocpReactor& reactor, FastCache::IocpLis
     if (r.has_value() && *r > 0)
         (void) co_await socket->Write(std::span<std::byte const> { buf.data(), *r });
     socket->Close();
-    reactor.Stop();
+    reactor->Stop();
     co_return;
 }
 
@@ -99,7 +103,7 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
     REQUIRE(listener->IsBound());
 
     std::string peer;
-    Echo(reactor, *listener, peer);
+    Echo(&reactor, listener.get(), &peer);
 
     // Client lives on a separate thread so the reactor thread (this one)
     // can drive the accept + read + write.
@@ -198,7 +202,7 @@ struct RawPair
     RawPair()
     {
         auto const acceptor = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        REQUIRE(acceptor != INVALID_SOCKET);
+        REQUIRE(acceptor != InvalidSocketValue);
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
@@ -209,13 +213,13 @@ struct RawPair
         REQUIRE(::getsockname(acceptor, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         client = static_cast<SOCKET>(ConnectClient(ntohs(addr.sin_port)));
         served = ::accept(acceptor, nullptr, nullptr);
-        REQUIRE(served != INVALID_SOCKET);
+        REQUIRE(served != InvalidSocketValue);
         ::closesocket(acceptor);
     }
 
     ~RawPair()
     {
-        if (client != INVALID_SOCKET)
+        if (client != InvalidSocketValue)
             ::closesocket(client);
     }
 

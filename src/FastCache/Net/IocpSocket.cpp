@@ -29,6 +29,12 @@
 namespace FastCache
 {
 
+// The typed sentinel in the header must be the platform's, or every comparison
+// below silently stops meaning what it says. Both operands are uintptr_t here, so
+// this assertion is not itself a mixed-sign comparison.
+static_assert(InvalidSocketValue == static_cast<std::uintptr_t>(INVALID_SOCKET),
+              "InvalidSocketValue must equal the platform's INVALID_SOCKET");
+
 namespace
 {
 
@@ -204,19 +210,23 @@ IocpSocket::IocpSocket(IocpReactor& reactor,
                        IocpAttachment attachment) noexcept:
     _impl { std::make_shared<Impl>(reactor, static_cast<SOCKET>(native)) },
     _native { native },
-    _peerAddress { std::move(peerAddress) }
-{
-    // Record whether the IOCP association succeeded. If it didn't, no
-    // completion will ever be dequeued for this socket; callers must check
-    // IsAttached() and abandon the connection instead of awaiting forever.
+    _peerAddress { std::move(peerAddress) },
+    // Whether the IOCP association succeeded. If it did not, no completion will
+    // ever be dequeued for this socket; callers must check IsAttached() and
+    // abandon the connection instead of awaiting forever.
     //
     // A caller that already associated the handle says so rather than letting
     // this repeat it: a second CreateIoCompletionPort on the same handle fails,
     // and reporting that as "not attached" would condemn a working connection.
     // `ConnectEx` forces that order, because it requires the association before
     // the operation is issued.
-    _attached = attachment == IocpAttachment::AlreadyAttached
-                || reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
+    //
+    // Reads the `native` PARAMETER rather than `_impl->native`: they are the same
+    // value, and taking it from the parameter removes a dependency on this
+    // initialiser running after `_impl`'s -- which member ORDER guarantees today
+    // and would silently stop guaranteeing if the members were reordered.
+    _attached { attachment == IocpAttachment::AlreadyAttached || reactor.AttachHandle(reinterpret_cast<void*>(native)) }
+{
 }
 
 // The teardown rule lives in `Async/ReactorTeardown.hpp`, not here.
@@ -269,7 +279,7 @@ void IocpSocket::Close() noexcept
     if (_closed)
         return;
     _closed = true;
-    if (_impl && _impl->native != INVALID_SOCKET)
+    if (_impl && _impl->native != InvalidSocketValue)
     {
         ::closesocket(_impl->native);
         _impl->native = INVALID_SOCKET;
@@ -278,7 +288,7 @@ void IocpSocket::Close() noexcept
 
 void IocpSocket::CancelRead() noexcept
 {
-    if (_closed || !_impl || _impl->native == INVALID_SOCKET)
+    if (_closed || !_impl || _impl->native == InvalidSocketValue)
         return;
     if (_impl->readOp.awaitable == nullptr)
         return;
@@ -526,9 +536,9 @@ struct IocpListener::Impl
         auto* awaitable = op->awaitable;
         op->awaitable = nullptr;
 
-        if (err != 0 || op->acceptSock == INVALID_SOCKET)
+        if (err != 0 || op->acceptSock == InvalidSocketValue)
         {
-            if (op->acceptSock != INVALID_SOCKET)
+            if (op->acceptSock != InvalidSocketValue)
             {
                 ::closesocket(op->acceptSock);
                 op->acceptSock = INVALID_SOCKET;
@@ -573,11 +583,19 @@ struct IocpListener::Impl
     {
     }
 
+    // It owns two sockets and closes both, so a copy or a move would double-close.
+    // It is held by shared_ptr and never copied; deleting these keeps that true by
+    // construction rather than by nobody having tried yet.
+    Impl(Impl const&) = delete;
+    Impl& operator=(Impl const&) = delete;
+    Impl(Impl&&) = delete;
+    Impl& operator=(Impl&&) = delete;
+
     ~Impl()
     {
-        if (current.acceptSock != INVALID_SOCKET)
+        if (current.acceptSock != InvalidSocketValue)
             ::closesocket(current.acceptSock);
-        if (listenSock != INVALID_SOCKET)
+        if (listenSock != InvalidSocketValue)
             ::closesocket(listenSock);
     }
 };
@@ -623,7 +641,10 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
                  SIO_GET_EXTENSION_FUNCTION_POINTER,
                  &guidAcceptEx,
                  sizeof(guidAcceptEx),
-                 &fn,
+                 // Explicit: `&fn` is a pointer to a FUNCTION pointer, and letting that
+                 // reach `LPVOID` implicitly is a multilevel conversion the analyser
+                 // refuses -- the arity is easy to get wrong and WSAIoctl cannot check it.
+                 static_cast<void*>(&fn),
                  sizeof(fn),
                  &bytesReturned,
                  nullptr,
@@ -646,7 +667,10 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
                  SIO_GET_EXTENSION_FUNCTION_POINTER,
                  &guidGetAcceptExSockaddrs,
                  sizeof(guidGetAcceptExSockaddrs),
-                 &getAddrsFn,
+                 // Explicit: `&getAddrsFn` is a pointer to a FUNCTION pointer, and letting that
+                 // reach `LPVOID` implicitly is a multilevel conversion the analyser
+                 // refuses -- the arity is easy to get wrong and WSAIoctl cannot check it.
+                 static_cast<void*>(&getAddrsFn),
                  sizeof(getAddrsFn),
                  &addrsBytesReturned,
                  nullptr,
@@ -672,7 +696,7 @@ std::unique_ptr<IocpListener> IocpListener::Bind(
 
 bool IocpListener::IsBound() const noexcept
 {
-    return _impl && _impl->listenSock != INVALID_SOCKET;
+    return _impl && _impl->listenSock != InvalidSocketValue;
 }
 
 std::string_view IocpListener::BindError() const noexcept
@@ -682,7 +706,7 @@ std::string_view IocpListener::BindError() const noexcept
 
 std::uint16_t IocpListener::BoundPort() const noexcept
 {
-    if (!_impl || _impl->listenSock == INVALID_SOCKET)
+    if (!_impl || _impl->listenSock == InvalidSocketValue)
         return 0;
     return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->listenSock));
 }
@@ -691,7 +715,7 @@ void IocpListener::Close() noexcept
 {
     if (!_impl)
         return;
-    if (_impl->listenSock != INVALID_SOCKET)
+    if (_impl->listenSock != InvalidSocketValue)
     {
         ::closesocket(_impl->listenSock);
         _impl->listenSock = INVALID_SOCKET;
@@ -720,7 +744,7 @@ AcceptAwaitable IocpListener::Accept()
     op.completion.overlapped = OVERLAPPED {};
 
     op.acceptSock = ::socket(_impl->family, SOCK_STREAM, IPPROTO_TCP);
-    if (op.acceptSock == INVALID_SOCKET)
+    if (op.acceptSock == InvalidSocketValue)
         return AcceptAwaitable { std::unexpected(MakeWsaError(WSAGetLastError(), "socket(accept)")) };
 
     DWORD bytesReceived = 0;
