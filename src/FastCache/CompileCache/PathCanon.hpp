@@ -369,4 +369,37 @@ using PathTransform = std::function<std::string(std::string_view)>;
 ///         @p from and @p to are equal, which is the common case.
 [[nodiscard]] std::string RewriteIncludeNoteMarker(std::string_view text, std::string_view from, std::string_view to);
 
+/// A producing machine's notes, re-spelled into the form a value is STORED in.
+///
+/// One of the two directions `RewriteIncludeNoteMarker` can be asked for, and the
+/// reason both exist as names is that the general form carries its direction in the
+/// ORDER OF TWO PARAMETERS OF THE SAME TYPE. Swapping them compiles, and it passes
+/// every test on every platform this project builds on: the only call sites are in
+/// `fastcache-cc/main.cpp`, which is in no test target, and on an English toolchain
+/// both directions are byte-exact no-ops. It would then poison every stored value on
+/// exactly the machines this exists to fix, silently. That is #700's own argument --
+/// `RenderShowIncludes` takes its marker required and undefaulted so a producer
+/// cannot drift from its parser -- applied to DIRECTION rather than to presence.
+///
+/// @param text           The captured region, in the producer's own spelling.
+/// @param producerMarker The prefix this machine's notes carry.
+/// @return The region with its notes carrying `IncludeNoteMarker`.
+[[nodiscard]] inline std::string NormalizeIncludeNoteMarker(std::string_view text, std::string_view producerMarker)
+{
+    return RewriteIncludeNoteMarker(text, producerMarker, IncludeNoteMarker);
+}
+
+/// A stored value's notes, re-spelled into the form THIS build's parser matches.
+///
+/// The inverse of `NormalizeIncludeNoteMarker`; see it for why the direction is a
+/// name rather than an argument position.
+///
+/// @param text           A localized region, carrying `IncludeNoteMarker`.
+/// @param consumerMarker The prefix this build's `msvc_deps_prefix` holds.
+/// @return The region with its notes carrying `consumerMarker`.
+[[nodiscard]] inline std::string RestoreIncludeNoteMarker(std::string_view text, std::string_view consumerMarker)
+{
+    return RewriteIncludeNoteMarker(text, IncludeNoteMarker, consumerMarker);
+}
+
 } // namespace FastCache::PathCanon

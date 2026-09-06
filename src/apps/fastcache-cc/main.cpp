@@ -1562,7 +1562,7 @@ struct MaterializedHit
     // because neither ever sees the other's prefix.
     std::array<std::string, ReplayRegionCount> replayed;
     for (std::size_t idx = 0; idx < localized.size() && idx < replayed.size(); ++idx)
-        replayed[idx] = PathCanon::RewriteIncludeNoteMarker(localized[idx].bytes, Cc::IncludeNoteMarker, showIncludesMarker);
+        replayed[idx] = PathCanon::RestoreIncludeNoteMarker(localized[idx].bytes, showIncludesMarker);
     ReplayStreams(replayed[0], replayed[1]);
     return NotMaterialized(HitDisposition::Served);
 }
@@ -2517,57 +2517,79 @@ void RecordManifest(Config const& cfg,
             if (!decoded.has_value())
             {
                 NoteUndecodableValue("the fetched object", decoded.error());
-                return Warn(DecodeFailureReason(decoded.error()));
+                // CARRY ON rather than return, and that is what makes a generation
+                // bump cost one cold cache instead of a permanent outage.
+                //
+                // `Warn` returns `nullopt`, and a `nullopt` out of `RunCached` reaches
+                // `RunPassthrough` -- a plain compile with NO STORE. The key is
+                // unchanged by a generation bump (only `objkey-v*` moves a key, and a
+                // generation is deliberately not that), so the refused value stays
+                // under the very key this build just computed, is fetched and refused
+                // again on every later build, and is never overwritten. After an
+                // upgrade that is EVERY key in the cache: a fleet that never caches
+                // anything again, presenting as a slow build with a `--show-stats`
+                // reason nobody reads.
+                //
+                // Falling through reaches the MISS path, whose STORE overwrites this
+                // key with a value of this generation -- which is exactly what the
+                // STALE-hit branch below already does, and for the same reason stated
+                // there. `WarnAndCarryOn` is the spelling the fetch-failure arms above
+                // use; the bucket an operator sees is unchanged.
+                WarnAndCarryOn(DecodeFailureReason(decoded.error()));
             }
-
-            // HIT: check what the value asserts, then write the object, reproduce
-            // the depfile, and replay the streams (all with paths localized).
-            //
-            // Reproducing the depfile is not optional: skipping it silently breaks
-            // incremental builds, because Ninja/Make would see no header
-            // dependencies for this TU and stop rebuilding it when they change.
-            auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
-            if (materialized.disposition == HitDisposition::Unusable)
-                return Warn("could not write object on hit");
-            if (materialized.disposition == HitDisposition::Served)
+            else
             {
-                invocation.valueBytes = decoded->objectBlob.size();
-                invocation.cacheMs = MsSince(cacheStarted);
 
-                // Backfill the direct-mode manifest from the hit we just served.
+                // HIT: check what the value asserts, then write the object, reproduce
+                // the depfile, and replay the streams (all with paths localized).
                 //
-                // Without this, direct mode could never populate on a cache that already
-                // holds preprocessed-key entries: manifests would only ever be written by
-                // the miss path, so a warm cache would preprocess forever.
-                //
-                // From THIS machine's probe rather than from the value's replayed
-                // /showIncludes text, which is what it used to read. Both name the same
-                // headers, but the replayed text was written by the producer's compiler
-                // in the producer's language, so parsing it made the backfill work only
-                // between machines that happened to share a locale (issue #692). The
-                // probe already ran, so this still costs no compiler invocation.
-                if (cfg.direct)
-                    RecordManifest(
-                        cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
+                // Reproducing the depfile is not optional: skipping it silently breaks
+                // incremental builds, because Ninja/Make would see no header
+                // dependencies for this TU and stop rebuilding it when they change.
+                auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
+                if (materialized.disposition == HitDisposition::Unusable)
+                    return Warn("could not write object on hit");
+                if (materialized.disposition == HitDisposition::Served)
+                {
+                    invocation.valueBytes = decoded->objectBlob.size();
+                    invocation.cacheMs = MsSince(cacheStarted);
 
-                // The preprocessed-key hit, verified exactly as the direct-mode one
-                // is. Both paths, because a wrong object served through either is the
-                // same defect and a feature that covered one would be a feature an
-                // operator could not rely on (#423).
-                ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
-                TraceOutcome("HIT", key);
-                return 0;
+                    // Backfill the direct-mode manifest from the hit we just served.
+                    //
+                    // Without this, direct mode could never populate on a cache that already
+                    // holds preprocessed-key entries: manifests would only ever be written by
+                    // the miss path, so a warm cache would preprocess forever.
+                    //
+                    // From THIS machine's probe rather than from the value's replayed
+                    // /showIncludes text, which is what it used to read. Both name the same
+                    // headers, but the replayed text was written by the producer's compiler
+                    // in the producer's language, so parsing it made the backfill work only
+                    // between machines that happened to share a locale (issue #692). The
+                    // probe already ran, so this still costs no compiler invocation.
+                    if (cfg.direct)
+                        RecordManifest(
+                            cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
+
+                    // The preprocessed-key hit, verified exactly as the direct-mode one
+                    // is. Both paths, because a wrong object served through either is the
+                    // same defect and a feature that covered one would be a feature an
+                    // operator could not rely on (#423).
+                    ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
+                    TraceOutcome("HIT", key);
+                    return 0;
+                }
+                // Stale: the object is fine but the dependency record it carries is not
+                // true here, so fall through and compile for real. The STORE that follows
+                // overwrites this very key with a correct one, which is what repairs the
+                // entry rather than leaving it to poison every later build.
+                //
+                // And if that STORE is refused for any reason, the build still converges:
+                // the real compiler ran, so a correct depfile is on disk regardless, and
+                // the cost degrades to a permanent miss for this key.
             }
-            // Stale: the object is fine but the dependency record it carries is not
-            // true here, so fall through and compile for real. The STORE that follows
-            // overwrites this very key with a correct one, which is what repairs the
-            // entry rather than leaving it to poison every later build.
-            //
-            // And if that STORE is refused for any reason, the build still converges:
-            // the real compiler ran, so a correct depfile is on disk regardless, and
-            // the cost degrades to a permanent miss for this key.
         }
-        // MISS — fall through to compile.
+        // MISS — fall through to compile. A refused generation arrives here too,
+        // which is what turns a bump into one cold cache rather than a dead one.
     }
     invocation.cacheMs = MsSince(cacheStarted);
     // Only a daemon that answered produces a MISS. A refusal and a transport
@@ -2665,8 +2687,8 @@ void RecordManifest(Config const& cfg,
     // therefore still not canonicalized, and cannot be until the prefix is
     // discovered from the compiler (#878); it is unchanged rather than worsened,
     // because an unmatched marker rewrites nothing.
-    auto const storedOut = PathCanon::RewriteIncludeNoteMarker(run->out, cfg.showIncludesMarker, Cc::IncludeNoteMarker);
-    auto const storedErr = PathCanon::RewriteIncludeNoteMarker(run->err, cfg.showIncludesMarker, Cc::IncludeNoteMarker);
+    auto const storedOut = PathCanon::NormalizeIncludeNoteMarker(run->out, cfg.showIncludesMarker);
+    auto const storedErr = PathCanon::NormalizeIncludeNoteMarker(run->err, cfg.showIncludesMarker);
     auto const includeTextOut = reconciler.Region(storedOut, IncludeGrammar());
     auto const includeTextErr = reconciler.Region(storedErr, IncludeGrammar());
     value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextOut });

@@ -297,12 +297,21 @@ namespace
     /// Where a `/showIncludes` note's marker ENDS on one line, or npos when the
     /// line is not a note.
     ///
-    /// The single recognition rule, because three things ask the question and they
-    /// must give one answer: `SplitLine`, which finds the path span to rewrite;
-    /// `RewriteIncludeNoteMarker`, which re-spells the prefix in front of it; and,
-    /// one layer up, the launcher's `IncludeNotePath`. A line one of them calls a
-    /// note and another does not is a stored region carrying a canonical token
-    /// under a prefix nobody can find, or the reverse.
+    /// The one recognition rule for the two readers IN THIS FILE: `SplitLine`, which
+    /// finds the path span to rewrite, and `RewriteIncludeNoteMarker`, which re-spells
+    /// the prefix in front of it. A line one of them calls a note and the other does
+    /// not is a stored region carrying a canonical token under a prefix nobody can
+    /// find, or the reverse.
+    ///
+    /// **The launcher's `IncludeNotePath` is a THIRD reader and does not share this**,
+    /// which is stated rather than implied because two hand-maintained copies of this
+    /// rule is exactly the mechanism that produced
+    /// [#891](https://github.com/LASTRADA-Software/fastcached/issues/891): that one
+    /// skipped leading blanks while `SplitLine` demanded column zero, and nothing made
+    /// them agree. They agree again now, by hand, which is the same footing. Promoting
+    /// this helper to the header and calling it from `IncludeNotePath` is the repair --
+    /// legal and free, since the app->library edge and the `_fc_cc_core` link edge both
+    /// already exist -- and it is deliberately not folded in here.
     ///
     /// Anchored at the start of the line, and nothing may precede it but blanks.
     /// That is load-bearing on the launcher's side of the same rule: the splitter

@@ -344,7 +344,8 @@ mixed fleet on an older build still has it.
 A note's prefix is now a *canonical form*, exactly as `<SRCROOT>` is a canonical form
 for a checkout root. The launcher rewrites its own prefix to the English
 `Note: including file:` before a value is stored, and rewrites it back to this build's
-prefix when a hit is replayed — so what crosses the wire is locale-free, and neither
+prefix when a hit is replayed (`NormalizeIncludeNoteMarker` and
+`RestoreIncludeNoteMarker` — the direction is a name, not an argument position) — so what crosses the wire is locale-free, and neither
 machine ever sees the other's prefix. That is why nothing on either server changed:
 they only ever canonicalize the one spelling. It is the launcher that does both
 rewrites, and it has to be, since only the producing machine knows what language its
@@ -359,7 +360,11 @@ the identity probe is forced to English,
 `CompileValueVersion` to 3
 ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)), so a value written
 by a generation-2 build is refused rather than replayed. **Expect one cold cache on the
-upgrade**; that is the cost of retiring values whose regions were never canonicalized.
+upgrade** — one, because a refused generation now falls through to the miss path and the
+STORE that follows overwrites the key with a value of this generation. A bump that
+refused and then declined to re-store would leave the old value under a key that does not
+change with the generation, fetched and refused on every later build: not a cold cache but
+a dead one.
 
 What this still does **not** cover. A *local* compile on a localized toolchain that has
 **not** set this variable stores a region the launcher cannot normalize, because nothing
@@ -368,9 +373,23 @@ such a machine is exactly where it was rather than worse. Discovering the prefix
 the compiler is
 [#878](https://github.com/LASTRADA-Software/fastcached/issues/878), and it needs no
 further generation: the stored form is already locale-free, so #878 only supplies a
-better value to normalize with. Setting this variable is therefore the way to get a
-localized machine's regions canonicalized today, in addition to fixing its dispatched
-notes.
+better value to normalize with. Setting this variable fixes a localized machine's
+dispatched notes, and for an **ASCII** prefix it also gets that machine's stored regions
+canonicalized.
+
+**It does not do the second for a non-ASCII prefix, and that is a known gap rather than
+a claim being made carefully.** The value arrives from the environment in this process's
+narrow text, which this project forces to UTF-8, while a local `cl` writes its notes in
+the **console output code page** — the same mismatch `RootReconciler` is handed a
+`HostNarrowTextPolicy` to deal with for paths. German happens to work because its prefix
+is ASCII; the Japanese and Chinese catalogues use a full-width colon (`U+FF1A`) and the
+Russian one is wholly non-ASCII, so the two byte strings differ, nothing matches, and the
+region is stored uncanonicalized with no diagnostic. A **dispatched** compile on the same
+host is unaffected, because the launcher synthesises those notes from the same UTF-8
+value it compares against. Decoding the marker through the same policy as the paths is
+the repair, and it belongs with
+[#878](https://github.com/LASTRADA-Software/fastcached/issues/878), which is already the
+ticket for learning the prefix properly.
 
 ## How it works
 
