@@ -522,6 +522,41 @@ PreprocessArgv() {
     python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
 import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
+
+
+def SplitCommand(entry):
+    """Split a compile-database `command` string into an argv.
+
+    `shlex.split` defaults to POSIX rules, in which a backslash ESCAPES the next
+    character -- so a Windows database, whose every path is `D:\\a\\...`, comes
+    back with the separators eaten: `D:afastcachedfastcached...`. clang-cl then
+    reports `no such file or directory` for a file that is plainly there, and the
+    Windows leg spent those units analysing nothing while looking like it had.
+
+    Which rule applies is a property of the DATABASE, not of the host running this
+    script, so it is read off the entry's own `directory`: a drive-letter root
+    means the command was built by a Windows generator and its backslashes are
+    path separators rather than escapes. Sniffing the host would be wrong for a
+    database copied between machines, and sniffing for a leading `/` is the
+    mistake this file's own header warns about one function down.
+    """
+    command = entry.get("command") or ""
+    if not command:
+        return []
+    windows = re.match(r"^[A-Za-z]:[\\/]", entry.get("directory", "")) is not None
+    if not windows:
+        return shlex.split(command)
+    lexer = shlex.shlex(command, posix=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    argv = []
+    for token in lexer:
+        # `posix=False` keeps the quote characters, which the POSIX mode strips.
+        if len(token) > 1 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        argv.append(token)
+    return argv
+
 try:
     entries = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
@@ -530,7 +565,11 @@ target = sys.argv[2].replace("\\", "/")
 for entry in entries:
     path = entry.get("file", "").replace("\\", "/")
     if path == target or path.endswith("/" + target):
-        argv = shlex.split(entry.get("command") or "") or list(entry.get("arguments", []))
+        # `arguments` first: it is already a list, so nothing has to be re-parsed.
+        # CMake's Ninja generator writes `command`, so the split below is the usual
+        # path -- but when a generator does provide `arguments`, splitting a string
+        # we did not have to build is pure risk.
+        argv = list(entry.get("arguments") or []) or SplitCommand(entry)
         driver = re.sub(r"\.exe$", "", (argv[0] if argv else "").replace("\\", "/").rsplit("/", 1)[-1], flags=re.I)
         clStyle = re.match(r"^(.*-)?(clang-)?cl(-[0-9.]+)?$", driver, re.I) is not None
         out, skip = [], False
@@ -710,6 +749,31 @@ SelfTest() {
     }
 
     echo "TIDY SWEEP SELF-TEST"
+
+    # `PreprocessArgv` against a WINDOWS compile database. `shlex.split` defaults to
+    # POSIX rules where a backslash escapes the next character, so every path in a
+    # Windows `command` string came back with its separators eaten -- clang-cl then
+    # answered `no such file or directory` for a file that is plainly there, and the
+    # Windows leg reported on five units it had never opened.
+    #
+    # Both database shapes, because the fix must not change the POSIX one: the split
+    # rule is a property of the DATABASE and is read off its own `directory`.
+    mkdir -p "$scratch/wdb" "$scratch/pdb"
+    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo /c /FoCMakeFiles\\x.obj D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
+        > "$scratch/wdb/compile_commands.json"
+    printf '%s' '[{"directory":"/home/u/build","command":"/usr/bin/clang++ -c -o CMakeFiles/x.o /home/u/src/N/P.cpp","file":"/home/u/src/N/P.cpp"}]' \
+        > "$scratch/pdb/compile_commands.json"
+
+    # The source path must survive intact, and `/c` and `/Fo` must be gone with `/E`
+    # appended -- a cl grammar keeping `/c` writes the preprocessed text into the
+    # OBJECT file and leaves stdout empty, which reads as an honest `empty`.
+    Expect "a Windows database keeps its path separators" \
+           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"D:\\a\\proj\\src\\N\\W.cpp"$'\n'"/E" \
+           "$(PreprocessArgv "$scratch/wdb" src/N/W.cpp)"
+
+    Expect "a POSIX database is unchanged by the Windows rule" \
+           "/home/u/build"$'\n'"/usr/bin/clang++"$'\n'"/home/u/src/N/P.cpp"$'\n'"-E" \
+           "$(PreprocessArgv "$scratch/pdb" src/N/P.cpp)"
     # A header two levels down still reaches the translation unit at the top --
     # and a `.c` unit is one of them, which is the assertion that stops the
     # translation-unit table from silently drifting back to "only `.cpp`".
