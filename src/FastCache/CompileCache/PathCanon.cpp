@@ -312,6 +312,20 @@ namespace
     /// it is milder and still real — both regions the launcher stores are tagged
     /// `ShowIncludes` and one of them is the diagnostic stream.
     ///
+    /// **Leading blanks are skipped because `cl` INDENTS a note by inclusion depth**,
+    /// and this grammar used to demand the marker at column zero while
+    /// `IncludeNotePath` already skipped them. Nothing made the two agree, so a note
+    /// for anything a header pulled in transitively — which is essentially all of
+    /// them — had its path found by the launcher's reader and NOT by the
+    /// canonicalizer, and the region was stored with the producing checkout's
+    /// absolute paths in it. Independent of language, so it reached every MSVC direct
+    /// compile with an include tree deeper than one
+    /// ([#891](https://github.com/LASTRADA-Software/fastcached/issues/891)).
+    ///
+    /// The indentation itself is not part of the match and is preserved verbatim by
+    /// both callers: Ninja ignores it, and rewriting it would be a change to text no
+    /// defect asked for.
+    ///
     /// @param body   One line, already stripped of its terminators.
     /// @param marker The prefix a note begins with.
     /// @return The offset just past `marker`, or npos when `body` is not a note.
@@ -319,9 +333,12 @@ namespace
     {
         // An empty marker would otherwise match at the head of every line, which
         // turns "this build does not know its own prefix" into "rewrite everything".
-        if (marker.empty() || !body.starts_with(marker))
+        if (marker.empty())
             return std::string_view::npos;
-        return marker.size();
+        auto const indent = body.find_first_not_of(" \t");
+        if (indent == std::string_view::npos || !body.substr(indent).starts_with(marker))
+            return std::string_view::npos;
+        return indent + marker.size();
     }
 
     /// Split a line into (leading text kept verbatim, path span, trailing text kept

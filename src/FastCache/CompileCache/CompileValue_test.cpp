@@ -773,6 +773,37 @@ constexpr std::array ConformanceCorpus {
                       .producerEffect = RegionEffect::Rewrites,
                       .consumerEffect = RegionEffect::Rewrites,
                       .replayMarkerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "an indented note canonicalizes, and its depth survives",
+                      // #891, and it needs no language pack: `cl` indents a note by
+                      // inclusion depth, so this is what a note for anything a header
+                      // pulls in transitively looks like. The grammar demanded the
+                      // marker at column zero while `IncludeNotePath` already skipped
+                      // blanks, so the launcher's reader found these paths and the
+                      // canonicalizer did not.
+                      //
+                      // The first line is at depth zero deliberately -- the control,
+                      // in the same region as the thing it controls, so "recognise an
+                      // indented note" and "recognise a note at all" cannot be one
+                      // passing assertion. Both must rewrite, and the tabs and spaces
+                      // between them must come through untouched.
+                      .producerSourceRoot = R"(C:\ci\deep\src)",
+                      .producerBuildTree = R"(C:\ci\deep\build)",
+                      .consumerSourceRoot = R"(D:\project)",
+                      .consumerBuildTree = R"(D:\project\build)",
+                      .text = "Note: including file: "
+                              R"(C:\ci\deep\src\a.h)"
+                              "\r\n"
+                              " Note: including file: "
+                              R"(C:\ci\deep\src\b.h)"
+                              "\r\n"
+                              "\t  Note: including file: "
+                              R"(C:\ci\deep\build\gen\cfg.h)"
+                              "\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Preserves,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites,
+                      .replayMarkerEffect = RegionEffect::Preserves },
     ConformanceCase { .name = "a diagnostic quoting the marker mid-line is not a note",
                       // The anchor, on the side that matters. Both regions a launcher
                       // stores are tagged `ShowIncludes` and one of them is the
@@ -846,7 +877,7 @@ constexpr std::array StoredValueGenerations {
     // note both canonicalized to nothing and their regions kept the producing
     // checkout's absolute paths.
     StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
-    StoredValueGeneration { .digest = "14d6cd7b416e7d50c92f687e3a24451d0a753c6f34a65faa3ee319a85f3e6b12", .version = 3 },
+    StoredValueGeneration { .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e", .version = 3 },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
