@@ -1498,7 +1498,25 @@ sizing_pid="$started_pid"
 # The count itself depends on the runner, so what is asserted is that it is a
 # positive number and that the class reached the worker -- not a fixed value, which
 # would make this case a report about the CI machine rather than about the code.
-sizing_slots="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p" "${workdir}/sizing.log" | head -1)"
+# BOUNDED, not one-shot. The comment above is right that the slot count is a field
+# of the readiness line itself -- but `wait_for_log` matches the MARKER, and a line
+# whose tail has not reached the file yet satisfies that match while this pattern
+# still finds nothing. Under a loaded parallel ctest that cost a wrong "the worker
+# did not report a derived slot count" about a worker that reports it a moment
+# later: roughly one run in two at `-j 12`, and 5 of 5 passes when run alone, which
+# is what says it is timing rather than slot derivation (#301).
+#
+# `wait_until` and not a sleep, for the reason the rulebook gives: the bound is read
+# from a clock and its timeout reports the MEASURED elapsed, so a slow machine and a
+# worker that never sizes itself are told apart rather than both reading as a stall.
+sizing_slots=""
+_sizing_slots_ready() {
+    sizing_slots="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p" "${workdir}/sizing.log" | head -1)"
+    [ -n "$sizing_slots" ]
+}
+wait_until _sizing_slots_ready \
+    "the sizing worker to report a derived slot count for its node class" \
+    "$sizing_pid" "${workdir}/sizing.log" 30
 [[ -n "$sizing_slots" ]] \
     || { cat "${workdir}/sizing.log" >&2; fail "the worker did not report a derived slot count for its node class"; }
 [[ "$sizing_slots" -ge 1 ]] \
