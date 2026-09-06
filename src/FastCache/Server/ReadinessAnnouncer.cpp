@@ -17,15 +17,54 @@ ReadinessAnnouncer::~ReadinessAnnouncer()
 {
     if (Announced())
         return;
+
     // The one state that would otherwise have no line of its own. A waiter blocked
-    // on the readiness marker needs the log to say why it never came, and "how many
-    // of how many" is what distinguishes a daemon that failed to bind from one whose
-    // acceptors were still coming up when it was told to stop.
-    _logger.Logf(LogLevel::Warn,
-                 "readiness was never announced: {} of {} acceptor(s) armed ({})",
-                 ArmedCount(),
-                 ExpectedCount(),
-                 _endpointSummary);
+    // on the readiness marker needs the log to say why it never came.
+    //
+    // **THREE states reach here and a bare "{} of {}" renders two of them as `0 of
+    // 0`.** `MaybeAnnounce` requires sealed AND expected > 0 AND armed >= expected,
+    // so failing any one of those arrives at this destructor:
+    //
+    //   - the set was never CLOSED -- the spawn loop did not reach
+    //     `AcceptorsAllSpawned()`;
+    //   - it was closed with NOTHING registered -- no acceptor was ever created;
+    //   - it was closed and some participant never armed.
+    //
+    // `0 of 0` is arithmetically complete and reads as vacuous success, which is the
+    // `all_of` over an empty range this repository refuses elsewhere (`ValidateManifest`
+    // on an empty dependency set; `node-config-reference` when either scan matches
+    // nothing, "because two empty lists agree perfectly"). Worse, an unclosed set that
+    // HAD registered participants renders as "3 of 5" -- indistinguishable from a
+    // closed set whose acceptors failed to arm, which is a different fault fixed in a
+    // different place.
+    //
+    // So the SEAL is reported, not inferred from the counts: it is the fact that
+    // separates them, and it is the one the counts cannot carry
+    // ([#736](https://github.com/LASTRADA-Software/fastcached/issues/736)).
+    auto const expected = ExpectedCount();
+    auto const armed = ArmedCount();
+
+    if (!_sealed.load(std::memory_order_acquire))
+    {
+        _logger.Logf(LogLevel::Warn,
+                     "readiness was never announced: the acceptor set was never closed, "
+                     "{} registered and {} armed ({})",
+                     expected,
+                     armed,
+                     _endpointSummary);
+        return;
+    }
+
+    if (expected == 0)
+    {
+        _logger.Logf(LogLevel::Warn,
+                     "readiness was never announced: the acceptor set was closed with none registered ({})",
+                     _endpointSummary);
+        return;
+    }
+
+    _logger.Logf(
+        LogLevel::Warn, "readiness was never announced: {} of {} acceptor(s) armed ({})", armed, expected, _endpointSummary);
 }
 
 void ReadinessAnnouncer::ExpectAcceptor()
