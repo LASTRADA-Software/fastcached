@@ -3822,3 +3822,62 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
 }
 
 #endif
+
+TEST_CASE("A cache the operator NAMED is refused when no node surface can serve it", "[node-config]")
+{
+    // #229. The tier is served on the node surface, so with no `--listen-node`
+    // there is nothing to reach it through -- and an operator who configured 64 GiB
+    // of cache got none of it and one line at boot. The tier does say so now, and
+    // names the flags, which is better than the silence originally reported; a
+    // refusal is what the ticket asks for, because an Info line hours back in an
+    // event log is not an answer.
+    //
+    // In `StartupPolicyRejection` and not the tier, so `--install-service` refuses
+    // it too: a registration bakes the command line in and replays it at every
+    // boot, into a log nobody reads.
+
+    SECTION("an explicit --cache-memory with no port is refused, and names both flags")
+    {
+        auto cfg = Installable();
+        cfg.nodeListen = {};
+        cfg.cacheMemoryExplicit = true;
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--listen-node"));
+        CHECK(Unwrap(refusal).contains("--cache-memory"));
+    }
+
+    SECTION("a --cache-dir with no port is refused")
+    {
+        auto cfg = Installable();
+        cfg.nodeListen = {};
+        cfg.cacheDir = "/var/lib/fastcache-node/cache";
+        REQUIRE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    // The other direction, and it is what stops this refusing a correct tree: a node
+    // that asked for NO cache still starts without a port. `--cache-memory` has a
+    // default, so keying on the value rather than on the explicit bit would refuse
+    // every portless node in the tree.
+    SECTION("a node that named no cache still starts without a port")
+    {
+        auto cfg = Installable();
+        cfg.nodeListen = {};
+        cfg.cacheMemoryExplicit = false;
+        cfg.cacheDir.clear();
+        auto const refusal = StartupPolicyRejection(cfg);
+        if (refusal.has_value())
+            CHECK_FALSE(Unwrap(refusal).contains("--cache-memory or --cache-dir"));
+    }
+
+    // And a configured cache WITH a port is fine, which is the ordinary case.
+    SECTION("a configured cache with a port is not refused for this reason")
+    {
+        auto cfg = Installable();
+        cfg.cacheMemoryExplicit = true;
+        cfg.cacheDir = "/var/lib/fastcache-node/cache";
+        auto const refusal = StartupPolicyRejection(cfg);
+        if (refusal.has_value())
+            CHECK_FALSE(Unwrap(refusal).contains("--cache-memory or --cache-dir"));
+    }
+}
