@@ -524,38 +524,76 @@ import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
 
 
+def SplitWindowsCommand(command):
+    """Split a Windows command line the way the C runtime does.
+
+    `shlex` cannot do this, in either mode. POSIX mode treats a backslash as an
+    ESCAPE, so every path loses its separators; non-POSIX mode with
+    `whitespace_split` does not recognise a quote that BEGINS mid-token, so
+    `-I"C:\\Program Files\\..."` splits at the space and clang-cl reports
+    `no such file or directory` for half of it. Both were observed on this leg --
+    the second while fixing the first, which is why this is a parser and not a
+    third guess at a shlex flag.
+
+    The rules are the documented ones: 2n backslashes before a quote are n
+    backslashes and a quote toggle, 2n+1 are n backslashes and a literal quote,
+    and backslashes not before a quote are literal.
+    """
+    argv, cur, started, quoted, i, n = [], [], False, False, 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            run = 0
+            while i < n and command[i] == "\\":
+                run += 1
+                i += 1
+            if i < n and command[i] == '"':
+                cur.append("\\" * (run // 2))
+                started = True
+                if run % 2:
+                    cur.append('"')
+                else:
+                    quoted = not quoted
+                i += 1
+            else:
+                cur.append("\\" * run)
+                started = True
+            continue
+        if ch == '"':
+            quoted = not quoted
+            started = True
+            i += 1
+            continue
+        if not quoted and ch in " \t":
+            if started:
+                argv.append("".join(cur))
+                cur, started = [], False
+            i += 1
+            continue
+        cur.append(ch)
+        started = True
+        i += 1
+    if started:
+        argv.append("".join(cur))
+    return argv
+
+
 def SplitCommand(entry):
     """Split a compile-database `command` string into an argv.
 
-    `shlex.split` defaults to POSIX rules, in which a backslash ESCAPES the next
-    character -- so a Windows database, whose every path is `D:\\a\\...`, comes
-    back with the separators eaten: `D:afastcachedfastcached...`. clang-cl then
-    reports `no such file or directory` for a file that is plainly there, and the
-    Windows leg spent those units analysing nothing while looking like it had.
-
     Which rule applies is a property of the DATABASE, not of the host running this
     script, so it is read off the entry's own `directory`: a drive-letter root
-    means the command was built by a Windows generator and its backslashes are
-    path separators rather than escapes. Sniffing the host would be wrong for a
-    database copied between machines, and sniffing for a leading `/` is the
+    means a Windows generator built the command. Sniffing the host would be wrong
+    for a database copied between machines, and sniffing for a leading `/` is the
     mistake this file's own header warns about one function down.
     """
     command = entry.get("command") or ""
     if not command:
         return []
-    windows = re.match(r"^[A-Za-z]:[\\/]", entry.get("directory", "")) is not None
-    if not windows:
-        return shlex.split(command)
-    lexer = shlex.shlex(command, posix=False)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    argv = []
-    for token in lexer:
-        # `posix=False` keeps the quote characters, which the POSIX mode strips.
-        if len(token) > 1 and token[0] == token[-1] and token[0] in "\"'":
-            token = token[1:-1]
-        argv.append(token)
-    return argv
+    if re.match(r"^[A-Za-z]:[\\/]", entry.get("directory", "")):
+        return SplitWindowsCommand(command)
+    return shlex.split(command)
+
 
 try:
     entries = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -759,16 +797,19 @@ SelfTest() {
     # Both database shapes, because the fix must not change the POSIX one: the split
     # rule is a property of the DATABASE and is read off its own `directory`.
     mkdir -p "$scratch/wdb" "$scratch/pdb"
-    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo /c /FoCMakeFiles\\x.obj D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
+    printf '%s' '[{"directory":"D:\\a\\proj\\build","command":"C:\\LLVM\\clang-cl.exe /nologo -I\"C:\\Program Files\\OpenSSL\\include\" /c /FoCMakeFiles\\x.obj D:\\a\\proj\\src\\N\\W.cpp","file":"D:\\a\\proj\\src\\N\\W.cpp"}]' \
         > "$scratch/wdb/compile_commands.json"
     printf '%s' '[{"directory":"/home/u/build","command":"/usr/bin/clang++ -c -o CMakeFiles/x.o /home/u/src/N/P.cpp","file":"/home/u/src/N/P.cpp"}]' \
         > "$scratch/pdb/compile_commands.json"
 
-    # The source path must survive intact, and `/c` and `/Fo` must be gone with `/E`
-    # appended -- a cl grammar keeping `/c` writes the preprocessed text into the
-    # OBJECT file and leaves stdout empty, which reads as an honest `empty`.
-    Expect "a Windows database keeps its path separators" \
-           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"D:\\a\\proj\\src\\N\\W.cpp"$'\n'"/E" \
+    # The source path must survive intact, `/c` and `/Fo` must be gone with `/E`
+    # appended, and the QUOTED SPACE in `Program Files` must hold together -- that
+    # last is what broke the first attempt: a shlex lexer with `whitespace_split`
+    # does not recognise a quote that begins mid-token, so the include split at the
+    # space and clang-cl reported half of it missing. A fixture with no space in it
+    # passes under that bug.
+    Expect "a Windows database keeps its path separators and its quoted spaces" \
+           "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"-IC:\\Program Files\\OpenSSL\\include"$'\n'"D:\\a\\proj\\src\\N\\W.cpp"$'\n'"/E" \
            "$(PreprocessArgv "$scratch/wdb" src/N/W.cpp)"
 
     Expect "a POSIX database is unchanged by the Windows rule" \
