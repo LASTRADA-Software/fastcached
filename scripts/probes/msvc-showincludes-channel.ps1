@@ -1,0 +1,116 @@
+# Which stream does `cl /showIncludes` write its notes to, with and without `/EP`?
+#
+# This is the measurement #825 asks for and nobody on this team could take: it needs a
+# real MSVC toolchain and every maintainer here is on Linux. Committed so that whoever
+# next has a Windows host can settle it with one command instead of re-deriving the
+# question -- a citation people can re-run is one they stop re-litigating, which is the
+# idiom `redis-eof-semantics.py` and `ninja-msvc-deps-prefix.sh` set.
+#
+# ## The contradiction it settles
+#
+# Three sites in this tree said `cl` writes `/showIncludes` on **stderr**; the analysis
+# on #700 and the review of #821 said **stdout**. Neither was measured. All three sites
+# now say UNVERIFIED and point at `.agent/rules/compile-cache.md`, which states the
+# question once -- so the tree no longer contradicts itself, and this is what replaces
+# "unverified" with an answer.
+#
+# The `clang-cl` half IS measured (LLVM D46394): `/c` puts notes on stdout, `/EP` moves
+# them to stderr so they do not corrupt the preprocessed text. Case 3 re-measures it
+# here as a CONTROL -- if it disagrees with D46394 the probe itself is wrong, and no
+# verdict about `cl` from the same run should be believed.
+#
+# ## Why it matters even though nothing is broken today
+#
+# At the one site that reads it, both regions are tagged `ShowIncludes` either way, so
+# the replay is correct under either reading. It stops being inert the moment something
+# ACTS on the channel, and something nearly did: #821 built a dispatch refusal on a
+# predicate fed from stderr alone. Under one reading that guard covers `cl`; under the
+# other it cannot fire for `cl` at all.
+#
+# ## Running it
+#
+#     powershell -ExecutionPolicy Bypass -File scripts\probes\msvc-showincludes-channel.ps1
+#
+# From a Visual Studio developer prompt, or anywhere `cl` and `clang-cl` are on PATH.
+# Streams are captured to SEPARATE FILES rather than to a pipeline, because PowerShell's
+# merge operators would answer the very question being asked.
+#
+# Record the output on #825, including the toolchain version and whether a language pack
+# is installed: the answer may differ for a localized `cl`, which is the case #700 is
+# about, and a reading taken on an en-US install does not settle a localized one.
+
+$ErrorActionPreference = 'Stop'
+$work = Join-Path ([System.IO.Path]::GetTempPath()) ("showincludes-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $work | Out-Null
+
+try {
+    # A header the note must name, so a matched line is provably about THIS include and
+    # not some toolchain header that happens to appear.
+    $marker = 'fastcache_probe_header.h'
+    Set-Content -Path (Join-Path $work $marker) -Value '/* probe */' -Encoding Ascii
+    Set-Content -Path (Join-Path $work 'tu.cpp') -Value @"
+#include "$marker"
+int main() { return 0; }
+"@ -Encoding Ascii
+
+    function Measure-Channel {
+        param([string]$Driver, [string]$Label, [string[]]$ExtraArgs)
+
+        # The label is prose ("cl /EP"); a filename cannot carry its slash or space on
+        # Windows, and a failed redirect would make every reading NEITHER -- which this
+        # probe reports as "not a channel answer" rather than silently as stderr.
+        $slug = $Label -replace '[^A-Za-z0-9]', '_'
+        $out = Join-Path $work "$slug.out"
+        $err = Join-Path $work "$slug.err"
+        $argv = @('/nologo', '/showIncludes') + $ExtraArgs + @('tu.cpp')
+
+        $p = Start-Process -FilePath $Driver -ArgumentList $argv -WorkingDirectory $work `
+                           -RedirectStandardOutput $out -RedirectStandardError $err `
+                           -NoNewWindow -PassThru -Wait -ErrorAction SilentlyContinue
+        if ($null -eq $p) {
+            Write-Host ("  {0,-22} DRIVER NOT FOUND ({1}) -- no reading, not a result" -f $Label, $Driver)
+            return
+        }
+
+        # The note is identified by naming the probe header, never by the English
+        # prefix: a localized toolchain writes a different sentence, and matching the
+        # sentence would make this probe answer only for en-US -- which is the exact
+        # class of mistake #700 records.
+        $onOut = @(Select-String -Path $out -SimpleMatch $marker -ErrorAction SilentlyContinue).Count
+        $onErr = @(Select-String -Path $err -SimpleMatch $marker -ErrorAction SilentlyContinue).Count
+
+        $verdict =
+            if ($onOut -gt 0 -and $onErr -gt 0) { 'BOTH -- unexpected, report it' }
+            elseif ($onOut -gt 0)               { 'stdout' }
+            elseif ($onErr -gt 0)               { 'stderr' }
+            else { 'NEITHER -- the note was not produced; this is not a channel answer' }
+
+        Write-Host ("  {0,-22} exit={1,-4} stdout={2,-3} stderr={3,-3} -> {4}" -f `
+                    $Label, $p.ExitCode, $onOut, $onErr, $verdict)
+    }
+
+    Write-Host "toolchain:"
+    foreach ($d in @('cl', 'clang-cl')) {
+        $found = Get-Command $d -ErrorAction SilentlyContinue
+        if ($found) { Write-Host ("  {0}: {1}" -f $d, $found.Source) }
+        else        { Write-Host ("  {0}: NOT ON PATH" -f $d) }
+    }
+    Write-Host ""
+    Write-Host "readings (a note is identified by naming $marker, never by its English prefix):"
+
+    # The two `cl` cases are the open question.
+    Measure-Channel -Driver 'cl'       -Label 'cl /c'          -ExtraArgs @('/c')
+    Measure-Channel -Driver 'cl'       -Label 'cl /EP'         -ExtraArgs @('/EP')
+    # CONTROLS: measured already (LLVM D46394). If these disagree, distrust the run.
+    Measure-Channel -Driver 'clang-cl' -Label 'clang-cl /c'    -ExtraArgs @('/c')
+    Measure-Channel -Driver 'clang-cl' -Label 'clang-cl /EP'   -ExtraArgs @('/EP')
+
+    Write-Host ""
+    Write-Host "controls: clang-cl /c is expected stdout and clang-cl /EP stderr (LLVM D46394)."
+    Write-Host 'If either disagrees, this probe is wrong and its cl readings prove nothing.'
+    Write-Host 'Report the cl rows on #825 with the toolchain version and whether a language'
+    Write-Host 'pack is installed: a reading on en-US does not settle a localized cl.' 
+}
+finally {
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+}

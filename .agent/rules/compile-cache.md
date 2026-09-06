@@ -517,7 +517,11 @@ same on both — the same defect with no MSVC anywhere near it.
     writes on stderr -- `Flavor::Cl`'s doc comment, the driver table in
     `docs/tools/fastcache-cc.md`, and the stored-region comment in `fastcache-cc/main.cpp`
     -- while the analysis on #700 and the review of #821 both say stdout. Nobody on this team
-    has a Windows host, so **no reading has been taken either way**, and those three sites now
+    has a Windows host, so **no reading has been taken either way**. The measurement is
+    committed as `scripts/probes/msvc-showincludes-channel.ps1`, unrun -- it identifies a
+    note by the header it NAMES rather than by the English prefix, so it answers for a
+    localized `cl` too, and it re-measures the `clang-cl` halves as CONTROLS: if those
+    disagree with D46394 the probe is wrong and its `cl` rows prove nothing. Those three sites now
     say so instead of restating the claim: a claim stated in three places needs a correction
     that finds all three, which is how a wrong one survives being corrected. It is inert
     today because both regions are tagged `ShowIncludes` whichever stream carries the notes
