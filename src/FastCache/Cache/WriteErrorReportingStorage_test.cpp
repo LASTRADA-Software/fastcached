@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -143,6 +144,37 @@ class StubStorage final: public FastCache::IStorage
 }
 
 } // namespace
+
+TEST_CASE("WriteErrorReportingStorage can own the storage it reports for", "[cache][write-errors]")
+{
+    // #574. The borrowing constructor suits the daemon, which keeps its backend in
+    // a local outliving the decorator. A tier composed and handed back as ONE
+    // `unique_ptr` -- the compile node's -- has nowhere to keep the inner alive,
+    // which is why the node had no write-error reporting at all and exported
+    // `fastcached_write_errors_total` as a counter that could never rise.
+    FastCache::CapturingLogger logger;
+
+    auto inner = std::make_unique<StubStorage>();
+    inner->writeError = FastCache::StorageError { .code = FastCache::StorageErrorCode::IoError,
+                                                  .systemCode = 28,
+                                                  .context = "no space left on device" };
+
+    // The caller's handle is EMPTIED here. Everything below runs with the inner
+    // reachable only through the decorator, which is the whole point: a borrowing
+    // decorator would be reading a destroyed object, and the assertions would pass
+    // or fail by luck rather than by construction.
+    FastCache::WriteErrorReportingStorage reporter { std::move(inner), logger };
+    REQUIRE(inner == nullptr);
+
+    auto const result = reporter.Set("obj", std::vector<std::byte> { std::byte { 'x' } }, 0, FastCache::TimePoint::max());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(reporter.Snapshot().writeErrors == 1);
+    CHECK(HasLine(logger.Snapshot(), FastCache::LogLevel::Warn, { "storage write failed", "obj" }));
+
+    // And a read still reaches the owned inner, so ownership did not change what
+    // the decorator forwards -- only who keeps it alive.
+    CHECK(reporter.Get("obj", FastCache::TimePoint::max()).has_value());
+}
 
 TEST_CASE("WriteErrorReportingStorage logs and counts a persistence failure", "[cache][write-errors]")
 {
