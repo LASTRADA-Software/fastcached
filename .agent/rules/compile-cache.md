@@ -1605,12 +1605,24 @@ stops being one — the same confound that cost #493 a re-run.
       - The warning and the rule builder are asserted TOGETHER. A warning where the
         builder is happy is noise, silence where it skips is the defect, and either
         assertion alone passes under a predicate that answers constantly.
-    - **One residual, measured**: a client whose source argument is ABSOLUTE and whose
-      line carries a matching `-fdebug-prefix-map` records the mapped spelling locally,
-      while the dispatched object records the unmapped one, because `RemoteCompileArgs`
-      drops the client's rules by design. Deterministic and strictly better than
-      `job-N`, and it is [#800](https://github.com/LASTRADA-Software/fastcached/issues/800).
-      MSVC keeps its own residual for the same reason `cl` has no row here at all.
+    - **The client sends what its own compile would RECORD, not what the build system
+      wrote** ([#800](https://github.com/LASTRADA-Software/fastcached/issues/800)). An
+      ABSOLUTE source argument matched by a rule on the line records the MAPPED spelling
+      locally, so `sourceName` carries the source put through
+      `MappedByPrefixMapRules` — the computation `MappedCompileDirectory` was already
+      built on, now named for what it does rather than for the one value it was first
+      asked about. One model of the flag, asked twice; a second would be a second thing
+      to be wrong. Measured on clang 22.1.8: the dispatched `DW_AT_name` becomes
+      byte-identical to the local one where it was the raw absolute path.
+      - **It does not reach gcc, and that is a different residual with a different
+        cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule the worker
+        builds matches it and both spellings give the raw absolute path (measured, gcc
+        16.2.1). [#883](https://github.com/LASTRADA-Software/fastcached/issues/883).
+      - A RELATIVE source argument — the common case — matches no absolute rule, so
+        nothing about it changes. The fallback is the ORIGINAL spelling, and an empty
+        replacement falls back too: legal for a directory, a name `SafeSourceName` would
+        replace anyway.
+      - MSVC keeps its own residual for the same reason `cl` has no row here at all.
   - Read `comp_dir` and `DW_AT_name`, never compare objects: two different-but-checkout-independent
     mappings compare EQUAL, which is how the rule-order defect above first read
     green. `dist-compile-e2e --case suite` case 13 runs the launcher from a
@@ -2012,17 +2024,17 @@ with current truth at the moment the staleness would otherwise have done harm.
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
-- **[#800](https://github.com/LASTRADA-Software/fastcached/issues/800)** — a client
-  whose source argument is ABSOLUTE and whose line carries a matching
-  `-fdebug-prefix-map` records the mapped spelling locally, while the dispatched object
-  records the unmapped one: `RemoteCompileArgs` drops the client's rules by design, so
-  the worker maps its scratch to the raw spelling it was sent. #506's disagreement shape
-  one attribute over, and strictly better than the `job-N` scratch path #660 replaced.
-  The fix is to send what the client's own compile RECORDS rather than what the build
-  system wrote -- `MappedCompileDirectory` is already that computation, named and
-  documented for the working directory only -- and the reason it was not folded into
-  #660 is that its only call site is `main.cpp`, which no test can reach. No wire field
-  either way.
+- **[#883](https://github.com/LASTRADA-Software/fastcached/issues/883)** — #800 sends
+  what the client's own compile RECORDS rather than what the build system wrote, which
+  closes the disagreement on **clang** (it takes `DW_AT_name` from the input file path)
+  and not on **gcc** (it takes it from the `#line` marker, which no rule the worker
+  builds ever matches). Measured on gcc 16.2.1 and clang 22.1.8: the dispatched gcc
+  name is the client's raw absolute path under BOTH spellings, unchanged in either
+  direction. Neither driver rewrites a marker for `-fdebug-prefix-map`, and
+  `-ffile-prefix-map` would rewrite `__FILE__` into the text the worker compiles, which
+  is a wrong object under a correct key. Closing it needs the client's raw source path
+  AND its mapped spelling on a payload whose arity is exact — the one place #660's
+  "no wire bump" stops holding.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

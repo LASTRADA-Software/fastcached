@@ -1819,9 +1819,22 @@ case13_at() {
     # reference compile's own `-fdebug-prefix-map` never matches it. Both sides
     # therefore record the same raw absolute path and agree. A build whose source lies
     # UNDER a mapped root -- which is what `_fc_debug_prefix_map_rules` produces for an
-    # in-tree build -- records the MAPPED spelling locally and the unmapped one
-    # remotely, because the client's own rules never reach the worker. That divergence
-    # is #800 and this case cannot see it.
+    # in-tree build -- is the arrangement #800 is about, and this case cannot see it.
+    #
+    # Since #800 the launcher sends what its OWN compile would record: the source
+    # argument put through the line's own prefix-map rules. Measured on clang 22.1.8,
+    # that makes the dispatched `DW_AT_name` byte-identical to the local one where it
+    # used to be the raw absolute path. **It does not reach gcc**, whose `DW_AT_name`
+    # comes from the `#line` marker rather than from the input path -- measured on gcc
+    # 16.2.1, the dispatched name is the client's raw absolute path under BOTH
+    # spellings, and neither driver rewrites a marker for this flag. Closing that half
+    # needs the client's own source-root mapping on the wire, which the payload's exact
+    # arity makes a version bump.
+    #
+    # So a case built here would be red on gcc and green on clang, which is why the
+    # arrangement is unchanged rather than extended: it would have to select on the
+    # driver's banner, and a driver-conditional assertion is a decision rather than a
+    # case. See the follow-up issue linked from `.agent/rules/compile-cache.md`.
     local reference_source_name remote_source_name
     reference_source_name="$(source_name_of "$reference_dump")"
     remote_source_name="$(source_name_of "$remote_dump")"

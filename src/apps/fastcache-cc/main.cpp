@@ -2045,6 +2045,30 @@ void RecordManifest(Config const& cfg,
     auto const compileDirPath = compileDir.has_value() ? compileDir->directory : std::string {};
     auto const compileDirReplacement = compileDir.has_value() ? compileDir->replacement : std::string {};
 
+    // **What this compile would RECORD, not what the build system wrote** (#800).
+    //
+    // A compiler with debug info on records the name of the file it was handed, and
+    // both drivers put the client's own `-fdebug-prefix-map` rules through it. The
+    // worker maps its scratch path to whatever arrives here, and `RemoteCompileArgs`
+    // drops the client's rules by design -- so a source argument that is ABSOLUTE and
+    // matched by a rule on this line recorded the MAPPED spelling locally and the raw
+    // one when the same translation unit was dispatched. Same key, two names.
+    //
+    // Measured on clang 22.1.8: sending this makes the dispatched object's
+    // `DW_AT_name` byte-identical to the local one, where sending `cmd.source` leaves
+    // it at the raw path. Relative source arguments -- the common case -- match no
+    // rule and are unchanged.
+    //
+    // `value_or` on the ORIGINAL, because no rule governing it is the ordinary answer
+    // and the raw spelling is what a local compile records then too. An empty
+    // replacement falls back for a different reason: it is a legal reproducible-build
+    // spelling for a DIRECTORY, and as a file name it is one `SafeSourceName` would
+    // replace anyway, so sending it buys a name neither machine has.
+    //
+    // A named value and not a temporary, for the reason the block above states.
+    auto const mappedSource = Cc::MappedByPrefixMapRules(argv, Cc::DriverOf(cmd.flavor).family, cmd.source);
+    auto const sourceName = mappedSource.has_value() && !mappedSource->empty() ? *mappedSource : cmd.source;
+
     auto const exchange = Cc::MakeTcpExchange(Notice());
     auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
@@ -2052,7 +2076,7 @@ void RecordManifest(Config const& cfg,
                                                             .objectKey = key,
                                                             .args = *args,
                                                             .preprocessed = preprocessRun.out,
-                                                            .sourceName = cmd.source,
+                                                            .sourceName = sourceName,
                                                             .compileDir = compileDirPath,
                                                             .compileDirReplacement = compileDirReplacement },
                                       DispatchBudgetsOf(cfg),

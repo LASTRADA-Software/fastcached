@@ -269,6 +269,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   (`ScratchRootMappingWarnings`, #810) — asked of the longest `<root>/job-<n>/<name>`
   rather than the root, and asserted TOGETHER with the rule builder, since a warning
   without silence and silence without a warning each pass under a constant answer.
+  What `sourceName` carries is what the client's own compile would RECORD — the source
+  argument through `MappedByPrefixMapRules`, ONE model of the flag asked twice (#800).
+  It closes clang and NOT gcc, which takes the name from the `#line` marker no worker
+  rule matches (#883); a relative source matches no rule and is unchanged.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
