@@ -1050,7 +1050,10 @@ STUB
 # not offer anywhere else.
 mode=diff
 scopeFlag=""
-for arg in "$@"; do
+# `${1+"$@"}`: an empty `$@` under `set -u` is unbound before bash 4.4, and
+# `tidy-sweep.sh` with no arguments is a documented mode (it defaults to
+# --diff). See #793.
+for arg in ${1+"$@"}; do
     case "$arg" in
         --all|--ci|--self-test|--only=*) ;;
         *) fatal "usage: $0 [--all|--ci|--only=<file>|--self-test]" ;;

@@ -76,7 +76,11 @@ command -v gh >/dev/null || Fatal "gh is not on PATH; this reporter cannot silen
 # that dies when handed no labels would be a reporter nobody notices is broken,
 # since the labelled call sites work.
 labelArgs=()
-for label in "$@"; do
+# ...and `${1+"$@"}` here for the same reason the comment above gives for
+# the array: on bash 3.2 the bare expansion dies BEFORE the guarded call
+# below is ever reached, so the protection was defeated by the loop that
+# builds the thing it protects.
+for label in ${1+"$@"}; do
     labelArgs+=(--label "$label")
 done
 

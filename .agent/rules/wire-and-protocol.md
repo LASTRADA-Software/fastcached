@@ -1823,15 +1823,6 @@ consequence rather than a precaution.
 
 ## Open work
 
-- **[#828](https://github.com/LASTRADA-Software/fastcached/issues/828)** — the admin
-  surface's pre-first-byte wait and its mid-head read deadline are one number
-  (`AdminHttpServer::RequestTimeout`, armed as `SO_RCVTIMEO`), so a browser
-  preconnect used after 2 s is closed rather than served. #824 fixed the
-  disposition; this is the deadline. Not "raise the timeout", which slackens the
-  mid-head bound in exchange — split the two. The ticket carries the measured
-  before/after table and the two viable designs, and notes that
-  `RequestTimeout` is per READ rather than per request, so the head has no total
-  budget at all.
 - **[#884](https://github.com/LASTRADA-Software/fastcached/issues/884)** —
   `ISocket::CancelRead` cannot retire an IOCP read synchronously: the kernel owns the
   read op's single `OVERLAPPED`, so the override can only `CancelIoEx` and the reactor

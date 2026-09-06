@@ -151,7 +151,14 @@ gate_usage_status=2
 format=1
 self_test=0
 classify_log=""
-for arg in "$@"; do
+# `${1+"$@"}` rather than `"$@"`: before bash 4.4 -- macOS ships a 2007
+# /bin/bash -- expanding an empty `$@` under `set -u` is an UNBOUND variable
+# and the script dies before it runs a step. This fires on exactly the
+# zero-argument invocation AGENT.md documents, and ctest always passes
+# --self-test, so `local-gate-selftest` cannot reach it (#793). The same
+# spelling and the same reasoning are already 40 lines below, in `Leg` --
+# the argument was carried one call short.
+for arg in ${1+"$@"}; do
     case "$arg" in
         --no-format) format=0 ;;
         --self-test) self_test=1 ;;

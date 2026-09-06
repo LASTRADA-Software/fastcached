@@ -887,6 +887,45 @@ set_tests_properties("version-fallback-warning" PROPERTIES
 # GIT_EXECUTABLE is located by cmake/Version.cmake and passed in rather than
 # looked up again, so the check and the version resolution cannot disagree about
 # which git they mean.
+# Every tracked shell script carrying a shebang is mode 100755 (#720).
+#
+# `scripts/local-gate.sh` was 100644 while AGENT.md documents running it
+# DIRECTLY, so the gate this project tells every contributor to run refused on a
+# fresh checkout with `Permission denied`. Thirteen siblings shared the mode and
+# did not care, because every one of them is registered here as
+# `COMMAND ${FASTCACHED_BASH} <path>` -- so the interpreter is explicit and the
+# bit is irrelevant. The one script with NO automated caller is the one that bit,
+# and its not being run leaves no trace anywhere.
+#
+# Derived from the SHEBANG rather than a list of files, for #492's reason: a list
+# is exact about what it knows and silent about what it does not. A sourced
+# library has neither a shebang nor the bit and falls out of the rule instead of
+# needing an exemption.
+#
+# It reads the INDEX, not the filesystem: the checked-in mode is what a fresh
+# clone gets, and a local chmod that was never staged is not a fix.
+add_test(
+    NAME "script-modes"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
+)
+set_tests_properties("script-modes" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# The guard's own both-directions proof: a clean tree passes, a shebanged 644
+# script is refused, an EMPTY scan is refused, and a tree whose only script has
+# no shebang is refused. The last two matter because two empty lists agree
+# perfectly -- a scan that matched nothing would otherwise report success.
+add_test(
+    NAME "script-modes-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh" --self-test
+)
+set_tests_properties("script-modes-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "repository-hygiene"
     COMMAND ${CMAKE_COMMAND}
