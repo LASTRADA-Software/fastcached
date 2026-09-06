@@ -1163,7 +1163,8 @@ int DaemonBody(FastCache::Config const& effective,
                                                                                                        - adminStartedAt) },
                     };
                 },
-                logger);
+                logger,
+                steadyClock);
             adminThread = std::jthread { [&adminServer] {
                 FC_THREAD_NAME("fc-admin");
                 FastCache::SyncRun(adminServer->Run());

@@ -5,6 +5,7 @@
 #include <FastCache/Net/NetError.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <expected>
@@ -394,6 +395,27 @@ class ISocket
     /// `TlsSocket` qualifies the "reads keep working" half and says why on its own
     /// override -- TLS reads write, so they are the one case a half-close can reach.
     virtual void ShutdownWrite() noexcept {}
+
+    /// Re-arm how long a single read may block before it reports a deadline expiry.
+    ///
+    /// Exists so a caller can hold **two** different bounds over one connection --
+    /// "how long may this peer stay silent before it asks anything" and "how long may
+    /// one read take once it has started" are different questions, and a surface that
+    /// answers them with one number gets one of them wrong. The admin surface is the
+    /// first caller: a browser preconnect holds a socket far longer than any sane
+    /// mid-request bound ([#828](https://github.com/LASTRADA-Software/fastcached/issues/828)).
+    ///
+    /// **The default does nothing, and unlike `CancelRead`'s that is safe.** A
+    /// transport that cannot re-arm keeps whatever deadline it already had, so the
+    /// behaviour degrades to exactly what it was before this existed -- a weaker bound,
+    /// never a wrong one. `CancelRead`'s inherited no-op silently breaks retirement;
+    /// this one silently changes nothing.
+    ///
+    /// Meaningless on a reactor socket, whose reads suspend rather than block, and
+    /// harmless there for the same reason.
+    /// @param deadline How long a read may block. Non-positive leaves the current
+    ///        setting alone, matching `SO_RCVTIMEO`'s own reading of zero.
+    virtual void SetReceiveDeadline(std::chrono::milliseconds /*deadline*/) noexcept {}
 
     /// @return true if Close() has been called or the peer has closed and a
     /// Read has observed EOF. Used by Connection to break its loop.

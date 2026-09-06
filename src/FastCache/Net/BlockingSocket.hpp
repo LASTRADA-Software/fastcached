@@ -346,6 +346,10 @@ class BlockingSocket final: public ISocket
     /// @copydoc ISocket::ShutdownWrite
     void ShutdownWrite() noexcept override;
 
+    /// Re-arm `SO_RCVTIMEO` on this socket.
+    /// @param deadline How long a read may block; non-positive leaves it alone.
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;

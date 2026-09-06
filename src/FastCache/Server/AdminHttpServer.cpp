@@ -365,10 +365,23 @@ namespace
     /// 60 KB head to `/healthz` are both answered `200 OK`, from a head this server
     /// only read the first 8,192 bytes of. That is the defect. A route reading no
     /// headers survives it by luck; `/fleet` reads a credential and does not.
-    Task<RequestHead> ReadRequestHead(ISocket* socket)
+    Task<RequestHead> ReadRequestHead(ISocket* socket, IClock* clock)
     {
         std::string buffer;
         bool sawHeadEnd = false;
+        // **The socket carries the two per-read bounds; the clock carries the total**
+        // ([#828](https://github.com/LASTRADA-Software/fastcached/issues/828)). A silent
+        // peer is a preconnect and gets the long deadline; the moment a byte arrives it
+        // is a request in progress and gets the short one.
+        //
+        // Deliberately NOT a retry loop over the short deadline. Measured while trying
+        // that: it has to assume the failed read consumed real time, and a socket that
+        // answers `WouldBlock` without blocking -- non-blocking, or reactor-backed,
+        // whose reads suspend -- turns it into a CPU spin. `FailingReadSocket` made it
+        // burn 10.00 s at 99% CPU. That is `waited += poll` inverted: refusing to COUNT
+        // a sleep is the recorded rule; refusing to ASSUME one is the same rule.
+        socket->SetReceiveDeadline(AdminHttpServer::FirstByteTimeout);
+        auto started = clock->Now();
         while (!sawHeadEnd && buffer.size() < MaxRequestBytes)
         {
             std::array<std::byte, 1024> chunk {};
@@ -402,6 +415,15 @@ namespace
             }
             if (*result == 0)
                 break;
+            if (buffer.empty())
+            {
+                // First byte: this is no longer a preconnect. Tighten to the per-read
+                // bound that stops a slowloris, and start the total here rather than at
+                // accept -- a peer that thought for 20 s and then asked promptly is not
+                // slow, and charging it the wait would refuse the case #828 is about.
+                socket->SetReceiveDeadline(AdminHttpServer::RequestTimeout);
+                started = clock->Now();
+            }
             // Rescan from three bytes before the freshly-appended region: the
             // terminator is four bytes and may straddle a chunk boundary in any of
             // three ways. That keeps the total scan linear rather than re-reading
@@ -409,6 +431,12 @@ namespace
             auto const scanFrom = buffer.size() < 3 ? 0 : buffer.size() - 3;
             buffer.append(reinterpret_cast<char const*>(chunk.data()), *result);
             sawHeadEnd = buffer.find("\r\n\r\n", scanFrom) != std::string::npos;
+            // The TOTAL, which no per-read deadline can express: a client dribbling one
+            // byte under each `RequestTimeout` never trips it and would otherwise hold a
+            // slot for `MaxRequestBytes` reads. Checked after a SUCCESSFUL read, so it
+            // costs nothing on the ordinary path and cannot spin.
+            if (!sawHeadEnd && clock->Now() - started >= AdminHttpServer::HeadTimeout)
+                co_return RequestHead { .outcome = AdminHeadOutcome::Truncated };
         }
 
         // Nothing was received, so nothing was asked and nothing is owed. Reaching
@@ -551,6 +579,7 @@ namespace
 Task<void> ServeAdminHttp(ISocket* socket,
                           IMetricsSink const* metrics,
                           AdminHttpServer::SnapshotProvider snapshotProvider,
+                          IClock* clock,
                           std::span<AdminRoute const> routes)
 {
     // TLS terminates here rather than in the accept loop, so a handshake failure
@@ -559,7 +588,7 @@ Task<void> ServeAdminHttp(ISocket* socket,
     if (!co_await socket->HandshakeIfNeeded())
         co_return;
 
-    auto const request = co_await ReadRequestHead(socket);
+    auto const request = co_await ReadRequestHead(socket, clock);
     if (request.outcome != AdminHeadOutcome::Complete)
     {
         // The disposition is read off `AdminHeadOutcomeTable`, never decided here.
@@ -638,12 +667,14 @@ AdminHttpServer::AdminHttpServer(IListener& listener,
                                  IMetricsSink const& metrics,
                                  SnapshotProvider snapshotProvider,
                                  ILogger& logger,
+                                 IClock& clock,
                                  std::vector<AdminRoute> routes,
                                  TlsContext* tls) noexcept:
     _listener { listener },
     _metrics { metrics },
     _snapshotProvider { std::move(snapshotProvider) },
     _logger { logger },
+    _clock { clock },
     _routes { std::move(routes) },
     _tls { tls }
 {
@@ -658,10 +689,11 @@ AdminHttpServer::AdminHttpServer(IListener& listener,
 static DetachedTask ServeAdminConnection(std::unique_ptr<ISocket> socket,
                                          IMetricsSink const* metrics,
                                          AdminHttpServer::SnapshotProvider snapshotProvider,
+                                         IClock* clock,
                                          std::span<AdminRoute const> routes,
                                          std::atomic<std::size_t>* inFlight)
 {
-    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), routes);
+    co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes);
     socket->Close();
     inFlight->fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -706,7 +738,8 @@ Task<void> AdminHttpServer::Run()
             (*accepted)->Close();
             continue;
         }
-        ServeAdminConnection(WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, _routes, &_inFlight);
+        ServeAdminConnection(
+            WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, &_clock, _routes, &_inFlight);
     }
     co_return;
 }

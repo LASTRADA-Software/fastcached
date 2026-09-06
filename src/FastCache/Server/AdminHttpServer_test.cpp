@@ -74,7 +74,8 @@ std::string ServeAndCollect(FastCache::ISocket* serveOn,
     auto provider = [&stats] {
         return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider));
+    FastCache::SteadyClock clock;
+    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, &clock));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
@@ -123,6 +124,58 @@ class ShortReadSocket final: public FastCache::Testing::SocketDecorator
 
   private:
     std::size_t _limit;
+};
+
+/// Records every `SetReceiveDeadline` the server applies, in order.
+///
+/// The two deadlines are the whole of #828, and a test that cannot see WHICH was armed
+/// WHEN can only assert that "some deadline" exists -- which both the fixed and the
+/// broken tree produce.
+class DeadlineRecordingSocket final: public FastCache::Testing::SocketDecorator
+{
+  public:
+    explicit DeadlineRecordingSocket(FastCache::ISocket& inner) noexcept:
+        SocketDecorator { inner }
+    {
+    }
+
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    {
+        armed.push_back(deadline);
+        SocketDecorator::SetReceiveDeadline(deadline);
+    }
+
+    std::vector<std::chrono::milliseconds> armed;
+};
+
+/// Hands up at most `limit` bytes per read and charges the clock for each one.
+///
+/// Models a client dribbling under the per-read deadline: every read succeeds, so the
+/// per-read bound never fires, and only a TOTAL can see it.
+class ClockAdvancingSocket final: public FastCache::Testing::SocketDecorator
+{
+  public:
+    ClockAdvancingSocket(FastCache::ISocket& inner,
+                         std::size_t limit,
+                         FastCache::ManualClock& clock,
+                         std::chrono::milliseconds perRead) noexcept:
+        SocketDecorator { inner },
+        _limit { limit },
+        _clock { clock },
+        _perRead { perRead }
+    {
+    }
+
+    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> buffer) override
+    {
+        _clock.Advance(_perRead);
+        return SocketDecorator::Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
+    }
+
+  private:
+    std::size_t _limit;
+    FastCache::ManualClock& _clock;
+    std::chrono::milliseconds _perRead;
 };
 
 /// Serve one request over a fresh pair, and return what reached the client.
@@ -216,7 +269,8 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider));
+    FastCache::SteadyClock clock;
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider, &clock));
 
     auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -248,7 +302,8 @@ std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 1s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, routes));
+    FastCache::SteadyClock clock;
+    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, &clock, routes));
     pair.server->Close();
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
@@ -482,6 +537,65 @@ TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served 
     auto const response = ServeAndCollect(&stalled, pair, metrics, {});
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+}
+
+TEST_CASE("AdminHttp: a silent peer gets the preconnect budget, and a started head gets the short one",
+          "[admin][http][timeout]")
+{
+    // **#828: two questions were sharing one number.** `RequestTimeout` (2 s) is the
+    // right answer to "how long may a peer take once it has started" and the wrong one
+    // to "is this peer going to ask anything" -- a browser preconnect holds a socket far
+    // longer, which is what made an ordinary navigation fail.
+    //
+    // Asserted on WHICH deadline is armed and WHEN, because that is the whole change.
+    // A test that only checked "a request is served" passes on the broken tree too.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\n\r\n")));
+    DeadlineRecordingSocket recorder { *pair.server };
+
+    FastCache::AtomicMetricsSink metrics;
+    auto const response = ServeAndCollect(&recorder, pair, metrics, {});
+    REQUIRE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    REQUIRE(recorder.armed.size() >= 2);
+    // The long budget is armed BEFORE the first read: a peer that has said nothing is a
+    // preconnect, not a slow request.
+    CHECK(recorder.armed.front() == FastCache::AdminHttpServer::FirstByteTimeout);
+    // And it is tightened the moment a byte arrives, so the slowloris bound is not
+    // slackened in exchange -- which is the trade the ticket explicitly refuses.
+    CHECK(recorder.armed[1] == FastCache::AdminHttpServer::RequestTimeout);
+    CHECK(FastCache::AdminHttpServer::FirstByteTimeout > FastCache::AdminHttpServer::RequestTimeout);
+}
+
+TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408", "[admin][http][timeout]")
+{
+    // `RequestTimeout` is per READ, so a client sending one byte under each deadline
+    // never trips it and holds a slot for `MaxRequestBytes` reads. The total is the only
+    // bound that can see that, and it needs a clock -- so the clock is injected and moved
+    // here rather than waited on.
+    //
+    // The control is the case above: an ordinary request served under the same total
+    // must stay 200, or "enforces a total" and "refuses every request" are one passing
+    // test.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nX: ")));
+    FastCache::ManualClock clock;
+    // Each read costs time, which is what a dribbling client actually does -- the fake
+    // advances the clock rather than the test doing it, because the reads happen inside
+    // one `ServeAdminHttp` call and there is no seam between them.
+    ClockAdvancingSocket dribble { *pair.server, 4, clock, FastCache::AdminHttpServer::RequestTimeout };
+
+    using namespace std::chrono_literals;
+    FastCache::AtomicMetricsSink metrics;
+    auto provider = [] {
+        return FastCache::MetricsSnapshot { .storage = std::nullopt,
+                                            .host = std::nullopt,
+                                            .uptime = FastCache::Uptime { 1s } };
+    };
+    FastCache::SyncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, &clock));
+    pair.server->Close();
+    auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    CHECK(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
 }
 
 TEST_CASE("AdminHttp: an UNFINISHED head is refused 400 even though the peer finished sending",

@@ -511,6 +511,15 @@ std::uint16_t BlockingListener::BoundPort() const noexcept
     return Detail::BoundPortOf(_native);
 }
 
+void BlockingSocket::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+{
+    if (_closed)
+        return;
+    // Only the RECEIVE half: `SetIoTimeouts` leaves a non-positive value alone, so the
+    // send timeout the listener applied at accept is not disturbed.
+    Detail::SetIoTimeouts(_native, deadline, std::chrono::milliseconds { 0 });
+}
+
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept
 {
     _ioTimeout = ioTimeout;

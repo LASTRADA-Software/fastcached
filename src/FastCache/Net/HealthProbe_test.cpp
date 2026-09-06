@@ -218,7 +218,8 @@ TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise"
 
     NullLogger logger;
     AtomicMetricsSink metrics;
-    AdminHttpServer server { *listener, metrics, [] { return MetricsSnapshot {}; }, logger };
+    SteadyClock clock;
+    AdminHttpServer server { *listener, metrics, [] { return MetricsSnapshot {}; }, logger, clock };
 
     std::jthread serverThread { [&server] { FastCache::SyncRun(server.Run()); } };
 

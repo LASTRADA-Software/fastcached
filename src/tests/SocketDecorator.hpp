@@ -3,6 +3,7 @@
 
 #include <FastCache/Net/ISocket.hpp>
 
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <expected>
@@ -100,6 +101,13 @@ class SocketDecorator: public ISocket
     void ShutdownWrite() noexcept override
     {
         _inner.ShutdownWrite();
+    }
+
+    /// Forward the deadline to the decorated socket.
+    /// @param deadline How long a read may block.
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    {
+        _inner.SetReceiveDeadline(deadline);
     }
 
     /// @copydoc ISocket::IsClosed
