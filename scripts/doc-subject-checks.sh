@@ -465,9 +465,24 @@ message(STATUS "CMake Error: the prose and the table disagree")'
     # And the mirror, equally untested until the same mutation asked: a non-zero
     # exit with nothing in the output a pattern could match. The verdict is a
     # disjunction, and a case for one arm proves half of it.
-    local quietlyBad='cmake_minimum_required(VERSION 3.28)
-message(STATUS "nothing to see")
-cmake_language(EXIT 3)'
+    #
+    # A BASH check, not a `cmake -P` one, and that is forced rather than chosen
+    # (#792). This used to be `cmake_language(EXIT 3)`, which is CMake **3.29+**
+    # while this project's declared minimum is **3.28** -- and below 3.29 there is
+    # no way to write a `cmake -P` script that exits non-zero with clean output at
+    # all, `message(FATAL_ERROR)` printing `CMake Error` by construction. So on
+    # 3.28 the fixture printed the very thing it exists NOT to print, case 2c
+    # could not match, and this self-test was RED on a clean tree -- on stock
+    # Ubuntu 24.04, which ships 3.28.3 -- while CI's newer image stayed green.
+    # Measured on both: 3.28.3 exits 1 with `CMake Error`, 4.3.0 exits 3 cleanly.
+    #
+    # Staging it with bash loses nothing, because the verdict is ONE
+    # runner-agnostic expression -- `[[ status -ne 0 ]] || [[ out =~ failRegex ]]`
+    # -- with no per-runner path for a cmake check to take instead. What this case
+    # still holds that `t-bash-fail` does not is EMPTY output: that one prints a
+    # line which merely fails to match, this one prints nothing at all.
+    local quietlyBad='#!/bin/bash
+exit 3'
 
     # A staged tree that is byte-identical to the baseline stages NOTHING, and
     # the case then reports on the baseline while claiming to report on a break.
@@ -579,9 +594,21 @@ cmake_language(EXIT 3)'
 
     # 2c. And the other arm: a non-zero exit with clean output.
     tree="${scratch}/t-quietly-bad"
-    StageTree "$tree" "$(GoodCMakeLists)"
+    # `beta-docs` respelled as a bash check, matching the `beta.sh` written below.
+    # Derived from `GoodCMakeLists` rather than a fourth hand-written CMakeLists,
+    # so a change to the shared shape reaches this case too.
+    # Only the `beta-docs` block: a bare `sed` on `COMMAND ${CMAKE_COMMAND}` would
+    # respell alpha and gamma too, and those really are `cmake -P` scripts.
+    StageTree "$tree" "$(GoodCMakeLists | awk '
+        /NAME "beta-docs"/ { inBeta = 1 }
+        inBeta && /^\)$/   { inBeta = 0 }
+        inBeta && /COMMAND \$\{CMAKE_COMMAND\}/ { print "    COMMAND bash"; next }
+        inBeta && /-DFASTCACHED_SOURCE_DIR=/       { next }
+        inBeta && /-P .*scripts\/beta\.cmake/     { print "        \"${CMAKE_SOURCE_DIR}/scripts/beta.sh\""; next }
+        { print }
+    ')"
     WriteCheck "$tree" alpha.cmake "$quiet"
-    WriteCheck "$tree" beta.cmake "$quietlyBad"
+    WriteCheck "$tree" beta.sh "$quietlyBad"
     WriteCheck "$tree" gamma.cmake "$quiet"
     Expect "FAILED   beta-docs (exit 3)" "a non-zero exit was read as a pass" "a check exiting non-zero with clean output is FAILED" want-fail "$tree"
 
