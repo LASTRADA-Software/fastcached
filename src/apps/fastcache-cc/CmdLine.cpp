@@ -1353,9 +1353,9 @@ std::string CompilerWorkingDirectory(std::string_view physicalDirectory)
     return CompilerWorkingDirectory(physicalDirectory, pwd.has_value() ? std::string_view { *pwd } : std::string_view {});
 }
 
-std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
-                                                       DriverFamily family,
-                                                       std::string_view workingDirectory)
+std::optional<std::string> MappedByPrefixMapRules(std::span<std::string const> argv,
+                                                  DriverFamily family,
+                                                  std::string_view path)
 {
     auto const introducers = IntroducersOf(family);
 
@@ -1365,7 +1365,7 @@ std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string con
     // -- it emits the source rule first and the build-tree rule last precisely so the
     // build tree wins -- so a first-match model here would predict the source rule's
     // replacement and disagree with every object this project builds.
-    std::optional<MappedCompileDir> mapped;
+    std::optional<std::string> mapped;
     for (auto const& arg: argv)
     {
         auto const match = MatchPathValueFlag(arg, introducers, family);
@@ -1380,18 +1380,29 @@ std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string con
         // `/tmp/worker` to `Xer` on gcc and on clang alike. Requiring a separator
         // boundary would read better and would make this client predict a replacement
         // its own compiler does not write.
-        if (!workingDirectory.starts_with(match->value))
+        if (!path.starts_with(match->value))
             continue;
 
-        // `valueTail` carries the separator, so the replacement is what follows it. The
-        // directory travels beside it because a worker needs BOTH left-hand sides: gcc
-        // under `-g` puts this directory into the preprocessed text and the worker's
-        // object then adopts it, while clang leaves the worker's own showing.
-        mapped = MappedCompileDir { .directory = std::string { workingDirectory },
-                                    .replacement = std::string { match->valueTail.substr(1) }
-                                                   + std::string { workingDirectory.substr(match->value.size()) } };
+        // `valueTail` carries the separator, so the replacement is what follows it,
+        // plus whatever of the path the prefix did not cover.
+        mapped = std::string { match->valueTail.substr(1) } + std::string { path.substr(match->value.size()) };
     }
     return mapped;
+}
+
+std::optional<MappedCompileDir> MappedCompileDirectory(std::span<std::string const> argv,
+                                                       DriverFamily family,
+                                                       std::string_view workingDirectory)
+{
+    // The directory travels beside its replacement because a worker needs BOTH
+    // left-hand sides: gcc under `-g` puts this directory into the preprocessed text
+    // and the worker's object then adopts it, while clang leaves the worker's own
+    // showing. That pairing is the only thing this adds to the computation above --
+    // which is why the computation is its own function rather than this one's body
+    // (#800): the source spelling wants the same rules and none of the pairing.
+    return MappedByPrefixMapRules(argv, family, workingDirectory).transform([workingDirectory](std::string replacement) {
+        return MappedCompileDir { .directory = std::string { workingDirectory }, .replacement = std::move(replacement) };
+    });
 }
 
 std::vector<std::string> DispatchPreprocessCommand(ParsedCommand const& cmd, std::span<std::string const> argv)

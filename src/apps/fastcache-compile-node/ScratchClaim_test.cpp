@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <latch>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -401,5 +403,75 @@ TEST_CASE("Two nodes compiling at once, each on its own claimed root, keep their
         INFO("node " << index);
         REQUIRE(results.at(index).has_value());
         REQUIRE(asText(results.at(index)->object) == texts.at(index));
+    }
+}
+
+TEST_CASE("The directory a daemonized node runs in leaves its own prefix-map rule standing",
+          "[scratch-claim][daemon][prefix-map]")
+{
+    // #784. `PosixDaemonHost` chdir'd to `/` unconditionally, so `--daemon` landed a
+    // compile worker there whatever its unit said -- a unit's `WorkingDirectory=` does
+    // not survive the double fork, because the chdir happens after it. From `/` the
+    // worker's own rule is `-fdebug-prefix-map=/=<replacement>`, and a prefix-map rule
+    // appends the unmatched tail, so it rewrites every absolute path in the object.
+    //
+    // The assertion is on the RULE the worker constructs, never on an object
+    // comparison: two different-but-checkout-independent mappings compare EQUAL, which
+    // is how #506's rule-order defect first read green.
+    auto const stated = ScratchBaseDirectory().string();
+
+    // A client directory that is a real one and is not under the node's own tree, which
+    // is the ordinary arrangement: a build somewhere on the machine, dispatched to a
+    // worker whose scratch lives under TMPDIR.
+    constexpr std::string_view ClientDirectory = "/home/ci/build";
+    constexpr std::string_view Replacement = ".";
+
+    SECTION("it is not /, and it contains no client's build directory")
+    {
+        // The ticket, in the two clauses that make a worker's directory safe, and
+        // neither depends on anything about this host but the choice itself.
+        CHECK(stated != "/");
+        CHECK_FALSE(ClientDirectory.starts_with(stated));
+    }
+
+    SECTION("the rules built from it keep the worker's own")
+    {
+        // Whether THIS HOST's temp path can be spelled inside a mapping rule is a
+        // property of the host and not of the choice -- a Windows profile with a space
+        // in it is ordinary, and it is #810's subject rather than this one's. So a host
+        // that cannot spell it SKIPS: a pass here would report a property nothing
+        // established, and a failure would blame this ticket for that one.
+        if (!FastCache::Cc::ScratchRootMappingWarnings(stated).empty())
+            SKIP("this host's temp directory cannot be spelled inside a mapping rule (#810), so the rules "
+                 "below cannot be built from it: "
+                 + stated);
+
+        // TWO rules: the client's directory and the worker's own. That second one is
+        // what clang records, and it is the whole point -- gcc adopts the client's
+        // directory out of the preprocessed text, clang leaves this machine's showing.
+        auto const rules =
+            FastCache::Cc::WorkerPrefixMapRules(stated, ClientDirectory, Replacement, FastCache::Cc::DriverFamily::Gnu);
+        REQUIRE(rules.has_value());
+        CHECK(rules->size() == 2);
+        CHECK(std::ranges::any_of(*rules, [&](std::string const& rule) {
+            return rule == std::format("-fdebug-prefix-map={}={}", stated, Replacement);
+        }));
+    }
+
+    SECTION("the control: from / the worker's own rule is dropped")
+    {
+        // The state the fix leaves behind, and the reason this is a narrowing rather
+        // than a hole: `WorkerPrefixMapRules` drops its own rule when the worker's
+        // directory contains the client's, so a worker in `/` produced the pre-#506
+        // clang object rather than the corrupted one. Asserted so the section above
+        // cannot pass by the function returning two rules for everything -- which is
+        // the shape that makes a test agree with the healthy and the broken state
+        // alike.
+        auto const rules =
+            FastCache::Cc::WorkerPrefixMapRules("/", ClientDirectory, Replacement, FastCache::Cc::DriverFamily::Gnu);
+        REQUIRE(rules.has_value());
+        CHECK(rules->size() == 1);
+        CHECK(
+            std::ranges::none_of(*rules, [](std::string const& rule) { return rule.starts_with("-fdebug-prefix-map=/="); }));
     }
 }

@@ -22,6 +22,20 @@ the foreground avoids both and gives journald the daemon's stderr directly.
 journalctl -u fastcached -f
 ```
 
+Two things about `--daemon` changed in the release that fixed
+[#784](https://github.com/LASTRADA-Software/fastcached/issues/784), and neither
+affects a machine installed from the packages, since no shipped unit passes the
+flag:
+
+- A **relative** `--pidfile` now resolves against the directory the command was
+  run in. It used to resolve against `/`, because the host changed directory
+  before writing it and only root can write there. An **absolute** `--pidfile` —
+  which is what every documented invocation uses — is unaffected.
+- `fastcached --daemon` still changes directory to `/`; it executes nothing, so
+  that costs it nothing but a busy mount point. `fastcache-compile-node --daemon`
+  now changes to a directory of its own instead, because it spawns a compiler and
+  a worker running in `/` records rewritten paths in every object it produces.
+
 Leave `log_timestamps` off — journald timestamps every line already, and off
 is the default on Linux.
 

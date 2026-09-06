@@ -186,4 +186,24 @@ inline constexpr std::size_t DefaultMaxScratchRoots = 64;
 /// @return The production claimant.
 [[nodiscard]] std::unique_ptr<IScratchClaimant> MakeLockFileScratchClaimant();
 
+/// Where this host's compile-node scratch roots live, and the directory a
+/// daemonized node runs in.
+///
+/// One expression, in one place, because it now answers two questions. It is the
+/// base a claim is taken under, and it is what `--daemon` chdirs into: a
+/// daemonizing host must leave the invocation directory, and `/` — the classical
+/// answer, and the one `PosixDaemonHost` used unconditionally until
+/// [#784](https://github.com/LASTRADA-Software/fastcached/issues/784) — makes the
+/// worker's own `-fdebug-prefix-map` rule match every absolute path in the object
+/// it produces.
+///
+/// This directory qualifies on both counts a worker's directory has to: it is not
+/// `/`, and it is this node's own, so it contains no client's build directory and
+/// the rule is not dropped. `TEMP`/`TMPDIR` is how an operator relocates it, which
+/// is the same mechanism the scratch root has always used — there is one answer
+/// here rather than a daemon-only second one nothing else knows about.
+///
+/// @return The base directory; the caller creates it.
+[[nodiscard]] std::filesystem::path ScratchBaseDirectory();
+
 } // namespace FastCache::Node

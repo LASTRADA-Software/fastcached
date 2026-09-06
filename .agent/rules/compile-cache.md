@@ -1494,15 +1494,34 @@ stops being one — the same confound that cost #493 a re-run.
     which is a worse outcome than the defect. `/run` rather than `/tmp`: a worker
     directory that CONTAINS a client's build directory drops the rule exactly as `/`
     does, and CI builds run in `/tmp`.
-    The drop above STAYS, because a unit is not the only route — `PosixDaemonHost`
-    calls `chdir("/")`, so `--daemon` still lands there
-    ([#784](https://github.com/LASTRADA-Software/fastcached/issues/784)), as does any
-    hand-written unit. And the guard is a SCAN of the shipped file
+    The drop above STAYS, because a unit is not the only route: a hand-written one may
+    still name `/` or none. And the guard is a SCAN of the shipped file
     (`ctest -R node-working-directory`, with its own selftest): running the real unit
     needs root and a live systemd, so it is reachable only from the packaging job —
     which is not a required context and therefore reports to nobody (#684) — and no
     fixture substitutes, since every one of them starts the node from the FIXTURE's
     directory. That is precisely how #674 reached master with a dispatch e2e green.
+  - **The daemonize route was the other half, and it is a PARAMETER now, not a
+    constant** ([#784](https://github.com/LASTRADA-Software/fastcached/issues/784)).
+    `PosixDaemonHost` chdir'd to `/` unconditionally, so `--daemon` landed a worker
+    there whatever its unit said — a `WorkingDirectory=` does not survive the double
+    fork, because the chdir happens after it. `MakePosixDaemonHost` therefore takes the
+    directory and has **no default**: the cache daemon states `/` (it executes nothing,
+    so no rule is ever derived from its directory) and the node states
+    `Node::ScratchBaseDirectory()`, which it creates before daemonizing. No default is
+    the point — a third daemonizing binary meets a compile error rather than inheriting
+    an answer chosen for something else.
+    - The pidfile is written BEFORE the chdir now. Where a relative one lands must not
+      depend on which directory the host was told to move to, or giving the node a
+      directory of its own silently relocates its pidfile — the same class of defect.
+      It resolves against the invocation directory for both binaries; it used to
+      resolve against `/`, where only root can write.
+    - Asserted by reading the CALL SITES (`PosixDaemonHost_test`), because that is the
+      whole of the defect: one line of `main.cpp`. A compiler-spawning binary's second
+      argument may not be a string literal at all; the cache daemon's must be exactly
+      `"/"`, and that control is not decoration — without it the rule reads "never pass
+      a literal", which refuses a correct tree. Comment-only lines are stripped first,
+      and BOTH halves were shown red.
   - **`:` is a path character here.** A Windows absolute path begins `C:\`, and a
     GNU-layout driver on Windows — mingw, or plain clang — is an ordinary client.
     Leaving `:` out of the safe set refused every such client's own directory before
@@ -1567,12 +1586,43 @@ stops being one — the same confound that cost #493 a re-run.
       switch at all, are ordinary. Skipping an `=` is also the NARROW choice: gcc cuts
       `<from>=<to>` at the last separator and clang at the first, so such a rule records
       a name NEITHER machine has, which is worse than recording the worker's.
-    - **One residual, measured**: a client whose source argument is ABSOLUTE and whose
-      line carries a matching `-fdebug-prefix-map` records the mapped spelling locally,
-      while the dispatched object records the unmapped one, because `RemoteCompileArgs`
-      drops the client's rules by design. Deterministic and strictly better than
-      `job-N`, and it is [#800](https://github.com/LASTRADA-Software/fastcached/issues/800).
-      MSVC keeps its own residual for the same reason `cl` has no row here at all.
+    - **But the WORKER's half of that same skip is a startup property, and is said at
+      startup** ([#810](https://github.com/LASTRADA-Software/fastcached/issues/810)).
+      `scratchSourcePath` lies under a root the process chose ONCE, so a root carrying a
+      space (`/Users/john doe/...`, an ordinary macOS home) or an `=` makes EVERY rule on
+      that worker unspellable and every dispatched object goes back to `job-N` — nothing
+      counting it, and `dist-compile-e2e` blind to it because its scratch root is
+      well-behaved. `ScratchRootMappingWarnings` is a pure function the claim site logs;
+      the call site still SKIPS, because such a machine compiles perfectly well and only
+      its debug names degrade.
+      - It is asked of the LONGEST path a job on that root can produce, never the root:
+        the rule's left-hand side is `<root>/job-<n>/<name>`, so a root a few bytes under
+        the length ceiling is spellable while every path beneath it is not, and checking
+        the root alone answers `fine` for a worker on which every rule is skipped.
+      - It is asked of every prefix-map row the TABLE holds rather than of the families
+        this node serves: the served set exists only once the survey's first round lands
+        on the heartbeat thread (#365), minutes after the operator stopped watching.
+      - The warning and the rule builder are asserted TOGETHER. A warning where the
+        builder is happy is noise, silence where it skips is the defect, and either
+        assertion alone passes under a predicate that answers constantly.
+    - **The client sends what its own compile would RECORD, not what the build system
+      wrote** ([#800](https://github.com/LASTRADA-Software/fastcached/issues/800)). An
+      ABSOLUTE source argument matched by a rule on the line records the MAPPED spelling
+      locally, so `sourceName` carries the source put through
+      `MappedByPrefixMapRules` — the computation `MappedCompileDirectory` was already
+      built on, now named for what it does rather than for the one value it was first
+      asked about. One model of the flag, asked twice; a second would be a second thing
+      to be wrong. Measured on clang 22.1.8: the dispatched `DW_AT_name` becomes
+      byte-identical to the local one where it was the raw absolute path.
+      - **It does not reach gcc, and that is a different residual with a different
+        cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule the worker
+        builds matches it and both spellings give the raw absolute path (measured, gcc
+        16.2.1). [#883](https://github.com/LASTRADA-Software/fastcached/issues/883).
+      - A RELATIVE source argument — the common case — matches no absolute rule, so
+        nothing about it changes. The fallback is the ORIGINAL spelling, and an empty
+        replacement falls back too: legal for a directory, a name `SafeSourceName` would
+        replace anyway.
+      - MSVC keeps its own residual for the same reason `cl` has no row here at all.
   - Read `comp_dir` and `DW_AT_name`, never compare objects: two different-but-checkout-independent
     mappings compare EQUAL, which is how the rule-order defect above first read
     green. `dist-compile-e2e --case suite` case 13 runs the launcher from a
@@ -1974,17 +2024,17 @@ with current truth at the moment the staleness would otherwise have done harm.
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
-- **[#800](https://github.com/LASTRADA-Software/fastcached/issues/800)** — a client
-  whose source argument is ABSOLUTE and whose line carries a matching
-  `-fdebug-prefix-map` records the mapped spelling locally, while the dispatched object
-  records the unmapped one: `RemoteCompileArgs` drops the client's rules by design, so
-  the worker maps its scratch to the raw spelling it was sent. #506's disagreement shape
-  one attribute over, and strictly better than the `job-N` scratch path #660 replaced.
-  The fix is to send what the client's own compile RECORDS rather than what the build
-  system wrote -- `MappedCompileDirectory` is already that computation, named and
-  documented for the working directory only -- and the reason it was not folded into
-  #660 is that its only call site is `main.cpp`, which no test can reach. No wire field
-  either way.
+- **[#883](https://github.com/LASTRADA-Software/fastcached/issues/883)** — #800 sends
+  what the client's own compile RECORDS rather than what the build system wrote, which
+  closes the disagreement on **clang** (it takes `DW_AT_name` from the input file path)
+  and not on **gcc** (it takes it from the `#line` marker, which no rule the worker
+  builds ever matches). Measured on gcc 16.2.1 and clang 22.1.8: the dispatched gcc
+  name is the client's raw absolute path under BOTH spellings, unchanged in either
+  direction. Neither driver rewrites a marker for `-fdebug-prefix-map`, and
+  `-ffile-prefix-map` would rewrite `__FILE__` into the text the worker compiles, which
+  is a wrong object under a correct key. Closing it needs the client's raw source path
+  AND its mapped spelling on a payload whose arity is exact — the one place #660's
+  "no wire bump" stops holding.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

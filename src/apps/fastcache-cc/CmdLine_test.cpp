@@ -1269,6 +1269,67 @@ TEST_CASE("MappedCompileDirectory reports a rule that maps a root to nothing")
     CHECK(Unwrap(mapped).replacement.empty());
 }
 
+// --- MappedByPrefixMapRules, and the source spelling (#800) ------------------
+
+TEST_CASE("A source argument travels as what the client's own compile would RECORD")
+{
+    // #800. A compiler with debug info on records the name of the file it was handed
+    // -- DWARF's `DW_AT_name` -- and both drivers put the line's own
+    // `-fdebug-prefix-map` rules through it. The worker maps its scratch path to
+    // whatever `sourceName` carries, and `RemoteCompileArgs` drops the client's rules
+    // by design, so an ABSOLUTE source matched by a rule recorded the mapped spelling
+    // locally and the raw one when dispatched. Same key, two names.
+    //
+    // Measured on clang 22.1.8, ELF, one TU at `<root>/src/tu.cpp` compiled from
+    // `<root>/build` under `-fdebug-prefix-map=<root>=/MAPPED`: local reads
+    // `/MAPPED/src/tu.cpp`, dispatched with the raw spelling reads `<root>/src/tu.cpp`,
+    // dispatched with this function's answer reads `/MAPPED/src/tu.cpp`.
+    std::vector<std::string> const argv { "clang++", "-c", "/home/ci/src/tu.cpp", "-fdebug-prefix-map=/home/ci=/MAPPED" };
+
+    auto const mapped = MappedByPrefixMapRules(argv, DriverFamily::Gnu, "/home/ci/src/tu.cpp");
+    REQUIRE(mapped.has_value());
+    CHECK(Unwrap(mapped) == "/MAPPED/src/tu.cpp");
+}
+
+TEST_CASE("A relative source argument matches no rule, so nothing about it changes")
+{
+    // The common case, and the reason this is a residual rather than a defect: a build
+    // system writing a relative source argument produces a name no absolute rule
+    // reaches, on the client and on the worker alike. Asserted so the change above
+    // cannot be one that rewrites every dispatched name.
+    std::vector<std::string> const argv { "clang++", "-c", "../src/tu.cpp", "-fdebug-prefix-map=/home/ci=/MAPPED" };
+    CHECK_FALSE(MappedByPrefixMapRules(argv, DriverFamily::Gnu, "../src/tu.cpp").has_value());
+}
+
+TEST_CASE("The source spelling and the compilation directory read the SAME rules")
+{
+    // One computation, asked twice. It is a function of its own rather than
+    // `MappedCompileDirectory`'s body precisely so this holds by construction: a
+    // second model of the flag is a second thing to be wrong, and a client predicting
+    // a replacement its own driver does not write is #506's disagreement rebuilt in
+    // the other direction.
+    //
+    // The build-tree rule LAST is what this project's own `_fc_debug_prefix_map_rules`
+    // emits, so the two rules here are the real arrangement rather than a synthetic
+    // one.
+    std::vector<std::string> const argv { "g++",
+                                          "-c",
+                                          "/home/ci/checkout/src/tu.cpp",
+                                          "-fdebug-prefix-map=/home/ci/checkout=/fastcache/src",
+                                          "-fdebug-prefix-map=/home/ci/checkout/out/build/x=." };
+
+    auto const directory = MappedCompileDirectory(argv, DriverFamily::Gnu, "/home/ci/checkout/out/build/x");
+    REQUIRE(directory.has_value());
+    CHECK(Unwrap(directory).replacement == ".");
+
+    // The source lies outside the build tree, so the FIRST rule is the last one that
+    // matches it -- the same "last match wins" walk reaching a different answer for a
+    // different path, which is what makes one function correct for both.
+    auto const source = MappedByPrefixMapRules(argv, DriverFamily::Gnu, "/home/ci/checkout/src/tu.cpp");
+    REQUIRE(source.has_value());
+    CHECK(Unwrap(source) == "/fastcache/src/src/tu.cpp");
+}
+
 TEST_CASE("MappedCompileDirectory ignores a rule with no replacement")
 {
     // `-fdebug-prefix-map=/abs` is malformed and the driver says so; it maps nothing,

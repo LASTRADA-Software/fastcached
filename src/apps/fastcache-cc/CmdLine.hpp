@@ -886,6 +886,48 @@ struct MappedCompileDir
                                                                      DriverFamily family,
                                                                      std::string_view workingDirectory);
 
+/// What this client's own `-fdebug-prefix-map` rules spell @p path as.
+///
+/// The computation `MappedCompileDirectory` is built on, named for what it does rather
+/// than for the one value it was first asked about. It models the driver's flag and
+/// nothing else — last match wins, byte prefix, unmatched tail appended — and the three
+/// paragraphs above are its measurements.
+///
+/// A second value needs it, which is why it is a function of its own
+/// ([#800](https://github.com/LASTRADA-Software/fastcached/issues/800)). A compiler
+/// with debug info on records the **name of the file it was handed**, DWARF's
+/// `DW_AT_name`, and `RemoteCompileArgs` drops the client's rules by design — so a
+/// client whose source argument is ABSOLUTE and whose line carries a rule matching it
+/// recorded the MAPPED spelling locally and the raw one when the same translation unit
+/// was dispatched. Same key, two recorded names.
+///
+/// **Measured on clang 22.1.8, ELF, `readelf --debug-dump=info`**, one TU at
+/// `<root>/src/tu.cpp` compiled from `<root>/build` under
+/// `-fdebug-prefix-map=<root>=/MAPPED`:
+///
+/// | compile | `DW_AT_name` |
+/// |---|---|
+/// | local | `/MAPPED/src/tu.cpp` |
+/// | dispatched, worker sent the raw spelling | `<root>/src/tu.cpp` |
+/// | dispatched, worker sent this function's answer | `/MAPPED/src/tu.cpp` |
+///
+/// **gcc is neither fixed nor worsened, and that is a different residual with a
+/// different cause.** gcc takes `DW_AT_name` from the `#line` marker in the
+/// preprocessed text, so the worker's scratch rule never matches it — measured on
+/// gcc 16.2.1, the dispatched name is the client's raw absolute path under both
+/// spellings. Reaching it would need a rule whose left-hand side is the client's raw
+/// path as well, which is a second field on a wire whose payload arity is exact.
+/// Neither driver rewrites a `#line` marker for this flag (measured on both), so the
+/// preprocessed text is not a route either.
+///
+/// @param argv The original full invocation, as the build system wrote it.
+/// @param family The client driver's family, so `/I` is not read as a flag on POSIX.
+/// @param path The path to spell — a working directory, or the source argument.
+/// @return The replacement, or nullopt when no rule on the line governs @p path.
+[[nodiscard]] std::optional<std::string> MappedByPrefixMapRules(std::span<std::string const> argv,
+                                                                DriverFamily family,
+                                                                std::string_view path);
+
 [[nodiscard]] std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                                                          std::span<std::string const> argv,
                                                          std::string_view dependencyProbePath = {});
