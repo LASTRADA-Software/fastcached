@@ -2371,7 +2371,20 @@ TEST_CASE("A client that hangs up after reading its reply is not a mid-answer de
 TEST_CASE("A connection this node sweeps is not filed as a peer departure", "[node][frame][peerwatch]")
 {
     // **`ConsultedAtExit`'s own case, and without it that guard is a guard nobody has
-    // watched refuse.** A swept connection never reaches `AbandonIfPeerGone` -- the
+    // watched refuse.**
+    //
+    // **It does NOT pin `ClosedLocally`, and must not be read as doing so (#826).**
+    // Both guards can suppress here, and WHICH one does is an alignment rather than a
+    // property: `ExplanationGraceFor(window)` and `FrameServer::RefusalTimeout` are
+    // the same 1250 ms started at different instants, so if the sweep closes first
+    // `ClosedLocally` suppresses, and if `AwaitWatchQuiet` returns first `consulted`
+    // does. Measured on Linux/epoll, deleting `!state.ClosedLocally(socket)` fails this
+    // case 5 runs of 5 -- this host's alignment, not a contract, and a platform landing
+    // the other way passes it for the OTHER reason and stays green.
+    //
+    // The case that pins `ClosedLocally` structurally is
+    // *"A connection this node closes at SHUTDOWN is not filed as a peer departure"*
+    // below: no sweep is configured there, so there is no race to align. A swept connection never reaches `AbandonIfPeerGone` -- the
     // deferred refusal breaks the loop before it -- so nothing on that path reads the
     // watch, and the `socket->Close()` that follows reaches the parked watcher looking
     // exactly like a peer hanging up. Counted, this node's own teardown would arrive
@@ -2438,6 +2451,71 @@ TEST_CASE("A connection this node sweeps is not filed as a peer departure", "[no
                                              - sweptBefore));
     RequireNoDepartureFiled(fleet, observedBefore, seenBefore, abandonedBefore);
 }
+
+TEST_CASE("A connection this node closes at SHUTDOWN is not filed as a peer departure", "[node][frame][peerwatch]")
+{
+    // **`ClosedLocally`'s own case, and the sweep case above is not it (#826).** There
+    // both guards can suppress, and WHICH one does is an alignment rather than a
+    // property: `ExplanationGraceFor(window)` and `FrameServer::RefusalTimeout` are the
+    // same 1250 ms, started at different instants, so the order is not guaranteed.
+    // Measured on Linux/epoll it lands one way 5 runs of 5 -- but a platform landing
+    // the other way passes that case for the OTHER reason and stays green, which is a
+    // guard nobody has watched refuse.
+    //
+    // Here there is no race to align: **no `PlaceRequestTimeout`, so nothing sweeps.**
+    // The connection is closed by `FrameServer::State::CloseAll` while it is provably
+    // still inside the responder, so `consulted` is structurally false and only
+    // `ClosedLocally` can suppress the count. Deleting `!state.ClosedLocally(socket)`
+    // fails this deterministically rather than probabilistically.
+    //
+    // Measured on: Linux/epoll. It does NOT rely on `Close()` resuming inline -- the
+    // synchronisation is `FramePeerWatchDeparturesObserved`, which `RecordDeparture`
+    // increments BEFORE either guard runs, so the wake is observed wherever the resume
+    // happens. On IOCP that resume is marshalled to a later turn, and `WaitFor` simply
+    // waits longer.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+
+    // Held open for the whole case: this client does NOT go away, so any departure
+    // counted here is provably this node's own teardown.
+    Conversation client { port };
+    REQUIRE(client.SendOnly(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
+
+    // On another thread, because `Shutdown()` posts `CloseAll` to the reactor and then
+    // BLOCKS on its bounded drain -- which cannot finish while the responder is held.
+    // Bounded rather than deadlocking is what makes this stageable at all; the ticket
+    // named the drain as the obstacle.
+    std::thread stopper { [&endpoint] { endpoint->reset(); } }; // ~FrameEndpoint IS the shutdown
+
+    // Waited for: the watcher WOKE. `RecordDeparture` increments this before it asks
+    // either question, so this is the arrival and not the verdict.
+    REQUIRE(WaitFor([&fleet, observedBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1;
+    }));
+
+    // Released only now, so the answer returns AFTER the close and the drain completes.
+    responder.Hold(false);
+    stopper.join();
+
+    // The verdict. `consulted` is false because the connection never left the responder
+    // before the close, so this zero is `ClosedLocally` and nothing else.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1);
+}
+
 
 TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")
 {
