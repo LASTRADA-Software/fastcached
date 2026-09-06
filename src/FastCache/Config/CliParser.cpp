@@ -548,6 +548,33 @@ namespace
         // reload column could not answer for them, and `--install-service` replays
         // a command line, so an operator who set them in a file had no way for the
         // setting to reach the unit at all.
+        //
+        // All three are `Reloadable::No` DELIBERATELY, and this says so because the
+        // default made it look inherited (#756).
+        //
+        // They are decode-safe, which is the part that invites flipping them:
+        // `InMemoryLruStorage` stamps each entry with the codec it was written
+        // under and decompresses with THAT, never with the configured one, so a
+        // mixed tier is readable by construction. Level is not even read at
+        // decompression, and min-bytes only decides whether a FUTURE write
+        // compresses. Decode safety is not the obstacle.
+        //
+        // The obstacle is reach, and it is narrower than it looks. `SetCompression`
+        // is on `InMemoryLruStorage` rather than on `IStorage`, and the L1
+        // instances are buried inside `ShardedStorage`/`LayeredStorage` with no
+        // handle collecting them -- a 32-shard daemon has 32 and can address none.
+        //
+        // And the obvious repair, collecting `InMemoryLruStorage*` as the bundle
+        // builds them, is UNSAFE: `SetCompression` is a plain unsynchronised member
+        // write, a reload runs while the reactors serve, and calling it on a
+        // collected pointer bypasses the per-shard lock. `Resize` is reloadable
+        // precisely BECAUSE it goes through `IStorage` and `ShardedStorage::Resize`
+        // takes `shard->mu` around each one. So the reach has to be the locked path
+        // or a synchronised setting -- not a pointer someone kept.
+        //
+        // Flipping the column without solving that is what `Reloadable`'s own
+        // documentation warns against: a live-wired object disagreeing with the
+        // configuration that claims to describe it, with nothing saying so.
         { .primary = "--memory-compression",
           .arity = Arity::Value,
           .operand = "=<codec>",
@@ -556,7 +583,9 @@ namespace
           .description = "in-memory value codec for the L1 tier: none|lz4|zstd (default none)\n"
                          "independent of --compression, which is the on-disk one",
           .yamlKey = "memory_compression",
+          .reloadable = Reloadable::No,
           .same = FieldEq<&Config::memoryCompression>() },
+        // `Reloadable::No` deliberately; see the note on `--memory-compression`.
         { .primary = "--memory-compression-level",
           .arity = Arity::Value,
           .operand = "=<N>",
@@ -564,7 +593,9 @@ namespace
           .explicitBit = &CliResult::memoryCompressionLevelExplicit,
           .description = "codec effort level for --memory-compression (1..22; default 3, zstd)",
           .yamlKey = "memory_compression_level",
+          .reloadable = Reloadable::No,
           .same = FieldEq<&Config::memoryCompressionLevel>() },
+        // `Reloadable::No` deliberately; see the note on `--memory-compression`.
         { .primary = "--memory-compression-min-bytes",
           .arity = Arity::Value,
           .operand = "=<size>",
@@ -573,6 +604,7 @@ namespace
           .description = "keep in-memory values smaller than this uncompressed; k/m/g accepted\n"
                          "(default 4096)",
           .yamlKey = "memory_compression_min_bytes",
+          .reloadable = Reloadable::No,
           .same = FieldEq<&Config::memoryCompressionMinBytes>() },
         { .primary = "--lru-mode",
           .arity = Arity::Value,
