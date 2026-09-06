@@ -4,6 +4,8 @@
 
 #include <FastCache/Async/Task.hpp>
 
+#include <memory>
+#include <mutex>
 #include <utility>
 
 namespace FastCache::Node
@@ -66,6 +68,14 @@ void NodeIoLoop::Start()
         return;
 
     _thread = std::jthread { [this] { _reactor.Run(); } };
+}
+
+void NodeIoLoop::Retire(std::unique_ptr<IListener> listener)
+{
+    if (!listener)
+        return;
+    std::scoped_lock const guard { _retiredMutex };
+    _retired.push_back(std::move(listener));
 }
 
 void NodeIoLoop::NoteLoopStarted() noexcept

@@ -3,11 +3,14 @@
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/PlatformConnector.hpp>
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -90,6 +93,46 @@ class NodeIoLoop
     /// accepting on.
     void Start();
 
+    /// Take ownership of a listener this reactor owns, and free it once the
+    /// reactor has stopped.
+    ///
+    /// **The rule is `IReactor::TeardownIsSerialisedWithDispatch()`**: an object a
+    /// reactor owns is destroyed on that reactor's worker thread, or with that
+    /// reactor stopped, because clearing a pending awaitable anywhere else races the
+    /// completion dispatch
+    /// ([#668](https://github.com/LASTRADA-Software/fastcached/issues/668)).
+    /// `~FrameEndpoint` could satisfy neither on its own: it runs on whatever thread
+    /// owns the endpoint, and `FrameServer::Shutdown()`'s drain waits for the very
+    /// condition that *triggers* the stop -- the last loop decrements before it calls
+    /// `NoteLoopFinished()`, and `Stop()` only sets a flag and posts a wakeup, so
+    /// `Running()` stays true until `Run()` returns. The endpoint's members were then
+    /// destroyed inside that gap
+    /// ([#840](https://github.com/LASTRADA-Software/fastcached/issues/840)), which is
+    /// what `Windows-cl-debug` reported intermittently and in a different
+    /// `FrameEndpoint_test` case each run
+    /// ([#737](https://github.com/LASTRADA-Software/fastcached/issues/737)).
+    ///
+    /// **Deferring is not the same as posting, and it is why this is here rather than
+    /// in the endpoint.** Posting the destruction onto the reactor and waiting for it
+    /// answers the multi-surface case and hangs on the ordinary one: a node runs a
+    /// single framed surface, so the endpoint being destroyed is usually the last
+    /// loop -- the reactor is stopping, the posted task will never be dequeued, and
+    /// the wait can only end at its ceiling. Handing the listener here needs no wait
+    /// at all: `_retired` is declared after the reactor and before the thread, so it
+    /// is destroyed *after* the thread has been joined and *before* the reactor it
+    /// points at, which is the "with that reactor stopped" arm of the rule, reached
+    /// by construction rather than by racing for it.
+    ///
+    /// The cost is that a retired listener's memory lives until this loop does. The
+    /// descriptor does not: `FrameServer::Shutdown()` has already closed it on the
+    /// reactor, so the port is free the moment the endpoint stops. The number
+    /// retained is the number of endpoints this loop ever served.
+    ///
+    /// Safe from any thread; an endpoint may be dropped from one that is not the
+    /// owner's. @p listener may be null, which retires nothing.
+    /// @param listener The listener to hold until the reactor has stopped.
+    void Retire(std::unique_ptr<IListener> listener);
+
     /// Note that one more loop is running.
     ///
     /// For loops a server spawns for itself rather than ones the owner adopted --
@@ -132,6 +175,18 @@ class NodeIoLoop
 
     std::vector<FrameServer*> _loops;
     std::atomic<std::size_t> _loopsRunning { 0 };
+
+    /// Listeners handed over by `Retire`, freed when this loop is.
+    ///
+    /// **Its POSITION is the mechanism.** Declared after `_reactor` and before
+    /// `_thread`, so destruction -- which runs in reverse -- joins the thread first,
+    /// then frees these with `Run()` provably returned, then frees the reactor they
+    /// name. Moving this declaration either way breaks the guarantee silently: above
+    /// `_reactor` and a listener outlives the reactor its destructor asks; below
+    /// `_thread` and it is freed while the loop still turns, which is the defect.
+    std::mutex _retiredMutex;
+    std::vector<std::unique_ptr<IListener>> _retired;
+
     std::jthread _thread;
 };
 
