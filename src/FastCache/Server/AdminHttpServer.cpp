@@ -744,9 +744,14 @@ Task<void> AdminHttpServer::Run()
     co_return;
 }
 
-void AdminHttpServer::Shutdown() noexcept
+void AdminHttpServer::RequestStop() noexcept
 {
     _shuttingDown.store(true, std::memory_order_release);
+}
+
+void AdminHttpServer::Shutdown() noexcept
+{
+    RequestStop();
     _listener.Close();
     // Detached request coroutines may still be in flight. They borrow the
     // metrics sink, snapshot provider and routes held on this object, so we must

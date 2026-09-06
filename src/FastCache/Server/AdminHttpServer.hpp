@@ -278,7 +278,26 @@ class AdminHttpServer
     /// @return Task that resolves when the accept loop exits.
     [[nodiscard]] Task<void> Run();
 
-    /// Close the listener to unblock Run() and stop accepting.
+    /// Ask the accept loop to stop, without touching the listener.
+    ///
+    /// **Call this, join the accept thread, and only then call `Shutdown()`.**
+    /// `Shutdown()` closes the listener, which is a write to a member the accept
+    /// thread reads on every pass -- a data race ThreadSanitizer reports at
+    /// `BlockingListener::Close`, and one the whole suite passes straight through
+    /// (#260). Closing was never the wake mechanism in the first place: POSIX does
+    /// not unblock a parked `accept()` on close, which is exactly why the listener
+    /// arms `AcceptPoll` via `BlockingListener::SetTimeouts`. So the loop leaves on
+    /// its own within one poll interval, and waiting for it costs at most that.
+    ///
+    /// Split out rather than folded into `Shutdown()`, because a single call
+    /// cannot both precede and follow the join.
+    void RequestStop() noexcept;
+
+    /// Stop accepting and close the listener, then drain in-flight requests.
+    ///
+    /// Safe to call after the accept thread has been joined; see `RequestStop()`
+    /// for why that order matters. Calling it alone still works and still stops
+    /// the loop -- it simply races the accept thread while doing so.
     void Shutdown() noexcept;
 
     /// Maximum number of concurrently-in-flight admin requests. The accept
