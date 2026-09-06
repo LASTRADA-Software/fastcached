@@ -2166,15 +2166,26 @@ jobs:
           grep -q STORED /tmp/fc-proto.txt
           grep -q hello  /tmp/fc-proto.txt
 
+          # The machine-wide config may hold a secret, so the package restricts it
+          # to the service account (#861). Assert the INSTALLED result: the ctest
+          # check reads the scriptlet source, which cannot see a scriptlet that
+          # did not run. Both halves matter -- unreadable to others AND readable
+          # by the account the unit runs as, or the daemon cannot start.
+          _mode=$(stat -c '%a %U:%G' /etc/fastcached/fastcached.yaml)
+          test "$_mode" = "640 root:fastcached" \
+            || { echo "::error::config is '$_mode', expected '640 root:fastcached'"; exit 1; }
+          sudo -u fastcached test -r /etc/fastcached/fastcached.yaml \
+            || { echo "::error::the service account cannot read its own config"; exit 1; }
+
           # Reload must apply a reloadable setting rather than restart or fail.
           # Assert the edit actually landed: sed exits 0 when it matches
           # nothing, so a reflow of the shipped comment would silently turn this
           # into "reload an unchanged file", which passes without ever
           # exercising the SIGHUP path.
-          grep -q '^#log_level: info' /etc/fastcached/fastcached.yaml \
+          sudo grep -q '^#log_level: info' /etc/fastcached/fastcached.yaml \
             || { echo "::error::the shipped yaml no longer contains '#log_level: info'; update this step"; exit 1; }
           sudo sed -i 's/^#log_level: info/log_level: debug/' /etc/fastcached/fastcached.yaml
-          grep -q '^log_level: debug' /etc/fastcached/fastcached.yaml \
+          sudo grep -q '^log_level: debug' /etc/fastcached/fastcached.yaml \
             || { echo "::error::config edit did not apply"; exit 1; }
           sudo systemctl reload fastcached
           sleep 2
@@ -2306,7 +2317,7 @@ jobs:
           set -euo pipefail
           echo '# local edit that must survive' | sudo tee -a /etc/fastcached/fastcached.yaml >/dev/null
           sudo apt-get install -y --reinstall ./$(ls fastcached_*.deb)
-          grep -q 'local edit that must survive' /etc/fastcached/fastcached.yaml \
+          sudo grep -q 'local edit that must survive' /etc/fastcached/fastcached.yaml \
             || { echo "::error::upgrade discarded the local config edit"; exit 1; }
           sudo systemctl stop fastcached || true
 
