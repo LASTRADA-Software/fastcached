@@ -3034,15 +3034,36 @@ jobs:
           # and it is declared once because two copies is how one of them loses an
           # entry.
           $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546')
-          # The write mask, unchanged. It is the directory's, it predates this
-          # branch, and widening it to match PlantingRights exactly would be a
-          # change to a pre-existing assertion on a platform this branch cannot
-          # run -- that belongs with whoever can test it.
-          $planting = [Security.AccessControl.FileSystemRights]::CreateFiles `
-                    -bor [Security.AccessControl.FileSystemRights]::CreateDirectories `
-                    -bor [Security.AccessControl.FileSystemRights]::Write `
-                    -bor [Security.AccessControl.FileSystemRights]::ChangePermissions `
-                    -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+          # The write mask, now PlantingRights from src/FastCache/Platform/FileTrust.cpp
+          # bit for bit (#866). It was NOT that mirror in either direction, while a
+          # comment presented it as one -- "a comment naming what it duplicates
+          # vouches for the duplicate's bugs":
+          #
+          #   * it OMITTED DELETE, GENERIC_WRITE and GENERIC_ALL, so a principal
+          #     granted any of them could plant or replace the machine-wide config
+          #     and this assertion passed;
+          #   * it INCLUDED the `Write` composite, which is WriteData|AppendData plus
+          #     WriteExtendedAttributes|WriteAttributes -- two rights the C++
+          #     predicate does not count, so it could also refuse a grant the daemon
+          #     considers harmless.
+          #
+          # CreateFiles/CreateDirectories are KEPT rather than WriteData/AppendData:
+          # identical bits (0x2 / 0x4), and the directory-facing names are the honest
+          # ones for a directory ACL. Dropping `Write` is what removes the two extra
+          # bits, since those two already carry everything it shared with
+          # FILE_WRITE_DATA | FILE_APPEND_DATA.
+          #
+          # FileSystemRights has no name for GENERIC_WRITE or GENERIC_ALL, so they are
+          # raw and decimal -- the same reasons the read mask below gives. int64 for
+          # consistency with it rather than necessity: both fit a positive Int32,
+          # unlike GENERIC_READ.
+          $planting = ([int64][Security.AccessControl.FileSystemRights]::CreateFiles) `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::CreateDirectories `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::Delete `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::ChangePermissions `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::TakeOwnership `
+                    -bor [int64]1073741824 `
+                    -bor [int64]268435456
           # The read mask is ReadingRights from src/FastCache/Platform/FileTrust.cpp,
           # spelled for PowerShell. ReadData rather than the Read composite: that
           # one includes ReadPermissions, which almost every entry carries, so a
