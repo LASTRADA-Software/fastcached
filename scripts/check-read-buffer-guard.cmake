@@ -194,7 +194,23 @@ foreach(source IN LISTS netSources)
                  "${shownPath}: ${className}::Read calls ${FastCachedReadGuardCall} only AFTER its first return, so every early exit skips it (#838)")
         endif()
 
-        math(EXPR cursor "${cursor} + ${afterSignature} + ${bodyStart}")
+        # `bodyStart` is ALREADY in `rest` coordinates, so this is one term and not two.
+        #
+        # It was two, briefly, and that is worth the space: the change that moved every
+        # offset into one coordinate system -- made precisely to remove where an
+        # off-by-one had been hiding -- left this line summing `afterSignature` a second
+        # time. The cursor then over-advanced by the whole signature, so the walk SKIPPED
+        # any second `Read` definition in a file whenever the first sat more than a few
+        # hundred bytes in, which is every real source here. Measured on a synthetic
+        # tree: a guarded implementation followed by an UNGUARDED one, 200 lines of
+        # filler ahead of them, reported `1 implementation(s) ... all refusing` and
+        # PASSED.
+        #
+        # A false pass in the instrument built to stop a false pass -- #492's shape one
+        # level up, in the check whose own header argues against it. The six original
+        # self-test cases could not see it because every one is a single implementation
+        # at offset zero; case 7 exists for exactly this and pads its file deliberately.
+        math(EXPR cursor "${cursor} + ${bodyStart}")
         if(cursor GREATER_EQUAL textLength)
             break()
         endif()

@@ -234,6 +234,55 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# 7. TWO implementations in ONE file, the second unguarded, with real padding ahead of
+#    the first. This is the case the other six structurally cannot reach: every one of
+#    them is a single implementation at offset zero, so a cursor that over-advances
+#    still lands past the only match and the verdict is unchanged.
+#
+#    It exists because the check DID over-advance -- by a whole signature -- and
+#    reported `1 implementation(s) ... all refusing` over a file whose second transport
+#    had no guard. A false pass in the instrument built to prevent one. The padding is
+#    load-bearing rather than realism: with both functions at the top of the file the
+#    over-advance is small enough to land inside the second signature and the check
+#    finds it anyway, which is a regression test that does not reproduce the regression.
+math(EXPR caseCount "${caseCount} + 1")
+set(paddedPair "")
+foreach(i RANGE 1 200)
+    string(APPEND paddedPair "// filler line ${i}, to push the first definition well into the file\n")
+endforeach()
+string(APPEND paddedPair
+"
+IoAwaitable AlphaSocket::Read(std::span<std::byte> buffer)
+{
+    Detail::RequireReadBuffer(buffer);
+    if (_closed)
+        return IoAwaitable { std::unexpected(NetError {}) };
+    return IoAwaitable { IoResult { buffer.size() } };
+}
+
+IoAwaitable BetaSocket::Read(std::span<std::byte> buffer)
+{
+    if (_closed)
+        return IoAwaitable { std::unexpected(NetError {}) };
+    return IoAwaitable { IoResult { buffer.size() } };
+}
+")
+fastcached_make_tree("twoinone" "TwoSockets.cpp" "${paddedPair}" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "twoinone: a file whose SECOND implementation has no guard passed -- the walk skipped it, which is a false pass in the instrument built to prevent one")
+else()
+    string(FIND "${output}" "BetaSocket::Read does not call" position)
+    if(position EQUAL -1)
+        list(APPEND failures "twoinone: it refused, but did not name the SECOND implementation, so the walk is still not reaching it")
+    endif()
+    string(FIND "${output}" "2 ISocket::Read implementation(s)" position)
+    if(position EQUAL -1)
+        list(APPEND failures "twoinone: it refused without having SEEN both implementations -- a refusal that counted one of two is right by accident")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # How many cases RAN is part of the output, because a self-test that stops early must
 # not look like one that judged something (#720).
 list(LENGTH failures failureCount)
