@@ -309,7 +309,7 @@ was fixed, neither flag could be given to a worker at all). The worker says whic
 it is in its own startup line:
 
 ```
-[INFO] compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674, 16 slot(s) as a … node, 2 toolchain(s), every caller admitted
+[INFO] compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674, 16 slot(s) as a … node, identifying 2 toolchain(s), every caller admitted
 [INFO] compile node ready on 0.0.0.0:6674, … , this machine only -- give --fleet-member or --fleet-open to admit peers
 ```
 
