@@ -60,11 +60,24 @@ namespace Detail
     ///
     /// Contract: a protocol handler assigns this immediately before a
     /// *synchronous* storage call (the engine calls run in co_await-free blocks),
-    /// so the value is current when TracingStorage reads it. It is a view: the
-    /// referenced string lives in the connection's coroutine frame and outlives
-    /// the storage call. Empty means "no source" — the line is logged unprefixed.
-    /// Each command assigns it afresh, so a connection never inherits another's.
-    inline thread_local std::string_view storageSourceTag {};
+    /// so the value is current when TracingStorage reads it. Empty means "no
+    /// source" — the line is logged unprefixed. Each command assigns it afresh,
+    /// so a connection never inherits another's.
+    ///
+    /// It **owns**. It was a `string_view` borrowing the connection's coroutine
+    /// frame, which is freed while this thread_local outlives it: a reactor
+    /// thread serving the next connection then rendered freed heap into the
+    /// `--log-source` trace line, and ASan aborted about one full-suite run in
+    /// three (#906). That is a disclosure into the log, not merely a crash, and
+    /// the log is exactly where it does not look wrong.
+    ///
+    /// This is `.agent/rules/wire-and-protocol.md`'s borrow rule applied to
+    /// ambient thread-local state rather than to a decoder's return value: what
+    /// the field DECIDES (log CONTENT) outranks the arithmetic, so it owns and
+    /// the copy is not weighed. The copy is also near-free — assigning to a
+    /// thread_local `std::string` reuses the capacity it already holds, so
+    /// steady state is a memcpy of a short tag with no allocation at all.
+    inline thread_local std::string storageSourceTag {};
 } // namespace Detail
 
 /// Logger abstraction. Implementations are expected to be O(memcpy) on the

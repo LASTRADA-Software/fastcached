@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -65,6 +66,43 @@ TEST_CASE("TracingStorage prefixes the line with the published source tag", "[tr
     auto const records = logger.Snapshot();
     REQUIRE(records.size() == 1);
     REQUIRE(records[0].message.starts_with("[203.0.113.7] storage: GET key=foo"));
+}
+
+TEST_CASE("TracingStorage's source tag survives the frame that published it", "[tracing][logsource]")
+{
+    // #906. The tag was a `string_view` borrowing the connection's coroutine
+    // frame. A reactor thread outlives that frame, so every trace line emitted
+    // between one connection ending and the next publishing read freed heap --
+    // and RENDERED it into the `--log-source` line, which is a disclosure and
+    // not merely a crash. Publish from storage that is then destroyed, which is
+    // exactly what a closing connection does.
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::ManualClock clock;
+    FastCache::TracingStorage tracer { inner, logger, clock };
+
+    // The tag must not fit libstdc++'s 15-char SSO buffer, or the bytes sit in
+    // a still-live stack slot, read back correctly and NOTHING is reported --
+    // the size-dependence `.agent/rules/wire-and-protocol.md` records for #395.
+    // An IPv6 peer is what getpeername returns on any v6 deployment, so this is
+    // a REAL size rather than a large one.
+    static constexpr std::string_view tag = "[2001:db8:85a3::8a2e:370:7334]";
+    static_assert(tag.size() > 15, "must exceed the SSO buffer, or the use-after-free is unobservable");
+
+    {
+        auto const frame = std::make_unique<std::string>(tag);
+        FastCache::Detail::storageSourceTag = *frame;
+    } // the publishing frame is freed here, as Connection::Run()'s is
+
+    REQUIRE(tracer.Get("foo", clock.Now()).has_value());
+    FastCache::Detail::storageSourceTag = {};
+
+    auto const records = logger.Snapshot();
+    REQUIRE(records.size() == 1);
+    // Asserts the CONTENT, not merely that a line was emitted: a borrowed tag
+    // reads back as whatever the allocator left there, which both states
+    // produce a line for.
+    REQUIRE(records[0].message.starts_with(std::string { tag } + " storage: GET key=foo"));
 }
 
 TEST_CASE("TracingStorage omits the prefix when no source tag is published", "[tracing][logsource]")

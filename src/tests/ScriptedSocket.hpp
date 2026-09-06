@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <span>
@@ -71,8 +72,26 @@ class ScriptedSocket final: public ISocket
     /// Hand back the next slice of the script.
     /// @param buffer Where to put it.
     /// @return How much was copied; `0` once the script is spent, which is EOF.
+    /// Run `hook` at the start of every `Read`, before any bytes are handed over.
+    ///
+    /// The seam models ANOTHER connection running while this one is suspended in
+    /// a read, which on a reactor thread is exactly what a `co_await` permits. It
+    /// is the only way to reach a class of defect where a handler publishes
+    /// ambient thread-local state, suspends, and then uses it (#919) — a single
+    /// connection cannot reproduce those, and a test built from one passes under
+    /// the bug.
+    ///
+    /// Defaulted to nothing, so no existing caller changes behaviour.
+    /// @param hook Called on each Read; pass {} to disarm.
+    void SetOnRead(std::function<void()> hook)
+    {
+        _onRead = std::move(hook);
+    }
+
     [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
     {
+        if (_onRead)
+            _onRead();
         // Recorded before the short-read check: an attempted read is still a read
         // for the purpose of "did this client wait for a reply mid-conversation".
         if (_trace.empty() || _trace.back() != 'R')
@@ -156,6 +175,7 @@ class ScriptedSocket final: public ISocket
     }
 
   private:
+    std::function<void()> _onRead {};
     std::vector<std::byte> _replies;
     std::vector<std::byte> _sent;
     std::size_t _cursor { 0 };

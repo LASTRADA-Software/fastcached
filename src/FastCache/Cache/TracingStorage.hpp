@@ -148,7 +148,7 @@ class TracingStorage final: public IStorage
     /// @return The bracketed-source-plus-space prefix, or an empty string.
     [[nodiscard]] static std::string SourcePrefix()
     {
-        auto const tag = Detail::storageSourceTag;
+        auto const& tag = Detail::storageSourceTag;
         if (tag.empty())
             return {};
         return std::string { tag } + ' ';
