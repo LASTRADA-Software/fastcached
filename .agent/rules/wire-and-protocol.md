@@ -1103,6 +1103,50 @@ Every rule below has already been a bug.
   to complete the second after the first has taken the socket down; and the same edit
   went to `KqueueSocket::Close`, which was a copy of the same loop and had the same
   defect on a platform where nothing had ever run a sanitizer either.
+- **An object a reactor owns is destroyed on that reactor's WORKER THREAD, or with
+  that reactor STOPPED** — `IReactor::TeardownIsSerialisedWithDispatch()`, which is
+  `!Running() || IsOnWorkerThread()`. Clearing a pending awaitable anywhere else races
+  the completion dispatch that would read it.
+  [#668](https://github.com/LASTRADA-Software/fastcached/issues/668) landed the
+  predicate, `Detail::AssertTeardownIsSerialisedWithDispatch` and the must-die
+  `reactor-teardown-canary`; **it did not land a rule here, and that is the reason
+  this entry exists** — the constraint was expressed only in code, so it fired for
+  nobody who had not already opened `IocpSocket.cpp`.
+  - **The defect is portable; only the PREDICATE was Windows-only.** `Running()` and
+    `IsOnWorkerThread()` lived on `IocpReactor` and nowhere else, so epoll and kqueue
+    never checked — not because the ordering is safe there, but because their
+    `Close()` resumes inline and the race has a cheaper consequence. It still resumes
+    and unwinds a per-connection coroutine on the STOPPING thread while the reactor
+    dispatches, which is the same hazard one bullet up.
+  - **A drain that waits for the loops cannot also mean the reactor has stopped.** The
+    last loop decrements its own counter *before* calling `NodeIoLoop::NoteLoopFinished()`,
+    and `Stop()` only sets a flag and posts a wakeup, so `Running()` stays true until
+    `Run()` returns. `~FrameEndpoint` destroyed its listener inside exactly that gap
+    ([#840](https://github.com/LASTRADA-Software/fastcached/issues/840)).
+  - **Posting the teardown and waiting for it is the tempting fix and it hangs on the
+    ordinary case.** A node runs ONE framed surface, so the endpoint being dropped is
+    usually the last loop: the reactor is already stopping, the posted task is never
+    dequeued, and the wait can only end at its ceiling. **Deferring is the third
+    option** — `NodeIoLoop::Retire` holds the listener in a member declared after the
+    reactor and before the thread, so it is freed after the join and before the reactor
+    it names. No wait, no ceiling, no race; the cost is that its memory (not its
+    descriptor, which `Shutdown()` already closed) lives as long as the loop.
+  - **Its one observer was `Windows-cl-debug`, which does not gate**, and it fired
+    intermittently in a different `FrameEndpoint_test` case each run
+    ([#737](https://github.com/LASTRADA-Software/fastcached/issues/737)) — which is
+    what a race looks like when every case shares one teardown. **Reproduced on
+    Linux** by adding the shared assertion to `~EpollListener` and delaying
+    `EpollReactor::RunLoop()`'s return by 200 ms: `[frame]` aborted **20 of 20** runs
+    across **13 distinct cases**, the reported signature exactly. A green run there
+    is the absence of a trip, never evidence of a fix.
+  - **So the regression test does not wait for the race, it removes it.** A second
+    loop that never finishes (`NoteLoopStarted` with no matching finish until the end)
+    makes the reactor unable to stop, so the predicate is false from the calling thread
+    for as long as the case lasts — and a fake listener records
+    `TeardownIsSerialisedWithDispatch()` as it dies rather than asserting, because an
+    assert aborts and can only ever be a canary. Measured: **20 of 20 fail** with the
+    fix neutered, **20 of 20 pass** with it, and the three failing assertions are
+    exactly the three that describe the defect.
 - **A watchdog may not write to a socket a coroutine owns, and the reason is
   OWNERSHIP rather than interleaving.** `FrameServer::CloseOverdue` closes connections
   past their deadline, so a peer got a bare TCP close it cannot tell from a crash, a
@@ -1561,6 +1605,20 @@ consequence rather than a precaution.
 
 ## Open work
 
+- **[#885](https://github.com/LASTRADA-Software/fastcached/issues/885)** —
+  `RaftPeerServer::Shutdown` closes every accepted connection from the calling
+  thread, so on epoll and kqueue each per-connection coroutine is resumed and
+  unwound there and its `unique_ptr<ISocket>` is destroyed off the reactor —
+  the teardown rule above, at a second owner. `FrameServer::Shutdown` posts its
+  closes onto the reactor for exactly this reason and says so; this one does not.
+  **Measured on Linux**, not inferred: with `Detail::AssertTeardownIsSerialisedWithDispatch`
+  added to `~EpollSocket`/`~EpollListener` and nothing else changed, `cluster-e2e`
+  is the only failure in the whole suite (a node aborts 134 after SIGTERM, 2 of 2),
+  and a backtrace probe files all six violations at `ConsensusTier.cpp:495` →
+  `EpollSocket::Close` → `ServePeer`. **This blocks making the rule portable**:
+  adding that assertion to the epoll and kqueue destructors is what would give #668's
+  rule an observer on every leg instead of only `Windows-cl-debug`, and it cannot
+  land while this is present.
 - **[#828](https://github.com/LASTRADA-Software/fastcached/issues/828)** — the admin
   surface's pre-first-byte wait and its mid-head read deadline are one number
   (`AdminHttpServer::RequestTimeout`, armed as `SO_RCVTIMEO`), so a browser
