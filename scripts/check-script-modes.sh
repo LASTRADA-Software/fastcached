@@ -87,34 +87,66 @@ if [ "$selfTest" -eq 0 ]; then
 fi
 
 # --- self-test: both directions, or a check that always passes looks the same ---
+#
+# The fixtures are REAL git repositories, and each case asserts which enumeration
+# it exercised. A synthetic directory is not a git repo, so a self-test built on
+# one would drive the `walk` fallback while CI drives `git` -- the mode under
+# test would not be the mode in use, which is a guard passing because it is
+# testing something else (#499's shape).
+#
+# It is also the only portable way to stage the negative: on Windows `chmod 644`
+# does not stick and the staged violation reads as executable, so the case that
+# must FAIL passes. Git index modes are the same on every platform.
 cases=0
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-mkdir -p "$tmp/good/scripts"
-printf '#!/usr/bin/env bash\ntrue\n' > "$tmp/good/scripts/a.sh"; chmod +x "$tmp/good/scripts/a.sh"
-printf '# sourced library, no shebang\ntrue\n' > "$tmp/good/scripts/lib.sh"   # 644, must be ignored
-cases=$((cases + 1))
-if Check "$tmp/good" >/dev/null 2>&1; then echo "  ok: clean tree passes"
-else echo "  FAIL: clean tree was refused"; exit 1; fi
+MakeRepo() {  # $1 = dir, $2 = mode for scripts/a.sh (+x or -x)
+    mkdir -p "$1/scripts"
+    git -C "$1" init -q
+    printf '#!/usr/bin/env bash\ntrue\n' > "$1/scripts/a.sh"
+    printf 'true\n' > "$1/scripts/lib.sh"   # sourced library: no shebang, no bit
+    git -C "$1" add -A >/dev/null 2>&1
+    git -C "$1" update-index "--chmod=$2" scripts/a.sh
+}
 
-mkdir -p "$tmp/bad/scripts"
-printf '#!/usr/bin/env bash\ntrue\n' > "$tmp/bad/scripts/a.sh"; chmod 644 "$tmp/bad/scripts/a.sh"
-cases=$((cases + 1))
-if Check "$tmp/bad" >/dev/null 2>&1; then echo "  FAIL: a shebanged 644 script was accepted"; exit 1
-else echo "  ok: a shebanged 644 script is refused"; fi
+Assert() {  # $1 = label, $2 = dir, $3 = expect pass|fail, $4 = expected mode
+    local out rc
+    out=$(Check "$2" 2>&1) && rc=0 || rc=1
+    cases=$((cases + 1))
+    case "$4" in
+        ?*) printf '%s\n' "$out" | grep -q "enumerated via $4" \
+                || { echo "  FAIL: $1 -- expected enumeration '$4', got: $(printf '%s' "$out" | head -1)"; exit 1; } ;;
+    esac
+    if [ "$3" = pass ] && [ "$rc" -ne 0 ]; then echo "  FAIL: $1 -- expected a pass"; printf '%s\n' "$out"; exit 1; fi
+    if [ "$3" = fail ] && [ "$rc" -eq 0 ]; then echo "  FAIL: $1 -- expected a refusal"; printf '%s\n' "$out"; exit 1; fi
+    echo "  ok: $1"
+}
 
-# The empty-scan refusal: a directory with no .sh at all must FAIL, not pass.
-mkdir -p "$tmp/empty/scripts"
-cases=$((cases + 1))
-if Check "$tmp/empty" >/dev/null 2>&1; then echo "  FAIL: an empty scan passed"; exit 1
-else echo "  ok: an empty scan is refused"; fi
+MakeRepo "$tmp/good" "+x"
+Assert "a shebanged script with the bit passes, and a bitless library is ignored" "$tmp/good" pass git
 
-# A tree whose only .sh has no shebang: the probe cannot be vacuously satisfied.
-mkdir -p "$tmp/noshebang/scripts"
+MakeRepo "$tmp/bad" "-x"
+Assert "a shebanged script without the bit is refused" "$tmp/bad" fail git
+
+# Two empty lists agree perfectly, so both of these must REFUSE rather than pass.
+mkdir -p "$tmp/empty"; git -C "$tmp/empty" init -q
+Assert "a tree with no .sh at all is refused" "$tmp/empty" fail git
+
+mkdir -p "$tmp/noshebang/scripts"; git -C "$tmp/noshebang" init -q
 printf 'true\n' > "$tmp/noshebang/scripts/lib.sh"
+git -C "$tmp/noshebang" add -A >/dev/null 2>&1
+Assert "a tree whose only .sh carries no shebang is refused" "$tmp/noshebang" fail git
+
+# And the fallback is REACHED for a non-git tree. Asserted on the enumeration it
+# chose, not on a verdict: the walk reads the filesystem bit, which Windows does
+# not carry, so a mode-dependent expectation here would be the #499 trap again.
+mkdir -p "$tmp/nogit/scripts"
+printf '#!/usr/bin/env bash\ntrue\n' > "$tmp/nogit/scripts/a.sh"
+out=$(Check "$tmp/nogit" 2>&1 || true)
 cases=$((cases + 1))
-if Check "$tmp/noshebang" >/dev/null 2>&1; then echo "  FAIL: a tree with no shebang at all passed"; exit 1
-else echo "  ok: a tree with no shebanged script is refused"; fi
+printf '%s\n' "$out" | grep -q "enumerated via walk" \
+    && echo "  ok: a non-git tree falls back to the walk" \
+    || { echo "  FAIL: a non-git tree did not use the walk: $(printf '%s' "$out" | head -1)"; exit 1; }
 
 echo "check-script-modes self-test: $cases case(s) ran, all as expected"
