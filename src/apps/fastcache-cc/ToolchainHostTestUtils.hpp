@@ -40,6 +40,25 @@ namespace FastCache::Cc::Testing
 class ScriptedToolchainHost final: public IToolchainHost
 {
   public:
+    /// Make this scripted host resolve a leading `/` against the current drive,
+    /// as Win32 does.
+    ///
+    /// Defaulted OFF, so every existing case is unchanged. A case that wants
+    /// Windows semantics asks for them -- which is what keeps that behaviour
+    /// reachable from a Linux runner, the property the layout table's
+    /// un-`#if`ed-ness exists to protect.
+    /// @return This host, for chaining.
+    ScriptedToolchainHost& WithDriveRelativeSlash()
+    {
+        _leadingSlashIsDriveRelative = true;
+        return *this;
+    }
+
+    [[nodiscard]] bool LeadingSlashIsDriveRelative() const noexcept override
+    {
+        return _leadingSlashIsDriveRelative;
+    }
+
     /// The suffix a bare executable name gains on a Windows-shaped machine.
     ///
     /// Named here rather than taken from the host this test binary runs on: a
@@ -299,6 +318,8 @@ class ScriptedToolchainHost final: public IToolchainHost
 
     std::set<std::string> _directories;
     std::set<std::string> _executables;
+    bool _leadingSlashIsDriveRelative { false };
+
     std::map<std::string, std::string> _files;
     std::map<RegistryEntry, std::string> _registry;
     std::map<std::string, std::string> _environment;

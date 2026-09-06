@@ -241,7 +241,8 @@ namespace
           .versionHintFile = {},
           .binPaths = BinOnly,
           .binaries = PosixBinaries,
-          .match = NameMatch::ExactOrVersionSuffixed },
+          .match = NameMatch::ExactOrVersionSuffixed,
+          .filesystem = LayoutFilesystem::PosixRooted },
         { .name = "usr",
           .root = LayoutRoot::FixedPath,
           .rootPath = "/usr",
@@ -252,7 +253,8 @@ namespace
           .versionHintFile = {},
           .binPaths = BinOnly,
           .binaries = PosixBinaries,
-          .match = NameMatch::ExactOrVersionSuffixed },
+          .match = NameMatch::ExactOrVersionSuffixed,
+          .filesystem = LayoutFilesystem::PosixRooted },
         // MacPorts, then Homebrew's Apple-silicon prefix. Homebrew's Intel prefix is
         // `/usr/local`, which the rows above already cover.
         { .name = "macports",
@@ -265,7 +267,8 @@ namespace
           .versionHintFile = {},
           .binPaths = BinOnly,
           .binaries = PosixBinaries,
-          .match = NameMatch::ExactOrVersionSuffixed },
+          .match = NameMatch::ExactOrVersionSuffixed,
+          .filesystem = LayoutFilesystem::PosixRooted },
         { .name = "homebrew",
           .root = LayoutRoot::FixedPath,
           .rootPath = "/opt/homebrew",
@@ -276,7 +279,8 @@ namespace
           .versionHintFile = {},
           .binPaths = BinOnly,
           .binaries = PosixBinaries,
-          .match = NameMatch::ExactOrVersionSuffixed },
+          .match = NameMatch::ExactOrVersionSuffixed,
+          .filesystem = LayoutFilesystem::PosixRooted },
         // Last, and the only row that spawns anything on POSIX. On most Macs it
         // confirms what `/usr/bin` already yielded rather than adding to it, and the
         // duplicate check collapses the overlap.
@@ -568,6 +572,23 @@ std::vector<ToolchainCandidate> DiscoverToolchainCandidates(IToolchainHost& host
     VsWhereInstallations vsWhere;
     for (auto const& layout: ToolchainLayouts())
     {
+        // A `/`-rooted row is meaningless where a leading `/` is drive-relative.
+        // On Windows `/usr` resolves against the current drive, so on an MSYS2 or
+        // Cygwin install rooted at `C:\` this walk would find
+        // `C:\usr\bin\gcc.exe` -- the MSYS-runtime compiler the `msys2` row
+        // deliberately excludes, because a job dispatched to it comes back linked
+        // against a DLL the client does not have. The exclusion was being undone
+        // through a path nobody looked at (#174).
+        //
+        // Asked of the HOST, never a `#if`. The layout table describes machines
+        // rather than the one it was compiled for, which is what lets a scripted
+        // host exercise the Windows rows from a Linux runner; settling this at
+        // compile time would take that back for exactly the rows in question and
+        // make the Windows behaviour untestable on the only platform that runs
+        // these tests.
+        if (layout.filesystem == LayoutFilesystem::PosixRooted && host.LeadingSlashIsDriveRelative())
+            continue;
+
         auto record = [&](std::string compiler) {
             if (!seen.insert(PathIdentity(compiler)).second)
                 return;
