@@ -1035,12 +1035,51 @@ _e2e_bound_outcome_path() { printf '%s' "${_e2e_workdir}/.bounded-outcome"; }
 
 # What the last `run_bounded` did: finished | exceeded | unstartable.
 #
-# Defaults to `finished` when nothing has been recorded, which is the reading a
-# caller that never bounded anything should get.
+# This is the ONE helper built to keep those three apart, and it used to have a
+# fourth state it silently mapped onto the happiest of the three: `cat` failing was
+# swallowed by `2>/dev/null || true`, so a record that was never written or could
+# not be read came back `finished`. A canary that hung and was killed, in a run
+# where the outcome file could not be written, read as a completed run (#709).
+#
+# The four states are now separated rather than a fourth being added to the
+# vocabulary, which would change the contract every consumer already depends on:
+#
+#   * absent          -- nothing was bounded. `run_bounded` writes the record as its
+#                        FIRST act and refuses if that write fails, so absence can
+#                        only mean it was never called. That is what a caller which
+#                        bounded nothing should read, and it stays `finished`.
+#   * present, sound  -- the recorded word.
+#   * present, unreadable or empty  -- the instrument cannot answer, so it REFUSES.
+#   * present, unrecognised         -- likewise. A truncated write is not a verdict.
+#
+# Refusing rather than inventing a value is how this repository handles "the
+# instrument could not answer" everywhere else, and it keeps the three-word
+# vocabulary the callers were written against.
 e2e_bound_outcome() {
-    local recorded
-    recorded="$(cat "$(_e2e_bound_outcome_path)" 2>/dev/null || true)"
-    printf '%s' "${recorded:-$E2eBoundFinished}"
+    local path recorded
+    path="$(_e2e_bound_outcome_path)"
+
+    if [ ! -e "$path" ]; then
+        printf '%s' "$E2eBoundFinished"
+        return 0
+    fi
+
+    if [ ! -r "$path" ]; then
+        fail "e2e_bound_outcome: ${path} exists and cannot be read, so this fixture has no outcome to report"
+    fi
+
+    recorded="$(cat "$path" 2>/dev/null || true)"
+    case "$recorded" in
+        "$E2eBoundFinished" | "$E2eBoundOutcomeExceeded" | "$E2eBoundUnstartable")
+            printf '%s' "$recorded"
+            ;;
+        "")
+            fail "e2e_bound_outcome: ${path} is empty, so the recorded outcome was lost rather than being 'finished'"
+            ;;
+        *)
+            fail "e2e_bound_outcome: ${path} holds '${recorded}', which is not one of ${E2eBoundFinished}/${E2eBoundOutcomeExceeded}/${E2eBoundUnstartable}"
+            ;;
+    esac
 }
 
 # Run a command under a wall-clock ceiling. Echoes its combined output.
@@ -1138,7 +1177,13 @@ run_bounded() {
     local seconds="$1"; shift
     local capture pid deadline grace status=0 exceeded=0 tick=0
 
-    printf '%s' "$E2eBoundFinished" > "$(_e2e_bound_outcome_path)"
+    # Written FIRST, and the write is CHECKED. `e2e_bound_outcome` reads absence as
+    # "nothing was bounded", which is only sound if a failed write cannot also
+    # produce absence -- a removed workdir, ENOSPC, a permissions change. Refusing
+    # here is what makes that reading unambiguous (#709).
+    if ! printf '%s' "$E2eBoundFinished" > "$(_e2e_bound_outcome_path)" 2>/dev/null; then
+        fail "run_bounded: cannot write $(_e2e_bound_outcome_path), so this run could not report its own outcome"
+    fi
 
     # ASKED, not inferred. `command -v` answers whether this name resolves to
     # something executable -- a path, a PATH lookup, a function, a builtin -- and

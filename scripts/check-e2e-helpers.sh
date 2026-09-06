@@ -716,6 +716,33 @@ run_case() {
         echo "two subshells down, the outcome reads $(probe)"
         ;;
 
+    # #709. The helper built to keep three states apart had a FOURTH it mapped onto
+    # the happiest of them: `cat` failing was swallowed, so a record that was never
+    # written or could not be read came back `finished` -- a killed canary reading
+    # as a completed run.
+    #
+    # All four states, because a fix asserted only on the broken one would pass a
+    # helper that refused unconditionally, which breaks every caller that bounded
+    # nothing.
+    bounded-outcome-absent-is-finished)
+        # Nothing bounded yet. This is the reading the default exists for, and it
+        # must survive the fix.
+        rm -f "${_e2e_workdir}/.bounded-outcome"
+        echo "no record at all: outcome=$(e2e_bound_outcome)"
+        ;;
+
+    bounded-outcome-empty-refuses)
+        # A truncated or failed write. `finished` here is the #709 defect exactly.
+        : > "${_e2e_workdir}/.bounded-outcome"
+        echo "empty record: outcome=$(e2e_bound_outcome)"
+        ;;
+
+    bounded-outcome-garbage-refuses)
+        # A partial write is not a verdict, and must not be passed through.
+        printf 'fini' > "${_e2e_workdir}/.bounded-outcome"
+        echo "partial record: outcome=$(e2e_bound_outcome)"
+        ;;
+
     # The bound expires, and it reports that rather than the child's status. A
     # `sleep` killed by a signal exits 143 on most shells, and 143 read as an
     # answer is exactly the shape of the bug above.
@@ -1570,6 +1597,9 @@ cases=(
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
     "bounded-expires|0|an expired bound exited 124, outcome exceeded"
+    "bounded-outcome-absent-is-finished|0|no record at all: outcome=finished|!BUG:"
+    "bounded-outcome-empty-refuses|1|is empty, so the recorded outcome was lost"
+    "bounded-outcome-garbage-refuses|1|which is not one of finished/exceeded/unstartable"
     "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"
     "duration-reading-shape|0|accepted 3 readings and refused 7|!BUG:"
