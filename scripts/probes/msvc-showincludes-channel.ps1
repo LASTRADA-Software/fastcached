@@ -87,6 +87,47 @@ int main() { return 0; }
 
         Write-Host ("  {0,-22} exit={1,-4} stdout={2,-3} stderr={3,-3} -> {4}" -f `
                     $Label, $p.ExitCode, $onOut, $onErr, $verdict)
+
+        # The PREFIX, which is #878's question and comes free from the same run.
+        #
+        # Printed with delimiters and as a hex dump, because the two hazards #878 names
+        # are both invisible in plain output:
+        #
+        #   1. `cl` INDENTS nested notes, so "the line minus the known path" captures
+        #      the indent into the prefix. Only the top-level note is read here, and the
+        #      bytes show whether trailing blanks are part of what was captured.
+        #   2. A localized DIAGNOSTIC can also end in a known path, so a heuristic can
+        #      learn a prefix that is not the note prefix at all. Every matching line is
+        #      shown rather than the first, so a second shape is visible rather than
+        #      silently adopted.
+        #
+        # This does NOT implement discovery. It is the reading a discovery would have to
+        # be built on, taken on a machine that has what this one does not.
+        foreach ($f in @($out, $err)) {
+            foreach ($hit in @(Select-String -Path $f -SimpleMatch $marker -ErrorAction SilentlyContinue)) {
+                $line = $hit.Line
+                # Everything before the note's PATH -- and the path is found EXACTLY,
+                # not guessed at. This probe created the header, so it knows the full
+                # path the note should name; cutting at the last separator instead would
+                # leave the directory inside the "prefix", which is the shape that makes
+                # a derived prefix silently wrong and is hazard 1 in #878.
+                #
+                # Which anchor matched is REPORTED, because "the note named the full
+                # path" and "it named something else ending in the file name" are
+                # different observations and a discovery built on the second would be
+                # learning the wrong string.
+                $full = Join-Path $work $marker
+                $cut  = $line.IndexOf($full)
+                $how  = 'full path'
+                if ($cut -lt 0) { $cut = $line.LastIndexOf($marker); $how = 'FILE NAME ONLY -- the note did not name the path this probe expected' }
+                $prefix = $line.Substring(0, $cut)
+                $hex = ($prefix.ToCharArray() | ForEach-Object { '{0:x2}' -f [int]$_ }) -join ' '
+                Write-Host ("      note on {0}" -f (Split-Path $f -Leaf))
+                Write-Host ("        full line   : [{0}]" -f $line)
+                Write-Host ("        before path : [{0}]   (anchored on the {1})" -f $prefix, $how)
+                Write-Host ("        those bytes : {0}" -f $hex)
+            }
+        }
     }
 
     Write-Host "toolchain:"
