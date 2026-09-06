@@ -1395,7 +1395,11 @@ int main(int argc, char const* const* argv)
 #if defined(_WIN32)
         host = FastCache::MakeWindowsServiceHost(effective.serviceName);
 #else
-        host = FastCache::MakePosixDaemonHost(effective.pidfile);
+        // `/`, stated rather than defaulted. This daemon executes nothing, so no
+        // path-mapping rule is ever derived from its working directory and the
+        // classical answer is right for it -- unlike the compile node, which spawns
+        // a compiler and states a directory of its own (#784).
+        host = FastCache::MakePosixDaemonHost(effective.pidfile, "/");
 #endif
     }
     if (!host)

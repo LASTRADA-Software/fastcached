@@ -231,8 +231,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `comp_dir` of `.tmp/…/client` and system headers reading `.usr/include/...`, worse
     than the bug. `/` was the SHIPPED value until #674 gave the unit a
     `WorkingDirectory=` naming its own `RuntimeDirectory=`; the drop STAYS, for the
-    routes a unit does not reach — `--daemon` still `chdir("/")`s (#784), and a
-    hand-written unit still may. That a compiler-spawning unit names a directory it
+    routes a unit does not reach — a hand-written one still may name `/`. `--daemon`
+    no longer does: `MakePosixDaemonHost` takes the directory with NO default (#784),
+    the cache daemon states `/` and the node states its scratch base, and the pidfile
+    is written before the chdir so a relative one does not move with it. The CALL
+    SITES are what is asserted, since that is the whole defect — one line of
+    `main.cpp`. That a compiler-spawning unit names a directory it
     CREATES is `ctest -R node-working-directory`, and it has to be a scan: running the
     real unit needs root and a live systemd, and every fixture starts the node from the
     FIXTURE's directory, which is how #674 reached master behind a green dispatch e2e.
@@ -254,6 +258,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     visible disagreement it replaces, so err NARROW. Both wide models turned up while
     fixing this one ticket: matching by filesystem identity rather than the byte prefix,
     and `path::is_absolute()` rather than a leading `/`.
+- `DW_AT_name` is `comp_dir`'s SIBLING: clang takes it from the INPUT FILE PATH, so a
+  dispatched object recorded the worker's `<scratch>/job-N/<name>` — a directory on no
+  machine, with a counter that advances, so two dispatches of ONE translation unit gave
+  byte-differing objects under one key (#660). The client's spelling travels as a
+  REPLACEMENT, never a path the worker opens; the WHOLE path is mapped, and the rule goes
+  LAST or it is overridden by the `compileDir` one. Every way of not building it is NO
+  RULE — a source called `my file.cpp` is ordinary. But the WORKER's half of that skip is
+  a property of a root chosen ONCE, so it is reported at STARTUP
+  (`ScratchRootMappingWarnings`, #810) — asked of the longest `<root>/job-<n>/<name>`
+  rather than the root, and asserted TOGETHER with the rule builder, since a warning
+  without silence and silence without a warning each pass under a constant answer.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

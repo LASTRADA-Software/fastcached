@@ -1494,15 +1494,34 @@ stops being one — the same confound that cost #493 a re-run.
     which is a worse outcome than the defect. `/run` rather than `/tmp`: a worker
     directory that CONTAINS a client's build directory drops the rule exactly as `/`
     does, and CI builds run in `/tmp`.
-    The drop above STAYS, because a unit is not the only route — `PosixDaemonHost`
-    calls `chdir("/")`, so `--daemon` still lands there
-    ([#784](https://github.com/LASTRADA-Software/fastcached/issues/784)), as does any
-    hand-written unit. And the guard is a SCAN of the shipped file
+    The drop above STAYS, because a unit is not the only route: a hand-written one may
+    still name `/` or none. And the guard is a SCAN of the shipped file
     (`ctest -R node-working-directory`, with its own selftest): running the real unit
     needs root and a live systemd, so it is reachable only from the packaging job —
     which is not a required context and therefore reports to nobody (#684) — and no
     fixture substitutes, since every one of them starts the node from the FIXTURE's
     directory. That is precisely how #674 reached master with a dispatch e2e green.
+  - **The daemonize route was the other half, and it is a PARAMETER now, not a
+    constant** ([#784](https://github.com/LASTRADA-Software/fastcached/issues/784)).
+    `PosixDaemonHost` chdir'd to `/` unconditionally, so `--daemon` landed a worker
+    there whatever its unit said — a `WorkingDirectory=` does not survive the double
+    fork, because the chdir happens after it. `MakePosixDaemonHost` therefore takes the
+    directory and has **no default**: the cache daemon states `/` (it executes nothing,
+    so no rule is ever derived from its directory) and the node states
+    `Node::ScratchBaseDirectory()`, which it creates before daemonizing. No default is
+    the point — a third daemonizing binary meets a compile error rather than inheriting
+    an answer chosen for something else.
+    - The pidfile is written BEFORE the chdir now. Where a relative one lands must not
+      depend on which directory the host was told to move to, or giving the node a
+      directory of its own silently relocates its pidfile — the same class of defect.
+      It resolves against the invocation directory for both binaries; it used to
+      resolve against `/`, where only root can write.
+    - Asserted by reading the CALL SITES (`PosixDaemonHost_test`), because that is the
+      whole of the defect: one line of `main.cpp`. A compiler-spawning binary's second
+      argument may not be a string literal at all; the cache daemon's must be exactly
+      `"/"`, and that control is not decoration — without it the rule reads "never pass
+      a literal", which refuses a correct tree. Comment-only lines are stripped first,
+      and BOTH halves were shown red.
   - **`:` is a path character here.** A Windows absolute path begins `C:\`, and a
     GNU-layout driver on Windows — mingw, or plain clang — is an ordinary client.
     Leaving `:` out of the safe set refused every such client's own directory before
@@ -1567,6 +1586,25 @@ stops being one — the same confound that cost #493 a re-run.
       switch at all, are ordinary. Skipping an `=` is also the NARROW choice: gcc cuts
       `<from>=<to>` at the last separator and clang at the first, so such a rule records
       a name NEITHER machine has, which is worse than recording the worker's.
+    - **But the WORKER's half of that same skip is a startup property, and is said at
+      startup** ([#810](https://github.com/LASTRADA-Software/fastcached/issues/810)).
+      `scratchSourcePath` lies under a root the process chose ONCE, so a root carrying a
+      space (`/Users/john doe/...`, an ordinary macOS home) or an `=` makes EVERY rule on
+      that worker unspellable and every dispatched object goes back to `job-N` — nothing
+      counting it, and `dist-compile-e2e` blind to it because its scratch root is
+      well-behaved. `ScratchRootMappingWarnings` is a pure function the claim site logs;
+      the call site still SKIPS, because such a machine compiles perfectly well and only
+      its debug names degrade.
+      - It is asked of the LONGEST path a job on that root can produce, never the root:
+        the rule's left-hand side is `<root>/job-<n>/<name>`, so a root a few bytes under
+        the length ceiling is spellable while every path beneath it is not, and checking
+        the root alone answers `fine` for a worker on which every rule is skipped.
+      - It is asked of every prefix-map row the TABLE holds rather than of the families
+        this node serves: the served set exists only once the survey's first round lands
+        on the heartbeat thread (#365), minutes after the operator stopped watching.
+      - The warning and the rule builder are asserted TOGETHER. A warning where the
+        builder is happy is noise, silence where it skips is the defect, and either
+        assertion alone passes under a predicate that answers constantly.
     - **One residual, measured**: a client whose source argument is ABSOLUTE and whose
       line carries a matching `-fdebug-prefix-map` records the mapped spelling locally,
       while the dispatched object records the unmapped one, because `RemoteCompileArgs`

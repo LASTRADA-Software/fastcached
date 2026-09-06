@@ -56,9 +56,34 @@ class ForegroundHost final: public IDaemonHost
 /// Construct a POSIX daemon host (double-fork, setsid, stdio /dev/null,
 /// optional pidfile). Returns nullptr on platforms where it's not
 /// supported (Windows).
-/// @param pidfile Path to pidfile (may be empty).
+///
+/// **The working directory is the CALLER's to state, and there is no default.**
+/// Daemonizing means leaving the invocation directory — a daemon that keeps it
+/// holds a filesystem busy and cannot be unmounted — and `/` is the classical
+/// answer, right for a process that executes nothing. It is wrong for one that
+/// SPAWNS A COMPILER: the compile node builds
+/// `-fdebug-prefix-map=<its own directory>=<what the client asked for>`, a
+/// prefix-map rule appends the unmatched tail, and `<from>` = `/` therefore
+/// rewrites every absolute path in the object — `/usr/include/stdio.h` becomes
+/// `.usr/include/stdio.h`, under a cache key that is correct
+/// ([#784](https://github.com/LASTRADA-Software/fastcached/issues/784),
+/// [#674](https://github.com/LASTRADA-Software/fastcached/issues/674)).
+///
+/// So the two binaries answer differently and each says which it is, rather than
+/// one of them inheriting an answer chosen for the other. No default parameter:
+/// a third daemonizing binary must decide, and a compile error is the only thing
+/// that makes it.
+///
+/// @param pidfile Path to pidfile (may be empty). Written BEFORE the chdir, so a
+///        relative one lands where the operator ran the command rather than
+///        wherever this host was told to move to.
+/// @param workingDirectory The directory to chdir into. Must be absolute and must
+///        exist; `/` is used when the chdir fails, which is the historic value and
+///        keeps a daemon that cannot reach its directory running rather than
+///        parked on a mount point it cannot release.
 /// @return Owning host or nullptr.
-[[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile);
+[[nodiscard]] std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile,
+                                                               std::string const& workingDirectory);
 
 /// Construct a Windows Service host registered with the SCM. Returns
 /// nullptr on non-Windows platforms.

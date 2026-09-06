@@ -22,7 +22,7 @@ namespace FastCache
 
 #if defined(_WIN32)
 
-std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& /*pidfile*/)
+std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& /*pidfile*/, std::string const& /*workingDirectory*/)
 {
     return nullptr; // unsupported on Windows
 }
@@ -35,8 +35,9 @@ namespace
     class PosixDaemonHost final: public IDaemonHost
     {
       public:
-        explicit PosixDaemonHost(std::string pidfile) noexcept:
-            _pidfile { std::move(pidfile) }
+        PosixDaemonHost(std::string pidfile, std::string workingDirectory) noexcept:
+            _pidfile { std::move(pidfile) },
+            _workingDirectory { std::move(workingDirectory) }
         {
         }
 
@@ -59,7 +60,6 @@ namespace
                 std::exit(EXIT_SUCCESS);
 
             ::umask(0);
-            std::ignore = ::chdir("/");
 
             // Redirect stdio to /dev/null.
             ::close(STDIN_FILENO);
@@ -75,12 +75,30 @@ namespace
                     ::close(fdNull);
             }
 
-            // Write pidfile (best effort).
+            // Write pidfile (best effort), BEFORE the chdir below. Where a relative
+            // pidfile lands must not depend on which directory this host was told to
+            // move to -- otherwise giving the compile node a directory of its own
+            // silently relocates its pidfile, which is the same class of defect as
+            // the one that change is fixing. It resolves against the directory the
+            // operator ran the command in, for both binaries; it used to resolve
+            // against `/`, where only root can write.
             if (!_pidfile.empty())
             {
                 if (std::ofstream out { _pidfile, std::ios::trunc }; out)
                     out << std::format("{}\n", ::getpid());
             }
+
+            // **The caller's directory, never a constant.** See `MakePosixDaemonHost`:
+            // for the compile node `/` turns a `-fdebug-prefix-map` rule into a
+            // rewriter of every absolute path in the object it produces (#784).
+            //
+            // `/` on failure rather than staying put: this host has already detached,
+            // so the alternative is a daemon pinned to whatever directory the operator
+            // happened to be in, which is the busy-mount-point problem daemonizing
+            // exists to avoid. It is also the value this call had before, so a host
+            // whose directory cannot be reached is exactly as it was.
+            if (::chdir(_workingDirectory.c_str()) != 0)
+                std::ignore = ::chdir("/");
 
             if (!body)
                 return 0;
@@ -89,13 +107,14 @@ namespace
 
       private:
         std::string _pidfile;
+        std::string _workingDirectory;
     };
 
 } // namespace
 
-std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile)
+std::unique_ptr<IDaemonHost> MakePosixDaemonHost(std::string const& pidfile, std::string const& workingDirectory)
 {
-    return std::make_unique<PosixDaemonHost>(pidfile);
+    return std::make_unique<PosixDaemonHost>(pidfile, workingDirectory);
 }
 
 #endif // !_WIN32

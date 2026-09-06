@@ -391,4 +391,9 @@ std::unique_ptr<IScratchClaimant> MakeLockFileScratchClaimant()
     return std::make_unique<LockFileScratchClaimant>();
 }
 
+std::filesystem::path ScratchBaseDirectory()
+{
+    return std::filesystem::temp_directory_path() / "fastcache-compile-node";
+}
+
 } // namespace FastCache::Node

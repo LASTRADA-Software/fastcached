@@ -755,7 +755,7 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // the survey answered and jobs started arriving. The two maps are equal in size
     // only after the walk, which is exactly what has not happened yet.
     auto const servesCompiles = !discoveredToolchains.entries.empty();
-    auto const scratchBase = std::filesystem::temp_directory_path() / "fastcache-compile-node";
+    auto const scratchBase = Node::ScratchBaseDirectory();
     auto scratchClaimOrRefusal = ClaimWorkerScratchRoot(servesCompiles, scratchBase, logger);
     if (!scratchClaimOrRefusal.has_value())
         return ExitUsage;
@@ -1965,7 +1965,41 @@ int main(int argc, char** argv)
 #if defined(_WIN32)
         host = MakeWindowsServiceHost(cfg.serviceName);
 #else
-        host = MakePosixDaemonHost(cfg.pidfile);
+        // **A worker states its own working directory, and it is not `/`** (#784).
+        //
+        // Daemonizing has to leave the invocation directory, and `/` was what this
+        // host chdir'd to unconditionally. For a process that spawns a compiler that
+        // is a wrong object under a correct key: the worker builds
+        // `-fdebug-prefix-map=<its own directory>=<what the client asked for>`, a
+        // prefix-map rule appends the unmatched tail, and `/` matches every absolute
+        // path in the object -- `/usr/include/stdio.h` becomes `.usr/include/stdio.h`.
+        // #674 gave the shipped unit a `WorkingDirectory=`, which closes the packaged
+        // route and not this one: a unit's directory does not survive the double
+        // fork's chdir, because the chdir happens after it.
+        //
+        // `WorkerPrefixMapRules` still DROPS the worker's own rule when its directory
+        // contains the client's, so a `--daemon` worker produced the pre-#506 clang
+        // state rather than the corrupted object. That drop stays -- it is what covers
+        // a hand-written unit -- and this makes the case it covers rarer rather than
+        // relying on it.
+        //
+        // Created here rather than left to the host, because this is the last point
+        // at which anything can be REPORTED: `PosixDaemonHost` has redirected stdout
+        // to /dev/null by the time the body runs, so a failure diagnosed inside it
+        // reaches nobody. A directory that cannot be made falls back to `/`, which is
+        // what this call did before, and says so.
+        std::error_code scratchBaseError;
+        auto const daemonDirectory = Node::ScratchBaseDirectory();
+        std::filesystem::create_directories(daemonDirectory, scratchBaseError);
+        if (scratchBaseError)
+            logger.Logf(LogLevel::Warn,
+                        "cannot create {}: {}; daemonizing into / instead, where this worker's own "
+                        "-fdebug-prefix-map rule is dropped and a dispatched clang object records this machine's "
+                        "directory",
+                        daemonDirectory.string(),
+                        scratchBaseError.message());
+        auto const daemonWorkingDirectory = scratchBaseError ? std::filesystem::path { "/" } : daemonDirectory;
+        host = MakePosixDaemonHost(cfg.pidfile, daemonWorkingDirectory.string());
 #endif
     }
     if (!host)
