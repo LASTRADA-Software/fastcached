@@ -42,35 +42,13 @@ std::vector<std::string> SecretExposureWatcher::Transitions(std::span<SecretFile
 
 void WatchSecretExposure(ConfigReloader& reloader, bool secretNamedOnCommandLine, SecretExposureReport report)
 {
-    // Owned by the closures rather than by the caller, so no call site can hand this
-    // a lifetime shorter than the reloader's. `Subscribe` has no unsubscribe, so a
-    // watcher living in the caller's frame would be a hazard nobody could see.
-    auto const watcher = std::make_shared<SecretExposureWatcher>();
-
-    auto observe = [watcher, secretNamedOnCommandLine, report = std::move(report)](Config const& cfg) {
-        // Through `DaemonSecretFiles` rather than deriving the subject list here:
-        // the start and every reload must ask the SAME question, and two derivations
-        // of one gate is the shape this whole change exists to avoid.
-        auto const files = DaemonSecretFiles(cfg, secretNamedOnCommandLine);
-        for (auto const& warning: watcher->Observe(files))
-            report(warning);
-    };
-
-    // The startup observation, and it is what SEEDS the memory a reload compares
-    // against: a subscription attached WITHOUT it would report a standing exposure a
-    // second time at the first SIGHUP, because the memory would still be empty.
-    //
-    // The claim is about the observation HAPPENING, never about its order relative to
-    // `Subscribe` -- observing second would seed the memory just as well, and no
-    // reload can be observed before this call returns anyway. It is written first
-    // because a rule that does not depend on the order should not be spelled as one:
-    // a comment claiming a reordering breaks something is a reason that outruns the
-    // fact it was drawn from, which is the failure this file's own rulebook records.
-    observe(*reloader.Current());
-
-    // Moved rather than copied: the seeding call above is the last use here, and the
-    // subscriber list is where this closure lives from now on.
-    reloader.Subscribe([observe = std::move(observe)](auto const& /*previous*/, auto const& current) { observe(*current); });
+    // `DaemonSecretFiles` rather than a list derived at the call site: the start and
+    // every reload must ask the SAME question, and two derivations of one gate is the
+    // shape this whole arrangement exists to avoid.
+    WatchSecretExposure<Config>(
+        reloader,
+        [secretNamedOnCommandLine](Config const& cfg) { return DaemonSecretFiles(cfg, secretNamedOnCommandLine); },
+        std::move(report));
 }
 
 } // namespace FastCache

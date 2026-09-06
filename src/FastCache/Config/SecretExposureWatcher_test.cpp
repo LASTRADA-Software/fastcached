@@ -327,6 +327,66 @@ TEST_CASE("SecretExposureWatcher: a reload reports a transition into exposure, o
     }
 }
 
+TEST_CASE("ReportSecretExposure: the arm for a process with no file to reload", "[config][secret]")
+{
+    // **The other half of #868's wiring, and the half only a source scan asserted.**
+    // `fastcache-compile-node` started entirely from argv still names four key files
+    // and takes this arm; a `main` reaching it against a function that reported
+    // nothing would pass every text scan there is. So the arm is driven here rather
+    // than left to the two call sites.
+    //
+    // The subject list is `DaemonSecretFiles` because that is the production one this
+    // test binary can reach, NOT because it is the one the arm is handed: the only
+    // production caller is `fastcache-compile-node`, which hands `NodeSecretFiles`. A
+    // real subject list rather than a bespoke lambda, since a lambda would test the
+    // loop and not the shape the loop exists for; that the WORKER reaches this arm at
+    // all is `NodeConfig_test`'s wiring scan.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-once" };
+    scratch.Write("tls.key", "not-a-real-key\n");
+    auto const key = scratch / "tls.key";
+
+    FastCache::SecretSubjectFiles<Config> const subjects { [](Config const& cfg) {
+        return FastCache::DaemonSecretFiles(cfg, /*secretNamedOnCommandLine*/ false);
+    } };
+
+    Config cfg {};
+    cfg.tlsKeyPath = key.string();
+
+    std::vector<std::string> said;
+    auto const report = [&said](std::string_view warning) {
+        said.emplace_back(warning);
+    };
+
+    SECTION("an exposed file is reported, with no watcher and no memory")
+    {
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
+
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+
+        REQUIRE(said.size() == 1);
+        CHECK(said.front().contains(key.string()));
+        CHECK(said.front().contains("chmod o-r"));
+
+        // **Asked twice on purpose.** There is no remembering here and there must not
+        // be: this arm exists because nothing will re-ask, so a second call answering
+        // silently would mean the say-once rule had leaked into the moment that has
+        // only one moment. Said once per call is what the two arms differ by.
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+        CHECK(said.size() == 2);
+    }
+
+    SECTION("a private file says nothing at all")
+    {
+        // The control: without it, "reports an exposure" and "reports whatever it is
+        // handed" are one passing test, and the rule would fire on every 0600 key
+        // every deployment ships.
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+        FastCache::ReportSecretExposure<Config>(cfg, subjects, report);
+        CHECK(said.empty());
+    }
+}
+
 #endif
 
 TEST_CASE("SecretExposureWatcher: the daemon attaches it, and that is asserted", "[config][secret][reload]")

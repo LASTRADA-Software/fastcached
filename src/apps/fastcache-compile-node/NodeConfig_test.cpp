@@ -8,6 +8,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ConfigReloader.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
@@ -33,6 +34,10 @@
 #include <tests/PathFlagCoverage.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
+
+#if !defined(_WIN32)
+    #include <sys/stat.h>
+#endif
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -3650,7 +3655,14 @@ TEST_CASE("NodeSecretFiles: the worker actually asks, and that is asserted", "[n
     REQUIRE(code.contains("StartupPolicyRejection(cfg)"));
 
     CHECK(code.contains("NodeSecretFiles("));
-    CHECK(code.contains("SecretFileWarnings("));
+
+    // BOTH moments, and they are separate assertions because they are separate
+    // wirings: `ReportSecretExposure` is the arm for a worker with no configuration
+    // file to reload, and `WatchSecretExposure` is the arm that follows one. A scan
+    // for either alone would pass a `main` that had lost the other, which is #868 on
+    // one side and #752 on the other.
+    CHECK(code.contains("ReportSecretExposure<NodeConfig>("));
+    CHECK(code.contains("WatchSecretExposure<NodeConfig>("));
 }
 
 TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[node][config][secret]")
@@ -3692,3 +3704,88 @@ TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[no
               == std::vector<std::filesystem::path> { configFile, cfg.clusterKeyFile });
     }
 }
+
+#if !defined(_WIN32)
+
+TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node][config][secret][reload]")
+{
+    // **#868.** #753 made the DAEMON re-ask at every reload and left the worker with
+    // the startup-only version -- on the binary holding FIVE such files rather than
+    // one. Only half of #753 is reachable here: none of the worker's secret settings
+    // is `Reloadable::Yes`, so a node file cannot GAIN a secret across a reload and
+    // `ValidateNodeReloadable` refuses such a candidate by name. The other half is the
+    // half no snapshot can answer -- a file's MODE is in no configuration, so an
+    // operator who loosens `--cluster-key-file` an hour in produced two byte-identical
+    // snapshots and total silence, for a key that MACs discovery proofs and lease
+    // grants.
+    //
+    // Driven against the REAL `ConfigReloaderOf<NodeConfig>` and a real file on disk,
+    // through the same `MakeNodeReloader` recipe `main` wires: the two things that
+    // must be true are that the subscription is attached at all and that what it asks
+    // reaches the filesystem, and a fake reloader would establish neither.
+    Testing::ScratchDirectory const scratch { "node-secret-reload" };
+
+    // `key` is what the case is about; the configuration file itself stays 0600 and
+    // carries no `token:`, so it can contribute no warning of its own and anything
+    // `said` holds came from the key.
+    scratch.Write("cluster.key", "not-a-real-key\n");
+    auto const key = scratch / "cluster.key";
+    REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+    auto const path = WriteRunnableNodeConfigFile(scratch.Path(), std::format("cluster_key_file: {}\n", key.string()));
+    REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+    // **Declared before the reloader**, so it is destroyed after it: the report closure
+    // lives in the subscriber list and refers to this vector, which is what
+    // `WatchSecretExposure` means by "must outlive the reloader" and the same ordering
+    // `main` gets by declaring its logger further up.
+    std::vector<std::string> said;
+
+    NodeConfig initial = RunningNode();
+    // Matching the file, because `cluster_key_file` is `Reloadable::No` -- a seed that
+    // disagreed would make the FIRST reload refuse by name, which looks nothing like
+    // the case under test.
+    initial.clusterKeyFile = key;
+
+    auto reloader = MakeNodeReloader(initial, path);
+    WatchSecretExposure<NodeConfig>(
+        reloader,
+        // `{}` and `false`: no configuration-file secret is in play here, which is
+        // asserted by the fact that a case in this file drives that half separately.
+        [](NodeConfig const& live) { return NodeSecretFiles(live, {}, false); },
+        [&said](std::string_view warning) { said.emplace_back(warning); });
+
+    SECTION("a mode that loosens while the node runs is reported at the next reload")
+    {
+        REQUIRE(said.empty());
+
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
+        REQUIRE(reloader.Reload().has_value());
+
+        REQUIRE(said.size() == 1);
+        CHECK(said.front().contains(key.string()));
+        CHECK(said.front().contains("chmod o-r"));
+        // Not the configuration file: it never moved, and a watcher that reported its
+        // whole subject list on any transition would name it too.
+        CHECK_FALSE(said.front().contains(path.string()));
+
+        // **Asserted on the COUNT**, because a repeating implementation warns here as
+        // well. Said once is what stops this becoming an alarm at every SIGHUP.
+        REQUIRE(reloader.Reload().has_value());
+        REQUIRE(reloader.Reload().has_value());
+        CHECK(said.size() == 1);
+    }
+
+    SECTION("a run in which nothing changed says nothing at all")
+    {
+        // The control, and it is the half that decides whether the section above means
+        // anything: without it, "reports a transition" and "reports at every reload"
+        // are told apart by nothing, and a rule that warned about the ORDINARY 0600
+        // key would fire on every deployment there is.
+        REQUIRE(reloader.Reload().has_value());
+        REQUIRE(reloader.Reload().has_value());
+        CHECK(said.empty());
+    }
+}
+
+#endif

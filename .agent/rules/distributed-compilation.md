@@ -1129,6 +1129,49 @@ Consequences that are each load-bearing:
   retires a registry entry, and adding one
   ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)) is therefore a
   latency optimisation over a bounded, self-healing window — not a correctness fix.
+- **A file's MODE is in no configuration, so the worker's secret-file check follows
+  the RELOAD and not only the start** ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)).
+  None of this binary's five secret settings is `Reloadable::Yes`, so a node file
+  cannot *gain* a secret across a reload the way the daemon's can —
+  `ValidateNodeReloadable` refuses such a candidate by name — and that half of #753
+  genuinely does not exist here. The half that does is the one a snapshot cannot
+  answer: an operator edits `log_level:`, sends SIGHUP, the reload is accepted, and
+  nothing re-asks the filesystem, so a `--cluster-key-file` that went to 0644 an hour
+  after the node started is silent for the rest of the process's life. That key MACs
+  discovery proofs AND lease grants. `SecretExposureWatcher` re-asks and remembers
+  `(path, exposure)`, so a standing exposure is said once; an implementation reasoning
+  from the reloader's previous-and-current pair concludes nothing changed and never
+  looks, which is what makes the snapshot-diffing version look correct while covering
+  half the ticket.
+  - **`ApplyReloadRequest`'s decline is about `WorkerBody`'s frame, and reading it as
+    "the worker cannot `Subscribe`" is one frame too wide.** The reloader is declared
+    in `main` and outlives `WorkerBody`, and `Subscribe` has no unsubscribe — so a
+    subscriber capturing that frame's locals would outlive them, which is why the
+    heartbeat is still signalled by comparing snapshots. A subscription attached from
+    **`main`**, beside the reloader's own declaration, capturing only what `main` owns
+    and what is declared before the reloader, is the arrangement that decline
+    describes as safe: it is what `DaemonBody` already does. #753 read the decline the
+    wide way and declined to generalise the seam on the strength of it, which is the
+    reason this took a second ticket. **Answer such a reason by satisfying it, not by
+    routing around it** — and check which frame it is about before concluding it
+    forbids the shape.
+  - **Two arms, because the difference is whether there is a SECOND moment at all.**
+    A worker started with no configuration file still names four key files and still
+    has to be told; what it has no use for is the memory, since nothing will re-ask.
+    `ReportSecretExposure` is that arm and carries no watcher, so there is no second
+    copy of the remembering rule — and both arms are asserted by the wiring scan
+    separately, or a `main` that lost one reads exactly like a `main` that has both.
+  - **The resolved path travels UNGUARDED by "was the file applied", and the reason is
+    that the guard could never decide anything.** A resolved path that will not load
+    already exits `ExitUsage` above, except under `--uninstall-service`, which returns
+    at the service block — so a run reaching the check either applied its file or never
+    had one. In the unreachable case the gate answers false either way: `cfg` IS the
+    command-line parse there, so argv named the token or no secret is in force. **It is
+    NOT a reload fix, and saying so would be a reason outrunning its fact**:
+    `--requirepass` is `Reloadable::No` with a `same` comparator, so a SIGHUP that
+    introduces a token is refused and publishes nothing. Dropping the guard buys one
+    expression instead of two; the reload half of the rule is bought by the filesystem
+    re-ask, and by nothing else.
 - **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
   code with the counter it moves, and `std::nullopt` is a legitimate row: a
   malformed frame is a *client* defect, and counting it beside the capacity
@@ -2424,20 +2467,6 @@ real framing, with an empty argument and one containing a space. That last one i
 only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
-
-- **[#868](https://github.com/LASTRADA-Software/fastcached/issues/868)** — #753 made the
-  DAEMON re-ask about its secret's file at every reload; the worker still has the
-  startup-only version, and it holds five such files rather than one. Only half of #753
-  is reachable here — none of the five settings is `Reloadable::Yes`, so a node file
-  cannot GAIN a secret across a reload — but the other half is the one a snapshot cannot
-  answer: a mode is in no configuration, so an operator who loosens
-  `--cluster-key-file` an hour after the node started gets silence for the rest of the
-  process's life, and that key MACs discovery proofs and lease grants.
-  `SecretExposureWatcher` is already generic over a path list, so no second copy of the
-  RULE is wanted; what is daemon-shaped is `WatchSecretExposure`, which names the
-  concrete `ConfigReloader` and `DaemonSecretFiles`. Any fix must answer
-  `ApplyReloadRequest`'s own stated reason for declining `Subscribe` — the reloader
-  outlives `WorkerBody` and `Subscribe` has no unsubscribe — rather than route around it.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was
