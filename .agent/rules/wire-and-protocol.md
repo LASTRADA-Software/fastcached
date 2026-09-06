@@ -1139,6 +1139,25 @@ Every rule below has already been a bug.
     `EpollReactor::RunLoop()`'s return by 200 ms: `[frame]` aborted **20 of 20** runs
     across **13 distinct cases**, the reported signature exactly. A green run there
     is the absence of a trip, never evidence of a fix.
+  - **The rule is now ASKED on every reactor, not only on IOCP.**
+    `Detail::AssertTeardownIsSerialisedWithDispatch` is called from `~EpollSocket`,
+    `~EpollListener`, `~KqueueSocket` and `~KqueueListener` as well as the IOCP pair,
+    which is what gives the class an observer on every leg instead of one that does
+    not gate. It could not be added until both owners that broke it were fixed --
+    `~FrameEndpoint` (#840) and `RaftPeerServer::Shutdown`
+    ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)) -- and the
+    proof that it is a GUARD rather than decoration is that it has been watched
+    refusing: with #885 alone neutered, `cluster-e2e` aborts 134 and the whole suite
+    is green again with it restored.
+  - **The same defect surfaced in THREE test files and was triaged as three things.**
+    #737 in `FrameEndpoint_test`, #875 in `CompileResponder_test`, plus the #523 sweep
+    case in #668 -- one site, `~FrameEndpoint`, and every case that builds an endpoint
+    on a live `NodeIoLoop` shares it. #875's triage read *"every `IocpSocket` teardown
+    CASE in that run passed, so #737's signature is absent"*, which collapses **a test
+    case about teardown** into **the teardown assertion firing**: the assertion text
+    was in that run's log, at `IocpSocket.cpp, line 96`. **Match the ASSERTION, never
+    the case that happened to be running** -- the case is what the scheduler picked,
+    and picking a different one each run is the signature rather than a distinction.
   - **So the regression test does not wait for the race, it removes it.** A second
     loop that never finishes (`NoteLoopStarted` with no matching finish until the end)
     makes the reactor unable to stop, so the predicate is false from the calling thread
@@ -1605,20 +1624,6 @@ consequence rather than a precaution.
 
 ## Open work
 
-- **[#885](https://github.com/LASTRADA-Software/fastcached/issues/885)** —
-  `RaftPeerServer::Shutdown` closes every accepted connection from the calling
-  thread, so on epoll and kqueue each per-connection coroutine is resumed and
-  unwound there and its `unique_ptr<ISocket>` is destroyed off the reactor —
-  the teardown rule above, at a second owner. `FrameServer::Shutdown` posts its
-  closes onto the reactor for exactly this reason and says so; this one does not.
-  **Measured on Linux**, not inferred: with `Detail::AssertTeardownIsSerialisedWithDispatch`
-  added to `~EpollSocket`/`~EpollListener` and nothing else changed, `cluster-e2e`
-  is the only failure in the whole suite (a node aborts 134 after SIGTERM, 2 of 2),
-  and a backtrace probe files all six violations at `ConsensusTier.cpp:495` →
-  `EpollSocket::Close` → `ServePeer`. **This blocks making the rule portable**:
-  adding that assertion to the epoll and kqueue destructors is what would give #668's
-  rule an observer on every leg instead of only `Windows-cl-debug`, and it cannot
-  land while this is present.
 - **[#828](https://github.com/LASTRADA-Software/fastcached/issues/828)** — the admin
   surface's pre-first-byte wait and its mid-head read deadline are one number
   (`AdminHttpServer::RequestTimeout`, armed as `SO_RCVTIMEO`), so a browser

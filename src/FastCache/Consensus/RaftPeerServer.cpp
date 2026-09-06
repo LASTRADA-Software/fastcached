@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
@@ -158,11 +159,10 @@ namespace
 
 } // namespace
 
-RaftPeerServer::RaftPeerServer(IListener& listener,
-                               IRaftMessageSink& sink,
-                               ILogger& logger,
-                               PeerServerOptions options) noexcept:
+RaftPeerServer::RaftPeerServer(
+    IListener& listener, IExecutor& reactor, IRaftMessageSink& sink, ILogger& logger, PeerServerOptions options) noexcept:
     _listener { listener },
+    _reactor { reactor },
     _sink { sink },
     _logger { logger },
     _options { options }
@@ -205,17 +205,12 @@ Task<void> RaftPeerServer::Run()
     co_return;
 }
 
-void RaftPeerServer::Shutdown() noexcept
+void RaftPeerServer::CloseAll() noexcept
 {
-    _shuttingDown.store(true, std::memory_order_release);
     _listener.Close();
 
-    // And every connection already accepted. Closing one completes whatever read
-    // was parked on it, which is how each per-connection task reaches its own end
-    // -- a task still parked when the reactor's `Run()` returns is a frame nobody
-    // resumes and nobody frees. Copied out under the lock rather than closed under
-    // it, because a close resumes the task that removes itself from this very
-    // vector.
+    // Copied out under the lock rather than closed under it, because a close
+    // resumes the task that removes itself from this very vector.
     auto sockets = std::vector<ISocket*> {};
     {
         auto const guard = std::scoped_lock { _open.mutex };
@@ -223,6 +218,27 @@ void RaftPeerServer::Shutdown() noexcept
     }
     for (auto* socket: sockets)
         socket->Close();
+}
+
+void RaftPeerServer::Shutdown() noexcept
+{
+    if (_shuttingDown.exchange(true, std::memory_order_acq_rel))
+        return;
+
+    // Posted onto the reactor, never done here. See the declaration: on epoll and
+    // kqueue `Close` completes a parked read by resuming its coroutine INLINE, so
+    // closing from the stopping thread runs this server's connection tasks there --
+    // and destroys the socket each of them owns off the reactor, which is the
+    // teardown rule (#668) violated at a second owner (#885).
+    //
+    // Borrows `this` rather than sharing state, which is sound for the same reason
+    // the connection tasks may: the drain below does not return until this has run.
+    [](RaftPeerServer* self) -> DetachedTask {
+        co_await ResumeOn { self->_reactor };
+        self->CloseAll();
+        self->_closesRan.store(true, std::memory_order_release);
+        co_return;
+    }(this);
 
     // Detached connection coroutines borrow the sink, the logger and the
     // counters held on this object, so they must drain before Shutdown returns
@@ -234,10 +250,29 @@ void RaftPeerServer::Shutdown() noexcept
     // This wait was correct, and was then copied twice by loops that cited it and
     // counted their polls instead of measuring them. So it is now the shared
     // `DrainWithin`, and the ceiling and the cadence live there with it (#452).
-    if (DrainWithin([this] { return _active.load(std::memory_order_acquire) > 0; }) == DrainResult::Ceiling)
-        _logger.Logf(LogLevel::Error,
-                     "raft: {} peer connection(s) did not finish within the stop ceiling",
-                     _active.load(std::memory_order_acquire));
+    //
+    // It waits for the posted closes AS WELL, and that half is what makes borrowing
+    // `this` above safe: nothing may free this object while a task holding it is
+    // still queued. It is also the only thing that ends the wait at all -- until
+    // the listener is closed the accept loop keeps running and no connection is
+    // told to finish.
+    auto const outcome = DrainWithin(
+        [this] { return !_closesRan.load(std::memory_order_acquire) || _active.load(std::memory_order_acquire) > 0; });
+
+    if (outcome != DrainResult::Ceiling)
+        return;
+
+    // Named separately, because they are opposite diagnoses fixed by different
+    // people: connections outstanding is a peer that will not finish, while closes
+    // that never ran is a reactor that stopped before it could run what it was
+    // handed -- and reporting the second as the first sends somebody hunting a
+    // slow peer that does not exist.
+    if (!_closesRan.load(std::memory_order_acquire))
+        _logger.Log(LogLevel::Error,
+                    "raft: the peer listener's closes never ran within the stop ceiling; the reactor was not turning");
+    if (auto const stuck = _active.load(std::memory_order_acquire); stuck > 0)
+        _logger.Log(LogLevel::Error,
+                    std::format("raft: {} peer connection(s) did not finish within the stop ceiling", stuck));
 }
 
 } // namespace FastCache::Consensus

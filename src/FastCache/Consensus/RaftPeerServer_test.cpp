@@ -4,18 +4,23 @@
 // frame this build cannot interpret: it must be stepped over rather than end
 // the connection, because a node running a newer build would otherwise
 // partition itself from every older peer in a fleet nobody upgrades atomically.
+#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -90,7 +95,11 @@ void Append(std::vector<std::byte>& out, std::span<std::byte const> bytes)
 {
     InMemoryListener listener;
     NullLogger logger;
-    auto server = std::make_unique<RaftPeerServer>(listener, sink, logger, options);
+    // A reactor this case never turns: `RunOnce` drives the accept loop by hand and
+    // never calls `Shutdown()`, which is the only thing that posts anything.
+    SteadyClock clock;
+    PlatformReactor reactor { clock };
+    auto server = std::make_unique<RaftPeerServer>(listener, reactor, sink, logger, options);
 
     auto client = listener.ConnectClient();
     SyncRun(WriteAll(client.get(), wire));
@@ -255,4 +264,154 @@ TEST_CASE("A truncated frame ends the connection without delivering", "[consensu
 
     CHECK(sink.received.empty());
     CHECK(server->DeliveredMessages() == 0);
+}
+
+namespace
+{
+
+/// Wait until @p ready holds, or give up. Bounded, and it says what it waited for.
+///
+/// Through `DrainWithin` rather than a spin of its own, for the reason that helper
+/// exists: counting the sleeps it ASKED for states a ceiling and enforces a
+/// multiple of it, because a sleep costs what the host's timer granularity says.
+/// @param ready What is being waited for; called until it answers true.
+/// @return True when it happened inside the ceiling, false when it never did.
+template <typename Predicate>
+[[nodiscard]] bool WaitFor(Predicate ready)
+{
+    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = std::chrono::seconds { 15 } })
+           == DrainResult::Drained;
+}
+
+/// A reactor turning on a thread of its own, stopped and joined by its destructor.
+///
+/// RAII rather than a `Stop()` at the end of the case, and that is not tidiness: a
+/// failing `REQUIRE` unwinds past such a call, `~jthread` then joins a loop nobody
+/// stopped, and the case HANGS instead of reporting. A case about teardown ordering
+/// is the last one that may turn a red into a timeout -- a hang says nothing, where
+/// a red says which half of the rule was missing.
+class RunningReactor
+{
+  public:
+    RunningReactor():
+        _thread { [this] { _reactor.Run(); } }
+    {
+    }
+
+    ~RunningReactor()
+    {
+        // Asked to stop BEFORE the member sweep, because `_thread` is declared last
+        // and so is joined first -- a join without this would wait on a loop with no
+        // reason to return.
+        _reactor.Stop();
+    }
+
+    RunningReactor(RunningReactor const&) = delete;
+    RunningReactor(RunningReactor&&) = delete;
+    RunningReactor& operator=(RunningReactor const&) = delete;
+    RunningReactor& operator=(RunningReactor&&) = delete;
+
+    /// @return The reactor, for handing to whatever is under test.
+    [[nodiscard]] IReactor& Get() noexcept
+    {
+        return _reactor;
+    }
+
+    /// @return The worker thread's id, which is what a teardown case compares against.
+    [[nodiscard]] std::thread::id WorkerId() const noexcept
+    {
+        return _thread.get_id();
+    }
+
+  private:
+    SteadyClock _clock;
+    PlatformReactor _reactor { _clock };
+    std::jthread _thread;
+};
+
+/// A listener that records the thread its `Close()` ran on, and nothing else.
+///
+/// The whole of #885 is *which thread* closes, so the fake records a thread id
+/// rather than a boolean: "it was closed" is true under the defect and under the
+/// fix alike, and a case asserting that could never fail for the reason it exists.
+class ClosingThreadListener final: public IListener
+{
+  public:
+    /// Never yields a connection; this case drives `Shutdown()`, not `Run()`.
+    AcceptAwaitable Accept() override
+    {
+        return AcceptAwaitable { AcceptResult {
+            std::unexpect, NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} } } };
+    }
+
+    void Close() noexcept override
+    {
+        _closedOn.store(std::this_thread::get_id(), std::memory_order_release);
+        _closes.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
+    /// @return How many times `Close()` has been called.
+    [[nodiscard]] std::size_t Closes() const noexcept
+    {
+        return _closes.load(std::memory_order_acquire);
+    }
+
+    /// @return The thread of the most recent `Close()`; default-constructed if none.
+    [[nodiscard]] std::thread::id ClosedOn() const noexcept
+    {
+        return _closedOn.load(std::memory_order_acquire);
+    }
+
+  private:
+    std::atomic<std::thread::id> _closedOn {};
+    std::atomic<std::size_t> _closes { 0 };
+};
+
+} // namespace
+
+TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling thread",
+          "[consensus][raft][peerserver][teardown]")
+{
+    // #885. `Shutdown()` used to close the listener and every accepted connection
+    // from whatever thread was tearing the node down. On epoll and kqueue
+    // `ISocket::Close` completes a parked read by resuming its coroutine INLINE, so
+    // that ran each per-connection task on the stopping thread -- while the reactor
+    // thread was still driving the others -- and destroyed the socket owned by that
+    // task's frame off the reactor, which is #668's rule. IOCP does not resume
+    // inline, so the platform that gates least is the one that could never show it.
+    //
+    // Asserted as a THREAD IDENTITY, because that is what distinguishes: the
+    // listener is closed either way, and a case checking only that it was closed
+    // passes under the defect forever.
+    // Declared so that the listener OUTLIVES the reactor thread: destruction runs in
+    // reverse, so `server` goes first, then `loop` (which stops and joins), and only
+    // then the listener the reactor was closing. The other order leaves a window in
+    // which the worker thread could touch a destroyed fake.
+    ClosingThreadListener listener;
+    RecordingSink sink;
+    NullLogger logger;
+    RunningReactor loop;
+
+    // The arrangement, asserted rather than assumed: if the reactor were not running,
+    // the closes would be posted where nothing runs them and the identity below would
+    // be comparing two things that mean nothing.
+    REQUIRE(WaitFor([&loop] { return loop.Get().Running(); }));
+    REQUIRE_FALSE(loop.Get().IsOnWorkerThread());
+
+    RaftPeerServer server { listener, loop.Get(), sink, logger };
+
+    server.Shutdown();
+
+    // Returned only once the posted closes had run -- which is also what makes the
+    // task's borrowed `this` safe, so it is checked rather than assumed.
+    REQUIRE(listener.Closes() == 1);
+
+    INFO("the listener must have been closed on the reactor's worker thread, not on the thread that called Shutdown");
+    CHECK(listener.ClosedOn() == loop.WorkerId());
+    CHECK_FALSE(listener.ClosedOn() == std::this_thread::get_id());
 }

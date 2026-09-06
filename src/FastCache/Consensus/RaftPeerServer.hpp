@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/IExecutor.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -94,10 +95,18 @@ class RaftPeerServer
   public:
     /// Construct over its collaborators; all must outlive the server.
     /// @param listener Bound listener for this node's peer port.
+    /// @param reactor The executor that listener and its connections belong to.
+    ///        `Shutdown()` posts its closes there rather than performing them on
+    ///        the calling thread; see that function for why the pairing is
+    ///        load-bearing rather than a convenience.
     /// @param sink Where decoded messages go.
     /// @param logger Where refusals are reported.
     /// @param options Frame and connection limits.
-    RaftPeerServer(IListener& listener, IRaftMessageSink& sink, ILogger& logger, PeerServerOptions options = {}) noexcept;
+    RaftPeerServer(IListener& listener,
+                   IExecutor& reactor,
+                   IRaftMessageSink& sink,
+                   ILogger& logger,
+                   PeerServerOptions options = {}) noexcept;
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
     /// @return Task that resolves when the loop exits.
@@ -110,6 +119,28 @@ class RaftPeerServer
     /// it was -- so a connection nobody closed is a coroutine frame nobody ever
     /// resumes and nobody ever frees. Closing the socket completes that read with
     /// `Cancelled`, which is how the frame reaches its own end.
+    ///
+    /// **The closes are POSTED onto the reactor, never performed here**, and that
+    /// is not caution
+    /// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). On
+    /// epoll and kqueue `ISocket::Close` completes a parked read by resuming its
+    /// coroutine **inline**, so closing from the stopping thread ran each
+    /// per-connection task there -- while the reactor thread was still driving the
+    /// others -- and destroyed the `std::unique_ptr<ISocket>` in that task's frame
+    /// off the reactor, which is #668's rule
+    /// (`IReactor::TeardownIsSerialisedWithDispatch()`) violated. IOCP routes
+    /// cancellation back through the port and does not resume inline, which is
+    /// exactly what would have made this a defect that passes CI on Windows.
+    ///
+    /// Measured on Linux before the fix: with the teardown assertion live at
+    /// `~EpollSocket`, `cluster-e2e` was the only failure in the whole suite, and a
+    /// backtrace filed every violation here. `FrameServer::Shutdown` has posted its
+    /// closes for this reason since it was written; this one had the same shape and
+    /// did not.
+    ///
+    /// Safe from any thread. Returns once the closes have run AND every connection
+    /// has ended, because the detached connection tasks borrow members of this
+    /// object -- bounded, so a stuck peer cannot turn a stop into a hang.
     void Shutdown() noexcept;
 
     /// How many frames were stepped over because this build did not know them.
@@ -132,11 +163,15 @@ class RaftPeerServer
     }
 
   private:
-    /// Serve one peer connection until it closes or desynchronizes.
-    /// @param socket The accepted connection.
-    /// @return Task that resolves when the connection ends.
+    /// Close the listener and every connection currently registered.
+    ///
+    /// Reactor thread only -- see `Shutdown()`, which posts it there. Copies the
+    /// set out under the lock rather than closing under it, because a close
+    /// resumes the task that removes itself from that very vector.
+    void CloseAll() noexcept;
 
     IListener& _listener;
+    IExecutor& _reactor;
     IRaftMessageSink& _sink;
     ILogger& _logger;
     PeerServerOptions _options;
@@ -144,6 +179,16 @@ class RaftPeerServer
     OpenConnections _open;
 
     std::atomic<bool> _shuttingDown { false };
+
+    /// Whether the posted closes have run.
+    ///
+    /// Waited for alongside `_active`, and NOT folded into it: `_active` is also
+    /// what the `maxConnections` cap is judged against, so borrowing a slot for
+    /// teardown would refuse one honest peer at the moment of a stop. Its own flag
+    /// is also what lets the ceiling message say WHICH of the two it abandoned,
+    /// and those are opposite diagnoses -- a wedged peer, or a reactor that
+    /// stopped before it could run what it was handed.
+    std::atomic<bool> _closesRan { false };
     std::atomic<std::size_t> _active { 0 };
     std::atomic<std::uint64_t> _skipped { 0 };
     std::atomic<std::uint64_t> _delivered { 0 };
