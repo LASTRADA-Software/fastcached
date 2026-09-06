@@ -854,23 +854,14 @@ jobs:
           # `$ENV.TITLE` rather than the title spliced into the jq program, so no
           # quoting in a title anyone rewords later can turn the lookup into a
           # syntax error and every later failure into a second issue.
-          limit=500
-          found="$(gh issue list --state open --limit "$limit" --json number,title \
-                   --jq '(length | tostring) + "\t"
-                         + ([.[] | select(.title == $ENV.TITLE) | .number] | first // "" | tostring)')"
-          seen="${found%%$'\t'*}"
-          existing="${found#*$'\t'}"
-          if [[ "$seen" -ge "$limit" ]]; then
-            echo "::warning::the open-issue listing hit its ${limit} cap; a duplicate report may be opened"
-          fi
-          if [[ -n "$existing" ]]; then
-            echo "updating existing report #${existing} (searched ${seen} open issues)"
-            gh issue comment "$existing" --body "$body"
-          else
-            echo "opening a new report (searched ${seen} open issues, no title match)"
-            gh issue create --title "$TITLE" --body "$body" \
-              --label type/bug --label area/build --label status/needs-triage
-          fi
+          # Through the shared reporter (#724), not a hand-rolled listing. It is
+          # the only caller in this tree that treats a FAILED query as distinct
+          # from one that found nothing, and that checks the response SHAPE
+          # before drawing a conclusion from it -- this copy had the cap warning
+          # and neither of the other two.
+          printf '%s\n' "$body" > "${RUNNER_TEMP}/tidy-report.md"
+          bash scripts/ci-report-issue.sh "$TITLE" "${RUNNER_TEMP}/tidy-report.md" \
+            type/bug area/build status/needs-triage
 
   # The other half of what used to be the clang-tidy job. The ctest run here is
   # load-bearing and is the reason this job exists rather than the tidy job
@@ -1036,13 +1027,16 @@ jobs:
           It does not cover \`_WIN32\` regions inside files Linux analyses (#873),
           findings that differ only because MSVC's standard library differs (#874),
           or the five \`__APPLE__\` units (#858)."
-          existing="$(gh issue list --state open --search "$TITLE" --json number,title \
-                      --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
-          if [[ -n "$existing" ]]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh issue create --title "$TITLE" --body "$body" --label status/needs-triage
-          fi
+          # Through the shared reporter (#724). This copy had NONE of its three
+          # properties: no `--limit` at all, so it took `gh`'s default of 30; the
+          # title spliced straight into the jq program, which the sibling
+          # reporter's own comment warns turns a reworded title into a syntax
+          # error and then into a silent "no match"; and `head -1` over a
+          # `--search`, whose INDEX lags, so a just-opened issue is not found and
+          # a second one is opened.
+          printf '%s\n' "$body" > "${RUNNER_TEMP}/tidy-windows-report.md"
+          bash scripts/ci-report-issue.sh "$TITLE" "${RUNNER_TEMP}/tidy-windows-report.md" \
+            status/needs-triage
 
   clang-asan-ubsan:
     name: "clang-asan-ubsan"
