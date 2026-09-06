@@ -508,3 +508,41 @@ TEST_CASE("The discovery seam reports what the table found", "[toolchain-discove
     REQUIRE(candidates.size() == 1);
     CHECK(candidates.front().compiler == "/usr/bin/g++");
 }
+
+TEST_CASE("A `/`-rooted layout is not walked where a leading slash is drive-relative", "[toolchain-discovery]")
+{
+    // #174. On Windows `/usr` is DRIVE-RELATIVE -- Win32 resolves it against the
+    // current drive -- so on an MSYS2 or Cygwin install rooted at `C:\` the walk
+    // found `C:\usr\bin\gcc.exe`. That is the MSYS-runtime compiler the `msys2`
+    // row deliberately excludes, because a job dispatched to it comes back linked
+    // against a DLL the client does not have. The exclusion was being undone
+    // through a path nobody looked at.
+    //
+    // BOTH directions, because a guard that skipped the rows unconditionally
+    // would pass the first half and break every POSIX machine.
+    auto stage = [](ScriptedToolchainHost& host) {
+        host.AddExecutable("/usr/bin/gcc");
+        host.AddExecutable("/usr/local/bin/clang");
+    };
+
+    SECTION("a POSIX host still finds them")
+    {
+        ScriptedToolchainHost host;
+        stage(host);
+        ScriptedRunner runner;
+        auto const paths = PathsOf(DiscoverToolchainCandidates(host, runner));
+        CHECK(std::ranges::any_of(paths, [](auto const& p) { return p == "/usr/bin/gcc"; }));
+        CHECK(std::ranges::any_of(paths, [](auto const& p) { return p == "/usr/local/bin/clang"; }));
+    }
+
+    SECTION("a host where a leading slash is drive-relative does not")
+    {
+        ScriptedToolchainHost host;
+        host.WithDriveRelativeSlash();
+        stage(host);
+        ScriptedRunner runner;
+        auto const paths = PathsOf(DiscoverToolchainCandidates(host, runner));
+        CHECK_FALSE(std::ranges::any_of(paths, [](auto const& p) { return p.starts_with("/usr"); }));
+        CHECK_FALSE(std::ranges::any_of(paths, [](auto const& p) { return p.starts_with("/opt"); }));
+    }
+}

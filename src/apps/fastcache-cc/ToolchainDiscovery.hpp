@@ -89,6 +89,13 @@ enum class NameMatch : std::uint8_t
 /// Visual Studio arrangement is a ROW -- never another `if (exists(...))` threaded
 /// through the walk -- which is the same reason `ClassifyCompiler`'s stem table is
 /// a table.
+/// Whether a layout's fixed path means what it says on this host.
+enum class LayoutFilesystem : std::uint8_t
+{
+    Any,         ///< The root is host-absolute, a registry value or an environment variable.
+    PosixRooted, ///< The root starts at `/` and means it -- not a drive-relative path.
+};
+
 struct ToolchainLayout
 {
     /// What this layout is called, in the startup log.
@@ -126,6 +133,21 @@ struct ToolchainLayout
     std::span<std::string_view const> binaries;
     /// How those names are matched.
     NameMatch match { NameMatch::Exact };
+    /// Whether this row's `rootPath` is meaningful only where a leading `/` is a
+    /// filesystem ROOT.
+    ///
+    /// `Any` for every row whose root is host-absolute, a registry value or an
+    /// environment variable -- those describe a machine and the filesystem decides
+    /// whether they find anything, which is what lets a scripted host exercise the
+    /// Windows rows from a Linux runner.
+    ///
+    /// `PosixRooted` for the four rows spelled `/usr`, `/usr/local`, `/opt/local`
+    /// and `/opt/homebrew`. On Windows those are DRIVE-RELATIVE: Win32 resolves
+    /// them against the current drive, so on an MSYS2 or Cygwin install rooted at
+    /// `C:\` the walk finds `C:\usr\bin\gcc.exe` -- which is exactly the
+    /// MSYS-runtime compiler the `msys2` row deliberately excludes, re-admitted
+    /// through a path nobody looked at (#174).
+    LayoutFilesystem filesystem { LayoutFilesystem::Any };
 };
 
 /// The layouts this build knows about, in the order they are searched.

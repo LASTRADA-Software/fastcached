@@ -105,6 +105,16 @@ namespace
     class HostToolchainHost final: public IToolchainHost
     {
       public:
+        /// The one place the `#if` lives. Everything above it asks the HOST.
+        [[nodiscard]] bool LeadingSlashIsDriveRelative() const noexcept override
+        {
+#if defined(_WIN32)
+            return true;
+#else
+            return false;
+#endif
+        }
+
         bool DirectoryExists(std::string_view path) override
         {
             auto const directory = PathFromNarrowText(path);

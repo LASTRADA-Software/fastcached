@@ -52,6 +52,19 @@ class IToolchainHost
     IToolchainHost(IToolchainHost&&) = delete;
     IToolchainHost& operator=(IToolchainHost&&) = delete;
 
+    /// Whether a leading `/` on this host is DRIVE-RELATIVE rather than a root.
+    ///
+    /// True on Windows, where Win32 resolves `/usr` against the current drive. It
+    /// is asked of the HOST rather than settled with a `#if` for the reason the
+    /// layout table itself is un-`#if`ed: the table describes machines, not the
+    /// one it was compiled for, so a scripted host on a Linux runner can exercise
+    /// the Visual Studio and MSYS2 rows. A compile-time answer here would take
+    /// that back for the POSIX rows and make the Windows behaviour untestable
+    /// from the only platform that runs these tests (#174).
+    ///
+    /// @return True when a leading `/` is drive-relative.
+    [[nodiscard]] virtual bool LeadingSlashIsDriveRelative() const noexcept = 0;
+
     /// Whether @p path names an existing directory.
     /// @param path Directory path.
     /// @return True when it exists and is a directory.
