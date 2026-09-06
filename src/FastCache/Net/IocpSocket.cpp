@@ -8,6 +8,7 @@
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
+#include <FastCache/Net/WriteSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
 
     #include <winsock2.h>
@@ -398,7 +399,7 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto& op = _impl->writeOp;
-    op.awaitable = nullptr;
+    Detail::ClaimWriteSlot(op.awaitable);
     op.completion.overlapped = OVERLAPPED {};
 
     WSABUF wsaBuf;
@@ -432,7 +433,7 @@ IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     auto& op = _impl->writeOp;
-    op.awaitable = nullptr;
+    Detail::ClaimWriteSlot(op.awaitable);
     op.completion.overlapped = OVERLAPPED {};
 
     // Build the WSABUF array from the non-empty segments. Both this array and

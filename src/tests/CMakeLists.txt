@@ -3727,3 +3727,37 @@ set_tests_properties("configure-subprocess-bounds-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# The write-slot discipline: the read-slot rule's missing half (#893).
+#
+# A socket has ONE operation per direction. `Net/ReadSlot.hpp` states that for
+# reads, where arming over a parked operation drops the coroutine with no
+# assertion, no error and no log (#663) -- and the write side was the same machine
+# with none of the machinery. `TlsSocket::CancelRead` retires a pump parked on the
+# READ slot; one suspended in `FlushOutgoing`'s `_raw->Write` is not retired at all.
+#
+# A scan rather than a canary, and that is not a shortcut: a canary aborts at the
+# FIRST violation, so it watches one site whatever it picks and is silent about the
+# rest -- which is how the read-buffer guard could be deleted from `EpollSocket`
+# with the whole suite still green.
+add_test(
+    NAME "write-slot-guard"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh"
+)
+set_tests_properties("write-slot-guard" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Six cases, both directions -- including a seventh transport joining no list, a
+# transport contradicting its own exemption, and an empty tree refusing rather
+# than reporting clean.
+add_test(
+    NAME "write-slot-guard-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh" --self-test
+)
+set_tests_properties("write-slot-guard-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
