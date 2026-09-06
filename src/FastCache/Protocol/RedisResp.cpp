@@ -289,8 +289,16 @@ namespace
         /// teardown and catastrophic for a client that merely unsubscribed. This trips
         /// the same rearm latch `RearmReadable` does, but tells the watcher to exit
         /// rather than to watch again, so the coroutine ends where it is already parked
-        /// and no parked `WaitReadable` has to be retrieved from a socket that has no
-        /// way to retrieve one (#710 is the ticket about that missing primitive).
+        /// and no parked `WaitReadable` has to be retrieved from the socket at all.
+        ///
+        /// **That primitive now EXISTS**, and this sentence used to say it did not
+        /// ("#710 is the ticket about that missing primitive") -- which, left standing,
+        /// is a comment telling the next reader not to try. `ISocket::CancelRead()`
+        /// retires a parked read without closing the socket, and it is what
+        /// [#755](https://github.com/LASTRADA-Software/fastcached/issues/755) wants:
+        /// the watcher surviving the exit from subscribe mode can be retired directly
+        /// rather than through the `WatcherActive()` busy-check this shape needs. Not
+        /// done here, because that is #755's change and not this one's.
         ///
         /// Safe precisely because the watcher is parked on the LATCH at this point: the
         /// loop re-arms only once the reader has drained, so a watcher that has not
@@ -690,22 +698,23 @@ namespace
     class DisconnectWatch
     {
       public:
-        /// Point the watch at the waiter of the pass now running.
+        /// Point the watch at the waiter of the pass now running, and say whether the
+        /// caller must arm a trampoline for it.
+        ///
+        /// **One call, because the two halves have a mandated ORDER and separate ones
+        /// left that order enforced by a comment.** The re-target must happen before a
+        /// trampoline is armed, or a `WaitReadable` that resolves synchronously with
+        /// EOF -- which is what the in-memory transport does for a peer that has
+        /// already half-closed -- finds no waiter to resolve and the loop parks
+        /// forever. Folded, there is no way to spell it wrong.
         /// @param waiter This pass's waiter.
-        void Retarget(std::shared_ptr<StreamWaiter> waiter) noexcept
+        /// @return True when the caller should arm a trampoline; false when an earlier
+        ///         one is still parked and will be re-targeted instead.
+        [[nodiscard]] bool RetargetAndBeginWatch(std::shared_ptr<StreamWaiter> waiter) noexcept
         {
             std::scoped_lock const lock { _mu };
-            if (!_retired)
-                _current = std::move(waiter);
-        }
-
-        /// Claim the socket's read slot for a new trampoline, if no earlier one still
-        /// holds it.
-        /// @return True when the caller should arm one; false when one is still parked.
-        [[nodiscard]] bool BeginWatch() noexcept
-        {
-            std::scoped_lock const lock { _mu };
-            if (_retired || _watching)
+            _current = std::move(waiter);
+            if (_watching)
                 return false;
             _watching = true;
             return true;
@@ -719,14 +728,13 @@ namespace
         }
 
         /// Trampoline arm: the peer has finished sending, so resolve whichever waiter
-        /// this pass is parked on. A no-op once retired.
+        /// this pass is parked on. A no-op once retired, because retirement is spelled
+        /// as forgetting the waiter.
         void Disconnect() noexcept
         {
             std::shared_ptr<StreamWaiter> current;
             {
                 std::scoped_lock const lock { _mu };
-                if (_retired)
-                    return;
                 current = _current;
             }
             if (current)
@@ -734,18 +742,36 @@ namespace
         }
 
         /// The blocking read is over: resolve nobody from here on.
+        ///
+        /// **Spelled as forgetting the waiter, and NOT as a separate `_retired` flag.**
+        /// A flag would be a third representation of one fact -- `_current` being null
+        /// already says it, and `ScopedDisconnectWatch` dropping its `shared_ptr`
+        /// already says it a layer up -- and three guards for one condition is how two
+        /// of them end up disagreeing.
         void Retire() noexcept
         {
             std::scoped_lock const lock { _mu };
-            _retired = true;
             _current.reset();
         }
 
       private:
+        /// Not load-bearing on today's threading model and kept anyway.
+        ///
+        /// Every access is on the connection's own reactor thread: `StreamWaiter::WakeOnce`
+        /// marshals the registry's cross-thread wake through `_reactor->Submit`, so it never
+        /// reaches this object, and `IReactor` is one worker thread per reactor. Measured at
+        /// ~6 ns per pass against a pass that already takes `StreamWaiterRegistry`'s
+        /// process-wide lock and walks its whole key map -- so it is unmeasurable in situ,
+        /// on a path only a BLOCKing verb reaches.
+        ///
+        /// **The reentrancy is safe by ORDERING, not by luck, and this mutex is not
+        /// recursive.** `ScopedDisconnectWatch::Retire()` releases `_mu` and drops its
+        /// `shared_ptr` BEFORE calling `CancelRead()`, which synchronously resumes the
+        /// trampoline into `Disconnect()` and `EndWatch()` -- both of which retake `_mu`.
+        /// Reverse that order and this self-deadlocks.
         std::mutex _mu;
         std::shared_ptr<StreamWaiter> _current {};
         bool _watching { false };
-        bool _retired { false };
     };
 
     /// Retire a blocking read's watch and hand the socket's read slot back, exactly
@@ -782,8 +808,12 @@ namespace
         }
 
         /// The shared watch, created on first use so a non-reactor transport pays for
-        /// nothing.
-        /// @return The watch, or nullptr once retired.
+        /// nothing -- neither the allocation nor the `CancelRead()` at retirement.
+        /// @return The watch. Never null: `Retire()` drops this object's reference, so a
+        ///         call after one mints a fresh watch rather than handing back a retired
+        ///         one. No caller does that -- every `Retire()` is followed by
+        ///         `co_return` -- and the reference is returned rather than copied
+        ///         because the one call site reads it in scope.
         [[nodiscard]] std::shared_ptr<DisconnectWatch> const& Watch()
         {
             if (!_watch)
@@ -3294,8 +3324,7 @@ namespace
                 // transport does for a peer that has already half-closed -- would find
                 // no waiter to resolve and the loop would park forever.
                 auto const& watch = disconnect.Watch();
-                watch->Retarget(waiter);
-                if (watch->BeginWatch())
+                if (watch->RetargetAndBeginWatch(waiter))
                     ArmDisconnect(watch, socket);
             }
             auto const total = poll();

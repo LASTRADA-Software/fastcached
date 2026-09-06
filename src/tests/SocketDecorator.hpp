@@ -277,7 +277,7 @@ class ParkingReadableSocket final: public SocketDecorator
     /// @copydoc ISocket::CancelRead
     void CancelRead() noexcept override
     {
-        if (RetireParked(NetErrorCode::Cancelled))
+        if (RetireParked())
             ++_watchesRetiredByCancel;
         SocketDecorator::CancelRead();
     }
@@ -285,7 +285,7 @@ class ParkingReadableSocket final: public SocketDecorator
     /// @copydoc ISocket::Close
     void Close() noexcept override
     {
-        if (RetireParked(NetErrorCode::Cancelled))
+        if (RetireParked())
             ++_watchesRetiredByClose;
         SocketDecorator::Close();
     }
@@ -356,14 +356,18 @@ class ParkingReadableSocket final: public SocketDecorator
         _parked = nullptr;
     }
 
-    /// @param code What to complete a parked watch with.
-    /// @return Whether there was one.
-    bool RetireParked(NetErrorCode code) noexcept
+    /// Complete a parked watch with `Cancelled`, which is what both retirement routes
+    /// deliver -- a caller's `CancelRead` and the connection's `Close`. Taking the code
+    /// as a parameter would be a knob with one setting; WHICH route retired the watch
+    /// is what the two counters record, and that is the distinction worth keeping.
+    /// @return Whether there was a parked watch to retire.
+    bool RetireParked() noexcept
     {
         auto* const parked = std::exchange(_parked, nullptr);
         if (parked == nullptr)
             return false;
-        parked->Complete(IoResult { std::unexpected(NetError { .code = code, .systemCode = 0, .context = {} }) });
+        parked->Complete(
+            IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
         return true;
     }
 

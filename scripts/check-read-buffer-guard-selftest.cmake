@@ -84,9 +84,19 @@ function(fastcached_run_check tree outObjected outOutput)
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"
         OUTPUT_VARIABLE captured ERROR_VARIABLE capturedErrors RESULT_VARIABLE ignored)
     set(combined "${captured}${capturedErrors}")
-    # Flattened before matching, because CMake WRAPS its diagnostics at ~74 columns:
-    # a phrase can exist in the output and in no single LINE of it, and a negative
-    # test written without this reads as a refutation.
+    # **This copy of `fastcached_run_check` DIVERGES from its three siblings, and the
+    # divergence is deliberate.** `check-target-file-guards-selftest`,
+    # `check-worker-refusals-selftest` and `check-succeed-not-skip-selftest` carry the
+    # same function byte-identically and do NOT flatten. This one must: CMake wraps its
+    # diagnostics at ~74 columns, so a phrase can exist in the output and in no single
+    # LINE of it, and the phrases this selftest matches on
+    # (`ExampleSocket::Read does not call`, `only AFTER its first return`) are long
+    # enough to straddle. A negative test written without it reads as a refutation.
+    #
+    # Said out loud because a silently non-identical copy is worse than either a
+    # faithful one or a shared helper -- it is the case a later consolidation cannot
+    # detect. The siblings match shorter phrases and are correct today; whether they
+    # should flatten too is their question, not this one.
     string(REGEX REPLACE "[\r\n]+" " " combined "${combined}")
     string(REGEX REPLACE " +" " " combined "${combined}")
     string(FIND "${combined}" "CMake Error" position)

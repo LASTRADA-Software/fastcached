@@ -102,6 +102,19 @@ void InMemorySocket::Close() noexcept
         parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
 }
 
+void InMemorySocket::CancelRead() noexcept
+{
+    // Detached FIRST and completed LAST, exactly as `Close()` above does and for the
+    // reason recorded there. Unlike `Close()` this leaves the socket usable: the
+    // progress callback stays installed and a later `Read` works, which is the whole
+    // difference between retiring an operation and tearing the connection down.
+    auto* const parked = std::exchange(_pendingRead, nullptr);
+    if (parked == nullptr)
+        return;
+    _pendingReadBuffer = {};
+    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+}
+
 void InMemorySocket::ShutdownWrite() noexcept
 {
     if (_outbound)

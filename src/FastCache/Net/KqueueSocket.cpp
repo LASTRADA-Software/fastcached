@@ -373,22 +373,10 @@ void KqueueSocket::CancelRead() noexcept
 {
     if (_closed || !_impl)
         return;
-
-    auto* const parked = std::exchange(_impl->readOp.awaitable, nullptr);
-    if (parked == nullptr)
-        return;
-    _impl->readOp.readBuffer = {};
-    _impl->readOp.readPeekOnly = false;
-    // The interest is recomputed from `readOp.awaitable`, which is now null, so this
-    // takes EVFILT_READ back down: the operation is gone and a readable edge would
-    // find nothing to complete.
-    _impl->UpdateInterest();
-
-    // Detached FIRST and completed LAST, with no member touched afterwards -- the same
-    // discipline `Close()` records below and for the same reason: completing resumes
-    // the parked coroutine, and a coroutine that owns this socket runs to its end and
-    // destroys it before `Complete` returns.
-    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+    // The detach-then-complete discipline is shared with `EpollSocket`, in
+    // `Net/ReadSlot.hpp` beside the slot rule it belongs to -- this is the second copy
+    // of it in this directory and the header says why there is not a third.
+    Detail::RetireParkedRead(*_impl);
 }
 
 void KqueueSocket::Close() noexcept

@@ -2,8 +2,10 @@
 #pragma once
 
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 
 #include <cassert>
+#include <expected>
 
 namespace FastCache::Detail
 {
@@ -89,6 +91,50 @@ namespace FastCache::Detail
 /// socket -- the call site, not this function -- and must die.
 ///
 /// @param slot The op's `awaitable` pointer, cleared by this call.
+/// Retire a parked read operation on a reactor socket: detach it, drop the interest,
+/// and complete it with `Cancelled`.
+///
+/// **The counterpart to `ClaimReadSlot`, and it lives here for the same reason.** That
+/// one is the discipline's tripwire; this is the only way a caller can honour it
+/// without closing the socket (`ISocket::CancelRead`, #710). Both are about the single
+/// read-op slot, so both belong beside it rather than in whichever transport was
+/// written first.
+///
+/// **Shared because `EpollSocket` and `KqueueSocket` spell it identically**, down to
+/// the ordering, and this is the second copy of the detach-then-complete discipline in
+/// this directory -- `Close()` in each of them is the first, and those two are already
+/// byte-identical duplicates that predate this. A third copy would be a defect by this
+/// project's own data-driven rule; a template over the `Impl` is the one generic that
+/// takes both without inventing a type.
+///
+/// **Detached FIRST and completed LAST, with no member touched afterwards.** That is
+/// not tidiness: `Complete` resumes the parked coroutine, and a coroutine that OWNS
+/// this socket runs to its end and destroys it before `Complete` returns -- so
+/// `updateInterest` and every field access must already have happened. `EpollSocket::Close`
+/// records the ASan report that established this.
+///
+/// `IocpSocket` deliberately does NOT use it: the kernel owns that op's `OVERLAPPED`,
+/// so its retirement retracts rather than completes, and sharing a body between the two
+/// shapes would hide exactly the difference #884 is about.
+///
+/// @tparam Impl The socket's `Impl`, which must expose `readOp` and `UpdateInterest()`.
+/// @param impl The socket's implementation block.
+template <typename Impl>
+void RetireParkedRead(Impl& impl) noexcept
+{
+    auto* const parked = impl.readOp.awaitable;
+    if (parked == nullptr)
+        return;
+    impl.readOp.awaitable = nullptr;
+    impl.readOp.readBuffer = {};
+    impl.readOp.readPeekOnly = false;
+    // Recomputed from `readOp.awaitable`, which is now null, so the read interest comes
+    // back down: the operation is gone and a readable edge would find nothing to
+    // complete.
+    impl.UpdateInterest();
+    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+}
+
 inline void ClaimReadSlot(IoAwaitable*& slot) noexcept
 {
     assert(slot == nullptr

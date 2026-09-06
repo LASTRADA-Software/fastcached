@@ -33,6 +33,21 @@ cmake_minimum_required(VERSION 3.28)
 # one spelling of the pattern that reads it, and `scripts/check-script-check-signals.cmake`
 # for the measurement and the reasons, deliberately not restated here (#565).
 #
+# **This is the THIRD copy of the canary-gate driver, and that is stated rather than
+# left to be discovered.** `scripts/read-slot-guard-gate.cmake` and
+# `scripts/reactor-teardown-gate.cmake` are the other two; measured, the executable
+# lines differ only in the two string literals this gate matches on. Keep it
+# byte-for-byte with them apart from those, for the reason `check-psk-signing-seam.cmake`
+# gives about its own copies: a copy that rewrites an escape or a spelling is equivalent
+# and non-identical, which is exactly the divergence a later consolidation cannot detect.
+# Consolidating the three into one parameterised gate is worth doing and is deliberately
+# NOT pre-empted here -- it would touch two guards this change has no other business in,
+# and a canary gate is the last thing to refactor in a hurry.
+#
+# One outcome none of the three distinguishes: an `execute_process` TIMEOUT produces no
+# `RESULT_VARIABLE` a reader can tell from an ordinary non-zero exit. It would present
+# as "died of something else", which is at least a refusal rather than a pass.
+#
 # Usage:
 #   cmake -DFASTCACHED_CANARY=<path> -P scripts/empty-read-buffer-gate.cmake
 

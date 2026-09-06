@@ -95,9 +95,18 @@ if(scannedCount EQUAL 0)
         "here on. Fix the glob in ${CMAKE_CURRENT_LIST_FILE}.")
 endif()
 
-set(guarded "")
 set(violations "")
 set(implementationCount 0)
+
+# DERIVED, never written out. An earlier draft hardcoded `34` here for a signature that
+# is 35 characters -- benign, because the extra character landed on the closing `)`
+# which matches neither of the two things the walk looks for next, and because the
+# cursor advance was wrong by the same one in the other direction. Two errors
+# cancelling is not a reason to keep either: it is a second source of truth for a
+# constant this file already holds as data, in the check whose own header argues it
+# DERIVES its set rather than tabulating it. Nothing in the selftest could have caught
+# it, which is the part worth recording.
+string(LENGTH "${FastCachedReadSignature}" signatureLength)
 
 foreach(source IN LISTS netSources)
     file(READ "${source}" text)
@@ -137,7 +146,13 @@ foreach(source IN LISTS netSources)
 
         # A DECLARATION ends in `;` and has no body; only a definition can carry the
         # guard, and refusing a header declaration would make the rule unstatable.
-        math(EXPR afterSignature "${signatureAt} + 34")
+        #
+        # Every offset below is kept in ONE coordinate system -- positions within
+        # `rest` -- rather than the three the first draft used (`rest`, then a `tail`
+        # slice, then a `bodyRest` slice, summed back together at the advance). That is
+        # where the hardcoded length above hid: with three origins, an error in one is
+        # cancelled by an error in another and the walk still lands correctly.
+        math(EXPR afterSignature "${signatureAt} + ${signatureLength}")
         string(SUBSTRING "${rest}" ${afterSignature} -1 tail)
         string(FIND "${tail}" "{" braceAt)
         string(FIND "${tail}" ";" semicolonAt)
@@ -153,8 +168,8 @@ foreach(source IN LISTS netSources)
         # these is a top-level function definition, so that terminator is exact; a
         # brace-counting walk would be a second, weaker way to answer the same
         # question.
-        math(EXPR bodyStart "${braceAt} + 1")
-        string(SUBSTRING "${tail}" ${bodyStart} -1 bodyRest)
+        math(EXPR bodyStart "${afterSignature} + ${braceAt} + 1")
+        string(SUBSTRING "${rest}" ${bodyStart} -1 bodyRest)
         string(FIND "${bodyRest}" "\n}" bodyEnd)
         if(bodyEnd EQUAL -1)
             list(APPEND violations
@@ -177,8 +192,6 @@ foreach(source IN LISTS netSources)
         elseif(NOT returnAt EQUAL -1 AND guardAt GREATER returnAt)
             list(APPEND violations
                  "${shownPath}: ${className}::Read calls ${FastCachedReadGuardCall} only AFTER its first return, so every early exit skips it (#838)")
-        else()
-            list(APPEND guarded "${shownPath}: ${className}::Read")
         endif()
 
         math(EXPR cursor "${cursor} + ${afterSignature} + ${bodyStart}")

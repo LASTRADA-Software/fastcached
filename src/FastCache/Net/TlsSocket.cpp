@@ -103,6 +103,17 @@ Task<IoResult> TlsSocket::FeedIncoming()
 
 Task<IoResult> TlsSocket::PumpRead(std::span<std::byte> out)
 {
+    // **#838's defect written out longhand, one layer below the guard that now refuses
+    // it.** `0` on this interface means the peer has finished sending, so answering it
+    // for an empty destination is the same false claim `Detail::RequireReadBuffer`
+    // exists to stop -- and `TlsSocket::Read` asserts before it ever gets here, so in a
+    // Debug build this line is unreachable by contract.
+    //
+    // Kept rather than deleted, because deleting it changes RELEASE behaviour: the
+    // alternative is `SSL_read(ssl, p, 0)`, whose non-positive return this loop would
+    // classify through `SSL_get_error`, and swapping one wrong answer for a differently
+    // wrong one on a path nothing takes is not a fix. It goes when the guard does --
+    // that is, if the release-side refusal ever lands (see `RequireReadBuffer`).
     if (out.empty())
         co_return IoResult { std::size_t { 0 } };
 
@@ -375,6 +386,14 @@ void TlsSocket::Close() noexcept
     // resume the TLS session. Sending close_notify cleanly would require an
     // async Shutdown() coroutine, which is out of scope here.
     _raw->Close();
+}
+
+void TlsSocket::CancelRead() noexcept
+{
+    // One forward retires both layers. See the override's documentation for the chain
+    // and for why this transport needs the override at all -- its reads PARK, which is
+    // the case `ISocket::CancelRead`'s default no-op is explicitly not for (#710).
+    _raw->CancelRead();
 }
 
 bool TlsSocket::IsClosed() const noexcept

@@ -317,10 +317,18 @@ class ISocket
     /// narrower than not cancelling at all, and not closed
     /// ([#884](https://github.com/LASTRADA-Software/fastcached/issues/884)).
     ///
-    /// **The default does nothing, and that is for FAKES**, exactly as `ShutdownWrite`
-    /// below: a transport whose reads never park has nothing to retire, and making this
-    /// pure virtual would reach into test files across three lanes to say so. A no-op
-    /// costs such a transport nothing, because there is no frame to free.
+    /// **The default does nothing, and that is for FAKES** -- a scripted double whose
+    /// reads resolve inline has no frame to free, and making this pure virtual would
+    /// reach into eleven test files across four lanes to say so.
+    ///
+    /// **It is NOT a safe default for a transport whose reads park, and the analogy to
+    /// `ShutdownWrite` below is where that gets missed.** `TlsSocket` overrides BOTH,
+    /// and for the same underlying reason: its reads are not read-only at the transport
+    /// layer. A `WaitReadable` there decrypts, and parks on a RAW read whenever OpenSSL
+    /// wants more bytes -- so inheriting this no-op would leave the raw socket's slot
+    /// occupied and hand the connection loop's next read a double-arm. Every transport
+    /// this library hands out that can park a read overrides this; a new one that can
+    /// must too, and nothing but this sentence enforces that.
     ///
     /// Idempotent, and not a `Close()`: the socket stays open, and a later `Read` works.
     virtual void CancelRead() noexcept {}
@@ -424,8 +432,17 @@ namespace Detail
     /// this interface can express: `0` is taken, and it is taken by the opposite fact. There
     /// is no result that would be true, which is this project's definition of contract misuse
     /// -- `AGENT.md`'s *"reserve exceptions for programmer errors (precondition violation,
-    /// contract misuse)"* -- so it is an assertion rather than a `NetErrorCode` a caller would
-    /// have to start handling for a case that cannot legitimately occur.
+    /// contract misuse)"* -- so it is an assertion rather than a `NetErrorCode`.
+    ///
+    /// **What that choice costs is the taxonomy, NOT "callers would have to start handling
+    /// it".** This paragraph said the latter first and it is false: every `Read` caller in this
+    /// tree already has an error branch (`RecvExactly`, `PullChunk`, `AdminHttpServer`,
+    /// `ProtocolAutodetect`, `FrameEndpoint`), so an error code would only change WHICH
+    /// existing branch a buggy caller takes -- from *clean EOF, close politely* to *read
+    /// failed*, which is strictly the better one. The real price is a new enumerator in a
+    /// taxonomy that has none like it and a behaviour change on every shipped transport. The
+    /// convenient reason is recorded as withdrawn rather than quietly replaced, because it is
+    /// the kind that survives into a decision somebody else makes.
     ///
     /// **Debug-only, and the release residual is a decision rather than an omission.** With
     /// assertions compiled out an empty read still answers EOF, exactly as before. Refusing it
