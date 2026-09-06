@@ -2803,6 +2803,44 @@ jobs:
           }
           Write-Host "daemon serving as $($svc.StartName)"
 
+          # **Honoured or ignored: this is the only assertion that can tell them
+          # apart**, and its absence is why #860 went unseen from 2026-08-25.
+          #
+          # The round trip above is on 6674, the BUILT-IN DEFAULT, so a daemon that
+          # reads its machine-wide config and one that silently ignores it produce the
+          # IDENTICAL observation. `ResolveDefaultConfigPath` skips every
+          # `ConfigScope::System` row unless `IsPrivilegedProcess()`, which on Windows
+          # asked only about BUILTIN\Administrators -- and the service moved to a
+          # virtual account, which is a service principal and not an administrator.
+          #
+          # So: name a NON-DEFAULT port in the seeded config, restart, and require an
+          # answer THERE. Honoured and ignored now differ. Asserting what
+          # DISTINGUISHES is the whole point -- the 6674 round trip stays, because it
+          # is the control that says the daemon still serves at all.
+          $cfg = "$env:ProgramData\fastcached\fastcached.yaml"
+          Add-Content -Path $cfg -Value "`nport: 6699"
+          Restart-Service FastCached -Force
+          $moved = ''
+          for ($i = 0; $i -lt 30 -and -not $moved; $i++) {
+            try {
+              $c = New-Object Net.Sockets.TcpClient('127.0.0.1', 6699)
+              $st = $c.GetStream()
+              $w = New-Object IO.StreamWriter($st); $w.NewLine = "`r`n"; $w.AutoFlush = $true
+              $w.WriteLine('set m 0 0 5'); $w.WriteLine('moved'); $w.WriteLine('get m')
+              $r = New-Object IO.StreamReader($st)
+              $c.ReceiveTimeout = 5000
+              $moved = $r.ReadLine() + '|' + $r.ReadLine() + '|' + $r.ReadLine()
+              $c.Close()
+            } catch { Start-Sleep 1 }
+          }
+          if ($moved -notmatch 'STORED' -or $moved -notmatch 'moved') {
+            Show-InstallLog
+            throw ("the service did not honour its machine-wide config: it was told port 6699 and did not answer " +
+                   "there. That is #860 -- the System config row is skipped and the daemon runs on built-in " +
+                   "defaults, silently. Reply was: '$moved'")
+          }
+          Write-Host "daemon honoured its machine-wide config (answered on 6699)"
+
       # The compile worker registers itself; the MSI never does. What is asserted
       # here is the identity it registers UNDER: told nothing, CreateService logs a
       # service on as LocalSystem -- the whole machine -- and this process compiles

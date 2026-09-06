@@ -387,23 +387,51 @@ namespace
 
 } // namespace
 
+#if defined(_WIN32)
+namespace
+{
+    /// Is the effective token a member of @p wellKnown?
+    ///
+    /// A null token means the effective one, and membership here is *enabled*
+    /// membership -- so the unelevated half of a split administrator token answers
+    /// false, which is the right answer: that process could not have written the
+    /// machine-wide config either.
+    [[nodiscard]] bool EffectiveTokenIsIn(WELL_KNOWN_SID_TYPE wellKnown) noexcept
+    {
+        std::array<std::byte, SECURITY_MAX_SID_SIZE> sid {};
+        auto size = static_cast<DWORD>(sid.size());
+        if (::CreateWellKnownSid(wellKnown, nullptr, sid.data(), &size) == FALSE)
+            return false;
+
+        BOOL member = FALSE;
+        if (::CheckTokenMembership(nullptr, sid.data(), &member) == FALSE)
+            return false;
+        return member == TRUE;
+    }
+} // namespace
+#endif
+
 bool IsPrivilegedProcess()
 {
 #if defined(_WIN32)
-    std::array<std::byte, SECURITY_MAX_SID_SIZE> administrators {};
-    auto size = static_cast<DWORD>(administrators.size());
-    if (::CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators.data(), &size) == FALSE)
-        return false;
-
-    // A null token means the effective one. Membership here is *enabled*
-    // membership, so the unelevated half of a split administrator token answers
-    // false — which is the right answer: that process could not have written
-    // the machine-wide config either.
-    BOOL member = FALSE;
-    if (::CheckTokenMembership(nullptr, administrators.data(), &member) == FALSE)
-        return false;
-
-    return member == TRUE;
+    // **Two identities, because the question is "am I the machine-wide instance",
+    // not "am I an administrator"** and the two parted company on 2026-08-25.
+    //
+    // `90edf4e0` moved the service off LocalSystem to a VIRTUAL ACCOUNT, whose token
+    // is a service principal and not an administrator -- that commit's own comment
+    // says so, reasoning about file readability and never noticing this predicate.
+    // From then the shipped Windows service answered false here, so
+    // `ResolveDefaultConfigPath` skipped every `ConfigScope::System` row and the
+    // daemon silently ran on built-in defaults: `requirepass` placed in
+    // `%ProgramData%\fastcached\fastcached.yaml` was not in force, and nothing was
+    // logged ([#860](https://github.com/LASTRADA-Software/fastcached/issues/860)).
+    //
+    // **Widening the LOOKUP does not widen TRUST.** The single caller uses this
+    // answer for two things -- whether to consider a system row at all, and whether
+    // to demand `IsTrustedSystemLocation` of what it finds -- and a service now gets
+    // BOTH. So a machine-wide config is still obeyed only when only an administrator
+    // could have written it; what changed is that the service is allowed to look.
+    return EffectiveTokenIsIn(WinBuiltinAdministratorsSid) || EffectiveTokenIsIn(WinServiceSid);
 #else
     return ::geteuid() == 0;
 #endif
