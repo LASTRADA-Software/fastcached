@@ -289,13 +289,18 @@ namespace
 /// visible half untested, and the operator-visible half is the ticket.
 struct Observed
 {
-    ManualClock clock;
+    // Order is constrained by the default member initialisers, not chosen freely:
+    // `storage` needs `raw` and `logger` before it, and `engine` needs `storage`,
+    // `clock` and `metrics`. The analyser's suggested "optimal" order puts
+    // `engine` ahead of `storage`, which does not compile -- so this is the
+    // least-padded order that the dependencies actually permit.
     InMemoryLruStorage raw;
     NullLogger logger;
     WriteErrorReportingStorage storage { raw, logger };
-    AtomicMetricsSink metrics;
-    CacheEngine engine { storage, clock, DefaultSystemWallClock(), &metrics };
     MemcachedTextHandler text;
+    AtomicMetricsSink metrics;
+    ManualClock clock;
+    CacheEngine engine { storage, clock, DefaultSystemWallClock(), &metrics };
 
     /// Plant `blob` under `key` tagged with `flags`, as an ordinary memcached client.
     void Plant(std::string_view key, std::uint32_t flags, std::string_view blob)

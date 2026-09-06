@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -55,6 +56,22 @@ class WriteErrorReportingStorage final: public IStorage
     ///        logger, since a persistence failure is a server condition, not a
     ///        per-client one).
     WriteErrorReportingStorage(IStorage& inner, ILogger& logger) noexcept;
+
+    /// Construct over an inner storage this decorator OWNS.
+    ///
+    /// The borrowing form above suits the daemon, which keeps its backend in a
+    /// local that outlives the decorator. A tier composed and handed back as a
+    /// single `unique_ptr` -- the compile node's -- has nowhere to keep the inner
+    /// alive, and that is why the node had no write-error reporting at all
+    /// (#574): it exported `fastcached_write_errors_total` and could never move
+    /// it, so a node whose persistent tier was failing every write looked
+    /// identical, on every surface an operator watches, to a healthy one.
+    ///
+    /// An owning overload rather than a second forwarding decorator, which would
+    /// be every `IStorage` method written twice.
+    /// @param inner  Backing storage; taken by ownership, must not be null.
+    /// @param logger Sink for the `Warn` write-failure lines.
+    WriteErrorReportingStorage(std::unique_ptr<IStorage> inner, ILogger& logger) noexcept;
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
 
@@ -165,6 +182,10 @@ class WriteErrorReportingStorage final: public IStorage
     /// @param error The storage error the inner backend returned.
     void ReportWriteFailure(std::string_view verb, std::string_view key, StorageError const& error) noexcept;
 
+    /// Non-null exactly when the owning constructor was used; `_inner` refers
+    /// into it. Declared BEFORE `_inner` so it is initialised first -- member
+    /// order is what makes binding the reference to `*_owned` well defined.
+    std::unique_ptr<IStorage> _owned;
     IStorage& _inner;
     ILogger& _logger;
     std::atomic<std::uint64_t> _writeErrors { 0 };

@@ -8,6 +8,7 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/LayeredStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
+#include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
 
 #include <chrono>
@@ -141,8 +142,20 @@ namespace
                                          : std::make_unique<LayeredStorage>(std::move(memory), std::move(storage));
         }
 
+        // A persistence failure (full disk / I/O error / corruption / read-only)
+        // is otherwise invisible at the default log level: it never reaches the
+        // trace-only TracingStorage, so a store silently does not happen. The
+        // daemon has wrapped its backend in this since the counter existed; the
+        // node did not, so it exported `fastcached_write_errors_total` and could
+        // never move it, and a node whose disk tier was failing every write
+        // looked identical to a healthy one on every surface an operator watches
+        // (#574).
+        //
+        // Wrapped INSIDE the sharding wrapper, so it observes the true result the
+        // composed backend returns -- the disk error LayeredStorage propagates --
+        // and so it is covered by the lock that wrapper exists to provide.
         std::vector<std::unique_ptr<IStorage>> shards;
-        shards.push_back(std::move(storage));
+        shards.push_back(std::make_unique<WriteErrorReportingStorage>(std::move(storage), logger));
         return std::make_unique<ShardedStorage>(std::move(shards));
     }
 } // namespace

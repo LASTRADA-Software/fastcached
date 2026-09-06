@@ -56,6 +56,13 @@ WriteErrorReportingStorage::WriteErrorReportingStorage(IStorage& inner, ILogger&
 {
 }
 
+WriteErrorReportingStorage::WriteErrorReportingStorage(std::unique_ptr<IStorage> inner, ILogger& logger) noexcept:
+    _owned { std::move(inner) },
+    _inner { *_owned },
+    _logger { logger }
+{
+}
+
 void WriteErrorReportingStorage::ReportWriteFailure(std::string_view verb,
                                                     std::string_view key,
                                                     StorageError const& error) noexcept
