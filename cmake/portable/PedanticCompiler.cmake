@@ -152,7 +152,15 @@ endif()
 # paired `-Wno-error=` rows stop being belt-and-braces and start carrying their
 # own weight, which is what they are for.
 if(${PEDANTIC_COMPILER_WERROR})
-    if(("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU") OR ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang"))
+    # The SAME condition the block sat under before it was lifted, and the frontend
+    # half is load-bearing. `clang-cl` reports `CMAKE_CXX_COMPILER_ID` as `Clang`
+    # with `CMAKE_CXX_COMPILER_FRONTEND_VARIANT` as `MSVC`, and the MSVC arm above
+    # deliberately adds no `-Werror` (its `/WX` has been commented out since before
+    # any of this). Guarding on the ID alone therefore does not "restore" the old
+    # behaviour -- it EXTENDS `-Werror` to a configuration that never had it, and
+    # `Windows-clangcl-release` went red on `_wfopen is deprecated` immediately.
+    if(NOT ("${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
+       AND (("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU") OR ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")))
         try_add_compile_options(-Werror)
 
         # Fatality only. `-Wno-error=X` says "keep X visible, do not fail on

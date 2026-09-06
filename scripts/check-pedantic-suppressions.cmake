@@ -418,15 +418,19 @@ message("pedantic suppressions: ${personaCount} compiler persona(s) asked, "
 # property they were never written to have. The subject is named in the status
 # line below, so a run that asserted nothing says whose module it did not ask.
 if(FASTCACHED_PEDANTIC_FILE STREQUAL "${FASTCACHED_SOURCE_DIR}/cmake/portable/PedanticCompiler.cmake")
-foreach(row IN ITEMS "ON;ON;1" "ON;OFF;0" "OFF;ON;1" "OFF;OFF;0")
-    list(GET row 0 wantPedantic)
-    list(GET row 1 wantWerror)
-    list(GET row 2 wantCount)
-    pedantic_flags_for("GNU" "GNU" "${wantWerror}" rowFlags "${wantPedantic}")
+foreach(row IN ITEMS "GNU;GNU;ON;ON;1"   "GNU;GNU;ON;OFF;0"
+                     "GNU;GNU;OFF;ON;1"  "GNU;GNU;OFF;OFF;0"
+                     "Clang;MSVC;ON;ON;0" "Clang;MSVC;OFF;ON;0")
+    list(GET row 0 wantId)
+    list(GET row 1 wantFrontend)
+    list(GET row 2 wantPedantic)
+    list(GET row 3 wantWerror)
+    list(GET row 4 wantCount)
+    pedantic_flags_for("${wantId}" "${wantFrontend}" "${wantWerror}" rowFlags "${wantPedantic}")
     pedantic_count_flag(rowFlags "-Werror" seenCount)
     if(NOT seenCount EQUAL wantCount)
         message(FATAL_ERROR
-            "check-pedantic-suppressions: PEDANTIC_COMPILER=${wantPedantic} "
+            "check-pedantic-suppressions: ${wantId}/${wantFrontend} PEDANTIC_COMPILER=${wantPedantic} "
             "PEDANTIC_COMPILER_WERROR=${wantWerror} added -Werror ${seenCount} time(s), expected ${wantCount}. "
             "The row that motivated this is OFF/ON: `-Werror` used to be nested inside "
             "`if(\${PEDANTIC_COMPILER})`, so an operator who asked for warnings to be fatal got a build "
