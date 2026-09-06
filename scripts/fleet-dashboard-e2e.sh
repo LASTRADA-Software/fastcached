@@ -302,22 +302,38 @@ else
     # added to `http_response_to_silence` would land there and be reported as "the
     # surface would not answer", which is a diagnosis this fixture has not
     # established -- the exact mis-bucketing the three named statuses exist to stop.
+    # **The expected verdict INVERTED with #828, and the old error message predicted
+    # it.** It read "either the node is wedged, or AdminHttpServer::RequestTimeout has
+    # been raised to or past _e2e_http_read_bound -- those two are a pair". #828 splits
+    # that one number: a peer that has said NOTHING now gets FirstByteTimeout (30 s),
+    # because a browser preconnect holds a socket far longer than any sane mid-request
+    # bound, and closing it is what made an ordinary navigation depend on the client
+    # retrying.
+    #
+    # So HELD is now the passing outcome and CLOSED is the defect. `Inconclusive` is
+    # this probe's name for "neither answered nor closed inside my bound", which is
+    # exactly what waiting looks like from the outside -- the probe cannot distinguish
+    # a server that is waiting from one that is wedged, and does not claim to.
     case "$probe_rc" in
-        "$E2eSilenceAnswered") ;;
+        "$E2eSilenceInconclusive") ;;
         "$E2eSilenceRefused") fail "the silence probe could not connect at all: the node is gone, which is not this assertion's subject" ;;
-        "$E2eSilenceInconclusive")
-            fail "the silence probe could not decide: the admin surface neither answered nor closed within the" \
-                 "probe's read bound. Either the node is wedged, or AdminHttpServer::RequestTimeout has been" \
-                 "raised to or past _e2e_http_read_bound in scripts/lib/e2e-common.sh -- those two are a pair" ;;
+        "$E2eSilenceAnswered")
+            fail "the admin surface answered or CLOSED a peer that said nothing, inside the probe's read bound." \
+                 "That is the #824/#828 defect: a browser preconnect is dropped and the page then depends on the" \
+                 "client re-dialling. AdminHttpServer::FirstByteTimeout must stay well past _e2e_http_read_bound" \
+                 "in scripts/lib/e2e-common.sh -- those two are a pair" ;;
         *) fail "the silence probe returned an unknown status ${probe_rc}; http_response_to_silence grew an outcome this leg does not classify" ;;
     esac
     [[ -z "$unasked" ]] \
         || fail "the admin surface answered a peer that said nothing: ${unasked%%$'\n'*}"
 
+    # **The control, and it is what stops "holds a preconnect" from meaning "serves
+    # nobody".** A surface that had simply stopped answering would pass the probe above
+    # and fail here.
     prompt="$(dash_get "$admin_port" /healthz)"
     [[ "$prompt" == HTTP/1.1\ 200* ]] \
         || fail "the control (a peer that does ask) was not served 200: ${prompt%%$'\n'*}"
-    echo "-- idle-preconnect: silence closed unanswered, a real request served 200"
+    echo "-- idle-preconnect: silence HELD unanswered (not closed), a real request served 200"
 fi
 
 # ------------------------------------------------------------- 3. credential
