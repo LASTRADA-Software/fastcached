@@ -52,6 +52,7 @@ foreach(_binary IN LISTS _binaries)
     # to be adding a row to the app table, and this was a second place that had to be
     # edited in step with it. Now it is not.
     execute_process(COMMAND /usr/bin/file --brief "${_binary}"
+    TIMEOUT 10
                     OUTPUT_VARIABLE _kind
                     OUTPUT_STRIP_TRAILING_WHITESPACE
                     COMMAND_ERROR_IS_FATAL ANY)
@@ -63,7 +64,7 @@ foreach(_binary IN LISTS _binaries)
     # Extended attributes left by the build (resource forks, quarantine flags)
     # make codesign fail with "resource fork, Finder information, or similar
     # detritus not allowed".
-    execute_process(COMMAND xattr -c "${_binary}" COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(COMMAND xattr -c "${_binary}" TIMEOUT 30 COMMAND_ERROR_IS_FATAL ANY)
 
     # --options=runtime enables the hardened runtime and --timestamp requests a
     # secure timestamp; notarization rejects a submission missing either. No
@@ -74,10 +75,14 @@ foreach(_binary IN LISTS _binaries)
     execute_process(
         COMMAND codesign --force --timestamp --options=runtime
                 --sign "${CPACK_FASTCACHED_SIGN_IDENTITY_APP}" "${_binary}"
+                # Generous: --timestamp contacts Apple's timestamp server, so this
+                # is a NETWORK call and the one here most able to hang.
+                TIMEOUT 300
         COMMAND_ERROR_IS_FATAL ANY
     )
     execute_process(
         COMMAND codesign --verify --strict --verbose=2 "${_binary}"
+        TIMEOUT 60
         COMMAND_ERROR_IS_FATAL ANY
     )
 endforeach()

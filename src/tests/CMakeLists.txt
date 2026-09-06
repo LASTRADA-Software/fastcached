@@ -3694,3 +3694,36 @@ set_tests_properties("psk-signing-seam-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# Every `execute_process` that runs an external program during configure carries
+# a TIMEOUT.
+#
+# A configure that blocks in a subprocess writes NOTHING -- no compile starts, no
+# artefact is touched -- so it is indistinguishable from a hung build, and the
+# only evidence it leaves is two mtimes far apart. `git` is the sharp case:
+# `cmake/Version.cmake` runs it at every configure because the tag is the only
+# version source, and "it is only `git describe`" reads as a pure local
+# computation while git in fact takes repository locks and may be racing
+# `gc --auto`.
+add_test(
+    NAME "configure-subprocess-bounds"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh"
+)
+set_tests_properties("configure-subprocess-bounds" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And it must be SEEN to refuse. Four cases, both directions: a bounded call
+# passes, an unbounded one is caught, a COMMENT mentioning execute_process is not
+# a call site, and an empty scan REFUSES rather than reporting a clean tree --
+# two empty lists agree perfectly.
+add_test(
+    NAME "configure-subprocess-bounds-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh" --self-test
+)
+set_tests_properties("configure-subprocess-bounds-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

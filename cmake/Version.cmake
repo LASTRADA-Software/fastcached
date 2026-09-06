@@ -120,15 +120,34 @@ function(FastCachedRunGit OutputVar)
         return()
     endif()
 
+    # TIMEOUT, because this is the only unbounded subprocess left in the
+    # configure path and a configure that blocks here produces NO output at all:
+    # no compile starts, nothing is written, and the build looks hung rather than
+    # slow. git is not a pure computation on a local directory -- it takes
+    # repository locks, and `gc --auto` can be repacking underneath it -- so
+    # "it is only `git describe`" is not a bound.
+    #
+    # 20s is far above any healthy answer here (measured: ~10ms on this
+    # repository) and far below the point where somebody starts diagnosing their
+    # build. Timing out is ALREADY a supported outcome: `commandResult` is then a
+    # sentence rather than "0", which takes the same branch as a git that failed,
+    # and the version falls back exactly as it does on a tarball with no .git.
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" ${ARGN}
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE commandOutput
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
+        TIMEOUT 20
         RESULT_VARIABLE commandResult
     )
     if(NOT commandResult STREQUAL "0")
+        # Named, because a silent fallback here is a version that is quietly
+        # wrong and a hang that is quietly survived -- and an operator seeing
+        # neither cannot tell this ran at all.
+        if(NOT commandResult MATCHES "^[0-9]+$")
+            message(WARNING "fastcached: git did not answer (${commandResult}); version falls back")
+        endif()
         set(commandOutput "")
     endif()
     set(${OutputVar} "${commandOutput}" PARENT_SCOPE)
