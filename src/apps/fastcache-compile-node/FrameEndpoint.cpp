@@ -2110,6 +2110,7 @@ FrameEndpoint::FrameEndpoint(NodeIoLoop& io,
                              std::string boundEndpoint,
                              IMetricsSink& metrics,
                              ILogger& logger):
+    _io { io },
     _listener { std::move(listener) },
     _server { std::make_unique<FrameServer>(io, *_listener, responder, what, metrics, logger) },
     _boundEndpoint { std::move(boundEndpoint) }
@@ -2127,11 +2128,43 @@ FrameEndpoint::~FrameEndpoint()
     // is what lets the accept loop and its connection tasks reach their own ends.
     // The reactor thread itself is joined by `NodeIoLoop`, which outlives this.
     _server->Shutdown();
+
+    // The server before the listener, because `FrameServer::State` holds a reference
+    // to it. Explicit rather than left to member order, since the ordering is now
+    // load-bearing twice over: the handover below moves the listener out from under
+    // that reference.
+    _server.reset();
+
+    // And the listener is NOT destroyed here. `Shutdown()` above returned as soon as
+    // this server's loops and connections had ended -- which is the very condition
+    // that makes the last loop call `NodeIoLoop::NoteLoopFinished()`, and `Stop()`
+    // only sets a flag and posts a wakeup, so the reactor is typically still
+    // `Running()` at this line and this thread is not its worker. Destroying a
+    // reactor-owned listener there clears a pending awaitable while a completion may
+    // be dispatched (#668's rule, #840's site); on IOCP the window is wide enough
+    // that `Windows-cl-debug` hit it intermittently, in a different case each run
+    // (#737). `NodeIoLoop` frees it once its thread has been joined.
+    _io.Retire(std::move(_listener));
 }
 
 std::size_t FrameEndpoint::InFlightBytes() const noexcept
 {
     return _server->InFlightBytes();
+}
+
+std::unique_ptr<FrameEndpoint> FrameEndpoint::StartWithListener(NodeIoLoop& io,
+                                                                NodeSurface surface,
+                                                                std::unique_ptr<IListener> listener,
+                                                                std::string boundEndpoint,
+                                                                IFrameResponder& responder,
+                                                                IMetricsSink& metrics,
+                                                                ILogger& logger)
+{
+    // `new` rather than `make_unique` because the constructor is private: the ways to
+    // reach it are this function and nothing else, and the two factories below have
+    // each already proved their listener is bound.
+    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
+        io, std::move(listener), responder, RowFor(surface).name, std::move(boundEndpoint), metrics, logger } };
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(NodeIoLoop& io,
@@ -2176,11 +2209,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     auto bound = std::format("{}:{}", endpoint.host, listener->BoundPort());
     logger.Logf(LogLevel::Info, "{} listening on {}", row.name, bound);
 
-    // `new` rather than `make_unique` because the constructor is private: the ways to
-    // reach it are this factory and `StartAdopted`, each of which has already proved
-    // its listener is bound, and nothing else.
-    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, row.name, std::move(bound), metrics, logger } };
+    return StartWithListener(io, surface, std::move(listener), std::move(bound), responder, metrics, logger);
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartAdopted(NodeIoLoop& io,
@@ -2230,8 +2259,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     auto bound = FormatHostPort(advertisedHost, listener->BoundPort());
     logger.Logf(LogLevel::Info, "{} serving a socket-activated listener, advertised as {}", row.name, bound);
 
-    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, row.name, std::move(bound), metrics, logger } };
+    return StartWithListener(io, surface, std::move(listener), std::move(bound), responder, metrics, logger);
 #endif
 }
 

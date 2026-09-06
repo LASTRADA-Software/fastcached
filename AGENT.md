@@ -736,6 +736,21 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   close is the ORDINARY one (#712). `TlsSocket::WaitReadable` decrypts with `SSL_peek`,
   which removes nothing — "consumes nothing" is about bytes the CALLER could have read,
   not the decorator's own buffering. A raw EOF before a full record is EOF too.
+- An object a reactor OWNS is destroyed on that reactor's worker thread, or with that
+  reactor stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, since clearing a
+  pending awaitable anywhere else races the completion dispatch. #668 landed the
+  predicate, the shared assertion and a must-die canary and **wrote the rule down
+  nowhere**, so it fired for nobody who had not already opened `IocpSocket.cpp` —
+  #737 and #840 are what that cost, and #885 is a second owner breaking it today.
+  The defect is PORTABLE and only the predicate was Windows-only. A drain that waits for the loops does not mean
+  the reactor stopped — the last loop decrements before `NoteLoopFinished()`, and
+  `Stop()` only posts a wakeup — which is the gap `~FrameEndpoint` freed its listener
+  in (#840), reported as a different `FrameEndpoint_test` case each run (#737).
+  Posting the teardown HANGS the ordinary single-surface case, because that endpoint
+  is the last loop and nothing will dequeue it; DEFER instead (`NodeIoLoop::Retire`,
+  where member ORDER is the mechanism). A test removes the race rather than waiting
+  for it: a loop that never finishes, and a fake listener that RECORDS the predicate
+  instead of asserting.
 - `Close()` can be the last thing that runs on a socket, so it must touch no
   member after it completes an awaitable.
 - An awaitable's address is taken in `await_suspend`, never in the factory that returns

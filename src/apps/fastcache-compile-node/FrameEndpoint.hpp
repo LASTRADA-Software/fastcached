@@ -952,7 +952,47 @@ class FrameEndpoint
         IMetricsSink& metrics,
         ILogger& logger);
 
+    /// Serve a surface on a listener the CALLER built.
+    ///
+    /// The one door `Start` and `StartAdopted` both arrive at once they have a bound
+    /// listener, so the adopt-and-serve half exists once rather than twice, and the
+    /// **test seam for the teardown rule**
+    /// ([#840](https://github.com/LASTRADA-Software/fastcached/issues/840)). That
+    /// defect is about *which thread* -- and with *what* running -- the listener this
+    /// endpoint owns is destroyed on, and neither factory above lets a case supply a
+    /// listener it can ask. Without this, a test can pin the defect's precondition and
+    /// nothing else, which is what #668 shipped and deliberately did not call a fix.
+    ///
+    /// **It opens no port and can open none.** The listener arrives already bound, and
+    /// the surface still arrives as a `NodeSurface`, so the row supplies the name in
+    /// the log lines exactly as it does for the two factories -- there is still no
+    /// argument to pass a bare address to, which is what `Start` documents at length.
+    ///
+    /// Infallible, and that is what separates it from the two above: everything that
+    /// can fail is the bind, and this is reached after it.
+    /// @param io The loop this endpoint accepts and answers on.
+    /// @param surface Which surface to serve; its row supplies the name only.
+    /// @param listener A bound listener belonging to `io.Reactor()`. Ownership passes
+    ///        here, and `~FrameEndpoint` hands it to `io` rather than freeing it.
+    /// @param boundEndpoint What `BoundEndpoint()` reports; the caller derives it,
+    ///        because only it knows whether the host came from a row or `--advertise`.
+    /// @param responder Answers each request; must outlive the endpoint.
+    /// @param metrics Where this endpoint's own at-capacity refusal is counted.
+    /// @param logger Shared logger.
+    /// @return The running endpoint. Never null.
+    [[nodiscard]] static std::unique_ptr<FrameEndpoint> StartWithListener(NodeIoLoop& io,
+                                                                          NodeSurface surface,
+                                                                          std::unique_ptr<IListener> listener,
+                                                                          std::string boundEndpoint,
+                                                                          IFrameResponder& responder,
+                                                                          IMetricsSink& metrics,
+                                                                          ILogger& logger);
+
     /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
+    ///
+    /// The listener is not freed here: it belongs to the reactor, which is typically
+    /// still running at this point, so it is handed to `NodeIoLoop::Retire` -- see
+    /// there for why deferring rather than posting is what closes #840.
     ~FrameEndpoint();
 
     FrameEndpoint(FrameEndpoint const&) = delete;
@@ -985,6 +1025,13 @@ class FrameEndpoint
                   std::string boundEndpoint,
                   IMetricsSink& metrics,
                   ILogger& logger);
+
+    /// The loop this endpoint accepts on, and what its listener is handed back to.
+    ///
+    /// Held rather than only borrowed at construction because `~FrameEndpoint` needs
+    /// it: the listener is reactor-owned and must not be destroyed on this thread
+    /// while the reactor turns. See `NodeIoLoop::Retire`.
+    NodeIoLoop& _io;
 
     /// `IListener` and not the platform type, deliberately: naming the concrete one
     /// would drag `<windows.h>` into every header that includes this, and nothing

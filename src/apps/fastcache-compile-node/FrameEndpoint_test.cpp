@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
@@ -2722,4 +2723,197 @@ TEST_CASE("A request pipelined while a watched reply is being written is still s
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 2; }));
     CHECK_FALSE(client.ReadReply().empty());
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
+}
+
+namespace
+{
+
+/// What a listener's destructor saw about the reactor that owned it.
+///
+/// Reached through a `shared_ptr` rather than held by the case, because the whole
+/// question is *when* the listener dies. Once #840 is fixed it outlives the
+/// `NodeIoLoop` thread and is freed by that loop's own destructor, so a witness in
+/// the case's frame is still alive to be read -- but one held by the fixture would be
+/// destroyed in the same sweep it exists to observe, and the case would then read
+/// freed memory to decide whether the fix worked.
+struct TeardownWitness
+{
+    /// Whether the destructor has run at all. FALSE at the moment the endpoint is
+    /// dropped is the whole point: a listener freed there is freed too early.
+    std::atomic<bool> destroyed { false };
+
+    /// `IReactor::TeardownIsSerialisedWithDispatch()`, as of the destructor.
+    std::atomic<bool> ruleHeld { false };
+
+    /// The two facts the rule is derived from, recorded separately so a failure says
+    /// WHICH arm was missing rather than only that the disjunction was false.
+    std::atomic<bool> reactorRunning { false };
+    std::atomic<bool> onWorkerThread { false };
+};
+
+/// A listener that accepts nothing and records the teardown rule as it dies.
+///
+/// The point of `FrameEndpoint::StartWithListener`: the production listeners are
+/// `EpollListener`/`IocpListener`/`KqueueListener`, none of which can be asked what
+/// its destructor observed -- on IOCP it does not report, it `assert`s, which aborts
+/// the process and can therefore only ever be a canary, never a case that fails.
+///
+/// Local to this file rather than in `src/tests/`, because it stands for exactly one
+/// property and one case; a second user is what would make it a shared fake.
+class WitnessListener final: public IListener
+{
+  public:
+    /// @param reactor The reactor this listener belongs to; asked, never driven.
+    /// @param witness Where the destructor reports. Must outlive the reactor's loop.
+    WitnessListener(IReactor& reactor, std::shared_ptr<TeardownWitness> witness) noexcept:
+        _reactor { reactor },
+        _witness { std::move(witness) }
+    {
+    }
+
+    ~WitnessListener() override
+    {
+        // Exactly what `Detail::AssertTeardownIsSerialisedWithDispatch` asks, RECORDED
+        // rather than asserted. An assert here would abort the process, which is a
+        // canary and not a test: `reactor-teardown-canary` already occupies that role
+        // for the predicate, and what is missing -- and what #668 said was missing --
+        // is a case that can go red and name the defect.
+        _witness->reactorRunning.store(_reactor.Running(), std::memory_order_relaxed);
+        _witness->onWorkerThread.store(_reactor.IsOnWorkerThread(), std::memory_order_relaxed);
+        _witness->ruleHeld.store(_reactor.TeardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
+        _witness->destroyed.store(true, std::memory_order_release);
+    }
+
+    WitnessListener(WitnessListener const&) = delete;
+    WitnessListener(WitnessListener&&) = delete;
+    WitnessListener& operator=(WitnessListener const&) = delete;
+    WitnessListener& operator=(WitnessListener&&) = delete;
+
+    /// Ends the accept loop at once, with an error that is not `WouldBlock`.
+    ///
+    /// This case is about teardown; an accept that parked would add a wait to it and
+    /// change nothing, since `Shutdown()` waits for the sweeper either way.
+    AcceptAwaitable Accept() override
+    {
+        return AcceptAwaitable { AcceptResult { std::unexpect,
+                                                NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+    }
+
+    void Close() noexcept override {}
+
+    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    {
+        return 0;
+    }
+
+  private:
+    IReactor& _reactor;
+    std::shared_ptr<TeardownWitness> _witness;
+};
+
+/// Holds one standing loop on a `NodeIoLoop`, so its reactor cannot stop.
+///
+/// RAII rather than a `NoteLoopFinished()` at the end of the case, and that is not
+/// tidiness: a `REQUIRE` that fails unwinds past such a call, `~NodeIoLoop` then joins
+/// a thread whose reactor nobody stopped, and the case HANGS instead of reporting.
+/// A case about teardown ordering is the last one that may fail that way -- a hang
+/// says nothing, where a red says which arm of the rule was missing.
+class StandingLoop
+{
+  public:
+    /// @param io The loop to hold. Must outlive this.
+    explicit StandingLoop(NodeIoLoop& io) noexcept:
+        _io { io }
+    {
+        _io.NoteLoopStarted();
+    }
+
+    ~StandingLoop()
+    {
+        _io.NoteLoopFinished();
+    }
+
+    StandingLoop(StandingLoop const&) = delete;
+    StandingLoop(StandingLoop&&) = delete;
+    StandingLoop& operator=(StandingLoop const&) = delete;
+    StandingLoop& operator=(StandingLoop&&) = delete;
+
+  private:
+    NodeIoLoop& _io;
+};
+
+} // namespace
+
+TEST_CASE("The listener an endpoint owns is freed with its reactor stopped, not when the endpoint is dropped",
+          "[node][frame][teardown]")
+{
+    // #840, and the observable half of #737. `~FrameEndpoint` used to destroy its
+    // listener -- a reactor-owned object -- on the calling thread, inside the window
+    // between `Shutdown()`'s drain being satisfied and `Run()` returning. On epoll
+    // that window is nanoseconds wide and the violation is latent; on IOCP it is wide
+    // enough that `Windows-cl-debug` tripped `IocpSocket.cpp`'s assertion
+    // intermittently, in a different `FrameEndpoint_test` case each run.
+    //
+    // Reproduced on Linux by staging the wider window -- a 200 ms delay before
+    // `EpollReactor::RunLoop()` returns, plus the shared assertion at
+    // `~EpollListener`: 20 runs of `[frame]`, 20 aborts, 13 distinct cases, which is
+    // the reported signature exactly. This case needs neither patch, because it makes
+    // the arrangement deterministic instead of waiting for the race to be lost.
+    auto witness = std::make_shared<TeardownWitness>();
+    {
+        Fleet fleet;
+
+        auto endpoint = FrameEndpoint::StartWithListener(fleet.io,
+                                                         NodeSurface::Node,
+                                                         std::make_unique<WitnessListener>(fleet.io.Reactor(), witness),
+                                                         "127.0.0.1:0",
+                                                         fleet.responder,
+                                                         fleet.metrics,
+                                                         fleet.logger);
+        // The seam carried the caller's own endpoint text through, which is the one
+        // thing about `StartWithListener` a case can check. Deliberately NOT
+        // `REQUIRE(endpoint != nullptr)`: that function cannot return null, so the
+        // assertion could never fail and would read as coverage forever.
+        REQUIRE(endpoint->BoundEndpoint() == "127.0.0.1:0");
+        fleet.Serve();
+
+        // A loop that is never finished, so the reactor CANNOT stop while the endpoint
+        // is dropped. Without it this case is a coin flip: the single-surface shape is
+        // a genuine race, and on epoll the reactor usually wins -- which is why #840
+        // measured the assertion HOLDING 3 of 3 on Linux and why re-running clears the
+        // Windows red. After `NoteLoopStarted` the arrangement is the multi-surface
+        // one, and the predicate is false from this thread for as long as it lasts.
+        //
+        // After `Serve()`, never before: `Start()` STORES the adopted count rather than
+        // adding to it, so a note taken first would be overwritten and the case would
+        // quietly go back to being a race.
+        //
+        // Released by its destructor at the end of this block -- before `fleet`, which
+        // is what lets `~NodeIoLoop` join. See `StandingLoop` for why not by hand.
+        StandingLoop const standing { fleet.io };
+
+        // The arrangement, asserted rather than assumed -- `reactor-teardown-canary`'s
+        // rule, and the reason it exits 0 and complains when its own setup is wrong. If
+        // the reactor were not running, or this thread were its worker, the checks below
+        // would pass for a reason that has nothing to do with the defect.
+        REQUIRE(WaitFor([&fleet] { return fleet.io.Reactor().Running(); }));
+        REQUIRE_FALSE(fleet.io.Reactor().IsOnWorkerThread());
+        REQUIRE_FALSE(fleet.io.Reactor().TeardownIsSerialisedWithDispatch());
+
+        endpoint.reset();
+
+        // THE assertion. Under the defect the listener has already been destroyed by
+        // this line, on this thread, with that reactor running.
+        INFO("the endpoint has been dropped while its reactor is still running; a listener freed here is freed on a "
+             "thread that is not the reactor's worker, which is what races the completion dispatch");
+        CHECK_FALSE(witness->destroyed.load(std::memory_order_acquire));
+    }
+
+    // And it IS freed -- retiring must not become leaking. The rule's "stopped" arm is
+    // what makes that legal, so both halves are checked: a fix that freed it on the
+    // worker thread instead would satisfy `ruleHeld` and fail `reactorRunning`, and
+    // saying which arm held is what tells those apart.
+    CHECK(witness->destroyed.load(std::memory_order_acquire));
+    CHECK(witness->ruleHeld.load(std::memory_order_acquire));
+    CHECK_FALSE(witness->reactorRunning.load(std::memory_order_acquire));
 }

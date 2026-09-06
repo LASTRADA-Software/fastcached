@@ -4,6 +4,7 @@
 #if defined(_WIN32)
 
     #include <FastCache/Async/IocpReactor.hpp>
+    #include <FastCache/Async/ReactorTeardown.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
@@ -12,7 +13,6 @@
     #include <winsock2.h>
 
     #include <array>
-    #include <cassert>
     #include <cstddef>
     #include <cstdint>
     #include <expected>
@@ -66,34 +66,6 @@ namespace
             .systemCode = code,
             .context = std::move(ctx),
         };
-    }
-
-    /// Assert that a destructor clearing a pending awaitable cannot race the
-    /// completion dispatch that would read it.
-    ///
-    /// `IocpSocket` and `IocpListener` null `awaitable` on teardown so a
-    /// completion arriving afterwards does not resume a coroutine frame that is
-    /// gone. That is a plain unsynchronised store, and it is safe for exactly one
-    /// reason: dispatch runs on the reactor's single worker thread, so teardown on
-    /// that thread cannot overlap it. `IocpReactor` has always documented one
-    /// worker thread; #465 is what made the property load-bearing rather than
-    /// descriptive, and a documented property that something now depends on needs
-    /// a check rather than a citation.
-    ///
-    /// Tearing down while no thread is inside `Run()` is equally fine and common
-    /// -- tests build a socket and drop it without ever running the reactor, and
-    /// shutdown destroys listeners after `Run()` has returned. With nothing
-    /// dequeuing there is no race to lose, so that case passes.
-    ///
-    /// Debug-only, by `assert`: a destructor cannot throw, and this is a contract
-    /// violation by the caller rather than a runtime condition to report. The same
-    /// shape `RaftPeerTransport::Stop` uses for its own thread rule.
-    /// @param reactor The reactor whose worker thread the object belongs to.
-    void AssertTeardownIsSerialisedWithDispatch([[maybe_unused]] IocpReactor const& reactor) noexcept
-    {
-        assert((!reactor.Running() || reactor.IsOnWorkerThread())
-               && "an IOCP socket/listener must be destroyed on its reactor's worker thread, or with that "
-                  "reactor stopped -- otherwise clearing a pending awaitable races the completion dispatch");
     }
 
 } // namespace
@@ -247,11 +219,28 @@ IocpSocket::IocpSocket(IocpReactor& reactor,
                 || reactor.AttachHandle(reinterpret_cast<void*>(static_cast<std::uintptr_t>(_impl->native)));
 }
 
+// The teardown rule lives in `Async/ReactorTeardown.hpp`, not here.
+//
+// `IocpSocket` and `IocpListener` null `awaitable` on teardown so a completion
+// arriving afterwards does not resume a coroutine frame that is gone. That is a
+// plain unsynchronised store, and it is safe for exactly one reason: dispatch
+// runs on the reactor's single worker thread, so teardown on that thread cannot
+// overlap it. Tearing down with nobody inside `Run()` is equally fine and common
+// -- tests build a socket and drop it without ever running the reactor.
+//
+// Those are the two arms of `IReactor::TeardownIsSerialisedWithDispatch()`, and
+// this file used to spell them out itself, in `#if defined(_WIN32)`, where no
+// analyser and four of five CI legs could reach it
+// ([#668](https://github.com/LASTRADA-Software/fastcached/issues/668)). Two live
+// spellings of one rule is two things to reword, and the gate that reads the
+// assertion's own words could only match the tail they happened to share -- so
+// rewording either left the gate green and the other unmatched
+// ([#840](https://github.com/LASTRADA-Software/fastcached/issues/840)).
 IocpSocket::~IocpSocket()
 {
     if (_impl)
     {
-        AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
+        Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
 
         // The awaitable lives in the AWAITING coroutine's frame, which is
         // normally being destroyed alongside this socket. `inFlight` keeps the
@@ -574,7 +563,7 @@ IocpListener::~IocpListener()
     if (!_impl)
         return;
 
-    AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
+    Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
 
     // See ~IocpSocket: the awaitable is in the awaiting coroutine's frame, which
     // `AcceptOp::inFlight` does not and cannot keep alive.
