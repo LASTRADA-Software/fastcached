@@ -3881,3 +3881,38 @@ TEST_CASE("A cache the operator NAMED is refused when no node surface can serve 
             CHECK_FALSE(Unwrap(refusal).contains("--cache-memory or --cache-dir"));
     }
 }
+
+TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
+{
+    // #262. The refusal's premise -- that an empty member set declines everybody --
+    // is false on a clustered node, because consensus supplies the set. It was
+    // pushing operators toward `--fleet-open`, which admits the entire network: a
+    // security downgrade taken to satisfy a startup check.
+    //
+    // Both directions, because relaxing this must not relax it for a STANDALONE
+    // scheduler, which is what the rule was written for and where it is still right.
+
+    SECTION("a clustered scheduler with no member list starts")
+    {
+        auto cfg = Installable();
+        cfg.serveScheduler = true;
+        cfg.fleetMembers.clear();
+        cfg.fleetOpen = false;
+        cfg.nodeId = "n1"; // what RunsConsensus asks about
+        auto const refusal = StartupPolicyRejection(cfg);
+        if (refusal.has_value())
+            CHECK_FALSE(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
+    }
+
+    SECTION("a STANDALONE scheduler with no member list is still refused")
+    {
+        auto cfg = Installable();
+        cfg.serveScheduler = true;
+        cfg.fleetMembers.clear();
+        cfg.fleetOpen = false;
+        cfg.nodeId.clear();
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
+    }
+}

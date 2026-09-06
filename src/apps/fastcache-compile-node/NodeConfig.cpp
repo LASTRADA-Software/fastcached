@@ -2285,10 +2285,27 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--cache-memory or --cache-dir was given with an empty --listen-node: the cache tier is "
                      "served on the node surface, so with no port there is nothing to reach it through and the "
                      "cache would be configured and unused. Give --listen-node a port, or drop the cache flags." },
-        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty(); },
-          .message = "--serve-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
-                     "refuses every caller, which is the right default but not a working configuration. It would "
-                     "start, bind, log nothing wrong, and decline the whole fleet." },
+        // Not on a CLUSTERED node, where the premise is false: consensus supplies the
+        // member set, so an empty `--fleet-member` there is a working configuration
+        // rather than one that declines everybody (#262).
+        //
+        // The refusal was pushing operators toward `--fleet-open`, which admits the
+        // entire network -- a real security downgrade taken to satisfy a startup
+        // check, which is a refusal working against itself. The other way out was a
+        // `--fleet-member` list duplicating what the cluster already agrees, to be
+        // maintained in two places.
+        //
+        // `RunsConsensus` and not a spelling of its own: `StartConsensusOrExplain`
+        // decides whether a driver starts from that same expression, and if the two
+        // disagreed one of them would be wrong about the other (#613).
+        { .refuses =
+              [](NodeConfig const& c) {
+                  return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty() && !RunsConsensus(c);
+              },
+          .message = "--serve-scheduler needs --fleet-member or --fleet-open on a node that is not clustered: a "
+                     "scheduler with an empty member set refuses every caller, which is the right default but not a "
+                     "working configuration. It would start, bind, log nothing wrong, and decline the whole fleet. "
+                     "On a clustered node consensus supplies the member set, so neither flag is required there." },
         { .refuses = [](NodeConfig const& c) { return c.fleetOpen && !c.fleetMembers.empty(); },
           .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
                      "admits a list. Silently preferring either would make the narrower of the two a no-op an "
