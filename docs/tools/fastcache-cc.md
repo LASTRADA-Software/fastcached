@@ -318,6 +318,11 @@ Select-String msvc_deps_prefix build.ninja      # in your build directory
 $env:FASTCACHE_MSVC_DEPS_PREFIX = 'Hinweis: Einlesen der Datei:'
 ```
 
+The line that comes back is the whole assignment — `msvc_deps_prefix = Hinweis:
+Einlesen der Datei:`. What goes in the variable is the text **after the `=`**: a
+prefix that carries the assignment matches no line Ninja ever sees, and fails in
+exactly the same silence as writing English.
+
 Ninja's behaviour here is measured rather than assumed, and the measurement is
 re-runnable: `scripts/probes/ninja-msvc-deps-prefix.sh` drives three cases (matching,
 mismatched, and localized-matching) and reports the dependency count and whether a
@@ -331,6 +336,18 @@ synthesises notes, naming the prefix it used and where that came from — which 
 one line that answers *why did my build stop rebuilding this file*. Learning the
 prefix from the compiler instead is
 [#878](https://github.com/LASTRADA-Software/fastcached/issues/878).
+
+**One caveat, for a shared cache spanning two UI languages.** The synthesised notes
+are stored with the object and replayed verbatim on a later hit, and the cache key
+does not fold the prefix — a German and an English Visual Studio of the same toolset
+key identically, deliberately, since the identity probe is forced to English
+([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). So a machine
+that sets this variable and dispatches can store a value whose notes a differently
+localized machine then replays and cannot match. That is not new breakage so much as a
+change in *which* machine is affected: before this setting existed the localized
+machine under-rebuilt every time, and now it does not. A locale-homogeneous fleet — the
+usual case — is unaffected either way. The fix is a fleet-format change, tracked on
+[#879](https://github.com/LASTRADA-Software/fastcached/issues/879).
 
 Two things this does **not** cover, deliberately. A *local* compile is unaffected: it
 emits the real compiler's own notes, which match by construction. And a stored value's

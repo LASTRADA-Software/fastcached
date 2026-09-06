@@ -317,8 +317,11 @@ namespace
                                 "toolchain and WRONG on a Visual Studio carrying a language\n"
                                 "pack: Ninja then records no dependencies for that\n"
                                 "translation unit and the next header edit does not rebuild\n"
-                                "it. Copy the value out of your build: grep msvc_deps_prefix\n"
-                                "build.ninja. Only dispatched compiles synthesise notes; a\n"
+                                "it. Copy the value out of your build -- grep\n"
+                                "msvc_deps_prefix build.ninja -- taking the text AFTER the\n"
+                                "'=' and not the whole line, since a prefix carrying the\n"
+                                "assignment matches nothing and fails the same silent way.\n"
+                                "Only dispatched compiles synthesise notes; a\n"
                                 "local compile emits the compiler's own and needs nothing." },
     };
 

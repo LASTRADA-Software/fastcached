@@ -2127,12 +2127,35 @@ void RecordManifest(Config const& cfg,
         // dead for its stated purpose.
         // Both arms name the variable, so it is spelled once and an operator reading
         // either sentence learns what to reach for.
-        Note(std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
-                         cfg.showIncludesMarker,
-                         cfg.showIncludesMarkerNamed ? "named by" : "the default; override with",
-                         Cc::EnvName::MsvcDepsPrefix));
+        //
+        // An empty dependency set is its own sentence, and NOT a claim about why. With
+        // nothing to render, `RenderShowIncludes` returns nothing and "writing notes
+        // with prefix X" is false -- said in exactly the investigation this line exists
+        // for, and pointing at the one setting that cannot be the cause: no prefix, right
+        // or wrong, changes an empty set. That is an OBSERVED property of the span about
+        // to be rendered rather than a reading of `ProbedDependencies::unreadable`, so it
+        // is not the guard the paragraph above refuses -- and it names no cause, because
+        // "no dependency flags on this command line" and "the probe's notes could not be
+        // read" both arrive here and are fixed in different places.
+        if (dependencyPaths.empty())
+            Note("/showIncludes: no dependencies to write, so this translation unit gets no notes at all "
+                 "and the build records none for it");
+        else
+            Note(std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
+                             cfg.showIncludesMarker,
+                             cfg.showIncludesMarkerNamed ? "named by" : "the default; override with",
+                             Cc::EnvName::MsvcDepsPrefix));
         // Prepended, not appended: `cl` emits its notes before its diagnostics, and
         // the stored value's region ordering is what a later hit replays verbatim.
+        //
+        // "Replays verbatim" is load-bearing and is why #879 carries a second mechanism:
+        // this text becomes a STORED region, the key does not fold the marker, and a
+        // German and an English toolset of one version key identically by design (the
+        // identity probe is forced to English, #692). So in a cache shared across UI
+        // languages one machine can replay a prefix the other cannot match. That is a
+        // change in WHICH machine is affected rather than new breakage -- the localized
+        // one under-rebuilt unconditionally before this setting existed -- and closing
+        // it is a key or value-format bump, which is deliberately not this change.
         run.out = Cc::RenderShowIncludes(dependencyPaths, cfg.showIncludesMarker) + run.out;
     }
 
