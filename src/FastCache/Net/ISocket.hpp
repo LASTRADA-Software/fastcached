@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/NetError.hpp>
 
+#include <cassert>
 #include <coroutine>
 #include <cstddef>
 #include <expected>
@@ -152,6 +153,15 @@ class ISocket
     /// Read up to buffer.size() bytes into buffer. Resolves with the byte
     /// count written, 0 on clean EOF, or a NetError on failure.
     ///
+    /// **The buffer must be non-empty, and that is a precondition rather than a
+    /// preference.** `0` here means *the peer has finished sending*, so a zero-length
+    /// read has no truthful answer to give: every transport's receive primitive returns
+    /// `0` for it and the caller is handed a graceful close that never happened
+    /// ([#838](https://github.com/LASTRADA-Software/fastcached/issues/838)). It is
+    /// enforced by `Detail::RequireReadBuffer` below in Debug builds, watched refusing by
+    /// `ctest -R empty-read-buffer-canary`; the reasoning, and what a release build still
+    /// does, are on that function.
+    ///
     /// **A socket has ONE read operation, and this shares it with
     /// `WaitReadable`.** Every reactor socket keeps a single `awaitable` pointer per
     /// direction, and both read verbs begin by claiming it. So arming either while
@@ -270,6 +280,59 @@ class ISocket
         return IoAwaitable { IoResult { std::size_t { 1 } } };
     }
 
+    /// Retire a read-side operation THIS caller armed, freeing the coroutine parked on
+    /// it, without closing the socket.
+    ///
+    /// **A parked read could only ever be retrieved by `Close()`, which is what made the
+    /// caller-side rule on `Read` above unfollowable.** A caller holding a parked
+    /// `WaitReadable` must resolve or abandon it before it reads, and until this existed
+    /// *abandon* had no spelling short of tearing the connection down. `RunBlockingRead`
+    /// is the caller that could not follow it
+    /// ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710)): it armed a
+    /// fresh readability watch per loop iteration and cancelled none, so a pass that
+    /// ended with the previous one still parked dropped that coroutine -- never resumed,
+    /// never freed -- and on IOCP the reused `OVERLAPPED` completed the wrong operation
+    /// and reported a spurious EOF on a healthy connection.
+    ///
+    /// **It is the CALLER's call, and that is why it is a verb here rather than
+    /// something `Read` does for you.** At the arm site a socket cannot tell a stale
+    /// parked wait from a live one, and cancelling a live one resolves its waiter as
+    /// *the peer went away* -- dropping a healthy client. The caller can tell, because
+    /// it knows when its own iteration ended. So this changes nothing about
+    /// double-arming: `Detail::ClaimReadSlot` still asserts, and a caller that arms over
+    /// a parked wait is still wrong. See `Net/ReadSlot.hpp`.
+    ///
+    /// **The parked awaitable is COMPLETED with `Cancelled`, not dropped**, or this
+    /// would be the leak it exists to remove. That is not a new mechanism:
+    /// `EpollSocket::Close` and `KqueueSocket::Close` have always detached a parked read
+    /// and completed it exactly this way, and they do it to `RunBlockingRead`'s own
+    /// trampoline on every close that finds one parked.
+    ///
+    /// **Retirement is not synchronous on every platform and a caller must not assume it
+    /// is.** Epoll and kqueue detach and complete inline, so the slot is free when this
+    /// returns. IOCP cannot: the kernel owns the read op's single `OVERLAPPED`, so the
+    /// override there retracts the operation with `CancelIoEx` and the reactor completes
+    /// the awaitable when the aborted completion is dequeued. A caller that arms another
+    /// read in the SAME reactor turn is therefore still double-arming on Windows --
+    /// narrower than not cancelling at all, and not closed
+    /// ([#884](https://github.com/LASTRADA-Software/fastcached/issues/884)).
+    ///
+    /// **The default does nothing, and that is for FAKES** -- a scripted double whose
+    /// reads resolve inline has no frame to free, and making this pure virtual would
+    /// reach into eleven test files across four lanes to say so.
+    ///
+    /// **It is NOT a safe default for a transport whose reads park, and the analogy to
+    /// `ShutdownWrite` below is where that gets missed.** `TlsSocket` overrides BOTH,
+    /// and for the same underlying reason: its reads are not read-only at the transport
+    /// layer. A `WaitReadable` there decrypts, and parks on a RAW read whenever OpenSSL
+    /// wants more bytes -- so inheriting this no-op would leave the raw socket's slot
+    /// occupied and hand the connection loop's next read a double-arm. Every transport
+    /// this library hands out that can park a read overrides this; a new one that can
+    /// must too, and nothing but this sentence enforces that.
+    ///
+    /// Idempotent, and not a `Close()`: the socket stays open, and a later `Read` works.
+    virtual void CancelRead() noexcept {}
+
     /// The remote peer's address as a printable host string ("203.0.113.7" /
     /// "::1"), captured at accept time. Used by the `--log-source` connection
     /// log prefix. The default returns "" so transports that have no peer
@@ -336,5 +399,74 @@ class ISocket
     /// Read has observed EOF. Used by Connection to break its loop.
     [[nodiscard]] virtual bool IsClosed() const noexcept = 0;
 };
+
+namespace Detail
+{
+
+    /// Refuse a `Read` whose destination span is empty, at the transport that was handed it.
+    ///
+    /// **An empty buffer is answered EOF, which is the one false claim this interface's `0`
+    /// exists to make meaningful.** Every transport here computes its result from what its
+    /// receive primitive returned, and every receive primitive answers `0` for a zero-length
+    /// request: `recv(fd, p, 0, 0)` returns 0 on all three POSIX backends, a zero-length
+    /// `WSARecv` completes with `bytesReceived == 0`, `InMemorySocket::TryPull` pulls nothing.
+    /// And `0` on this interface means *the peer has finished sending*. So a caller that
+    /// reaches `Read` with an empty span is told its peer closed
+    /// ([#838](https://github.com/LASTRADA-Software/fastcached/issues/838)).
+    ///
+    /// **Nothing exotic gets a caller there.** An off-by-one in a `subspan(got)` accumulation
+    /// loop, or a decorator narrowing a chunk size to zero, and the loop terminates cleanly
+    /// reporting a graceful close that never happened -- with the consequences already
+    /// recorded against EOF misreads in `.agent/rules/wire-and-protocol.md`: a server that
+    /// abandons what is still pending, and on the compile surface a mid-compile EOF read as
+    /// *gone*.
+    ///
+    /// **The rule belongs to the seam, not to whoever hits it.** `Net/TcpClient.cpp`'s
+    /// `RecvExactly` had already found this and answered it locally -- *"asked for nothing,
+    /// answered with nothing. Reading zero bytes from a socket is indistinguishable from a
+    /// peer that closed"* -- which is one consumer carrying a contract every consumer needs.
+    /// It is stated on `Read` and checked in one function so a seventh transport inherits
+    /// both.
+    ///
+    /// **It is a programmer error, not a legitimate no-op.** A zero-byte read has no answer
+    /// this interface can express: `0` is taken, and it is taken by the opposite fact. There
+    /// is no result that would be true, which is this project's definition of contract misuse
+    /// -- `AGENT.md`'s *"reserve exceptions for programmer errors (precondition violation,
+    /// contract misuse)"* -- so it is an assertion rather than a `NetErrorCode`.
+    ///
+    /// **What that choice costs is the taxonomy, NOT "callers would have to start handling
+    /// it".** This paragraph said the latter first and it is false: every `Read` caller in this
+    /// tree already has an error branch (`RecvExactly`, `PullChunk`, `AdminHttpServer`,
+    /// `ProtocolAutodetect`, `FrameEndpoint`), so an error code would only change WHICH
+    /// existing branch a buggy caller takes -- from *clean EOF, close politely* to *read
+    /// failed*, which is strictly the better one. The real price is a new enumerator in a
+    /// taxonomy that has none like it and a behaviour change on every shipped transport. The
+    /// convenient reason is recorded as withdrawn rather than quietly replaced, because it is
+    /// the kind that survives into a decision somebody else makes.
+    ///
+    /// **Debug-only, and the release residual is a decision rather than an omission.** With
+    /// assertions compiled out an empty read still answers EOF, exactly as before. Refusing it
+    /// there is a new enumerator in `Net`'s taxonomy plus a behaviour change on every shipped
+    /// transport, bought for a path this tree does not take: the census behind #838 found no
+    /// production or fixture caller passing an empty span, and the one that could have
+    /// (`RecvExactly`) guards it a layer up. That is the same trade `Detail::ClaimReadSlot`
+    /// states next door, reached from the other side -- there the release behaviour is a leak,
+    /// here it is a wrong answer -- and it is written down so the next reader weighs it rather
+    /// than rediscovering it.
+    ///
+    /// Watched refusing by `empty-read-buffer-canary`, which drives a REAL socket's `Read`.
+    /// The call site is what it drives, not this function: asserting the assertion would prove
+    /// `assert` works and say nothing about whether a transport reaches it.
+    ///
+    /// @param buffer The destination span a caller passed to `Read`.
+    inline void RequireReadBuffer([[maybe_unused]] std::span<std::byte> buffer) noexcept
+    {
+        assert(!buffer.empty()
+               && "Read was given an empty buffer: a zero-length read resolves to 0, which on this interface means "
+                  "the peer has finished sending, so the caller is handed a graceful close that never happened "
+                  "(see FastCache/Net/ISocket.hpp and issue #838)");
+    }
+
+} // namespace Detail
 
 } // namespace FastCache

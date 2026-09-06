@@ -398,6 +398,16 @@ void KqueueSocket::ShutdownWrite() noexcept
         Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_fd));
 }
 
+void KqueueSocket::CancelRead() noexcept
+{
+    if (_closed || !_impl)
+        return;
+    // The detach-then-complete discipline is shared with `EpollSocket`, in
+    // `Net/ReadSlot.hpp` beside the slot rule it belongs to -- this is the second copy
+    // of it in this directory and the header says why there is not a third.
+    Detail::RetireParkedRead(*_impl);
+}
+
 void KqueueSocket::Close() noexcept
 {
     if (_closed)
@@ -477,6 +487,7 @@ namespace
 
 IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
 {
+    Detail::RequireReadBuffer(buffer);
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };

@@ -789,14 +789,72 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   complete last with `Cancelled`. Prove the leak instrument before believing a green
   ASan run — a parked frame is a live unreachable allocation, which LSan reports
   exactly; the size-dependent caveat belongs to use-after-free, not to leaks.
+- `Read`'s buffer must be NON-EMPTY, because `0` is taken and taken by the opposite
+  fact: every transport's receive primitive answers `0` for a zero-length request, so
+  an empty span was answered *the peer has finished sending* — the one way this
+  interface could still make the exact false claim the EOF rule exists to prevent
+  (#838). `Detail::RequireReadBuffer`, beside the sentence it enforces, called as
+  `Read`'s first statement by all six transports; a PROGRAMMER ERROR, so an assert and
+  not an error code, since no result would be true. `RecvExactly` had already found it
+  and answered it at ONE consumer, which is a contract no other consumer can see. The
+  census came FIRST and is what made the assert safe (the whole suite green with it
+  live); release still answers EOF, and that is a stated trade rather than an
+  omission. `empty-read-buffer-canary` hands a REAL transport an empty span and must
+  die — but a canary aborts at the FIRST violation, so it watches one site and is
+  silent about five, and WHICH site is an accident of ordering (deleting the call from
+  `EpollSocket::Read` leaves it and the whole suite GREEN, measured). `read-buffer-guard`
+  DERIVES the set and requires the call before the body's first `return`.
+- **A guard folded INTO the operation is self-enforcing; a guard called ALONGSIDE one
+  needs a scan.** That is the general rule, and it decides the shape of the next guard
+  rather than only explaining these two: `ClaimReadSlot` takes the slot the arm site
+  must clear anyway, so there is no line to forget it on, while `RequireReadBuffer`
+  reads a parameter and changes nothing, so every site can omit it independently. Ride
+  the guard on something the site must do; where you cannot, the scan is not optional.
+  **The author of that rule broke it one commit later, in the same branch** —
+  `ISocket::CancelRead`'s default no-op was inherited by TWO of six transports that
+  both park a read, which was #710 still live on the ticket that commit closed. Same
+  author, same hours, having just written the rule down: whoever reads this and
+  concludes *I would have noticed* is the next instance. And the fix for it is NOT
+  pure virtual — **reach for the type system when the obligation is DO SOMETHING,
+  reach for a scan when it is SAY WHY**; a pure virtual compels seven fakes to write
+  `{}` with no reason beside it, which is *forgot* in the vocabulary of *decided*
+  (#892).
+- **A `/simplify` finding is a change like any other and is not exempt from the review
+  its subject just had.** The cleanup that moved `check-read-buffer-guard`'s offsets into
+  ONE coordinate system — made precisely because an off-by-one had hidden in the
+  three-origin arithmetic — left the cursor advance summing one term twice, so the walk
+  SKIPPED any second definition in a file: a false pass in the instrument built to
+  prevent false passes. It landed AFTER the four passes that would have caught it and
+  BEFORE the correctness pass that did, which is the window: a late cleanup arrives
+  wearing the authority of a review rather than the suspicion of a change. And **a
+  regression test can fail to reproduce its regression** — six self-test cases could not
+  see it, being single-implementation files at offset zero, and case 7's PADDING is
+  load-bearing because without it the over-advance lands inside the second signature and
+  the check finds it anyway.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
   `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression so no
   arm site has a bare `awaitable = nullptr` to forget it on, and
-  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal and
-  not a completion: the first breaks a live caller (#710), the second turns a leak into
-  a use-after-free.
+  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal, which
+  breaks a live caller — and **the second half of that sentence has been RETRACTED**: it
+  said a completion "turns a leak into a use-after-free", which was overstated and cost
+  another lane a withdrawn cancellation primitive before anyone checked it against
+  `EpollSocket::Close`, which detaches and `Complete`s with `Cancelled` on every
+  ordinary disconnect. The hazard is the **SITE**, not ownership: at the ARM site a
+  socket cannot tell a stale parked wait from a live one, and cancelling a live one is
+  a false disconnect that drops a healthy client. The CALLER can tell.
+- So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of
+  *abandon* that is not `Close()`, virtual with a default no-op like `ShutdownWrite`.
+  `RunBlockingRead` armed a watch per loop pass and cancelled none (#710): it now keeps
+  ONE, re-TARGETED per pass and re-armed only once the previous has RESOLVED (arming
+  once and never again makes #673's pipelined case pass vacuously), retired by RAII AND
+  explicitly before the reply write. Retiring is not disconnecting — the cancel arrives
+  as an ERROR and `ArmDisconnect` reads any error as a departure, so what silences it
+  must be the RETIREMENT, never the code. Synchronous on epoll/kqueue, **asynchronous on
+  IOCP** where the kernel owns the op's one `OVERLAPPED` (#884). `InMemorySocket` never
+  parks a `WaitReadable`, so twelve blocking cases were green throughout —
+  `Testing::ParkingReadableSocket` parks and COUNTS orphaned watches instead of aborting.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
 - A missing keyspace event has two ends — the tier that never named the victim and

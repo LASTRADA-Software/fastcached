@@ -400,6 +400,7 @@ void BlockingSocket::Close() noexcept
 IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
 {
     FC_ZONE_SCOPED_N("socket.read");
+    Detail::RequireReadBuffer(buffer);
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };

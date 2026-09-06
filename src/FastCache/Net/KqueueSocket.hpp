@@ -43,6 +43,9 @@ class KqueueSocket final: public ISocket
     [[nodiscard]] IoAwaitable WaitReadable() override;
     void Close() noexcept override;
 
+    /// @copydoc ISocket::CancelRead
+    void CancelRead() noexcept override;
+
     /// @copydoc ISocket::ShutdownWrite
     void ShutdownWrite() noexcept override;
 

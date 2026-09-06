@@ -99,6 +99,16 @@ class InMemorySocket: public ISocket
     [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
+
+    /// @copydoc ISocket::CancelRead
+    ///
+    /// **Overridden because this transport's READS park**, even though its
+    /// `WaitReadable` never does. That asymmetry is why the default no-op looked safe
+    /// here and is not: a `Read` with nothing buffered and a peer that has not closed
+    /// suspends, and the default would leave that frame for the caller's next read to
+    /// drop -- #710's shape on the transport the whole suite runs through.
+    void CancelRead() noexcept override;
+
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;

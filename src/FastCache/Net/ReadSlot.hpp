@@ -2,11 +2,57 @@
 #pragma once
 
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/NetError.hpp>
 
 #include <cassert>
+#include <expected>
 
 namespace FastCache::Detail
 {
+
+/// Retire a parked read operation on a reactor socket: detach it, drop the interest,
+/// and complete it with `Cancelled`.
+///
+/// **The counterpart to `ClaimReadSlot`, and it lives here for the same reason.** That
+/// one is the discipline's tripwire; this is the only way a caller can honour it
+/// without closing the socket (`ISocket::CancelRead`, #710). Both are about the single
+/// read-op slot, so both belong beside it rather than in whichever transport was
+/// written first.
+///
+/// **Shared because `EpollSocket` and `KqueueSocket` spell it identically**, down to
+/// the ordering, and this is the second copy of the detach-then-complete discipline in
+/// this directory -- `Close()` in each of them is the first, and those two are already
+/// byte-identical duplicates that predate this. A third copy would be a defect by this
+/// project's own data-driven rule; a template over the `Impl` is the one generic that
+/// takes both without inventing a type.
+///
+/// **Detached FIRST and completed LAST, with no member touched afterwards.** That is
+/// not tidiness: `Complete` resumes the parked coroutine, and a coroutine that OWNS
+/// this socket runs to its end and destroys it before `Complete` returns -- so
+/// `updateInterest` and every field access must already have happened. `EpollSocket::Close`
+/// records the ASan report that established this.
+///
+/// `IocpSocket` deliberately does NOT use it: the kernel owns that op's `OVERLAPPED`,
+/// so its retirement retracts rather than completes, and sharing a body between the two
+/// shapes would hide exactly the difference #884 is about.
+///
+/// @tparam Impl The socket's `Impl`, which must expose `readOp` and `UpdateInterest()`.
+/// @param impl The socket's implementation block.
+template <typename Impl>
+void RetireParkedRead(Impl& impl) noexcept
+{
+    auto* const parked = impl.readOp.awaitable;
+    if (parked == nullptr)
+        return;
+    impl.readOp.awaitable = nullptr;
+    impl.readOp.readBuffer = {};
+    impl.readOp.readPeekOnly = false;
+    // Recomputed from `readOp.awaitable`, which is now null, so the read interest comes
+    // back down: the operation is gone and a readable edge would find nothing to
+    // complete.
+    impl.UpdateInterest();
+    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+}
 
 /// Take a socket's single read-op slot for an operation that is about to park.
 ///
@@ -67,14 +113,23 @@ namespace FastCache::Detail
 ///    wait from a live one. The caller can**, because it knows when its own iteration
 ///    ended -- which is why the cancel belongs there and not here.
 ///
-/// Two callers currently double-arm this slot, and they need different fixes:
+/// **And the caller now has a spelling for it.** `ISocket::CancelRead()` retires a
+/// parked read-side operation without closing the socket, which is what the paragraph
+/// above says belongs at the caller -- until it existed, *abandon* had no spelling
+/// short of tearing the connection down, so the discipline this file states was one no
+/// caller could actually follow. It changes nothing here: this assertion still fires on
+/// a double-arm, and a caller that arms over a parked wait is still wrong.
+///
+/// Two callers double-armed this slot and needed different fixes.
 /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710)
-/// (`RunBlockingRead`'s trampoline, re-armed per blocking iteration) and
+/// (`RunBlockingRead`'s trampoline, re-armed per blocking iteration) is FIXED -- it
+/// keeps one watch, re-targets it per pass and retires it through `CancelRead`.
 /// [#755](https://github.com/LASTRADA-Software/fastcached/issues/755)
-/// (`RearmReadable`'s watcher surviving the transition out of subscribe mode). Both
-/// abort at the assertion below, so the abort names the slot and not the caller --
-/// a fixture for one that wanders through the other's path produces a red that
-/// attributes the wrong defect.
+/// (`RearmReadable`'s watcher surviving the transition out of subscribe mode) is still
+/// OPEN, and aborts at the assertion below -- which names the slot and not the caller,
+/// so a fixture for it that wanders through a blocking read's path still produces a red
+/// that attributes the wrong defect. That sentence survives one of its two subjects
+/// going away, which is the point of keeping it.
 ///
 /// It is watched refusing by `read-slot-guard-canary`, which double-arms a REAL
 /// socket -- the call site, not this function -- and must die.

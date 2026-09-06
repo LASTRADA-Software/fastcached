@@ -481,6 +481,87 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
+# The empty-read-buffer canary: another program that MUST die.
+#
+# `Detail::RequireReadBuffer` (`src/FastCache/Net/ISocket.hpp`) is the tripwire for
+# #838 -- `ISocket::Read` documents that its destination span must be non-empty and
+# nothing enforced it, so a caller reaching `Read` with an empty span was answered
+# `0`, which on this interface means the peer has finished sending. A graceful close
+# that never happened, handed to the caller by the one call whose result the type has
+# no way to express.
+#
+# It hands the empty span to a REAL transport, so what it drives is the CALL SITE and
+# not the guard function -- asserting `RequireReadBuffer` in isolation would prove the
+# `assert` fires and say nothing about whether an `ISocket::Read` reaches it. Which
+# transport, and why it is `InMemorySocket` rather than a reactor socket, is argued in
+# the canary's own header: a canary aborts at the first violation, so it watches ONE
+# site whatever it picks, and the one worth watching is the one with no environmental
+# failure modes and the same verdict on every platform.
+#
+# `scripts/empty-read-buffer-gate.cmake` and not a bare `WILL_FAIL`, for the reason
+# the two blocks above give. Guarded to Debug because `assert` compiles out elsewhere.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(empty-read-buffer-canary EmptyReadBufferCanary.cpp)
+    target_link_libraries(empty-read-buffer-canary PRIVATE FastCache)
+    add_test(
+        NAME "empty-read-buffer-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_CANARY=$<TARGET_FILE:empty-read-buffer-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/empty-read-buffer-gate.cmake"
+    )
+    set_tests_properties("empty-read-buffer-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# The canary above watches ONE call site; this is what holds the other five.
+#
+# A canary aborts at the first violation, so it can only ever drive one `Read`
+# whatever it picks -- and that is #492's shape: exact about the site it knows,
+# silent about the ones it does not, and silence reads identically to complete
+# coverage. Measured rather than argued: with `Detail::RequireReadBuffer` deleted
+# from `EpollSocket::Read` -- the transport every Linux deployment reads through --
+# `empty-read-buffer-canary` PASSES and the whole suite reports 3316 of 3316.
+#
+# `Detail::ClaimReadSlot` next door needs no equivalent because it IS the claim: an
+# arm site cannot omit it without omitting the operation. `RequireReadBuffer` is
+# purely additive, which is exactly the difference.
+#
+# The check DERIVES its set from the sources rather than tabulating six paths, so a
+# seventh transport is caught by construction; it requires the call to stand before
+# the body's first `return`, because all six open with `if (_closed) return ...` and
+# a guard that drifts below that is skipped while a presence-only scan reads green;
+# and it fails closed on an empty scan twice over. Not guarded to Debug: it reads
+# TEXT, so it covers the Windows and macOS transports from a Linux run.
+add_test(
+    NAME "read-buffer-guard"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-read-buffer-guard.cmake"
+)
+set_tests_properties("read-buffer-guard" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+add_test(
+    NAME "read-buffer-guard-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/read-buffer-guard-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-read-buffer-guard-selftest.cmake"
+)
+set_tests_properties("read-buffer-guard-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A reactor's teardown rule is watched refusing, on every platform rather than one.
 #
 # `IReactor::TeardownIsSerialisedWithDispatch()` is the tripwire for #668: an object

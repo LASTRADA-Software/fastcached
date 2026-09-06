@@ -101,6 +101,31 @@ class TlsSocket final: public ISocket
     [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
     void Close() noexcept override;
 
+    /// @copydoc ISocket::CancelRead
+    ///
+    /// **Overridden because this transport's reads PARK, which is exactly the case
+    /// `ISocket::CancelRead`'s default is not for.** `WaitReadable` here is not a
+    /// probe the socket can answer from its own state: it decrypts through
+    /// `PumpWaitReadable`, which parks on a raw `Read` whenever OpenSSL wants more
+    /// bytes -- so a blocking RESP verb over TLS leaves the RAW socket's single
+    /// read-op slot occupied, and the connection loop's next read then double-arms it.
+    /// That is [#710](https://github.com/LASTRADA-Software/fastcached/issues/710) on
+    /// the one transport where the plaintext reasoning does not carry.
+    ///
+    /// Forwarding retires a pump parked on a raw READ, and the chain is worth stating
+    /// because it is not obvious: `_raw->CancelRead()` completes the parked raw read
+    /// with `Cancelled`, `FeedIncoming` propagates that as `unexpected`, the pump
+    /// returns it, and `DriveWaitReadable`/`DriveRead` completes the CALLER's awaitable
+    /// with it. That holds for a park inside `PumpWaitReadable` and inside `PumpRead`
+    /// alike.
+    ///
+    /// **It does NOT retire a pump parked in `FlushOutgoing`'s raw WRITE**, which this
+    /// paragraph used to claim by asserting that no frame is left parked at either
+    /// layer. There is no write-slot equivalent of `Detail::ClaimReadSlot` anywhere in
+    /// this library, so nothing here can take that operation back:
+    /// [#893](https://github.com/LASTRADA-Software/fastcached/issues/893).
+    void CancelRead() noexcept override;
+
     /// @copydoc ISocket::ShutdownWrite
     ///
     /// Delegated to the raw transport, and **no `close_notify` is sent** -- for the

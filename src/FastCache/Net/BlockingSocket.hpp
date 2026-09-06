@@ -328,6 +328,21 @@ class BlockingSocket final: public ISocket
                                             std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
 
+    /// @copydoc ISocket::CancelRead
+    ///
+    /// **A written no-op with a reason, rather than an inherited one.** Nothing here
+    /// ever parks: `Read` is a blocking `recv` that has already returned by the time
+    /// the awaitable is constructed, and `WaitReadable` takes the interface default,
+    /// which resolves immediately. So there is no frame to free and no slot to hand
+    /// back -- which is the same answer the base class gives, arrived at deliberately.
+    ///
+    /// Stated because the other two transports that inherited the default were both
+    /// WRONG to (`TlsSocket` and `InMemorySocket` park, and #710 was live on both), and
+    /// a default that is correct for the transport you happen to be thinking about is
+    /// the dangerous kind. Every transport this library hands out now answers this
+    /// question in its own file.
+    void CancelRead() noexcept override {}
+
     /// @copydoc ISocket::ShutdownWrite
     void ShutdownWrite() noexcept override;
 
