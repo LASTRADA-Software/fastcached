@@ -2148,14 +2148,23 @@ void RecordManifest(Config const& cfg,
         // Prepended, not appended: `cl` emits its notes before its diagnostics, and
         // the stored value's region ordering is what a later hit replays verbatim.
         //
-        // "Replays verbatim" is load-bearing and is why #879 carries a second mechanism:
-        // this text becomes a STORED region, the key does not fold the marker, and a
+        // "Replays verbatim" is load-bearing and is why #879 carries a second mechanism.
+        // This text becomes a STORED region; the key does not fold the marker; and a
         // German and an English toolset of one version key identically by design (the
-        // identity probe is forced to English, #692). So in a cache shared across UI
-        // languages one machine can replay a prefix the other cannot match. That is a
-        // change in WHICH machine is affected rather than new breakage -- the localized
-        // one under-rebuilt unconditionally before this setting existed -- and closing
-        // it is a key or value-format bump, which is deliberately not this change.
+        // identity probe is forced to English, #692). So setting the variable on one
+        // machine can make its differently-localized PEERS under-rebuild: they replay a
+        // prefix their Ninja does not match.
+        //
+        // That is NEW breakage on a machine that had none, not a relocation of the old
+        // breakage -- before this setting existed every stored value carried the English
+        // marker, so English machines always matched and only localized ones were broken.
+        // Saying "which machine is affected has changed" reads as a wash and is wrong;
+        // the previously-working English builders are the ones newly at risk.
+        //
+        // What makes it shippable is that the hatch is OPT-IN: the marker defaults to
+        // `IncludeNoteMarker`, so no fleet changes behaviour until an operator sets the
+        // variable, and that operator is the one the docs can warn. Closing it properly
+        // is a key or value-format bump, which is deliberately not this change.
         run.out = Cc::RenderShowIncludes(dependencyPaths, cfg.showIncludesMarker) + run.out;
     }
 

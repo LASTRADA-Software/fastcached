@@ -337,16 +337,24 @@ one line that answers *why did my build stop rebuilding this file*. Learning the
 prefix from the compiler instead is
 [#878](https://github.com/LASTRADA-Software/fastcached/issues/878).
 
-**One caveat, for a shared cache spanning two UI languages.** The synthesised notes
-are stored with the object and replayed verbatim on a later hit, and the cache key
-does not fold the prefix — a German and an English Visual Studio of the same toolset
-key identically, deliberately, since the identity probe is forced to English
-([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). So a machine
-that sets this variable and dispatches can store a value whose notes a differently
-localized machine then replays and cannot match. That is not new breakage so much as a
-change in *which* machine is affected: before this setting existed the localized
-machine under-rebuilt every time, and now it does not. A locale-homogeneous fleet — the
-usual case — is unaffected either way. The fix is a fleet-format change, tracked on
+**Setting this on a machine that shares a cache with differently localized peers can
+make *those peers* under-rebuild.** The synthesised notes are stored with the object
+and replayed verbatim on a later hit, and the cache key does **not** fold the prefix —
+a German and an English Visual Studio of the same toolset key identically, deliberately,
+since the identity probe is forced to English
+([#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). So a German
+machine that sets this variable fixes its own builds *and* begins storing values whose
+notes an English peer replays and cannot match. That peer was previously fine: before
+this setting existed every stored value carried the English marker, so English machines
+always matched and only localized ones were broken. This is new breakage on a machine
+that had none, not a relocation of the old breakage.
+
+What makes it safe to ship is that **it is opt-in**. The prefix defaults to the English
+`Note: including file:`, so no existing fleet changes behaviour until somebody sets the
+variable — and the person who sets it is exactly the person this paragraph is for. If
+your cache is shared across UI languages, weigh that before exporting it; a
+locale-homogeneous fleet, which is the usual case, is unaffected. The real fix is a key
+or value-format change, tracked on
 [#879](https://github.com/LASTRADA-Software/fastcached/issues/879).
 
 Two things this does **not** cover, deliberately. A *local* compile is unaffected: it
