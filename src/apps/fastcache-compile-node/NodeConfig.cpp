@@ -1761,7 +1761,27 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
         return std::nullopt;
 
     // Only an endpoint naming this machine is judged; see the note above.
-    if (!IsLoopbackHost(HostOfEndpoint(advertised)))
+    auto const host = HostOfEndpoint(advertised);
+    if (!IsLoopbackHost(host))
+        return std::nullopt;
+
+    // **ONE parser answers both halves, because two disagree about a bare IPv6
+    // literal** ([#822](https://github.com/LASTRADA-Software/fastcached/issues/822)).
+    //
+    // The gate above asks `HostOfEndpoint`, which deliberately declines to split an
+    // unbracketed IPv6 literal -- its own comment says why: `::1` is a host, and
+    // splitting at the last colon yields "a plausible-looking wrong answer rather than
+    // a failure". `SplitHostPort` has no such guard and splits on the LAST colon
+    // regardless, so `--advertise=::1` reached it as host `:` and port `1`, and this
+    // rule refused a correct configuration while **naming a port nobody typed**.
+    //
+    // `HostOfEndpoint` returns the WHOLE endpoint when there is no port to split off,
+    // so "is the host the entire string" is exactly "did the operator name a port" --
+    // and it is the same answer the gate was already given. A bare host advertises no
+    // port, so there is nothing for this rule to disagree with. `[::1]` with no port
+    // does not reach here as a bare host (the brackets are stripped, so the sizes
+    // differ), and is refused a line below by `SplitHostPort` returning nothing.
+    if (host.size() == advertised.size())
         return std::nullopt;
 
     auto const split = SplitHostPort(advertised);
