@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -223,6 +224,36 @@ class AdminHttpServer
     /// for everybody (slowloris).
     static constexpr auto RequestTimeout = std::chrono::milliseconds { 2000 };
 
+    /// How long a peer may hold the connection having sent **nothing**.
+    ///
+    /// **Two questions were sharing one number and the shared answer was wrong for one
+    /// of them** ([#828](https://github.com/LASTRADA-Software/fastcached/issues/828)).
+    /// A browser opens speculative *preconnect* sockets ahead of a navigation and may
+    /// send on one long afterwards, so 2 s is simply the wrong answer to "is this peer
+    /// going to ask anything" -- and it is the answer that makes an ordinary navigation
+    /// fail. #824 stopped that being a `400`; it is still a close, so whether the page
+    /// loads depends on the client retrying.
+    ///
+    /// Raising `RequestTimeout` instead would slacken the mid-head bound in exchange,
+    /// which `.agent/rules/distributed-compilation.md` refuses in the same words: *"a
+    /// cache exchange is bounded by a round trip, a dispatched compile by how long a
+    /// COMPILER runs; sharing one deadline abandoned every TU worth distributing while
+    /// the worker finished the job anyway."* Same defect, different wire.
+    ///
+    /// Armed on the socket at the top of the head read and **tightened to
+    /// `RequestTimeout` the moment a byte arrives**, so the two bounds never overlap
+    /// and neither is enforced by a retry loop -- a loop would have to assume the read
+    /// consumed real time, which a non-blocking or reactor-backed socket does not.
+    static constexpr auto FirstByteTimeout = std::chrono::milliseconds { 30000 };
+
+    /// How long the whole request head may take once the peer has started.
+    ///
+    /// `RequestTimeout` is per **read**, so without a total a client dribbling one byte
+    /// under each deadline holds a slot for `MaxRequestBytes` reads. A per-read bound
+    /// cannot express a total and a total cannot express a stall, so both exist and
+    /// neither is derived from the other.
+    static constexpr auto HeadTimeout = std::chrono::milliseconds { 10000 };
+
     /// Provider for a fresh metrics snapshot (storage stats + uptime), so
     /// `/metrics` reflects live state on each scrape rather than a stale copy.
     /// Computing uptime here keeps the server itself clock-agnostic.
@@ -239,6 +270,7 @@ class AdminHttpServer
                     IMetricsSink const& metrics,
                     SnapshotProvider snapshotProvider,
                     ILogger& logger,
+                    IClock& clock,
                     std::vector<AdminRoute> routes = {},
                     TlsContext* tls = nullptr) noexcept;
 
@@ -262,6 +294,7 @@ class AdminHttpServer
     IMetricsSink const& _metrics;
     SnapshotProvider _snapshotProvider;
     ILogger& _logger;
+    IClock& _clock;
     std::vector<AdminRoute> _routes;
     /// Server TLS context, or null for plaintext. Not owned.
     TlsContext* _tls { nullptr };
@@ -292,6 +325,7 @@ class AdminHttpServer
 [[nodiscard]] Task<void> ServeAdminHttp(ISocket* socket,
                                         IMetricsSink const* metrics,
                                         AdminHttpServer::SnapshotProvider snapshotProvider,
+                                        IClock& clock,
                                         std::span<AdminRoute const> routes = {});
 
 } // namespace FastCache

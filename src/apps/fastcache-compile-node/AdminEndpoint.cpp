@@ -826,7 +826,8 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              std::vector<AdminRoute> routes,
                              TlsContext* tls):
     _listener { std::move(listener) },
-    _server { std::make_unique<AdminHttpServer>(*_listener, metrics, std::move(snapshot), logger, std::move(routes), tls) },
+    _server { std::make_unique<AdminHttpServer>(
+        *_listener, metrics, std::move(snapshot), logger, _clock, std::move(routes), tls) },
     _boundEndpoint { std::move(boundEndpoint) },
     _thread { [server = _server.get()] { SyncRun(server->Run()); } }
 {

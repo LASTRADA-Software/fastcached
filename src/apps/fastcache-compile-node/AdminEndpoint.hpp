@@ -4,6 +4,7 @@
 #include "NodeConfig.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -537,6 +538,11 @@ class AdminEndpoint
                   TlsContext* tls);
 
     std::unique_ptr<BlockingListener> _listener;
+    /// Owned rather than injected, declared before `_server` which references it.
+    /// **A stated deviation**: this class is app WIRING, and the testable seam for the
+    /// head deadlines is one level down on `ServeAdminHttp(..., IClock&, ...)`, which is
+    /// where a test that needs to move time reaches.
+    SteadyClock _clock;
     std::unique_ptr<AdminHttpServer> _server;
     std::string _boundEndpoint;
     std::jthread _thread;
