@@ -191,12 +191,36 @@ class IMetricsSink
         /// unit (#327, #494).
         DispatchFramesRefusedTruncated,
 
-        /// Compiles a worker began. With `WorkerJobsCompleted` this is also the
-        /// in-flight count — two monotone counters rather than a gauge, which this
-        /// interface deliberately does not have, and their difference is what
-        /// "slots in use" means. Slots *configured* is not here at all: it is
-        /// configuration rather than a measurement, and pushing it through a
-        /// counter would mean incrementing to its value at startup.
+        /// Compiles handed to the runner.
+        ///
+        /// **Their difference with `WorkerJobsCompleted` is NOT the in-flight
+        /// count**, which this said until #307. All four runner refusals —
+        /// `UnknownFingerprint`, `RejectedArgument`, `ScratchUnavailable`,
+        /// `SpawnFailed` — increment this and then return without reaching
+        /// `WorkerJobsCompleted`, so the difference gains one permanently per
+        /// refusal. The counters are monotone, so nothing retracts it, and it is
+        /// worst exactly where it hurts most: an unknown fingerprint is documented
+        /// as the commonest setup failure, so the most misconfigured machine reads
+        /// the highest load, forever, while idle.
+        ///
+        /// **In-flight is `fastcache_node_slots_busy`**, a gauge sampled at scrape
+        /// time. That is not a workaround invented for this: `PrometheusFormatter`
+        /// had already declined to derive it from these two, because they are
+        /// incremented by different components and a scrape landing between them
+        /// reports a phantom job — right on average and wrong at exactly the moment
+        /// somebody is looking. Two comments in this tree disagreed, and this was
+        /// the one that was wrong.
+        ///
+        /// Balancing the pair on the refusal path is not the fix either:
+        /// `WorkerJobsCompleted` is the `_count` half of a duration with
+        /// `WorkerCompileMillisTotal`, so counting a refusal there would drag
+        /// `rate(sum)/rate(count)` — the average compile time — toward zero with
+        /// jobs that never ran. Counting inside the runner was also considered and
+        /// deliberately rejected; see the call site.
+        ///
+        /// Slots *configured* is not here at all: it is configuration rather than a
+        /// measurement, and pushing it through a counter would mean incrementing to
+        /// its value at startup.
         WorkerJobsStarted,
         /// Compiles that finished, whatever the compiler concluded. A compiler
         /// that ran and rejected the code did its job; that is the client's

@@ -163,14 +163,23 @@ TEST_CASE("A compile node reports its size, and a cache daemon does not", "[metr
     CHECK(withHost.contains("fastcache_node_disk_free_bytes 123456789"));
     CHECK(withHost.contains("fastcache_node_slots_configured 14"));
     CHECK(withHost.contains("fastcache_node_slots_busy 3"));
+    // The positive control for the `# TYPE` assertions below: a negative check
+    // on a spelling nothing ever emits would pass whatever the renderer did.
+    CHECK(withHost.contains("# TYPE fastcache_node_slots_busy"));
 
     // The daemon leaves it absent rather than reporting cores it does not schedule
     // against. Absent means the series is missing, not present and zero -- a zero
     // would read as a machine with no cores.
     auto const withoutHost = RenderPrometheus(
         metrics, MetricsSnapshot { .storage = StorageStats {}, .host = std::nullopt, .uptime = Uptime { 1s } });
-    CHECK_FALSE(withoutHost.contains("fastcache_node_logical_cores"));
-    CHECK_FALSE(withoutHost.contains("fastcache_node_slots_busy"));
+    // Asserted on the `# TYPE` line rather than as a bare substring. A counter's
+    // HELP text may legitimately NAME another series -- `jobs_started_total`'s now
+    // names this gauge, to point an operator at the real in-flight signal (#307) --
+    // and `contains()` cannot tell a mention from an exported series. A `# TYPE`
+    // line is emitted for every rendered metric and for nothing else, so its
+    // absence is the series being absent.
+    CHECK_FALSE(withoutHost.contains("# TYPE fastcache_node_logical_cores"));
+    CHECK_FALSE(withoutHost.contains("# TYPE fastcache_node_slots_busy"));
 }
 
 TEST_CASE("A tiered cache renders one labelled sample per tier", "[metrics][prometheus][storage-tier]")

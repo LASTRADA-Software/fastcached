@@ -910,6 +910,46 @@ TEST_CASE("A refusal's counter and its wire code come from one row", "[worker-pr
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint) == 1);
 }
 
+TEST_CASE("A runner refusal counts as started and never as completed", "[worker-protocol]")
+{
+    // #307. This PINS the behaviour rather than changing it, because the docs are
+    // what were wrong. `WorkerJobsStarted` counts jobs handed to the RUNNER, and a
+    // runner refusal returns before `WorkerJobsCompleted` -- so their difference
+    // gains one permanently and is NOT the in-flight count, which is what
+    // IMetricsSink.hpp claimed until now and what the exported help text told
+    // every operator to compute.
+    //
+    // Balancing the pair here is not the fix: `WorkerJobsCompleted` is the _count
+    // half of a duration with `WorkerCompileMillisTotal`, so a refusal counted
+    // there would drag the average compile time toward zero with jobs that never
+    // ran. In-flight is the `fastcache_node_slots_busy` gauge.
+    //
+    // Asserted as an exact difference after a MIX, not after one refusal: the
+    // drift is cumulative, and a single refusal cannot tell "never returns" from
+    // "off by one once".
+    Fixture fix;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto const refused = fix.worker.Answer(CompileFrame("clang-19"));
+        REQUIRE(refused.has_value());
+        CHECK(Decode(Unwrap(refused)).status == Wire::Status::Error);
+    }
+
+    auto const started = fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted);
+    auto const completed = fix.metrics.Read(IMetricsSink::Counter::WorkerJobsCompleted);
+    auto const refusals = fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedUnknownFingerprint);
+
+    CHECK(refusals == 3);
+    CHECK(completed == 0);
+    CHECK(started == 3);
+    // The worker is idle, and the difference says three jobs are running.
+    CHECK(started - completed == 3);
+    // What an operator can actually difference, which is the correction the docs
+    // now carry: the refusals are the missing term.
+    CHECK(started - completed - refusals == 0);
+}
+
 TEST_CASE("A request's declared footprint is what its envelope asks for", "[worker-protocol]")
 {
     // What an admitting surface charges a request, and the number that was missing:
