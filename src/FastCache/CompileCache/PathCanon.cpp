@@ -399,6 +399,64 @@ namespace
                 tail = line.substr(open); // everything from '(' onward, incl. CR
                 return true;
             }
+            case Grammar::GccDiagnostics: {
+                // Three ANCHORED shapes and nothing else:
+                //
+                //     <path>:<line>:<col>: ...                the diagnostic itself
+                //     In file included from <path>:<line>[,:]  the include chain head
+                //                      from <path>:<line>[,:]  its continuations
+                //
+                // Never a scan for path-shaped spans. A GCC diagnostic embeds the
+                // offending SOURCE LINE and a caret, and this repository's own
+                // tests carry path literals -- a blanket rewrite would corrupt a
+                // snippet that merely quotes one, turning a correct diagnostic into
+                // a wrong one. Only these positions hold a path; the rest of the
+                // line is somebody's code.
+                constexpr std::string_view IncludedFrom = "In file included from ";
+                constexpr std::string_view ContinuedFrom = "from ";
+
+                std::size_t begin = 0;
+                if (body.starts_with(IncludedFrom))
+                {
+                    begin = IncludedFrom.size();
+                }
+                else if (!body.empty() && body.front() == ' ')
+                {
+                    // A continuation line: spaces, then `from `. Anything else that
+                    // begins with a space is source text or a caret and is left alone.
+                    std::size_t at = 0;
+                    while (at < body.size() && body[at] == ' ')
+                        ++at;
+                    if (!body.substr(at).starts_with(ContinuedFrom))
+                        return false;
+                    begin = at + ContinuedFrom.size();
+                }
+
+                // The path runs to the `:` that begins `:<digits>` followed by `:`
+                // or `,`. Searched left to right from `begin`, so a drive letter's
+                // colon cannot end it -- `C:` is not followed by digits-then-
+                // separator -- and a path containing a literal `:<digits>:` would
+                // have to do so before its real location suffix, which no compiler
+                // emits.
+                std::size_t at = begin;
+                while (true)
+                {
+                    std::size_t const colon = body.find(':', at);
+                    if (colon == std::string_view::npos || colon == begin)
+                        return false;
+                    std::size_t digits = colon + 1;
+                    while (digits < body.size() && body[digits] >= '0' && body[digits] <= '9')
+                        ++digits;
+                    if (digits > colon + 1 && digits < body.size() && (body[digits] == ':' || body[digits] == ','))
+                    {
+                        head = line.substr(0, begin);
+                        path = body.substr(begin, colon - begin);
+                        tail = line.substr(colon); // from the ':' onward, incl. any CR
+                        return true;
+                    }
+                    at = colon + 1;
+                }
+            }
             case Grammar::GccDepfile:
                 // A depfile line carries MANY path spans (a target plus its whole
                 // dependency list), so it cannot be expressed as one head/path/tail

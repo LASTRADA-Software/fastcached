@@ -1055,9 +1055,37 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
     return DispatchBudgetsOf(cfg).control;
 }
 
-/// The grammar to tag the include-bearing stream with, per compiler flavor.
-[[nodiscard]] PathCanon::Grammar IncludeGrammar()
+/// The grammar to tag a stored TEXT REGION with, per compiler flavor.
+///
+/// `ShowIncludes` for the MSVC family and a diagnostics grammar for the GNU one,
+/// and the asymmetry is the whole of it.
+///
+/// A GNU driver emits no `/showIncludes` on either stream, so `ShowIncludes` had
+/// nothing to find there and nothing was ever rewritten -- which is why a
+/// replayed GCC warning named the checkout that STORED it. On a machine with
+/// several checkouts that path resolves to a different tree at a possibly
+/// different revision, so the line number lands on unrelated code and the
+/// developer edits the wrong one (#202).
+///
+/// The MSVC family is deliberately LEFT on `ShowIncludes`. Which stream `cl`
+/// writes its notes on is UNVERIFIED (#825) -- which is precisely why both
+/// regions carry that grammar today -- so moving stderr to `MsvcDiagnostics`
+/// would stop canonicalizing the notes if the answer turns out to be stderr.
+/// That trades a fixed bug for a worse one on the strength of a guess.
+/// `MsvcDiagnostics` is implemented and tested and is waiting for the
+/// measurement, not for someone to decide it is probably fine.
+[[nodiscard]] PathCanon::Grammar TextGrammar(Cc::Flavor flavor) noexcept
 {
+    switch (flavor)
+    {
+        case Cc::Flavor::Gcc:
+        case Cc::Flavor::Clang:
+            return PathCanon::Grammar::GccDiagnostics;
+        case Cc::Flavor::Cl:
+        case Cc::Flavor::ClangCl:
+        case Cc::Flavor::Unknown:
+            return PathCanon::Grammar::ShowIncludes;
+    }
     return PathCanon::Grammar::ShowIncludes;
 }
 
@@ -2689,10 +2717,11 @@ void RecordManifest(Config const& cfg,
     // because an unmatched marker rewrites nothing.
     auto const storedOut = PathCanon::NormalizeIncludeNoteMarker(run->out, cfg.showIncludesMarker);
     auto const storedErr = PathCanon::NormalizeIncludeNoteMarker(run->err, cfg.showIncludesMarker);
-    auto const includeTextOut = reconciler.Region(storedOut, IncludeGrammar());
-    auto const includeTextErr = reconciler.Region(storedErr, IncludeGrammar());
-    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextOut });
-    value.textRegions.push_back({ .grammar = IncludeGrammar(), .bytes = includeTextErr });
+    auto const textGrammar = TextGrammar(cmd.flavor);
+    auto const includeTextOut = reconciler.Region(storedOut, textGrammar);
+    auto const includeTextErr = reconciler.Region(storedErr, textGrammar);
+    value.textRegions.push_back({ .grammar = textGrammar, .bytes = includeTextOut });
+    value.textRegions.push_back({ .grammar = textGrammar, .bytes = includeTextErr });
 
     // Region 2, when present, is the GNU depfile the compile just wrote. It is
     // tagged with the depfile grammar so the daemon canonicalizes the header

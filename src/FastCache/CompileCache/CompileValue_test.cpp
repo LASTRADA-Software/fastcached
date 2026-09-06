@@ -117,7 +117,7 @@ TEST_CASE("The generation byte is pinned by value, not only by name")
     // Generation 3 since #879 / #891.
     auto const encoded = EncodeCompileValue(CompileValue {});
     REQUIRE_FALSE(encoded.empty());
-    CHECK(encoded.front() == std::byte { 3 });
+    CHECK(encoded.front() == std::byte { 4 });
 }
 
 TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
@@ -835,6 +835,40 @@ constexpr std::array ConformanceCorpus {
                       .grammar = Grammar::MsvcDiagnostics,
                       .producerEffect = RegionEffect::Preserves,
                       .consumerEffect = RegionEffect::Preserves },
+    // #202: GCC/Clang diagnostics. A replayed warning used to name the checkout
+    // that stored it, because stderr was tagged `ShowIncludes` -- a grammar that
+    // cannot see a diagnostic's path -- so nothing was ever rewritten.
+    ConformanceCase { .name = "gcc diagnostic under the source root",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "/home/dev/proj/src/a.cpp:12:5: warning: unused variable 'x'\n",
+                      .grammar = Grammar::GccDiagnostics,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // The include chain: its header and its indented continuations, both anchored.
+    ConformanceCase { .name = "gcc include chain, header and continuation",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "In file included from /home/dev/proj/inc/a.hpp:3,\n"
+                              "                 from /home/dev/proj/src/a.cpp:1:\n"
+                              "/home/dev/proj/build/gen/cfg.hpp:9:1: note: expanded here\n",
+                      .grammar = Grammar::GccDiagnostics,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites },
+    // A path OUTSIDE both roots is left standing, as every other grammar leaves it.
+    ConformanceCase { .name = "gcc diagnostic in a toolchain header is untouched",
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "/usr/include/c++/16/vector:120:7: note: candidate\n",
+                      .grammar = Grammar::GccDiagnostics,
+                      .producerEffect = RegionEffect::Preserves,
+                      .consumerEffect = RegionEffect::Preserves },
 };
 
 /// One generation of the stored-value contract: the `CompileValueVersion` it was
@@ -877,7 +911,13 @@ constexpr std::array StoredValueGenerations {
     // note both canonicalized to nothing and their regions kept the producing
     // checkout's absolute paths.
     StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
+    // Generation 3 is RETIRED (#202): stderr was tagged `Grammar::ShowIncludes`, a
+    // grammar that cannot see a diagnostic's path, so a replayed warning named the
+    // checkout that STORED it -- on a machine with several checkouts, a path that
+    // resolves to a different tree at a different revision, so the line number
+    // lands on unrelated code.
     StoredValueGeneration { .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e", .version = 3 },
+    StoredValueGeneration { .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf", .version = 4 },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
