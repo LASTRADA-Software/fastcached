@@ -176,8 +176,10 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsStarted,
       .prometheusName = "fastcache_worker_jobs_started_total",
-      .help = "Compiles this worker began. Minus jobs_completed_total, the number "
-              "running right now.",
+      .help = "Compiles this worker handed to its runner. NOT the running count when "
+              "differenced with jobs_completed_total: a refused job increments this "
+              "one only, so the difference drifts up and never returns. Use the "
+              "fastcache_node_slots_busy gauge for what is running now.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsCompleted,
       .prometheusName = "fastcache_worker_jobs_completed_total",

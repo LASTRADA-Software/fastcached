@@ -1681,7 +1681,7 @@ exposition cannot drift apart again without a red build.
 
 | Series | Says |
 |---|---|
-| `fastcache_worker_jobs_started_total` | Compiles this worker began. Minus jobs_completed_total, the number running right now. |
+| `fastcache_worker_jobs_started_total` | Compiles this worker handed to its runner. NOT the running count when differenced with jobs_completed_total: a refused job increments this one only, so the difference drifts up and never returns. Use the fastcache_node_slots_busy gauge for what is running now. |
 | `fastcache_worker_jobs_completed_total` | Compiles that finished, whatever the compiler concluded. Also the count half of the compile-time sum below. |
 | `fastcache_worker_compile_milliseconds_total` | Total wall time spent compiling. Divide by jobs_completed_total, or take rate() of both, for the average compile. |
 | `fastcache_worker_jobs_abandoned_client_gone_total` | Compiles whose client had disconnected before the object could be written back. The compile itself still counts in jobs_completed_total -- the compiler ran and this machine paid for it; only the delivery found nobody there. Never a refusal: nothing was declined and no reply was sent. |
