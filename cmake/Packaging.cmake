@@ -148,6 +148,7 @@ if(UNIX AND NOT APPLE)
     find_program(DPKG_EXECUTABLE dpkg)
     if(DPKG_EXECUTABLE)
         execute_process(COMMAND "${DPKG_EXECUTABLE}" --print-architecture
+        TIMEOUT 10
             OUTPUT_VARIABLE _deb_arch
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET)

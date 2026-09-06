@@ -136,6 +136,7 @@ foreach(tool IN ITEMS profdata cov)
 
     execute_process(
         COMMAND "${LLVM_${upper}_PATH}" --version
+        TIMEOUT 10
         OUTPUT_VARIABLE tool_version
         ERROR_VARIABLE tool_version
         OUTPUT_STRIP_TRAILING_WHITESPACE
