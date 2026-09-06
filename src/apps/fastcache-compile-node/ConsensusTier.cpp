@@ -410,7 +410,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     Republish();
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
-    _peerServer = std::make_unique<Consensus::RaftPeerServer>(*_listener, *_sink, _logger);
+    _peerServer = std::make_unique<Consensus::RaftPeerServer>(*_listener, _reactor, *_sink, _logger);
 
     // Both loops on ONE reactor, and neither through `SyncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
