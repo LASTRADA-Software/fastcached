@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DependencyOutput.hpp"
-#include "DirectManifest.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -65,15 +64,24 @@ std::string RenderDepFile(std::string_view target, std::span<std::string const> 
     return out;
 }
 
-std::string RenderShowIncludes(std::span<std::string const> dependencyPaths)
+std::string RenderShowIncludes(std::span<std::string const> dependencyPaths, std::string_view marker)
 {
     std::string out;
     for (auto const& dep: Unique(dependencyPaths))
     {
-        // The marker comes from DirectManifest, which is where the READING side
-        // gets it. A second spelling here is how a producer and its parser drift --
-        // and this pair has to agree byte-for-byte, since Ninja matches the prefix.
-        out += IncludeNoteMarker;
+        // The marker is the CALLER's, and this file deliberately spells none of its
+        // own. It used to write `IncludeNoteMarker` -- the reading side's constant --
+        // under a comment saying a second spelling here is how a producer and its
+        // parser drift. That was right about the two parties it could see and blind
+        // to the third: Ninja does not match `IncludeNoteMarker`, it matches
+        // `msvc_deps_prefix`, which CMake took from the actual compiler and which is
+        // localized on a Visual Studio carrying a language pack (#700).
+        //
+        // So the invariant survives in a stronger form. There is no literal here to
+        // drift with, the one definition is `IncludeNoteMarker`, and the only way
+        // these lines carry anything else is an operator naming it. See
+        // DependencyOutput.hpp for the ninja measurement behind that.
+        out += marker;
         out += ' ';
         out += dep;
         out += "\r\n";

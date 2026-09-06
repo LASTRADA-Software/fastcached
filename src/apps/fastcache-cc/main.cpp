@@ -196,6 +196,26 @@ struct Config
     /// Largest encoded value the launcher will offer to the daemon; 0 = no
     /// limit. See Cc::IsStorableSize for why this is a client-side policy.
     std::size_t maxStoreBytes { Cc::DefaultMaxStoreBytes };
+
+    /// The prefix a DISPATCHED compile's synthesised `/showIncludes` notes carry.
+    ///
+    /// This is the build's `msvc_deps_prefix` and NOT the launcher's own reading
+    /// marker, which is the whole of #700: Ninja matches this string literally, CMake
+    /// took it from the actual compiler, and a Visual Studio carrying a language pack
+    /// makes it a localized sentence. Emitting the English one there records no
+    /// dependencies for the translation unit and stops rebuilding it when its headers
+    /// change -- a wrong build under a zero exit code.
+    ///
+    /// Defaulted to `Cc::IncludeNoteMarker` HERE, which is the only place the two
+    /// values ever meet. That keeps one definition of the literal in the tree while
+    /// letting the writing side answer a question the reading side does not ask; see
+    /// `RenderShowIncludes` for why the renderer takes it as a required parameter
+    /// rather than defaulting it itself.
+    ///
+    /// The launcher CANNOT derive this. It is a value the build holds and never tells
+    /// anybody, so an operator names it or the launcher guesses English. Discovering
+    /// it from the compiler is #878, and is unexercisable in this repository's CI.
+    std::string showIncludesMarker { Cc::IncludeNoteMarker };
 };
 
 /// Read an environment variable, or a fallback when unset/empty.
@@ -306,6 +326,11 @@ struct Config
     c.schedulerAddr = EnvOr(Cc::EnvName::Scheduler, "");
     c.credential.username = EnvOr(Cc::EnvName::User, "");
     c.credential.secret = EnvOr(Cc::EnvName::Token, "");
+    // Set-but-empty collapses to the default, as everywhere else here, and that is
+    // right rather than merely consistent: an empty `msvc_deps_prefix` is not a
+    // prefix Ninja could match a note against -- it would match every line -- so
+    // there is no reading of the empty value that is better than the default.
+    c.showIncludesMarker = EnvOr(Cc::EnvName::MsvcDepsPrefix, Cc::IncludeNoteMarker);
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
     // be, and a truncating cast turns a ceiling somebody raised into a tiny one
     // that silently stops caching almost everything.
@@ -2056,9 +2081,40 @@ void RecordManifest(Config const& cfg,
         return DeclineDispatch(Discarded("the depfile for a dispatched compile could not be written"),
                                "could not write the depfile for a dispatched compile; compiling locally");
     if (cmd.wantShowIncludes)
+    {
+        // Said on every dispatched compile that synthesises notes, because this is
+        // the one line that answers "why did my build stop rebuilding this file".
+        //
+        // The launcher is GUESSING here whenever nothing named the prefix, and it
+        // cannot do better: `msvc_deps_prefix` is a value the build holds and never
+        // exports. The guess is right on an English toolchain and wrong on a
+        // localized one, and #700's whole character is that being wrong is SILENT --
+        // Ninja does not complain about a note it fails to match, it prints it as
+        // ordinary compiler output and records nothing. So the guess is stated
+        // rather than merely made.
+        //
+        // Verbose rather than unconditional: an English toolchain is the common case
+        // and would get this line on every dispatched translation unit, which is how
+        // a diagnostic becomes noise nobody reads. FASTCACHE_VERBOSE is exactly the
+        // switch somebody investigating an under-rebuild turns on.
+        //
+        // Deliberately NOT keyed on `ProbedDependencies::unreadable`. That predicate
+        // feeds a message and nothing else by contract, and #825 records the claim
+        // underneath it -- which stream `cl` writes its notes to -- as unmeasured and
+        // stated two ways in this tree. A guard resting on it may not fire for `cl`
+        // at all, which is what #821 was reverted for: it read in the source like a
+        // safety net and was close to dead for its stated purpose.
+        Note(std::format("/showIncludes: writing {} note(s) with prefix \"{}\" ({}); it must equal this build's "
+                         "msvc_deps_prefix or no dependencies are recorded for this TU",
+                         dependencyPaths.size(),
+                         cfg.showIncludesMarker,
+                         cfg.showIncludesMarker == Cc::IncludeNoteMarker
+                             ? std::format("the default; set {} if this build expects another", Cc::EnvName::MsvcDepsPrefix)
+                             : std::format("from {}", Cc::EnvName::MsvcDepsPrefix)));
         // Prepended, not appended: `cl` emits its notes before its diagnostics, and
         // the stored value's region ordering is what a later hit replays verbatim.
-        run.out = Cc::RenderShowIncludes(dependencyPaths) + run.out;
+        run.out = Cc::RenderShowIncludes(dependencyPaths, cfg.showIncludesMarker) + run.out;
+    }
 
     // The object is kept, so this is a plain `Dispatched`. Recorded HERE rather than
     // beside the call above, because every branch between the two returns through

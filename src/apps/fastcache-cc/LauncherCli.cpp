@@ -309,6 +309,17 @@ namespace
                      .summary = "Username to accompany FASTCACHE_TOKEN. Unset (the usual\n"
                                 "case) authenticates against the secret alone, which is what\n"
                                 "--requirepass configures. Ignored without a token." },
+        EnvVarSpec { .name = EnvName::MsvcDepsPrefix,
+                     .summary = "The prefix a DISPATCHED compile's synthesised /showIncludes\n"
+                                "notes must carry -- i.e. this build's msvc_deps_prefix,\n"
+                                "which Ninja matches literally. Unset means the English\n"
+                                "\"Note: including file:\", which is right on an English\n"
+                                "toolchain and WRONG on a Visual Studio carrying a language\n"
+                                "pack: Ninja then records no dependencies for that\n"
+                                "translation unit and the next header edit does not rebuild\n"
+                                "it. Copy the value out of your build: grep msvc_deps_prefix\n"
+                                "build.ninja. Only dispatched compiles synthesise notes; a\n"
+                                "local compile emits the compiler's own and needs nothing." },
     };
 
     /// Where the statistics log goes.

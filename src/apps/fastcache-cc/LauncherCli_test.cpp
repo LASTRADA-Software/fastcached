@@ -358,6 +358,20 @@ TEST_CASE("the help text documents every environment variable the launcher reads
                              "FASTCACHE_SCHEDULER",
                              "FASTCACHE_TOKEN",
                              "FASTCACHE_USER",
+                             // Was missing from this oracle while its row existed in
+                             // the table, so the row could have been dropped with
+                             // nothing failing -- the exact hole the oracle is for.
+                             // Found while adding the row below it; a hand-kept list
+                             // is exact about what it knows and silent about what it
+                             // does not.
+                             "FASTCACHE_VERIFY",
+                             // A build that reads this and documents nothing leaves an
+                             // operator no way to discover the one setting that can fix
+                             // a silent under-rebuild (#700). It is also the only row
+                             // here whose value an operator must copy from somewhere
+                             // else, so the summary carrying the recipe is load-bearing
+                             // rather than decorative -- asserted separately below.
+                             "FASTCACHE_MSVC_DEPS_PREFIX",
                              "LOCALAPPDATA",
                              "XDG_STATE_HOME",
                              "HOME" })
@@ -365,6 +379,23 @@ TEST_CASE("the help text documents every environment variable the launcher reads
         INFO("variable " << name);
         CHECK(help.contains(name));
     }
+}
+
+TEST_CASE("the help text tells an operator where to find their msvc_deps_prefix")
+{
+    // FASTCACHE_MSVC_DEPS_PREFIX is the only launcher variable whose value cannot be
+    // invented: it has to equal a string the build already holds, and getting it
+    // wrong is silent in exactly the way #700 is. So documenting the NAME is not
+    // enough -- the summary has to carry the recipe, and that is a property worth an
+    // assertion rather than a reviewer's memory.
+    //
+    // Matched on `msvc_deps_prefix` and `build.ninja` rather than on a whole
+    // sentence, so rewording the help does not fail this while dropping the recipe
+    // still does.
+    auto const help = HelpText();
+    INFO(help);
+    CHECK(help.contains("msvc_deps_prefix"));
+    CHECK(help.contains("build.ninja"));
 }
 
 TEST_CASE("the help text states the dispatch deadline the launcher actually uses")
