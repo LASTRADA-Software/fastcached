@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -223,7 +224,11 @@ class FilePageStore final: public IPageStore
     int _fd { -1 }; ///< POSIX file descriptor.
 #endif
     std::size_t _pageSize { 0 };
-    std::size_t _totalDataPages { 0 };
+    /// Atomic for the same reason as `_lastDurableSlot`: `PageCount()` is a
+    /// `noexcept` interface member that locked. `TotalDataPages()` read it
+    /// with no lock at all, which was a plain data race -- so the atomic is
+    /// what makes that reader correct rather than merely quiet.
+    std::atomic<std::size_t> _totalDataPages { 0 };
 
     /// Currently-allocated data page indices (1-based). Tracked so Read
     /// of a freed page can be rejected.
@@ -254,7 +259,13 @@ class FilePageStore final: public IPageStore
     /// The next Batched flush always writes to the *other* slot, so a torn
     /// flush can never destroy the last durable meta. Initialised on
     /// Bootstrap/Recover and advanced by `FlushBatchLocked`.
-    MetaSlot _lastDurableSlot { MetaSlot::A };
+    /// Atomic because `LastDurableSlot()` is `noexcept` on `IPageStore` and a
+    /// `std::mutex::lock` can throw `std::system_error` -- which inside a
+    /// `noexcept` function is `std::terminate`, not an error return. Every
+    /// WRITE still happens under `_ioMutex`, so the lock goes on ordering the
+    /// slot against the meta write it describes; the atomic exists so the
+    /// accessor can read it without taking one.
+    std::atomic<MetaSlot> _lastDurableSlot { MetaSlot::A };
 
     /// Whether the file is actually claimed. Both platforms can downgrade it,
     /// and neither takes the claim's word for it: POSIX reads what `flock`
