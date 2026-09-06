@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <tests/PathFlagCoverage.hpp>
 #include <tests/ScratchPath.hpp>
 
 #if !defined(_WIN32)
     #include <sys/stat.h>
 #endif
 
+using FastCache::CliOptions;
+using FastCache::CliResult;
 using FastCache::Config;
+using FastCache::DaemonPublicPathFlags;
 using FastCache::DaemonSecretFiles;
+using FastCache::DaemonSecretFileTable;
 using FastCache::SecretCameFromConfigFile;
 using FastCache::SecretFileWarnings;
 using FastCache::SecretProvenanceFacts;
@@ -266,3 +274,145 @@ TEST_CASE("SecretProvenance: which paths are never asked about at all", "[config
         CHECK(SecretFileWarnings(files).empty());
     }
 }
+
+TEST_CASE("DaemonSecretFiles: every path-valued flag is classified, secret or not", "[config][secret]")
+{
+    // **The coverage guard, and it is mandatory rather than opt-in.** A list that is
+    // exact about the flags it knows and silent about the ones it does not reads
+    // identically to complete coverage (#492), which is the failure #752 describes:
+    // answering the narrow half while looking complete. So a seventh `=<path>` row
+    // cannot be added to `CliOptions()` without its author saying which kind it is.
+    //
+    // The join itself is `Testing::ClassifyPathFlags`, shared with the worker's twin --
+    // one rule asked of two option tables, rather than two Catch2 cases that would
+    // drift on which directions they check.
+    auto const secret = DaemonSecretFileTable();
+    auto const publicPaths = DaemonPublicPathFlags();
+    auto const coverage = FastCache::Testing::ClassifyPathFlags<CliResult>(
+        CliOptions(), FastCache::Testing::FlagsOf(secret), FastCache::Testing::FlagsOf(publicPaths));
+
+    SECTION("every =<path> row of CliOptions() is in exactly one table")
+    {
+        // Three assertions rather than one, because "nobody classified it", "both
+        // tables claim it" and "a table names a flag that no longer exists" are three
+        // different repairs. A single verdict would name none of them.
+        INFO("unclassified: " << FastCache::Testing::Join(coverage.unclassified));
+        CHECK(coverage.unclassified.empty());
+
+        INFO("classified twice: " << FastCache::Testing::Join(coverage.classifiedTwice));
+        CHECK(coverage.classifiedTwice.empty());
+
+        INFO("naming no row: " << FastCache::Testing::Join(coverage.namingNoRow));
+        CHECK(coverage.namingNoRow.empty());
+
+        // The positive control. A scan that matched nothing would leave all three
+        // lists empty and pass, and "no violations found" and "the scan found nothing
+        // to look at" are the two states this codebase keeps having to tell apart.
+        CHECK(coverage.pathRows > 0);
+        CHECK(coverage.pathRows == secret.size() + publicPaths.size());
+    }
+
+    SECTION("every public row says why, and --tls-cert is one of them")
+    {
+        for (auto const& row: publicPaths)
+        {
+            INFO("public row: " << row.flag);
+            // The reason is a forcing function, not a dead field: a blank one would
+            // spell "forgot" in the vocabulary of "decided".
+            CHECK_FALSE(row.why.empty());
+        }
+
+        // Decided explicitly rather than by omission, because it is the one an author
+        // would add by symmetry with `--tls-key`. A certificate is presented to every
+        // client during the handshake, so warning about the mode of a file that is
+        // MEANT to be readable is the alarm that teaches operators to ignore the one
+        // that matters.
+        CHECK(FastCache::Testing::Names(publicPaths, "--tls-cert"));
+        CHECK(FastCache::Testing::Names(secret, "--tls-key"));
+    }
+}
+
+TEST_CASE("DaemonSecretFiles: a path-reached secret is not provenance-gated", "[config][secret]")
+{
+    // **#752's design decision, on the daemon.** #384's rule is gated on provenance
+    // because `--requirepass` can also arrive in argv, where the exposure is `ps` and
+    // belongs to `InlineCredentialRejection`. A key FILE has no second route: the path
+    // is not the secret and the file is. Routing `--tls-key` through the provenance
+    // gate would silently skip every argv-named key, which is a change no test
+    // asserting merely that "some warning arrives" could see.
+    Config cfg;
+    cfg.tlsKeyPath = "/etc/fastcached/server.key";
+    cfg.tlsCertPath = "/etc/fastcached/server.crt";
+
+    SECTION("named in argv, with no configuration file at all")
+    {
+        // Both halves of the provenance gate answer "not this file's business" here,
+        // and the key must still be asked about.
+        CHECK(DaemonSecretFiles(cfg, /*secretNamedOnCommandLine*/ true)
+              == std::vector<std::filesystem::path> { cfg.tlsKeyPath });
+    }
+
+    SECTION("the certificate is never asked about")
+    {
+        auto const files = DaemonSecretFiles(cfg, false);
+        CHECK(std::ranges::find(files, std::filesystem::path { cfg.tlsCertPath }) == files.end());
+    }
+
+    SECTION("a key named with --tls off is still a key on disk")
+    {
+        // Whether a surface exists is not a fact about the configuration, so a rule
+        // whose premise is "somebody will read this" cannot state its premise without
+        // guessing. `tlsEnabled` is left false here deliberately.
+        REQUIRE_FALSE(cfg.tlsEnabled);
+        CHECK(DaemonSecretFiles(cfg, false) == std::vector<std::filesystem::path> { cfg.tlsKeyPath });
+    }
+
+    SECTION("an unnamed flag contributes nothing")
+    {
+        CHECK(DaemonSecretFiles(Config {}, false).empty());
+    }
+
+    SECTION("the configuration file comes first")
+    {
+        // It is the file an operator most often has open, and the order is the
+        // caller's rather than the filesystem's.
+        cfg.requirePass = "hunter2";
+        cfg.configPath = "/etc/fastcached/fastcached.yaml";
+        CHECK(DaemonSecretFiles(cfg, false)
+              == std::vector<std::filesystem::path> { std::filesystem::path { cfg.configPath }, cfg.tlsKeyPath });
+    }
+}
+
+#if !defined(_WIN32)
+
+TEST_CASE("DaemonSecretFiles: an exposed --tls-key warns and a private one does not", "[config][secret]")
+{
+    // **#864's acceptance, and the two halves are asserted separately.** A test that
+    // only showed the warning arriving would pass just as well against an
+    // implementation that warns about every key file it is handed, which is the alarm
+    // that gets the real one ignored.
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-daemon-tls-key" };
+    scratch.Write("server.key", "-----BEGIN PRIVATE KEY-----\n");
+    auto const key = scratch / "server.key";
+
+    Config cfg;
+    cfg.tlsKeyPath = key.string();
+
+    SECTION("world-readable warns, and says what to do")
+    {
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
+
+        auto const warnings = SecretFileWarnings(DaemonSecretFiles(cfg, false));
+        REQUIRE(warnings.size() == 1);
+        CHECK(warnings.front().contains(key.string()));
+        CHECK(warnings.front().contains("chmod o-r"));
+    }
+
+    SECTION("mode 0600 says nothing at all")
+    {
+        REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR) == 0);
+        CHECK(SecretFileWarnings(DaemonSecretFiles(cfg, false)).empty());
+    }
+}
+
+#endif

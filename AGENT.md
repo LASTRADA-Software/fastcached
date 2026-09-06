@@ -854,6 +854,13 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   FILE a protected list of its own (SYSTEM, Administrators, `NT AUTHORITY\SERVICE`
   read), not the MSI, which cannot reach a file that is not payload. An existing
   file is repaired only when it is *currently* broadly readable, never by content.
+- A secret reached BY PATH is not provenance-gated — the path is not the secret and
+  the file is — so `--tls-key`, `--cluster-key-file` and the two token files are asked
+  about however their paths were named, while `--requirepass` out of a config file
+  still is. Which `=<path>` rows are which is a TABLE per binary and classification is
+  MANDATORY (`--tls-cert` is named PUBLIC, not left off), because an opt-in list reads
+  identically to complete coverage. One subject list per binary
+  (`DaemonSecretFiles`, `NodeSecretFiles`), so a row reaches every moment that reads it.
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
 - Which flags carry text *other machines* will read is a column of that table
   (`ParseUtf8Text`). `--cluster-forget` is deliberately out of it, or a bad member

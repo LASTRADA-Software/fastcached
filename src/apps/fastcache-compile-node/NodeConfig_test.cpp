@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/PathFlagCoverage.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -3519,54 +3520,48 @@ TEST_CASE("NodeSecretFiles: every path-valued flag is classified, secret or not"
     // **The coverage guard, and it is mandatory rather than opt-in.** A list that is
     // exact about the flags it knows and silent about the ones it does not reads
     // identically to complete coverage (#492) -- and #752 is written about exactly
-    // that failure: answering the narrow half while looking complete. So a sixth
-    // `=<path>` row cannot be added without its author saying which kind it is.
+    // that failure: answering the narrow half while looking complete. So a further
+    // `=<path>` row cannot be added without its author saying which kind it is --
+    // `NodeOptions()` has nine of them today, four secret and five public.
+    //
+    // The join itself is `Testing::ClassifyPathFlags`, shared with the daemon's twin
+    // since [#864](https://github.com/LASTRADA-Software/fastcached/issues/864) gave
+    // that binary the same two tables -- one rule asked of two option tables, rather
+    // than two Catch2 cases that drift on which directions they check.
     auto const secret = NodeSecretFileTable();
     auto const publicPaths = NodePublicPathFlags();
-
-    // One predicate over either table rather than two lambdas differing only in which
-    // one they scan: the two halves of the XOR below have to stay in step, and two
-    // spellings of "is this flag in that table" is one more place for them to drift.
-    auto const names = [](auto const& table, std::string_view flag) {
-        return std::ranges::any_of(table, [flag](auto const& row) { return row.flag == flag; });
-    };
+    auto const coverage = FastCache::Testing::ClassifyPathFlags<NodeConfig>(
+        NodeOptions(), FastCache::Testing::FlagsOf(secret), FastCache::Testing::FlagsOf(publicPaths));
 
     SECTION("every =<path> row of NodeOptions() is in exactly one table")
     {
-        std::size_t pathRows = 0;
-        for (auto const& spec: NodeOptions())
-        {
-            if (spec.operand != "=<path>")
-                continue;
-            ++pathRows;
-            INFO("flag: " << spec.primary);
-            CHECK(names(secret, spec.primary) != names(publicPaths, spec.primary));
-        }
+        // Three assertions rather than one, because "nobody classified it", "both
+        // tables claim it" and "a table names a flag that no longer exists" are three
+        // different repairs. A single verdict would name none of them -- and the last
+        // is not decoration: a flag renamed in the option table leaves a row here
+        // naming nothing, and the file it used to cover goes unasked about with both
+        // tables still looking full.
+        INFO("unclassified: " << FastCache::Testing::Join(coverage.unclassified));
+        CHECK(coverage.unclassified.empty());
 
-        // The positive control. A scan that matched nothing would pass the loop above
-        // vacuously, and "no violations found" and "the scan found nothing to look at"
-        // are the two states this codebase keeps having to tell apart.
-        CHECK(pathRows == secret.size() + publicPaths.size());
-        CHECK(pathRows > 0);
+        INFO("classified twice: " << FastCache::Testing::Join(coverage.classifiedTwice));
+        CHECK(coverage.classifiedTwice.empty());
+
+        INFO("naming no row: " << FastCache::Testing::Join(coverage.namingNoRow));
+        CHECK(coverage.namingNoRow.empty());
+
+        // The positive control. A scan that matched nothing would leave all three
+        // lists empty and pass, and "no violations found" and "the scan found nothing
+        // to look at" are the two states this codebase keeps having to tell apart.
+        CHECK(coverage.pathRows > 0);
+        CHECK(coverage.pathRows == secret.size() + publicPaths.size());
     }
 
-    SECTION("every table entry names a row that exists")
+    SECTION("every public row says why")
     {
-        // The other direction, and it is not decoration: a flag renamed in the option
-        // table would otherwise leave a row here naming nothing, and the file it used
-        // to cover would go unasked about with both tables still looking full.
-        auto const isARow = [](std::string_view flag) {
-            return std::ranges::any_of(NodeOptions(), [flag](auto const& spec) { return spec.primary == flag; });
-        };
-        for (auto const& row: secret)
-        {
-            INFO("secret row: " << row.flag);
-            CHECK(isARow(row.flag));
-        }
         for (auto const& row: publicPaths)
         {
             INFO("public row: " << row.flag);
-            CHECK(isARow(row.flag));
             // The reason is a forcing function, not a dead field: a blank one would
             // spell "forgot" in the vocabulary of "decided".
             CHECK_FALSE(row.why.empty());
@@ -3580,8 +3575,8 @@ TEST_CASE("NodeSecretFiles: every path-valued flag is classified, secret or not"
         // client during the handshake, so warning about the mode of a file that is
         // MEANT to be readable is the alarm that teaches operators to ignore the four
         // that matter.
-        CHECK(names(publicPaths, "--tls-cert"));
-        CHECK(names(secret, "--tls-key"));
+        CHECK(FastCache::Testing::Names(publicPaths, "--tls-cert"));
+        CHECK(FastCache::Testing::Names(secret, "--tls-key"));
     }
 }
 
