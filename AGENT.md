@@ -770,6 +770,15 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   must clear anyway, so there is no line to forget it on, while `RequireReadBuffer`
   reads a parameter and changes nothing, so every site can omit it independently. Ride
   the guard on something the site must do; where you cannot, the scan is not optional.
+  **The author of that rule broke it one commit later, in the same branch** —
+  `ISocket::CancelRead`'s default no-op was inherited by TWO of six transports that
+  both park a read, which was #710 still live on the ticket that commit closed. Same
+  author, same hours, having just written the rule down: whoever reads this and
+  concludes *I would have noticed* is the next instance. And the fix for it is NOT
+  pure virtual — **reach for the type system when the obligation is DO SOMETHING,
+  reach for a scan when it is SAY WHY**; a pure virtual compels seven fakes to write
+  `{}` with no reason beside it, which is *forgot* in the vocabulary of *decided*
+  (#892).
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;

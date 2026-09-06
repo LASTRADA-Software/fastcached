@@ -1421,6 +1421,31 @@ Every rule below has already been a bug.
     Prefer the folded shape when the guard can ride on something the site must do;
     when it cannot, the scan is not optional, because the alternative is a rule
     enforced by everyone having remembered.
+    - **And the author of this rule broke it in the same branch, within hours.**
+      `ISocket::CancelRead` landed one commit later with a default no-op inherited
+      by TWO of six transports that both PARK a read -- `TlsSocket`, where
+      `PumpWaitReadable` parks on a RAW read whenever OpenSSL wants more bytes, and
+      `InMemorySocket`, whose `WaitReadable` never parks while its `Read` does. Both
+      were #710 still live, on the very ticket that commit closed. Recorded in this
+      shape deliberately: the comfortable reading of a rule broken next door is that
+      it never reached the person who broke it, and here it cannot be -- **same
+      author, same branch, same hours, having just written the rule down.** Whoever
+      reads this and concludes *I would have noticed* is the next instance.
+    - **A default that is correct for the transport you happen to be thinking about
+      is the dangerous kind**, and `InMemorySocket`'s asymmetry is why this one read
+      as safe. The obligation is now stated on the interface with both transports
+      named, and all six the library hands out answer it in their own file --
+      `BlockingSocket`'s answer is a written no-op WITH ITS REASON, which is the
+      distinction that matters.
+    - **Pure virtual was proposed for it and rejected, and the reason generalises:
+      reach for the type system when the obligation is DO SOMETHING; reach for a
+      scan when the obligation is SAY WHY.** `ClaimReadSlot` and `SigningDomain` are
+      the first kind -- there is nothing to say, only a thing to do -- which is why
+      the analogy felt right and was not. A pure virtual would compel seven test
+      doubles to write `{}` with no reason beside it, which is *forgot* spelled in
+      the vocabulary of *decided*: `RefuseWithoutCounter`'s own argument, pointed at
+      the proposal that invoked it. The scan is
+      [#892](https://github.com/LASTRADA-Software/fastcached/issues/892).
   - **And a canary watching one site is not coverage of six**, which is the trap an
     additive guard sets and a folded one does not. **A canary aborts at the FIRST
     violation, so it watches ONE site whatever it picks -- and which site is an
