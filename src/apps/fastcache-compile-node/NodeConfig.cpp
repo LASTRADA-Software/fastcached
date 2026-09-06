@@ -2269,6 +2269,22 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         { .refuses = [](NodeConfig const& c) { return c.toolchains.empty() && !c.toolchainDiscovery; },
           .message = "--no-toolchain-discovery was given and no --toolchain: a worker with none would register "
                      "and then refuse every job the scheduler sent it." },
+        // A cache the operator NAMED, on a node that serves no surface to reach it
+        // through. The tier already says so at Info and names the flags, which is
+        // better than the silence #229 was filed about -- but an operator who
+        // configured 64 GiB of cache and got none of it deserves a refusal, not a
+        // line at boot that scrolls away. `--cache-memory`'s default is not the
+        // subject: only an EXPLICIT one, plus a `--cache-dir` which has no default
+        // at all, so a node that asked for nothing still starts.
+        //
+        // A ROW here rather than a check in the tier, which `--install-service`
+        // returns long before reaching: the same registration would otherwise bake
+        // the mistake in and replay it at every boot, into a log nobody reads.
+        { .refuses =
+              [](NodeConfig const& c) { return (c.cacheMemoryExplicit || !c.cacheDir.empty()) && c.nodeListen.empty(); },
+          .message = "--cache-memory or --cache-dir was given with an empty --listen-node: the cache tier is "
+                     "served on the node surface, so with no port there is nothing to reach it through and the "
+                     "cache would be configured and unused. Give --listen-node a port, or drop the cache flags." },
         { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty(); },
           .message = "--serve-scheduler needs --fleet-member or --fleet-open: a scheduler with an empty member set "
                      "refuses every caller, which is the right default but not a working configuration. It would "
