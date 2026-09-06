@@ -2,13 +2,18 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <span>
@@ -16,6 +21,8 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+
+#include <tests/ScriptedSocket.hpp>
 
 namespace
 {
@@ -76,6 +83,41 @@ std::string Exchange(MetaFixture& fix, std::string_view req)
 }
 
 } // namespace
+
+TEST_CASE("meta ms keeps its own source tag across the payload read", "[protocol][meta][ms][logsource]")
+{
+    // #919. HandleMs suspends twice reading the payload, so another connection
+    // can run on this reactor thread and overwrite the thread-local source tag
+    // before the engine call TracingStorage logs. MemcachedText's `set` path
+    // re-publishes against exactly this hazard and says so in a comment; the
+    // meta sibling never got it.
+    //
+    // The read hook IS the other connection. A single-connection test cannot
+    // reach this and passes under the bug, which is why the fixture above --
+    // which drives whole conversations -- could never have caught it.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage inner;
+    FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
+    FastCache::TracingStorage tracer { inner, logger, clock };
+    FastCache::CacheEngine engine { tracer, clock };
+
+    auto const bytes = FastCache::AsBytes(std::string_view { "foo\r\n" });
+    FastCache::Testing::ScriptedSocket socket { std::vector<std::byte> { bytes.begin(), bytes.end() } };
+    socket.SetOnRead([] { FastCache::Detail::storageSourceTag = "[198.51.100.9]"; });
+
+    FastCache::ByteReader reader { socket, 1024, 1024, 256 };
+
+    FastCache::Detail::storageSourceTag = "[203.0.113.7]";
+    std::array<std::string_view, 2> const args { "k", "3" };
+    REQUIRE(FastCache::SyncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
+    FastCache::Detail::storageSourceTag = {};
+
+    auto const records = logger.Snapshot();
+    REQUIRE(!records.empty());
+    // Ours, not the interloper's. Asserting the PREFIX rather than that a line
+    // exists: both states emit one, and both name a plausible client.
+    REQUIRE(records[0].message.starts_with("[203.0.113.7] storage: "));
+}
 
 TEST_CASE("meta mn returns MN", "[protocol][meta]")
 {

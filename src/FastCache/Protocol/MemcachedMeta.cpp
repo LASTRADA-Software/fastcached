@@ -3,6 +3,7 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedShared.hpp>
 
@@ -594,6 +595,17 @@ namespace
         auto const flagTokens = args.subspan(2);
         auto const f = ParseSetFlags(flagTokens);
 
+        // Keep this connection's source tag across the reads below. They are
+        // co_await points, so another connection can run on this reactor thread
+        // and overwrite the thread-local before the engine calls further down --
+        // the same hazard MemcachedText's `set` path re-publishes against, which
+        // this sibling never got (#919). `ms` is the only meta verb carrying a
+        // payload, so it is the only one that suspends before storage.
+        //
+        // Copying is sound only because the tag OWNS since #906; while it was a
+        // string_view, saving it saved a dangling pointer and restored it intact.
+        auto const ourSourceTag = Detail::storageSourceTag;
+
         // Read the payload + trailing CRLF.
         auto payload = co_await reader->ReadExactly(datalen);
         if (!payload.has_value())
@@ -601,6 +613,11 @@ namespace
         auto trailing = co_await reader->ReadExactly(2);
         if (!trailing.has_value())
             co_return co_await WriteAll(socket, "CLIENT_ERROR missing CRLF\r\n");
+
+        // Restore it before the storage calls: everything from here to the
+        // engine call is co_await-free, so the tag stays ours for the line
+        // TracingStorage emits.
+        Detail::storageSourceTag = ourSourceTag;
 
         auto const exptime = f.hasTtl ? f.ttl : 0U;
         auto const flagsValue = f.hasFlags ? f.flags : 0U;
