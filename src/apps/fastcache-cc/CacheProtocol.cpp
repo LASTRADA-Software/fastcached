@@ -20,14 +20,25 @@ namespace
     {
         CacheOutcome outcome;
         outcome.kind = kind;
+        // `transportFailure` is seeded `Unreached` so an exchange that never ran
+        // cannot read as a peer that was contacted and lost -- see the field. That
+        // seeding is right and stays; what was missing is the other half. Once a
+        // kind is DECIDED, a non-Transport outcome has no transport failure, and
+        // the field went on claiming `Unreached` on every hit, miss and refusal
+        // while documenting itself as `None` for exactly those (#732).
+        //
+        // Cleared HERE, the one place all three builders pass through, rather than
+        // at three sites that can each forget it -- and a fourth builder gets it by
+        // construction instead of by remembering.
+        if (kind != CacheOutcomeKind::Transport)
+            outcome.transportFailure = TransportFailure::None;
         return outcome;
     }
 
     /// Build a Hit outcome around the served bytes.
     [[nodiscard]] CacheOutcome Hit(std::vector<std::byte> value)
     {
-        CacheOutcome outcome;
-        outcome.kind = CacheOutcomeKind::Hit;
+        auto outcome = Plain(CacheOutcomeKind::Hit);
         outcome.value = std::move(value);
         return outcome;
     }
@@ -35,8 +46,7 @@ namespace
     /// Build a Rejected outcome carrying the daemon's own reason.
     [[nodiscard]] CacheOutcome Rejected(Wire::ErrorCode code, std::string message)
     {
-        CacheOutcome outcome;
-        outcome.kind = CacheOutcomeKind::Rejected;
+        auto outcome = Plain(CacheOutcomeKind::Rejected);
         outcome.code = code;
         outcome.message = std::move(message);
         return outcome;

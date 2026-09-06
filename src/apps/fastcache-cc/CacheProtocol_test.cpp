@@ -108,6 +108,45 @@ TEST_CASE("A progress frame is stepped over, and the answer behind it is the out
     CHECK(liveness.Moves() == 4);
 }
 
+TEST_CASE("A decided outcome carries no transport failure")
+{
+    // #732. `transportFailure` documents itself as `None` for every outcome that
+    // is not a Transport failure, and held `Unreached` on every hit, miss and
+    // refusal -- the three builders default-constructed and set only `kind`.
+    //
+    // Asserted for all three DECIDED kinds, because a fix applied at whichever
+    // one a reader happened to look at would pass a test written for that one.
+    auto const object = std::vector<std::byte> { std::byte { 0x01 } };
+
+    {
+        Testing::ScriptedSocket client { Stream({ Wire::EncodeReply(Wire::Status::Ok, object) }) };
+        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        CHECK(outcome.kind == CacheOutcomeKind::Hit);
+        CHECK(outcome.transportFailure == TransportFailure::None);
+    }
+    {
+        Testing::ScriptedSocket client { Stream({ Wire::EncodeReply(Wire::Status::Miss, {}) }) };
+        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        CHECK(outcome.kind != CacheOutcomeKind::Transport);
+        CHECK(outcome.transportFailure == TransportFailure::None);
+    }
+    {
+        Testing::ScriptedSocket client { Stream(
+            { Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion, "too old") }) };
+        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        CHECK(outcome.kind == CacheOutcomeKind::Rejected);
+        CHECK(outcome.transportFailure == TransportFailure::None);
+    }
+
+    // And the seeding this must NOT undo: a default-constructed outcome is an
+    // exchange that never ran, which reads as `Unreached` and never as a peer
+    // that was contacted and lost. Without this the fix could be "default it to
+    // None", which passes everything above and reintroduces what the field's
+    // comment exists to prevent.
+    CacheOutcome const neverRan;
+    CHECK(neverRan.transportFailure == TransportFailure::Unreached);
+}
+
 TEST_CASE("A refusal behind a progress frame is still the refusal")
 {
     // The pulse says nothing about the OUTCOME, so it must not colour it: a worker
