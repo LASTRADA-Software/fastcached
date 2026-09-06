@@ -939,6 +939,25 @@ set_tests_properties("workflow-script-invocations-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# `scripts/flake-rate.sh` keeps a tally, and its own self-test proves it (#735).
+#
+# `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as
+# `100% tests passed` -- measured, six consecutive green full-suite runs over a
+# live flake, which a counting loop found on the first try. The tool used to HUNT
+# flakes reports success in proportion to how rare the defect is.
+#
+# The cases stage a deterministic 1-in-5 failure, which is the one input where a
+# tally and a last-read DISAGREE: over `true` or over `false` the two agree, so a
+# self-test built on either would pass under the bug.
+add_test(
+    NAME "flake-rate-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/flake-rate.sh" --self-test
+)
+set_tests_properties("flake-rate-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

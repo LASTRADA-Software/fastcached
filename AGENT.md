@@ -1673,6 +1673,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
+- `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as
+  `100% tests passed` — measured, six consecutive green runs over a live flake, found on
+  the first try by a loop that counted. `scripts/flake-rate.sh` keeps a tally, keeps the
+  early stop, and states its N on every line, because a stability claim without one
+  invites the inference it cannot support.
 - **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found FIVE tests that
   could not fail for the reason they existed — five shapes, all green, three of them acceptance criteria written by
   whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
