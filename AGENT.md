@@ -1510,6 +1510,21 @@ what differs between compilers, standard libraries, hosts and tool versions.
   OFF, which is a database no correction to the configure line explains. That is one
   of #454's two halves, and **a symptom with two mechanisms reads as unreproducible
   the moment either one alone is ruled out.**
+- **When the SUBJECT under test is the build environment, a green local gate is not weak
+  evidence — it is none.** One change, one afternoon, four platform defects, none visible
+  locally: a `/_deps/` DENYLIST that CI's in-repo CPM cache walked past (an exclusion list
+  bets on the world's layout; an inclusion list states your own), a POSIX shell stub
+  spawned by Python on Windows (**ENOEXEC**), a heredoc inside `$( )` that bash 3.2 cannot
+  PARSE, and Git Bash rewriting `clang-cl … /nologo` into
+  `'C:/Program Files/Git/nologo'` — `MSYS2_ARG_CONV_EXCL='*'` **and** `MSYS_NO_PATHCONV=1`,
+  both spellings, always. The mangling was the LUCKY half: the same GNU-only strip left
+  `/c` and `/Fo<obj>` standing, which SUCCEEDS — preprocessed text into the object file,
+  empty stdout, an honest `empty` rather than `unknown`, and a coverage check reporting
+  **CLEAN over the six files it exists to read**. Drop flags from a TABLE keyed on the
+  driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
+  report clean over a member it could not cover — `--all` chose its own set, `--only` was
+  handed one. Knowing a rule and having just applied it is not protection: the ENOEXEC was
+  the same author's own fix from three hours earlier, in a file written afterwards.
 
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
