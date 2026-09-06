@@ -1179,7 +1179,16 @@ int DaemonBody(FastCache::Config const& effective,
     int const exitCode = FastCache::RunReactorServer(serverOpts, engine, logger, /*admission*/ nullptr, &metrics);
 
     if (adminServer)
-        adminServer->Shutdown(); // unblocks the admin accept loop so adminThread joins
+    {
+        // Ask, join, then close -- the same ordering `AdminEndpoint::~AdminEndpoint`
+        // documents (#260). Shutdown() alone closes the listener while this thread's
+        // accept loop may be reading it, which is a data race whatever the suite says.
+        // The loop leaves within one `AcceptPoll` of the flag, so the join is bounded.
+        adminServer->RequestStop();
+        if (adminThread.joinable())
+            adminThread.join();
+        adminServer->Shutdown();
+    }
     reloaderQuit.store(true, std::memory_order_release);
     return exitCode;
 }

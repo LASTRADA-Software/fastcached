@@ -33,15 +33,3 @@
 #
 # Format: https://clang.llvm.org/docs/ThreadSanitizerFlags.html
 
-# https://github.com/LASTRADA-Software/fastcached/issues/260
-#
-# `AdminEndpoint` closes its listener from the main thread while its own accept
-# thread is still inside `Accept()`. Reported 6 times from one underlying race,
-# entirely within `AdminEndpoint` construction and teardown. This is the shape the
-# rulebook already records for sockets -- "Close() can be the last thing that runs
-# on a socket, so it must touch no member after it completes an awaitable" --
-# arriving from the thread side rather than the coroutine side.
-#
-# Found by the first ThreadSanitizer run ever done on this tree, which is the
-# argument for this gate existing at all.
-race_top:FastCache::BlockingListener::Close

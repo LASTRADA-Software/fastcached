@@ -835,9 +835,23 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
 
 AdminEndpoint::~AdminEndpoint()
 {
-    // Order, not tidiness: closing the listener is what returns `Run()`, and the
-    // jthread destructor that follows joins a loop which would otherwise still be
-    // parked in `accept()`.
+    // Order, and the order is the whole fix (#260).
+    //
+    // This used to be `_server->Shutdown()` alone, leaving the jthread destructor
+    // to join afterwards. Shutdown() CLOSES the listener, which writes a member the
+    // accept thread reads on every pass -- ThreadSanitizer reports it as a data race
+    // at `BlockingListener::Close`, and the whole suite passes straight through it.
+    //
+    // Closing was never what wakes the loop: POSIX does not unblock a parked
+    // `accept()` when another thread closes the socket, which is precisely why
+    // `Start` arms `AdminHttpServer::AcceptPoll` through
+    // `BlockingListener::SetTimeouts`. The loop therefore leaves on its own within
+    // one poll interval of the flag being set, and waiting for it costs at most
+    // that -- so ask it to stop, JOIN, and only then close, at which point nobody
+    // is inside `Accept()` and there is nothing left to race.
+    _server->RequestStop();
+    if (_thread.joinable())
+        _thread.join();
     _server->Shutdown();
 }
 
