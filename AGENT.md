@@ -187,6 +187,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
+- A stored value's `/showIncludes` region is canonicalized only if the grammar can FIND
+  a note, and `Grammar::ShowIncludes` matched the literal English marker at column zero
+  — so a localized `cl` (#879) and any note `cl` INDENTED by inclusion depth (#891) were
+  stored carrying the producing checkout's absolute paths, with every server agreeing
+  perfectly about nothing. Generation 3. The MARKER is a canonical form exactly as
+  `<SRCROOT>` is: the LAUNCHER normalizes its own prefix to `IncludeNoteMarker` before
+  storing and restores this build's after localizing, so the stored bytes are locale-free
+  and no server changed. Only the producer knows its own language, which is what forces
+  that. The restore runs AFTER the stale-hit guard, which reads the canonical marker.
+  Recognition is anchored — leading blanks only — through one `IncludeNoteMarkerEnd`,
+  because the diagnostic stream carries the same tag and `SplitIncludeNotes` runs over
+  text that is also preprocessed SOURCE. A localized toolchain that names no prefix is
+  unchanged rather than worse, and is #878, which needs no further generation.
 - Reading `/showIncludes` and WRITING it are different questions and must not be
   consolidated. The reader matches `IncludeNoteMarker`; a dispatched compile's
   synthesised notes must match the BUILD's `msvc_deps_prefix`, which CMake took from

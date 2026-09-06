@@ -114,10 +114,10 @@ TEST_CASE("The generation byte is pinned by value, not only by name")
     // like, and it is expected to be edited by a deliberate generation bump -- which
     // is exactly the moment somebody should have to think about it.
     //
-    // Generation 2 since #547.
+    // Generation 3 since #879 / #891.
     auto const encoded = EncodeCompileValue(CompileValue {});
     REQUIRE_FALSE(encoded.empty());
-    CHECK(encoded.front() == std::byte { 2 });
+    CHECK(encoded.front() == std::byte { 3 });
 }
 
 TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
@@ -460,13 +460,77 @@ struct ConformanceCase
     std::string_view producerBuildTree;  ///< `<BUILDTREE>` on the producing machine.
     std::string_view consumerSourceRoot; ///< `<SRCROOT>` on the consuming machine.
     std::string_view consumerBuildTree;  ///< `<BUILDTREE>` on the consuming machine.
-    std::string_view text;               ///< The captured region, exactly as a driver wrote it.
+    /// The prefix the PRODUCER's `/showIncludes` notes carry, i.e. its
+    /// `msvc_deps_prefix`. `PathCanon::IncludeNoteMarker` for a machine whose
+    /// toolchain speaks English, which is every row that predates #879.
+    std::string_view producerMarker { PathCanon::IncludeNoteMarker };
+    /// The prefix the CONSUMER's build matches. A row where this differs from
+    /// `producerMarker` is two machines in different UI languages sharing a cache,
+    /// which is the case #700 introduced and #879 closes.
+    std::string_view consumerMarker { PathCanon::IncludeNoteMarker };
+    std::string_view text; ///< The captured region, exactly as a driver wrote it.
     // The byte-wide members sit together at the end, which is this tree's layout rule
     // wherever a struct mixes them with wider ones.
-    Grammar grammar;             ///< Which grammar locates path spans in `text`.
-    RegionEffect producerEffect; ///< What canonicalization must do to `text`.
+    Grammar grammar; ///< Which grammar locates path spans in `text`.
+    /// What normalizing the producer's marker must do to `text`. Defaulted to
+    /// `Preserves` beside `producerMarker`'s own default, and the pair is the point:
+    /// a row that says nothing about markers is CLAIMING to be about something else,
+    /// and this column is what holds it to that rather than letting it pass silently.
+    RegionEffect storeMarkerEffect { RegionEffect::Preserves };
+    RegionEffect producerEffect; ///< What canonicalization must do to the normalized text.
     RegionEffect consumerEffect; ///< What localization must do to the canonical form.
+    /// What restoring the consumer's marker must do to the localized text. Its own
+    /// column rather than sharing `storeMarkerEffect`, because the two sides are
+    /// independent — a value produced in German and replayed in English rewrites on
+    /// one side only, and that asymmetry IS #700's peer edge.
+    RegionEffect replayMarkerEffect { RegionEffect::Preserves };
 };
+
+/// One row driven through the whole stored-value pipeline, stage by stage.
+///
+/// Both the digest and the per-row effect assertions need these, and they need the
+/// SAME ones: a digest taken over one pipeline while the effects are asserted against
+/// another is two claims about two things wearing one name. Four stages rather than
+/// two since #879, because the marker is a canonical form as much as `<SRCROOT>` is
+/// and the launcher's two rewrites are where a fleet agrees about it.
+struct PipelineTrace
+{
+    std::string normalized;             ///< Producer's marker rewritten to the canonical one.
+    std::vector<std::byte> storedBytes; ///< What a server holds: the canonical value, framing included.
+    std::string canonical;              ///< The stored region's text alone.
+    std::string localized;              ///< Paths localized into the consumer's roots.
+    std::string replayed;               ///< Canonical marker rewritten to the consumer's own.
+};
+
+/// Run one row through producer-normalize, canonicalize, localize and
+/// replay-restore.
+/// @param row The corpus row.
+/// @return Every stage's output.
+[[nodiscard]] PipelineTrace RunConformanceRow(ConformanceCase const& row)
+{
+    PipelineTrace trace;
+    trace.normalized = PathCanon::RewriteIncludeNoteMarker(row.text, row.producerMarker, PathCanon::IncludeNoteMarker);
+
+    CompileValue produced;
+    // A real object blob, because the contract includes leaving it untouched.
+    produced.objectBlob = { std::byte { 0x7F }, std::byte { 0x45 }, std::byte { 0x4C }, std::byte { 0x46 } };
+    produced.textRegions.push_back(TextRegion { .grammar = row.grammar, .bytes = trace.normalized });
+
+    auto const canonical = CanonicalStoredValue(EncodeCompileValue(produced), row.producerSourceRoot, row.producerBuildTree);
+    REQUIRE(canonical.outcome == CanonicalizationOutcome::Canonicalized);
+    trace.storedBytes = canonical.bytes;
+
+    auto const stored = DecodeCompileValue(canonical.bytes);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->textRegions.size() == 1);
+    trace.canonical = stored->textRegions.front().bytes;
+
+    PathCanon::Layout const consumer { .sourceRoot = std::string { row.consumerSourceRoot },
+                                       .buildTree = std::string { row.consumerBuildTree } };
+    trace.localized = PathCanon::LocalizeRegion(trace.canonical, row.grammar, consumer);
+    trace.replayed = PathCanon::RewriteIncludeNoteMarker(trace.localized, PathCanon::IncludeNoteMarker, row.consumerMarker);
+    return trace;
+}
 
 /// The corpus the stored-value contract is digested over.
 ///
@@ -667,6 +731,101 @@ constexpr std::array ConformanceCorpus {
                       .grammar = Grammar::ShowIncludes,
                       .producerEffect = RegionEffect::Rewrites,
                       .consumerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "a localized producer normalizes its marker, and an English consumer matches it",
+                      // #879's first half, and the shape #229 records. Before the
+                      // marker was a canonical form the grammar found no note here at
+                      // all, so the region was stored with `/home/dev/proj` still in
+                      // it and every consumer replayed the producing checkout.
+                      //
+                      // The consumer is deliberately ENGLISH rather than a mirror of
+                      // the producer: that is #700's peer edge, where a machine
+                      // setting FASTCACHE_MSVC_DEPS_PREFIX made previously-healthy
+                      // differently-localized peers under-rebuild. Both marker
+                      // columns are asserted, so a row that stopped rewriting on
+                      // EITHER side is a failure and not a quieter pass.
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .producerMarker = "Hinweis: Einlesen der Datei:",
+                      .text = "Hinweis: Einlesen der Datei: /home/dev/proj/inc/a.hpp\r\n"
+                              "Hinweis: Einlesen der Datei: /usr/include/stdio.h\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Rewrites,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites,
+                      .replayMarkerEffect = RegionEffect::Preserves },
+    ConformanceCase { .name = "an English producer's value replays under a localized consumer's marker",
+                      // The mirror, and it is not decoration: the two rewrites are
+                      // separate calls in separate binaries -- the store side runs
+                      // before the value leaves the launcher, the replay side after
+                      // the stale-hit guard -- so a fix to one says nothing about the
+                      // other. Without this row `replayMarkerEffect` would be
+                      // `Preserves` everywhere and could never fail.
+                      .producerSourceRoot = R"(C:\src\proj)",
+                      .producerBuildTree = R"(C:\src\proj\out)",
+                      .consumerSourceRoot = R"(D:\work\proj)",
+                      .consumerBuildTree = R"(D:\work\proj\build)",
+                      .consumerMarker = "Hinweis: Einlesen der Datei:",
+                      .text = "Note: including file: C:\\src\\proj\\inc\\a.hpp\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Preserves,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites,
+                      .replayMarkerEffect = RegionEffect::Rewrites },
+    ConformanceCase { .name = "an indented note canonicalizes, and its depth survives",
+                      // #891, and it needs no language pack: `cl` indents a note by
+                      // inclusion depth, so this is what a note for anything a header
+                      // pulls in transitively looks like. The grammar demanded the
+                      // marker at column zero while `IncludeNotePath` already skipped
+                      // blanks, so the launcher's reader found these paths and the
+                      // canonicalizer did not.
+                      //
+                      // The first line is at depth zero deliberately -- the control,
+                      // in the same region as the thing it controls, so "recognise an
+                      // indented note" and "recognise a note at all" cannot be one
+                      // passing assertion. Both must rewrite, and the tabs and spaces
+                      // between them must come through untouched.
+                      .producerSourceRoot = R"(C:\ci\deep\src)",
+                      .producerBuildTree = R"(C:\ci\deep\build)",
+                      .consumerSourceRoot = R"(D:\project)",
+                      .consumerBuildTree = R"(D:\project\build)",
+                      .text = "Note: including file: "
+                              R"(C:\ci\deep\src\a.h)"
+                              "\r\n"
+                              " Note: including file: "
+                              R"(C:\ci\deep\src\b.h)"
+                              "\r\n"
+                              "\t  Note: including file: "
+                              R"(C:\ci\deep\build\gen\cfg.h)"
+                              "\r\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Preserves,
+                      .producerEffect = RegionEffect::Rewrites,
+                      .consumerEffect = RegionEffect::Rewrites,
+                      .replayMarkerEffect = RegionEffect::Preserves },
+    ConformanceCase { .name = "a diagnostic quoting the marker mid-line is not a note",
+                      // The anchor, on the side that matters. Both regions a launcher
+                      // stores are tagged `ShowIncludes` and one of them is the
+                      // DIAGNOSTIC stream, so a marker rule matching anywhere in a
+                      // line would rewrite a path a compiler merely quoted -- and on
+                      // the launcher's side of the same rule it would delete an
+                      // ordinary source line from the bytes the key is hashed over.
+                      //
+                      // Preserves on every side, and that is the assertion: the path
+                      // in it lies under the producer's source root, so a grammar
+                      // that matched would canonicalize it and this row would fail on
+                      // `producerEffect` rather than merely not fire.
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "warning: the string \"Note: including file: /home/dev/proj/inc/a.hpp\" is unused\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Preserves,
+                      .producerEffect = RegionEffect::Preserves,
+                      .consumerEffect = RegionEffect::Preserves,
+                      .replayMarkerEffect = RegionEffect::Preserves },
     ConformanceCase { .name = "empty region",
                       .producerSourceRoot = "/home/dev/proj",
                       .producerBuildTree = "/home/dev/proj/build",
@@ -713,7 +872,12 @@ constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
     // producer side and doubled its separator on the consumer side.
     StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
+    // Generation 2 is RETIRED (#879, #891): `Grammar::ShowIncludes` matched only the
+    // literal English marker, at column zero, so a localized `cl` and an indented
+    // note both canonicalized to nothing and their regions kept the producing
+    // checkout's absolute paths.
     StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
+    StoredValueGeneration { .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e", .version = 3 },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
@@ -743,30 +907,22 @@ constexpr std::array StoredValueGenerations {
 
     for (auto const& row: ConformanceCorpus)
     {
-        // A real object blob, because the contract includes leaving it untouched.
-        CompileValue produced;
-        produced.objectBlob = { std::byte { 0x7F }, std::byte { 0x45 }, std::byte { 0x4C }, std::byte { 0x46 } };
-        produced.textRegions.push_back(TextRegion { .grammar = row.grammar, .bytes = std::string { row.text } });
-
-        auto const canonical =
-            CanonicalStoredValue(EncodeCompileValue(produced), row.producerSourceRoot, row.producerBuildTree);
-        REQUIRE(canonical.outcome == CanonicalizationOutcome::Canonicalized);
+        auto const trace = RunConformanceRow(row);
 
         // The STORED bytes, framing included: what one server writes and another
         // reads is this exact byte string, so this is the thing two generations
-        // have to agree about.
-        append(canonical.bytes);
+        // have to agree about. It is downstream of the producer's marker
+        // normalization, which is why that rewrite is inside the digest at all --
+        // two builds normalizing differently would put different bytes here under
+        // one generation, which is the failure this vector exists for.
+        append(trace.storedBytes);
 
-        auto const stored = DecodeCompileValue(canonical.bytes);
-        REQUIRE(stored.has_value());
-
-        // And the consumer's half. Localize is the inverse the producer's rewrite is
-        // only useful through, so a change to it splits a fleet exactly as a change
-        // to Canonicalize does.
-        PathCanon::Layout const consumer { .sourceRoot = std::string { row.consumerSourceRoot },
-                                           .buildTree = std::string { row.consumerBuildTree } };
-        for (auto const& region: stored->textRegions)
-            appendText(PathCanon::LocalizeRegion(region.bytes, region.grammar, consumer));
+        // And the consumer's half, all the way to what the build system actually
+        // reads. Localize is the inverse the producer's rewrite is only useful
+        // through, so a change to it splits a fleet exactly as a change to
+        // Canonicalize does -- and the marker restore after it is the same argument
+        // one field over.
+        appendText(trace.replayed);
     }
 
     return HexDigest(Sha256::Hash(material));
@@ -902,37 +1058,37 @@ TEST_CASE("Every conformance row does what it says on each side")
     // which is what happened to the bare-root row added in #483 and repaired in
     // #547. Declaring the effect per side, rather than requiring every row to change
     // something, is what keeps the two DELIBERATE no-ops honest instead of waived.
+    // Four stages, four columns, and each is asserted where it happens. The two
+    // marker stages are separate calls in separate binaries -- the store side runs in
+    // the launcher before a value is sent, the replay side after the stale-hit guard
+    // has read the canonical marker -- so one column could not honestly cover both.
     for (auto const& row: ConformanceCorpus)
     {
-        CompileValue produced;
-        produced.objectBlob = { std::byte { 0x7F } };
-        produced.textRegions.push_back(TextRegion { .grammar = row.grammar, .bytes = std::string { row.text } });
-
-        auto const canonical =
-            CanonicalStoredValue(EncodeCompileValue(produced), row.producerSourceRoot, row.producerBuildTree);
-        REQUIRE(canonical.outcome == CanonicalizationOutcome::Canonicalized);
-        auto const stored = DecodeCompileValue(canonical.bytes);
-        REQUIRE(stored.has_value());
-        REQUIRE(stored->textRegions.size() == 1);
-        auto const& canonText = stored->textRegions.front().bytes;
-
-        PathCanon::Layout const consumer { .sourceRoot = std::string { row.consumerSourceRoot },
-                                           .buildTree = std::string { row.consumerBuildTree } };
-        auto const localized = PathCanon::LocalizeRegion(canonText, row.grammar, consumer);
+        auto const trace = RunConformanceRow(row);
 
         auto const observed = [](bool changed) {
             return changed ? RegionEffect::Rewrites : RegionEffect::Preserves;
         };
 
+        INFO("row \"" << row.name << "\" declares storeMarkerEffect=" << NameOf(row.storeMarkerEffect)
+                      << " but normalizing the producer's marker "
+                      << (trace.normalized != row.text ? "CHANGED" : "did not change") << " the text.");
+        CHECK(observed(trace.normalized != row.text) == row.storeMarkerEffect);
+
         INFO("row \"" << row.name << "\" declares producerEffect=" << NameOf(row.producerEffect) << " but canonicalization "
-                      << (canonText != row.text ? "CHANGED" : "did not change")
+                      << (trace.canonical != trace.normalized ? "CHANGED" : "did not change")
                       << " the text. A row that rewrites nothing asserts nothing, and the digest cannot see the "
                          "difference.");
-        CHECK(observed(canonText != row.text) == row.producerEffect);
+        CHECK(observed(trace.canonical != trace.normalized) == row.producerEffect);
 
         INFO("row \"" << row.name << "\" declares consumerEffect=" << NameOf(row.consumerEffect) << " but localization "
-                      << (localized != canonText ? "CHANGED" : "did not change") << " the canonical text.");
-        CHECK(observed(localized != canonText) == row.consumerEffect);
+                      << (trace.localized != trace.canonical ? "CHANGED" : "did not change") << " the canonical text.");
+        CHECK(observed(trace.localized != trace.canonical) == row.consumerEffect);
+
+        INFO("row \"" << row.name << "\" declares replayMarkerEffect=" << NameOf(row.replayMarkerEffect)
+                      << " but restoring the consumer's marker "
+                      << (trace.replayed != trace.localized ? "CHANGED" : "did not change") << " the localized text.");
+        CHECK(observed(trace.replayed != trace.localized) == row.replayMarkerEffect);
     }
 }
 

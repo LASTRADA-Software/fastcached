@@ -52,6 +52,43 @@ enum class Grammar : std::uint8_t
     GccDepfile,      ///< GCC/Clang `-MF` depfile: `target: dep dep \` continuation.
 };
 
+/// The marker a `/showIncludes` note carries **in a stored value**.
+///
+/// It is a canonical form in exactly the sense `<SRCROOT>` is, and that is a
+/// stronger statement than "the string an English `cl` prints". A note's prefix is
+/// what Ninja matches under `deps = msvc`, it is `msvc_deps_prefix` rather than
+/// anything this project chose, and a Visual Studio carrying a language pack makes
+/// it a translated sentence
+/// ([#700](https://github.com/LASTRADA-Software/fastcached/issues/700)). So a
+/// producer whose notes carry another prefix rewrites them to this one on the way
+/// into the cache and a consumer rewrites them back to its own on the way out —
+/// `RewriteIncludeNoteMarker`, both directions — and everything in between, this
+/// file and both servers included, only ever sees this spelling.
+///
+/// **Why the stored form is normalized rather than labelled.** The alternative was
+/// to carry the producer's prefix as a field of the region and have every reader
+/// honour it. That puts a second variable into the one place two machines have to
+/// agree byte-for-byte, and it buys nothing: the consumer has to re-render the
+/// prefix into its OWN build's spelling regardless, because what it replays must
+/// match ITS `msvc_deps_prefix` and not the producer's. Normalizing makes the
+/// stored bytes independent of both machines' locales, which is the property the
+/// canonicalization spec already has for roots.
+///
+/// **The launcher does the rewriting, and that is forced rather than chosen.** Only
+/// the producing machine knows which language its own notes are in; a server
+/// canonicalizing a STORE cannot recover it from the bytes and an environment
+/// variable on the CONSUMER answers a different question entirely. So the value
+/// arrives already normalized, and "every server on this wire canonicalizes
+/// identically" keeps holding by construction — which is why closing
+/// [#879](https://github.com/LASTRADA-Software/fastcached/issues/879) moved
+/// `CompileValueVersion` and changed neither server.
+///
+/// Spelled HERE rather than in the launcher, though `Cc::IncludeNoteMarker` is the
+/// name most callers reach it by. `SplitLine` had a private copy of the same
+/// literal one layer down, so the grammar and the launcher's two readers were three
+/// spellings of one wire constant that nothing made agree.
+inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
+
 /// True for an ASCII letter — the only thing a Windows drive specifier may start
 /// with, and the single definition of that rule.
 ///
@@ -299,5 +336,70 @@ using PathTransform = std::function<std::string(std::string_view)>;
 /// @param layout  The consuming machine's roots.
 /// @return The region with tokens replaced by localized native paths.
 [[nodiscard]] std::string LocalizeRegion(std::string_view text, Grammar grammar, Layout const& layout);
+
+/// Re-spell the marker every `/showIncludes` note in @p text begins with.
+///
+/// The marker half of the stored-value contract: a producer calls this with its own
+/// prefix and `IncludeNoteMarker` before a value is stored, a consumer calls it the
+/// other way round after localizing, and the bytes in between are locale-free. See
+/// `IncludeNoteMarker` for why the stored form is normalized rather than labelled,
+/// and `CompileValueVersion` for the generation that names this rule.
+///
+/// **A note is recognised exactly as `SplitLine` recognises one** — anchored at the
+/// start of the line after leading blanks and nothing else — because the two have to
+/// agree about which lines are notes. A line the path grammar rewrote and this
+/// function did not would carry a canonical `<SRCROOT>` token under a prefix no
+/// consumer can find, and the reverse would rewrite the prefix of a line whose path
+/// was never canonicalized. Loosening the anchor is what must not happen: both
+/// regions the launcher stores are tagged `ShowIncludes`, and one of them is the
+/// DIAGNOSTIC stream, so a rule matching anywhere in a line rewrites text a compiler
+/// merely quoted.
+///
+/// Everything but the marker survives byte-for-byte: the indentation `cl` uses for
+/// inclusion depth, the blanks between marker and path, the path, and either line
+/// ending. It is a pure text substitution and asks nothing of the filesystem, so it
+/// runs identically on every host — the property the whole of this file has.
+///
+/// @param text The region bytes.
+/// @param from The marker to look for. An empty view matches nothing, so a caller
+///             that does not know its own prefix rewrites nothing rather than
+///             every line.
+/// @param to   What to write in its place.
+/// @return The region with each note's marker re-spelled; @p text unchanged when
+///         @p from and @p to are equal, which is the common case.
+[[nodiscard]] std::string RewriteIncludeNoteMarker(std::string_view text, std::string_view from, std::string_view to);
+
+/// A producing machine's notes, re-spelled into the form a value is STORED in.
+///
+/// One of the two directions `RewriteIncludeNoteMarker` can be asked for, and the
+/// reason both exist as names is that the general form carries its direction in the
+/// ORDER OF TWO PARAMETERS OF THE SAME TYPE. Swapping them compiles, and it passes
+/// every test on every platform this project builds on: the only call sites are in
+/// `fastcache-cc/main.cpp`, which is in no test target, and on an English toolchain
+/// both directions are byte-exact no-ops. It would then poison every stored value on
+/// exactly the machines this exists to fix, silently. That is #700's own argument --
+/// `RenderShowIncludes` takes its marker required and undefaulted so a producer
+/// cannot drift from its parser -- applied to DIRECTION rather than to presence.
+///
+/// @param text           The captured region, in the producer's own spelling.
+/// @param producerMarker The prefix this machine's notes carry.
+/// @return The region with its notes carrying `IncludeNoteMarker`.
+[[nodiscard]] inline std::string NormalizeIncludeNoteMarker(std::string_view text, std::string_view producerMarker)
+{
+    return RewriteIncludeNoteMarker(text, producerMarker, IncludeNoteMarker);
+}
+
+/// A stored value's notes, re-spelled into the form THIS build's parser matches.
+///
+/// The inverse of `NormalizeIncludeNoteMarker`; see it for why the direction is a
+/// name rather than an argument position.
+///
+/// @param text           A localized region, carrying `IncludeNoteMarker`.
+/// @param consumerMarker The prefix this build's `msvc_deps_prefix` holds.
+/// @return The region with its notes carrying `consumerMarker`.
+[[nodiscard]] inline std::string RestoreIncludeNoteMarker(std::string_view text, std::string_view consumerMarker)
+{
+    return RewriteIncludeNoteMarker(text, IncludeNoteMarker, consumerMarker);
+}
 
 } // namespace FastCache::PathCanon
