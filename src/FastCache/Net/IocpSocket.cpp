@@ -304,6 +304,7 @@ namespace
 
 IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
 {
+    Detail::RequireReadBuffer(buffer);
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };

@@ -224,6 +224,7 @@ DetachedTask TlsSocket::DriveWrite(IoAwaitable* awaitable, std::span<std::byte c
 
 IoAwaitable TlsSocket::Read(std::span<std::byte> buffer)
 {
+    Detail::RequireReadBuffer(buffer);
     _readView = buffer;
     IoAwaitable awaitable;
     awaitable.SetSuspendCallback(

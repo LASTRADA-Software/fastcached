@@ -1297,6 +1297,49 @@ Every rule below has already been a bug.
     Shown red by removing the guard from one arm site, where it reports `the canary
     SURVIVED` rather than a bare failure.
 
+- **`Read`'s buffer must be non-empty, because `0` is already taken and it is taken
+  by the OPPOSITE fact.** `0` on this interface means *the peer has finished
+  sending*, and every transport computes its result from a receive primitive that
+  answers `0` for a zero-length request: `recv(fd, p, 0, 0)` on all three POSIX
+  backends, a zero-length `WSARecv` completing with `bytesReceived == 0`,
+  `InMemorySocket::TryPull` pulling nothing. So a caller reaching `Read` with an
+  empty span was told its peer closed
+  ([#838](https://github.com/LASTRADA-Software/fastcached/issues/838)) -- **the one
+  way this interface can still make the exact false claim the EOF rule above exists
+  to stop anyone making by accident.** An off-by-one in a `subspan(got)`
+  accumulation loop, or a decorator narrowing a chunk to zero, and the loop
+  terminates cleanly on a graceful close that never happened.
+  - **It belongs to the seam, not to whoever hits it.** `Net/TcpClient.cpp`'s
+    `RecvExactly` had already found it and answered it locally -- *"asked for
+    nothing, answered with nothing"* -- which is one consumer carrying a contract
+    every consumer needs and no other consumer can see. `Detail::RequireReadBuffer`
+    sits beside the sentence it enforces in `ISocket.hpp`, and the six transports
+    call it as `Read`'s first statement.
+  - **Programmer error, so an assertion rather than an error code.** There is no
+    result a zero-byte read could return that would be true, which is this
+    project's definition of contract misuse; a `NetErrorCode` for it would make
+    every caller start handling a case that cannot legitimately occur.
+  - **The census came FIRST, and it is what made the assertion safe to add.** The
+    ticket's own acceptance put it first for that reason: an assert converts a
+    silent wrong answer into a crashing suite, so *does anything read a zero-length
+    span today* decides everything after it. Measured empirically rather than by
+    grep -- guard in place, whole suite -- **3315 of 3315 passing on
+    `clang-debug`**, so no production path and no fixture passes an empty span.
+  - **Debug-only, and the release residual is a DECISION.** With assertions
+    compiled out an empty read still answers EOF. Refusing it there costs a new
+    enumerator in `Net`'s taxonomy plus a behaviour change on every shipped
+    transport, bought for a path the census says nothing takes. That is
+    `ClaimReadSlot`'s trade above reached from the other side -- there the release
+    behaviour is a leak, here it is a wrong answer -- and it is written down so it
+    is weighed rather than rediscovered.
+  - **Watched refusing by `empty-read-buffer-canary`**, which hands the empty span
+    to a real transport (the call site, never the guard function) and must die.
+    `InMemorySocket` rather than a reactor socket: a canary aborts at the first
+    violation so it watches ONE site whatever it picks, and that one has no bind to
+    be refused, no client thread to fail to arrive, and the same verdict on every
+    platform. Shown red by removing the guard, where it reports `it answered 0 with
+    7 bytes still pending` -- the defect observed, not merely a failure.
+
 - **A wait that cannot be cancelled is a frame that cannot be freed, so `Schedule`
   grew a counterpart.** `IReactor` could park a coroutine on a deadline and had no
   way to take it back, which is why `DeadlineTimer` and `InterruptibleSleepUntil`

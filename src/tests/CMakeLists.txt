@@ -481,6 +481,42 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
+# The empty-read-buffer canary: another program that MUST die.
+#
+# `Detail::RequireReadBuffer` (`src/FastCache/Net/ISocket.hpp`) is the tripwire for
+# #838 -- `ISocket::Read` documents that its destination span must be non-empty and
+# nothing enforced it, so a caller reaching `Read` with an empty span was answered
+# `0`, which on this interface means the peer has finished sending. A graceful close
+# that never happened, handed to the caller by the one call whose result the type has
+# no way to express.
+#
+# It hands the empty span to a REAL transport, so what it drives is the CALL SITE and
+# not the guard function -- asserting `RequireReadBuffer` in isolation would prove the
+# `assert` fires and say nothing about whether an `ISocket::Read` reaches it. Which
+# transport, and why it is `InMemorySocket` rather than a reactor socket, is argued in
+# the canary's own header: a canary aborts at the first violation, so it watches ONE
+# site whatever it picks, and the one worth watching is the one with no environmental
+# failure modes and the same verdict on every platform.
+#
+# `scripts/empty-read-buffer-gate.cmake` and not a bare `WILL_FAIL`, for the reason
+# the two blocks above give. Guarded to Debug because `assert` compiles out elsewhere.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(empty-read-buffer-canary EmptyReadBufferCanary.cpp)
+    target_link_libraries(empty-read-buffer-canary PRIVATE FastCache)
+    add_test(
+        NAME "empty-read-buffer-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_CANARY=$<TARGET_FILE:empty-read-buffer-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/empty-read-buffer-gate.cmake"
+    )
+    set_tests_properties("empty-read-buffer-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # A reactor's teardown rule is watched refusing, on every platform rather than one.
 #
 # `IReactor::TeardownIsSerialisedWithDispatch()` is the tripwire for #668: an object

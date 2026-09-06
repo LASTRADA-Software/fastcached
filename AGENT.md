@@ -749,6 +749,17 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   complete last with `Cancelled`. Prove the leak instrument before believing a green
   ASan run — a parked frame is a live unreachable allocation, which LSan reports
   exactly; the size-dependent caveat belongs to use-after-free, not to leaks.
+- `Read`'s buffer must be NON-EMPTY, because `0` is taken and taken by the opposite
+  fact: every transport's receive primitive answers `0` for a zero-length request, so
+  an empty span was answered *the peer has finished sending* — the one way this
+  interface could still make the exact false claim the EOF rule exists to prevent
+  (#838). `Detail::RequireReadBuffer`, beside the sentence it enforces, called as
+  `Read`'s first statement by all six transports; a PROGRAMMER ERROR, so an assert and
+  not an error code, since no result would be true. `RecvExactly` had already found it
+  and answered it at ONE consumer, which is a contract no other consumer can see. The
+  census came FIRST and is what made the assert safe (3315 of 3315 with it live);
+  release still answers EOF, and that is a stated trade rather than an omission.
+  `empty-read-buffer-canary` hands a REAL transport an empty span and must die.
 - A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
   either while the other is parked drops the parked coroutine — never resumed, never
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
