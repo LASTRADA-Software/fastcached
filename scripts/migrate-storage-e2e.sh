@@ -31,7 +31,26 @@ if [[ -z "$FASTCACHED" || ! -x "$FASTCACHED" ]]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Reaps daemons BEFORE removing the work tree. `create_store` starts a daemon and
+# kills it on the way out, but every `fail` between those two points -- including
+# the one `wait_until` raises on expiry -- exits without reaching the kill, which
+# left the daemon running and then deleted the store out from under it (#808).
+# The hand-rolled poll this replaced did `kill "$pid"` before its own `fail`; the
+# `wait_until` that replaced it does not, and no `e2e_on_fail` was set here.
+#
+# Fixed in the TRAP rather than at that one wait, because the leak is a property
+# of every exit path out of `create_store`, not of the wait that happened to be
+# the first one noticed. Space-separated rather than an array: bash 3.2.
+_MIGRATE_DAEMON_PIDS=""
+_migrate_cleanup() {
+    local pid
+    for pid in $_MIGRATE_DAEMON_PIDS; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$WORK"
+}
+trap _migrate_cleanup EXIT
 
 # The shared helpers, for `fail` and for `free_port`. The whole argument for the
 # port range -- why a connect probe cannot see a port held as an OUTBOUND
@@ -86,6 +105,8 @@ create_store() {
     # `wait` would then block forever. Found exactly that way.
     "$FASTCACHED" --config "$EMPTY_CONFIG" --port="$p" "$@" &
     local pid=$!
+    # Tracked before anything can fail, so the EXIT trap reaps it on every path.
+    _MIGRATE_DAEMON_PIDS="$_MIGRATE_DAEMON_PIDS $pid"
 
     # Waits for the number of stores the CALLER asserts, and that count is a
     # parameter for exactly that reason. It used to break on the FIRST `.cow` to
