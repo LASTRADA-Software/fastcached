@@ -1277,13 +1277,29 @@ Every rule below has already been a bug.
     seventh site as at the first -- the same shape as `SigningDomain` leaving no
     argument to pass a bare label to. `IocpSocket`'s destructor still assigns
     directly, and that is a teardown rather than a claim.
-  - **Debug-only, and the two louder options are both worse.** Refusing the new
-    operation would turn today's silent leak into a broken connection on a path that
-    is live right now (#710 arms a fresh wait per iteration and cancels none), and
-    completing the dropped awaitable would resume a coroutine that may already have
-    lost the socket it holds -- a use-after-free where there is currently a leak. So
-    the fix for a caller that does this belongs at the caller; what belongs in `Net/`
-    is the tripwire that names it.
+  - **Debug-only, and the fix for a caller that does this belongs at the CALLER --
+    but the reason changed, and the old one is quoted in two places.** This bullet
+    used to say that completing the dropped awaitable *"would resume a coroutine that
+    may already have lost the socket it holds -- a use-after-free where there is
+    currently a leak"*. That was overstated, and `ReadSlot.hpp` retracted it: the
+    counter-evidence is in the same directory, because `EpollSocket::Close` and
+    `KqueueSocket::Close` already detach a parked awaitable and `Complete` it with
+    `Cancelled`, and they do it to `RunBlockingRead`'s own trampoline on every close
+    that finds one parked. Were that a use-after-free this tree would be crashing on
+    ordinary disconnects. It cost a decision before it was caught: another lane
+    withdrew a cancellation primitive on the strength of it.
+    - **The conclusion survives with a sound reason: the hazard is the SITE, not
+      ownership.** At the ARM site the resumed coroutine runs inside `Read` with the
+      slot mid-claim and is free to call `Read` again -- and, decisively, cancelling a
+      trampoline whose iteration is still LIVE resolves that iteration's waiter as
+      *the peer went away*, dropping a healthy client. A socket cannot tell a stale
+      parked wait from a live one at arm time. **The caller can**, because it knows
+      when its own iteration ended, which is why the cancel belongs there.
+    - **Refusing the new operation is still wrong**, and for the reason that did not
+      change: it turns a silent leak into a broken connection on a live path.
+    - So `CancelRead` exists (below) and `ClaimReadSlot` still only asserts. The two
+      are not alternatives: the tripwire names the misuse, the verb gives the caller
+      the only spelling of *abandon* that is not `Close()`.
   - **It is watched refusing, and the hazard has no other coverage at all.** Measured
     while landing the guard: a probe at all six arm sites reported ZERO double-arms
     across `FastCacheTest` (2073 cases) and `fastcache-compile-node-tests`, and no
@@ -1296,6 +1312,58 @@ Every rule below has already been a bug.
     which is the same argument `iterator-debug-gate.ps1` makes about the same shape.
     Shown red by removing the guard from one arm site, where it reports `the canary
     SURVIVED` rather than a bare failure.
+
+- **A parked read is retrieved by `CancelRead`, and the caller that armed it is the
+  only one who may.** `Read` and `WaitReadable` share one slot, and until #710 the
+  only thing that could take a parked wait back was `Close()` -- so the caller-side
+  discipline above had no spelling for *abandon* short of tearing the connection down.
+  `RunBlockingRead` is the caller that could not follow it
+  ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710)): it armed a
+  fresh readability watch per loop pass and cancelled none, so every pass that ended
+  with the previous trampoline parked dropped that coroutine, and the blocking read's
+  own exit left one for the connection loop's next `Read` to drop. One frame plus its
+  `shared_ptr<StreamWaiter>` per pass, unbounded on a `BLOCK 0` reader; on IOCP the
+  reused `OVERLAPPED` completes the wrong operation and reports EOF on a healthy
+  connection.
+  - **Re-target, do not re-arm -- and re-arm only once the previous watch has
+    RESOLVED.** The loop points one `DisconnectWatch` at each pass's waiter; a fresh
+    trampoline is armed only when the slot is free. "Arm once and never again" is the
+    tempting simplification and it is wrong: `ArmDisconnect` ENDS deliberately on a
+    non-zero count (bytes pending for the next command), re-arming after that is both
+    legitimate and safe, and #673's pipelined-data case stages its whole distinction
+    through that second watch -- so the simplification would leave a green test
+    asserting nothing.
+  - **Retiring is not disconnecting, and that is the half that is easy to get
+    backwards.** `CancelRead` completes the parked watch with an ERROR, and
+    `ArmDisconnect` reads any error as a departure -- so what silences it must be the
+    watch being RETIRED, never the error code. Silence it by code and a genuine
+    abortive close stops being noticed; silence it by nothing and cancelling drops a
+    healthy client.
+  - **Retirement is RAII and also explicit, and the pair is deliberate.** A destructor
+    covers the four exits that exist and the ones added later; the explicit calls put
+    the cancel BEFORE the reply write, which on IOCP -- where cancellation is
+    asynchronous -- gives the aborted completion a write round trip in which to
+    arrive. Forgetting an explicit call therefore costs promptness on one platform
+    rather than correctness.
+  - **Synchronous on epoll and kqueue, asynchronous on IOCP, and a caller must not
+    assume otherwise.** The kernel owns the read op's single `OVERLAPPED` there, so
+    `CancelIoEx` is all that is available and the reactor completes the awaitable when
+    the aborted completion is dequeued. A `Read` in the same reactor turn still reuses
+    it: narrower than not cancelling at all, not closed, and
+    [#884](https://github.com/LASTRADA-Software/fastcached/issues/884).
+  - **The in-memory transport cannot stage any of this**, which is why twelve blocking
+    cases were green while a coroutine leaked per connection: `InMemorySocket::WaitReadable`
+    answers inline, so nothing is ever parked. `Testing::ParkingReadableSocket` parks
+    the way a reactor socket does and MODELS the shared slot -- a competing arm
+    ORPHANS the parked watch and is counted, rather than aborting through
+    `ClaimReadSlot`, whose abort names the slot rather than the caller. Retirement by
+    the caller and retirement by `Close()` are counted APART, because they are
+    opposite answers about this ticket and one counter renders them the same.
+  - **Shown red by neutering both halves**, per case so one `REQUIRE` cannot mask its
+    siblings: `armed=2 orphaned=2` on a read that loops once, exactly the two new
+    cases failing and the two controls plus every pre-existing blocking case staying
+    green. The asymmetry is the evidence.
+  - Epoll was MEASURED; IOCP and kqueue were code-read.
 
 - **`Read`'s buffer must be non-empty, because `0` is already taken and it is taken
   by the OPPOSITE fact.** `0` on this interface means *the peer has finished
@@ -1637,16 +1705,15 @@ consequence rather than a precaution.
   before/after table and the two viable designs, and notes that
   `RequestTimeout` is per READ rather than per request, so the head has no total
   budget at all.
-- **[#710](https://github.com/LASTRADA-Software/fastcached/issues/710)** —
-  `RunBlockingRead` arms a fresh `ArmDisconnect` per loop iteration and cancels none,
-  so a wait resolved by the data or timeout arm leaves the previous trampoline parked
-  in `WaitReadable`, against the socket's single read-op slot. Predates #673 and is
-  unchanged by it. Same family as
-  [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) and deliberately
-  not folded into it: #663 is the shared slot, this is one caller misusing it. Since
-  #663 landed the misuse is no longer silent — `Detail::ClaimReadSlot` asserts, so a
-  Debug build reaching this path dies naming it, which is what a fixture for this
-  ticket should expect to see before it sees a leak.
+- **[#884](https://github.com/LASTRADA-Software/fastcached/issues/884)** —
+  `ISocket::CancelRead` cannot retire an IOCP read synchronously: the kernel owns the
+  read op's single `OVERLAPPED`, so the override can only `CancelIoEx` and the reactor
+  completes the awaitable when the aborted completion is dequeued. A `Read` issued in
+  the SAME reactor turn therefore still reuses that `OVERLAPPED`. Narrower than #710's
+  unconditional per-pass reuse and not closed; closing it needs a per-operation
+  completion in `IocpSocket`'s I/O core, on a platform nobody in this run can compile.
+  The ticket carries the mechanism and the acceptance, and the residual is stated on
+  `CancelRead` itself rather than only here.
 - **[#711](https://github.com/LASTRADA-Software/fastcached/issues/711)** — three
   comment blocks in `src/apps/fastcache-compile-node/` still state the pre-#671
   doctrine and the pre-#677 socket behaviour. Listed here rather than only with the

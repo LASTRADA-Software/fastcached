@@ -27,6 +27,8 @@
 #include <thread>
 #include <vector>
 
+#include <tests/SocketDecorator.hpp>
+
 namespace
 {
 
@@ -3265,13 +3267,29 @@ struct BlockingHarness
         reactor.Run();
     }
 
+    /// Launcher coroutine: runs the handler on @p socket and captures the reply.
+    ///
+    /// Split out of `RunHandler` so a case can interpose a decorator between the
+    /// handler and the pair's server end -- which is the only way to stage a
+    /// readability watch that genuinely PARKS, since the in-memory transport always
+    /// answers `WaitReadable` inline (see `Testing::ParkingReadableSocket`).
+    /// @param socket  What the handler serves on; must outlive this task.
+    /// @param session Session context, by value: a coroutine must not hold a
+    ///        reference parameter across a suspension.
+    FastCache::Task<void> RunHandlerOn(FastCache::ISocket* socket, FastCache::SessionContext session)
+    {
+        co_await handler.Run(socket, &engine, /*primer*/ {}, session);
+        handlerReturned = true;
+        socket->Close();
+        reply = co_await DrainResponse(pair.client.get());
+    }
+
     /// Launcher coroutine: runs the handler to completion and captures the reply.
+    /// @param session Session context.
+    /// @return The launcher task.
     FastCache::Task<void> RunHandler(FastCache::SessionContext session)
     {
-        co_await handler.Run(pair.server.get(), &engine, /*primer*/ {}, session);
-        handlerReturned = true;
-        pair.server->Close();
-        reply = co_await DrainResponse(pair.client.get());
+        return RunHandlerOn(pair.server.get(), session);
     }
 };
 
@@ -3381,6 +3399,207 @@ TEST_CASE("RESP: XREAD BLOCK 0 is abandoned when the peer closes gracefully", "[
     // block, which was not determined, produced nothing: no entries, and no nil
     // either, since there is no live peer to answer.
     REQUIRE(h.reply == "$3\r\n1-0\r\n");
+}
+
+TEST_CASE("RESP: a blocking read retires its readability watch instead of leaving it parked", "[protocol][resp][stream]")
+{
+    // #710. `RunBlockingRead` armed a readability watch and, when the read ended, left
+    // it parked on the socket's single read-op slot -- so the connection loop's very
+    // next `Read` claimed that slot and ORPHANED the watch's coroutine: never resumed,
+    // never freed, one frame plus its `shared_ptr<StreamWaiter>` per blocking read.
+    //
+    // Unreachable on the plain pair: `InMemorySocket::WaitReadable` answers inline, so
+    // nothing is ever parked and twelve blocking cases were green throughout.
+    // `ParkingReadableSocket` is what a reactor socket does instead.
+    BlockingHarness h;
+    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    auto session = h.Session();
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+
+    auto launcher = h.RunHandlerOn(&watched, session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE_FALSE(h.handlerReturned);
+    // The premise, asserted rather than assumed: a watch is armed and genuinely parked.
+    // Without this the two assertions below would hold vacuously on any transport that
+    // never parks, which is exactly how this defect stayed invisible.
+    REQUIRE(watched.WatchesArmed() == 1);
+    REQUIRE(watched.IsWatchParked());
+
+    // A second connection appends what the read is waiting for; it replies and returns
+    // to the command loop, which reads again.
+    auto const added = h.engine.StreamAdd("s",
+                                          FastCache::StreamCodec::StreamId { .ms = 2, .seq = 0 },
+                                          false,
+                                          std::vector<std::pair<std::string, std::string>> { { "g", "w" } },
+                                          std::nullopt,
+                                          false);
+    REQUIRE(added.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+
+    // What DISTINGUISHES: the watch was retired by the caller that armed it, before the
+    // command loop's next read could claim the slot. Pre-fix, `WatchesOrphaned()` is 1
+    // and `WatchesRetiredByCancel()` is 0.
+    REQUIRE(watched.WatchesOrphaned() == 0);
+    REQUIRE(watched.WatchesRetiredByCancel() == 1);
+    REQUIRE_FALSE(watched.IsWatchParked());
+
+    h.EndConnection();
+    REQUIRE(h.handlerReturned);
+    REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\ng\r\n$1\r\nw\r\n"));
+}
+
+TEST_CASE("RESP: a blocking read that loops does not arm a second readability watch", "[protocol][resp][stream]")
+{
+    // The other half of #710, and the one its title names: a fresh `ArmDisconnect` per
+    // loop iteration, cancelling none. Each pass that ends with the previous trampoline
+    // still parked arms over it, and the socket has ONE read operation -- so the count
+    // of orphaned watches grows with the number of spurious wakes, unbounded on a
+    // `BLOCK 0` reader.
+    BlockingHarness h;
+    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    auto session = h.Session();
+
+    // Waits for something after 5-0, which nothing below will satisfy until the end.
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+
+    auto launcher = h.RunHandlerOn(&watched, session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE_FALSE(h.handlerReturned);
+    REQUIRE(watched.WatchesArmed() == 1);
+
+    // Two real appends the cursor does not want: each wakes the read, which re-polls,
+    // finds nothing after 5-0 and loops. The watch is still parked, so it must be
+    // RE-TARGETED at the new pass's waiter rather than re-armed over itself.
+    for (auto const id: { std::uint64_t { 1 }, std::uint64_t { 2 } })
+    {
+        auto const unwanted = h.engine.StreamAdd("s",
+                                                 FastCache::StreamCodec::StreamId { .ms = id, .seq = 0 },
+                                                 false,
+                                                 std::vector<std::pair<std::string, std::string>> { { "a", "b" } },
+                                                 std::nullopt,
+                                                 false);
+        REQUIRE(unwanted.has_value());
+        h.waiters.NotifyAppended("s");
+        h.reactor.Run();
+        REQUIRE_FALSE(h.handlerReturned);
+        // What DISTINGUISHES: pre-fix this is 2 then 3, and one watch is orphaned per
+        // pass. The parked assertion is what stops the count staying at 1 for the wrong
+        // reason -- a build that stopped watching at all would also read 1.
+        REQUIRE(watched.WatchesArmed() == 1);
+        REQUIRE(watched.WatchesOrphaned() == 0);
+        REQUIRE(watched.IsWatchParked());
+    }
+
+    // The entry it IS waiting for ends the read, and the watch is retired with it.
+    auto const wanted = h.engine.StreamAdd("s",
+                                           FastCache::StreamCodec::StreamId { .ms = 6, .seq = 0 },
+                                           false,
+                                           std::vector<std::pair<std::string, std::string>> { { "f", "v" } },
+                                           std::nullopt,
+                                           false);
+    REQUIRE(wanted.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+    REQUIRE(watched.WatchesOrphaned() == 0);
+    REQUIRE(watched.WatchesRetiredByCancel() == 1);
+
+    h.EndConnection();
+    REQUIRE(h.handlerReturned);
+    REQUIRE(h.reply.ends_with("*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n6-0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"));
+}
+
+TEST_CASE("RESP: a readability watch that resolved IS re-armed on the next pass", "[protocol][resp][stream]")
+{
+    // The control for the case above, and it is not optional: "re-target instead of
+    // re-arming" and "never watch anything again" are the same passing test without it.
+    //
+    // `ArmDisconnect` ends deliberately on a non-zero count -- bytes pending for the
+    // next command, which are not a departure and must not be consumed to find out.
+    // Re-arming after THAT is both legitimate and safe, because the slot is free. The
+    // rule is "only once the previous one has resolved", never "only once".
+    BlockingHarness h;
+    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    auto session = h.Session();
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+
+    auto launcher = h.RunHandlerOn(&watched, session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE(watched.WatchesArmed() == 1);
+    REQUIRE(watched.IsWatchParked());
+
+    // Bytes pending: the watch resolves and gives the slot back, and the reader is NOT
+    // abandoned -- a count above zero is a pipelined command, not a peer that left.
+    watched.ResolveReadable(1);
+    h.reactor.Run();
+    REQUIRE_FALSE(h.handlerReturned);
+    REQUIRE(watched.WatchesResolved() == 1);
+    REQUIRE_FALSE(watched.IsWatchParked());
+
+    // Now make the read loop. The slot is free, so this pass must arm a fresh watch.
+    auto const unwanted = h.engine.StreamAdd("s",
+                                             FastCache::StreamCodec::StreamId { .ms = 1, .seq = 0 },
+                                             false,
+                                             std::vector<std::pair<std::string, std::string>> { { "a", "b" } },
+                                             std::nullopt,
+                                             false);
+    REQUIRE(unwanted.has_value());
+    h.waiters.NotifyAppended("s");
+    h.reactor.Run();
+    REQUIRE(watched.WatchesArmed() == 2);
+    REQUIRE(watched.WatchesOrphaned() == 0);
+    REQUIRE(watched.IsWatchParked());
+
+    // And the SECOND watch is live rather than merely counted: EOF through it ends the
+    // read. `EndConnection()` cannot do this job here -- half-closing the pair reaches
+    // the inner socket, and the handler is parked on the decorator's watch, which only
+    // this resolves. A case that ended there would hang rather than assert.
+    watched.ResolveReadable(0);
+    h.reactor.Run();
+    REQUIRE(h.handlerReturned);
+}
+
+TEST_CASE("RESP: a parked readability watch still reports a peer that went away", "[protocol][resp][stream]")
+{
+    // The control that keeps #673 alive across #710's fix. Retiring a watch and never
+    // reporting a departure are the same green suite otherwise -- and the failure would
+    // be silent, because a `BLOCK 0` reader whose peer left simply parks forever.
+    //
+    // It also pins the half of the fix that is easy to get backwards: `CancelRead`
+    // completes the parked watch with an ERROR, and `ArmDisconnect` reads any error as
+    // a departure -- so retirement has to be what silences it, not the error code. Here
+    // nothing is retired and the departure must arrive.
+    BlockingHarness h;
+    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    auto session = h.Session();
+
+    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+
+    auto launcher = h.RunHandlerOn(&watched, session);
+    h.reactor.Submit(launcher.Native());
+    h.reactor.Run();
+    REQUIRE_FALSE(h.handlerReturned);
+    REQUIRE(watched.IsWatchParked());
+
+    // `0` is EOF: the peer has finished sending. Nothing else in this case would ever
+    // wake the reader, so `handlerReturned` can only be the disconnect arm firing.
+    watched.ResolveReadable(0);
+    h.reactor.Run();
+    REQUIRE(h.handlerReturned);
 }
 
 TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "[protocol][resp][stream]")

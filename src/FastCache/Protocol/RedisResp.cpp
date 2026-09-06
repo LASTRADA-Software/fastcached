@@ -656,6 +656,156 @@ namespace
         bool _disconnected { false };
     };
 
+    /// The ONE readability watch of a blocking read, shared with its trampoline.
+    ///
+    /// **`RunBlockingRead` used to arm a fresh watch per loop iteration and cancel
+    /// none** ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710)). A
+    /// pass that ended with the previous trampoline still parked in `WaitReadable`
+    /// therefore armed a second one over it -- and a socket has ONE read operation
+    /// (`ISocket::Read`, #663), so the parked awaitable's pointer is dropped: that
+    /// coroutine is never resumed, never freed, and takes its `shared_ptr<StreamWaiter>`
+    /// with it. On IOCP it is worse than a leak, because the reused `OVERLAPPED`
+    /// completes the wrong operation and reports EOF on a healthy connection.
+    ///
+    /// **So the watch is RE-TARGETED rather than re-armed.** The loop points it at each
+    /// pass's waiter through `Retarget`, and the trampoline resolves whichever one is
+    /// current when the peer turns out to have gone. Nothing else about the loop's shape
+    /// changes: a waiter is still one-shot, because that is what makes the registry's
+    /// wake race-safe.
+    ///
+    /// **A fresh trampoline is armed only once the previous one has RESOLVED**, which
+    /// `BeginWatch` is the whole of. That is not a weakening of the old behaviour, it is
+    /// the half of it that was correct: `ArmDisconnect` deliberately ENDS on a non-zero
+    /// count (bytes pending for the next command), and re-arming after that is both
+    /// legitimate and safe because the slot is free. Arming only ever once would make
+    /// #673's pipelined-data case pass vacuously -- it stages the distinction through
+    /// the second watch, and says so in its own comment.
+    ///
+    /// **`Retire` is not `Disconnect`.** Retiring says *this blocking read is over*, so
+    /// a trampoline resumed afterwards -- including by the `Cancelled` completion
+    /// `ISocket::CancelRead` delivers -- must resolve nobody. Without that, cancelling
+    /// would present to the loop as the peer having gone, which is a healthy client
+    /// dropped: the false disconnect `Net/ReadSlot.hpp` names as the reason a socket
+    /// cannot do this for its caller.
+    class DisconnectWatch
+    {
+      public:
+        /// Point the watch at the waiter of the pass now running.
+        /// @param waiter This pass's waiter.
+        void Retarget(std::shared_ptr<StreamWaiter> waiter) noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            if (!_retired)
+                _current = std::move(waiter);
+        }
+
+        /// Claim the socket's read slot for a new trampoline, if no earlier one still
+        /// holds it.
+        /// @return True when the caller should arm one; false when one is still parked.
+        [[nodiscard]] bool BeginWatch() noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            if (_retired || _watching)
+                return false;
+            _watching = true;
+            return true;
+        }
+
+        /// The trampoline has resolved and given the read slot back.
+        void EndWatch() noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            _watching = false;
+        }
+
+        /// Trampoline arm: the peer has finished sending, so resolve whichever waiter
+        /// this pass is parked on. A no-op once retired.
+        void Disconnect() noexcept
+        {
+            std::shared_ptr<StreamWaiter> current;
+            {
+                std::scoped_lock const lock { _mu };
+                if (_retired)
+                    return;
+                current = _current;
+            }
+            if (current)
+                current->WakeDisconnect();
+        }
+
+        /// The blocking read is over: resolve nobody from here on.
+        void Retire() noexcept
+        {
+            std::scoped_lock const lock { _mu };
+            _retired = true;
+            _current.reset();
+        }
+
+      private:
+        std::mutex _mu;
+        std::shared_ptr<StreamWaiter> _current {};
+        bool _watching { false };
+        bool _retired { false };
+    };
+
+    /// Retire a blocking read's watch and hand the socket's read slot back, exactly
+    /// once, however the read ends.
+    ///
+    /// **RAII because retirement must not be a line an exit can forget.**
+    /// `RunBlockingRead` leaves by four paths plus a loop-back, and a parked trampeline
+    /// left behind at any of them is orphaned by the connection loop's very next
+    /// `Read` -- which is #710's epoll scenario verbatim. A destructor covers the paths
+    /// that exist and the ones added later.
+    ///
+    /// **It is ALSO called explicitly at each exit, and that is not belt-and-braces for
+    /// its own sake.** A destructor runs as the coroutine frame unwinds, which is after
+    /// the reply has been written; retiring before the write gives IOCP -- where
+    /// cancellation is asynchronous (`ISocket::CancelRead`, #884) -- a whole write round
+    /// trip in which to dequeue the aborted completion. Forgetting one of those explicit
+    /// calls therefore costs promptness on one platform rather than correctness, which
+    /// is the property that makes the pair worth having.
+    class ScopedDisconnectWatch
+    {
+      public:
+        /// @param socket The connection socket whose read slot the watch occupies.
+        explicit ScopedDisconnectWatch(ISocket* socket) noexcept:
+            _socket { socket }
+        {
+        }
+        ScopedDisconnectWatch(ScopedDisconnectWatch const&) = delete;
+        ScopedDisconnectWatch(ScopedDisconnectWatch&&) = delete;
+        ScopedDisconnectWatch& operator=(ScopedDisconnectWatch const&) = delete;
+        ScopedDisconnectWatch& operator=(ScopedDisconnectWatch&&) = delete;
+        ~ScopedDisconnectWatch()
+        {
+            Retire();
+        }
+
+        /// The shared watch, created on first use so a non-reactor transport pays for
+        /// nothing.
+        /// @return The watch, or nullptr once retired.
+        [[nodiscard]] std::shared_ptr<DisconnectWatch> const& Watch()
+        {
+            if (!_watch)
+                _watch = std::make_shared<DisconnectWatch>();
+            return _watch;
+        }
+
+        /// Idempotent. Retires the watch and takes the read slot back.
+        void Retire() noexcept
+        {
+            if (!_watch)
+                return;
+            _watch->Retire();
+            _watch.reset();
+            _socket->CancelRead();
+        }
+
+      private:
+        ISocket* _socket;
+        std::shared_ptr<DisconnectWatch> _watch {};
+    };
+
     /// Detached trampoline arming the timeout arm of a blocking read: sleep to
     /// `deadline` on the reactor, then resolve the waiter as a timeout. Holds a
     /// shared_ptr so the waiter outlives this task even if the data arm won and
@@ -702,10 +852,12 @@ namespace
     /// bytes the next command owns. So the trampoline ends, leaving the wait to the
     /// data and timeout arms. It does not loop: `WaitReadable` would keep answering
     /// with the same pending byte immediately, which is a spin, not a watch.
-    /// `RunBlockingRead` arms a fresh one per iteration, so a wait that resumes and
-    /// re-registers is watched again; a wait that stays parked with bytes pending is
-    /// not. That per-iteration arming cancels nothing and predates this arm, which is
-    /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710).
+    /// `RunBlockingRead` arms a fresh one on the next pass **only once this one has
+    /// resolved**, so a wait that resumes and re-registers is watched again; a wait
+    /// that stays parked with bytes pending is not, and is re-targeted rather than
+    /// armed over. Arming per pass regardless was
+    /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710): the socket
+    /// has one read operation, so the second arm dropped the first trampoline.
     ///
     /// **Two cases it therefore does not cover**, both stated rather than left to be
     /// discovered:
@@ -719,13 +871,19 @@ namespace
     ///    a TLS socket needs the record decrypted, which is a decision for that
     ///    layer, not something to soften here —
     ///    [#712](https://github.com/LASTRADA-Software/fastcached/issues/712).
-    /// @param waiter The waiter to resolve on disconnect (kept alive here).
+    /// @param watch  The blocking read's watch, which names the waiter to resolve and
+    ///        says whether this trampoline is still wanted (kept alive here).
     /// @param socket The connection socket to watch for closure.
-    DetachedTask ArmDisconnect(std::shared_ptr<StreamWaiter> waiter, ISocket* socket)
+    DetachedTask ArmDisconnect(std::shared_ptr<DisconnectWatch> watch, ISocket* socket)
     {
         auto const readable = co_await socket->WaitReadable();
         if (!readable.has_value() || *readable == 0)
-            waiter->WakeDisconnect();
+            // `Disconnect` is a no-op once the watch is retired, which is what keeps the
+            // `Cancelled` completion `ISocket::CancelRead` delivers from presenting as a
+            // departure. The error case still has to reach here for a genuine abortive
+            // close, so this cannot be narrowed to "not an error".
+            watch->Disconnect();
+        watch->EndWatch();
     }
 
     /// Mutation hook: every Redis write verb calls this after its engine
@@ -3118,6 +3276,11 @@ namespace
             co_return co_await ReplyNull(socket, resp);
         }
         // Blocking path: register first, then poll, so no append is missed.
+        //
+        // ONE readability watch for the whole read, re-targeted per pass rather than
+        // re-armed, and retired however this ends -- see `DisconnectWatch` and
+        // `ScopedDisconnectWatch` above (#710).
+        ScopedDisconnectWatch disconnect { socket };
         while (true)
         {
             auto const waiter = std::make_shared<StreamWaiter>(session.reactor);
@@ -3126,26 +3289,43 @@ namespace
             {
                 if (deadline != TimePoint::max())
                     ArmTimeout(waiter, deadline);
-                ArmDisconnect(waiter, socket);
+                // Re-targeted BEFORE the trampoline is armed, or a `WaitReadable` that
+                // resolves synchronously with EOF -- which is what the in-memory
+                // transport does for a peer that has already half-closed -- would find
+                // no waiter to resolve and the loop would park forever.
+                auto const& watch = disconnect.Watch();
+                watch->Retarget(waiter);
+                if (watch->BeginWatch())
+                    ArmDisconnect(watch, socket);
             }
             auto const total = poll();
             if (!total.has_value())
             {
                 session.streamWaiters->Unregister(waiter.get());
+                disconnect.Retire();
                 co_return co_await onError(total.error());
             }
             if (*total > 0)
             {
                 session.streamWaiters->Unregister(waiter.get());
+                disconnect.Retire();
                 co_return co_await write();
             }
             co_await waiter->Wait();
             session.streamWaiters->Unregister(waiter.get());
             if (waiter->Disconnected())
+            {
+                disconnect.Retire();
                 co_return false; // client gone; let Run() unwind and release the slot.
+            }
             if (waiter->TimedOut())
+            {
+                disconnect.Retire();
                 co_return co_await ReplyNull(socket, resp);
-            // Appended (or spurious): loop, re-register, and re-poll.
+            }
+            // Appended (or spurious): loop, re-register, and re-poll. The watch stays
+            // as it is -- re-targeted at the next pass's waiter, and armed again only
+            // if this pass's trampoline has already resolved.
         }
     }
 

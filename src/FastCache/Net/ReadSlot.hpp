@@ -67,14 +67,23 @@ namespace FastCache::Detail
 ///    wait from a live one. The caller can**, because it knows when its own iteration
 ///    ended -- which is why the cancel belongs there and not here.
 ///
-/// Two callers currently double-arm this slot, and they need different fixes:
+/// **And the caller now has a spelling for it.** `ISocket::CancelRead()` retires a
+/// parked read-side operation without closing the socket, which is what the paragraph
+/// above says belongs at the caller -- until it existed, *abandon* had no spelling
+/// short of tearing the connection down, so the discipline this file states was one no
+/// caller could actually follow. It changes nothing here: this assertion still fires on
+/// a double-arm, and a caller that arms over a parked wait is still wrong.
+///
+/// Two callers double-armed this slot and needed different fixes.
 /// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710)
-/// (`RunBlockingRead`'s trampoline, re-armed per blocking iteration) and
+/// (`RunBlockingRead`'s trampoline, re-armed per blocking iteration) is FIXED -- it
+/// keeps one watch, re-targets it per pass and retires it through `CancelRead`.
 /// [#755](https://github.com/LASTRADA-Software/fastcached/issues/755)
-/// (`RearmReadable`'s watcher surviving the transition out of subscribe mode). Both
-/// abort at the assertion below, so the abort names the slot and not the caller --
-/// a fixture for one that wanders through the other's path produces a red that
-/// attributes the wrong defect.
+/// (`RearmReadable`'s watcher surviving the transition out of subscribe mode) is still
+/// OPEN, and aborts at the assertion below -- which names the slot and not the caller,
+/// so a fixture for it that wanders through a blocking read's path still produces a red
+/// that attributes the wrong defect. That sentence survives one of its two subjects
+/// going away, which is the point of keeping it.
 ///
 /// It is watched refusing by `read-slot-guard-canary`, which double-arms a REAL
 /// socket -- the call site, not this function -- and must die.

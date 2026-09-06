@@ -43,6 +43,9 @@ class EpollSocket final: public ISocket
                                             std::shared_ptr<void const> keepAlive = {}) override;
     void Close() noexcept override;
 
+    /// @copydoc ISocket::CancelRead
+    void CancelRead() noexcept override;
+
     /// @copydoc ISocket::ShutdownWrite
     void ShutdownWrite() noexcept override;
 

@@ -770,9 +770,25 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
   `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression so no
   arm site has a bare `awaitable = nullptr` to forget it on, and
-  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal and
-  not a completion: the first breaks a live caller (#710), the second turns a leak into
-  a use-after-free.
+  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal, which
+  breaks a live caller — and **the second half of that sentence has been RETRACTED**: it
+  said a completion "turns a leak into a use-after-free", which was overstated and cost
+  another lane a withdrawn cancellation primitive before anyone checked it against
+  `EpollSocket::Close`, which detaches and `Complete`s with `Cancelled` on every
+  ordinary disconnect. The hazard is the **SITE**, not ownership: at the ARM site a
+  socket cannot tell a stale parked wait from a live one, and cancelling a live one is
+  a false disconnect that drops a healthy client. The CALLER can tell.
+- So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of
+  *abandon* that is not `Close()`, virtual with a default no-op like `ShutdownWrite`.
+  `RunBlockingRead` armed a watch per loop pass and cancelled none (#710): it now keeps
+  ONE, re-TARGETED per pass and re-armed only once the previous has RESOLVED (arming
+  once and never again makes #673's pipelined case pass vacuously), retired by RAII AND
+  explicitly before the reply write. Retiring is not disconnecting — the cancel arrives
+  as an ERROR and `ArmDisconnect` reads any error as a departure, so what silences it
+  must be the RETIREMENT, never the code. Synchronous on epoll/kqueue, **asynchronous on
+  IOCP** where the kernel owns the op's one `OVERLAPPED` (#884). `InMemorySocket` never
+  parks a `WaitReadable`, so twelve blocking cases were green throughout —
+  `Testing::ParkingReadableSocket` parks and COUNTS orphaned watches instead of aborting.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
 - A missing keyspace event has two ends — the tier that never named the victim and

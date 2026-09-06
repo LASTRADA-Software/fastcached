@@ -287,6 +287,30 @@ void IocpSocket::Close() noexcept
     }
 }
 
+void IocpSocket::CancelRead() noexcept
+{
+    if (_closed || !_impl || _impl->native == INVALID_SOCKET)
+        return;
+    if (_impl->readOp.awaitable == nullptr)
+        return;
+
+    // **The awaitable cannot be completed here, and that is a property of the
+    // platform rather than a choice.** The kernel owns `&readOp.completion` and WRITES
+    // to it -- `Internal` and `InternalHigh` are updated at completion -- which is the
+    // same fact `Op::inFlight` exists for and the reason `Close()` above retracts
+    // nothing either. Detaching the awaitable and completing it inline, the way
+    // `EpollSocket::CancelRead` does, would free the coroutine and leave the next
+    // `Read` reusing an `OVERLAPPED` the kernel still holds.
+    //
+    // So this retracts the operation instead. The completion is still dequeued, with
+    // `ERROR_OPERATION_ABORTED`, and `Impl::Dispatch` completes the awaitable and
+    // releases the slot then -- on a LATER reactor turn. `ISocket::CancelRead` states
+    // that consequence, and the window it leaves is
+    // [#884](https://github.com/LASTRADA-Software/fastcached/issues/884).
+    static_cast<void>(
+        ::CancelIoEx(reinterpret_cast<HANDLE>(_impl->native), reinterpret_cast<LPOVERLAPPED>(&_impl->readOp.completion)));
+}
+
 namespace
 {
 

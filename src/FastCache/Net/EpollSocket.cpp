@@ -435,6 +435,28 @@ void EpollSocket::Close() noexcept
     _fd = -1;
 }
 
+void EpollSocket::CancelRead() noexcept
+{
+    if (_closed || !_impl)
+        return;
+
+    auto* const parked = std::exchange(_impl->readOp.awaitable, nullptr);
+    if (parked == nullptr)
+        return;
+    _impl->readOp.readBuffer = {};
+    _impl->readOp.readPeekOnly = false;
+    // The interest is recomputed from `readOp.awaitable`, which is now null, so this
+    // takes EPOLLIN back down: the operation is gone and a readable edge would find
+    // nothing to complete.
+    _impl->UpdateInterest();
+
+    // Detached FIRST and completed LAST, with no member touched afterwards -- the same
+    // discipline `Close()` records above and for the same reason: completing resumes
+    // the parked coroutine, and a coroutine that owns this socket runs to its end and
+    // destroys it before `Complete` returns.
+    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+}
+
 namespace
 {
 

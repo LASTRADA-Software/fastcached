@@ -3,6 +3,7 @@
 
 #include <FastCache/Net/ISocket.hpp>
 
+#include <coroutine>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -26,9 +27,9 @@ namespace FastCache::Testing
 /// `Write`, `WriteVectored`, `Close` and `IsClosed` were byte-identical to it.
 ///
 /// **What the hand-written copies both got wrong is the part they did not write.**
-/// `ISocket` has four virtuals with default implementations -- `HandshakeIfNeeded`,
-/// `WaitReadable`, `PeerAddress` and `ShutdownWrite` -- and a decorator that
-/// overrides none of them silently answers from the BASE rather than from the
+/// `ISocket` has five virtuals with default implementations -- `HandshakeIfNeeded`,
+/// `WaitReadable`, `PeerAddress`, `ShutdownWrite` and `CancelRead` -- and a decorator
+/// that overrides none of them silently answers from the BASE rather than from the
 /// socket it decorates. So a decorated TLS socket handshakes vacuously, a decorated
 /// peer has no address, and a half-close reaches nothing. None of that is visible
 /// at a call site: every one of those defaults succeeds. Forwarding them is a
@@ -87,6 +88,12 @@ class SocketDecorator: public ISocket
     void Close() noexcept override
     {
         _inner.Close();
+    }
+
+    /// @copydoc ISocket::CancelRead
+    void CancelRead() noexcept override
+    {
+        _inner.CancelRead();
     }
 
     /// @copydoc ISocket::ShutdownWrite
@@ -192,6 +199,180 @@ class FailingReadSocket final: public SocketDecorator
 
     NetErrorCode _code;
     std::size_t _remaining;
+};
+
+/// A socket whose `WaitReadable` PARKS, the way a reactor socket's does.
+///
+/// **The in-memory transport cannot stage this, and that is the whole reason this
+/// exists.** `InMemorySocket::WaitReadable` answers `0` or `1` synchronously and is
+/// right to: it holds both pipes and can always tell. A reactor socket cannot, so it
+/// arms interest and suspends -- and a SUSPENDED readability wait is what occupies the
+/// socket's single read-op slot, which is the entire subject of
+/// [#663](https://github.com/LASTRADA-Software/fastcached/issues/663) and
+/// [#710](https://github.com/LASTRADA-Software/fastcached/issues/710). A fixture on the
+/// plain pair cannot reach either defect at all: every watch resolves inline and
+/// nothing is ever left parked, which is why twelve blocking-read cases were green
+/// while `RunBlockingRead` orphaned a coroutine per connection.
+///
+/// **It models the shared slot rather than asserting on it.** Arming a read verb while
+/// a watch is parked ORPHANS that watch -- pointer dropped, never resumed, never freed
+/// -- which is exactly what `EpollSocket::Read`'s `readOp.awaitable = nullptr` does.
+/// `Detail::ClaimReadSlot` would instead abort the process, and its abort names the
+/// SLOT rather than the caller (`Net/ReadSlot.hpp` says so, because two callers share
+/// that assertion), so a case that wants to say WHICH caller double-armed has to be
+/// able to observe it and carry on.
+///
+/// **`Close()` retires a parked watch and a cancel does too, and they are counted
+/// apart.** Every real socket retires at `Close`, so a fake that did not would leak on
+/// ordinary teardown and hide the defect behind its own bug -- but a watch retired by
+/// the connection's teardown and one retired by the caller that armed it are opposite
+/// answers about #710, and one counter would render them the same.
+class ParkingReadableSocket final: public SocketDecorator
+{
+  public:
+    /// @param inner The socket reads and writes are forwarded to; must outlive this.
+    explicit ParkingReadableSocket(ISocket& inner) noexcept:
+        SocketDecorator { inner }
+    {
+    }
+
+    ParkingReadableSocket(ParkingReadableSocket const&) = delete;
+    ParkingReadableSocket(ParkingReadableSocket&&) = delete;
+    ParkingReadableSocket& operator=(ParkingReadableSocket const&) = delete;
+    ParkingReadableSocket& operator=(ParkingReadableSocket&&) = delete;
+
+    /// Retires a watch a case left parked. Not merely tidiness: an awaitable that is
+    /// never completed is a coroutine frame that is never freed, which is the very
+    /// thing these counters measure -- a fake that leaked one itself would report the
+    /// defect against every build, including a fixed one.
+    ~ParkingReadableSocket() override
+    {
+        ParkingReadableSocket::Close();
+    }
+
+    /// Park, always -- there is no synchronous answer, which is the point.
+    /// @return An awaitable the test resolves with `ResolveReadable`, or that
+    ///         `CancelRead`/`Close` retires.
+    [[nodiscard]] IoAwaitable WaitReadable() override
+    {
+        ClaimSlot();
+        ++_watchesArmed;
+        IoAwaitable awaitable;
+        // Recorded from inside `await_suspend`, never here: this local is returned by
+        // value and destroyed, so its address is not the one the caller suspends on
+        // (#734).
+        awaitable.SetSuspendCallback(&OnWaitSuspended, this);
+        return awaitable;
+    }
+
+    /// Forward, having first claimed the shared read slot the way a real socket does.
+    /// @param buffer Where the forwarded read puts its bytes.
+    /// @return The decorated socket's answer.
+    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    {
+        ClaimSlot();
+        return SocketDecorator::Read(buffer);
+    }
+
+    /// @copydoc ISocket::CancelRead
+    void CancelRead() noexcept override
+    {
+        if (RetireParked(NetErrorCode::Cancelled))
+            ++_watchesRetiredByCancel;
+        SocketDecorator::CancelRead();
+    }
+
+    /// @copydoc ISocket::Close
+    void Close() noexcept override
+    {
+        if (RetireParked(NetErrorCode::Cancelled))
+            ++_watchesRetiredByClose;
+        SocketDecorator::Close();
+    }
+
+    /// Resolve the parked watch as a reactor would when the socket becomes readable.
+    /// @param count `0` for EOF, non-zero for bytes pending -- the distinction
+    ///        `ISocket::WaitReadable` makes contractual.
+    void ResolveReadable(std::size_t count) noexcept
+    {
+        auto* const parked = std::exchange(_parked, nullptr);
+        if (parked == nullptr)
+            return;
+        ++_watchesResolved;
+        parked->Complete(IoResult { count });
+    }
+
+    /// @return How many readability watches were armed.
+    [[nodiscard]] std::size_t WatchesArmed() const noexcept
+    {
+        return _watchesArmed;
+    }
+
+    /// @return How many were dropped by a competing arm: never resumed, never freed.
+    [[nodiscard]] std::size_t WatchesOrphaned() const noexcept
+    {
+        return _watchesOrphaned;
+    }
+
+    /// @return How many the CALLER retired through `CancelRead` -- #710's fix working.
+    [[nodiscard]] std::size_t WatchesRetiredByCancel() const noexcept
+    {
+        return _watchesRetiredByCancel;
+    }
+
+    /// @return How many the connection's teardown swept up instead, which is a
+    ///         different answer from the one above and not a substitute for it.
+    [[nodiscard]] std::size_t WatchesRetiredByClose() const noexcept
+    {
+        return _watchesRetiredByClose;
+    }
+
+    /// @return How many resolved as readability rather than being retired.
+    [[nodiscard]] std::size_t WatchesResolved() const noexcept
+    {
+        return _watchesResolved;
+    }
+
+    /// @return Whether a watch is parked on the read slot right now.
+    [[nodiscard]] bool IsWatchParked() const noexcept
+    {
+        return _parked != nullptr;
+    }
+
+  private:
+    /// @param awaitable The caller's awaitable, at its final address.
+    static void OnWaitSuspended(IoAwaitable* awaitable, std::coroutine_handle<> /*handle*/) noexcept
+    {
+        static_cast<ParkingReadableSocket*>(awaitable->CallbackState())->_parked = awaitable;
+    }
+
+    /// Take the single read slot for a new operation, orphaning whatever held it --
+    /// which is what every reactor socket does, and the defect the counter names.
+    void ClaimSlot() noexcept
+    {
+        if (_parked == nullptr)
+            return;
+        ++_watchesOrphaned;
+        _parked = nullptr;
+    }
+
+    /// @param code What to complete a parked watch with.
+    /// @return Whether there was one.
+    bool RetireParked(NetErrorCode code) noexcept
+    {
+        auto* const parked = std::exchange(_parked, nullptr);
+        if (parked == nullptr)
+            return false;
+        parked->Complete(IoResult { std::unexpected(NetError { .code = code, .systemCode = 0, .context = {} }) });
+        return true;
+    }
+
+    IoAwaitable* _parked { nullptr };
+    std::size_t _watchesArmed { 0 };
+    std::size_t _watchesOrphaned { 0 };
+    std::size_t _watchesRetiredByCancel { 0 };
+    std::size_t _watchesRetiredByClose { 0 };
+    std::size_t _watchesResolved { 0 };
 };
 
 } // namespace FastCache::Testing

@@ -280,6 +280,51 @@ class ISocket
         return IoAwaitable { IoResult { std::size_t { 1 } } };
     }
 
+    /// Retire a read-side operation THIS caller armed, freeing the coroutine parked on
+    /// it, without closing the socket.
+    ///
+    /// **A parked read could only ever be retrieved by `Close()`, which is what made the
+    /// caller-side rule on `Read` above unfollowable.** A caller holding a parked
+    /// `WaitReadable` must resolve or abandon it before it reads, and until this existed
+    /// *abandon* had no spelling short of tearing the connection down. `RunBlockingRead`
+    /// is the caller that could not follow it
+    /// ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710)): it armed a
+    /// fresh readability watch per loop iteration and cancelled none, so a pass that
+    /// ended with the previous one still parked dropped that coroutine -- never resumed,
+    /// never freed -- and on IOCP the reused `OVERLAPPED` completed the wrong operation
+    /// and reported a spurious EOF on a healthy connection.
+    ///
+    /// **It is the CALLER's call, and that is why it is a verb here rather than
+    /// something `Read` does for you.** At the arm site a socket cannot tell a stale
+    /// parked wait from a live one, and cancelling a live one resolves its waiter as
+    /// *the peer went away* -- dropping a healthy client. The caller can tell, because
+    /// it knows when its own iteration ended. So this changes nothing about
+    /// double-arming: `Detail::ClaimReadSlot` still asserts, and a caller that arms over
+    /// a parked wait is still wrong. See `Net/ReadSlot.hpp`.
+    ///
+    /// **The parked awaitable is COMPLETED with `Cancelled`, not dropped**, or this
+    /// would be the leak it exists to remove. That is not a new mechanism:
+    /// `EpollSocket::Close` and `KqueueSocket::Close` have always detached a parked read
+    /// and completed it exactly this way, and they do it to `RunBlockingRead`'s own
+    /// trampoline on every close that finds one parked.
+    ///
+    /// **Retirement is not synchronous on every platform and a caller must not assume it
+    /// is.** Epoll and kqueue detach and complete inline, so the slot is free when this
+    /// returns. IOCP cannot: the kernel owns the read op's single `OVERLAPPED`, so the
+    /// override there retracts the operation with `CancelIoEx` and the reactor completes
+    /// the awaitable when the aborted completion is dequeued. A caller that arms another
+    /// read in the SAME reactor turn is therefore still double-arming on Windows --
+    /// narrower than not cancelling at all, and not closed
+    /// ([#884](https://github.com/LASTRADA-Software/fastcached/issues/884)).
+    ///
+    /// **The default does nothing, and that is for FAKES**, exactly as `ShutdownWrite`
+    /// below: a transport whose reads never park has nothing to retire, and making this
+    /// pure virtual would reach into test files across three lanes to say so. A no-op
+    /// costs such a transport nothing, because there is no frame to free.
+    ///
+    /// Idempotent, and not a `Close()`: the socket stays open, and a later `Read` works.
+    virtual void CancelRead() noexcept {}
+
     /// The remote peer's address as a printable host string ("203.0.113.7" /
     /// "::1"), captured at accept time. Used by the `--log-source` connection
     /// log prefix. The default returns "" so transports that have no peer
