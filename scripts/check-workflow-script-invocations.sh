@@ -38,13 +38,12 @@ done
 # There is no filesystem fallback on purpose: the INDEX mode is what a fresh clone
 # gets, and a local chmod that was never staged is not the fact this asks about.
 # A tree with no index cannot answer, and says so.
-ModeOf() {  # $1 = repo root, $2 = repo-relative path
+ModeTable() {  # $1 = repo root -- prints "<mode> <path>" lines
     if [ -n "${FASTCACHED_WORKFLOW_MODE_FILE:-}" ]; then
-        awk -v want="$2" '$2 == want { print $1; found = 1 } END { if (!found) print "absent" }' \
-            "$FASTCACHED_WORKFLOW_MODE_FILE"
+        cat "$FASTCACHED_WORKFLOW_MODE_FILE"
         return 0
     fi
-    git -C "$1" ls-files -s -- "$2" 2>/dev/null | awk 'NR == 1 { print $1 } END { if (NR == 0) print "absent" }'
+    git -C "$1" ls-files -s -- 'scripts/*.sh' 2>/dev/null | awk '{ print $1, $4 }'
 }
 
 ModeSourceName() {
@@ -52,42 +51,48 @@ ModeSourceName() {
 }
 
 Check() {
-    local root="$1" workflows found=0 bare=0 bad=0 line path mode prefix
+    local root="$1" hits found=0 bare=0 bad=0 file prefix path mode
+
     echo "check-workflow-script-invocations: modes from $(ModeSourceName)"
 
-    workflows=$(ls "$root"/.github/workflows/*.yml 2>/dev/null || true)
-    if [ -z "$workflows" ]; then
+    local -a workflows=()
+    for file in "$root"/.github/workflows/*.yml; do
+        [ -f "$file" ] && workflows[${#workflows[@]}]="$file"
+    done
+    if [ "${#workflows[@]}" -eq 0 ]; then
         echo "FAIL no workflow files under .github/workflows -- the scan is broken, not the tree"
         return 1
     fi
 
-    local file
-    for file in $workflows; do
-        # Full-line shell comments are stripped: a COMMENT is not a call site, and
-        # two checks in this tree have refused a correct workflow by matching their
-        # own headers.
-        while IFS= read -r line; do
-            case "$(printf '%s' "$line" | sed 's/^[[:space:]]*//')" in
-                '#'*) continue ;;
-            esac
-            case "$line" in
-                *scripts/*.sh*) ;;
-                *) continue ;;
-            esac
-            # Every scripts/*.sh occurrence on the line, with the word before it.
-            # `-` for an absent word, never an empty field. `IFS=$'\t' read` does
-            # NOT read TSV: tab is IFS *whitespace*, so a leading empty field is
-            # COLLAPSED and every field after it shifts left. That is a trap this
-            # repository already records, and it cost this check a silent skip of
-            # the one bare invocation whose word before the path is nothing at all
-            # -- an indented `run: |` body. It read as clean.
-            printf '%s\n' "$line" | tr ' \t' '\n\n' | awk '
-                /^scripts\/[A-Za-z0-9_.-]+\.sh$/ { print (prev == "" ? "-" : prev) "\t" $0 }
-                $0 != "" { prev = $0 }' | while IFS="$(printf '\t')" read -r prefix path; do
-                printf '%s\t%s\t%s\n' "$file" "${prefix:--}" "$path"
-            done
-        done < "$file"
-    done > "${root}/.wsi-hits" 2>/dev/null || true
+    # ONE awk pass over every workflow, not a shell pipeline per LINE. The
+    # per-line version spawned several processes for each of ~3000 lines and timed
+    # out at 120s on Windows, where a process spawn under Git Bash costs orders of
+    # more than on Linux -- correct, and unusably slow on the only platform whose
+    # failure mode this check exists to prevent.
+    #
+    # `-` for an absent word, never an empty field: `IFS=$'\t' read` does NOT read
+    # TSV -- tab is IFS *whitespace*, so a leading empty field is COLLAPSED and
+    # every field after it shifts left. That dropped the one bare invocation with
+    # nothing before it, an indented `run: |` body, and the check read as clean.
+    hits="$(awk '
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (substr(line, 1, 1) == "#") next          # a comment is not a call site
+            n = split($0, word, /[ \t]+/)
+            prev = "-"
+            for (i = 1; i <= n; i++) {
+                if (word[i] == "") continue
+                if (word[i] ~ /^scripts\/[A-Za-z0-9_.-]+\.sh$/)
+                    printf "%s\t%s\t%s\n", FILENAME, prev, word[i]
+                prev = word[i]
+            }
+        }' "${workflows[@]}")"
+
+    # One `git ls-files -s` for every path, not one per hit: same spawn cost, same
+    # platform.
+    local modeTable
+    modeTable="$(ModeTable "$root")"
 
     while IFS="$(printf '\t')" read -r file prefix path; do
         [ -n "${path:-}" ] || continue
@@ -96,7 +101,7 @@ Check() {
             bash | sh | */bash | */sh) continue ;;
         esac
         bare=$((bare + 1))
-        mode="$(ModeOf "$root" "$path")"
+        mode="$(printf '%s\n' "$modeTable" | awk -v want="$path" '$2 == want { print $1; f = 1 } END { if (!f) print "absent" }')"
         if [ "$mode" = "absent" ]; then
             echo "FAIL ${file}: invokes ${path} bare, and that path is not in the index"
             bad=$((bad + 1))
@@ -104,8 +109,9 @@ Check() {
             echo "FAIL ${file}: invokes ${path} bare, but it is ${mode} -- exit 126 on the runner"
             bad=$((bad + 1))
         fi
-    done < "${root}/.wsi-hits"
-    rm -f "${root}/.wsi-hits"
+    done <<EOF
+$hits
+EOF
 
     if [ "$found" -eq 0 ]; then
         echo "FAIL no scripts/*.sh invocation found in any workflow -- the scan is broken, not the tree"
