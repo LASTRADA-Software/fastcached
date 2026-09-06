@@ -61,7 +61,13 @@ stage() {
     # A workflow the leg-derivation can read. Staged rather than copied from the real
     # tree, so a case can name a leg that does or does not exist without depending on
     # what CI happens to run today.
-    printf 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --ci\n' \
+    #
+    # EACH LEG IS SPELLED THE WAY THE REAL ONE IS. This fake used to give both jobs
+    # `--ci`, and the real Windows leg sweeps with `--only=` -- so the fake was more
+    # PERMISSIVE than the thing it stood for, every case here passed, and CI refused
+    # a correct tree by name. A staged workflow that agrees with the derivation
+    # rather than with the workflow tests the derivation against itself.
+    printf 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --self-test\n      - run: bash scripts/tidy-sweep.sh "--only=$WORKFILE"\n' \
         > "$work/.github/workflows/build.yml"
     printf '%s\n' "$1" > "$work/scripts/tidy-blind-spots.txt"
     shift
@@ -142,6 +148,47 @@ run_case reached_by_absent_leg refuse "which is not a clang-tidy leg"
 stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
     "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
 run_case reports_unreached_count pass "reached by NO analyser leg"
+
+# WHICH SPELLINGS COUNT AS A LEG. The staged workflow above already exercises the
+# passing direction -- `clang-tidy-windows` sweeps with `--only=` and nothing else,
+# so every `clang-tidy-windows` case above is red under a detector that knows only
+# `--ci`. These three are the directions a staged tree cannot reach.
+stageWorkflow() {
+    rm -rf "$work/build" "$work/src" "$work/scripts" "$work/.github"
+    mkdir -p "$work/build" "$work/scripts" "$work/.github/workflows"
+    printf '%b' "$1" > "$work/.github/workflows/build.yml"
+    printf 'src/FastCache/Net/IocpSocket.cpp\tclang-tidy-windows\tguarded\n' \
+        > "$work/scripts/tidy-blind-spots.txt"
+    entries=""
+    for pair in "$ctrl:50" "src/FastCache/Net/IocpSocket.cpp:2"; do
+        rel="${pair%:*}"; count="${pair##*:}"
+        mkdir -p "$work/$(dirname "$rel")" "$work/build/obj/$(dirname "$rel")"
+        : > "$work/$rel"
+        obj="$work/build/obj/$rel.o"
+        : > "$obj"
+        i=0; while [[ $i -lt $count ]]; do echo "0000 T sym$i" >> "$obj"; i=$((i + 1)); done
+        [[ -n $entries ]] && entries="$entries,"
+        entries="$entries{\"directory\":\"$work/build\",\"command\":\"c++ -fsanitize=address -c $work/$rel -o obj/$rel.o\",\"file\":\"$work/$rel\"}"
+    done
+    printf '[%s]' "$entries" > "$work/build/compile_commands.json"
+}
+
+# A mode the check cannot classify REFUSES. Assumed non-sweeping it would make a
+# real leg invisible and take every row naming it down with it -- which is the
+# defect above, one release later.
+stageWorkflow 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --dry-run\n'
+run_case unknown_sweep_mode refuse "does not recognise"
+
+# A COMMENT IS NOT A CALL SITE. `build.yml` really does carry the string
+# `scripts/tidy-sweep.sh --self-test` inside a comment, and a scan that reads
+# comments attributes an invocation to whatever job it is discussed in.
+stageWorkflow 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      # bash scripts/tidy-sweep.sh --only=x is what the other lane does\n      - run: echo nothing\n'
+run_case leg_claimed_by_a_comment refuse "which is not a clang-tidy leg"
+
+# The pair that keeps the one above from passing for the wrong reason: the SAME
+# invocation, uncommented, IS a leg.
+stageWorkflow 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --only=x\n'
+run_case leg_sweeping_with_only pass "contribute nothing in this configuration"
 
 echo "check-tidy-blind-spots-selftest: ran $cases case(s), $failures failure(s)"
 [[ $failures -eq 0 ]] || exit 1
