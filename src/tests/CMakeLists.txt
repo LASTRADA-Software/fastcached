@@ -958,6 +958,41 @@ set_tests_properties("flake-rate-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# No workflow calls `apt-get update` directly (#550).
+#
+# The runner image ships `packages.microsoft.com` preinstalled, and `apt-get
+# update` exits non-zero when ANY configured source is unreachable -- so a 403
+# from a mirror nothing here uses failed a step that only wanted the Ubuntu
+# archive, and read as an unrelated red check on whatever branch was building.
+# Established as a flake by an A/B inside ONE run: two jobs with byte-identical
+# install steps, same image, same moment, one 403.
+#
+# `scripts/ci-apt-update.sh` removes the unused sources FIRST and leaves an Ubuntu
+# archive failure fatal -- ignoring errors afterwards is how a real archive outage
+# becomes a silent one. This refuses a call site that skips the wrapper, which is
+# what gives it a chance of surviving: eleven sites exist today and the twelfth is
+# written by somebody who has never read this.
+add_test(
+    NAME "apt-update-wrapped"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh"
+)
+set_tests_properties("apt-update-wrapped" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Both directions, plus the two ways this scan could lie: a commented mention, and
+# a tree that calls NEITHER -- which must refuse rather than report clean over a
+# check that had stopped meaning anything.
+add_test(
+    NAME "apt-update-wrapped-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh" --self-test
+)
+set_tests_properties("apt-update-wrapped-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
