@@ -724,7 +724,15 @@ UnitContribution() {
         # whose module-map files do not exist yet, a clang-cl database spelling `-c`
         # as `/c` -- otherwise prints "0 of N contributed" with nothing an operator
         # can act on, which is a confident count over nothing.
+        # The ARGV is recorded beside the message. Without it an `unknown` says what
+        # the compiler refused but not what it was handed, and the two are different
+        # questions: `no such file or directory: '/E'` is either a driver that does
+        # not take that spelling or an argv that never reached it in that shape, and
+        # nothing in the reason alone separates them. Costing a CI round to find that
+        # out is what this line replaces.
         UnknownUnit "$2" "$3" "$(head -1 "${preprocessed}.err")"
+        printf '    argv: %s\n' "$(printf '[%s] ' "${argv[@]}")" >> "${3}.unknown"
+        printf '    cwd:  %s\n' "$directory" >> "${3}.unknown"
     fi
     rm -f "$preprocessed" "${preprocessed}.err"
     printf '%s\n' "${verdict:-unknown}"
