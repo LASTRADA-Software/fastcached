@@ -34,7 +34,7 @@ namespace
 std::uintptr_t ConnectClient(std::uint16_t port)
 {
     auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE(sock != InvalidSocketValue);
+    REQUIRE(sock != FastCache::InvalidSocketValue);
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -49,7 +49,7 @@ std::uintptr_t ConnectClient(std::uint16_t port)
 std::uint16_t FindFreePort()
 {
     auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE(sock != InvalidSocketValue);
+    REQUIRE(sock != FastCache::InvalidSocketValue);
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = 0;
@@ -202,7 +202,7 @@ struct RawPair
     RawPair()
     {
         auto const acceptor = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        REQUIRE(acceptor != InvalidSocketValue);
+        REQUIRE(acceptor != FastCache::InvalidSocketValue);
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
@@ -213,13 +213,13 @@ struct RawPair
         REQUIRE(::getsockname(acceptor, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         client = static_cast<SOCKET>(ConnectClient(ntohs(addr.sin_port)));
         served = ::accept(acceptor, nullptr, nullptr);
-        REQUIRE(served != InvalidSocketValue);
+        REQUIRE(served != FastCache::InvalidSocketValue);
         ::closesocket(acceptor);
     }
 
     ~RawPair()
     {
-        if (client != InvalidSocketValue)
+        if (client != FastCache::InvalidSocketValue)
             ::closesocket(client);
     }
 
