@@ -904,6 +904,41 @@ set_tests_properties("version-fallback-warning" PROPERTIES
 #
 # It reads the INDEX, not the filesystem: the checked-in mode is what a fresh
 # clone gets, and a local chmod that was never staged is not a fix.
+# A workflow's script invocation agrees with that script's file mode (#723).
+#
+# A `run:` line naming `scripts/x.sh` either spells an interpreter or relies on the
+# executable bit; relying on it while the file is 644 exits 126 on the runner, and
+# that is a CI-ONLY failure a local run never reproduces, because a human types
+# `bash` in front of the script by habit. It has happened twice, once inside a step
+# whose `name:` is a REQUIRED context.
+#
+# The rule is AGREEMENT, not a spelling: `scripts/ci-scope.sh` is 755 and invoked
+# bare, which is correct and must keep passing.
+#
+# `script-modes` beside it is not the same check -- that one asks whether a
+# shebanged script carries the bit, this one asks whether a CALL SITE depends on it.
+add_test(
+    NAME "workflow-script-invocations"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh"
+)
+set_tests_properties("workflow-script-invocations" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Both directions plus the shapes that make a scan lie: a commented mention, a tree
+# with no workflows, a tree with no invocations, and a bare call with NO word before
+# it -- which an `IFS=$'\t' read` collapses, shifting the path out of its field and
+# dropping the entry silently.
+add_test(
+    NAME "workflow-script-invocations-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh" --self-test
+)
+set_tests_properties("workflow-script-invocations-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
