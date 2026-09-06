@@ -1165,6 +1165,25 @@ std::expected<std::optional<CowTreeStorage::StoredRef>, StorageError> CowTreeSto
     return StoredRef { .overflow = parsed->overflow, .root = parsed->root };
 }
 
+std::expected<std::optional<CacheEntry>, StorageError> CowTreeStorage::LoadEntryMetadata(std::string_view key) const
+{
+    if (_tree == nullptr)
+        return std::unexpected(MakeError(StorageErrorCode::IoError, "not open"));
+    auto reader = _tree->BeginRead();
+    auto got = reader.Get(KeyView(key));
+    if (!got.has_value())
+        return std::unexpected(TranslateError(got.error()));
+    if (!got->has_value())
+        return std::optional<CacheEntry> {};
+    auto parsed = ParseRecord(CowTree::BytesView { (*got)->data(), (*got)->size() });
+    if (!parsed.has_value())
+        return std::unexpected(parsed.error());
+    // Stops here deliberately: `ParsedRecord::entry` already carries every field
+    // but the value, so nothing below this line -- the overflow walk and the
+    // decompress -- can change what a metadata caller sees.
+    return std::optional<CacheEntry> { std::move(parsed->entry) };
+}
+
 std::expected<std::optional<CowTreeStorage::LoadedEntry>, StorageError> CowTreeStorage::LoadEntry(std::string_view key) const
 {
     if (_tree == nullptr)
@@ -1925,7 +1944,9 @@ PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
         auto const node = _sweepCursor++;
         ++outcome.scanned;
 
-        auto loaded = LoadEntry(node->key);
+        // METADATA only: the two predicates below are `ParseRecord` output, and
+        // a `LoadEntry` here inflates a value the sweep never looks at (#944).
+        auto loaded = LoadEntryMetadata(node->key);
         if (!loaded.has_value())
             continue;
         if (!loaded->has_value())
@@ -1934,7 +1955,7 @@ PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
             // mirror; nothing to erase on disk.
             victims.push_back(Victim { .key = node->key, .lapsed = false });
         }
-        else if (auto const& entry = (*loaded)->entry; entry.expiry <= now)
+        else if (auto const& entry = **loaded; entry.expiry <= now)
         {
             if (!node->fetched)
                 ++_stats.expiredUnfetched;
@@ -1958,7 +1979,8 @@ PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
 
     for (auto const& victim: victims)
     {
-        auto loaded = LoadEntry(victim.key);
+        // Existence is all this asks, so it asks it without a decompress too.
+        auto loaded = LoadEntryMetadata(victim.key);
         if (loaded.has_value() && loaded->has_value())
         {
             if (auto const r = EraseEntry(victim.key); !r.has_value())

@@ -374,6 +374,20 @@ class CowTreeStorage final: public IStorage
     /// Load and decode an entry by key (no LRU side-effect).
     [[nodiscard]] std::expected<std::optional<LoadedEntry>, StorageError> LoadEntry(std::string_view key) const;
 
+    /// Load only an entry's METADATA by key -- everything `ParseRecord` decodes
+    /// except the value.
+    ///
+    /// `LoadEntry` continues past this point to walk any overflow chain and
+    /// decompress the stored bytes. A caller that reads only `expiry` or
+    /// `generation` therefore pays a full inflate of a value it discards, which
+    /// on a compressed store is the dominant cost of a sweep and is what made an
+    /// idle daemon spend most of a core (#944). `ReadStoredRef` stops in the same
+    /// place for the same reason.
+    ///
+    /// @param key Entry key.
+    /// @return The decoded metadata, `nullopt` when the key is absent.
+    [[nodiscard]] std::expected<std::optional<CacheEntry>, StorageError> LoadEntryMetadata(std::string_view key) const;
+
     /// Persist the entry to the tree.
     [[nodiscard]] std::expected<void, StorageError> StoreEntry(std::string_view key, CacheEntry const& entry);
 

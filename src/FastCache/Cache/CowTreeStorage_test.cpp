@@ -3354,3 +3354,67 @@ TEST_CASE("Closing a CowTreeStorage releases the path for the next one", "[cowst
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 }
+
+TEST_CASE("The expiry sweep reads a TTL without inflating the value", "[cowstorage][purge][cost]")
+{
+    // #944: `PurgeExpired` used `LoadEntry`, which walks the overflow chain and
+    // decompresses, to reach two fields `ParseRecord` had already produced. On
+    // the dogfood store that spent 76% of a core on an idle daemon forever.
+    //
+    // Asserted by COUNT, not by timing: a timing assertion on a small store
+    // measures the machine. The page store counts its reads, and an out-of-line
+    // value is the only shape where walking the chain is distinguishable from
+    // not walking it -- so the value has to be big enough to overflow.
+    constexpr std::size_t PageSize = 4096;
+    CowTree::InMemoryPageStore store { PageSize };
+
+    FastCache::CowTreeStorage::Options opts;
+    opts.pageSize = PageSize;
+    opts.maxValueBytes = 4 * 1024 * 1024;
+    auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+    REQUIRE(storage.has_value());
+    FastCache::ManualClock clock;
+
+    // SEMI-compressible, and that is the whole difficulty. `StoreEntry` lets the
+    // STORED (post-compression) size decide inline-vs-overflow, so a trivially
+    // compressible blob shrinks to a couple of KiB, lands inline, and the test
+    // measures a chain that is not there -- which is how the first version of
+    // this case failed, with a Get costing exactly one page read. The value must
+    // compress (or no decompress is on the path being tested) AND stay far bigger
+    // than a page afterwards. A restricted-alphabet PRNG gives roughly 2:1.
+    std::string big(1024 * 1024, '\0');
+    std::uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+    for (auto& c: big)
+    {
+        lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
+        c = static_cast<char>('a' + ((lcg >> 33) % 16));
+    }
+    REQUIRE((*storage)->Set("k", MakeBytes(big), 0, clock.Now() + 3600s).has_value());
+
+    // A Get is the control: it must materialise the value, so it must walk the
+    // chain. Without it the sweep's own figure calibrates against nothing.
+    auto const beforeGet = store.ReadCount();
+    REQUIRE((*storage)->Get("k", clock.Now())->found);
+    auto const getReads = store.ReadCount() - beforeGet;
+    REQUIRE(getReads > 8U); // the chain really is many pages
+
+    // The sweep scans the same key and reclaims nothing -- the TTL is an hour out.
+    auto const beforeSweep = store.ReadCount();
+    auto const outcome = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    auto const sweepReads = store.ReadCount() - beforeSweep;
+    REQUIRE(outcome.scanned == 1U);
+    REQUIRE(outcome.purged == 0U);
+
+    // The distinguishing assertion. Under the defect the sweep took the same
+    // path as the Get and this is >= getReads; the metadata load stops at the
+    // record page, so it is a small fraction of it.
+    REQUIRE(sweepReads < getReads / 4);
+
+    // ... and the sweep still WORKS: an out-of-line compressed value expires
+    // exactly when it did. Without this, "reads less" and "reads nothing
+    // useful" are the same passing test.
+    clock.Advance(3601s);
+    auto const lapsed = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    REQUIRE(lapsed.purged == 1U);
+    REQUIRE_FALSE((*storage)->Get("k", clock.Now())->found);
+}
