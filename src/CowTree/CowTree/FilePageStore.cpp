@@ -695,7 +695,8 @@ auto FilePageStore::WriteMeta(Meta const& meta) -> std::expected<void, CowTreeEr
 
 auto FilePageStore::LastDurableSlot() const noexcept -> MetaSlot
 {
-    std::scoped_lock const lock { _ioMutex };
+    // No lock: see `_lastDurableSlot`. Locking here was `std::terminate` on a
+    // `std::mutex::lock` failure, because this override is `noexcept`.
     return _lastDurableSlot;
 }
 
@@ -716,7 +717,7 @@ auto FilePageStore::Flush() -> std::expected<void, CowTreeError>
 
 std::size_t FilePageStore::PageCount() const noexcept
 {
-    std::scoped_lock const lock { _ioMutex };
+    // No lock, for the reason `LastDurableSlot` gives.
     return _totalDataPages;
 }
 
