@@ -1898,6 +1898,21 @@ int main(int argc, char** argv)
     auto const eventLogger = cfg.daemon ? MakeWindowsEventLogger(cfg.serviceName, cfg.logLevel) : nullptr;
     ILogger& logger = eventLogger ? static_cast<ILogger&>(*eventLogger) : static_cast<ILogger&>(*consoleLogger);
 
+    // Its OWN version, first thing, the way `fastcached` already does
+    // ("fastcached {} starting"). A manually bundled install is built once,
+    // deployed once, and then runs indefinitely with no further contact with what
+    // is current -- and the persisted disk tier makes that worse rather than
+    // better, because a stale object does not expire on its own. Without this line
+    // "how old is this install" is answerable only by cross-referencing file
+    // timestamps against git history by hand (#181).
+    //
+    // A LINE OF ITS OWN, deliberately, and not a field on the readiness line. That
+    // line is a wire contract: four fixtures in two languages match its bytes, and
+    // one of them `sed`s a field out of it by position. Adding a field there would
+    // break them by TIMEOUT rather than by a failed build, which is the failure
+    // mode #654 records about that exact string.
+    logger.Logf(LogLevel::Info, "fastcache-compile-node {} starting", VersionString);
+
     // An empty `--scheduler` and "no --toolchain and no discovery" were both refused
     // HERE, as inline `if`s, and both are now `StartupPolicyRejection` rows -- the
     // toolchain pair by #403, the scheduler by #386. Neither reads anything but the
