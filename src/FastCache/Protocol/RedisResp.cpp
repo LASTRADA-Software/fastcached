@@ -1001,6 +1001,20 @@ namespace
     ///    a TLS socket needs the record decrypted, which is a decision for that
     ///    layer, not something to soften here —
     ///    [#712](https://github.com/LASTRADA-Software/fastcached/issues/712).
+    ///  - **An RST on an idle connection**, which needs no pipelining peer at all.
+    ///    MEASURED on Linux/epoll, stable over 5 runs: a peer set to
+    ///    `SO_LINGER {1,0}` and closed with an EMPTY receive buffer makes `epoll_wait`
+    ///    report `EPOLLIN|EPOLLERR|EPOLLHUP`, and the first `recv(MSG_PEEK)` answers
+    ///    `-1 ECONNRESET` -- which `EpollSocket` turns into a flat `1`, so this arm
+    ///    reads "data pending" with no data. The SECOND peek answers `0`, so the error
+    ///    is consumed and a later arm would see the departure; that does not rescue
+    ///    the window, because nothing arms again until the next pass
+    ///    ([#899](https://github.com/LASTRADA-Software/fastcached/issues/899)).
+    ///
+    ///    Recorded because #899's own clause 2 offered an exit -- *if the window is
+    ///    only reachable behind a pipelining peer, it is the case this list already
+    ///    documents* -- and the measurement CLOSES that exit. An ordinary client
+    ///    crash reaches it. The list said "a peer that pipelines"; it is wider.
     /// @param watch  The blocking read's watch, which names the waiter to resolve and
     ///        says whether this trampoline is still wanted (kept alive here).
     /// @param socket The connection socket to watch for closure.
