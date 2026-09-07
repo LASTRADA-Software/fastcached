@@ -175,6 +175,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The compiler identity is the driver AND the target it generates for: `clang-cl`
   takes `-fms-compatibility-version` from whatever MSVC it finds, and that is code
   generation. The **key** folds the target, the **fingerprint** must not.
+- The FINGERPRINT folds the driver's argument GRAMMAR (`DriverGrammarName`), which is
+  a different question from the target and does not contradict the line above: the
+  target is code generation, the grammar is which spellings the driver can READ.
+  `clang-cl`, `clang++` and `clang` from one LLVM install print the same banner and own
+  one include tree, so they fingerprinted identically — and a worker looks a toolchain
+  up by fingerprint, runs its OWN driver and appends the client's `args` verbatim, so a
+  GNU driver handed `/std:c++20` read it as a filename. Distribution was silently off
+  for one family on every machine with both, with no counter moving (#226). A NAME, not
+  the enumerator's value, or reordering the enum splits every fleet; and the grammar is
+  in the cache file NAME as well as the digest, since `clang++` and `clang-cl` are both
+  symlinks to `clang` and a canonicalizing resolution gives them one path — the second
+  driver would then read the first's entry under a stamp that validates, which is a
+  false MATCH.
 - Read the `-cc1` line's `-triple`; the `Target:` header three lines above it is
   unversioned, and pinning it changes nothing while looking like a fix.
 - An empty triple means the identity is UNCHANGED, so a driver that states nothing

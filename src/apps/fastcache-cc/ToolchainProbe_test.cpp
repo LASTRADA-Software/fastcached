@@ -272,8 +272,10 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     std::vector<std::string> const rootsOne { (one / "inc").string() };
     std::vector<std::string> const rootsTwo { (two / (std::string { deeper } + "/inc")).string() };
 
-    auto const first = ComputeToolchainFingerprint("cc 1.0", WalkSerially(rootsOne).files);
-    auto const second = ComputeToolchainFingerprint("cc 1.0", WalkSerially(rootsTwo).files);
+    auto const first =
+        ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), WalkSerially(rootsOne).files);
+    auto const second =
+        ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), WalkSerially(rootsTwo).files);
     CHECK(first == second);
     CHECK(!first.empty());
 }
@@ -283,12 +285,69 @@ TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
     std::vector<std::string> const roots { (tree / "inc").string() };
-    auto const before = ComputeToolchainFingerprint("cc 1.0", WalkSerially(roots).files);
+    auto const before =
+        ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), WalkSerially(roots).files);
 
     tree.Write("inc/a.hpp", "edited!");
-    auto const after = ComputeToolchainFingerprint("cc 1.0", WalkSerially(roots).files);
+    auto const after =
+        ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), WalkSerially(roots).files);
 
     CHECK(before != after);
+}
+
+TEST_CASE("One LLVM install's two driver grammars fingerprint differently", "[toolchain-probe][driver-grammar]")
+{
+    // Issue #226, and the arrangement IS the defect: `clang-cl`, `clang++` and `clang`
+    // out of one install print the same banner and own one include tree, so every other
+    // input to this digest is identical between them by construction. Staging two
+    // different trees would test nothing -- the trees would separate them under the bug
+    // too -- so the banner and the files are held EQUAL and the grammar is the only
+    // thing that differs.
+    //
+    // A worker looks a toolchain up by fingerprint, runs its OWN driver, and appends
+    // the client's `args` verbatim. Collapsed, one family was always routed to a driver
+    // that cannot read its arguments: a GNU driver handed `/std:c++20` reads it as a
+    // filename, the job fails and the client falls back locally, so distribution was
+    // silently off for that family with no counter moving.
+    FastCache::Testing::ScratchDirectory tree { "fc-tcp-grammar" };
+    tree.Write("inc/a.hpp", "#define SHARED 1");
+    std::vector<std::string> const roots { (tree / "inc").string() };
+    auto const files = WalkSerially(roots).files;
+    REQUIRE_FALSE(files.empty());
+
+    auto const gnu = ComputeToolchainFingerprint("clang version 22.1.8", DriverGrammarName(DriverFamily::Gnu), files);
+    auto const msvc = ComputeToolchainFingerprint("clang version 22.1.8", DriverGrammarName(DriverFamily::Msvc), files);
+    CHECK(gnu != msvc);
+    CHECK_FALSE(gnu.empty());
+
+    // And the SAME grammar still agrees, which is the other half: a digest that
+    // separated everything would also pass the check above while splitting the fleet
+    // between two machines running one toolchain.
+    CHECK(gnu == ComputeToolchainFingerprint("clang version 22.1.8", DriverGrammarName(DriverFamily::Gnu), files));
+}
+
+TEST_CASE("A driver grammar is named, never numbered", "[toolchain-probe][driver-grammar]")
+{
+    // The names reach a value machines compare across builds, so reordering the enum
+    // must not move a fingerprint. Pinned as LITERALS rather than by round-tripping the
+    // function, which would agree with itself under any renaming -- the same argument
+    // the wire constants make about spelling a byte as well as its symbol.
+    CHECK(DriverGrammarName(DriverFamily::Gnu) == "grammar-gnu");
+    CHECK(DriverGrammarName(DriverFamily::Msvc) == "grammar-msvc");
+    CHECK(DriverGrammarName(DriverFamily::Any) == "grammar-any");
+
+    // `None` identifies nothing and says so by being empty, so an unrecognised driver's
+    // fingerprint is what it was before #226 rather than one that joins a family.
+    CHECK(DriverGrammarName(DriverFamily::None).empty());
+
+    // Every name distinct, or two families would share a fingerprint again -- which is
+    // the defect, reintroduced by a copy-paste rather than by a design.
+    std::vector<std::string_view> const names { DriverGrammarName(DriverFamily::Gnu),
+                                                DriverGrammarName(DriverFamily::Msvc),
+                                                DriverGrammarName(DriverFamily::Any) };
+    auto sorted = names;
+    std::ranges::sort(sorted);
+    CHECK(std::ranges::adjacent_find(sorted) == sorted.end());
 }
 
 TEST_CASE("A missing search root is skipped, not fatal", "[toolchain-probe]")
@@ -815,7 +874,7 @@ TEST_CASE("Two MSVC toolsets do not fingerprint identically", "[toolchain-probe]
         REQUIRE(scan.files.size() == 2);
         // "cl" for both, which is what the banner fallback gives every MSVC
         // toolchain -- so the roots are the only thing that can tell these apart.
-        return ComputeToolchainFingerprint("cl", scan.files);
+        return ComputeToolchainFingerprint("cl", DriverGrammarName(DriverFamily::Msvc), scan.files);
     };
 
     CHECK(digestOf(older) != digestOf(newer));

@@ -355,6 +355,31 @@ struct PathValueMatch
 /// @return Its introducers; empty for DriverFamily::None.
 [[nodiscard]] std::string_view IntroducersOf(DriverFamily family) noexcept;
 
+/// The stable name of a driver's argument GRAMMAR, for folding into a fingerprint.
+///
+/// A toolchain fingerprint answers "can this worker compile what I preprocessed", and
+/// the grammar is part of that answer: `clang-cl`, `clang++` and `clang` from one LLVM
+/// install print the same banner and own one include tree, so they fingerprinted
+/// IDENTICALLY -- and a worker looks a toolchain up by fingerprint, runs its own
+/// driver, and appends the client's `args` verbatim. A GNU driver handed `/std:c++20`
+/// reads it as a filename, so on a machine with both, one family was always routed to a
+/// driver that cannot read its arguments and distribution was silently off for it
+/// ([#226](https://github.com/LASTRADA-Software/fastcached/issues/226)).
+///
+/// **A NAME rather than the enumerator's value.** A fingerprint is compared between
+/// machines and across builds, so folding an integer would make reordering the enum a
+/// silent fleet-wide split; folding the name makes it a rename nobody performs by
+/// accident. It is the same argument the wire constants make about spelling a byte.
+///
+/// This does NOT contradict the rule that the key folds the target and the fingerprint
+/// must not. That rule is about the target TRIPLE -- code generation, which the key
+/// separates -- where this is about which spellings the driver accepts, which is what
+/// makes a dispatched compile runnable at all.
+///
+/// @param family The driver family.
+/// @return Its grammar name; empty for DriverFamily::None, which identifies nothing.
+[[nodiscard]] std::string_view DriverGrammarName(DriverFamily family) noexcept;
+
 /// The source language a translation unit is written in.
 ///
 /// Needed only where a driver has to be TOLD, because the ordinary signal — the

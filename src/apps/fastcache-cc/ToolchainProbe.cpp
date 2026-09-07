@@ -640,14 +640,23 @@ namespace
     /// path contains separators and characters no filename may carry, and two
     /// compilers can differ only in a component a sanitizer would flatten.
     /// @return The cache file path, or empty when there is no state directory.
-    [[nodiscard]] std::filesystem::path CacheFilePath(std::string const& compiler)
+    [[nodiscard]] std::filesystem::path CacheFilePath(std::string const& compiler, std::string_view grammar)
     {
         auto const dir = StateDirectory();
         if (dir.empty())
             return {};
 
-        KeyDigest name { "toolchain-cache-name-v1" };
+        // The GRAMMAR is part of the cache identity, not only of the fingerprint
+        // (#226). On a POSIX install `clang++` and `clang-cl` are both symlinks to
+        // `clang`, so a resolution that canonicalizes gives them one path -- and with
+        // the grammar folded into the digest but not the file name, the second driver
+        // would read the first's entry, find a stamp that validates, and return a
+        // fingerprint computed for the other grammar. That is a false MATCH, which is
+        // the one error direction this whole mechanism exists to prevent, so it is
+        // closed here regardless of what `ResolveCompiler` does on any platform.
+        KeyDigest name { "toolchain-cache-name-v2" };
         name.Field(compiler);
+        name.Field(grammar);
 
         std::error_code ec;
         auto const sub = dir / "toolchains";
@@ -1257,7 +1266,8 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // company with the clients that call it `cc`.
     auto const resolved = host.ResolveOnSearchPath(compiler).value_or(compiler);
     auto const stamp = ComputeToolchainStamp(banner, resolved, roots);
-    auto const cachePath = CacheFilePath(resolved);
+    auto const grammar = DriverGrammarName(spec.family);
+    auto const cachePath = CacheFilePath(resolved, grammar);
 
     // Handed back rather than left for the caller to derive a second time (#259).
     // Every field is the one this function just used, so a caller recording what the
@@ -1308,7 +1318,7 @@ ToolchainIdentity CachedToolchainFingerprint(IProcessRunner& runner,
     // The expensive part, reached only on a miss or a forced refresh.
     auto scan = ProbeToolchainFiles(roots, parallel);
     auto const complete = scan.complete;
-    auto const fingerprint = ComputeToolchainFingerprint(banner, std::move(scan.files));
+    auto const fingerprint = ComputeToolchainFingerprint(banner, grammar, std::move(scan.files));
 
     // A short walk is excluded from the cache for a HARSHER reason than an unrun
     // probe is, and this is the line that matters most in this function. An unrun

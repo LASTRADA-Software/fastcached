@@ -97,6 +97,42 @@ same on both — the same defect with no MSVC anywhere near it.
   served, and there the target is load-bearing. `CacheCompilerId` builds the first;
   `CompilerBanner` alone still feeds `CachedToolchainFingerprint`, and the compile
   node must keep computing it the same way or the two ends stop matching in silence.
+  - **It DOES fold the driver's argument GRAMMAR, and that is a third question**
+    ([#226](https://github.com/LASTRADA-Software/fastcached/issues/226)). The target is
+    code generation; the grammar is which spellings the driver can READ, and it decides
+    whether a dispatched compile runs at all. `clang-cl`, `clang++` and `clang` from one
+    LLVM install print the same banner — clang's does not name its own `argv[0]` the way
+    a GNU driver's does — and own one include tree, so both of the fingerprint's other
+    inputs are identical between them BY CONSTRUCTION and it collapsed all three onto one
+    value. A worker looks a toolchain up by fingerprint, runs its OWN driver, and appends
+    the client's `args` verbatim, which `RemoteCompileArgs` built in the CLIENT's grammar
+    — so on a machine with both, one family was always routed to a driver that could not
+    read its arguments: a GNU driver reads `/std:c++20` as a filename, the job fails, and
+    the client falls back to a local compile. Wasted remote work rather than a wrong
+    object, but distribution was silently off for that family with every counter reading
+    zero, which is the failure shape this subsystem exists to avoid. #224 only moved which
+    family it happened to.
+    - A **NAME**, `DriverGrammarName`, never the enumerator's value: a fingerprint is
+      compared between machines and across builds, so folding an integer makes reordering
+      the enum a silent fleet-wide split, where folding the name makes it a rename nobody
+      performs by accident. `DriverFamily::None` is EMPTY — an unrecognised driver's
+      fingerprint is then exactly what it was, which is the conservative direction, since
+      it cannot silently join either family's fleet.
+    - Folded as its own length-prefixed field and never appended to the banner. Two pieces
+      concatenated are not a framing, and one banner naming three drivers is the whole
+      reason the value exists.
+    - **And it is in the cache file NAME as well as the digest.** On a POSIX install
+      `clang++` and `clang-cl` are both symlinks to `clang`, so a resolution that
+      canonicalizes hands them one path: with the grammar in the digest alone the second
+      driver reads the first's entry, finds a stamp that validates — the stamp covers the
+      binary and the roots, which are identical — and returns a fingerprint computed for
+      the other grammar. A false MATCH, which is the one error direction this mechanism
+      exists to prevent, so it is closed regardless of what `ResolveCompiler` does on any
+      platform. `toolchain-v2` and `toolchain-cache-name-v2` move together.
+    - A test staging two different include trees would pass under the bug. The banner and
+      the file list are held EQUAL and the grammar is the only difference, with the
+      same-grammar case asserted beside it — a digest that separated everything would pass
+      the first check while splitting one toolchain across two machines.
 - **A dispatched compile states the target on the line, first.** A worker otherwise
   re-derives it from its own machine. `--target=<triple>` goes **ahead** of the
   build's own arguments, so a `--target=` or `-m32` the build states still wins, as

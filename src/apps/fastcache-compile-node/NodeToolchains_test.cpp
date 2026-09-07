@@ -845,6 +845,43 @@ TEST_CASE("NodeToolchains: two names for one toolchain are served once, and said
     CHECK(Logged(logger, "discovered 1 toolchain(s)"));
 }
 
+TEST_CASE("NodeToolchains: clang-cl and clang++ from one install are TWO toolchains", "[node][toolchains]")
+{
+    // Issue #226, and the case above is its mirror: `clang` and `clang++` SHOULD
+    // collapse -- same binary, same grammar -- while `clang-cl` must not, because the
+    // worker looks a toolchain up by fingerprint, runs its own driver, and appends the
+    // client's `args` verbatim. Collapsed, whichever family lost was routed to a driver
+    // that reads `/std:c++20` as a filename: the job fails, the client compiles
+    // locally, and distribution is off for that family with nothing counting it.
+    //
+    // The banner is IDENTICAL on purpose. clang's does not name its own `argv[0]` the
+    // way a GNU driver's does, and the two drivers own one include tree, so every other
+    // fingerprint input agrees by construction -- a fixture giving them different
+    // banners would separate them under the bug and assert nothing.
+    NodeConfig const cfg = Startable();
+    FixedDiscovery discovery { { Candidate("/usr/bin/clang-cl"), Candidate("/usr/bin/clang++") } };
+    SpawnScript runner;
+    runner.Banner("/usr/bin/clang-cl", "Ubuntu clang version 20.1.2")
+        .Banner("/usr/bin/clang++", "Ubuntu clang version 20.1.2");
+    ScopedStateDir const state;
+    ScriptedToolchainHost host;
+    CapturingLogger logger;
+
+    auto const resolved = ResolveToolchains(cfg, &discovery, runner, host, TestClock(), logger);
+    REQUIRE(resolved.has_value());
+    CHECK(Unwrap(resolved).size() == 2);
+
+    // Two "serving" lines and NO collapse -- asserted separately, because the count
+    // alone would also pass if one had been dropped for an unrelated reason and a
+    // third appeared, and the collapse message is the shape #226 reported.
+    auto const records = logger.Snapshot();
+    auto const serving =
+        std::ranges::count_if(records, [](CapturingLogger::Record const& r) { return r.message.starts_with("serving "); });
+    CHECK(serving == 2);
+    CHECK_FALSE(Logged(logger, "is the same toolchain as"));
+    CHECK(Logged(logger, "discovered 2 toolchain(s)"));
+}
+
 TEST_CASE("NodeToolchains: the witness is the identity's own evidence and is probed once", "[node][toolchains]")
 {
     // Issue #259. The survey records what a fingerprint rests on so that noticing the
