@@ -94,6 +94,7 @@ if(FASTCACHED_BUILD_TESTS)
         ConsensusTier_test.cpp
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
+        ExchangeLog_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
         SchedulerTier.cpp
