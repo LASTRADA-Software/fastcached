@@ -97,6 +97,42 @@ same on both — the same defect with no MSVC anywhere near it.
   served, and there the target is load-bearing. `CacheCompilerId` builds the first;
   `CompilerBanner` alone still feeds `CachedToolchainFingerprint`, and the compile
   node must keep computing it the same way or the two ends stop matching in silence.
+  - **It DOES fold the driver's argument GRAMMAR, and that is a third question**
+    ([#226](https://github.com/LASTRADA-Software/fastcached/issues/226)). The target is
+    code generation; the grammar is which spellings the driver can READ, and it decides
+    whether a dispatched compile runs at all. `clang-cl`, `clang++` and `clang` from one
+    LLVM install print the same banner — clang's does not name its own `argv[0]` the way
+    a GNU driver's does — and own one include tree, so both of the fingerprint's other
+    inputs are identical between them BY CONSTRUCTION and it collapsed all three onto one
+    value. A worker looks a toolchain up by fingerprint, runs its OWN driver, and appends
+    the client's `args` verbatim, which `RemoteCompileArgs` built in the CLIENT's grammar
+    — so on a machine with both, one family was always routed to a driver that could not
+    read its arguments: a GNU driver reads `/std:c++20` as a filename, the job fails, and
+    the client falls back to a local compile. Wasted remote work rather than a wrong
+    object, but distribution was silently off for that family with every counter reading
+    zero, which is the failure shape this subsystem exists to avoid. #224 only moved which
+    family it happened to.
+    - A **NAME**, `DriverGrammarName`, never the enumerator's value: a fingerprint is
+      compared between machines and across builds, so folding an integer makes reordering
+      the enum a silent fleet-wide split, where folding the name makes it a rename nobody
+      performs by accident. `DriverFamily::None` is EMPTY — an unrecognised driver's
+      fingerprint is then exactly what it was, which is the conservative direction, since
+      it cannot silently join either family's fleet.
+    - Folded as its own length-prefixed field and never appended to the banner. Two pieces
+      concatenated are not a framing, and one banner naming three drivers is the whole
+      reason the value exists.
+    - **And it is in the cache file NAME as well as the digest.** On a POSIX install
+      `clang++` and `clang-cl` are both symlinks to `clang`, so a resolution that
+      canonicalizes hands them one path: with the grammar in the digest alone the second
+      driver reads the first's entry, finds a stamp that validates — the stamp covers the
+      binary and the roots, which are identical — and returns a fingerprint computed for
+      the other grammar. A false MATCH, which is the one error direction this mechanism
+      exists to prevent, so it is closed regardless of what `ResolveCompiler` does on any
+      platform. `toolchain-v2` and `toolchain-cache-name-v2` move together.
+    - A test staging two different include trees would pass under the bug. The banner and
+      the file list are held EQUAL and the grammar is the only difference, with the
+      same-grammar case asserted beside it — a digest that separated everything would pass
+      the first check while splitting one toolchain across two machines.
 - **A dispatched compile states the target on the line, first.** A worker otherwise
   re-derives it from its own machine. `--target=<triple>` goes **ahead** of the
   build's own arguments, so a `--target=` or `-m32` the build states still wins, as
@@ -1618,10 +1654,37 @@ stops being one — the same confound that cost #493 a re-run.
       asked about. One model of the flag, asked twice; a second would be a second thing
       to be wrong. Measured on clang 22.1.8: the dispatched `DW_AT_name` becomes
       byte-identical to the local one where it was the raw absolute path.
-      - **It does not reach gcc, and that is a different residual with a different
-        cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule the worker
-        builds matches it and both spellings give the raw absolute path (measured, gcc
-        16.2.1). [#883](https://github.com/LASTRADA-Software/fastcached/issues/883).
+      - **It does not reach gcc on its own, and that is a different residual with a
+        different cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule
+        the worker builds matches it and both spellings give the raw absolute path
+        (measured, gcc 16.2.1). Closed by a SECOND pair, `sourceRoot` /
+        `sourceRootReplacement`, carrying the raw spelling beside the mapped one
+        ([#883](https://github.com/LASTRADA-Software/fastcached/issues/883)) — a rewrite
+        rule needs two operands and `sourceName` is already the mapped half, so the raw
+        half has to travel too. It cannot ride `compileDir`, whose halves are the
+        compilation DIRECTORY and are what `comp_dir` rules are built from.
+        - **Ordered between the other two**, and the sandwich is the whole of it: after
+          the compilation-directory rules, because this replacement is already the answer
+          of every client-side rule applied in order and must outrank a rule
+          reconstructing one of them; before #660's source-NAME rule, which its own block
+          requires to be last. All three can match one path — an in-tree build's source
+          lies under its build directory — and both drivers honour the LAST match, so a
+          rule in the wrong place is silently overridden with every counter normal.
+        - **A half-filled pair is REFUSED where a directory's is not.**
+          `-fdebug-prefix-map=<builddir>=` maps a root to nothing and is a real
+          reproducible-build spelling, so `WorkerPrefixMapRules` reads the DIRECTORY
+          alone as saying whether a mapping is in force. A source file mapped to nothing
+          is not a spelling of anything.
+        - Every other way of not building the rule is NO RULE, `WorkerSourceNameRule`'s
+          answer rather than `WorkerPrefixMapRules`': both operands are the client's own
+          strings, `my file.cpp` is ordinary, and what is left when it is skipped is the
+          pre-#883 raw path — the same on every machine that dispatches it — rather than
+          the nondeterministic `job-N` #660 was about. Neither operand is a property of
+          the worker, so there is no #810-shaped startup warning to pair with it.
+        - The correlation digest covers the pair and its tag moved with it
+          (`compile-corr-v3`): the client knows both before sending and the runner
+          observes both, so leaving it out would let a crossed reply through on exactly
+          the axis the pair exists to fix.
       - A RELATIVE source argument — the common case — matches no absolute rule, so
         nothing about it changes. The fallback is the ORIGINAL spelling, and an empty
         replacement falls back too: legal for a directory, a name `SafeSourceName` would
@@ -1635,6 +1698,15 @@ stops being one — the same confound that cost #493 a re-run.
     agreement, because two readers that both return nothing agree perfectly. It is
     the only case in that fixture that opens the debug records, and it is what
     caught the worker-directory-only design that every unit test had accepted.
+    - **Case 14 is the source-name half, and its ARRANGEMENT is the case.** Case 13's
+      source lies outside every mapped root, so both objects record the same raw path
+      and agree for a reason unrelated to the subject; moving it under `$mapdir` does
+      not repair that, because `$mapdir` is the launcher's compile directory and the
+      compilation-directory rule maps that path as a side effect — green with #883
+      reverted. So case 14's mapped source root is DISJOINT from the compile directory,
+      asserted rather than assumed, and the reference object is required to be MAPPED
+      before the agreement is read: two unmapped objects agree with the whole feature
+      removed.
 - **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
   hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
   module is included from a `project()` that lists CXX first — so the first run
@@ -2067,17 +2139,6 @@ with current truth at the moment the staleness would otherwise have done harm.
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
-- **[#883](https://github.com/LASTRADA-Software/fastcached/issues/883)** — #800 sends
-  what the client's own compile RECORDS rather than what the build system wrote, which
-  closes the disagreement on **clang** (it takes `DW_AT_name` from the input file path)
-  and not on **gcc** (it takes it from the `#line` marker, which no rule the worker
-  builds ever matches). Measured on gcc 16.2.1 and clang 22.1.8: the dispatched gcc
-  name is the client's raw absolute path under BOTH spellings, unchanged in either
-  direction. Neither driver rewrites a marker for `-fdebug-prefix-map`, and
-  `-ffile-prefix-map` would rewrite `__FILE__` into the text the worker compiles, which
-  is a wrong object under a correct key. Closing it needs the client's raw source path
-  AND its mapped spelling on a payload whose arity is exact — the one place #660's
-  "no wire bump" stops holding.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

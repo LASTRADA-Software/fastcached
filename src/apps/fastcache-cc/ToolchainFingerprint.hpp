@@ -39,7 +39,7 @@ struct ToolchainFile
 /// A fingerprint mismatch merely disables distribution, so a bump here is cheap;
 /// a false *match* would dispatch to the wrong toolchain, which is the failure
 /// this whole mechanism exists to prevent.
-inline constexpr std::string_view FingerprintSchema = "toolchain-v1";
+inline constexpr std::string_view FingerprintSchema = "toolchain-v2";
 
 /// Compute a toolchain fingerprint from a compiler identity and its include tree.
 ///
@@ -59,9 +59,22 @@ inline constexpr std::string_view FingerprintSchema = "toolchain-v1";
 /// directory iteration order, which is a property of the filesystem rather than of
 /// the toolchain — cannot change the answer.
 ///
+/// **The driver GRAMMAR is folded in too**, and it is the third independent question:
+/// `clang-cl`, `clang++` and `clang` from one LLVM install print the same banner and
+/// own one include tree, so the two inputs above cannot tell them apart — and a worker
+/// looks a toolchain up by fingerprint, runs *its* driver, and appends the client's
+/// arguments verbatim, so a GNU driver serving an MSVC-spelled job reads `/std:c++20`
+/// as a filename ([#226](https://github.com/LASTRADA-Software/fastcached/issues/226)).
+/// The name comes from `DriverGrammarName`, never the enumerator's value, for the
+/// reason that function gives.
+///
 /// @param compilerBanner The compiler's own version line, verbatim.
+/// @param driverGrammar `DriverGrammarName` of the driver's family; empty identifies
+///        nothing, which is what an unrecognised driver gets.
 /// @param files The toolchain's include tree; order does not matter.
 /// @return An opaque fingerprint, stable across machines with the same toolchain.
-[[nodiscard]] std::string ComputeToolchainFingerprint(std::string_view compilerBanner, std::vector<ToolchainFile> files);
+[[nodiscard]] std::string ComputeToolchainFingerprint(std::string_view compilerBanner,
+                                                      std::string_view driverGrammar,
+                                                      std::vector<ToolchainFile> files);
 
 } // namespace FastCache::Cc

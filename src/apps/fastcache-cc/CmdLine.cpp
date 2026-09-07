@@ -826,6 +826,33 @@ std::string_view IntroducersOf(DriverFamily family) noexcept
     return {};
 }
 
+std::string_view DriverGrammarName(DriverFamily family) noexcept
+{
+    // No `default:`, so a family added to the enum fails to compile here rather than
+    // silently fingerprinting as something else -- which is the failure this exists to
+    // close, one level up.
+    switch (family)
+    {
+        case DriverFamily::None:
+            // Identifies nothing, and says so by being empty rather than by naming a
+            // grammar it does not have. An unknown driver's fingerprint is then exactly
+            // what it was before #226, which is the conservative direction: it cannot
+            // silently join either family's fleet.
+            return {};
+        case DriverFamily::Msvc:
+            return "grammar-msvc";
+        case DriverFamily::Gnu:
+            return "grammar-gnu";
+        case DriverFamily::Any:
+            // Not a driver -- it is the "every driver accepts this" marker a TABLE ROW
+            // carries, and `DriverSpec::family` never holds it. Named rather than left
+            // to the empty arm, so a value that did reach a fingerprint would be
+            // distinguishable from an unrecognised driver rather than merged with it.
+            return "grammar-any";
+    }
+    return {};
+}
+
 std::optional<PathValueMatch> MatchPathValueFlag(std::string_view arg, std::string_view introducers, DriverFamily families)
 {
     if (arg.empty() || !introducers.contains(arg.front()))

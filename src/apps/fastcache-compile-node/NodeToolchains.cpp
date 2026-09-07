@@ -470,6 +470,12 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
         // have, in the one log an operator reads to find out why the scheduler is not
         // matching them.
         //
+        // **`clang-cl` no longer collapses here and must not**: the fingerprint folds
+        // the driver's argument GRAMMAR since #226, so one LLVM install serves two
+        // toolchains rather than one. Collapsing `clang` onto `clang++` is right --
+        // same binary, same grammar -- and collapsing either onto `clang-cl` routed a
+        // whole family to a driver that cannot read its arguments, silently.
+        //
         // Reported for an explicit override too, and IN TABLE ORDER however the work
         // was scheduled: a fingerprint mismatch is invisible from both ends, so this
         // log is where two machines' digests get compared, and one ordered by which

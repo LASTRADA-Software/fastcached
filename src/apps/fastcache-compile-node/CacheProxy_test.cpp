@@ -233,7 +233,9 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
                                                                     .acceptedCodecs = {},
                                                                     .sourceName = "t.cpp",
                                                                     .compileDir = {},
-                                                                    .compileDirReplacement = {} });
+                                                                    .compileDirReplacement = {},
+                                                                    .sourceRoot = {},
+                                                                    .sourceRootReplacement = {} });
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
 }
 

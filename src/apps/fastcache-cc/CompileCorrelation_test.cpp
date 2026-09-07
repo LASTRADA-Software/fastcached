@@ -31,7 +31,9 @@ struct Job
                                                       .fingerprint = fingerprint,
                                                       .sourceName = sourceName,
                                                       .compileDir = compileDir,
-                                                      .compileDirReplacement = compileDirReplacement });
+                                                      .compileDirReplacement = compileDirReplacement,
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
     }
 };
 

@@ -175,6 +175,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The compiler identity is the driver AND the target it generates for: `clang-cl`
   takes `-fms-compatibility-version` from whatever MSVC it finds, and that is code
   generation. The **key** folds the target, the **fingerprint** must not.
+- The FINGERPRINT folds the driver's argument GRAMMAR (`DriverGrammarName`), which is
+  a different question from the target and does not contradict the line above: the
+  target is code generation, the grammar is which spellings the driver can READ.
+  `clang-cl`, `clang++` and `clang` from one LLVM install print the same banner and own
+  one include tree, so they fingerprinted identically — and a worker looks a toolchain
+  up by fingerprint, runs its OWN driver and appends the client's `args` verbatim, so a
+  GNU driver handed `/std:c++20` read it as a filename. Distribution was silently off
+  for one family on every machine with both, with no counter moving (#226). A NAME, not
+  the enumerator's value, or reordering the enum splits every fleet; and the grammar is
+  in the cache file NAME as well as the digest, since `clang++` and `clang-cl` are both
+  symlinks to `clang` and a canonicalizing resolution gives them one path — the second
+  driver would then read the first's entry under a stamp that validates, which is a
+  false MATCH.
 - Read the `-cc1` line's `-triple`; the `Target:` header three lines above it is
   unversioned, and pinning it changes nothing while looking like a fix.
 - An empty triple means the identity is UNCHANGED, so a driver that states nothing
@@ -285,7 +298,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   What `sourceName` carries is what the client's own compile would RECORD — the source
   argument through `MappedByPrefixMapRules`, ONE model of the flag asked twice (#800).
   It closes clang and NOT gcc, which takes the name from the `#line` marker no worker
-  rule matches (#883); a relative source matches no rule and is unchanged.
+  rule matches; a relative source matches no rule and is unchanged. gcc needs a SECOND
+  pair (`sourceRoot`/`sourceRootReplacement`, #883) carrying the RAW spelling beside the
+  mapped one — a rewrite rule has two operands and `sourceName` is already one of them,
+  and it cannot ride `compileDir`, whose halves are the compilation DIRECTORY. Ordered
+  AFTER the directory rules (its replacement is already the answer of every client rule
+  applied in order) and BEFORE #660's, which must stay last: all three can match one
+  path and the LAST wins, so a misplaced rule is overridden with every counter normal.
+  A half-filled pair is REFUSED where a directory's empty replacement is legal, and
+  every other failure to spell it is NO RULE. `dist-compile-e2e` case 14 is the e2e, and
+  its ARRANGEMENT is the case: the mapped source root must be DISJOINT from the compile
+  directory, or the directory rule maps the path as a side effect and it passes reverted.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

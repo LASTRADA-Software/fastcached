@@ -145,7 +145,9 @@ namespace
                                                        .acceptedCodecs = job.accepted,
                                                        .sourceName = sourceName,
                                                        .compileDir = job.request.compileDir,
-                                                       .compileDirReplacement = job.request.compileDirReplacement });
+                                                       .compileDirReplacement = job.request.compileDirReplacement,
+                                                       .sourceRoot = job.request.sourceRoot,
+                                                       .sourceRootReplacement = job.request.sourceRootReplacement });
         auto const compileOutcome = exchange.Exchange(job.endpoint, std::move(compileFrame), job.credential, job.budget);
         if (compileOutcome.kind == CacheOutcomeKind::Transport)
             // Unreachable, broken mid-reply, or out of budget. The three are one
@@ -190,7 +192,9 @@ namespace
                                                    .fingerprint = job.request.fingerprint,
                                                    .sourceName = sourceName,
                                                    .compileDir = job.request.compileDir,
-                                                   .compileDirReplacement = job.request.compileDirReplacement });
+                                                   .compileDirReplacement = job.request.compileDirReplacement,
+                                                   .sourceRoot = job.request.sourceRoot,
+                                                   .sourceRootReplacement = job.request.sourceRootReplacement });
         if (Wire::AsStringView(result->correlation) != expected)
             return Refused(DispatchStatus::Mismatched,
                            std::format("{} answered about a different compile (expected {}, got {})",

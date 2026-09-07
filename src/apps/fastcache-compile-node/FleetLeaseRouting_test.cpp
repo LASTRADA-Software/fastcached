@@ -45,7 +45,9 @@ constexpr std::string_view Key = "obj-abcdef";
                                  .preprocessed = "int main() { return 0; }",
                                  .sourceName = "main.cpp",
                                  .compileDir = {},
-                                 .compileDirReplacement = {} };
+                                 .compileDirReplacement = {},
+                                 .sourceRoot = {},
+                                 .sourceRootReplacement = {} };
 }
 
 /// Take a lease for `Key` from @p scheduler the way a second client would.

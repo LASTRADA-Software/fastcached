@@ -7,7 +7,9 @@
 namespace FastCache::Cc
 {
 
-std::string ComputeToolchainFingerprint(std::string_view compilerBanner, std::vector<ToolchainFile> files)
+std::string ComputeToolchainFingerprint(std::string_view compilerBanner,
+                                        std::string_view driverGrammar,
+                                        std::vector<ToolchainFile> files)
 {
     // Sorted here rather than trusted from the caller. The caller's order comes
     // from a directory traversal, which is a property of the filesystem — two
@@ -23,6 +25,10 @@ std::string ComputeToolchainFingerprint(std::string_view compilerBanner, std::ve
 
     KeyDigest digest { FingerprintSchema };
     digest.Field(compilerBanner);
+    // A separate length-prefixed field, never appended to the banner: two pieces
+    // concatenated are not a framing, and the whole reason this value exists is that
+    // one banner names three drivers.
+    digest.Field(driverGrammar);
     for (auto const& file: files)
     {
         // Path and hash are folded as separate length-prefixed pieces, not

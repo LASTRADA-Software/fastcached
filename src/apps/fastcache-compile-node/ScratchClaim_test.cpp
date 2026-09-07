@@ -390,7 +390,9 @@ TEST_CASE("Two nodes compiling at once, each on its own claimed root, keep their
                                                        .preprocessed = texts.at(index),
                                                        .sourceName = "a.cpp",
                                                        .compileDir = {},
-                                                       .compileDirReplacement = {} };
+                                                       .compileDirReplacement = {},
+                                                       .sourceRoot = {},
+                                                       .sourceRootReplacement = {} };
                 start.arrive_and_wait();
                 // No Catch2 macro on this thread: the assertion macros are not
                 // thread-safe, so the answer is carried back and checked below.

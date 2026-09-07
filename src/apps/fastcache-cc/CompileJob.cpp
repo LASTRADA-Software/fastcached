@@ -867,6 +867,47 @@ std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePa
     return PrefixMapRule(*row, scratchSourcePath, clientSourceName);
 }
 
+std::expected<std::optional<std::string>, JobError> WorkerSourcePathRule(std::string_view clientSourcePath,
+                                                                         std::string_view replacement,
+                                                                         DriverFamily family)
+{
+    // The client mapping nothing is the ordinary case -- a relative source argument
+    // matches no `-fdebug-prefix-map` rule -- and it must not become a refusal or a
+    // worker-chosen default, exactly as an absent compilation directory must not.
+    if (clientSourcePath.empty() && replacement.empty())
+        return std::optional<std::string> {};
+
+    // **Both directions of half a pair are refused here, where a DIRECTORY's are not.**
+    // `-fdebug-prefix-map=<builddir>=` maps a build root to nothing and is a standard
+    // reproducible-build spelling, so `WorkerPrefixMapRules` reads the directory alone
+    // as saying whether a mapping is in force. A source FILE mapped to nothing is not a
+    // spelling of anything -- it would make the driver record an empty name -- and a
+    // replacement with no left-hand side would map everything.
+    if (clientSourcePath.empty() || replacement.empty())
+        return std::unexpected(JobError { .reason = JobRefusal::RejectedArgument,
+                                          .detail = "a source-path replacement and the path it replaces travel "
+                                                    "together; one without the other is half a rule" });
+
+    // From here on every way of not building a rule is NO RULE, which is
+    // `WorkerSourceNameRule`'s answer and not `WorkerPrefixMapRules`'. The client did
+    // ask for this one, so the choice is worth stating rather than inheriting: both
+    // operands are the CLIENT's own strings, an ordinary source file called
+    // `my file.cpp` cannot be spelled inside a rule, and refusing it would stop
+    // distributing that translation unit to improve a debug record. What is left when
+    // the rule is skipped is the pre-#883 state -- gcc recording the client's raw path,
+    // which is the same on every machine that dispatches it -- rather than the
+    // nondeterministic `job-N` #660 was about. Neither operand is a property of THIS
+    // machine, so there is nothing here for a startup warning to report, which is what
+    // #810 pairs with the scratch root.
+    auto const* row = PrefixMapRowFor(family);
+    if (row == nullptr)
+        return std::optional<std::string> {};
+    if (!SpellableInRule(clientSourcePath, *row) || !SpellableInRule(replacement, *row))
+        return std::optional<std::string> {};
+
+    return std::optional<std::string> { PrefixMapRule(*row, clientSourcePath, replacement) };
+}
+
 namespace
 {
     /// The longest path `WorkerSourceNameRule` could ever be handed on a worker whose
@@ -1236,6 +1277,24 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // compile is actually handed, which is the sanitized one. `SafeSourceName` may have
     // renamed it, and mapping the whole path rather than the directory is what makes
     // that irrelevant -- the recorded name is the client's spelling either way.
+    // BEFORE the source-NAME rule and AFTER the compilation-directory ones, and the
+    // sandwich is what makes all three work together (#883).
+    //
+    // gcc reads `DW_AT_name` from the `#line` marker, which names the CLIENT's path --
+    // a string no rule built from this worker's scratch root can match, which is why
+    // #660's rule closes clang and leaves gcc recording the producing checkout. The
+    // client sends both halves; this spells the rule.
+    //
+    // Its replacement is already the answer of every client-side rule applied in order,
+    // so it must outrank the compilation-directory rule whenever both match one path --
+    // an in-tree build's source lies under its build directory. #660's rule stays LAST
+    // for the reason its own block gives.
+    auto sourceRootRule = WorkerSourcePathRule(job.sourceRoot, job.sourceRootReplacement, family);
+    if (!sourceRootRule.has_value())
+        return std::unexpected(sourceRootRule.error());
+    if (sourceRootRule->has_value())
+        argv.push_back(*std::move(*sourceRootRule));
+
     auto const sourcePath = source.string();
     if (auto rule = WorkerSourceNameRule(sourcePath, job.sourceName, family); rule.has_value())
         argv.push_back(*std::move(rule));
@@ -1273,7 +1332,9 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
                                                .fingerprint = job.fingerprint,
                                                .sourceName = job.sourceName,
                                                .compileDir = job.compileDir,
-                                               .compileDirReplacement = job.compileDirReplacement });
+                                               .compileDirReplacement = job.compileDirReplacement,
+                                               .sourceRoot = job.sourceRoot,
+                                               .sourceRootReplacement = job.sourceRootReplacement });
 
     auto run = _runner.RunCaptureSplit(argv);
     if (run.exitCode == NotSpawned)

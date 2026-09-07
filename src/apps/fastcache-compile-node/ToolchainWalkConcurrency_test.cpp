@@ -81,8 +81,8 @@ TEST_CASE("A concurrent walk yields the same fingerprint as a serial one", "[too
     CHECK(serialScan.files.size() == threadedScan.files.size());
     CHECK(serialScan.files.size() == 240);
 
-    CHECK(ComputeToolchainFingerprint("cc 1.0", serialScan.files)
-          == ComputeToolchainFingerprint("cc 1.0", threadedScan.files));
+    CHECK(ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), serialScan.files)
+          == ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), threadedScan.files));
 }
 
 TEST_CASE("Repeating a concurrent walk is stable", "[toolchain][concurrency]")
@@ -103,7 +103,8 @@ TEST_CASE("Repeating a concurrent walk is stable", "[toolchain][concurrency]")
 
     REQUIRE(first.complete);
     REQUIRE(second.complete);
-    CHECK(ComputeToolchainFingerprint("cc 1.0", first.files) == ComputeToolchainFingerprint("cc 1.0", second.files));
+    CHECK(ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), first.files)
+          == ComputeToolchainFingerprint("cc 1.0", DriverGrammarName(DriverFamily::Gnu), second.files));
 }
 
 TEST_CASE("A slice that does not finish clears complete", "[toolchain][concurrency]")

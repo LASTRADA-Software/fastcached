@@ -2115,6 +2115,25 @@ void RecordManifest(Config const& cfg,
     // A named value and not a temporary, for the reason the block above states.
     auto const mappedSource = Cc::MappedByPrefixMapRules(argv, Cc::DriverOf(cmd.flavor).family, cmd.source);
     auto const sourceName = mappedSource.has_value() && !mappedSource->empty() ? *mappedSource : cmd.source;
+    // The RAW spelling beside the mapped one, because a rewrite rule needs TWO operands
+    // and `sourceName` is already the mapped half (#883).
+    //
+    // clang and gcc take `DW_AT_name` from different places, so #660's `sourceName` closes
+    // one and not the other: clang takes it from the INPUT FILE PATH, which the worker
+    // opens and can therefore map with a rule it builds itself, while gcc takes it from
+    // the `#line` marker in the preprocessed text -- which names THIS machine's path, is
+    // on no command line the worker sees, and matches no rule derived from the worker's
+    // scratch root. The worker cannot know that string; only this process does.
+    //
+    // Both empty unless a rule actually CHANGED the spelling. When nothing maps the
+    // source -- the ordinary case, a relative source argument matching no rule -- a pair
+    // would spell `<x>=<x>`, a rule that rewrites nothing and costs an argument on every
+    // dispatched compile. Emptiness is also how the worker is told to map nothing, so the
+    // two ends agree by construction rather than by both remembering to be careful.
+    auto const sourceRoot = (mappedSource.has_value() && !mappedSource->empty() && *mappedSource != cmd.source)
+                                ? std::string_view { cmd.source }
+                                : std::string_view {};
+    auto const sourceRootReplacement = sourceRoot.empty() ? std::string_view {} : std::string_view { sourceName };
 
     auto const exchange = Cc::MakeTcpExchange(Notice());
     auto const outcome = Cc::Dispatch(*exchange,
@@ -2125,7 +2144,9 @@ void RecordManifest(Config const& cfg,
                                                             .preprocessed = preprocessRun.out,
                                                             .sourceName = sourceName,
                                                             .compileDir = compileDirPath,
-                                                            .compileDirReplacement = compileDirReplacement },
+                                                            .compileDirReplacement = compileDirReplacement,
+                                                            .sourceRoot = sourceRoot,
+                                                            .sourceRootReplacement = sourceRootReplacement },
                                       DispatchBudgetsOf(cfg),
                                       cfg.credential);
     // What the fleet's own answer means on the statistics axis, decided once and in
