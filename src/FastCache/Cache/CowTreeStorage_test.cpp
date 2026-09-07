@@ -3520,23 +3520,21 @@ TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][fre
     CHECK(afterSecond < afterFirst * 3 / 2);
 }
 
-TEST_CASE("A reopened store's bytesUsed counts what this session TOUCHED, not what is on disk",
+TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not inflate it",
           "[cowstorage][bytesused][capacity]")
 {
-    // The sibling of "A reopened store's index reports what has been TOUCHED", and the
-    // fact that decides how #1006 can be fixed rather than a preference about it.
+    // #1006, both halves, and the second is what nearly went wrong.
     //
-    // `_bytesUsed` is maintained by `TouchOrInsert`, which adds `valueSize` for any key
-    // not in the MIRROR -- including one already on disk. So it is not "bytes in the
-    // store", and the obvious fix for #1006 (seed it at `Open` from a durable total)
-    // would DOUBLE-COUNT: every warm read would add bytes that were already counted.
+    // `_bytesUsed` counts what this session has TOUCHED -- `TouchOrInsert` adds for any
+    // key not in the MIRROR, including one already on disk. So the obvious fix, seeding
+    // it at `Open` from a durable total, DOUBLE-COUNTS: measured, 8 objects of 1000
+    // bytes gave 8000, then 0 at reopen, then 8000 again after reading them back, so a
+    // seeded 8000 would have become 16000 and `EvictToFit` would have evicted a store
+    // twice the size it believed.
     //
-    // Measured, 8 objects of 1000 bytes: 8000 in session one, 0 at reopen, and 8000
-    // again after reading all eight back -- so a seeded 8000 becomes 16000, and
-    // `EvictToFit` evicts a store twice the size it believes.
-    //
-    // Pinning it because the ticket was filed on the opposite assumption and a reader
-    // who does not measure will make the same one.
+    // The fix is therefore a SECOND counter that reads never touch, seeded from the
+    // meta. This case asserts both: that a reopened store knows its size, and that
+    // reading it all back does not change that number.
     TempFile tmp;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
@@ -3551,16 +3549,16 @@ TEST_CASE("A reopened store's bytesUsed counts what this session TOUCHED, not wh
                 (*first)
                     ->Set(std::format("k-{:02}", i), MakeBytes(std::string(ValueLen, 'x')), 0, FastCache::TimePoint::max())
                     .has_value());
-        // Not vacuous: the field really does track the writes before the close.
         REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
     }
 
     auto second = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(second.has_value());
 
-    // Zero, while every one of the objects is still on disk -- which the reads below
-    // prove. This is the half that makes `--cache-disk` unenforced after a restart.
-    CHECK((*second)->Snapshot().bytesUsed == 0);
+    // **The first half.** Before this the answer was 0 while the store was full, so
+    // `--cache-disk` was unenforced until a whole budget had been rewritten and the
+    // gauge operators watch read under the limit exactly while the store was over it.
+    CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
 
     FastCache::ManualClock clock;
     for (auto const i: std::views::iota(0, Objects))
@@ -3570,8 +3568,37 @@ TEST_CASE("A reopened store's bytesUsed counts what this session TOUCHED, not wh
         REQUIRE(got->found);
     }
 
-    // **The assertion that constrains the fix.** Reading them back RE-ADDS their bytes,
-    // so the count is a function of this session's working set. A durable total seeded
-    // at `Open` would be added to, not replaced by, exactly these bytes.
+    // **The second half, and the one a seeding fix would have failed.** Reading every
+    // object back must not move the figure by a byte: those bytes were already counted
+    // when they were written.
     CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+}
+
+TEST_CASE("The store's byte total follows deletes and replaces, not just writes", "[cowstorage][bytesused][capacity]")
+{
+    // The counter is maintained in `StoreEntry` and `EraseEntry`, which every mutation
+    // funnels through -- so this asserts the arithmetic those two do rather than any
+    // one caller. A total that only ever grew would pass the case above and still
+    // evict a store it believed was full.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    auto store = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(store.has_value());
+    FastCache::ManualClock clock;
+
+    REQUIRE((*store)->Set("a", MakeBytes(std::string(1000, 'x')), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*store)->Set("b", MakeBytes(std::string(1000, 'x')), 0, FastCache::TimePoint::max()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == 2000);
+
+    // A replace is a delta, not an addition.
+    REQUIRE((*store)->Set("a", MakeBytes(std::string(400, 'x')), 0, FastCache::TimePoint::max()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == 1400);
+
+    REQUIRE((*store)->Delete("b", clock.Now()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == 400);
+
+    REQUIRE((*store)->Delete("a", clock.Now()).has_value());
+    CHECK((*store)->Snapshot().bytesUsed == 0);
 }

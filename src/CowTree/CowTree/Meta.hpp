@@ -58,8 +58,17 @@ struct Meta
     /// Data page size in bytes. Each non-meta page is exactly this big.
     std::uint32_t pageSize { 0 };
 
-    /// Reserved; must be zero on disk.
-    std::uint32_t reserved0 { 0 };
+    /// Total KEY bytes of every live record, as the storage layer counts them.
+    ///
+    /// Was `reserved0`, and deliberately still in its slot: an older store has zero
+    /// here, which reads back as "unknown" and degrades to exactly the previous
+    /// behaviour. Extending `MetaEncodedSize` instead moves the CRC and makes every
+    /// existing store answer `InvalidArg` at `Decode` -- #332 permits discarding them,
+    /// it is simply not necessary.
+    ///
+    /// A `u32`, saturating at 4 GiB of key bytes (~67M 64-byte keys). Past that it is a
+    /// FLOOR rather than a total, which is the safe direction for reserving memory.
+    std::uint32_t keyBytes { 0 };
 
     /// Monotonically increasing transaction id. The valid meta with the
     /// higher txnId is the live one.
@@ -76,8 +85,16 @@ struct Meta
     /// use it for stats but should not rely on it for correctness.
     std::uint64_t itemCount { 0 };
 
-    /// Reserved; must be zero on disk.
-    std::uint64_t reserved1 { 0 };
+    /// Total VALUE bytes of every live record, uncompressed, as the storage layer
+    /// counts them.
+    ///
+    /// Was `reserved1`; see `keyBytes` for why the slot is reused. Zero on an older
+    /// store, which is indistinguishable from empty and correct in both cases.
+    ///
+    /// **The tree neither computes nor interprets this.** It stores encoded records,
+    /// possibly compressed; what `--cache-disk` is compared against is the storage
+    /// layer's own count, which is a different number. Carried, not derived (#1006).
+    std::uint64_t valueBytes { 0 };
 
     /// CRC-32C over all preceding bytes when encoded on disk. Not used
     /// for in-memory comparisons.

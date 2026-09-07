@@ -263,6 +263,22 @@ class CowTree
     /// @return Approximate item count from the last committed meta.
     [[nodiscard]] std::uint64_t ItemCount() const noexcept;
 
+    /// Record the storage layer's byte totals, written at every subsequent commit.
+    ///
+    /// **Set where the counters CHANGE, not before each commit.** There are five
+    /// commit sites in `CowTreeStorage`; holding the value here means every commit
+    /// picks up the current one with nothing to remember.
+    /// @param valueBytes Total uncompressed value bytes of every live record.
+    /// @param keyBytes Total key bytes, saturating -- see `Meta::keyBytes`.
+    void SetByteTotals(std::uint64_t valueBytes, std::uint32_t keyBytes) noexcept;
+
+    /// @return Value-byte total as of the last commit; 0 on a store written before
+    ///         the field existed, which is indistinguishable from empty.
+    [[nodiscard]] std::uint64_t ValueBytes() const noexcept;
+
+    /// @return Key-byte total as of the last commit; see `ValueBytes`.
+    [[nodiscard]] std::uint32_t KeyBytes() const noexcept;
+
     /// @return Page size of the backing store.
     [[nodiscard]] std::size_t PageSize() const noexcept;
 
@@ -274,6 +290,10 @@ class CowTree
     TxnId _liveTxn { 0 };
     PageId _liveFreeRoot { PageId::None() };
     std::uint64_t _liveItemCount { 0 };
+
+    /// The storage layer's byte totals, carried through the meta (#1006).
+    std::uint64_t _liveValueBytes { 0 };
+    std::uint32_t _liveKeyBytes { 0 };
     bool _opened { false };
 
     /// Look up `key` starting from `root`.

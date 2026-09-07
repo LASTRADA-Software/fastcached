@@ -472,6 +472,9 @@ class CowTreeStorage final: public IStorage
     {
         bool overflow { false };
         CowTree::PageId root { CowTree::PageId::None() };
+        /// Uncompressed value length of the record. Carried so an erase can decrement
+        /// the store's byte total without a second read (#1006).
+        std::uint64_t originalLen { 0 };
     };
 
     /// One validated overflow page: a copy of its bytes (the store's read
@@ -610,6 +613,9 @@ class CowTreeStorage final: public IStorage
     ///                  mutation produces an entry nobody has read yet.
     void TouchOrInsert(std::string_view key, std::size_t valueSize, AccessKind access = AccessKind::Write);
 
+    /// Hand the current byte totals to the tree, which writes them at the next commit.
+    void PublishByteTotals() noexcept;
+
     /// Drop the entry from the LRU mirror.
     void EraseFromLru(std::string_view key);
 
@@ -719,6 +725,21 @@ class CowTreeStorage final: public IStorage
     std::size_t _indexBytes { 0 };
 
     std::size_t _bytesUsed { 0 };
+
+    /// What the STORE holds, as opposed to `_bytesUsed`, which is what this session
+    /// has TOUCHED.
+    ///
+    /// The distinction is the whole of #1006 and is easy to miss: `TouchOrInsert` adds
+    /// for any key not in the mirror, including one already on disk, so `_bytesUsed`
+    /// rebuilds itself from reads after a restart and cannot be seeded from a durable
+    /// total without double-counting -- measured, and pinned by
+    /// "A reopened store's bytesUsed counts what this session TOUCHED".
+    ///
+    /// These two are maintained ONLY in `StoreEntry` and `EraseEntry`, which every
+    /// mutation funnels through, so no call site can forget them. Seeded at `Open`
+    /// from the meta and pushed back to the tree whenever they change.
+    std::uint64_t _storeBytes { 0 };
+    std::uint64_t _storeKeyBytes { 0 };
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };
     CasToken _nextCas { 1 };

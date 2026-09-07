@@ -343,6 +343,8 @@ auto CowTree::Open() -> std::expected<void, CowTreeError>
     _liveTxn = live.txnId;
     _liveFreeRoot = live.freeRoot;
     _liveItemCount = live.itemCount;
+    _liveValueBytes = live.valueBytes;
+    _liveKeyBytes = live.keyBytes;
     _opened = true;
     return {};
 }
@@ -360,6 +362,22 @@ WriteTxn CowTree::BeginWrite()
 std::uint64_t CowTree::ItemCount() const noexcept
 {
     return _liveItemCount;
+}
+
+void CowTree::SetByteTotals(std::uint64_t valueBytes, std::uint32_t keyBytes) noexcept
+{
+    _liveValueBytes = valueBytes;
+    _liveKeyBytes = keyBytes;
+}
+
+std::uint64_t CowTree::ValueBytes() const noexcept
+{
+    return _liveValueBytes;
+}
+
+std::uint32_t CowTree::KeyBytes() const noexcept
+{
+    return _liveKeyBytes;
 }
 
 std::size_t CowTree::PageSize() const noexcept
@@ -852,6 +870,9 @@ auto CowTree::CommitTxn(WriteTxn& txn) -> std::expected<TxnId, CowTreeError>
     next.freeRoot = PageId::None(); // free list is in-memory only for v1
     auto const newItemCount = static_cast<std::int64_t>(_liveItemCount) + txn._itemDelta;
     next.itemCount = static_cast<std::uint64_t>(std::max<std::int64_t>(0, newItemCount));
+    // Carried unchanged; see `SetByteTotals`.
+    next.valueBytes = _liveValueBytes;
+    next.keyBytes = _liveKeyBytes;
 
     if (auto const r = _store.WriteMeta(next); !r.has_value())
         return std::unexpected(r.error());

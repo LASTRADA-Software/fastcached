@@ -55,12 +55,12 @@ namespace
         WriteLe<std::uint32_t>(cursor, meta.magic);
         WriteLe<std::uint32_t>(cursor, meta.version);
         WriteLe<std::uint32_t>(cursor, meta.pageSize);
-        WriteLe<std::uint32_t>(cursor, meta.reserved0);
+        WriteLe<std::uint32_t>(cursor, meta.keyBytes);
         WriteLe<std::uint64_t>(cursor, meta.txnId);
         WriteLe<std::uint64_t>(cursor, meta.root.value);
         WriteLe<std::uint64_t>(cursor, meta.freeRoot.value);
         WriteLe<std::uint64_t>(cursor, meta.itemCount);
-        WriteLe<std::uint64_t>(cursor, meta.reserved1);
+        WriteLe<std::uint64_t>(cursor, meta.valueBytes);
         return dst.size() - cursor.size();
     }
 
@@ -94,12 +94,12 @@ std::expected<Meta, CowTreeError> DecodeMeta(BytesView src) noexcept
     meta.magic = ReadLe<std::uint32_t>(cursor);
     meta.version = ReadLe<std::uint32_t>(cursor);
     meta.pageSize = ReadLe<std::uint32_t>(cursor);
-    meta.reserved0 = ReadLe<std::uint32_t>(cursor);
+    meta.keyBytes = ReadLe<std::uint32_t>(cursor);
     meta.txnId = ReadLe<std::uint64_t>(cursor);
     meta.root = PageId { ReadLe<std::uint64_t>(cursor) };
     meta.freeRoot = PageId { ReadLe<std::uint64_t>(cursor) };
     meta.itemCount = ReadLe<std::uint64_t>(cursor);
-    meta.reserved1 = ReadLe<std::uint64_t>(cursor);
+    meta.valueBytes = ReadLe<std::uint64_t>(cursor);
     meta.crc32c = ReadLe<std::uint32_t>(cursor);
 
     if (meta.crc32c != expectedCrc)
