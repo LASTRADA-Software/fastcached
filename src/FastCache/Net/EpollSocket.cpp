@@ -9,6 +9,7 @@
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
+    #include <FastCache/Net/WriteSlot.hpp>
 
     #include <sys/socket.h>
     #include <sys/uio.h>
@@ -584,7 +585,7 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
         return IoAwaitable { IoResult { buffer.size() } };
 
     // Park.
-    _impl->writeOp.awaitable = nullptr;
+    Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
     // Drop any vectored state before parking a scalar write: OnWritable checks
     // writeSegments first, so a leftover cursor would make it re-send the
     // previous operation's bytes and then report THIS buffer's size as sent.
@@ -624,7 +625,7 @@ IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> cons
         return IoAwaitable { IoResult { sent } };
 
     // Park: stash the cursor + keep-alive and arm EPOLLOUT.
-    _impl->writeOp.awaitable = nullptr;
+    Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
     // Symmetric to the scalar path: a stale writeRemaining must not outlive the
     // operation that set it.
     _impl->writeOp.writeRemaining = {};

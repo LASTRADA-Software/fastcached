@@ -9,6 +9,7 @@
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
+    #include <FastCache/Net/WriteSlot.hpp>
 
     #include <sys/socket.h>
     #include <sys/uio.h>
@@ -564,7 +565,9 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
     if (remaining.empty())
         return IoAwaitable { IoResult { buffer.size() } };
 
-    _impl->writeOp.awaitable = nullptr;
+    // Park. See `Net/WriteSlot.hpp`: this is the claim of the single write-op
+    // slot, folded into one expression so there is no bare clear to forget it on.
+    Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
     // Drop any vectored state before parking a scalar write: OnWritable checks
     // writeSegments first, so a leftover cursor would make it re-send the
     // previous operation's bytes and then report THIS buffer's size as sent.
@@ -600,7 +603,9 @@ IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> con
     if (progress == SendProgress::Completed)
         return IoAwaitable { IoResult { sent } };
 
-    _impl->writeOp.awaitable = nullptr;
+    // Park. See `Net/WriteSlot.hpp`: this is the claim of the single write-op
+    // slot, folded into one expression so there is no bare clear to forget it on.
+    Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
     // Symmetric to the scalar path: a stale writeRemaining must not outlive the
     // operation that set it.
     _impl->writeOp.writeRemaining = {};
