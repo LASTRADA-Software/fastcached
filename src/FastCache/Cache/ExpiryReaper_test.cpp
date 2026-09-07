@@ -8,6 +8,7 @@
 #include <FastCache/Async/Cancellation.hpp>
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/TestReactor.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Cache/ExpiryReaper.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
@@ -26,6 +27,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -44,8 +46,17 @@ class RecordingObserver final: public IStorageMutationObserver
   public:
     void OnMutation(MutationKind kind, std::string_view key) noexcept override
     {
+        // **Called from INSIDE the sweep**, which is what makes this the cheapest
+        // place to see which thread the sweep ran on (#946) -- no `IStorage` double
+        // is needed, and a double would have to reimplement two dozen verbs to say
+        // one thing. Blocking here blocks the sweep for the same reason.
+        sweptOn.store(std::this_thread::get_id(), std::memory_order_release);
+        entered.store(true, std::memory_order_release);
         events.emplace_back(std::format("{}:{}", static_cast<int>(kind), key));
     }
+
+    std::atomic<bool> entered { false };     ///< The sweep reached this callback.
+    std::atomic<std::thread::id> sweptOn {}; ///< Which thread it reached it on.
 
     [[nodiscard]] bool HasObservers() const noexcept override
     {
@@ -102,7 +113,7 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     ExpiryReaper reaper {
         f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms }, &f.metrics
     };
-    auto task = reaper.Run(&f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
     CHECK(f.storage.Snapshot().itemCount == 1U); // Still live; nothing to do yet.
@@ -128,7 +139,7 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     // ever resume and nobody will ever free.
     Fixture f;
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
-    auto task = reaper.Run(&f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
 
@@ -152,7 +163,7 @@ TEST_CASE("Stopping the expiry cycle reclaims a frame still parked on the reacto
     Fixture f;
     {
         ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
-        reaper.Start(f.reactor);
+        reaper.Start(f.reactor, f.reactor);
         f.reactor.Drain();
         REQUIRE(f.reactor.PendingTimers() == 1); // Parked mid-interval.
     } // ~ExpiryReaper -> Stop() -> CancelPending, then the frame is destroyed.
@@ -169,7 +180,7 @@ TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[
     REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
 
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = Duration::zero() } };
-    auto task = reaper.Run(&f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
 
@@ -212,7 +223,7 @@ TEST_CASE("The expiry cycle actually backs off on a running reactor", "[expiry][
     ExpiryReaper reaper { f.storage,
                           f.logger,
                           ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms, .stopWakeBound = 100ms } };
-    auto task = reaper.Run(&f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
     f.reactor.Submit(task.Native());
     f.reactor.Drain();
     CHECK(reaper.CurrentInterval() == 100ms);
@@ -324,4 +335,84 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
         fixed.AdaptScanBudget(std::chrono::seconds { 30 });
         CHECK(fixed.CurrentScanBudget() == 512);
     }
+}
+
+TEST_CASE("The sweep body runs on the executor it was given and not on the reactor", "[expiry][reaper][offreactor]")
+{
+    // #946's acceptance is a THREAD IDENTITY assertion rather than a behavioural
+    // one, and that is the whole point: the sweep reclaims the same keys either way,
+    // so a test that checks the outcome passes with the sweep still inline. The trap
+    // this ticket names; `CompileResponder_test.cpp` makes the same argument for the
+    // compile hop.
+    //
+    // Deliberately does NOT block inside the sweep. An earlier version held the sweep
+    // in the observer to also show the reactor still serving, and it deadlocked the
+    // fixture -- the pool thread holds the observer while the test thread pumps the
+    // same reactor. The property that decides #946 is WHICH THREAD ran the sweep, and
+    // that needs no blocking to see.
+    Fixture f;
+    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.Now() + 1ms).has_value());
+    f.clock.Advance(10ms);
+
+    // **Reset AFTER the Set.** `NotifyingStorage::Set` notifies too, so without this
+    // the observer records the store -- on the test thread -- and the case reads a
+    // pass or a fail about an event that is not the sweep. It cost a red run to find,
+    // and the red was the instrument working.
+    f.observer.entered.store(false, std::memory_order_release);
+    f.observer.sweptOn.store(std::thread::id {}, std::memory_order_release);
+
+    ThreadPoolExecutor pool { 1 };
+    auto const reactorThread = std::this_thread::get_id();
+    {
+        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 1ms, .stopWakeBound = 1ms } };
+        reaper.Start(f.reactor, pool);
+
+        // `Tick()` a bounded number of times rather than `Drain()`: Drain runs until a
+        // tick advances nothing, and a cycle whose interval keeps re-arming always has
+        // another timer, so Drain does not return on this fixture.
+        for (auto i = 0; i < 3000 && !f.observer.entered.load(std::memory_order_acquire); ++i)
+        {
+            f.clock.Advance(1ms);
+            f.reactor.Tick();
+            std::this_thread::sleep_for(std::chrono::microseconds { 100 });
+        }
+        REQUIRE(f.observer.entered.load(std::memory_order_acquire));
+
+        // **The assertion.** The sweep body did not run on the reactor's thread.
+        CHECK(f.observer.sweptOn.load(std::memory_order_acquire) != reactorThread);
+    }
+    SUCCEED("the reaper was destroyed after its sweep left the executor");
+}
+
+TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop", "[expiry][reaper][offreactor]")
+{
+    // The control, and it is what makes the case above mean something: with the
+    // reactor passed as its own executor the sweep runs on the loop, exactly as it
+    // did before #946. `IReactor` IS an `IExecutor`, so this is the same statements
+    // rather than a second code path -- and without this, "the sweep is elsewhere"
+    // could be true because the hop always leaves, which would be a different defect.
+    Fixture f;
+    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.Now() + 1ms).has_value());
+    f.clock.Advance(10ms);
+
+    // **Reset AFTER the Set.** `NotifyingStorage::Set` notifies too, so without this
+    // the observer records the store -- on the test thread -- and the case reads a
+    // pass or a fail about an event that is not the sweep. It cost a red run to find,
+    // and the red was the instrument working.
+    f.observer.entered.store(false, std::memory_order_release);
+    f.observer.sweptOn.store(std::thread::id {}, std::memory_order_release);
+
+    auto const reactorThread = std::this_thread::get_id();
+    {
+        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 1ms, .stopWakeBound = 1ms } };
+        reaper.Start(f.reactor, f.reactor);
+        for (auto i = 0; i < 3000 && !f.observer.entered.load(std::memory_order_acquire); ++i)
+        {
+            f.clock.Advance(1ms);
+            f.reactor.Tick();
+        }
+        REQUIRE(f.observer.entered.load(std::memory_order_acquire));
+        CHECK(f.observer.sweptOn.load(std::memory_order_acquire) == reactorThread);
+    }
+    SUCCEED("the sweep stayed on the reactor when the reactor was the executor");
 }

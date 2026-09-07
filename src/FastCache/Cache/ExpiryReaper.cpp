@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Cache/ExpiryReaper.hpp>
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Profiling.hpp>
 
 #include <format>
@@ -19,10 +21,10 @@ ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptio
 {
 }
 
-void ExpiryReaper::Start(IReactor& reactor)
+void ExpiryReaper::Start(IReactor& reactor, IExecutor& sweepOn)
 {
     _reactor = &reactor;
-    _task = Run(&reactor, _source.Token());
+    _task = Run(&reactor, &sweepOn, _source.Token());
     reactor.Submit(_task.Native());
 }
 
@@ -31,6 +33,23 @@ void ExpiryReaper::Stop() noexcept
     if (_reactor == nullptr)
         return;
     _source.Cancel();
+
+    // **Waited for BEFORE anything is reclaimed**, because a sweep on the executor
+    // is a frame the reactor does not hold: `CancelPending` would answer false and
+    // `~Task` would then destroy a coroutine the pool thread is still executing.
+    // Cancelling the token does not end the sweep -- `PurgeExpired` does not observe
+    // it -- so this waits for the body, which finishes on its own and needs no
+    // reactor to do so.
+    //
+    // Bounded, and it says what it abandoned: an unbounded wait here hands the
+    // choice to the supervisor, which answers SIGKILL with no diagnostic. Through
+    // `DrainWithin` rather than a hand-rolled loop, because a `waited += poll` count
+    // measures the sleep it ASKED for and a sleep costs what the host's timer
+    // granularity says.
+    if (DrainWithin([this] { return Sweeping(); }) == DrainResult::Ceiling)
+        _logger.Log(LogLevel::Warn,
+                    "expiry: a sweep was still running when the cycle stopped; abandoning it rather than waiting "
+                    "further. The frame is left to the reactor's own teardown.");
 
     // Taken back off the timer wheel rather than left there: by the time this
     // runs the loop has usually already stopped, so a parked frame would never
@@ -104,7 +123,7 @@ void ExpiryReaper::AdaptScanBudget(Duration elapsed) noexcept
     _scanBudget = grown > _options.scanBudget ? _options.scanBudget : grown;
 }
 
-Task<void> ExpiryReaper::Run(IReactor* reactor, CancellationToken token)
+Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, CancellationToken token)
 {
     // A disabled cycle ends rather than parking forever: a coroutine asleep on
     // a deadline nobody will move is a frame the reactor has to outlive.
@@ -151,7 +170,47 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, CancellationToken token)
         // nowhere -- so this elapsed time IS how long this reactor was unavailable,
         // and it is the only quantity the ceiling can honestly be expressed in.
         auto const startedAt = reactor->Clock().Now();
-        auto const outcome = SweepOnce(startedAt);
+
+        // --- Off the reactor for the sweep body (#946). ---
+        //
+        // `SweepOnce` suspends nowhere, so on the reactor it holds the loop for its
+        // whole duration and every connection pinned there is unserved. #964 bounded
+        // how long that is; this is what stops it being the reactor's time at all.
+        //
+        // The same two-hop the compile surface uses, and `IReactor` IS an `IExecutor`
+        // -- so a caller that passes the reactor gets exactly the previous behaviour
+        // through the same statements, rather than through a second code path.
+        co_await ResumeOn { *sweepOn };
+
+        // Bracketed around the body and nothing else: this is the interval in which
+        // the frame is NOT parked on the reactor, which is precisely the interval
+        // `Stop` must not destroy it in. See `Sweeping()`.
+        _sweeping.store(true, std::memory_order_release);
+        PurgeOutcome outcome {};
+        try
+        {
+            outcome = SweepOnce(startedAt);
+        }
+        catch (...)
+        {
+            // Swallowed, and the hop below still runs. An exception here would
+            // otherwise be rethrown where the awaiter resumes -- on the POOL thread
+            // if it escaped before the hop -- which is the mistake
+            // `CompileResponder` documents at length. A sweep that threw has
+            // reclaimed nothing; the cycle continues and the next one tries again.
+            outcome = PurgeOutcome {};
+        }
+        _sweeping.store(false, std::memory_order_release);
+
+        // --- Back, ALWAYS, before anything reads the reactor again. ---
+        //
+        // Unconditional even when the token is cancelled, and that is the whole rule:
+        // a `co_return` from the pool leaves this frame owned by nobody, which is the
+        // shape `TeardownIsSerialisedWithDispatch()` exists to catch (#668, #737,
+        // #840, #875). The loop's own `IsCancelled()` check is one statement below
+        // and runs on the reactor, where ending is safe.
+        co_await ResumeOn { *reactor };
+
         AdaptScanBudget(reactor->Clock().Now() - startedAt);
         if (outcome.purged != 0)
             _logger.Logf(LogLevel::Debug,
