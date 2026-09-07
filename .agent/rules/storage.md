@@ -320,20 +320,18 @@ is what the conversion does.
 
 ## Open work
 
-- **[#990](https://github.com/LASTRADA-Software/fastcached/issues/990)** — a disk
-  tier grows past `--cache-disk` across a restart while the gauge reads under it,
-  and the two halves compound. `CommitTxn` pins `freeRoot` to `None`, so the free
-  list does not survive a restart; `RecoverExistingFile` then marks **every** data
-  page live and subtracts only via the chain walk that can therefore never run. So
-  the pages a previous session freed are not merely forgotten, they are permanently
-  CLAIMED — which is what decides the shape of any fix: reclamation added later
-  helps only stores written after it, because in an existing file an orphan is
-  indistinguishable from a live page. `_bytesUsed` resets too, so each session's
-  `EvictToFit` does not fire until it has rewritten `maxBytes`, making the
-  extension larger before recycling starts. Measured: `maxBytes` 64 KiB, 300 × 1 KiB
-  writes, close, reopen, 300 more — file 1,114,112 → 2,179,072 bytes with
-  `bytesUsed` reading 65,536 in **both** sessions. Deliberately not decomposed
-  between the two causes: a plausible split neither measurement supports would be
-  believed. Shares its root cause with
-  [#175](https://github.com/LASTRADA-Software/fastcached/issues/175), and the page
-  store never shrinking is stated as contract in `IPageStore.hpp`.
+- **[#1006](https://github.com/LASTRADA-Software/fastcached/issues/1006)** — a disk
+  tier's BYTE TOTAL resets on restart, so `--cache-disk` is unenforced until the session
+  has rewritten a whole budget, and the gauge reads under the limit exactly while the
+  store is over it. `_bytesUsed` is touched only by `TouchOrInsert` and the erase paths,
+  never at `Open`, and `Snapshot().bytesUsed` is that same field — so the number an
+  operator is told to watch describes the working set since the last restart rather than
+  the store.
+
+  This is what SURVIVES #990, which persisted the free list and is closed: pages a
+  previous session freed are reused now, so the file no longer grows without bound, but
+  the accounting that bounds eviction still starts at zero. Third instance of one shape —
+  state that should describe the store is populated only by touch, never at `Open` — with
+  [#175](https://github.com/LASTRADA-Software/fastcached/issues/175) (the index) as the
+  other live one. They are deliberately not one ticket: #990's remedy does not transfer,
+  because bytes used is derivable from the tree rather than a structure to write down.
