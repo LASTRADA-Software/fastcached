@@ -65,6 +65,26 @@ struct ExpiryReaperOptions
     /// legitimate thing to ask for and is spelled rather than defaulted -- the
     /// same rule `InterruptibleSleepUntil` states.
     Duration stopWakeBound { std::chrono::milliseconds { 50 } };
+
+    /// How long one sweep may hold the reactor before the scan budget is cut.
+    ///
+    /// **`scanBudget` counts ENTRIES, and entries are not work** (#946). Its own
+    /// note above says it is "small enough that no single cycle is measurable
+    /// against a request" -- which is an assumption about per-entry cost, and that
+    /// cost varies by three orders of magnitude between a tier of 100-byte values
+    /// and one of multi-megabyte objects. A ceiling expressed in entries therefore
+    /// bounds how many keys a sweep touches and says nothing about how long the
+    /// reactor is unavailable, which is the thing actually being protected.
+    ///
+    /// So the budget is ADAPTED from a measurement instead of trusted: the reaper
+    /// times its own sweep and cuts the scan budget when it overruns this, growing
+    /// it back while it does not. The clock is the reactor's, which the cycle
+    /// already holds -- a wall-clock budget inside `PurgeExpired` would need a seam
+    /// that primitive does not have, since it takes `now` and no clock.
+    ///
+    /// This does NOT move the sweep off the reactor, which is the other half of
+    /// #946 and a decision of its own.
+    Duration sweepStallCeiling { std::chrono::milliseconds { 50 } };
 };
 
 static_assert(ExpiryReaperOptions::DefaultPurgeBudget <= ReclaimLog::DefaultCapacity,
@@ -189,6 +209,26 @@ class ExpiryReaper
     /// @return How long the cycle is currently waiting between sweeps. Grows
     /// while there is nothing to reclaim; back to `options.interval` as soon as
     /// there is.
+    /// The scan budget in force, which the reaper adapts from measured sweep cost.
+    ///
+    /// Sibling of `CurrentInterval()`, and for the same reason: both are values this
+    /// object adapts rather than holds, so both are worth being able to read.
+    /// @return Entries the next sweep may examine.
+    [[nodiscard]] std::size_t CurrentScanBudget() const noexcept
+    {
+        return _scanBudget;
+    }
+
+    /// Adapt the scan budget from how long the last sweep held the reactor.
+    ///
+    /// **Public because it is tested directly.** It is a pure function of the elapsed
+    /// time and this object's state, and driving it through `Run` would need an
+    /// `IStorage` fake that consumes clock time -- 28 forwarding methods to observe one
+    /// rule. Testing the rule where it lives is the honest trade; what that leaves
+    /// unasserted is the WIRING, which is stated on the definition.
+    /// @param elapsed How long the sweep took.
+    void AdaptScanBudget(Duration elapsed) noexcept;
+
     [[nodiscard]] Duration CurrentInterval() const noexcept
     {
         return _interval;
@@ -200,6 +240,15 @@ class ExpiryReaper
     IMetricsSink* _metrics;
     ExpiryReaperOptions _options;
     Duration _interval;
+
+    /// Floor for the adapted scan budget. Not zero: zero is `PurgeBudget`'s
+    /// spelling of *no ceiling*, so a budget that decayed to it would become an
+    /// unbounded scan -- the opposite of what the adaptation is for.
+    static constexpr std::size_t MinScanBudget = 8;
+
+    /// The scan budget actually in force, adapted from measured sweep cost and
+    /// never above `_options.scanBudget`. See `sweepStallCeiling`.
+    std::size_t _scanBudget;
     std::uint64_t _cycles { 0 };
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
