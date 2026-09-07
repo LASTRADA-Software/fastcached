@@ -1758,9 +1758,18 @@ jobs:
       # started" are two visible states (#376). The `cl-debug` leg only, because
       # one reading is the measurement and three are three copies of it.
       #
-      # This step is deleted in the same pull request once the answer is read; a
+      # It answers a SECOND question for free, because it needs the same `cl`:
+      # [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) asks for
+      # a way to exercise the localized case that is not a stub asserting its own
+      # premise, and says outright that "this needs a machine we do not have" is a
+      # legitimate finding -- which it is only if somebody MEASURED it. `VSLANG`
+      # selects `cl`'s diagnostic language but can only select an INSTALLED one, so
+      # asking for German and comparing the note byte for byte against the default
+      # settles whether this runner has a language pack.
+      #
+      # This step is deleted in the same pull request once the answers are read; a
       # diagnostic that outlives the question it answered is cost with no reader.
-      - name: "PROBE (#825): which channel does cl /showIncludes write to?"
+      - name: "PROBE (#825, #878): the /showIncludes channel, and whether cl can be localized here"
         if: ${{ needs.changes.outputs.code != 'false' && matrix.preset == 'cl-debug' }}
         continue-on-error: true
         shell: pwsh
