@@ -135,6 +135,11 @@ jobs:
           # filter in `build.yml` is `[master, fix-ci]`, and `fix-ci` is the branch
           # CI experiments are expected to fail on.
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          # The RUN's own conclusion. A cancelled run is a run that did nothing,
+          # and the decision's "nothing failed and nothing succeeded either"
+          # assertion would refuse it -- right about the record, wrong about the
+          # tree. Cancelling a superseded run is ordinary.
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
           # `bash <path>` and never a bare path. The mode is 755, so the bare
@@ -142,7 +147,8 @@ jobs:
           # bit, a moved file or a `noexec` mount. The sibling step in
           # `build.yml` shipped bare and took a REQUIRED context red with exit
           # 126 (#723, and #720 for the mode across fourteen scripts).
-          bash scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" "$HEAD_BRANCH" \
+          bash scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" \
+            "$HEAD_BRANCH" "$RUN_CONCLUSION" \
             > "$RUNNER_TEMP/reportable.tsv"
           echo "reportable=$(grep -c '' "$RUNNER_TEMP/reportable.tsv")" | tee -a "$GITHUB_OUTPUT"
 

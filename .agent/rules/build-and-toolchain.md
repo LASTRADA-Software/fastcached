@@ -3469,6 +3469,15 @@ the change is a ROW of `EventPolicy` and nothing else:
   deleting the token from the real workflow. The policy itself is mutation-tested:
   giving `push` the queue's policy fails exactly the two cases written for it, and
   dropping the branch guard fails exactly the one.
+- **A run nobody let FINISH is not a run that found nothing**, and that edge belongs to
+  this change rather than to whoever meets it. Every job of a cancelled run concludes
+  `cancelled`, which is `inert`, so the "nothing failed and nothing succeeded either"
+  assertion refuses it — right about the RECORD and wrong about the tree, and cancelling
+  a superseded run is ordinary. Before the `push` policy nothing read those records at
+  all, so it could not fire; it is closed with the change that opened it. The RUN's own
+  conclusion is the right question, not "were all its jobs cancelled": a run cancelled
+  after some jobs finished carries a mix, and reading the mix reports the failures of a
+  run nobody let finish.
 
 ### Doc-subject checks were skipped on doc-only changes (#687)
 
