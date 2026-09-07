@@ -277,7 +277,6 @@ class ExpiryReaper
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
     IReactor* _reactor { nullptr };
-    IExecutor* _sweepOn { nullptr };
     /// See `Sweeping()`. Atomic because `Stop` reads it from another thread.
     std::atomic<bool> _sweeping { false };
     CancellationSource _source;
