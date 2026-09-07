@@ -617,6 +617,16 @@ jobs:
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: ctest --preset ${{ matrix.preset }}
 
+      # TEMPORARY (#899): ctest swallows a PASSING test's output, so the
+      # abortive-close measurement is invisible in the log exactly where it is
+      # needed -- the Windows and macOS legs, which are the only way IOCP and
+      # kqueue get measured rather than inferred. `-V` surfaces it. Removed once
+      # the numbers are recorded on the ticket.
+      - name: "MEASURE #899 (temporary)"
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        continue-on-error: true
+        run: ctest --preset ${{ matrix.preset }} -R "MEASURED" -V
+
       # Both binaries the smoke jobs drive: the daemon every job starts, and the
       # launcher the compile-cache smoke job points at it. They share a parent
       # directory, so the artifact keeps them side by side at its root.
@@ -1517,6 +1527,12 @@ jobs:
       - name: "Test"
         run: ctest --preset clang-release
 
+      # TEMPORARY (#899): see the identical step in the linux job. macOS is the
+      # only leg that measures kqueue.
+      - name: "MEASURE #899 (temporary)"
+        continue-on-error: true
+        run: ctest --preset clang-release -R "MEASURED" -V
+
   # Builds the container image (which compiles with TLS on against the system
   # OpenSSL) and smoke-tests it: start the container, hit /healthz from the host,
   # and run the in-image `--healthcheck`. This is the authoritative check that
@@ -1875,6 +1891,16 @@ jobs:
       - name: "Test"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: ctest --preset ${{ matrix.preset }}
+
+      # TEMPORARY (#899): ctest swallows a PASSING test's output, so the
+      # abortive-close measurement is invisible in the log exactly where it is
+      # needed -- the Windows and macOS legs, which are the only way IOCP and
+      # kqueue get measured rather than inferred. `-V` surfaces it. Removed once
+      # the numbers are recorded on the ticket.
+      - name: "MEASURE #899 (temporary)"
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        continue-on-error: true
+        run: ctest --preset ${{ matrix.preset }} -R "MEASURED" -V
 
       # The other half of the bracket, and it only runs on a red.
       #
