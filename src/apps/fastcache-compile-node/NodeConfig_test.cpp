@@ -14,6 +14,8 @@
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/generators/catch_generators_all.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1789,13 +1791,23 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
             CHECK_FALSE(StartupPolicyRejection(sameBox).has_value());
         }
 
-        // A `--scheduler` that is not `host:port` is not this row's business: a bare
-        // port reaches `HostOfEndpoint` as a bare HOST, so it reads as "not loopback"
-        // and would be refused with a message about where the scheduler is when the
-        // fault is the value's shape.
+        // A `--scheduler` that is not `host:port` is still not THIS row's business, and
+        // since [#968](https://github.com/LASTRADA-Software/fastcached/issues/968) the
+        // shape row answers it first. The expectation moves from "not refused" to
+        // "refused by the OTHER rule", which is what this block's own comment argued
+        // for before such a rule existed: a bare port reaches `HostOfEndpoint` as a
+        // bare HOST, so it reads as "not loopback" and this row would have said where
+        // the scheduler is when the fault is the value's shape.
+        //
+        // Asserted on WHICH refusal, never on the mere fact of one -- a case checking
+        // only `has_value()` would pass whichever rule fired, which is the same green
+        // it gave before the row existed.
         NodeConfig malformed = bare;
         malformed.scheduler = "6675";
-        CHECK_FALSE(StartupPolicyRejection(malformed).has_value());
+        auto const shapeRefusal = StartupPolicyRejection(malformed);
+        REQUIRE(shapeRefusal.has_value());
+        CHECK(Unwrap(shapeRefusal).contains("--scheduler=6675"));
+        CHECK(Unwrap(shapeRefusal).contains("an address to dial"));
 
         // And the worker that answered the refusal: both flags named, so nothing
         // about it is loopback any more.
@@ -3981,5 +3993,147 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
         auto const refusal = StartupPolicyRejection(cfg);
         if (refusal.has_value())
             CHECK_FALSE(Unwrap(refusal).contains("clients can dial"));
+    }
+}
+
+TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each by its own grammar",
+          "[node][policy][dialled-address]")
+{
+    // [#968](https://github.com/LASTRADA-Software/fastcached/issues/968), the residual
+    // #208 left behind. `StartupPolicyRejection`'s address loop walks
+    // `NodeSurfaceTable()`, and a surface is a port this process BINDS -- so every
+    // address the node asks somebody ELSE about was unjudged except `--advertise`.
+    //
+    // **The distinguishing assertion is that the rows do NOT share a grammar.** One
+    // widened predicate would pass every case below that expects a refusal and then
+    // refuse `--fleet-member=worker-01`, which is documented as legal and is what
+    // discovery produces. So each direction is asserted for every row.
+    auto const base = [] {
+        NodeConfig cfg;
+        cfg.scheduler = std::string { SchedulerEndpoint };
+        cfg.toolchains = { "/usr/bin/g++" };
+        return cfg;
+    };
+
+    SECTION("a dialled address that is not one is refused, naming the flag and the value")
+    {
+        auto const [flag, value] = GENERATE(table<std::string, std::string>({
+            { "--scheduler", "not an address" },
+            { "--scheduler", "6675" },
+            { "--upstream", "cache.internal" },
+            { "--upstream", ":6674" },
+        }));
+        INFO(flag << "=" << value);
+
+        auto cfg = base();
+        if (flag == "--scheduler")
+            cfg.scheduler = value;
+        else
+            cfg.upstream = value;
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        // The FLAG and the VALUE, because five addresses were typed and a refusal that
+        // named neither would leave an operator bisecting a command line. The surface
+        // loop above echoes what was written for the same reason.
+        CHECK(Unwrap(refusal).contains(flag));
+        CHECK(Unwrap(refusal).contains(value));
+    }
+
+    SECTION("a bare port is refused for a DIALLED address, which is the decision #208 left open")
+    {
+        // Not a shape preference: `ParseEndpoint` supplies a default host, which is
+        // right for a bind address an operator typed and wrong for text naming
+        // somewhere else to ask -- a node told to dial `6675` would ask itself. The
+        // same call `--discovery` and `--advertise` already make.
+        auto cfg = base();
+        cfg.scheduler = "6675";
+        REQUIRE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a value nobody typed is not judged for shape")
+    {
+        // "Parses when GIVEN", never "must parse" -- the surface loop's own rule, and
+        // the two questions belong to different rules on purpose. `--upstream` is
+        // legitimately empty: a machine with no shared cache gets `NoUpstream`, which
+        // is honest rather than broken.
+        //
+        // `--scheduler` is REQUIRED, by a rule of its own further down, and that is
+        // why this section does not clear it. A shape row that also demanded presence
+        // would answer "is not an address to dial" for a flag nobody typed, which
+        // describes the wrong problem -- and it would make this case pass for a reason
+        // that has nothing to do with shape.
+        auto cfg = base();
+        cfg.upstream.clear();
+        cfg.fleetMembers.clear();
+        auto const refusal = StartupPolicyRejection(cfg);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+
+        // And the required-ness IS asserted, so the two rules are seen to be separate
+        // rather than assumed to be: an empty `--scheduler` is refused, by the other
+        // rule and not by this one.
+        auto missing = cfg;
+        missing.scheduler.clear();
+        auto const required = StartupPolicyRejection(missing);
+        REQUIRE(required.has_value());
+        CHECK(Unwrap(required).contains("--scheduler is required"));
+    }
+
+    SECTION("--fleet-member keeps its OWN grammar: a bare host is legal")
+    {
+        // The case a widened predicate breaks. `--fleet-member` is never dialled: it
+        // is matched against a peer's source address through `HostOfEndpoint`, which
+        // keeps an unsplittable value whole because a bare host is a legitimate
+        // spelling for a peer whose port nobody recorded.
+        auto const value = GENERATE(as<std::string> {}, "worker-01", "worker-01.internal:6674", "10.0.0.7");
+        INFO("--fleet-member=" << value);
+
+        // Admitting a peer on ANOTHER machine turns on two rules that have nothing to
+        // do with `--fleet-member`'s spelling: the three advertise rows, because such
+        // a node has told peers to dial it, and the cluster-key rule, because it will
+        // have to check the lease signature of a client it did not vouch for. Both are
+        // satisfied here rather than worked around -- a fixture that tripped either
+        // would report a red for a row this case is not about, which is the trap
+        // `SelfScheduler`'s own comment records one fixture up.
+        auto cfg = base();
+        cfg.nodeListen = "0.0.0.0:6674";
+        cfg.nodeListenExplicit = true;
+        cfg.advertise = "worker-99.internal:6674";
+        cfg.advertiseExplicit = true;
+        cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+        cfg.fleetMembers = { value };
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+    }
+
+    SECTION("an EMPTY --fleet-member element is refused, and that is the silent one")
+    {
+        // `--fleet-member=` appends `""`. It matches no peer the kernel ever reports,
+        // and it makes `fleetMembers` NON-empty -- so `HasMembershipPolicy` answers
+        // yes and the "a scheduler with no membership policy" rule below does not
+        // fire. The node starts, serves a scheduler, and admits nobody but its own
+        // machine, with no error at either end. #208's silent shape, one flag along.
+        auto cfg = base();
+        cfg.serveScheduler = true;
+        cfg.scheduler = std::string { SelfScheduler };
+        cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+        cfg.fleetMembers = { "" };
+
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--fleet-member"));
+
+        // **And it must be refused for ITS OWN reason.** The same configuration with
+        // no membership flags at all is refused too -- by the scheduler rule -- so a
+        // case asserting only "refused" would pass under the bug. This asserts WHICH.
+        auto uncovered = cfg;
+        uncovered.fleetMembers.clear();
+        auto const other = StartupPolicyRejection(uncovered);
+        REQUIRE(other.has_value());
+        CHECK_FALSE(Unwrap(other).contains("--fleet-member="));
+        CHECK(Unwrap(other) != Unwrap(refusal));
     }
 }

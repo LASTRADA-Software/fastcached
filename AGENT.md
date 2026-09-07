@@ -934,6 +934,18 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   — the option row for a grammar, `StartupPolicyRejection` for a cross-flag rule —
   never in the tier that happens to need it. An install returns before any tier
   exists.
+- **The addresses a node OPENS and the ones it DIALS are two tables, and one predicate
+  cannot serve both** (#208, #968). Opened surfaces are `NodeSurfaceTable()`'s rows;
+  dialled ones carry a predicate EACH, because their grammars differ. `--advertise`,
+  `--scheduler` and `--upstream` take `ParseDialEndpoint`, where a bare port names no
+  machine. `--fleet-member` must NOT: it is matched against a peer's source address
+  through `HostOfEndpoint`, which keeps an unsplittable value whole on purpose, so a
+  bare host is legal there and refusing it breaks the documented setup. What IS
+  refusable there is an EMPTY element — `--fleet-member=` makes the list non-empty, so
+  `HasMembershipPolicy` says yes, the no-membership-policy rule stays silent, and the
+  node serves a scheduler that admits nobody. Shape and PRESENCE stay separate rules:
+  `--scheduler` is required elsewhere, and a shape row demanding presence describes the
+  wrong problem. `--bind` is in neither — a host is only checkable by binding it.
 - Whatever reaches a supervisor must survive this project's own parser round trip
   — including the flags the *installer itself* adds, which are the daemon's only
   when the spec names an application.

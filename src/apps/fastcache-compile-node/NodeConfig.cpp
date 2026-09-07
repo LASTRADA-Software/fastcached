@@ -2246,6 +2246,99 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                            surface.grammar.shape);
     }
 
+    // And the addresses this node DIALS, which the loop above cannot reach: it walks
+    // `NodeSurfaceTable()`, and a surface is a port this process BINDS. #208 answered
+    // `--advertise` -- the one that costs something silently, since a worker whose
+    // advertised address nobody can dial registers, heartbeats, is leased out, and
+    // fails at every client -- and left the rest, which is
+    // [#968](https://github.com/LASTRADA-Software/fastcached/issues/968).
+    //
+    // **Each row carries its own predicate, because each flag has its own grammar**,
+    // which is #208's own point and the reason one widened predicate will not do:
+    //
+    //   * `--scheduler` and `--upstream` are DIALLED, so a bare port names no machine
+    //     and `ParseDialEndpoint` refuses it -- the same call `--discovery` already
+    //     makes, and the one `--advertise` was given.
+    //
+    //     Both rows are "parses when GIVEN", never "must parse", exactly as the
+    //     surface loop above spells it -- and for `--scheduler` that is not because
+    //     empty is legal (a rule below requires it) but because these two questions
+    //     belong to different rules. A shape row that also demanded presence would
+    //     answer "is not an address to dial" for a flag nobody typed, which describes
+    //     the wrong problem; `--upstream` really is legitimately empty, since a
+    //     machine with no shared cache gets `NoUpstream`, and one predicate covering
+    //     both is what keeps that difference out of this loop.
+    //   * `--fleet-member` is NOT dialled at all. It is matched against a peer's
+    //     source address through `HostOfEndpoint`, which keeps an unsplittable value
+    //     WHOLE on purpose -- a bare host is a legitimate spelling for a peer whose
+    //     port nobody recorded. So its shape is deliberately unconstrained here, and
+    //     no check can tell a hostname from a typo of one.
+    //
+    // What IS refusable there is an EMPTY element, and it is the row worth having:
+    // `--fleet-member=` appends `""`, which matches no peer the kernel ever reports,
+    // while making `fleetMembers` non-empty -- so `HasMembershipPolicy` answers yes,
+    // the "a scheduler with no membership policy" rule below does not fire, and the
+    // node starts, serves, and admits nobody but its own machine. That is #208's
+    // silent shape reached through a different flag.
+    //
+    // `--bind` is deliberately absent. Its value is a HOST with `--port` beside it,
+    // not an endpoint, and whether a host is usable is answerable only by binding it
+    // -- a rule here would either refuse legitimate spellings or pass everything.
+    struct DialledAddress
+    {
+        /// The flag, spelled as the operator types it.
+        std::string_view flag;
+        /// The first value that fails this row's grammar, or nothing when all pass.
+        ///
+        /// A function rather than a member pointer, because the rows are not one
+        /// shape: two are `std::string` and one is a repeatable list, and a table
+        /// that could only hold scalars would have left the list to a hand-written
+        /// check beside it -- which is the fifth-place-the-map-lives failure #288
+        /// records, one flag earlier.
+        std::optional<std::string> (*offender)(NodeConfig const&);
+        /// What a refusal tells the operator this value should have been.
+        std::string_view shape;
+    };
+
+    constexpr auto DialledAddresses = std::to_array<DialledAddress>({
+        { .flag = "--scheduler",
+          .offender = [](NodeConfig const& c) -> std::optional<std::string> {
+              if (c.scheduler.empty() || ParseDialEndpoint(c.scheduler).has_value())
+                  return std::nullopt;
+              return c.scheduler;
+          },
+          .shape = "an address to dial, as <host>:<port>" },
+        { .flag = "--upstream",
+          .offender = [](NodeConfig const& c) -> std::optional<std::string> {
+              if (c.upstream.empty() || ParseDialEndpoint(c.upstream).has_value())
+                  return std::nullopt;
+              return c.upstream;
+          },
+          .shape = "an address to dial, as <host>:<port>" },
+        { .flag = "--fleet-member",
+          .offender = [](NodeConfig const& c) -> std::optional<std::string> {
+              for (auto const& member: c.fleetMembers)
+                  if (member.empty())
+                      return member;
+              return std::nullopt;
+          },
+          .shape = "a peer to admit, as <host> or <host>:<port>" },
+    });
+
+    for (auto const& row: DialledAddresses)
+        if (auto const bad = row.offender(cfg); bad.has_value())
+            // The same sentence shape the surface loop uses, and it ECHOES what the
+            // operator wrote for the same reason: five addresses were typed and this
+            // says which one is wrong. The verb differs because the fact does -- these
+            // are asked of somewhere else, never bound here -- so a message about a
+            // listener would send an operator looking for a socket this node never
+            // opens.
+            return std::format("{}={} is not {}. This node refuses to start rather than "
+                               "run with an address it can never use.",
+                               row.flag,
+                               *bad,
+                               row.shape);
+
     // Separate from NodeServiceRejection because it is a *startup* rule rather than
     // an install-time one: this misconfiguration is fatal every time the process
     // runs, not only when a registration is written, and gating it on
