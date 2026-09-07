@@ -2363,8 +2363,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // A ROW rather than a check in a tier, for this table's standing reason:
         // `--install-service` returns long before any tier exists, so a registration
         // would otherwise bake the typo in and replay it at every boot.
-        { .refuses =
-              [](NodeConfig const& c) { return !c.advertise.empty() && !ParseDialEndpoint(c.advertise).has_value(); },
+        { .refuses = [](NodeConfig const& c) { return !c.advertise.empty() && !ParseDialEndpoint(c.advertise).has_value(); },
           .message = "--advertise is not an address clients can dial: it must be host:port (or [v6]:port), with a "
                      "host that names a machine and a port in range. A worker whose advertised address does not "
                      "parse registers, heartbeats, is leased out, and is never reached -- with no error at either "
