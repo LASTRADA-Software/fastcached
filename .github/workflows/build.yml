@@ -270,6 +270,52 @@ jobs:
         # branch's own self-test passed while the check never ran once.
         run: bash scripts/doc-subject-checks.sh
 
+      # The rulebook's `## Open work` entries must name OPEN issues, resolved
+      # against the API (#957).
+      #
+      # **In THIS job, and ungated**, for the reason the block above gives: the
+      # step's own `name:` is not a context, but this job's is -- `Check C++ style`
+      # is required by the `default-master` ruleset -- so a failure here gates.
+      # Reporting without gating is #684, and fixing one ticket by reintroducing
+      # another is not a fix.
+      #
+      # ## Why ctest cannot carry it
+      #
+      # `rulebook-open-work-state` is in the default ctest set and SKIPS there: its
+      # `--resolve` half needs the API, has no token in a build job, and exits 77
+      # (`SKIP_RETURN_CODE`). Measured on master's own run `34064703351` --
+      # `***Skipped 0.19 sec` -- while that tree carried a stale entry naming #174.
+      # Twice in one day a pull request closed its ticket and left the entry
+      # standing (#723, then #174); both reached master under a GREEN run, and both
+      # were caught by a human running ctest locally with `gh` authenticated. A
+      # guard whose coverage depends on who happens to hold a token is not a guard.
+      #
+      # The skip itself is CORRECT and stays: without it ctest scores a missing
+      # prerequisite as a FAILURE, a false red on a constrained runner, and whoever
+      # meets it deletes the skip rather than suspecting the registration (#499).
+      # What was wrong is that the prerequisite was missing on the one machine whose
+      # verdict gates master. This supplies it.
+      - name: "Check the rulebook's open-work entries still name open issues"
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # 77 is the script's "could not resolve" exit, and here it is a FAILURE
+        # rather than a skip -- on purpose. In ctest a missing prerequisite must skip
+        # (#499); on the machine whose verdict gates master, a guard that could not
+        # run is the thing this step exists to stop being silent. Named, so it is not
+        # a bare 77 nobody can read.
+        run: |
+          set +e
+          bash scripts/check-rulebook-open-work.sh --resolve
+          rc=$?
+          set -e
+          if [ "$rc" -eq 77 ]; then
+            echo "::error::the rulebook open-work check could not reach the issue API, so it verified NOTHING."
+            echo "::error::That is not a pass. It skips in ctest by design (#499); here it must not be silent (#957)."
+            exit 1
+          fi
+          exit "$rc"
+
       - name: "Install clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: |
