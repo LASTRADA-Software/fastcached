@@ -23,6 +23,15 @@
 # #826 sat inside the `type/bug` count for a day after merging; a batch of eight does
 # that eight times at once.
 #
+# ## The direction it reports and does not refuse
+#
+# Requiring the body keyword creates a second hazard, and this check is where it has to
+# be visible: excising a ticket from a batch removes its commits and leaves the body
+# promising to close it. That closes something undelivered, which is worse than one
+# staying open -- an open ticket gets re-triaged, a wrongly closed one does not. But an
+# unbacked body keyword is ORDINARY in the common case (a change with no trailer), so a
+# refusal would be wrong. It is named on every run instead.
+#
 # ## The DECISION is a pure function, and that is deliberate
 #
 # Acquisition (a `gh` call) and judgement are split, so the self-test drives staged
@@ -94,6 +103,34 @@ Judge() {
         echo "        what makes a ticket excisable from a batch branch." >&2
         return 1
     fi
+    # The OTHER direction is reported and never refused, and the asymmetry is the
+    # point rather than an omission.
+    #
+    # A ticket in the body that no commit names is legitimate in the ordinary case: a
+    # docs or chore pull request closes something without a trailer, and refusing that
+    # would teach people to write a trailer to satisfy a checker.
+    #
+    # It is DANGEROUS in exactly one case, and that case is created by this very check:
+    # once the body carries a keyword per ticket, excising a ticket from a batch --
+    # `rebase --onto`, which the batch workflow treats as routine -- removes its commits
+    # and leaves the body promising to close it. That closes a ticket nobody delivered,
+    # which is strictly worse than one staying open: an open ticket gets re-triaged, a
+    # wrongly closed one does not.
+    #
+    # So it is named on every run. A refusal would be wrong (the ordinary case is
+    # common) and silence would be worse (the dangerous case is invisible), which leaves
+    # saying it out loud -- the same shape as `RefuseWithoutCounter`.
+    local orphans="" b=""
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        grep -qx -- "$b" <<< "$inCommits" || orphans="$orphans $b"
+    done <<< "$inBody"
+    if [ -n "$orphans" ]; then
+        echo "  note: the body also closes${orphans}, which no commit names."
+        echo "        Ordinary for a change with no trailer -- and what a ticket EXCISED from"
+        echo "        this branch looks like, where it would close something undelivered."
+    fi
+
     echo "  every ticket the commits name ($(tr '\n' ' ' <<< "$inCommits")) is in the body"
     return 0
 }
@@ -146,9 +183,18 @@ Fixes #866"
     run_case "no trailer anywhere is not this check's business" pass \
         "A docs-only change." \
         "docs: reword a paragraph"
-    run_case "a body keyword with no commit trailer is allowed" pass \
+    run_case "a body keyword with no commit trailer is allowed, and is NAMED" pass \
         "Fixes #100" \
         "chore: tidy"
+    # The excision shape: the body still promises a ticket whose commits are gone. It
+    # PASSES -- refusing would break the ordinary case above -- but the note has to be
+    # there, because this is the direction that closes something undelivered.
+    run_case "an excised ticket leaves the body promising it" pass \
+        "Fixes #12
+Fixes #13" \
+        "feat: a
+
+Fixes #12"
     run_case "Closes and Fixes are both keywords" pass \
         "Closes #12
 Fixes #13" \
