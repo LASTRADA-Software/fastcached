@@ -426,18 +426,14 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
         auto const closeRaw = [](RawSocket s) {
             ::closesocket(s);
         };
-        auto const optCast = [](void const* p) {
-            return static_cast<char const*>(p);
-        };
+        using OptValue = char const*;
 #else
         using RawSocket = int;
         auto const invalid = -1;
         auto const closeRaw = [](RawSocket s) {
             ::close(s);
         };
-        auto const optCast = [](void const* p) {
-            return p;
-        };
+        using OptValue = void const*;
 #endif
         RawSocket const fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd == invalid)
@@ -457,12 +453,10 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
 
         // Zero linger on close is what turns FIN into RST, on both stacks.
         linger const abortive { .l_onoff = 1, .l_linger = 0 };
-        ::setsockopt(fd,
-                     SOL_SOCKET,
-                     SO_LINGER,
-                     static_cast<char const*>(static_cast<void const*>(&abortive)),
-                     static_cast<int>(sizeof(abortive)));
-        (void) optCast;
+        // `reinterpret_cast`, not a hop through `void const*`: the two-step is what
+        // `bugprone-casting-through-void` refuses, and setsockopt's `char const*` on
+        // Winsock against `void const*` on POSIX is exactly the shape that invites it.
+        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<OptValue>(&abortive), static_cast<int>(sizeof(abortive)));
         closeRaw(fd);
     } };
 
