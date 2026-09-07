@@ -16,6 +16,7 @@
 #include <cstring>
 #include <expected>
 #include <format>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -365,6 +366,16 @@ std::expected<void, StorageError> CowTreeStorage::Initialize()
     _tree = std::make_unique<CowTree::CowTree>(*_store);
     if (auto const r = _tree->Open(); !r.has_value())
         return std::unexpected(TranslateError(r.error(), "CowTree::Open"));
+
+    // **Seeded from the meta, which is what makes `--cache-disk` mean anything after a
+    // restart** (#1006). Zero on a store written before the field existed, which is
+    // indistinguishable from an empty one and leaves that store behaving exactly as it
+    // did -- so no cache in the field is discarded or misread.
+    //
+    // Note what is NOT seeded: `_bytesUsed`, the mirror's total. Seeding that would
+    // double-count, because reads add to it for keys already on disk.
+    _storeBytes = _tree->ValueBytes();
+    _storeKeyBytes = _tree->KeyBytes();
     if (auto const r = EnsureFormatVersion(); !r.has_value())
         return std::unexpected(r.error());
     if (auto const r = Replay(); !r.has_value())
@@ -1162,7 +1173,7 @@ std::expected<std::optional<CowTreeStorage::StoredRef>, StorageError> CowTreeSto
     auto parsed = ParseRecord(CowTree::BytesView { (*got)->data(), (*got)->size() });
     if (!parsed.has_value())
         return std::unexpected(parsed.error());
-    return StoredRef { .overflow = parsed->overflow, .root = parsed->root };
+    return StoredRef { .overflow = parsed->overflow, .root = parsed->root, .originalLen = parsed->originalLen };
 }
 
 std::expected<std::optional<CacheEntry>, StorageError> CowTreeStorage::LoadEntryMetadata(std::string_view key) const
@@ -1297,8 +1308,45 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
             FreeChain(newChain);
         return std::unexpected(TranslateError(put.error()));
     }
+    // **Accounted BEFORE the commit, because the commit is what writes the meta.**
+    // Updating after it meant every meta carried the PREVIOUS write's totals, so a
+    // reopened store was short by exactly the last write -- 7000 where 8000 was
+    // written. Caught by the case that pins what `bytesUsed` counts, which is the
+    // whole reason that case exists.
+    //
+    // The displaced record is parsed here rather than after the commit for the same
+    // reason; freeing its overflow chain still waits until the new value is durable,
+    // which is the CoW rule and is separate from the arithmetic.
+    std::uint64_t displacedLen = 0;
+    bool replaced = false;
+    std::optional<CowTree::PageId> oldChain;
+    if (put->has_value())
+    {
+        auto const& oldRecord = **put;
+        if (auto const oldParsed = ParseRecord(CowTree::BytesView { oldRecord.data(), oldRecord.size() });
+            oldParsed.has_value())
+        {
+            replaced = true;
+            displacedLen = oldParsed->originalLen;
+            if (oldParsed->overflow)
+                oldChain = oldParsed->root;
+        }
+    }
+    auto const savedBytes = _storeBytes;
+    auto const savedKeyBytes = _storeKeyBytes;
+    _storeBytes += originalLen;
+    if (replaced)
+        _storeBytes -= std::min<std::uint64_t>(displacedLen, _storeBytes);
+    else
+        _storeKeyBytes += key.size();
+    PublishByteTotals();
+
     if (auto const r = txn.Commit(); !r.has_value())
     {
+        // Rolled back: the meta this would have described was never written.
+        _storeBytes = savedBytes;
+        _storeKeyBytes = savedKeyBytes;
+        PublishByteTotals();
         if (newChain)
             FreeChain(newChain);
         return std::unexpected(TranslateError(r.error()));
@@ -1306,13 +1354,10 @@ std::expected<void, StorageError> CowTreeStorage::StoreEntry(std::string_view ke
     // Committed: the new value is durable, so an old overflow chain named by the
     // displaced record (if any) is now unreferenced and can be reclaimed. (CoW
     // correctness: never free the old data before the new value is durable.)
-    if (put->has_value())
-    {
-        auto const& oldRecord = **put;
-        if (auto const oldParsed = ParseRecord(CowTree::BytesView { oldRecord.data(), oldRecord.size() });
-            oldParsed.has_value() && oldParsed->overflow)
-            FreeChain(oldParsed->root);
-    }
+    // Durable now, so the displaced record's overflow chain is unreferenced. The
+    // accounting above already ran; this is only the reclamation.
+    if (oldChain)
+        FreeChain(*oldChain);
     return {};
 }
 
@@ -1326,11 +1371,40 @@ std::expected<void, StorageError> CowTreeStorage::EraseEntry(std::string_view ke
     auto r = txn.Erase(KeyView(key));
     if (!r.has_value())
         return std::unexpected(TranslateError(r.error()));
+    // Before the commit, for `StoreEntry`'s reason: the commit writes the meta, so a
+    // total updated afterwards describes the wrong transaction. Saturating rather than
+    // wrapping -- a total that went negative would read as enormous and evict the
+    // whole store.
+    auto const savedBytes = _storeBytes;
+    auto const savedKeyBytes = _storeKeyBytes;
+    if (oldRef->has_value())
+    {
+        _storeBytes -= std::min<std::uint64_t>((*oldRef)->originalLen, _storeBytes);
+        _storeKeyBytes -= std::min<std::uint64_t>(key.size(), _storeKeyBytes);
+        PublishByteTotals();
+    }
+
     if (auto const c = txn.Commit(); !c.has_value())
+    {
+        _storeBytes = savedBytes;
+        _storeKeyBytes = savedKeyBytes;
+        PublishByteTotals();
         return std::unexpected(TranslateError(c.error()));
+    }
     if (oldRef->has_value() && (*oldRef)->overflow)
         FreeChain((*oldRef)->root);
     return {};
+}
+
+void CowTreeStorage::PublishByteTotals() noexcept
+{
+    // Handed to the tree whenever they move, so every commit writes the current pair
+    // with nothing for a commit site to remember. Saturated into the meta's `u32` key
+    // field, which makes an over-large total a FLOOR -- the safe direction for a
+    // figure used to reserve memory.
+    _tree->SetByteTotals(
+        _storeBytes,
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(_storeKeyBytes, std::numeric_limits<std::uint32_t>::max())));
 }
 
 void CowTreeStorage::TouchOrInsert(std::string_view key, std::size_t valueSize, AccessKind access)
@@ -1439,7 +1513,12 @@ void CowTreeStorage::EvictToFit()
     // to leave the soft cap violated than to mutate the in-memory mirror
     // out of sync with the tree on disk.
     auto remainingAttempts = _lru.size();
-    while (_bytesUsed > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
+    // Bounded on the STORE, not on what this session touched (#1006). The reach is
+    // still the mirror -- `_lru` is what eviction can name -- so a restarted store
+    // that is over its bound cannot act until entries are touched back in. That
+    // residual is #175's emptiness arriving from the other side, and it is a smaller
+    // wrong than never knowing the bound was exceeded at all.
+    while (_storeBytes > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
     {
         auto victim = std::prev(_lru.end());
         auto const keyCopy = victim->key;
@@ -2005,7 +2084,10 @@ void CowTreeStorage::SetReclaimLog(IReclaimLog* log)
 StorageStats CowTreeStorage::Snapshot() const noexcept
 {
     _stats.itemCount = _index.size();
-    _stats.bytesUsed = _bytesUsed;
+    // The STORE's total, not the mirror's -- which is the point of #1006: an
+    // operator watching this against `--cache-disk` was told what this session had
+    // touched, and after a restart that is zero while the store is full.
+    _stats.bytesUsed = _storeBytes;
     _stats.bytesLimit = _options.maxBytes;
     _stats.indexBytes = _indexBytes;
     return _stats;
