@@ -444,8 +444,8 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
             return;
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
-        addr.sin_port = ::htons(port);
-        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (::connect(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
         {
             closeRaw(fd);
