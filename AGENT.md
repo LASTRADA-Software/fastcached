@@ -570,7 +570,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   admits *clients* — laptops, CI runners — which never join consensus, so what the
   cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`
   seam (`AnyOfMembership`), because the next route is a credential and not a host list.
-  The admission-layer reading of *absence from `ClusterState` is not removal*.
+  The admission-layer reading of *absence from `ClusterState` is not removal*. Addition is
+  dynamic and REMOVAL is not (#265): `--fleet-member` is `Reloadable::No`, so a host on
+  both lists survives `--cluster-forget` and revoking it is a config change AND a
+  restart; under `--fleet-open` there is no revocation at all. That does not contradict
+  the absence rule — absence is a member the state never named, a forget is a positive
+  act — and both are written down because they read as contradictory cold. Pinned by a
+  test, in the *worsen* direction: making `Publish` write the listed set would look like
+  a fix and would be #251 again.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
   inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
   the cap it advertises was unreachable while every client still got a correct object.

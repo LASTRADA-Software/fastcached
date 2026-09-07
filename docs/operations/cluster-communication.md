@@ -573,6 +573,41 @@ Two rules that have not moved:
 The node's ready line states which of these it is, so an operator sees the policy
 at the one moment they are watching.
 
+### Revocation, and why a restart is part of it
+
+Admission is fully dynamic and **removal is not**, and the asymmetry is worth stating
+plainly because the machine an operator most wants to revoke is the one most likely to
+be in both lists.
+
+| Admitted via | Does `--cluster-forget` revoke it? |
+|---|---|
+| the cluster only | **yes**, on the committed membership change |
+| `--fleet-member` only | **no** — consensus does not speak for that list |
+| **both** | **no** — the static list keeps admitting it |
+
+`--fleet-member` is **not a reloadable setting**, so removing a host from it takes a
+configuration change *and a restart of every node that lists it*. `SIGHUP` will not do
+it: the flag is fixed for the process's life, which is what makes a listed client
+machine survive every membership commit in the first place.
+
+Under **`--fleet-open` there is no revocation at all.** The flag says "admit
+everybody", so there is no set for a forget to remove anybody from and a committed
+membership change narrows nothing. That is the flag working rather than a limitation,
+and an operator who wants revocation has to turn it off first.
+
+This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it is
+not a regression: before #251 a forget *appeared* to revoke, as a side effect of the
+defect that also ejected every client laptop the moment the fleet agreed anything.
+What #251 exposed is that there has never been a revocation path for a statically
+listed host.
+
+**It does not contradict the rule that absence from `ClusterState` is not removal.**
+That rule is about *absence* — a member the state has never named, which a node must
+not read as a removal. An explicit `--cluster-forget` is a positive act, and it does
+revoke the admission consensus granted. What it cannot reach is a second, independent
+route that a different operator asserted by hand; a forget speaks for one list because
+it is the only one consensus owns.
+
 ## The node's own cache, and the shared one
 
 A node's tier is two independent halves, and the flags are separate because the
