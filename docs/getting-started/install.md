@@ -207,6 +207,33 @@ Apple Silicon only. On an Intel Mac, build from source.
 
 fastcached builds with CMake 3.28 or newer and a C++23 compiler.
 
+!!! warning "A build you installed by hand does not learn that it is out of date"
+
+    Nothing in either executable consults the release feed, so a manual install
+    runs the version you built until you rebuild it — and a package install does
+    not update itself either.
+
+    That matters more here than the usual "please upgrade" advice, because some
+    of this project's fixes are **correctness** fixes for the cache: a stale
+    object served for a translation unit whose body changed, a wrong object under
+    a right key. An install that predates one of those does not merely lack a
+    feature — it can reintroduce a bug that was already found and closed, and
+    every layer above it reports success. `ninja`, `cmake` and the linker are all
+    perfectly happy with a wrong object.
+
+    So when you follow a `type/bug` fix in
+    [the changelog](https://github.com/LASTRADA-Software/fastcached/releases),
+    **rebuild and redeploy** — both executables and any service registration, on
+    every machine, including the compile nodes. `--version` on either binary
+    reports what is running; comparing it against the latest release is a manual
+    step today
+    ([#181](https://github.com/LASTRADA-Software/fastcached/issues/181)).
+
+    Two things make the staleness outlive a restart rather than expire with it:
+    the on-disk cache tier persists, so a wrong object survives reboots until
+    something evicts it; and a compile node's fingerprint does not change when the
+    binary does, so an old node keeps being matched by the fleet.
+
 ## Linux / macOS
 
 ```sh

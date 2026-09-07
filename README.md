@@ -60,6 +60,12 @@ Requires CMake 3.28+, a C++23 compiler, and Ninja. Full details — presets,
 dependencies, and platform notes — in
 [Install](https://lastrada-software.github.io/fastcached/getting-started/install/).
 
+**Neither install updates itself, and some fixes here are cache-correctness
+fixes** — a stale object served under a key that says otherwise, which every layer
+above reports as success. When you follow a `type/bug` fix, rebuild and redeploy on
+every machine, compile nodes included; `--version` says what is running
+([#181](https://github.com/LASTRADA-Software/fastcached/issues/181)).
+
 ## Quick start: the cache daemon
 
 ```sh
