@@ -2707,7 +2707,30 @@ fi
 # reading -- a rename of the counter would otherwise leave this passing forever
 # while guarding nothing.
 ran=$(( ran + 1 ))
-own_increments="$(grep -cE 'failures=\$\(\( failures [+] 1 \)\)' "${BASH_SOURCE[0]}" | tr -d ' ')"
+# Matches the counter NAME on any assignment or arithmetic, not ONE rendering of
+# the increment (#808). The old needle was the literal `failures=$(( failures + 1
+# ))`, so `failures=$((failures+1))`, `failures=$(( failures+1 ))` and
+# `(( failures++ ))` each incremented without naming the failure and passed this
+# scan silently -- which is the reopen-by-omission it exists to make impossible.
+#
+# `failure[s]` rather than `failures`: the needle must not appear verbatim in
+# itself, which is the self-counting trap the paragraph above records. The
+# bracket makes the regex match "failures" while the literal text of these lines
+# does not match the regex.
+#
+# Full-line COMMENTS are stripped first. Writing this very comment, which spells
+# the bad renderings out, made the scan report five sites -- so the rule "a
+# comment is not a call site" was broken two lines below where it is cited.
+#
+# Three exclusions, all narrow: the `failures=0` initialisation is not an
+# increment, and this scan's own lines (which name BASH_SOURCE) are not call
+# sites -- a COMMENT or a grep pattern is not a call site, which this tree has
+# been caught on twice.
+own_increments="$(grep -nE 'failure[s][[:space:]]*(=|\+\+|\+=)' "${BASH_SOURCE[0]}" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE ':[[:space:]]*failure[s]=0[[:space:]]*$' \
+    | grep -vF 'BASH_SOURCE' \
+    | wc -l | tr -d ' ')"
 if [ "$own_increments" = "0" ]; then
     echo "FAIL failure-recording: found no direct increment of the counter in ${BASH_SOURCE[0]} at all;" >&2
     echo "     the counter has been renamed and this scan is now guarding nothing" >&2
@@ -2715,7 +2738,10 @@ if [ "$own_increments" = "0" ]; then
 elif [ "$own_increments" != "1" ]; then
     echo "FAIL failure-recording: ${own_increments} sites increment the failure counter directly;" >&2
     echo "     only note_failure may, or a failure is counted without being named (#678)" >&2
-    grep -nE 'failures=\$\(\( failures [+] 1 \)\)' "${BASH_SOURCE[0]}" | sed 's/^/     | /' >&2
+    grep -nE 'failure[s][[:space:]]*(=|\+\+|\+=)' "${BASH_SOURCE[0]}" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | grep -vE ':[[:space:]]*failure[s]=0[[:space:]]*$' \
+        | grep -vF 'BASH_SOURCE' | sed 's/^/     | /' >&2
     note_failure "failure-recording"
 fi
 

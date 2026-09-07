@@ -326,13 +326,21 @@ auto OpenMetaDamageStore(std::filesystem::path const& path)
     CowTree::FilePageStore::Options opts;
     opts.path = path;
     opts.pageSize = MetaDamagePageSize;
-    // `Batched` is STATED, though it is also the default, because the last
-    // assertion of the case below is about `FlushBatchLocked`'s alternation
-    // specifically -- under `Fsync` the slot comes from `CommitTxn`'s
-    // `txnId % 2` and a different code path is under test. Stating it keeps the
-    // fixture describing its own store if the default ever moves, which is
-    // cheaper than a runtime assertion that would fire for a precondition
-    // rather than for the property.
+    // `Batched` is STATED, though it is also the default, so the fixture goes on
+    // describing its own store if the default ever moves -- cheaper than a runtime
+    // assertion, which would fire for a precondition rather than for the property.
+    //
+    // It pins WHICH WRITER runs -- `FlushBatchLocked`, which the last assertion
+    // below is about -- and nothing more than that. It does NOT select a different
+    // slot rule: `WriteMeta` takes the identical `OtherSlot(_lastDurableSlot)`
+    // branch under `Fsync` and `Batched`, and there is no `txnId mod 2` parity
+    // anywhere (see `Meta.hpp`, which says so in as many words). This comment used
+    // to claim that `Fsync` derived the slot from `CommitTxn`'s `txnId % 2`; that
+    // expression was deleted in the very commit the claim was written in (#808).
+    //
+    // Measured, so the strength of the pin is not overstated: flipping this to
+    // `Fsync` leaves the whole `[filestore]` suite green -- 503 assertions, 21
+    // cases. The pin buys determinism about the path, not a passing assertion.
     opts.durability = CowTree::FilePageStore::Durability::Batched;
     return CowTree::FilePageStore::Open(opts);
 }

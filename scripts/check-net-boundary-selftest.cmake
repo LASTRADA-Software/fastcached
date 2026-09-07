@@ -96,8 +96,24 @@ endfunction()
 function(fastcached_run_check tree outObjected outOutput)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"
-        OUTPUT_VARIABLE captured ERROR_VARIABLE capturedErrors RESULT_VARIABLE ignored)
+        OUTPUT_VARIABLE captured ERROR_VARIABLE capturedErrors RESULT_VARIABLE runResult)
     set(combined "${captured}${capturedErrors}")
+
+    # A spawn that never RAN is not a verdict, and `RESULT_VARIABLE ignored` read
+    # it as one. If the spawn fails the output is empty, `CMake Error` is absent,
+    # `objected` comes back FALSE, and every `want-refuse` arm reports a failure --
+    # so a killed or unforkable `cmake` presents as a rule regression and sends the
+    # next reader hunting a logic defect that is not there (#747).
+    #
+    # `execute_process` reports a failure to LAUNCH as a STRING rather than a
+    # number ("No such file or directory"), which is exactly the distinction that
+    # was being discarded: a number is an exit status from something that ran.
+    if(NOT runResult MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "check-net-boundary-selftest: INCONCLUSIVE -- the check could not be RUN (${runResult}). "
+            "This is NOT a rule regression: no arm was evaluated, so no arm's verdict means anything. "
+            "Re-run; if it persists, the spawn is the subject and not the boundary rule.")
+    endif()
     string(FIND "${combined}" "CMake Error" position)
     if(position EQUAL -1)
         set(${outObjected} FALSE PARENT_SCOPE)

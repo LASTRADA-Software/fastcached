@@ -993,6 +993,33 @@ set_tests_properties("apt-update-wrapped-selftest" PROPERTIES
     TIMEOUT 60
 )
 
+# `mkdocs build --strict` must be able to fail the way two files promise it does
+# (#560).
+#
+# mkdocs 1.6 defaults `validation.nav.omitted_files` to `info`, so a page left out
+# of `nav:` was reported at INFO and the build SUCCEEDED -- while `mkdocs.yml` and
+# `.github/workflows/docs.yml` both said `--strict` fails on exactly that. Two
+# files stating the same wrong thing in almost the same sentence is how it stayed
+# wrong for as long as it did.
+#
+# This asserts the PARSED configuration and not a grep, and it asserts the
+# `not_in_nav` exemption too -- without that clause the validation fails the build
+# on three snippets that are correctly absent from nav, which is how a validation
+# flag gets turned back off by whoever meets it.
+#
+# It does not RUN mkdocs: that is the docs workflow's job and needs an install this
+# suite cannot assume. What it guards is the configuration that makes that job able
+# to fail at all. It SKIPs when PyYAML is absent rather than passing quietly.
+add_test(
+    NAME "mkdocs-validation"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-mkdocs-validation.sh"
+)
+set_tests_properties("mkdocs-validation" PROPERTIES
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 60
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
@@ -3812,6 +3839,34 @@ add_test(
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh" --self-test
 )
 set_tests_properties("write-slot-guard-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# Every `gh` listing goes through the shared reporter, or says why it does not.
+#
+# A listing that came back AT its `--limit` is a real answer about a set that is
+# not the whole set, and nothing about the rows distinguishes it -- so the cap
+# reads as the total (#724). Measured wrong twice here, both times in the
+# safe-looking direction, which is why neither reading invited a second look.
+# Raising the limit is not a fix: it moves the cliff and hides that there is one.
+add_test(
+    NAME "gh-listing-seam"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh"
+)
+set_tests_properties("gh-listing-seam" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Six cases, both directions -- including the two ways this check could pass
+# while guarding nothing: an empty scan, and the seam itself having been deleted.
+add_test(
+    NAME "gh-listing-seam-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh" --self-test
+)
+set_tests_properties("gh-listing-seam-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
