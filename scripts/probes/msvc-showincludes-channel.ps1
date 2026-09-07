@@ -146,6 +146,77 @@ int main() { return 0; }
     Measure-Channel -Driver 'clang-cl' -Label 'clang-cl /c'    -ExtraArgs @('/c')
     Measure-Channel -Driver 'clang-cl' -Label 'clang-cl /EP'   -ExtraArgs @('/EP')
 
+    # ------------------------------------------------------------------
+    # And the SECOND question this run can answer for free, because it needs the
+    # same `cl`: can this machine produce a LOCALIZED one at all?
+    #
+    # [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) asks for
+    # "a means of exercising the localized case that is not a stub asserting its
+    # own premise", and says outright that *"this needs a machine we do not have"*
+    # is a legitimate finding. It is only legitimate if somebody MEASURED it.
+    #
+    # `VSLANG` selects `cl`'s diagnostic language -- the launcher already sets it on
+    # its probe spawns for exactly that reason (#692, #200) -- but it can only
+    # select a language whose resources are INSTALLED. So: ask for German, and see
+    # whether the note comes back different. Same, and the runner has en-US only;
+    # different, and the localized case is exercisable here after all.
+    #
+    # Compared BYTE FOR BYTE against the English run rather than pattern-matched for
+    # German: the question is "did the language change", and a matcher for German
+    # words would answer "no" for every language that is not German, which is the
+    # narrower question wearing the wider one's clothes.
+    Write-Host ""
+    Write-Host "#878: can this machine produce a localized cl?"
+    $langDir = Join-Path $work "lang"
+    New-Item -ItemType Directory -Path $langDir -Force | Out-Null
+    Set-Content -Path (Join-Path $langDir $marker) -Value '/* probe */' -Encoding Ascii
+    Set-Content -Path (Join-Path $langDir 'tu.cpp') -Value @"
+#include "$marker"
+int main() { return 0; }
+"@ -Encoding Ascii
+
+    function Note-For {
+        param([string]$Lang)
+        $out = Join-Path $langDir ("lang-" + $Lang + ".out")
+        $err = Join-Path $langDir ("lang-" + $Lang + ".err")
+        $prev = $env:VSLANG
+        if ($Lang -eq 'default') { Remove-Item Env:VSLANG -ErrorAction SilentlyContinue }
+        else { $env:VSLANG = $Lang }
+        try {
+            Start-Process -FilePath 'cl' -ArgumentList @('/nologo', '/showIncludes', '/c', 'tu.cpp') `
+                          -WorkingDirectory $langDir -RedirectStandardOutput $out -RedirectStandardError $err `
+                          -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+        } finally {
+            if ($null -eq $prev) { Remove-Item Env:VSLANG -ErrorAction SilentlyContinue } else { $env:VSLANG = $prev }
+        }
+        foreach ($f in @($out, $err)) {
+            $hit = @(Select-String -Path $f -SimpleMatch $marker -ErrorAction SilentlyContinue)[0]
+            if ($null -ne $hit) { return $hit.Line }
+        }
+        return $null
+    }
+
+    # 1031 is de-DE. Any installed non-English pack would do; one is enough to
+    # answer the question, and a machine with de-DE and not en-US is not a case
+    # this needs to distinguish.
+    $english = Note-For 'default'
+    $german  = Note-For '1031'
+    if ($null -eq $english) {
+        Write-Host "  INCONCLUSIVE: no note in the default language, so there is nothing to compare against"
+    } elseif ($null -eq $german) {
+        Write-Host "  INCONCLUSIVE: VSLANG=1031 produced no note at all; that is not 'the same language'"
+    } elseif ($english -eq $german) {
+        Write-Host "  SAME under VSLANG=1031 -- this machine has en-US resources only."
+        Write-Host "  So #878's localized case is NOT exercisable here, measured rather than assumed."
+        Write-Host "  default: [$english]"
+    } else {
+        Write-Host "  DIFFERENT under VSLANG=1031 -- a language pack IS present and the localized"
+        Write-Host "  case is exercisable on this runner. #878's clause 1 has an answer that is not"
+        Write-Host "  'a machine we do not have'."
+        Write-Host "  default : [$english]"
+        Write-Host "  VSLANG=1031: [$german]"
+    }
+
     Write-Host ""
     Write-Host "controls: clang-cl /c is expected stdout and clang-cl /EP stderr (LLVM D46394)."
     Write-Host 'If either disagrees, this probe is wrong and its cl readings prove nothing.'

@@ -563,8 +563,36 @@ same on both — the same defect with no MSVC anywhere near it.
     today because both regions are tagged `ShowIncludes` whichever stream carries the notes
     -- and it stopped being inert the moment #821 built a dispatch refusal fed from stderr
     alone, which is why it is written down rather than left to be rediscovered.
-    [#825](https://github.com/LASTRADA-Software/fastcached/issues/825) holds the probe that
-    would settle it; until that runs, the `cl` half is unverified and must not be relied on.
+    **MEASURED** on `Windows-cl-debug` (`windows-2025`, MSVC toolset 14.44) by
+    `scripts/probes/msvc-showincludes-channel.ps1`, and the answer is neither of the
+    two the tree was arguing about
+    ([#825](https://github.com/LASTRADA-Software/fastcached/issues/825)):
+
+    <!-- table-total: none -->
+    | driver | flag | channel |
+    |---|---|---|
+    | `cl` | `/c` | **stdout** |
+    | `cl` | `/EP` | **stderr** |
+    | `clang-cl` | `/c` | stdout |
+    | `clang-cl` | `/EP` | stderr |
+
+    **The channel follows the FLAG, not the driver.** Both drivers put the notes on
+    stdout when compiling and move them to stderr under `/EP`, where stdout carries the
+    preprocessed text and a note on it would corrupt that text. The three sites said
+    "`cl` on stderr"; #700 and the #821 review said "`cl` on stdout"; each was half
+    right and neither had the rule. That is what makes a claim restated in three places
+    dangerous — none of the three was placed to notice the question had a second
+    variable.
+
+    The `clang-cl` rows are the CONTROL and agree with LLVM D46394, so the run is
+    trustworthy; had they disagreed the `cl` rows would prove nothing. The note is
+    identified by the header it NAMES rather than by the English prefix, so the reading
+    holds for a localized `cl` too.
+
+    It stays inert at the one site that reads it, because both regions are tagged
+    `ShowIncludes` whichever stream carries the notes. What sharpens is #821's shape: a
+    dispatch refusal fed from **stderr alone** is now known to be wrong for a COMPILE
+    and right only for a `/EP` run — a firmer statement than "it may not fire for `cl`".
   - **The note grammar is one rule, not one string, and it is anchored.** `SplitIncludeNotes`
     and `ParseIncludePaths` both call `IncludeNotePath`, which matches after leading blanks
     (`cl` indents by nesting depth) and **nowhere else**. Matching the marker anywhere in the
@@ -1252,8 +1280,10 @@ same on both — the same defect with no MSVC anywhere near it.
     how this returns in a different costume.
   - **The launcher cannot detect the unset case, and must not pretend to.** Do not build
     a guard or a message on `probed.unreadable`: #821 was reverted for exactly that, and
-    #825 records the claim underneath it — which stream `cl` writes its notes on — as
-    unmeasured and stated two ways in the tree. #700's own floor is *discovered, never
+    the claim underneath it — which stream `cl` writes its notes on — is now MEASURED
+    (#825, the table above) and says that guard was worse than merely unproven: it read
+    **stderr alone**, and a COMPILE puts the notes on stdout, so it could not fire for
+    the case it was written for and would have fired only on a `/EP` run. #700's own floor is *discovered, never
     inferred from a failed parse*. What ships instead is a `FASTCACHE_VERBOSE` line on
     every dispatched compile that synthesises notes, naming the prefix and its
     provenance, because that is the one line answering *why did my build stop rebuilding

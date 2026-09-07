@@ -1067,13 +1067,14 @@ void ReportVerification(Cc::HitComparison const& comparison, std::string const& 
 /// different revision, so the line number lands on unrelated code and the
 /// developer edits the wrong one (#202).
 ///
-/// The MSVC family is deliberately LEFT on `ShowIncludes`. Which stream `cl`
-/// writes its notes on is UNVERIFIED (#825) -- which is precisely why both
-/// regions carry that grammar today -- so moving stderr to `MsvcDiagnostics`
-/// would stop canonicalizing the notes if the answer turns out to be stderr.
-/// That trades a fixed bug for a worse one on the strength of a guess.
-/// `MsvcDiagnostics` is implemented and tested and is waiting for the
-/// measurement, not for someone to decide it is probably fine.
+/// The MSVC family is deliberately LEFT on `ShowIncludes`, and the measurement
+/// #825 was waiting for now says why that has to stay: the channel follows the
+/// FLAG, not the driver. Both `cl` and `clang-cl` put the notes on stdout under
+/// `/c` and on stderr under `/EP`. So a stored value can carry notes on EITHER
+/// region depending on which run produced it, and moving stderr to
+/// `MsvcDiagnostics` would stop canonicalizing the `/EP` ones.
+/// `.agent/rules/compile-cache.md` holds the table; this must not become a second
+/// home for it.
 [[nodiscard]] PathCanon::Grammar TextGrammar(Cc::Flavor flavor) noexcept
 {
     switch (flavor)
@@ -2702,15 +2703,18 @@ void RecordManifest(Config const& cfg,
     CompileValue value;
     value.objectBlob = *objectBytes;
     // Two regions, one per stream, in a fixed order (0=stdout, 1=stderr) so the
-    // hit path replays each on its correct channel. clang-cl emits
-    // /showIncludes on stdout; `cl` is believed to use stderr but that half is
-    // UNVERIFIED (#825) — nobody here has a Windows host and no reading has been
-    // taken. `.agent/rules/compile-cache.md` states it once and is where a
-    // measurement lands; this comment must not become a second home for it.
+    // hit path replays each on its correct channel. Measured (#825): BOTH `cl` and
+    // `clang-cl` emit /showIncludes on stdout under `/c` and on stderr under
+    // `/EP` -- the channel follows the FLAG, not the driver.
+    // `.agent/rules/compile-cache.md` holds the table and is where it stays; this
+    // comment must not become a second home for it.
     //
-    // Which is why nothing here depends on the answer: we tag BOTH regions with
-    // the ShowIncludes grammar, so whichever stream carries include notes gets
-    // canonicalized; a non-matching line in either region is preserved verbatim.
+    // Which is why nothing here depends on the answer, and the measurement says
+    // that was the right call rather than a lucky one: a stored value's notes are
+    // on stdout when a compile produced it and on stderr when a `/EP` run did, so
+    // there is no single stream to prefer. We tag BOTH regions with the
+    // ShowIncludes grammar, and a non-matching line in either is preserved
+    // verbatim.
     //
     // Both are reconciled first, and only the STORED copy is: ReplayStreams above
     // has already passed the compiler's own bytes through untouched. The daemon
