@@ -114,7 +114,7 @@ using WireVersion = std::uint8_t;
 /// so a worker learns which fleet it serves from the one exchange it has with the
 /// scheduler it was configured to reach
 /// ([#401](https://github.com/LASTRADA-Software/fastcached/issues/401)).
-inline constexpr WireVersion CurrentVersion = 4;
+inline constexpr WireVersion CurrentVersion = 5;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -150,7 +150,7 @@ inline constexpr WireVersion CurrentVersion = 4;
 /// spends its length on: a wrong answer that looks like a right one. Refusing the
 /// older REGISTER outright is `UnsupportedVersion`, which names the range and
 /// arrives before the worker believes it has joined anything.
-inline constexpr WireVersion MinSupportedVersion = 4;
+inline constexpr WireVersion MinSupportedVersion = 5;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -1045,8 +1045,8 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName,
-                   // compileDir, compileDirReplacement
-                   .fieldCount = 8,
+                   // compileDir, compileDirReplacement, sourceRoot, sourceRootReplacement
+                   .fieldCount = 10,
                    // `Progress` is legal HERE and on no other verb, which is the whole
                    // scope of the version-3 change: every other verb on this wire is
                    // answered from a table in microseconds, so a liveness pulse on one
@@ -2484,6 +2484,29 @@ struct CompileRequest
     /// What the client's own mapping spells `compileDir` as -- `.` for the rules
     /// `cmake/portable/CompileCache.cmake` emits. Empty exactly when `compileDir` is.
     std::string_view compileDirReplacement;
+
+    /// The client's SOURCE root, and what its own `-fdebug-prefix-map` rules spell that
+    /// root as. Both empty when the client maps nothing; a half-filled pair is malformed
+    /// and a worker refuses it, exactly as the compilation-directory pair above.
+    ///
+    /// **`sourceName` cannot carry this and that is not an oversight** (#883). That one
+    /// is a base name, deliberately -- the worker has no business learning the client's
+    /// directory to OPEN it -- and #800 makes it the already-MAPPED spelling, which is
+    /// one value. A rule needs two: what the compiler will emit, and what it should say
+    /// instead.
+    ///
+    /// **It exists because gcc and clang take `DW_AT_name` from different places.**
+    /// clang takes it from the input file path, so #800's mapped `sourceName` reaches it.
+    /// gcc takes it from the `#line` marker in the preprocessed text, which names the
+    /// CLIENT's path and which no rule the worker builds from its own scratch directory
+    /// can ever match -- so a dispatched gcc object records the producing checkout's
+    /// absolute source path where a local one records the mapped spelling. Measured on
+    /// gcc 16.2.1 / clang 22.1.8, `readelf --debug-dump=info`.
+    ///
+    /// A REPLACEMENT operand, never a path the worker opens -- the rule #660 states for
+    /// `sourceName` and the reason this can carry a directory at all.
+    std::string_view sourceRoot {};
+    std::string_view sourceRootReplacement {};
 };
 
 /// The same, as views into a received payload.
@@ -2500,6 +2523,12 @@ struct CompileView
     /// reaches a command line.
     std::span<std::byte const> compileDir;
     std::span<std::byte const> compileDirReplacement;
+
+    /// The client's source root and its mapped spelling. See `CompileRequest` for why
+    /// `sourceName` cannot carry this: that one is a base name and is already mapped,
+    /// which is one value where a rule needs two (#883).
+    std::span<std::byte const> sourceRoot {};
+    std::span<std::byte const> sourceRootReplacement {};
 };
 
 /// Frame a REGISTER request.
@@ -3099,7 +3128,9 @@ struct ClusterAdmitView
                                    std::span<std::byte const> { codecs },
                                    AsBytes(request.sourceName),
                                    AsBytes(request.compileDir),
-                                   AsBytes(request.compileDirReplacement) });
+                                   AsBytes(request.compileDirReplacement),
+                                   AsBytes(request.sourceRoot),
+                                   AsBytes(request.sourceRootReplacement) });
 }
 
 /// Split a COMPILE payload.
@@ -3117,7 +3148,9 @@ struct ClusterAdmitView
                          .acceptedCodecs = DecodeCodecList((*fields)[4]),
                          .sourceName = (*fields)[5],
                          .compileDir = (*fields)[6],
-                         .compileDirReplacement = (*fields)[7] };
+                         .compileDirReplacement = (*fields)[7],
+                         .sourceRoot = (*fields)[8],
+                         .sourceRootReplacement = (*fields)[9] };
 }
 
 /// What a scheduler answers a LEASE with, on success.

@@ -46,8 +46,13 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
-    CHECK(CurrentVersion == 4);
-    CHECK(MinSupportedVersion == 4);
+    // Version 5 adds COMPILE's source-root pair (#883). Both move together, and the
+    // MINIMUM moves because the arity is exact: `DecodeCompilePayload` splits
+    // `OpFieldCount(Op::Compile)` fields, so a version-4 frame is not a version-5 frame
+    // with two fields missing -- it is a frame this build cannot read. Tolerating it
+    // would be reading `sourceRoot` out of whatever followed.
+    CHECK(CurrentVersion == 5);
+    CHECK(MinSupportedVersion == 5);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -87,7 +92,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x04,                   // version
+        0x05,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -106,7 +111,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x04,                               // version
+        0x05,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -446,7 +451,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x04, 0x03,       // magic, version, op=Auth
+        0xFC, 0x05, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
