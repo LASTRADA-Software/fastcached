@@ -787,12 +787,16 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // machines and sends an operator to look at the wrong thing (#365).
     Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains), Cc::ToolchainSurvey::InFlight() };
 
-    // Every lease is accepted, and that is stated rather than hidden. The boundary
-    // today is reachability of this port plus membership -- the same boundary the
-    // cache itself has. The grant a client presents is now a signed credential
-    // (#281), so the other implementation of this seam is a local check of that
-    // signature rather than anything reaching the scheduler; `LeaseValidator` exists
-    // so #282 is a substitution and not a rewrite.
+    // A lease is CHECKED, and by a validator built about a hundred lines below --
+    // `MakeWorkerLeaseValidator`, which verifies the grant's MAC, the endpoint it
+    // names, and spends it once (#281, #614). This comment used to open "every lease
+    // is accepted", which was true when it was written and was contradicted three
+    // sentences later by its own account of the signed credential; a reader arriving
+    // at the sentence rather than the paragraph took the worker for an open door.
+    //
+    // What is still reachability-plus-membership is the surface in FRONT of the
+    // lease: who may open a connection at all. That is the same boundary the cache
+    // tier has, and the inbound credential that would replace it is #976.
     AtomicMetricsSink metrics;
     // Raised here rather than at the claim above, which runs before this sink exists.
     // Counted as well as logged because it is otherwise visible nowhere: a rise means
