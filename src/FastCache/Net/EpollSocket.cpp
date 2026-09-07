@@ -282,9 +282,38 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
         // already makes, on an fd the kernel has just told us is ready.
         std::array<std::byte, 1> probe {};
         auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
-        // A negative peek is a spurious wake-up or an error the caller's own `Read`
-        // will surface properly; reporting "data" keeps that path unchanged.
-        peekAwaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+        if (peeked >= 0)
+        {
+            peekAwaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+            return;
+        }
+
+        // **A negative peek is TWO things and this used to answer both with `1`.**
+        //
+        // `EAGAIN`/`EINTR` is a spurious readiness with nothing behind it, and `1`
+        // remains the right answer there: the caller re-arms and asks again, which is
+        // what it would do anyway.
+        //
+        // Anything else -- `ECONNRESET` above all -- is the peer GONE, and answering
+        // "one byte is pending" says the opposite of what happened. That is not
+        // hypothetical: an abortive close (`SO_LINGER{1,0}`) reaches it with one
+        // client, no pipelining and no race, and `ArmDisconnect` reads `> 0` as proof
+        // of life -- so #673's whole property was lost for every RST (#899).
+        // MEASURED, one abortive close per platform: epoll and kqueue answered
+        // `count=1` while a follow-up `Read` returned nothing, and IOCP answered with
+        // an ERROR. This makes the two POSIX transports agree with the one that was
+        // already right, rather than inventing a fourth behaviour.
+        //
+        // The comment this replaces was not wrong, which is why it survived: a
+        // negative peek IS an error "the caller's own `Read` will surface properly".
+        // It is true of a caller that READS and false of one that only WATCHES, and
+        // `ArmDisconnect` is the second kind.
+        if (errno == EAGAIN || errno == EINTR)
+        {
+            peekAwaitable->Complete(IoResult { std::size_t { 1 } });
+            return;
+        }
+        peekAwaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
         return;
     }
 

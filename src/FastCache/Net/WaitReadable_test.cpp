@@ -466,11 +466,22 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
     CHECK(unresolvedBeforeReset.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
 
-    // NOT asserted either way -- this case is a MEASUREMENT, and pinning the answer
-    // before it is known is how a test comes to assert the defect. What it must do is
-    // REPORT, so the number reaches the ticket.
-    WARN("MEASURED abortive close: hasValue=" << observed.hasValue.load(std::memory_order_relaxed)
-                                              << " count=" << observed.count.load(std::memory_order_relaxed)
-                                              << " readBack=" << observed.readBack.load(std::memory_order_relaxed));
-    SUCCEED("measurement recorded");
+    // **The assertion, and it was a measurement first.** #899's acceptance said to
+    // settle this by measuring rather than reading, so this case reported for one round
+    // and pinned nothing -- pinning an answer before the fix is decided is how a test
+    // comes to assert the defect.
+    //
+    // What that round found, one abortive close per platform: epoll and kqueue answered
+    // `count=1` -- "a byte is pending" -- about a peer that had sent none and was gone,
+    // while IOCP answered with an ERROR. `ArmDisconnect` reads `> 0` as proof of life,
+    // so #673's property was lost for every RST on the two POSIX transports. The fix
+    // made them agree with the one that was already right.
+    //
+    // Asserted for all three, because the premise of this whole file is that the
+    // implementations disagreed and nothing noticed.
+    CHECK_FALSE(observed.hasValue.load(std::memory_order_relaxed));
+
+    // And a `Read` after it gets nothing, which is what makes "pending data" the wrong
+    // answer rather than merely a different one.
+    CHECK(observed.readBack.load(std::memory_order_relaxed) == 0);
 }

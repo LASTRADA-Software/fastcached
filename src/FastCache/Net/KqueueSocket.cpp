@@ -263,11 +263,32 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
         // and says nothing about which kind, so a flat `1` reported "data pending" for
         // a peer that had gone -- the one thing a parked waiter is usually waiting to
         // hear. Same syscall the synchronous arm already makes, on an fd just reported
-        // ready. A negative peek is a spurious wake or an error the caller's own `Read`
-        // will surface, so it keeps the old answer.
+        // ready.
         std::array<std::byte, 1> probe {};
         auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
-        awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+        if (peeked >= 0)
+        {
+            awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+            return;
+        }
+
+        // **This arm disagreed with the SYNCHRONOUS one in this same file**, which has
+        // always answered `MakePosixError` for a negative peek that is not
+        // `EAGAIN`/`EINTR` -- see `WaitReadable` below. So one socket answered two
+        // different things about one event depending on whether the fd happened to be
+        // ready when the caller asked.
+        //
+        // A spurious readiness keeps `1`: the caller re-arms and asks again. Anything
+        // else -- `ECONNRESET` above all -- is the peer GONE, and `1` says the
+        // opposite. MEASURED on an abortive close, one per platform: kqueue and epoll
+        // answered `count=1` while a follow-up `Read` returned nothing, IOCP answered
+        // with an error (#899).
+        if (errno == EAGAIN || errno == EINTR)
+        {
+            awaitable->Complete(IoResult { std::size_t { 1 } });
+            return;
+        }
+        awaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
         return;
     }
     auto buf = impl->readOp.readBuffer;
