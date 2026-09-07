@@ -258,7 +258,9 @@ struct Fixture
                                                       .acceptedCodecs = std::move(accepted),
                                                       .sourceName = "a.cpp",
                                                       .compileDir = {},
-                                                      .compileDirReplacement = {} });
+                                                      .compileDirReplacement = {},
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
 }
 
 /// A well-formed COMPILE frame.
@@ -474,7 +476,9 @@ TEST_CASE("A codec envelope declaring more than the cap is refused before it is 
                                                                   .acceptedCodecs = { Wire::IdentityCodec },
                                                                   .sourceName = "a.cpp",
                                                                   .compileDir = {},
-                                                                  .compileDirReplacement = {} });
+                                                                  .compileDirReplacement = {},
+                                                                  .sourceRoot = {},
+                                                                  .sourceRootReplacement = {} });
     // The entire hostile frame is smaller than the header of what it asked this worker
     // to allocate. That is the amplification, stated as an assertion.
     CHECK(frame.size() < 128);
@@ -514,7 +518,9 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
                                                                   .acceptedCodecs = { Wire::IdentityCodec },
                                                                   .sourceName = "a.cpp",
                                                                   .compileDir = {},
-                                                                  .compileDirReplacement = {} });
+                                                                  .compileDirReplacement = {},
+                                                                  .sourceRoot = {},
+                                                                  .sourceRootReplacement = {} });
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::PayloadTooLarge);
@@ -532,7 +538,9 @@ TEST_CASE("An Identity envelope may not lie about the size of the bytes beside i
                                                                         .acceptedCodecs = { Wire::IdentityCodec },
                                                                         .sourceName = "a.cpp",
                                                                         .compileDir = {},
-                                                                        .compileDirReplacement = {} });
+                                                                        .compileDirReplacement = {},
+                                                                        .sourceRoot = {},
+                                                                        .sourceRootReplacement = {} });
     auto const modestAnswer = fix.worker.Answer(modestFrame);
     REQUIRE(modestAnswer.has_value());
     CHECK(ErrorOf(Unwrap(modestAnswer)) == Wire::ErrorCode::MalformedFrame);
@@ -646,7 +654,9 @@ TEST_CASE("A source in an undecodable codec is refused, not compiled as garbage"
                                                                   .acceptedCodecs = {},
                                                                   .sourceName = "a.cpp",
                                                                   .compileDir = {},
-                                                                  .compileDirReplacement = {} });
+                                                                  .compileDirReplacement = {},
+                                                                  .sourceRoot = {},
+                                                                  .sourceRootReplacement = {} });
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
     CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::UnsupportedCodec);
@@ -688,7 +698,9 @@ TEST_CASE("A payload that does not expand to its declared size is refused as cor
                                                                   .acceptedCodecs = { Wire::IdentityCodec },
                                                                   .sourceName = "a.cpp",
                                                                   .compileDir = {},
-                                                                  .compileDirReplacement = {} });
+                                                                  .compileDirReplacement = {},
+                                                                  .sourceRoot = {},
+                                                                  .sourceRootReplacement = {} });
     auto const answer = fix.worker.Answer(frame);
     REQUIRE(answer.has_value());
 
@@ -1870,7 +1882,9 @@ TEST_CASE("The real runner is what a correlation comes from", "[worker-protocol]
                                                     .fingerprint = "gcc-13",
                                                     .sourceName = "a.cpp",
                                                     .compileDir = {},
-                                                    .compileDirReplacement = {} }));
+                                                    .compileDirReplacement = {},
+                                                    .sourceRoot = {},
+                                                    .sourceRootReplacement = {} }));
 }
 
 namespace
@@ -2043,7 +2057,9 @@ TEST_CASE("A worker's reply is accepted by the client that asked for it", "[work
                                            .preprocessed = "int main(){return 0;}",
                                            .sourceName = "/home/dev/checkout/src/Widget.cpp",
                                            .compileDir = {},
-                                           .compileDirReplacement = {} };
+                                           .compileDirReplacement = {},
+                                           .sourceRoot = {},
+                                           .sourceRootReplacement = {} };
 
     auto const result = Dispatch(fleet, request);
 

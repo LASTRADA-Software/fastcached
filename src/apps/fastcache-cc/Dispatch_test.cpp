@@ -253,7 +253,9 @@ struct ReplyFields
                                                   .fingerprint = request.fingerprint,
                                                   .sourceName = SentSourceName(request.sourceName),
                                                   .compileDir = request.compileDir,
-                                                  .compileDirReplacement = request.compileDirReplacement });
+                                                  .compileDirReplacement = request.compileDirReplacement,
+                                                  .sourceRoot = request.sourceRoot,
+                                                  .sourceRootReplacement = request.sourceRootReplacement });
 }
 
 /// The reply an HONEST worker sends back for `request`.
@@ -324,7 +326,9 @@ struct ReplyFields
                              .preprocessed = "int main() { return 0; }",
                              .sourceName = "a.cpp",
                              .compileDir = {},
-                             .compileDirReplacement = {} };
+                             .compileDirReplacement = {},
+                             .sourceRoot = {},
+                             .sourceRootReplacement = {} };
 }
 
 } // namespace

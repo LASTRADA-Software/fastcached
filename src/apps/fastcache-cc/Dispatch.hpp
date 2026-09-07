@@ -313,6 +313,21 @@ struct DispatchRequest
     /// either.
     std::string_view compileDir;
     std::string_view compileDirReplacement;
+
+    /// The source path as the build system spelled it, RAW, and what this client's own
+    /// `-fdebug-prefix-map` rules make of it -- which is `sourceName` above.
+    ///
+    /// **Two operands, because `sourceName` is one** (#883). gcc takes `DW_AT_name`
+    /// from the `#line` marker in the preprocessed text, which names the CLIENT's path,
+    /// and no rule the worker builds from its own scratch directory can match that. So
+    /// the worker needs to be told what the compiler will emit AND what it should say
+    /// instead; `sourceName` is already the mapped half and cannot also be the raw one.
+    ///
+    /// Empty when nothing maps the source, which is the ordinary case -- a relative
+    /// source argument matches no rule. Both empty or both set: a half-filled pair is
+    /// malformed and the worker refuses it, exactly as the compilation-directory pair.
+    std::string_view sourceRoot;
+    std::string_view sourceRootReplacement;
 };
 
 /// Ask the scheduler for a worker and have it compile this translation unit.

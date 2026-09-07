@@ -1618,10 +1618,37 @@ stops being one — the same confound that cost #493 a re-run.
       asked about. One model of the flag, asked twice; a second would be a second thing
       to be wrong. Measured on clang 22.1.8: the dispatched `DW_AT_name` becomes
       byte-identical to the local one where it was the raw absolute path.
-      - **It does not reach gcc, and that is a different residual with a different
-        cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule the worker
-        builds matches it and both spellings give the raw absolute path (measured, gcc
-        16.2.1). [#883](https://github.com/LASTRADA-Software/fastcached/issues/883).
+      - **It does not reach gcc on its own, and that is a different residual with a
+        different cause** — gcc takes `DW_AT_name` from the `#line` marker, so no rule
+        the worker builds matches it and both spellings give the raw absolute path
+        (measured, gcc 16.2.1). Closed by a SECOND pair, `sourceRoot` /
+        `sourceRootReplacement`, carrying the raw spelling beside the mapped one
+        ([#883](https://github.com/LASTRADA-Software/fastcached/issues/883)) — a rewrite
+        rule needs two operands and `sourceName` is already the mapped half, so the raw
+        half has to travel too. It cannot ride `compileDir`, whose halves are the
+        compilation DIRECTORY and are what `comp_dir` rules are built from.
+        - **Ordered between the other two**, and the sandwich is the whole of it: after
+          the compilation-directory rules, because this replacement is already the answer
+          of every client-side rule applied in order and must outrank a rule
+          reconstructing one of them; before #660's source-NAME rule, which its own block
+          requires to be last. All three can match one path — an in-tree build's source
+          lies under its build directory — and both drivers honour the LAST match, so a
+          rule in the wrong place is silently overridden with every counter normal.
+        - **A half-filled pair is REFUSED where a directory's is not.**
+          `-fdebug-prefix-map=<builddir>=` maps a root to nothing and is a real
+          reproducible-build spelling, so `WorkerPrefixMapRules` reads the DIRECTORY
+          alone as saying whether a mapping is in force. A source file mapped to nothing
+          is not a spelling of anything.
+        - Every other way of not building the rule is NO RULE, `WorkerSourceNameRule`'s
+          answer rather than `WorkerPrefixMapRules`': both operands are the client's own
+          strings, `my file.cpp` is ordinary, and what is left when it is skipped is the
+          pre-#883 raw path — the same on every machine that dispatches it — rather than
+          the nondeterministic `job-N` #660 was about. Neither operand is a property of
+          the worker, so there is no #810-shaped startup warning to pair with it.
+        - The correlation digest covers the pair and its tag moved with it
+          (`compile-corr-v3`): the client knows both before sending and the runner
+          observes both, so leaving it out would let a crossed reply through on exactly
+          the axis the pair exists to fix.
       - A RELATIVE source argument — the common case — matches no absolute rule, so
         nothing about it changes. The fallback is the ORIGINAL spelling, and an empty
         replacement falls back too: legal for a directory, a name `SafeSourceName` would
@@ -1635,6 +1662,15 @@ stops being one — the same confound that cost #493 a re-run.
     agreement, because two readers that both return nothing agree perfectly. It is
     the only case in that fixture that opens the debug records, and it is what
     caught the worker-directory-only design that every unit test had accepted.
+    - **Case 14 is the source-name half, and its ARRANGEMENT is the case.** Case 13's
+      source lies outside every mapped root, so both objects record the same raw path
+      and agree for a reason unrelated to the subject; moving it under `$mapdir` does
+      not repair that, because `$mapdir` is the launcher's compile directory and the
+      compilation-directory rule maps that path as a side effect — green with #883
+      reverted. So case 14's mapped source root is DISJOINT from the compile directory,
+      asserted rather than assumed, and the reference object is required to be MAPPED
+      before the agreement is read: two unmapped objects agree with the whole feature
+      removed.
 - **`check_<lang>_compiler_flag` is asked only for an ENABLED language.** It is a
   hard `CMake Error` otherwise ("C: needs to be enabled before use"), and this
   module is included from a `project()` that lists CXX first — so the first run
@@ -2067,17 +2103,6 @@ with current truth at the moment the staleness would otherwise have done harm.
   under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
   install the answer depends on, so a stale value would be a wrong hit rather than
   a miss.
-- **[#883](https://github.com/LASTRADA-Software/fastcached/issues/883)** — #800 sends
-  what the client's own compile RECORDS rather than what the build system wrote, which
-  closes the disagreement on **clang** (it takes `DW_AT_name` from the input file path)
-  and not on **gcc** (it takes it from the `#line` marker, which no rule the worker
-  builds ever matches). Measured on gcc 16.2.1 and clang 22.1.8: the dispatched gcc
-  name is the client's raw absolute path under BOTH spellings, unchanged in either
-  direction. Neither driver rewrites a marker for `-fdebug-prefix-map`, and
-  `-ffile-prefix-map` would rewrite `__FILE__` into the text the worker compiles, which
-  is a wrong object under a correct key. Closing it needs the client's raw source path
-  AND its mapped spelling on a payload whose arity is exact — the one place #660's
-  "no wire bump" stops holding.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

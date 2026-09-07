@@ -38,6 +38,22 @@ struct CompileJob
     /// `WorkerPrefixMapRules` builds, and reach only the debug records of the object.
     std::string compileDir;
     std::string compileDirReplacement;
+    /// The CLIENT's own spelling of its source path, and what its `-fdebug-prefix-map`
+    /// rules make of it. Both empty when no rule governs the source, which is the
+    /// ordinary case; a half-filled pair is refused.
+    ///
+    /// This is `sourceName`'s companion, not a duplicate of it. `sourceName` is the
+    /// MAPPED half and is all clang needs, because clang takes `DW_AT_name` from the
+    /// input file path -- which this worker owns and can therefore map with a rule it
+    /// builds itself. gcc takes it from the `#line` marker inside the preprocessed
+    /// text, which names the CLIENT's path: a string on no command line this worker
+    /// sees and matching no rule derived from its scratch root
+    /// ([#883](https://github.com/LASTRADA-Software/fastcached/issues/883)). A rewrite
+    /// rule needs two operands, so the raw half has to travel too.
+    ///
+    /// Neither is a path this worker opens.
+    std::string sourceRoot;
+    std::string sourceRootReplacement;
 };
 
 /// Why a job was refused before any compiler ran.
@@ -561,6 +577,48 @@ class CompileJobRunner final: public ICompileJobRunner
 [[nodiscard]] std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePath,
                                                               std::string_view clientSourceName,
                                                               DriverFamily family);
+
+/// The rule that makes a **gcc** dispatched object record the client's source spelling.
+///
+/// `WorkerSourceNameRule` above closes clang and cannot close gcc, and the reason is
+/// where each driver reads `DW_AT_name` from. clang reads the INPUT FILE PATH, which is
+/// this worker's scratch file, so a rule this worker builds from a path it chose itself
+/// repairs it. gcc reads the `#line` marker in the preprocessed text, which names the
+/// path on the CLIENT's machine -- a string this worker cannot derive from anything it
+/// has ([#883](https://github.com/LASTRADA-Software/fastcached/issues/883)). So the
+/// client sends both halves and this spells the rule.
+///
+/// The pair is sent only when a client-side rule actually CHANGED the spelling, so
+/// `<x>=<x>` never crosses the wire and the ordinary case -- a relative source argument,
+/// which matches no rule -- costs nothing.
+///
+/// **Emitted after `WorkerPrefixMapRules`' rules and before `WorkerSourceNameRule`'s.**
+/// Both drivers honour the LAST matching rule, and all three can in principle match one
+/// path: the replacement here is already the answer of every client rule applied in
+/// order, so it must outrank the compilation-directory rule, while #660's rule stays
+/// last for the reason its own comment gives.
+///
+/// **A half-filled pair is refused, unlike a directory's.** `WorkerPrefixMapRules`
+/// accepts an empty replacement because `-fdebug-prefix-map=<builddir>=` is a real
+/// reproducible-build spelling for a DIRECTORY; a source file mapped to nothing is not
+/// a spelling of anything, so both directions of half a pair are malformed.
+///
+/// **A value that cannot be spelled inside a rule is NO RULE, never a refusal** -- the
+/// same answer `WorkerSourceNameRule` gives and for the same reason: a source called
+/// `my file.cpp` is ordinary, and refusing it would stop distributing that translation
+/// unit to improve a debug record. Neither operand is this worker's own property, so
+/// there is no startup warning to pair with it as #810 pairs with the scratch root.
+///
+/// @param clientSourcePath The client's raw spelling -- what its preprocessor wrote
+///        into the `#line` marker, and so what gcc is about to record. Never opened.
+/// @param replacement What a local compile on that machine would have recorded instead.
+/// @param family This worker's OWN driver family, never anything the client sent.
+/// @return The argument to append; nothing when the client mapped nothing or no
+///         unambiguous rule exists; or the `JobError` a half-filled pair is refused
+///         with.
+[[nodiscard]] std::expected<std::optional<std::string>, JobError> WorkerSourcePathRule(std::string_view clientSourcePath,
+                                                                                       std::string_view replacement,
+                                                                                       DriverFamily family);
 
 /// What an operator must be told about a scratch root no mapping rule can name.
 ///

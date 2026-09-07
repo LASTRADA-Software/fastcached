@@ -1831,10 +1831,17 @@ case13_at() {
     # needs the client's own source-root mapping on the wire, which the payload's exact
     # arity makes a version bump.
     #
-    # So a case built here would be red on gcc and green on clang, which is why the
-    # arrangement is unchanged rather than extended: it would have to select on the
-    # driver's banner, and a driver-conditional assertion is a decision rather than a
-    # case. See the follow-up issue linked from `.agent/rules/compile-cache.md`.
+    # That half is closed by #883's source-root pair, and **case 14 below is where it
+    # is asserted** -- not here. This case's arrangement is unchanged on purpose: its
+    # source lies outside every mapped root, so the two objects agree for a reason that
+    # has nothing to do with either ticket, which makes it a regression guard on both
+    # drivers and the ticket for neither. Case 14 builds the arrangement that can fail.
+    #
+    # It used to say a case here would be red on gcc and green on clang and so would
+    # need a driver-conditional assertion, which is a decision rather than a case. Both
+    # drivers now agree, so no such arm is needed -- and what was actually missing was
+    # never the arm: it was a source under a mapped root the compile directory does not
+    # already cover.
     local reference_source_name remote_source_name
     reference_source_name="$(source_name_of "$reference_dump")"
     remote_source_name="$(source_name_of "$remote_dump")"
@@ -1952,6 +1959,97 @@ else
             echo "   SKIPPED (symlinked): no usable directory symlink here, so the spelling"
             echo "            that distinguishes \$PWD from getcwd(3) cannot be built"
         fi
+
+        # --- case 14: a source under a mapped root that is NOT the build directory ---
+        #
+        # Issue #883, and the arrangement is the whole case. Case 13's source sits
+        # OUTSIDE every mapped root, so both objects record the same raw path and agree
+        # for a reason that has nothing to do with the subject -- its own comment says
+        # so. The obvious repair, moving the source under `$mapdir`, does not work
+        # either: `$mapdir` is the launcher's compile directory, so the
+        # compilation-directory rule the worker already builds from `compileDir` maps
+        # that path as a side effect and the case passes with #883 reverted.
+        #
+        # So the mapped source root here is DISJOINT from the compile directory. Then a
+        # worker holding only the compilation-directory pair maps nothing that reaches
+        # `DW_AT_name`, and the two objects disagree until the source-root pair travels.
+        #
+        # gcc is the ticket and clang is a regression guard, for the reason case 13
+        # records pointing the other way: clang takes `DW_AT_name` from the input file
+        # path, which #660's rule already repairs, while gcc takes it from the `#line`
+        # marker naming the CLIENT's path -- a string no rule built on this worker can
+        # match. Since both are closed, the assertion is unconditional and needs no
+        # driver-conditional arm; that arm being unwritable is what kept this case out
+        # of the fixture.
+        echo "== case 14: a dispatched object records the source name a local one records, under a mapped root"
+        src883_root="${workdir}/src883"
+        mkdir -p "$src883_root"
+        src883="${src883_root}/fourteen.cpp"
+        write_source "$src883" "casefourteen"
+
+        # Disjoint from the compile directory, ASSERTED rather than assumed: if
+        # `$mapdir` ever moved under `$src883_root` the compilation-directory rule
+        # would cover this path too and the case would go green under the bug.
+        # Anchored on a separator, with equality its own arm, exactly as case 13's
+        # containment guard is -- a bare string prefix calls `/a/b` an ancestor of
+        # `/a/b2`.
+        map_abs="$(cd "$mapdir" && pwd -P)"
+        src883_abs="$(cd "$src883_root" && pwd -P)"
+        if [[ "$map_abs" == "$src883_abs" || "$map_abs" == "$src883_abs"/* || "$src883_abs" == "$map_abs"/* ]]; then
+            fail "case 14 cannot bite: the mapped source root and the compile directory are not disjoint"
+        fi
+
+        (cd "$mapdir" && "$compiler" -std=c++17 -O1 -g "-fdebug-prefix-map=${mapdir}=." \
+            "-fdebug-prefix-map=${src883_abs}=/MAPPED883" \
+            -c "$src883" -o "${mapdir}/fourteen-ref.o") \
+            || fail "the case 14 reference compile failed"
+
+        (
+            export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
+            cd "$mapdir" && run_launcher "${workdir}/case14.log" -std=c++17 -O1 -g \
+                "-fdebug-prefix-map=${mapdir}=." "-fdebug-prefix-map=${src883_abs}=/MAPPED883" \
+                -c "$src883" -o "${mapdir}/fourteen.o"
+        ) || { cat "${workdir}/case14.log" >&2 || true; fail "the case 14 dispatched compile failed"; }
+
+        grep -q "DISPATCHED to " "${workdir}/case14.log" \
+            || {
+                cat "${workdir}/case14.log" >&2 || true
+                fail "case 14 was not dispatched, so it says nothing about a dispatched object"
+            }
+
+        ref14_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/fourteen-ref.o")")"
+        rem14_name="$(source_name_of "$(dwarf_dump_with "$dwarf_reader" "${mapdir}/fourteen.o")")"
+
+        # The reference must be MAPPED, or the case is asserting that two unmapped
+        # objects agree -- which they do with the whole feature removed. This is the
+        # clause case 13 could not state, and stating it is what stops case 14 becoming
+        # another arrangement that passes for the wrong reason.
+        [[ -n "$ref14_name" ]] \
+            || fail "the case 14 reference object records no source name; either the compile did not record one, or ${dwarf_reader}'s DW_AT_name rendering is one source_name_of cannot parse"
+        case "$ref14_name" in
+            /MAPPED883/*) ;;
+            *) fail "case 14 cannot bite: the reference object records '${ref14_name}', so ${compiler} did not map the source root and there is nothing for the dispatched object to agree with" ;;
+        esac
+
+        [[ "$rem14_name" == "$ref14_name" ]] \
+            || {
+                echo "--- reader: ${dwarf_reader}" >&2
+                echo "--- reference DW_AT_name: '${ref14_name}'" >&2
+                echo "--- dispatched DW_AT_name:'${rem14_name}'" >&2
+                # The pre-#883 shape named, because "some other disagreement" is a
+                # different fault in a different place: gcc reading the `#line` marker
+                # leaves the CLIENT's raw absolute path, where #660's shape leaves the
+                # worker's `job-N` scratch.
+                case "$rem14_name" in
+                    "${src883_abs}"/*) echo "--- this is the pre-#883 shape: the client's raw source path reached the object" >&2 ;;
+                    *job-*) echo "--- this is the pre-#660 shape: the worker's per-job scratch reached the object" >&2 ;;
+                esac
+                cat "${workdir}/case14.log" >&2 || true
+                echo "--- worker log ---" >&2
+                cat "${workdir}/worker.log" >&2 || true
+                fail "the dispatched object records source '${rem14_name}', the local one '${ref14_name}'"
+            }
+        echo "   both objects record source '${ref14_name}' (${dwarf_reader})"
     elif [[ -n "$dwarf_readable" ]]; then
         fail "case 13: ${dwarf_readable} read ${compiler}'s debug info but no DW_AT_comp_dir was recognised -- either the object records none, or this fixture does not know that reader's rendering"
     else

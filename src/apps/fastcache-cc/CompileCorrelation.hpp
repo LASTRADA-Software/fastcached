@@ -90,6 +90,11 @@ struct CorrelatedCompile
     std::string_view compileDir;
     /// What it asked that directory to read as; empty when the client maps nothing.
     std::string_view compileDirReplacement;
+    /// The client's own source path as it sent it, before validating, and what its
+    /// `-fdebug-prefix-map` rules make of it. Both empty when no rule governs the
+    /// source, which is the ordinary case.
+    std::string_view sourceRoot;
+    std::string_view sourceRootReplacement;
 };
 
 /// @param compile What this correlation covers.
@@ -117,11 +122,24 @@ struct CorrelatedCompile
     // the very thing that ticket closes, reappearing one layer down. Raw, like
     // `sourceName`, so the client is not made a second author of the worker's
     // validation rule.
-    KeyDigest digest { "compile-corr-v2" };
+    // The source-path pair (#883) qualifies on the same two clauses: the client
+    // computes both before it sends them, and the runner observes both -- they become
+    // the halves of a further `-fdebug-prefix-map` argument on the spawned line. Two
+    // jobs differing only there have different correct objects, the difference being
+    // `DW_AT_name` on gcc, so leaving it uncovered would let a crossed reply through on
+    // exactly the axis this pair exists to fix. Raw, like the two above.
+    //
+    // The tag moves with the covered set: a digest over more fields under the old tag
+    // would make an old worker and a new client disagree about every honest compile,
+    // which is a fleet-wide `Mismatched` rather than a version refusal. Both ends are
+    // built from this tree, so the bump costs nothing and says what changed.
+    KeyDigest digest { "compile-corr-v3" };
     digest.Field(compile.fingerprint);
     digest.Field(compile.sourceName);
     digest.Field(compile.compileDir);
     digest.Field(compile.compileDirReplacement);
+    digest.Field(compile.sourceRoot);
+    digest.Field(compile.sourceRootReplacement);
     for (auto const& arg: compile.args)
         digest.Item(arg);
     digest.Field(compile.preprocessed);

@@ -586,7 +586,9 @@ TEST_CASE("Every dispatch verb round-trips its fields")
                                                           .acceptedCodecs = { 1 },
                                                           .sourceName = "Widget.cpp",
                                                           .compileDir = "/home/ci/build",
-                                                          .compileDirReplacement = "./sub" });
+                                                          .compileDirReplacement = "./sub",
+                                                          .sourceRoot = {},
+                                                          .sourceRootReplacement = {} });
         auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(AsStringView(Unwrap(decoded).leaseToken) == "l1");
@@ -612,7 +614,9 @@ TEST_CASE("Every dispatch verb round-trips its fields")
                                                           .acceptedCodecs = { 1 },
                                                           .sourceName = "Widget.cpp",
                                                           .compileDir = {},
-                                                          .compileDirReplacement = {} });
+                                                          .compileDirReplacement = {},
+                                                          .sourceRoot = {},
+                                                          .sourceRootReplacement = {} });
         auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
         REQUIRE(decoded.has_value());
         CHECK(Unwrap(decoded).compileDir.empty());

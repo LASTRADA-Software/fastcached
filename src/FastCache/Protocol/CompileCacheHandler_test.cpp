@@ -1261,7 +1261,9 @@ TEST_CASE("A compile sent to the cache is refused with its own message", "[compi
                                                                                .acceptedCodecs = {},
                                                                                .sourceName = "t.cpp",
                                                                                .compileDir = {},
-                                                                               .compileDirReplacement = {} }),
+                                                                               .compileDirReplacement = {},
+                                                                               .sourceRoot = {},
+                                                                               .sourceRootReplacement = {} }),
                                     SessionContext {});
 
     auto const refusal = ErrorOf(SoleReply(reply));

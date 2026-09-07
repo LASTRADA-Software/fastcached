@@ -285,7 +285,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   What `sourceName` carries is what the client's own compile would RECORD — the source
   argument through `MappedByPrefixMapRules`, ONE model of the flag asked twice (#800).
   It closes clang and NOT gcc, which takes the name from the `#line` marker no worker
-  rule matches (#883); a relative source matches no rule and is unchanged.
+  rule matches; a relative source matches no rule and is unchanged. gcc needs a SECOND
+  pair (`sourceRoot`/`sourceRootReplacement`, #883) carrying the RAW spelling beside the
+  mapped one — a rewrite rule has two operands and `sourceName` is already one of them,
+  and it cannot ride `compileDir`, whose halves are the compilation DIRECTORY. Ordered
+  AFTER the directory rules (its replacement is already the answer of every client rule
+  applied in order) and BEFORE #660's, which must stay last: all three can match one
+  path and the LAST wins, so a misplaced rule is overridden with every counter normal.
+  A half-filled pair is REFUSED where a directory's empty replacement is legal, and
+  every other failure to spell it is NO RULE. `dist-compile-e2e` case 14 is the e2e, and
+  its ARRANGEMENT is the case: the mapped source root must be DISJOINT from the compile
+  directory, or the directory rule maps the path as a side effect and it passes reverted.
 - An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
   and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
   older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong

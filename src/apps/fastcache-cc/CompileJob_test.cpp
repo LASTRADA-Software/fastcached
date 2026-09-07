@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -182,7 +183,9 @@ class OverlappingEchoRunner final: public IProcessRunner
                         .preprocessed = "int main() { return 0; }",
                         .sourceName = "a.cpp",
                         .compileDir = {},
-                        .compileDirReplacement = {} };
+                        .compileDirReplacement = {},
+                        .sourceRoot = {},
+                        .sourceRootReplacement = {} };
 }
 
 } // namespace
@@ -1652,4 +1655,114 @@ TEST_CASE("A run refuses a value the worker will not spell, and spawns nothing",
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == JobRefusal::RejectedArgument);
     CHECK(runner.Argv().empty());
+}
+
+TEST_CASE("The source-path rule sits between the directory rules and the source-name rule",
+          "[compile-job][prefix-map][source-root]")
+{
+    // **The ORDER is the whole subject** (#883). All three rules can match one path --
+    // an in-tree build's source lies under its build directory, and both drivers honour
+    // the LAST matching rule -- so a rule emitted in the wrong place is silently
+    // overridden and the object records a path the fix was supposed to remove, with
+    // every counter reading normal and every other assertion here still passing.
+    //
+    // Asserting only that the rule is PRESENT is what would not test this: it is
+    // present under the bug too. What distinguishes is where it sits relative to the
+    // other two.
+    //
+    //   * after the compilation-directory rule, because this replacement is already
+    //     the answer of every client-side rule applied in order -- it must outrank a
+    //     rule reconstructing one of them;
+    //   * before #660's source-name rule, which its own block requires to be last.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.compileDir = "/home/ci/out/build/x";
+    job.compileDirReplacement = ".";
+    job.sourceRoot = "/home/ci/out/build/x/src/a.cpp";
+    job.sourceRootReplacement = "./src/a.cpp";
+    REQUIRE(jobs.Run(job).has_value());
+
+    auto const& argv = runner.Argv();
+    auto const atClientDir = std::ranges::find(argv, "-fdebug-prefix-map=/home/ci/out/build/x=.");
+    auto const atSourceRoot = std::ranges::find(argv, "-fdebug-prefix-map=/home/ci/out/build/x/src/a.cpp=./src/a.cpp");
+    REQUIRE(atClientDir != argv.end());
+    REQUIRE(atSourceRoot != argv.end());
+    CHECK(atSourceRoot > atClientDir);
+
+    // #660's rule, found by its left-hand side rather than by a literal: it names this
+    // worker's scratch, which the test cannot spell without predicting the job counter.
+    auto const atSourceName = std::ranges::find_if(
+        argv, [](std::string const& arg) { return arg.starts_with("-fdebug-prefix-map=") && arg.ends_with("=a.cpp"); });
+    REQUIRE(atSourceName != argv.end());
+    CHECK(atSourceRoot < atSourceName);
+}
+
+TEST_CASE("A run given no source-path pair gets no rule naming a path off this worker",
+          "[compile-job][prefix-map][source-root]")
+{
+    // A client that maps nothing must not have a mapping invented for it, which is the
+    // compilation-directory rule pointing the other way. The distinguishing observation
+    // is that NO emitted rule's left-hand side is a path this worker did not choose:
+    // #660's rule is expected and names the scratch, so a check that merely counted
+    // prefix-map arguments would pass under the bug.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    REQUIRE(jobs.Run(Job()).has_value());
+    for (auto const& arg: runner.Argv())
+        CHECK_FALSE(arg.starts_with("-fdebug-prefix-map=/home/ci/"));
+}
+
+TEST_CASE("Half a source-path pair is refused in both directions, and spawns nothing",
+          "[compile-job][prefix-map][source-root]")
+{
+    // Unlike a DIRECTORY, where an empty replacement is a real reproducible-build
+    // spelling (`-fdebug-prefix-map=<builddir>=`) and so the directory alone says
+    // whether a mapping is in force. A source file mapped to nothing is not a spelling
+    // of anything, and a replacement with no left-hand side would map everything -- so
+    // both directions are malformed, and both are refused rather than half-applied.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    using Pair = std::pair<std::string, std::string>;
+    auto const [root, replacement] = GENERATE(Pair { "/home/ci/src/a.cpp", "" }, Pair { "", "./src/a.cpp" });
+    INFO("sourceRoot: [" << root << "] replacement: [" << replacement << "]");
+
+    auto job = Job();
+    job.sourceRoot = root;
+    job.sourceRootReplacement = replacement;
+    auto const result = jobs.Run(job);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == JobRefusal::RejectedArgument);
+    CHECK(runner.Argv().empty());
+}
+
+TEST_CASE("A source path no rule can spell is skipped, and the compile still runs", "[compile-job][prefix-map][source-root]")
+{
+    // **Skipped, where the same value in the compilation-directory pair is REFUSED**,
+    // and the two answers are what this case exists to tell apart -- a check asserting
+    // only "the rule is absent" passes under either.
+    //
+    // Both operands are the client's own strings and a source file called `my file.cpp`
+    // is completely ordinary; refusing it would stop distributing that translation unit
+    // to improve a debug record. What is left is the pre-#883 state -- gcc recording the
+    // client's raw path, which is the same on every machine that dispatches it -- rather
+    // than the nondeterministic `job-N` #660 was about. Neither operand is a property of
+    // THIS machine, so there is nothing here for a startup warning to report either.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    auto job = Job();
+    job.sourceRoot = "/home/ci/src/my file.cpp";
+    job.sourceRootReplacement = "./src/my file.cpp";
+    REQUIRE(jobs.Run(job).has_value());
+    CHECK_FALSE(runner.Argv().empty());
+    for (auto const& arg: runner.Argv())
+        CHECK_FALSE(arg.starts_with("-fdebug-prefix-map=/home/ci/"));
 }

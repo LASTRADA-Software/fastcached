@@ -430,7 +430,11 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                // the runner is what spells it, so the check belongs beside the
                                // spelling rather than at each caller that might forget it.
                                .compileDir = std::string { Wire::AsStringView(fields->compileDir) },
-                               .compileDirReplacement = std::string { Wire::AsStringView(fields->compileDirReplacement) } });
+                               .compileDirReplacement = std::string { Wire::AsStringView(fields->compileDirReplacement) },
+                               // The gcc half of the source-name repair (#883): validated
+                               // where it becomes an argument, exactly as the pair above is.
+                               .sourceRoot = std::string { Wire::AsStringView(fields->sourceRoot) },
+                               .sourceRootReplacement = std::string { Wire::AsStringView(fields->sourceRootReplacement) } });
     if (!outcome.has_value())
     {
         // The refusal's detail rides the reply message, so a client's local fallback
