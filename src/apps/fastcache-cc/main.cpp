@@ -61,6 +61,7 @@
 #include "ParallelFor.hpp"
 #include "PathResolve.hpp"
 #include "ReactorExchange.hpp"
+#include "RefusalNotice.hpp"
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
@@ -2592,7 +2593,25 @@ void RecordManifest(Config const& cfg,
             // broke mid-reply, or the budget running out, all under one FIXED
             // string so the tally gets a row per cause rather than one per compile.
             if (fetchKind == Cc::CacheOutcomeKind::Rejected)
+            {
                 WarnAndCarryOn(Cc::DescribeOutcome(outcome));
+
+                // A refusal that will be true of every unit of this build is said out
+                // loud, once per interval, whatever the verbosity (#181). The tally
+                // above is correct and nobody reads it: #815 is a whole team building
+                // through a cache answering "no" to every request for weeks, with a
+                // `--show-stats` reason as the only trace.
+                //
+                // Throttled through the state directory rather than printed per unit,
+                // because a line per translation unit is thousands of lines and gets
+                // filtered -- which is worse than silence, since it buries everything
+                // else with it.
+                if (auto const* const row = Cc::PersistentRefusalFor(outcome.code);
+                    row != nullptr
+                    && Cc::ShouldAnnounceRefusal(
+                        Cc::StateDirectory(), cfg.addr, outcome.code, std::chrono::system_clock::now()))
+                    std::cerr << Cc::RefusalNoticeLine(cfg.addr, *row, outcome.message) << '\n';
+            }
             else
                 WarnAndCarryOn("fetch exchange failed");
         }

@@ -151,6 +151,7 @@ set(_fc_cc_sources
     ObjectEquivalence.cpp
     ParallelFor.cpp
     PathResolve.cpp
+    RefusalNotice.cpp
     ReplayGuard.cpp
     RootReconciler.cpp
     Stats.cpp
@@ -274,6 +275,7 @@ if(FASTCACHED_BUILD_TESTS)
         DependencyProbe_test.cpp
         DirectManifest_test.cpp
         PathResolve_test.cpp
+        RefusalNotice_test.cpp
         ReplayGuard_test.cpp
         RootReconciler_test.cpp
         ProcessRunner_test.cpp
