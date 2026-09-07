@@ -47,14 +47,20 @@ SkipUnavailable=77
 usage() {
     cat >&2 <<'USAGE'
 usage: check-pr-closing-keywords.sh --pr <number>
+       check-pr-closing-keywords.sh --list-closing <number>
        check-pr-closing-keywords.sh --self-test
 
-  --pr <n>     read the pull request from the API and judge it
-  --self-test  drive the decision against staged records
+  --pr <n>            read the pull request from the API and judge it
+  --list-closing <n>  print the tickets it closes, one per line, and judge nothing
+  --self-test         drive the decision against staged records
 
 exit 0 every ticket the commits name is in the body
      1 one or more are missing, or the body could not be read
     77 the API could not be reached, so NOTHING was verified
+
+`--list-closing` exists so `check-rulebook-open-work.sh` can ask which tickets a pull
+request will close WITHOUT restating GitHub's keyword pattern. A second copy of that
+pattern is not a cross-check, it is a second thing to be wrong (#1016).
 USAGE
 }
 
@@ -282,7 +288,13 @@ FIXED #42"
     exit 0
 fi
 
-[ "${1:-}" = "--pr" ] && [ -n "${2:-}" ] || { usage; exit 2; }
+mode=""
+case "${1:-}" in
+    --pr) mode="judge" ;;
+    --list-closing) mode="list" ;;
+    *) usage; exit 2 ;;
+esac
+[ -n "${2:-}" ] || { usage; exit 2; }
 pr="$2"
 
 command -v gh >/dev/null 2>&1 || {
@@ -314,6 +326,15 @@ commits="$(jq -r '[.commits[] | ((.messageHeadline // "") + "\n" + (.messageBody
     echo "check-pr-closing-keywords: #${pr} reported no commits at all, which cannot be true" >&2
     exit "$SkipUnavailable"
 }
+
+# The UNION of both sides, deliberately. `Judge` already refuses a pull request whose
+# body omits what its commits name, so by the time both checks pass the body is a
+# superset -- but a caller asking "what will this close" must not depend on the other
+# check having run first.
+if [ "$mode" = "list" ]; then
+    { ClosingKeywords "$commits"; ClosingKeywords "$body"; } | sort -un
+    exit 0
+fi
 
 echo "check-pr-closing-keywords: ${REPO}#${pr}"
 Judge "$body" "$commits"

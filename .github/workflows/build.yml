@@ -306,7 +306,17 @@ jobs:
         # a bare 77 nobody can read.
         run: |
           set +e
-          bash scripts/check-rulebook-open-work.sh --resolve
+          # On a pull request, ALSO judge the entries against what this pull request
+          # closes (#1016). An entry naming an issue this branch closes is true right
+          # now and stale the moment it merges, so master goes red on a change that
+          # passed every check -- three times in one day. `--pr` is the only moment
+          # that state is visible, and it is invisible on push, where the flag is
+          # correctly absent.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash scripts/check-rulebook-open-work.sh --resolve --pr "${{ github.event.pull_request.number }}"
+          else
+            bash scripts/check-rulebook-open-work.sh --resolve
+          fi
           rc=$?
           set -e
           if [ "$rc" -eq 77 ]; then
