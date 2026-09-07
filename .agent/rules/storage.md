@@ -74,7 +74,15 @@ belongs here is the part that constrains the code.
 **One code, two events, and WHERE decides which.** `Open` is not a scan: it reads
 the two meta slots, walks the free list and looks up two reserved keys — the
 in-flight-conversion marker and the format marker — and `Replay()` is deliberately
-a no-op. So damage inside that reach refuses the process to start, and damage
+a no-op. **The free-list walk is itself a no-op on any store this project writes**,
+and that has to be said wherever the reach is described (#637): `CommitTxn` pins
+`freeRoot` to `None` on every commit, so the chain is empty by construction and the
+two `Corrupt` refusals inside the walk are unreachable — pinned by a test that seeds
+the chain through `FilePageStore`'s own API, which is a guard on an invariant and
+must not be read as evidence the failure mode is live. So the reach that can
+actually refuse is the meta slots and the two reserved keys. The walk stays because
+the layout is reserved for a future format; what is forbidden is describing it as
+though a store in the field could trip it. So damage inside that reach refuses the process to start, and damage
 anywhere else is found per key while the process serves. Both `fastcached` and
 `fastcache-compile-node` treat a store that will not open as **fatal**, on purpose
 — the operator named a path, and coming up without it delivers less than was
@@ -309,3 +317,23 @@ describes stops at the first commit that reclaims a page.
 
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
+
+## Open work
+
+- **[#990](https://github.com/LASTRADA-Software/fastcached/issues/990)** — a disk
+  tier grows past `--cache-disk` across a restart while the gauge reads under it,
+  and the two halves compound. `CommitTxn` pins `freeRoot` to `None`, so the free
+  list does not survive a restart; `RecoverExistingFile` then marks **every** data
+  page live and subtracts only via the chain walk that can therefore never run. So
+  the pages a previous session freed are not merely forgotten, they are permanently
+  CLAIMED — which is what decides the shape of any fix: reclamation added later
+  helps only stores written after it, because in an existing file an orphan is
+  indistinguishable from a live page. `_bytesUsed` resets too, so each session's
+  `EvictToFit` does not fire until it has rewritten `maxBytes`, making the
+  extension larger before recycling starts. Measured: `maxBytes` 64 KiB, 300 × 1 KiB
+  writes, close, reopen, 300 more — file 1,114,112 → 2,179,072 bytes with
+  `bytesUsed` reading 65,536 in **both** sessions. Deliberately not decomposed
+  between the two causes: a plausible split neither measurement supports would be
+  believed. Shares its root cause with
+  [#175](https://github.com/LASTRADA-Software/fastcached/issues/175), and the page
+  store never shrinking is stated as contract in `IPageStore.hpp`.
