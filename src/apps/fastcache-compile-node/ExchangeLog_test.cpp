@@ -133,3 +133,105 @@ TEST_CASE("ExchangeLog: an unrecognised status byte renders as its byte", "[node
     auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "h", 8, weird, 0ms);
     CHECK(line.contains("status-0x7f"));
 }
+
+namespace
+{
+
+/// A logger that keeps what it was told, so a case can assert on the LEVEL as well
+/// as the text -- which is the whole point here: the exchange line already says a
+/// refusal happened, at the verb's own level, and what #181 is about is that nobody
+/// sees it there.
+class CapturingLines final: public FastCache::ILogger
+{
+  public:
+    void Log(FastCache::LogLevel level, std::string_view message) override
+    {
+        lines.emplace_back(level, std::string { message });
+    }
+    [[nodiscard]] FastCache::LogLevel MinLevel() const noexcept override
+    {
+        return FastCache::LogLevel::Trace;
+    }
+    void SetMinLevel(FastCache::LogLevel /*level*/) noexcept override {}
+
+    [[nodiscard]] std::size_t WarnCount() const
+    {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(lines, [](auto const& l) { return l.first == FastCache::LogLevel::Warn; }));
+    }
+
+    std::vector<std::pair<FastCache::LogLevel, std::string>> lines;
+};
+
+/// An `Error` reply carrying `code`, framed the way the wire frames one.
+[[nodiscard]] std::vector<std::byte> ErrorReply(Wire::ErrorCode code, std::string_view message)
+{
+    return Wire::EncodeErrorReply(code, message);
+}
+
+} // namespace
+
+TEST_CASE("NoteVersionRefusal: a version refusal is Warn, not the verb's level", "[node][logging][refusal]")
+{
+    // The defect: the exchange line follows the VERB, so a refused `fetch` is `Debug`
+    // and an operator at the default level sees a node refusing every request with no
+    // line saying so. #815 is what that costs -- weeks of building through a cache
+    // answering "no".
+    CapturingLines log;
+    RefusalThrottle throttle;
+    auto const t0 = std::chrono::steady_clock::time_point {};
+
+    NoteVersionRefusal(log, throttle, "10.0.0.4", ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"), t0);
+
+    REQUIRE(log.WarnCount() == 1);
+    CHECK(log.lines.front().second.contains("10.0.0.4"));
+    // The daemon's own words carry the range, which the category alone cannot.
+    CHECK(log.lines.front().second.contains("supported 5..5"));
+    // And it says what it MEANS for that client, not only what happened.
+    CHECK(log.lines.front().second.contains("version pair"));
+}
+
+TEST_CASE("NoteVersionRefusal: any other refusal is left to the exchange line", "[node][logging][refusal]")
+{
+    // Narrow on purpose. A malformed frame or an unauthenticated peer is about ONE
+    // request; only a version mismatch says the client cannot work with this node at
+    // all. Escalating the others would make the level meaningless.
+    CapturingLines log;
+    RefusalThrottle throttle;
+    auto const t0 = std::chrono::steady_clock::time_point {};
+
+    NoteVersionRefusal(log, throttle, "10.0.0.4", ErrorReply(Wire::ErrorCode::MalformedFrame, "bad"), t0);
+    NoteVersionRefusal(log, throttle, "10.0.0.4", ErrorReply(Wire::ErrorCode::Unauthenticated, "no token"), t0);
+    // And a perfectly good reply must not be mistaken for one.
+    NoteVersionRefusal(log, throttle, "10.0.0.4", Wire::EncodeReply(Wire::Status::Ok, {}), t0);
+
+    CHECK(log.WarnCount() == 0);
+}
+
+TEST_CASE("NoteVersionRefusal: a build's every translation unit produces one line", "[node][logging][refusal]")
+{
+    // A build opens a connection per translation unit, so an unthrottled line would be
+    // one per compile -- which buries the journal and is the failure mode #993 records
+    // one layer up.
+    CapturingLines log;
+    RefusalThrottle throttle;
+    auto const t0 = std::chrono::steady_clock::time_point {};
+
+    for (auto i = 0; i < 1000; ++i)
+        NoteVersionRefusal(log, throttle, "10.0.0.4", ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"), t0);
+    CHECK(log.WarnCount() == 1);
+
+    // A DIFFERENT machine is a different fact and must not be suppressed by the first:
+    // during a rollout the operator needs to know which machines are behind.
+    NoteVersionRefusal(log, throttle, "10.0.0.9", ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"), t0);
+    CHECK(log.WarnCount() == 2);
+
+    // ...and it speaks again once the interval passes, or somebody who fixes one node
+    // never learns the rest are still behind.
+    NoteVersionRefusal(log,
+                       throttle,
+                       "10.0.0.4",
+                       ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"),
+                       t0 + std::chrono::seconds { 61 });
+    CHECK(log.WarnCount() == 3);
+}

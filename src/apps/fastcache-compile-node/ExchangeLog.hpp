@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <map>
+#include <mutex>
 #include <ranges>
 #include <span>
 #include <string>
@@ -267,6 +269,91 @@ inline void LogExchange(ILogger& logger,
     if (level < logger.MinLevel())
         return;
     logger.Log(level, FormatExchange(opRaw, peer, requestBytes, reply, elapsed));
+}
+
+/// How often one peer's version refusal may be reported.
+///
+/// A minute, not five: a node is long-lived and shared, so this is the operator's
+/// first notice that a machine in the fleet cannot talk to it at all. Frequent
+/// enough to notice during a rollout, rare enough that a hundred stale clients
+/// produce a hundred lines a minute rather than a hundred a second.
+inline constexpr std::chrono::seconds VersionRefusalNoticeInterval { 60 };
+
+/// Remembers which peers have already been reported, so a stale client is named
+/// once rather than once per translation unit.
+///
+/// **In memory, not on disk, and that is the difference from the launcher's half.**
+/// `fastcache-cc` is a per-TU process with no shared state, so its throttle needs a
+/// file; a node outlives every client and can simply remember.
+///
+/// Shared across connections -- it belongs to the surface, not to one socket --
+/// because a build opens a connection per translation unit and a per-connection
+/// throttle would suppress nothing at all.
+class RefusalThrottle
+{
+  public:
+    /// @param peer Who was refused.
+    /// @param now The reactor's clock reading.
+    /// @param interval How long one peer stays quiet after being named.
+    /// @return True when the caller should report this refusal.
+    [[nodiscard]] bool ShouldReport(std::string_view peer,
+                                    std::chrono::steady_clock::time_point now,
+                                    std::chrono::seconds interval = VersionRefusalNoticeInterval)
+    {
+        std::scoped_lock const guard { _mutex };
+        auto const it = _lastReported.find(std::string { peer });
+        if (it != _lastReported.end() && now - it->second < interval)
+            return false;
+        _lastReported[std::string { peer }] = now;
+        return true;
+    }
+
+  private:
+    std::mutex _mutex;
+    std::map<std::string, std::chrono::steady_clock::time_point> _lastReported;
+};
+
+/// Report a peer this node cannot speak to, once per interval, at `Warn`.
+///
+/// **The server half of #181.** A version mismatch is not one client's problem: it
+/// says a machine in this fleet is running a build that cannot use this node at all,
+/// and it will stay true for every request that machine makes until somebody
+/// redeploys. #815 is what that costs when nobody is told -- an 0.1.0 daemon refusing
+/// a wire-3 launcher, everything degrading exactly as designed, for weeks.
+///
+/// `Warn` rather than the exchange line's own level, because the exchange line
+/// follows the VERB: a refused `fetch` is `Debug`, so at the default level an
+/// operator sees a node quietly refusing every request and no line saying so.
+///
+/// A CALL and not a branch at the call site: `ServeConnection` sits at clang-tidy's
+/// cognitive-complexity ceiling, so the whole decision lives here (#946 hit the same
+/// wall).
+///
+/// @param logger    Where the line goes.
+/// @param throttle  Shared across connections; see `RefusalThrottle`.
+/// @param peer      The peer's host, as the kernel reports it.
+/// @param reply     The reply about to be written.
+/// @param now       The reactor's clock reading.
+inline void NoteVersionRefusal(ILogger& logger,
+                               RefusalThrottle& throttle,
+                               std::string_view peer,
+                               std::span<std::byte const> reply,
+                               std::chrono::steady_clock::time_point now)
+{
+    auto const header = CompileCacheWire::DecodeReplyHeader(reply);
+    if (!header.has_value() || header->status != CompileCacheWire::Status::Error)
+        return;
+    auto const payload = CompileCacheWire::DecodeErrorPayload(reply.subspan(CompileCacheWire::ReplyHeaderSize));
+    if (!payload.has_value() || payload->first != CompileCacheWire::ErrorCode::UnsupportedVersion)
+        return;
+    if (!throttle.ShouldReport(peer, now))
+        return;
+
+    logger.Logf(LogLevel::Warn,
+                "refused {} on wire version grounds ({}); that client cannot use this node at all and will "
+                "compile without a cache until it is rebuilt -- launcher and node are a version pair",
+                peer.empty() ? std::string_view { "<unknown peer>" } : peer,
+                payload->second);
 }
 
 } // namespace FastCache::Node
