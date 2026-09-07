@@ -212,6 +212,12 @@ struct FrameServer::State
     IMetricsSink& metrics;
     ILogger& logger;
 
+    /// Which peers have already been told this node cannot speak their wire version.
+    ///
+    /// On the SERVER state and not the connection, because a build opens a connection
+    /// per translation unit -- a per-connection throttle would suppress nothing (#181).
+    Node::RefusalThrottle versionRefusals;
+
     std::atomic<bool> shuttingDown { false };
 
     /// Sockets being served, each with the instant it must finish by AND which
@@ -1785,6 +1791,14 @@ namespace
                     frame.size(),
                     reply,
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt));
+
+                // A peer this node cannot speak to AT ALL is louder than its verb's own
+                // level -- a refused `fetch` is `Debug`, so at the default level an
+                // operator sees a node refusing every request and no line saying so.
+                // Said once per peer per interval; `NoteVersionRefusal` owns the whole
+                // decision because `ServeConnection` is at the complexity ceiling.
+                Node::NoteVersionRefusal(
+                    state->logger, state->versionRefusals, peer, reply, std::chrono::steady_clock::now());
 
                 // **Before every write below, and there are three of them.** The pulse is
                 // the only writer while the responder answers; this is where that stops
