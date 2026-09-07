@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every ticket a pull request's COMMITS say it closes must also be named by a closing
+# keyword in its BODY.
+#
+# ## Why both, rather than one instead of the other
+#
+# They do different jobs and neither substitutes for the other:
+#
+#   * the COMMIT trailer, one per ticket, is what makes a ticket findable and EXCISABLE
+#     on a batch branch -- `git log --grep` re-derives the boundaries after a rebase,
+#     which is the only reliable way once every SHA has moved;
+#   * the BODY keyword is what the merge acts on.
+#
+# Measured across one day's merges (#974): #955, #953 and #961 carried the keyword in
+# both and closed #893, #901 and #208; #959 carried it only in its commits and left #826
+# and #866 OPEN. Every close event that worked has NO `commit_id` in the issue timeline,
+# which is what a body-keyword close looks like -- nothing in the sample was closed by a
+# commit trailer.
+#
+# A delivered ticket that stays open is indistinguishable from one nobody has started.
+# #826 sat inside the `type/bug` count for a day after merging; a batch of eight does
+# that eight times at once.
+#
+# ## The DECISION is a pure function, and that is deliberate
+#
+# Acquisition (a `gh` call) and judgement are split, so the self-test drives staged
+# records rather than a live pull request -- the shape `node-scratch-isolation-e2e`
+# arrived at after its own timing measurements could not be staged.
+#
+# bash 3.2: macOS ships a 2007 /bin/bash and this runs in the default ctest set.
+set -uo pipefail
+
+REPO="${FASTCACHED_REPO:-LASTRADA-Software/fastcached}"
+SkipUnavailable=77
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: check-pr-closing-keywords.sh --pr <number>
+       check-pr-closing-keywords.sh --self-test
+
+  --pr <n>     read the pull request from the API and judge it
+  --self-test  drive the decision against staged records
+
+exit 0 every ticket the commits name is in the body
+     1 one or more are missing, or the body could not be read
+    77 the API could not be reached, so NOTHING was verified
+USAGE
+}
+
+# Tickets a text closes, one per line, sorted and unique.
+#
+# The keyword must precede EACH number: `Closes #A and #B` closes only #A, which is
+# already a scar in `.agent/guides/team-run.md`. So this looks for the keyword-number
+# PAIR and never for a bare `#N`, and it is the same reading GitHub performs -- a
+# checker more permissive than the thing it stands for would pass a body that closes
+# half of what it claims.
+#
+# `grep -oE ... <<<`, never `printf | grep`: `grep -q` is not used here, but the
+# pipeline shape is the one #970 bans and the herestring costs nothing.
+# @param 1 the text
+ClosingKeywords() {
+    grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$1" \
+        | grep -oE '[0-9]+' | sort -un
+}
+
+# Judge one record.
+# @param 1 the pull request body
+# @param 2 every commit message, concatenated
+# @return 0 when the body names every ticket the commits do
+Judge() {
+    local body="$1" commits="$2" inCommits="" inBody="" missing="" n=""
+    inCommits="$(ClosingKeywords "$commits")"
+    inBody="$(ClosingKeywords "$body")"
+
+    # No trailer anywhere is a pull request that closes nothing -- ordinary, and not
+    # this check's business. It must not be an error: a docs-only or chore pull request
+    # legitimately names no ticket, and refusing it would teach people to write a
+    # keyword to satisfy a checker, which closes the wrong issue.
+    [ -n "$inCommits" ] || { echo "  no closing trailer in any commit; nothing to check"; return 0; }
+
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        grep -qx -- "$n" <<< "$inBody" || missing="$missing $n"
+    done <<< "$inCommits"
+
+    if [ -n "$missing" ]; then
+        echo "FAILED: the commits say this closes${missing}, and the body does not." >&2
+        echo "        Under the merge queue only the BODY keyword closes an issue, so those" >&2
+        echo "        tickets would stay OPEN after this merged -- delivered, counted as" >&2
+        echo "        outstanding, and indistinguishable from work nobody started (#974)." >&2
+        echo "        Add a line per ticket to the body; KEEP the commit trailers, which are" >&2
+        echo "        what makes a ticket excisable from a batch branch." >&2
+        return 1
+    fi
+    echo "  every ticket the commits name ($(tr '\n' ' ' <<< "$inCommits")) is in the body"
+    return 0
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    cases=0
+    failures=0
+    # @param 1 name  @param 2 expect pass|refuse  @param 3 body  @param 4 commits
+    run_case() {
+        local name="$1" want="$2" out="" got=pass
+        cases=$((cases + 1))
+        out="$(Judge "$3" "$4" 2>&1)" || got=refuse
+        if [ "$got" != "$want" ]; then
+            echo "  FAIL $name: expected $want, got $got" >&2
+            printf '%s\n' "$out" | sed 's/^/       | /' >&2
+            failures=$((failures + 1))
+            return
+        fi
+        echo "  ok   $name ($got)"
+    }
+
+    # selftest-data: begin
+    run_case "body carries the one trailer" pass \
+        "Prose about the change.
+
+Fixes #883" \
+        "fix(x): a thing
+
+Fixes #883"
+    run_case "body carries neither of two" refuse \
+        "Prose about the change." \
+        "fix(a): one
+
+Fixes #826
+
+fix(b): two
+
+Fixes #866"
+    run_case "body carries one of two -- the batch case" refuse \
+        "Prose.
+
+Fixes #826" \
+        "fix(a): one
+
+Fixes #826
+
+fix(b): two
+
+Fixes #866"
+    run_case "no trailer anywhere is not this check's business" pass \
+        "A docs-only change." \
+        "docs: reword a paragraph"
+    run_case "a body keyword with no commit trailer is allowed" pass \
+        "Fixes #100" \
+        "chore: tidy"
+    run_case "Closes and Fixes are both keywords" pass \
+        "Closes #12
+Fixes #13" \
+        "feat: a
+
+Closes #12
+
+fix: b
+
+Fixes #13"
+    # `Closes #A and #B` closes only #A, which is the scar in team-run.md. The checker
+    # must read it the way GitHub does or it is more permissive than the thing it
+    # stands for: here the BODY names only #12, so #13 is missing and this refuses.
+    run_case "'Closes #A and #B' in the body covers only #A" refuse \
+        "Closes #12 and #13" \
+        "feat: a
+
+Closes #12
+
+fix: b
+
+Closes #13"
+    # Case sensitivity: GitHub accepts `fixes`, `FIXES`, `Fixed`.
+    run_case "keyword case and tense do not matter" pass \
+        "fixes #42" \
+        "fix: x
+
+FIXED #42"
+    # selftest-data: end
+
+    echo "check-pr-closing-keywords self-test: $cases case(s) ran, $failures failure(s)"
+    [ "$failures" -eq 0 ] || exit 1
+    exit 0
+fi
+
+[ "${1:-}" = "--pr" ] && [ -n "${2:-}" ] || { usage; exit 2; }
+pr="$2"
+
+command -v gh >/dev/null 2>&1 || {
+    echo "check-pr-closing-keywords: no gh on PATH, so NOTHING was verified" >&2
+    exit "$SkipUnavailable"
+}
+
+# A LIVENESS anchor before the question, so "the API said no trailers" and "the API did
+# not answer" are two outcomes rather than one silent pass. `rate_limit` is the cheapest
+# authenticated call there is and needs no repository scope.
+gh api rate_limit >/dev/null 2>&1 || {
+    echo "check-pr-closing-keywords: the GitHub API did not answer, so NOTHING was verified" >&2
+    exit "$SkipUnavailable"
+}
+
+record="$(gh pr view "$pr" --repo "$REPO" --json body,commits 2>/dev/null)" || record=""
+[ -n "$record" ] || {
+    echo "check-pr-closing-keywords: could not read pull request #${pr} from ${REPO}" >&2
+    exit "$SkipUnavailable"
+}
+
+body="$(jq -r '.body // ""' <<< "$record")"
+commits="$(jq -r '[.commits[] | ((.messageHeadline // "") + "\n" + (.messageBody // ""))] | join("\n")' <<< "$record")"
+
+# An empty commit list is the API answering something this check cannot judge -- a pull
+# request always has at least one commit -- so it is a refusal to conclude rather than a
+# pass over nothing. Two empty lists agree perfectly.
+[ -n "$commits" ] || {
+    echo "check-pr-closing-keywords: #${pr} reported no commits at all, which cannot be true" >&2
+    exit "$SkipUnavailable"
+}
+
+echo "check-pr-closing-keywords: ${REPO}#${pr}"
+Judge "$body" "$commits"
