@@ -925,11 +925,13 @@ boot, silently, because a registration replays its command line forever. So:
   file, appending a `storage_path:` the worker does not have. On those platforms the
   worker is configured by `--install-service --config=<path>`.
 
-- **[#208](https://github.com/LASTRADA-Software/fastcached/issues/208)** — the rule
+- **[#968](https://github.com/LASTRADA-Software/fastcached/issues/968)** — the rule
   above covers the addresses this node OPENS. The ones it dials — `--advertise`,
   `--scheduler`, `--upstream`, `--fleet-member` — are never checked for shape at all.
-  `--advertise` is the costly one: nothing parses it, so `--advertise=nope` installs,
-  registers, heartbeats, is leased out and is never reached, which is word for word
-  the failure the emptiness rule beside it was written to prevent. Deciding it needs
+  `--advertise` was the costly one -- nothing parsed it, so `--advertise=nope` installed,
+  registered, heartbeated, was leased out and was never reached -- and it is CLOSED
+  (#208): `ParseDialEndpoint` judges it in `StartupPolicyRejection`, ordered after the
+  wildcard row so the more specific refusal keeps its own message. The rest fail
+  VISIBLY, at `connect()`, which is why they are the residual rather than the defect. Deciding it needs
   a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
   `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".
