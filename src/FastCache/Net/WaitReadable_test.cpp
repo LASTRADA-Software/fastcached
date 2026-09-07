@@ -15,6 +15,19 @@
 #include <memory>
 #include <span>
 #include <thread>
+
+#if defined(_WIN32)
+    #include <winsock2.h>
+
+    #include <ws2tcpip.h>
+#else
+    #include <sys/socket.h>
+
+    #include <unistd.h>
+
+    #include <arpa/inet.h>
+    #include <netinet/in.h>
+#endif
 #include <vector>
 
 /// What `ISocket::WaitReadable` reports, on a REAL socket, on this platform.
@@ -373,4 +386,97 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     // And the peer, which had closed only its write half, still got its answer.
     CHECK(observed.replySent.load(std::memory_order_relaxed));
     CHECK(received.size() == 3);
+}
+
+TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitreadable][measure899]")
+{
+    // #899's first acceptance criterion, and it says MEASURE, do not read: can
+    // `WaitReadable` answer `> 0` without pending bytes that survive to the next call?
+    //
+    // Reading says yes on every transport -- `EpollSocket`'s completion is
+    // `peeked == 0 ? 0 : 1`, so a NEGATIVE `MSG_PEEK` reports "data pending", and its
+    // own comment calls that "a spurious wake-up or an error". #899 names the IOCP
+    // analogue. What reading cannot say is whether that arm is REACHABLE, and a
+    // spurious wake is not something a test can force.
+    //
+    // An abortive close is. A peer that sets `SO_LINGER{1,0}` and closes sends RST
+    // rather than FIN; the server's fd becomes readable and `recv` fails with
+    // ECONNRESET -- negative, not zero. If the arm is reachable at all, this reaches
+    // it, with no pipelining peer and no spurious anything.
+    //
+    // Written with a RAW client socket rather than `BlockingConnector`, because
+    // `ISocket` exposes no way to set `SO_LINGER` and the whole point is the shape of
+    // the close.
+    FastCache::SteadyClock clock;
+    FastCache::PlatformReactor reactor { clock };
+    auto listener = FastCache::PlatformListener::Bind(reactor, "127.0.0.1", 0);
+    REQUIRE(listener);
+    REQUIRE(listener->IsBound());
+    auto const port = listener->BoundPort();
+    REQUIRE(port != 0);
+
+    Observation observed;
+    ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ true);
+
+    std::atomic<bool> unresolvedBeforeReset { false };
+    std::jthread client { [port, &observed, &unresolvedBeforeReset] {
+#if defined(_WIN32)
+        using RawSocket = SOCKET;
+        auto const invalid = INVALID_SOCKET;
+        auto const closeRaw = [](RawSocket s) {
+            ::closesocket(s);
+        };
+        auto const optCast = [](void const* p) {
+            return static_cast<char const*>(p);
+        };
+#else
+        using RawSocket = int;
+        auto const invalid = -1;
+        auto const closeRaw = [](RawSocket s) {
+            ::close(s);
+        };
+        auto const optCast = [](void const* p) {
+            return p;
+        };
+#endif
+        RawSocket const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd == invalid)
+            return;
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = ::htons(port);
+        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
+        {
+            closeRaw(fd);
+            return;
+        }
+
+        (void) WaitForFlag(observed.arming);
+        unresolvedBeforeReset.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
+
+        // Zero linger on close is what turns FIN into RST, on both stacks.
+        linger const abortive { .l_onoff = 1, .l_linger = 0 };
+        ::setsockopt(fd,
+                     SOL_SOCKET,
+                     SO_LINGER,
+                     static_cast<char const*>(static_cast<void const*>(&abortive)),
+                     static_cast<int>(sizeof(abortive)));
+        (void) optCast;
+        closeRaw(fd);
+    } };
+
+    reactor.Run();
+    client.join();
+
+    CHECK(unresolvedBeforeReset.load(std::memory_order_relaxed));
+    REQUIRE(observed.resolved.load(std::memory_order_acquire));
+
+    // NOT asserted either way -- this case is a MEASUREMENT, and pinning the answer
+    // before it is known is how a test comes to assert the defect. What it must do is
+    // REPORT, so the number reaches the ticket.
+    WARN("MEASURED abortive close: hasValue=" << observed.hasValue.load(std::memory_order_relaxed)
+                                              << " count=" << observed.count.load(std::memory_order_relaxed)
+                                              << " readBack=" << observed.readBack.load(std::memory_order_relaxed));
+    SUCCEED("measurement recorded");
 }
