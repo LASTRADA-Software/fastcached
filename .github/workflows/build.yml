@@ -1863,9 +1863,71 @@ jobs:
             exit 1
           }
 
+      # A spawn BRACKET around `ctest`, and the pair is what makes the reading
+      # mean something ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
+      #
+      # `Windows-cl-debug` once failed six tests, all with exit `0xc0000142`
+      # (`STATUS_DLL_INIT_FAILED`), and they were exactly the six that spawn a
+      # process while every in-process case passed. No defect in the tree selects
+      # for "spawns a process": a broken link or a missing runtime would take the
+      # in-process cases with it. But nothing SAID so, and six red smoke tests read
+      # as a regression -- which matters most on this leg, since it is the one run
+      # for `_ITERATOR_DEBUG_LEVEL=2` and its smoke tests are where a Debug-runtime
+      # defect would surface. A leg that intermittently reports nothing about the
+      # property it exists for is worse than one that is simply red.
+      #
+      # Cheap and side-effect free: `cmd /c exit 0` starts a process and nothing
+      # else. It cannot make a green run red for any reason but the one it names.
+      - name: "Can this runner start a process at all? (before)"
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        shell: pwsh
+        run: |
+          & cmd /c exit 0
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::this runner cannot start a process (cmd exited $LASTEXITCODE, 0xc0000142 is STATUS_DLL_INIT_FAILED)."
+            Write-Host "::error::Nothing below this line says anything about the tree (#966)."
+            exit 1
+          }
+          Write-Host "::notice::spawn works before ctest"
+
       - name: "Test"
         if: ${{ needs.changes.outputs.code != 'false' }}
         run: ctest --preset ${{ matrix.preset }}
+
+      # The other half of the bracket, and it only runs on a red.
+      #
+      # THREE outcomes, not two, because a probe that can only answer the two you
+      # expect will answer one of them whatever it sees:
+      #
+      #   * spawning is broken NOW -- the run degraded while ctest was running, and
+      #     the failures above say nothing about the tree;
+      #   * spawning works now -- so either the tree is genuinely broken, or the
+      #     runner recovered, and this reading cannot tell which;
+      #   * the probe itself could not conclude -- said out loud rather than folded
+      #     into either of the above.
+      #
+      # It is a reading taken AFTER the fact and says so. Paired with the one before
+      # ctest it still narrows things: both green is a tree finding, before-green
+      # and after-red is the runner, and before-red never reaches here at all.
+      #
+      # `continue-on-error` because this is a classifier on an already-failing job:
+      # it must not be able to change the verdict, only to explain it.
+      - name: "Can this runner start a process at all? (after a red)"
+        if: ${{ failure() && needs.changes.outputs.code != 'false' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $rc = $null
+          try { & cmd /c exit 0; $rc = $LASTEXITCODE } catch { $rc = $null }
+          if ($null -eq $rc) {
+            Write-Host "::warning::the spawn probe did not conclude; this run is unclassified (#966)"
+          } elseif ($rc -ne 0) {
+            Write-Host "::error::spawning worked BEFORE ctest and does not now (cmd exited $rc)."
+            Write-Host "::error::This runner degraded during the run, so the failures above are about the runner and not the tree (#966)."
+          } else {
+            Write-Host "::notice::spawning still works, so this red is not #966's runner-state shape; read the failures as being about the tree."
+          }
 
       - name: "Upload fastcached.exe"
         if: ${{ needs.changes.outputs.code != 'false' }}
