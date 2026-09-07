@@ -108,7 +108,8 @@ namespace
                                                                 Cc::IProcessRunner& runner,
                                                                 Cc::IToolchainHost& host,
                                                                 IClock const& clock,
-                                                                ILogger& logger)
+                                                                ILogger& logger,
+                                                                SurveyVoice voice)
     {
         std::vector<SurveyedToolchain> fingerprints(entries.size());
         std::atomic<std::size_t> next { 0 };
@@ -145,11 +146,13 @@ namespace
             AnnouncingParallelFor(Cc::IParallelFor& parallelFor,
                                   IClock const& source,
                                   ILogger& sink,
-                                  std::stop_token const& stopping) noexcept:
+                                  std::stop_token const& stopping,
+                                  SurveyVoice narration) noexcept:
                 inner { parallelFor },
                 clock { source },
                 logger { sink },
-                stop { stopping }
+                stop { stopping },
+                voice { narration }
             {
             }
 
@@ -159,10 +162,12 @@ namespace
             /// Observed per hashed file; see `Run`. A reference because the token
             /// outlives this wrapper -- it belongs to the thread being stopped.
             std::stop_token const& stop;
+            /// How loudly this survey narrates; see `SurveyVoice` (#993).
+            SurveyVoice voice;
 
             [[nodiscard]] bool Run(std::size_t count, std::function<void(std::size_t)> const& slice) override
             {
-                logger.Logf(LogLevel::Info, "hashing {} toolchain file(s)", count);
+                logger.Logf(NarrationLevel(voice), "hashing {} toolchain file(s)", count);
 
                 // And then, while it runs, how fast (#354). The line above marks the
                 // phase; these mark its RATE, which is what tells a cold cache from a
@@ -187,7 +192,7 @@ namespace
                 });
             }
         };
-        AnnouncingParallelFor announcing { parallel, clock, logger, stop };
+        AnnouncingParallelFor announcing { parallel, clock, logger, stop, voice };
 
         auto identify = [&] {
             for (auto index = next.fetch_add(1); index < entries.size(); index = next.fetch_add(1))
@@ -228,7 +233,7 @@ namespace
                 // Logged BEFORE the walk rather than after, because the walk is the
                 // slow part and an operator watching a cold start needs to know the
                 // process is working rather than wedged.
-                logger.Logf(LogLevel::Info, "computing the toolchain fingerprint for {}", entry.compiler);
+                logger.Logf(NarrationLevel(voice), "computing the toolchain fingerprint for {}", entry.compiler);
                 auto const banner = Cc::CompilerBanner(runner, entry.compiler);
 
                 // The three lines this one begins exist because a 300s stall here
@@ -241,12 +246,12 @@ namespace
                 // takes 15-36ms warm, and no process-tree poll cheap enough to run
                 // for five minutes will see it. What locates a stall is saying which
                 // phase ended.
-                logger.Logf(LogLevel::Info, "read the compiler banner for {}", entry.compiler);
+                logger.Logf(NarrationLevel(voice), "read the compiler banner for {}", entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
                 auto const& spec = Cc::DriverOf(flavor);
                 fingerprints[index].identity =
                     Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec, announcing);
-                logger.Logf(LogLevel::Info, "computed the toolchain fingerprint for {}", entry.compiler);
+                logger.Logf(NarrationLevel(voice), "computed the toolchain fingerprint for {}", entry.compiler);
 
                 // The evidence this identity rests on, kept so that noticing it has
                 // moved costs no spawn at all (#238) -- and TAKEN from the identity
@@ -342,7 +347,8 @@ std::string SearchedLayouts()
 std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& cfg,
                                                              Cc::IToolchainDiscovery* discovery,
                                                              Cc::IProcessRunner& runner,
-                                                             ILogger& logger)
+                                                             ILogger& logger,
+                                                             SurveyVoice voice)
 {
     // One fact, stated once. The set is the machine's when the operator named none
     // and there is something to ask -- which is also what decides whether the count
@@ -372,7 +378,7 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
                     LogLevel::Warn, "ignoring {} found by {}: it cannot be executed", candidate.compiler, candidate.layout);
                 continue;
             }
-            logger.Logf(LogLevel::Info, "found {} ({})", candidate.compiler, candidate.layout);
+            logger.Logf(NarrationLevel(voice), "found {} ({})", candidate.compiler, candidate.layout);
 
             // Built directly rather than pushed back through `SplitToolchain`. That
             // grammar reserves the first `=`, which is right for something an
@@ -409,7 +415,8 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
                                    Cc::IToolchainHost& host,
                                    IClock const& clock,
                                    ILogger& logger,
-                                   std::stop_token const& stop)
+                                   std::stop_token const& stop,
+                                   SurveyVoice voice)
 {
     auto const& entries = discovered.entries;
 
@@ -421,7 +428,7 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
     // start where an operator is watching. Warm starts read the cache and are
     // instant, so this buys nothing on any boot after the first; it is the first one
     // that decides whether the feature looks like it works.
-    auto fingerprints = FingerprintAll(stop, entries, runner, host, clock, logger);
+    auto fingerprints = FingerprintAll(stop, entries, runner, host, clock, logger, voice);
 
     // Asked after the walk rather than instead of it: the check inside skips the work
     // per file, so a cancelled survey returns promptly carrying entries that were
@@ -488,9 +495,9 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
                                                  .label = std::move(fingerprints[index].label),
                                                  .witness = std::move(fingerprints[index].witness) });
         if (inserted)
-            logger.Logf(LogLevel::Info, "serving {} as {}", entry.compiler, fingerprint);
+            logger.Logf(NarrationLevel(voice), "serving {} as {}", entry.compiler, fingerprint);
         else
-            logger.Logf(LogLevel::Info,
+            logger.Logf(NarrationLevel(voice),
                         "{} is the same toolchain as {} ({}); serving it once",
                         entry.compiler,
                         existing->second.compiler,
@@ -539,7 +546,7 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
     // nobody typed: an operator reading this log has to be able to tell "the fleet
     // decided" from "I configured that".
     if (discovered.source == ToolchainSource::MachineSearched)
-        logger.Logf(LogLevel::Info,
+        logger.Logf(NarrationLevel(voice),
                     "discovered {} toolchain(s) on this machine; pass --toolchain to serve a narrower set",
                     toolchains.size());
 
@@ -551,13 +558,14 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
                                                                         Cc::IProcessRunner& runner,
                                                                         Cc::IToolchainHost& host,
                                                                         IClock const& clock,
-                                                                        ILogger& logger)
+                                                                        ILogger& logger,
+                                                                        SurveyVoice voice)
 {
     // The whole survey, for every caller that can afford to wait for it: the
     // re-survey on the heartbeat thread, `--print-toolchain-fingerprint`, and every
     // test that wants one answer. Node startup is the one caller that cannot, and it
     // is the reason the two halves are separable at all (#365).
-    auto discovered = DiscoverToolchainEntries(cfg, discovery, runner, logger);
+    auto discovered = DiscoverToolchainEntries(cfg, discovery, runner, logger, voice);
     if (!discovered.has_value())
         return std::nullopt;
 
@@ -566,7 +574,7 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
     // heartbeat thread, `--print-toolchain-fingerprint`, and the tests. The node's
     // FIRST survey is the one that can be cancelled, and it calls the two halves
     // itself rather than coming through here.
-    auto surveyed = FingerprintToolchains(*discovered, runner, host, clock, logger, std::stop_token {});
+    auto surveyed = FingerprintToolchains(*discovered, runner, host, clock, logger, std::stop_token {}, voice);
     if (surveyed.outcome != SurveyOutcome::Served)
         return std::nullopt;
     return std::move(surveyed.served);
@@ -606,7 +614,8 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
                                    Cc::IToolchainHost& host,
                                    IClock const& clock,
                                    ILogger& logger,
-                                   RecheckDepth depth)
+                                   RecheckDepth depth,
+                                   SurveyVoice voice)
 {
     auto const stale = StaleToolchains(served);
     if (stale.empty() && depth == RecheckDepth::WhenEvidenceMoved)
@@ -622,7 +631,7 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
     // identical -- and the set is what this worker registers, so deriving it any way
     // but the startup way would give a node two identities depending on when it was
     // asked.
-    auto refreshed = ResolveToolchains(cfg, discovery, runner, host, clock, logger);
+    auto refreshed = ResolveToolchains(cfg, discovery, runner, host, clock, logger, voice);
 
     // `ResolveToolchains` refuses an empty result, which at startup is fatal and here
     // is a state the node has to be able to reach: the machine's only compiler was

@@ -1469,8 +1469,21 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
             actedOn = snapshot;
             auto const depth = Node::RecheckDepthFor(reloaded, beat, SweepEveryBeats);
 
-            if (auto refreshed = Node::RefreshToolchains(
-                    toolchains, liveCfg, discoveryFor(liveCfg), *runner, *toolchainHost, toolchainClock, logger, depth);
+            // How loudly that survey narrates itself. The timer sweep whispers; a
+            // reload and a moved witness do not (#993). Decided by a pure function
+            // rather than here, for `RecheckDepthFor`'s own reason: this file is in
+            // no test target.
+            auto const voice = Node::SurveyVoiceFor(reloaded, depth);
+
+            if (auto refreshed = Node::RefreshToolchains(toolchains,
+                                                         liveCfg,
+                                                         discoveryFor(liveCfg),
+                                                         *runner,
+                                                         *toolchainHost,
+                                                         toolchainClock,
+                                                         logger,
+                                                         depth,
+                                                         voice);
                 refreshed.changed)
             {
                 toolchains = std::move(refreshed.served);
