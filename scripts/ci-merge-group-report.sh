@@ -194,12 +194,31 @@ ReadRequiredContexts() {
 
 # ---------------------------------------------------------------------------
 
-[[ $# -eq 3 || $# -eq 4 ]] \
-    || Fatal "usage: $(basename "${BASH_SOURCE[0]}") <event> <runUrl> <jobsTsv> [headBranch]"
+[[ $# -ge 3 && $# -le 5 ]] \
+    || Fatal "usage: $(basename "${BASH_SOURCE[0]}") <event> <runUrl> <jobsTsv> [headBranch] [runConclusion]"
 event="$1"
 runUrl="$2"
 jobsTsv="$3"
 headBranch="${4:-}"
+runConclusion="${5:-}"
+
+# A run that was CANCELLED is a run that did nothing, and the positive assertion
+# below would refuse it by name -- correctly, as a statement about the RECORD, and
+# wrongly as a statement about the tree. Cancelling a superseded run is ordinary:
+# a new push cancels the old one, and a human cancels a run they no longer need.
+#
+# Reached only once the `push` policy started reading those records at all (#774);
+# before it, every non-merge_group event returned above and this could not fire.
+# So it is this change's own edge and is closed with it rather than found later as
+# a notifier that goes red on master whenever somebody cancels something.
+#
+# The run's conclusion is the RIGHT question rather than "were all its jobs
+# cancelled": a run cancelled after some jobs finished carries a mix, and reading
+# the mix would report the failures of a run nobody let finish.
+if [[ "$runConclusion" == "cancelled" ]]; then
+    Say "the run itself concluded 'cancelled'; a run nobody let finish reports on nothing"
+    exit 0
+fi
 
 # An event with no row is not a defect and not a silence -- it is a question this
 # reporter does not answer. Said out loud rather than left as an empty result,

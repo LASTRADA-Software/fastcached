@@ -262,17 +262,17 @@ REQ
     # nothing.
     Decide() {
         FASTCACHED_REQUIRED_CONTEXTS_FILE="$required" \
-            bash "$Decider" "$1" "https://example.invalid/run" "$2" ${3+"$3"}
+            bash "$Decider" "$1" "https://example.invalid/run" "$2" ${3+"$3"} ${4+"$4"}
     }
 
     Case() {
         # $1 = description, $2 = want-rows|want-none|want-refuse,
         # $3 = event, $4 = record file, $5 = expected substring (optional)
-        local what="$1" want="$2" event="$3" record="$4" expect="${5:-}" branch="${6:-}"
+        local what="$1" want="$2" event="$3" record="$4" expect="${5:-}" branch="${6:-}" conclusion="${7:-}"
         cases=$((cases + 1))
         local out err got=0
         err="${scratch}/err.txt"
-        out="$(Decide "$event" "$record" ${branch:+"$branch"} 2>"$err")" || got=$?
+        out="$(Decide "$event" "$record" ${branch:+"$branch"} ${conclusion:+"$conclusion"} 2>"$err")" || got=$?
 
         local rows=0
         [[ -n "$out" ]] && rows="$(printf '%s' "$out" | grep -c '' || true)"
@@ -355,6 +355,24 @@ REQ
     # of nothing" rule exists for.
     Case "an all-green push to master reports nothing" \
         want-none push "${scratch}/r-green.tsv" "nothing failed" master
+
+    # A run nobody let FINISH is not a run that found nothing. Its jobs are all
+    # `cancelled`, which is `inert`, so the positive assertion below would refuse
+    # it by name -- right about the record and wrong about the tree. Cancelling a
+    # superseded run is ordinary, and this edge exists only because the `push`
+    # policy reads those records at all, so it is closed with the change that
+    # opened it rather than found later as a notifier going red on master whenever
+    # somebody cancels something.
+    printf 'Code coverage\tcompleted\tcancelled\thttps://example.invalid/job\n' > "${scratch}/r-cancelled.tsv"
+    printf 'clang-tidy\tcompleted\tcancelled\thttps://example.invalid/job\n' >> "${scratch}/r-cancelled.tsv"
+    Case "a CANCELLED run reports nothing rather than being refused" \
+        want-none push "${scratch}/r-cancelled.tsv" "nobody let finish" master cancelled
+
+    # And the control: the same record WITHOUT the conclusion is refused, which is
+    # what makes the arm above a statement about the run rather than about the
+    # record. Without this, an arm that ignored its argument would pass.
+    Case "the same record with no run conclusion is still refused" \
+        want-refuse push "${scratch}/r-cancelled.tsv" "run that did nothing" master
 
     : > "${scratch}/r-empty.tsv"
     Case "an EMPTY record is refused: zero rows is the absence of a verdict" \
