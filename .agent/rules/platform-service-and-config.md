@@ -287,11 +287,45 @@ readable and silently ignored. Every rule below has already been one of them.
   and their *grammar* is every bit as much a pure function of the command line as a
   listen flag's. The honest split is narrower: this table covers the surfaces this
   node OPENS, whose grammar was already being checked in a tier and only in the wrong
-  place. Whether a dialled address is well-formed is a rule nobody has written yet,
-  not a rule deliberately declined
-  ([#208](https://github.com/LASTRADA-Software/fastcached/issues/208)). What genuinely
-  cannot move here is only the resolving: an address that does not exist when a
-  service is installed may exist by the time it boots.
+  place. What genuinely cannot move here is only the resolving: an address that does
+  not exist when a service is installed may exist by the time it boots.
+
+  **The DIALLED addresses are a second table beside it, one predicate per row, and the
+  per-row part is the rule** ([#208](https://github.com/LASTRADA-Software/fastcached/issues/208),
+  [#968](https://github.com/LASTRADA-Software/fastcached/issues/968)). One widened
+  predicate cannot serve them, because they do not share a grammar:
+
+  - `--advertise`, `--scheduler` and `--upstream` are DIALLED, so a bare port names no
+    machine and `ParseDialEndpoint` refuses it — the same call `--discovery` makes.
+    `--advertise` was the costly one: nothing parsed it, so `--advertise=nope`
+    installed, registered, heartbeated, was leased out and was never reached. The other
+    two fail VISIBLY at `connect()`, which is why they were the residual rather than
+    the defect.
+  - `--fleet-member` is NOT dialled and must not be judged as if it were. It is matched
+    against a peer's source address through `HostOfEndpoint`, which keeps an
+    unsplittable value WHOLE on purpose — a bare host is a legitimate spelling for a
+    peer whose port nobody recorded — so `worker-01` is legal there and refusing it
+    would break the documented setup and what discovery produces. No check can tell a
+    hostname from a typo of one.
+  - What IS refusable there is an EMPTY element, and it is the row worth having:
+    `--fleet-member=` appends `""`, which matches no peer any kernel reports, while
+    making the list NON-empty — so `HasMembershipPolicy` answers yes, the "a scheduler
+    with no membership policy" rule does not fire, and the node starts, serves, and
+    admits nobody but its own machine. #208's silent shape reached through another flag.
+  - **Shape and presence are different rules.** `--scheduler` is REQUIRED, by a rule of
+    its own; the shape row is "parses when GIVEN", exactly as the surface loop is. A
+    shape row that also demanded presence would answer "is not an address to dial" for
+    a flag nobody typed, which describes the wrong problem.
+  - `--bind` is deliberately in neither table. Its value is a HOST with `--port` beside
+    it, and whether a host is usable is answerable only by binding it.
+  - The rows carry a PREDICATE rather than a member pointer, because they are not one
+    shape: two are `std::string` and one is a repeatable list, and a table that could
+    hold only scalars would have left the list to a hand-written check beside it —
+    which is the fifth-place-the-map-lives failure #288 records, one flag earlier.
+  - A test asserting only "refused" passes whichever rule fired. Assert WHICH: the
+    membership row's own case had a `--scheduler=6675` fixture expecting NO refusal,
+    and its comment already said the right answer was a refusal about the value's
+    shape. That expectation MOVED rather than loosened when the row landed.
 
   **A host somebody did not write is not a host they meant.** All four rows refuse an
   empty one, and it is worth knowing why that is not fussiness: an empty BIND host
@@ -925,13 +959,3 @@ boot, silently, because a registration replays its command line forever. So:
   file, appending a `storage_path:` the worker does not have. On those platforms the
   worker is configured by `--install-service --config=<path>`.
 
-- **[#968](https://github.com/LASTRADA-Software/fastcached/issues/968)** — the rule
-  above covers the addresses this node OPENS. The ones it dials — `--advertise`,
-  `--scheduler`, `--upstream`, `--fleet-member` — are never checked for shape at all.
-  `--advertise` was the costly one -- nothing parsed it, so `--advertise=nope` installed,
-  registered, heartbeated, was leased out and was never reached -- and it is CLOSED
-  (#208): `ParseDialEndpoint` judges it in `StartupPolicyRejection`, ordered after the
-  wildcard row so the more specific refusal keeps its own message. The rest fail
-  VISIBLY, at `connect()`, which is why they are the residual rather than the defect. Deciding it needs
-  a grammar per flag (`--scheduler` is a host and a port; `--upstream` may be empty;
-  `--fleet-member` is a list of hosts with optional ports) and words other than "the surface it configures".
