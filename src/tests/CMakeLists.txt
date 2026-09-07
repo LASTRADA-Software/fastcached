@@ -3870,3 +3870,27 @@ set_tests_properties("gh-listing-seam-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# A pull request whose COMMITS name a ticket its BODY does not would merge and
+# leave that ticket open (#974).
+#
+# Only the SELF-TEST is registered, and only the decision is tested. The live half
+# needs the GitHub API and a pull request number, neither of which a build has --
+# the same split `rulebook-open-work` makes, and for the same reason: a check that
+# cannot reach its subject must report that as its own outcome rather than as a
+# pass, and in ctest the honest outcome would be a skip on every run. So the live
+# arm is a workflow step, where the number and the token exist, and the DECISION is
+# a pure function over (body, commits) driven here against staged records.
+#
+# Eight cases, both directions, and the batch case is the one that matters: a body
+# naming one of two tickets must REFUSE, because that is #959 exactly -- it closed
+# #826 and left #866 open, which is the shape a count cannot see.
+add_test(
+    NAME "pr-closing-keywords"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-pr-closing-keywords.sh" --self-test
+)
+set_tests_properties("pr-closing-keywords" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
