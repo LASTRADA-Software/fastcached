@@ -3519,3 +3519,59 @@ TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][fre
     INFO("file after session 1: " << afterFirst << ", after session 2: " << afterSecond);
     CHECK(afterSecond < afterFirst * 3 / 2);
 }
+
+TEST_CASE("A reopened store's bytesUsed counts what this session TOUCHED, not what is on disk",
+          "[cowstorage][bytesused][capacity]")
+{
+    // The sibling of "A reopened store's index reports what has been TOUCHED", and the
+    // fact that decides how #1006 can be fixed rather than a preference about it.
+    //
+    // `_bytesUsed` is maintained by `TouchOrInsert`, which adds `valueSize` for any key
+    // not in the MIRROR -- including one already on disk. So it is not "bytes in the
+    // store", and the obvious fix for #1006 (seed it at `Open` from a durable total)
+    // would DOUBLE-COUNT: every warm read would add bytes that were already counted.
+    //
+    // Measured, 8 objects of 1000 bytes: 8000 in session one, 0 at reopen, and 8000
+    // again after reading all eight back -- so a seeded 8000 becomes 16000, and
+    // `EvictToFit` evicts a store twice the size it believes.
+    //
+    // Pinning it because the ticket was filed on the opposite assumption and a reader
+    // who does not measure will make the same one.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    constexpr int Objects = 8;
+    constexpr std::size_t ValueLen = 1000;
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        for (auto const i: std::views::iota(0, Objects))
+            REQUIRE(
+                (*first)
+                    ->Set(std::format("k-{:02}", i), MakeBytes(std::string(ValueLen, 'x')), 0, FastCache::TimePoint::max())
+                    .has_value());
+        // Not vacuous: the field really does track the writes before the close.
+        REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
+    }
+
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+
+    // Zero, while every one of the objects is still on disk -- which the reads below
+    // prove. This is the half that makes `--cache-disk` unenforced after a restart.
+    CHECK((*second)->Snapshot().bytesUsed == 0);
+
+    FastCache::ManualClock clock;
+    for (auto const i: std::views::iota(0, Objects))
+    {
+        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.Now());
+        REQUIRE(got.has_value());
+        REQUIRE(got->found);
+    }
+
+    // **The assertion that constrains the fix.** Reading them back RE-ADDS their bytes,
+    // so the count is a function of this session's working set. A durable total seeded
+    // at `Open` would be added to, not replaced by, exactly these bytes.
+    CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+}
