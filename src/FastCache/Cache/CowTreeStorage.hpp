@@ -652,6 +652,31 @@ class CowTreeStorage final: public IStorage
     /// Evict from the LRU tail until bytesUsed <= maxBytes (best effort).
     void EvictToFit();
 
+    /// Erase one bounded slice of entries the mirror does not hold, and report whether
+    /// anything went.
+    ///
+    /// `_lru` is populated by `TouchOrInsert` alone, which no `Open` path calls, so a
+    /// reopened store's mirror holds exactly what this session has touched. Everything
+    /// else is COLD, and cold is not a tie-break: an entry absent from the mirror has
+    /// not been read or written since startup, so it is strictly less recently used
+    /// than anything in `_lru`. Evicting it first is the LRU answer, not a compromise
+    /// forced by the mirror's reach.
+    ///
+    /// One forward pass suffices and the walk never restarts. A cold entry cannot be
+    /// created -- every store goes through `TouchOrInsert`, so anything written after
+    /// startup is mirrored by construction -- which makes the cold set monotonically
+    /// shrinking and `_coldExhausted` permanent for the session.
+    ///
+    /// @return true when at least one entry was erased.
+    bool EvictColdSlice();
+
+    /// How many keys one refill walk collects before it stops.
+    ///
+    /// Bounded for the reason the migration slices are: the walk pins a read snapshot
+    /// and must not overlap a commit, so the keys are gathered first and erased after
+    /// the walk has ended.
+    static constexpr std::size_t ColdVictimSliceKeys = 256;
+
     /// Where reclaims are reported, or nullptr when nobody routed a log here.
     IReclaimLog* _reclaim { nullptr };
 
@@ -740,6 +765,13 @@ class CowTreeStorage final: public IStorage
     /// from the meta and pushed back to the tree whenever they change.
     std::uint64_t _storeBytes { 0 };
     std::uint64_t _storeKeyBytes { 0 };
+    /// How far the cold-victim walk has read, empty until it has read anything. In
+    /// memory only: a session that restarts re-derives it, and the walk it drives is
+    /// the thing that makes a restart correct in the first place.
+    std::vector<std::byte> _coldCursor;
+    /// Set once the forward pass has reached the end of the tree. Permanent for the
+    /// session -- see `EvictColdSlice` for why the cold set cannot grow.
+    bool _coldExhausted { false };
     std::uint64_t _liveGeneration { 1 };
     TimePoint _flushEffectiveAt { TimePoint::min() };
     CasToken _nextCas { 1 };

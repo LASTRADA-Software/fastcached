@@ -318,19 +318,38 @@ describes stops at the first commit that reclaims a page.
 Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
 
-## Open work
+## What a reopened store can name
 
-- **[#1012](https://github.com/LASTRADA-Software/fastcached/issues/1012)** — eviction
-  can only name victims the MIRROR holds, so a restarted store that is over its bound
-  now knows it and can still shrink nothing until traffic touches entries back in.
-  `EvictToFit` compares `_storeBytes` -- which #1006 made truthful at `Open` -- against
-  `maxBytes`, but iterates `_lru`, which `TouchOrInsert` populates and `Open` never
-  does.
+**The LRU mirror holds what this SESSION touched, never what is on disk.** `_lru` and
+`_index` are populated by `TouchOrInsert` alone, which every read and write verb calls
+and no `Open` path does. So a reopened store's mirror starts empty and fills only with
+traffic, while the tree holds everything.
 
-  The last live instance of a family this tree has hit four times: **state that should
-  describe the store is populated only by touch, never at `Open`.** #175 (the index cost
-  for capacity), #990 (the free list) and #1006 (the byte total) are all closed, and each
-  was fixed by finding a durable SOURCE for a number. This one is not that shape:
-  eviction needs a VICTIM to name rather than a figure, and the mirror is the only thing
-  that names victims -- so the fix is a tree walk or a seeded mirror, and the second
-  reopens the RAM question #175 exists about.
+That is the fourth instance of one family, and the first three are closed: state that
+should describe the STORE was populated only by touch — the index cost capacity reserves
+(#175), the free list (#990), the byte total (#1006). Each of those was fixed by finding
+a durable SOURCE for a number. This one could not be: eviction needs a VICTIM to name,
+not a figure.
+
+**So eviction reaches the cold set first, and that is LRU rather than a workaround.** An
+entry the mirror does not hold has not been read or written since startup, so it is
+strictly less recently used than anything in `_lru`. Taking it first is what the policy
+means here.
+
+Getting this wrong is not a missing optimisation, and the measurement is the reason to
+believe it (#1012, `ctest -R cowstorage`, the neutered-fix run): a store reopened over
+its bound, with ONE key read back, evicted **that key** — the mirror's only member, and
+the warmest thing in the store — and then stopped, the mirror being empty again. The
+bound stayed violated at 7000 against 3000. One cause, two failures, and the second is
+invisible to any test that only asserts the total.
+
+The walk that finds cold entries is bounded per call, resumes from a cursor, and gathers
+keys before erasing any of them, because **a walk must not overlap a commit** (above).
+It never restarts: a cold entry cannot be created — anything written after startup goes
+through `TouchOrInsert` and is mirrored by construction — so the cold set only shrinks
+and one forward pass is complete. A failed walk is not an exhausted one.
+
+`evictedUnfetched` is deliberately NOT incremented for a cold victim. That bit lives on
+the mirror node, which a cold entry has none of, so whether it was ever read is not
+something the process knows — and an unknown recorded as a "no" is a claim the data does
+not support. It undercounts, which is the honest direction.
