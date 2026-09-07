@@ -146,6 +146,26 @@ Shape() {
         && Ok "$Decider reads the required-context list from check-merge-queue-contexts.sh" \
         || Fail "$Decider does not read \`scripts/check-merge-queue-contexts.sh\`; a second copy of the required-context list is not a cross-check, it is a second thing to be wrong"
 
+    # The two halves of #774's push report, both of which are wiring the decision
+    # script cannot check about itself.
+    #
+    # The BRANCH, because the decider refuses a push run without one rather than
+    # assuming master -- so a workflow that stopped passing it would turn every
+    # master push into a hard failure of this notifier. That is the safe direction
+    # and it is still a break, and nothing else would say which.
+    grep -q 'HEAD_BRANCH' <<< "$(NonComment "$Workflow")" \
+        && Ok "it passes the head branch, so a push to a scratch branch is not reported as master" \
+        || Fail "$Workflow does not pass \`HEAD_BRANCH\`; $Decider refuses a push run with no branch rather than guessing, so every master push would fail this notifier"
+
+    # And the de-duplication mode, which is the whole of #774's objection to
+    # reporting pushes: a context that goes on failing on every subsequent push
+    # would otherwise comment on one issue indefinitely and say nothing new. A
+    # push report is a TRANSITION; a merge-group report is an EVENT, so it keeps
+    # commenting and must NOT set this.
+    grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW' <<< "$(NonComment "$Workflow")" \
+        && Ok "a push report is opened once and never updated" \
+        || Fail "$Workflow never sets \`FASTCACHED_REPORT_ONLY_IF_NEW\`; a context failing on every push to master would then comment on one report forever, which is #774's own objection to reporting pushes at all"
+
     # And it must not be a job in build.yml, for the reason check-release-gate
     # exists: a notifier job is skipped on a tag push, always, and would skip the
     # release with it.
@@ -242,17 +262,17 @@ REQ
     # nothing.
     Decide() {
         FASTCACHED_REQUIRED_CONTEXTS_FILE="$required" \
-            bash "$Decider" "$1" "https://example.invalid/run" "$2"
+            bash "$Decider" "$1" "https://example.invalid/run" "$2" ${3+"$3"} ${4+"$4"}
     }
 
     Case() {
         # $1 = description, $2 = want-rows|want-none|want-refuse,
         # $3 = event, $4 = record file, $5 = expected substring (optional)
-        local what="$1" want="$2" event="$3" record="$4" expect="${5:-}"
+        local what="$1" want="$2" event="$3" record="$4" expect="${5:-}" branch="${6:-}" conclusion="${7:-}"
         cases=$((cases + 1))
         local out err got=0
         err="${scratch}/err.txt"
-        out="$(Decide "$event" "$record" 2>"$err")" || got=$?
+        out="$(Decide "$event" "$record" ${branch:+"$branch"} ${conclusion:+"$conclusion"} 2>"$err")" || got=$?
 
         local rows=0
         [[ -n "$out" ]] && rows="$(printf '%s' "$out" | grep -c '' || true)"
@@ -292,11 +312,67 @@ REQ
         want-rows merge_group "${scratch}/r-leg.tsv" "Windows-cl-debug"
 
     # --- everything else -----------------------------------------------------
-    Case "a pull-request run is not a defect and not a silence: it says so" \
-        want-none pull_request "${scratch}/r-pkg.tsv" "not merge_group"
+    # **The expectation MOVED rather than loosened.** It read "not merge_group",
+    # which was the whole of the old decision; `pull_request` is now a row of
+    # `EventPolicy` saying `none`, so what has to be asserted is that the decision
+    # is DELIBERATE and named, not merely that nothing came out. A case checking
+    # only `want-none` would pass on a build that had silently dropped the event
+    # table altogether.
+    Case "a pull-request run reports nothing DELIBERATELY, and says why" \
+        want-none pull_request "${scratch}/r-pkg.tsv" "where somebody is already looking"
+
+    Case "an event with no row at all is answered 'not applicable', not 'nothing wrong'" \
+        want-none schedule "${scratch}/r-pkg.tsv" "not in this script's event table"
+
+    # --- a push to master: #774 ---------------------------------------------
+    #
+    # The SAME record that is reported under `merge_group` because the context is
+    # unrequired, and a record whose failure IS required -- which a queue does not
+    # report and a push must. Both, because one alone cannot tell "the push policy
+    # works" from "the push policy is the queue policy under another name".
+    Case "a push to master reports an unrequired failure, exactly as a queue does" \
+        want-rows push "${scratch}/r-pkg.tsv" "Package (macOS .pkg)" master
+
+    Case "a push to master ALSO reports a REQUIRED failure, which a queue would not" \
+        want-rows push "${scratch}/r-req.tsv" "macOS-clang-release" master
+
+    Case "a push to a scratch branch is somebody's own red, and is not reported" \
+        want-none push "${scratch}/r-pkg.tsv" "belongs to whoever pushed it" fix-ci
+
+    # The guess this refuses is the dangerous one: defaulting an absent branch to
+    # master would report every `fix-ci` push, which is the branch CI experiments
+    # are EXPECTED to fail on -- a notifier that cries wolf is one that gets muted.
+    Case "a push run with no branch is REFUSED rather than assumed to be master" \
+        want-refuse push "${scratch}/r-pkg.tsv" "refusing to guess"
+
 
     CapturedRun "" > "${scratch}/r-green.tsv"
     Case "an all-green run reports nothing" want-none merge_group "${scratch}/r-green.tsv"
+    # Here rather than beside the other push cases, because the green record is
+    # created on the line above: the first placement referenced it earlier in the
+    # file and the decider refused a MISSING record -- correctly, and loudly, which
+    # is the behaviour its own "a listing that could not be taken is not a listing
+    # of nothing" rule exists for.
+    Case "an all-green push to master reports nothing" \
+        want-none push "${scratch}/r-green.tsv" "nothing failed" master
+
+    # A run nobody let FINISH is not a run that found nothing. Its jobs are all
+    # `cancelled`, which is `inert`, so the positive assertion below would refuse
+    # it by name -- right about the record and wrong about the tree. Cancelling a
+    # superseded run is ordinary, and this edge exists only because the `push`
+    # policy reads those records at all, so it is closed with the change that
+    # opened it rather than found later as a notifier going red on master whenever
+    # somebody cancels something.
+    printf 'Code coverage\tcompleted\tcancelled\thttps://example.invalid/job\n' > "${scratch}/r-cancelled.tsv"
+    printf 'clang-tidy\tcompleted\tcancelled\thttps://example.invalid/job\n' >> "${scratch}/r-cancelled.tsv"
+    Case "a CANCELLED run reports nothing rather than being refused" \
+        want-none push "${scratch}/r-cancelled.tsv" "nobody let finish" master cancelled
+
+    # And the control: the same record WITHOUT the conclusion is refused, which is
+    # what makes the arm above a statement about the run rather than about the
+    # record. Without this, an arm that ignored its argument would pass.
+    Case "the same record with no run conclusion is still refused" \
+        want-refuse push "${scratch}/r-cancelled.tsv" "run that did nothing" master
 
     : > "${scratch}/r-empty.tsv"
     Case "an EMPTY record is refused: zero rows is the absence of a verdict" \
@@ -456,8 +532,21 @@ STUB
                 always)    echo "    if: \${{ always() }}" ;;
             esac
             echo "    steps:"
-            [[ "$steps" != "no-decider" ]]  && echo "      - run: scripts/ci-merge-group-report.sh x y z"
-            [[ "$steps" != "no-reporter" ]] && echo "      - run: scripts/ci-report-issue.sh t b"
+            # #774's two wiring facts. The branch is what lets a push run be told
+            # from a scratch one, and the only-if-new mode is what stops a context
+            # failing on every push from commenting on one report forever. Staged
+            # here rather than asserted only against the real file, so the fixture
+            # models a CORRECT workflow rather than the one that happens to exist.
+            [[ "$steps" != "no-decider" ]]  && {
+                echo "      - env:"
+                echo "          HEAD_BRANCH: \${{ github.event.workflow_run.head_branch }}"
+                echo "        run: scripts/ci-merge-group-report.sh x y z \"\$HEAD_BRANCH\""
+            }
+            [[ "$steps" != "no-reporter" ]] && {
+                echo "      - run: |"
+                echo "          [[ \"\$EVENT\" == push ]] && export FASTCACHED_REPORT_ONLY_IF_NEW=1"
+                echo "          scripts/ci-report-issue.sh t b"
+            }
         } > "$out"
         # Explicit, and load-bearing under `set -e`: the group above ends in a
         # `[[ ... ]] && echo` whose status is 1 whenever the condition is false,

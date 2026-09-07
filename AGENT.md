@@ -1471,7 +1471,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   copy, so the DECISION is a script driven against captured real records and the wiring is asserted statically:
   `ctest -R merge-group-report`, `-R merge-group-report-selftest`. Its trigger carries **no `branches:` filter**
   on purpose — that is what makes the one claim nobody could measure (that `workflow_run` fires for a
-  `merge_group` run at all) show itself on the first ordinary run instead of failing silently.
+  `merge_group` run at all) show itself on the first ordinary run instead of failing silently. The SECOND door is a push
+  to master, which needed no new trigger (#774): `workflow_run` already fired for those
+  runs, so the fix is a row of `EventPolicy` — `merge_group` reports unrequired
+  failures, `push` to master reports ALL of them, `pull_request` reports NONE and says
+  why. The release gate did not change and should not; `check-release-gate` already
+  stops a red packaging job shipping. A push report is a TRANSITION, opened once
+  (`FASTCACHED_REPORT_ONLY_IF_NEW`), or a context failing on every push comments
+  forever; and a push with no branch is REFUSED, never assumed master, because `fix-ci`
+  is expected to fail.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
   `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
   the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict
@@ -1756,7 +1764,13 @@ and what they may assume.
 - Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
-  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE.
+  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE. **And an
+  INCONCLUSIVE verdict is a place to ask somebody ELSE** (#965): a `launchctl kickstart`
+  timeout with almost no CPU cannot separate a busy host from a stall, and only launchd
+  knows whether the job ever left pending — so the fixture asks `launchctl print` on the
+  FAILURE PATH, every command `|| true`, because a diagnostic on an already-failed case
+  must explain the verdict and never change it. The next move is a different instrument,
+  not a better reading of the same one.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same window is the same
   number divided by the same 300: 3.4s spread over five minutes and 3.4s burned in the first ten before a wedge are
   opposite diagnoses. Draw the verdict from a RECENT window and print the totals as evidence only. No magnitude bar

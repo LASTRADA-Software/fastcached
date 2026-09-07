@@ -78,6 +78,37 @@ Each of these is a scar, not a preference.
 
 - **Nobody touches `D:/fastcached`.** It is the main checkout and other sessions hold
   uncommitted work in it.
+- **A closing keyword in the PR BODY is what closes the issue; a trailer on a commit is
+  not.** Both are needed and they do different jobs, so this replaces neither half:
+
+  - the **commit** trailer, exactly one per ticket, is what makes a ticket findable and
+    EXCISABLE on a batch branch. `git log --grep='^\(Closes\|Fixes\) #'` re-derives the
+    ticket boundaries after a rebase, which is the only reliable way once `/absorb` has
+    moved every SHA.
+  - the **body** keyword is what the merge actually acts on.
+
+  Measured across one day's merges. #955 (#893), #953 (#901) and #961 (#208) carried the
+  keyword in BOTH and all three closed; #959 carried it only in its commits and left
+  #826 and #866 open. Every close event on the ones that worked has **no `commit_id`**
+  in `gh api .../timeline`, which is what a body-keyword close looks like — nothing in
+  the sample was closed by a commit trailer at all.
+
+  The cost is not cosmetic. #826 was fully delivered, merged, and sat open for a day
+  inside the `type/bug` count, indistinguishable from work nobody had started. A batch
+  of eight does this eight times at once, and the next session either re-does one or
+  spends its triage finding out it need not.
+  [#974](https://github.com/LASTRADA-Software/fastcached/issues/974); enforced by
+  `ctest -R pr-closing-keywords`, which refuses a pull request whose commits name a
+  ticket its body does not.
+
+  **And the body keyword becomes part of an EXCISION.** Dropping a ticket from a batch
+  is `rebase --onto`, which removes its commits and leaves the body still promising to
+  close it — which closes something nobody delivered. That is strictly worse than a
+  ticket staying open: an open one gets re-triaged, a wrongly closed one does not. So
+  Step 8 gains a line: **edit the ticket out of the body as well as off the branch.**
+  The check names a body keyword no commit backs on every run and does not refuse it —
+  the ordinary case is a change with no trailer at all, so a refusal would be wrong and
+  silence would hide the dangerous one.
 - **`Closes #A and #B` closes only `#A`.** GitHub needs the keyword before *each*
   number, so `and #B` parses as a plain reference and that ticket stays open after its
   fix has merged. Write `Closes #A, closes #B`.

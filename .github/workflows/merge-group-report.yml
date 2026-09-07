@@ -130,6 +130,16 @@ jobs:
         env:
           EVENT: ${{ github.event.workflow_run.event }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          # The branch, so a `push` run can be told from a scratch one. The script
+          # REFUSES a push with no branch rather than assuming master: the `push:`
+          # filter in `build.yml` is `[master, fix-ci]`, and `fix-ci` is the branch
+          # CI experiments are expected to fail on.
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          # The RUN's own conclusion. A cancelled run is a run that did nothing,
+          # and the decision's "nothing failed and nothing succeeded either"
+          # assertion would refuse it -- right about the record, wrong about the
+          # tree. Cancelling a superseded run is ordinary.
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
           # `bash <path>` and never a bare path. The mode is 755, so the bare
@@ -138,6 +148,7 @@ jobs:
           # `build.yml` shipped bare and took a REQUIRED context red with exit
           # 126 (#723, and #720 for the mode across fourteen scripts).
           bash scripts/ci-merge-group-report.sh "$EVENT" "$RUN_URL" "$RUNNER_TEMP/jobs.tsv" \
+            "$HEAD_BRANCH" "$RUN_CONCLUSION" \
             > "$RUNNER_TEMP/reportable.tsv"
           echo "reportable=$(grep -c '' "$RUNNER_TEMP/reportable.tsv")" | tee -a "$GITHUB_OUTPUT"
 
@@ -158,12 +169,55 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          # A push report is a TRANSITION, a queue report is an EVENT. A context
+          # that fails on every subsequent push to master would otherwise comment
+          # on one issue indefinitely and say nothing new -- which is #774's own
+          # objection to reporting pushes at all. A merge-group failure repeating
+          # IS a new fact, so it keeps commenting.
+          if [[ "$EVENT" == "push" ]]; then
+            export FASTCACHED_REPORT_ONLY_IF_NEW=1
+          fi
           while IFS=$'\t' read -r context conclusion jobUrl; do
             [[ -n "$context" ]] || continue
             # The queue branch is `gh-readonly-queue/master/pr-<n>-<sha>` and is
             # printed RAW rather than parsed for the pull request number: a
             # reader can see the number in it, and a parser that stops matching
             # would print a confident wrong link instead of an honest string.
+            # Two events, two bodies and two titles, because they are two findings.
+            # Rendering a push as "the merge queue did not gate on it" would be a
+            # confident wrong sentence about where the failure happened -- and the
+            # titles differ so the de-duplication does too: a queue report and a
+            # master report about one context are separate facts.
+            if [[ "$EVENT" == "push" ]]; then
+              cat > "$RUNNER_TEMP/body.md" <<BODY
+          \`${context}\` concluded **${conclusion}** on a push to \`${HEAD_BRANCH}\`, and nobody was told.
+
+          - job: ${jobUrl}
+          - run: ${RUN_URL}
+          - commit: \`${HEAD_SHA}\`
+
+          Master is red on this context right now. There is no pull request page showing it
+          and no queue to eject anything, so the only trace is a run in the Actions tab that
+          nothing points at — which is how two packaging jobs stayed red on master until a
+          human went looking (#774).
+
+          **This is not a gating change and does not need one.** \`check-release-gate\`
+          already asserts every job in \`build.yml\` appears in \`release.needs\`, so a red
+          packaging job cannot ship a release; it would fail again on the tag. What was
+          missing is being told weeks earlier, rather than at the worst possible moment.
+
+          Triage is: decide whether this is an intermittent or a real break, fix or close it.
+          **This report is opened once and never updated** — a context that keeps failing on
+          every push would otherwise comment here forever and say nothing new. So if this is
+          still open, the finding still stands as written; check master for what it is doing
+          now.
+          BODY
+              bash scripts/ci-report-issue.sh \
+                "master: \"${context}\" failed and nobody was told" \
+                "$RUNNER_TEMP/body.md" \
+                type/bug area/build status/needs-triage
+              continue
+            fi
             cat > "$RUNNER_TEMP/body.md" <<BODY
           \`${context}\` concluded **${conclusion}** in a merge-group run, and nothing gated on it.
 

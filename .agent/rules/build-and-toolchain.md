@@ -3466,6 +3466,84 @@ turn those jobs into gates by the back door.
   the analysis; the enforcement here is that **the count is not written down**, so there
   is nothing for a scan to check.
 
+**The SECOND door is a push to master, and it needed no new trigger**
+([#774](https://github.com/LASTRADA-Software/fastcached/issues/774)). A job failing
+there reaches nobody by the same mechanism: nothing gates a push, no pull request page
+shows it, and the only trace is a run in the Actions tab that nothing points at — two
+packaging jobs stayed red on master `dd4633b2` until a human went looking.
+
+The `workflow_run` trigger was already unfiltered and already fired for those runs — the
+decision script had always narrated *"event is 'push', not merge_group"* for them — so
+the change is a ROW of `EventPolicy` and nothing else:
+
+<!-- table-total: none -->
+| event | policy | why |
+|---|---|---|
+| `merge_group` | report the **unrequired** failures | the required ones ejected the pull request and named the check |
+| `push` to `master` | report **all** of them | nothing gates a push, so there is no already-surfaced set to subtract |
+| `pull_request` | report **none** | the failure is on the pull request page, where somebody is already looking |
+
+- `pull_request` is a ROW rather than an omission, so the decision to stay quiet is
+  visible. A report per red pull-request job is noise, and noise is how a notifier gets
+  muted.
+- **The release gate did not change and should not.** `check-release-gate` already
+  asserts every job in `build.yml` appears in `release.needs`, so a red packaging job
+  cannot ship a release — it would fail again on the tag. What was missing is being
+  TOLD, weeks before the tag rather than at it.
+- **A push report is a TRANSITION; a queue report is an EVENT.**
+  `FASTCACHED_REPORT_ONLY_IF_NEW` answers the ticket's own objection to reporting
+  pushes: a context failing on every subsequent push would otherwise comment on one
+  issue indefinitely and say nothing new. Per CALLER, never a default on
+  `ci-report-issue.sh`, because the two callers genuinely differ and no default is right
+  for both.
+- **A push with no branch is REFUSED, never assumed to be master.** `build.yml`'s
+  `push:` filter is `[master, fix-ci]`, and `fix-ci` is the branch CI experiments are
+  expected to fail on. Defaulting an absent branch would report every one of them.
+- Both of those are wiring the decision script cannot check about itself, so both are
+  static assertions in `check-merge-group-report.sh` — and both were watched refusing by
+  deleting the token from the real workflow. The policy itself is mutation-tested:
+  giving `push` the queue's policy fails exactly the two cases written for it, and
+  dropping the branch guard fails exactly the one.
+- **A run nobody let FINISH is not a run that found nothing**, and that edge belongs to
+  this change rather than to whoever meets it. Every job of a cancelled run concludes
+  `cancelled`, which is `inert`, so the "nothing failed and nothing succeeded either"
+  assertion refuses it — right about the RECORD and wrong about the tree, and cancelling
+  a superseded run is ordinary. Before the `push` policy nothing read those records at
+  all, so it could not fire; it is closed with the change that opened it. The RUN's own
+  conclusion is the right question, not "were all its jobs cancelled": a run cancelled
+  after some jobs finished carries a mix, and reading the mix reports the failures of a
+  run nobody let finish.
+
+**A Windows leg that cannot start processes reports six red smoke tests, not a
+runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
+Observed on `Windows-cl-debug`: six failures, all exit `0xc0000142`
+(`STATUS_DLL_INIT_FAILED`), and they were exactly the six tests that spawn a process
+while every in-process case in the same binary passed.
+
+No defect in the tree selects for "spawns a process" — a broken link, a missing
+runtime or a bad DLL would take the in-process cases with it. But nothing said so, and
+six red smoke tests read as a regression. That matters most on this leg specifically:
+it is the one run for `_ITERATOR_DEBUG_LEVEL=2`, so its smoke tests are where a
+Debug-runtime defect surfaces, and a leg that intermittently reports nothing about the
+property it exists for is worse than one that is simply red.
+
+So `ctest` is BRACKETED by a spawn probe, and the PAIR is what carries the meaning:
+
+<!-- table-total: none -->
+| before | after | what it means |
+|---|---|---|
+| red | — | the runner was broken on arrival; nothing after it is about the tree |
+| green | green | not this shape; read the failures as being about the tree |
+| green | red | the runner degraded DURING the run — #966 exactly |
+
+- The probe is `cmd /c exit 0`: it starts a process and does nothing else, so it
+  cannot redden a green run for any reason but the one it names.
+- The "after" half runs only on a red and is `continue-on-error`: a classifier on an
+  already-failing job must be able to explain the verdict and never to change it.
+- It has **three** outcomes, not two — broken, working, and *could not conclude* —
+  because a probe that can only answer the two you expect will answer one of them
+  whatever it sees. And it says out loud that it is a reading taken after the fact.
+
 ### Doc-subject checks were skipped on doc-only changes (#687)
 
 `ci-scope.sh` answers `code=false` for a `docs/**`, `.agent/**` or `*.md` change
