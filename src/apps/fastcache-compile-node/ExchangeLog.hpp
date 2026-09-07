@@ -142,9 +142,16 @@ static_assert(EveryLogLevelIsExplained(), "a level chosen without a reason canno
 /// @return The level for that verb.
 [[nodiscard]] constexpr LogLevel LogLevelForOp(std::uint8_t opRaw) noexcept
 {
-    auto const* const it = std::ranges::find_if(
-        ExchangeLogTable, [&](VerbLogRow const& row) { return static_cast<std::uint8_t>(row.code) == opRaw; });
-    return it == ExchangeLogTable.end() ? LogLevel::Debug : it->level;
+    // A loop rather than `std::ranges::find_if`. `std::array`'s iterator is a raw
+    // POINTER on libstdc++ and a class type on MSVC's STL, so the spelling that
+    // satisfies `readability-qualified-auto` on the one fails to COMPILE on the other
+    // -- `error C3535: cannot deduce type for 'const auto *const '`. There is no
+    // portable `auto` form here, and naming the iterator type is worse than not
+    // holding one.
+    for (auto const& row: ExchangeLogTable)
+        if (static_cast<std::uint8_t>(row.code) == opRaw)
+            return row.level;
+    return LogLevel::Debug;
 }
 
 /// The verb's stable name, or a hex spelling when this build has no row for it.
@@ -156,10 +163,10 @@ static_assert(EveryLogLevelIsExplained(), "a level chosen without a reason canno
 /// @return A name suitable for a log line.
 [[nodiscard]] inline std::string ExchangeVerbName(std::uint8_t opRaw)
 {
-    auto const* const it = std::ranges::find_if(CompileCacheWire::OpTable, [&](CompileCacheWire::OpDescriptor const& row) {
-        return static_cast<std::uint8_t>(row.code) == opRaw;
-    });
-    return it == CompileCacheWire::OpTable.end() ? std::format("opcode-0x{:02x}", opRaw) : std::string { it->name };
+    for (auto const& row: CompileCacheWire::OpTable)
+        if (static_cast<std::uint8_t>(row.code) == opRaw)
+            return std::string { row.name };
+    return std::format("opcode-0x{:02x}", opRaw);
 }
 
 /// One row of the reply-status table: the wire byte and its name.
@@ -191,9 +198,10 @@ inline constexpr std::array StatusNameTable {
 /// @return A name suitable for a log line.
 [[nodiscard]] inline std::string ExchangeStatusName(std::uint8_t statusRaw)
 {
-    auto const* const it = std::ranges::find_if(
-        StatusNameTable, [&](StatusNameRow const& row) { return static_cast<std::uint8_t>(row.code) == statusRaw; });
-    return it == StatusNameTable.end() ? std::format("status-0x{:02x}", statusRaw) : std::string { it->name };
+    for (auto const& row: StatusNameTable)
+        if (static_cast<std::uint8_t>(row.code) == statusRaw)
+            return std::string { row.name };
+    return std::format("status-0x{:02x}", statusRaw);
 }
 
 /// One exchange, rendered.
