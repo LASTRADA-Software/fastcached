@@ -1456,7 +1456,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   copy, so the DECISION is a script driven against captured real records and the wiring is asserted statically:
   `ctest -R merge-group-report`, `-R merge-group-report-selftest`. Its trigger carries **no `branches:` filter**
   on purpose — that is what makes the one claim nobody could measure (that `workflow_run` fires for a
-  `merge_group` run at all) show itself on the first ordinary run instead of failing silently.
+  `merge_group` run at all) show itself on the first ordinary run instead of failing silently. The SECOND door is a push
+  to master, which needed no new trigger (#774): `workflow_run` already fired for those
+  runs, so the fix is a row of `EventPolicy` — `merge_group` reports unrequired
+  failures, `push` to master reports ALL of them, `pull_request` reports NONE and says
+  why. The release gate did not change and should not; `check-release-gate` already
+  stops a red packaging job shipping. A push report is a TRANSITION, opened once
+  (`FASTCACHED_REPORT_ONLY_IF_NEW`), or a context failing on every push comments
+  forever; and a push with no branch is REFUSED, never assumed master, because `fix-ci`
+  is expected to fail.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
   `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
   the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict

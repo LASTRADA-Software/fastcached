@@ -3466,6 +3466,45 @@ turn those jobs into gates by the back door.
   the analysis; the enforcement here is that **the count is not written down**, so there
   is nothing for a scan to check.
 
+**The SECOND door is a push to master, and it needed no new trigger**
+([#774](https://github.com/LASTRADA-Software/fastcached/issues/774)). A job failing
+there reaches nobody by the same mechanism: nothing gates a push, no pull request page
+shows it, and the only trace is a run in the Actions tab that nothing points at — two
+packaging jobs stayed red on master `dd4633b2` until a human went looking.
+
+The `workflow_run` trigger was already unfiltered and already fired for those runs — the
+decision script had always narrated *"event is 'push', not merge_group"* for them — so
+the change is a ROW of `EventPolicy` and nothing else:
+
+<!-- table-total: none -->
+| event | policy | why |
+|---|---|---|
+| `merge_group` | report the **unrequired** failures | the required ones ejected the pull request and named the check |
+| `push` to `master` | report **all** of them | nothing gates a push, so there is no already-surfaced set to subtract |
+| `pull_request` | report **none** | the failure is on the pull request page, where somebody is already looking |
+
+- `pull_request` is a ROW rather than an omission, so the decision to stay quiet is
+  visible. A report per red pull-request job is noise, and noise is how a notifier gets
+  muted.
+- **The release gate did not change and should not.** `check-release-gate` already
+  asserts every job in `build.yml` appears in `release.needs`, so a red packaging job
+  cannot ship a release — it would fail again on the tag. What was missing is being
+  TOLD, weeks before the tag rather than at it.
+- **A push report is a TRANSITION; a queue report is an EVENT.**
+  `FASTCACHED_REPORT_ONLY_IF_NEW` answers the ticket's own objection to reporting
+  pushes: a context failing on every subsequent push would otherwise comment on one
+  issue indefinitely and say nothing new. Per CALLER, never a default on
+  `ci-report-issue.sh`, because the two callers genuinely differ and no default is right
+  for both.
+- **A push with no branch is REFUSED, never assumed to be master.** `build.yml`'s
+  `push:` filter is `[master, fix-ci]`, and `fix-ci` is the branch CI experiments are
+  expected to fail on. Defaulting an absent branch would report every one of them.
+- Both of those are wiring the decision script cannot check about itself, so both are
+  static assertions in `check-merge-group-report.sh` — and both were watched refusing by
+  deleting the token from the real workflow. The policy itself is mutation-tested:
+  giving `push` the queue's policy fails exactly the two cases written for it, and
+  dropping the branch guard fails exactly the one.
+
 ### Doc-subject checks were skipped on doc-only changes (#687)
 
 `ci-scope.sh` answers `code=false` for a `docs/**`, `.agent/**` or `*.md` change
