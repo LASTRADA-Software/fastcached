@@ -238,6 +238,26 @@ determinism rests on.
   to a developer — the correction was wrong for the same reason as the thing it was
   correcting. Nobody is outside this; the remedy is that the pattern travels with the
   figure, not that people count more carefully.
+
+- **A listing that came back AT its `--limit` is a real answer about a set that is not
+  the whole set** ([#724](https://github.com/LASTRADA-Software/fastcached/issues/724),
+  closed). Nothing about the rows distinguishes it: the cap reads as the total, and the
+  reading is wrong in the SMALLER and therefore unsuspicious direction.
+
+  Measured twice. `gh project item-list` truncating silently produced two wrong board
+  figures that were reported onward — 300 and 121-with-44-Todo against a real 356 and
+  147-with-52 — and `build.yml`'s clang-tidy notifier stops de-duplicating past 500 open
+  issues, at 161 today.
+
+  **Raising the limit is not the fix**: it moves the cliff and hides that there is one,
+  which is the timeout argument from the top of this file wearing a different number.
+  The fix is that a listing at its cap SAYS so, which is what `scripts/ci-report-issue.sh`
+  does and what `ctest -R gh-listing-seam` requires of every other caller — a `gh`
+  listing goes through that seam or carries a stated reason why it does not.
+
+  Where a question can be asked so that truncation is impossible, ask it that way
+  instead: the search API's `total_count` is a count of the whole set rather than a page
+  of it.
 - **A stated total beside a table is DERIVED from it, or it is a second claim.** A
   hand-maintained number describing a hand-maintained list is two sources of truth
   wearing one hat: editing the table does not update the number, nothing checked that it
@@ -4079,17 +4099,6 @@ Three rules fall out, each generalising past this change:
   the tree and rejected rather than skipped. The measurement and the alternatives it
   rules out are on the ticket, and the rule it enforces is the
   *neither-the-set-nor-its-count* bullet above.
-- **[#724](https://github.com/LASTRADA-Software/fastcached/issues/724)** — a `gh`
-  listing that came back AT its `--limit` is a real answer about a set that is not
-  the whole set, and nothing distinguishes it, so the cap reads as the total.
-  Measured twice: `gh project item-list` truncating silently produced two wrong
-  board figures reported onward (300 and 121-with-44-Todo against 356 and
-  147-with-52), both wrong in the smaller and therefore unsuspicious direction;
-  and `build.yml`'s clang-tidy notifier stops de-duplicating past 500 open issues,
-  at 161 today. `scripts/ci-report-issue.sh` is the only caller that currently
-  warns at the cap rather than vouching for a set it did not see. Raising a limit
-  moves the cliff and hides that there is one, which is the timeout argument from
-  the top of this file wearing a different number.
 - **[#717](https://github.com/LASTRADA-Software/fastcached/issues/717)** — the
   open-or-update-an-issue decision exists twice: `scripts/ci-report-issue.sh`,
   which `merge-group-report-selftest` drives against a stub `gh`, and the inline
