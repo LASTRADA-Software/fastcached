@@ -1538,6 +1538,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   have not read is worth nothing**, and it *felt* like corroboration. The ticket's premise
   ("the sweep reports clean") was false throughout, and seven consecutive tickets fell to
   premise checks that a count would have confirmed.
+- **A listing that came back AT its `--limit` is an answer about a set that is not the
+  whole set**, and nothing about the rows says so — the cap reads as the total, wrong in
+  the unsuspicious direction (#724). Measured: two board figures reported onward were
+  300 and 121 against a real 356 and 147. Raising the limit moves the cliff and hides
+  that there is one. `ctest -R gh-listing-seam` requires every `gh` listing to go
+  through `ci-report-issue.sh`, which warns at the cap, or to carry a stated reason. Ask
+  a question truncation cannot reach where one exists — the search API's `total_count`
+  counts the whole set rather than a page.
 - **A census states its PATTERN, not only its number.** Two independent audits of one file set differed by
   exactly one and neither had miscounted: `scripts/check-*.cmake` (the glob a ticket names) gives 20 / 18 /
   34 for cac9bda-all / cac9bda-excl-selftests / HEAD, while an unanchored `grep 'check-.*\.cmake$'` gives
