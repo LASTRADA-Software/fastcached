@@ -3602,3 +3602,56 @@ TEST_CASE("The store's byte total follows deletes and replaces, not just writes"
     REQUIRE((*store)->Delete("a", clock.Now()).has_value());
     CHECK((*store)->Snapshot().bytesUsed == 0);
 }
+
+TEST_CASE("A reopened store projects what its index WILL cost, not what it costs now", "[cowstorage][index][capacity]")
+{
+    // #175: a disk tier's key index is real RAM that no figure described, so a
+    // disk-only node reserved nothing and offered the fleet the whole machine.
+    //
+    // The trap is that `indexBytes` -- the obvious figure -- is EMPTY the instant a
+    // full store reopens, which is the state the ticket is about. This asserts the
+    // difference between the two, because a projection that merely equalled
+    // `indexBytes` would satisfy any test written about the warm case and reserve
+    // nothing on the restarted one.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    constexpr int Objects = 64;
+    std::size_t warmProjection = 0;
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        for (auto const i: std::views::iota(0, Objects))
+            REQUIRE(
+                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+        auto const warm = (*first)->Snapshot();
+        // Warm, the projection is at least the actual cost and slightly above it: the
+        // tree also holds the store's RESERVED records -- the format marker and the
+        // in-flight-conversion marker -- which `ItemCount()` counts and the mirror
+        // never holds. An upper bound is what a reservation wants, so counting them is
+        // right; asserting equality here was wrong and this case caught it.
+        CHECK(warm.indexBytes > 0);
+        CHECK(warm.indexBytesAtCapacity >= warm.indexBytes);
+        warmProjection = warm.indexBytesAtCapacity;
+    }
+
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+    auto const cold = (*second)->Snapshot();
+
+    // The mirror is empty -- pinned elsewhere, restated here because it is what makes
+    // the next assertion mean something.
+    CHECK(cold.indexBytes == 0);
+
+    // **The assertion.** The projection still knows what the index will cost, because
+    // it is computed from the store's durable item and key totals rather than from the
+    // mirror. Without it a restarted node reserves zero.
+    CHECK(cold.indexBytesAtCapacity > 0);
+
+    // And it is the SAME answer as when warm: the store did not change, so neither
+    // should the projection. Asserted against the warm reading rather than against a
+    // recomputed constant, so the case cannot drift with `IndexBytesFor`'s internals
+    // and cannot pass by agreeing with its own arithmetic.
+    CHECK(cold.indexBytesAtCapacity == warmProjection);
+}

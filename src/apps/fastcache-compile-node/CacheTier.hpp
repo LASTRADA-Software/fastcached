@@ -159,6 +159,18 @@ class CacheTier
 /// A registration fact, because a budget does not move while the process runs.
 /// @param tier The node's cache, or null when it has none.
 /// @return The per-tier budgets; every tier absent when @p tier is null.
+/// Resident bytes this node's caches would spend on their key indexes with the whole
+/// store loaded (#175).
+///
+/// Passed to `NodeCapacityOf` as its own argument rather than added to
+/// `NodeCacheCapacity`, which is ON THE WIRE: a new field there would be a frame-shape
+/// change, and `MinSupportedVersion == CurrentVersion` makes that a flag day for the
+/// fleet (#998). `reservedMemoryBytes` already travels, so the figure reaches the
+/// leader through a field that exists.
+/// @param tier This node's cache tier, or nullptr when it runs none.
+/// @return Bytes to hold back, or 0 without a tier.
+[[nodiscard]] std::uint64_t IndexReserveBytesOf(CacheTier const* tier);
+
 [[nodiscard]] Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier);
 
 /// What @p tier holds right now, in the vocabulary the fleet speaks.

@@ -2090,6 +2090,15 @@ StorageStats CowTreeStorage::Snapshot() const noexcept
     _stats.bytesUsed = _storeBytes;
     _stats.bytesLimit = _options.maxBytes;
     _stats.indexBytes = _indexBytes;
+
+    // The upper bound: what the mirror would cost holding the WHOLE store. Exact
+    // rather than an assumed average, because `IndexBytesFor` is `fixed + 2 * keyLen`
+    // and #1006 made both terms durable -- so the sum over N records is
+    // `N * fixed + 2 * keyBytes`, read straight off the meta. See the field's own
+    // comment for why a reservation must not use `indexBytes` instead.
+    auto const perEntryFixed = IndexBytesFor(0);
+    _stats.indexBytesAtCapacity =
+        static_cast<std::size_t>(_tree->ItemCount() * perEntryFixed) + (2U * static_cast<std::size_t>(_tree->KeyBytes()));
     return _stats;
 }
 

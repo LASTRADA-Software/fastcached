@@ -4137,3 +4137,68 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         CHECK(Unwrap(other) != Unwrap(refusal));
     }
 }
+
+TEST_CASE("A disk-only node holds back what its key index costs", "[node][config][capacity]")
+{
+    // #175: `ResidentCacheBytes` folds tier BUDGETS whose column says the budget is
+    // RAM, which is the memory tier alone. A disk tier's budget is filesystem bytes,
+    // so it contributes nothing -- correctly, since adding it would be wrong by the
+    // ratio between two units -- and its in-memory key index was therefore reserved by
+    // nothing at all.
+    //
+    // A node like that offered the fleet the whole machine while holding an index that
+    // runs to hundreds of megabytes at a few million objects. Under-reserving is the
+    // direction that over-commits: the jobs come back as refusals the client retries
+    // locally, so the build gets slower while distribution looks like it is working.
+    NodeConfig cfg;
+    FakeHost const box { 8, 32ULL << 30 };
+
+    // A disk tier and no memory tier: the shape the ticket is about.
+    Distributed::NodeCacheCapacity diskOnly {};
+    diskOnly.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] = 40ULL << 30;
+
+    auto const without = NodeCapacityOf(cfg, box, diskOnly);
+    // The tier's own budget adds nothing to a MEMORY reserve, and that is right.
+    CHECK(without.reservedMemoryBytes == 0);
+
+    constexpr std::uint64_t IndexCost = 512ULL << 20;
+    auto const with = NodeCapacityOf(cfg, box, diskOnly, IndexCost);
+
+    // **The assertion.** The index is held back, and it is the only thing that changed.
+    CHECK(with.reservedMemoryBytes == IndexCost);
+    CHECK(with.totalMemoryBytes == without.totalMemoryBytes);
+    CHECK(with.logicalCores == without.logicalCores);
+}
+
+TEST_CASE("The index reserve is added to the tiers' own budgets, not substituted", "[node][config][capacity]")
+{
+    // A node running BOTH tiers holds its memory budget AND its disk tier's index, and
+    // the two are separately denominated. Asserted because the tempting shape --
+    // reserving whichever is larger, or replacing one with the other -- passes any test
+    // written about a single-tier node.
+    NodeConfig cfg;
+    FakeHost const box { 8, 32ULL << 30 };
+
+    Distributed::NodeCacheCapacity both {};
+    both.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 2ULL << 30;
+    both.tierBytesLimit[static_cast<std::size_t>(StorageTier::Disk)] = 40ULL << 30;
+
+    constexpr std::uint64_t IndexCost = 512ULL << 20;
+    auto const capacity = NodeCapacityOf(cfg, box, both, IndexCost);
+    CHECK(capacity.reservedMemoryBytes == (2ULL << 30) + IndexCost);
+}
+
+TEST_CASE("A reserve larger than the machine is clamped to it", "[node][config][capacity]")
+{
+    // Both terms are bounded by the machine and their SUM is not, so a pathological
+    // configuration could otherwise reserve more RAM than exists and offer negative
+    // capacity. Clamped rather than trusted.
+    NodeConfig cfg;
+    FakeHost const small { 4, 1ULL << 30 };
+
+    Distributed::NodeCacheCapacity mem {};
+    mem.tierBytesLimit[static_cast<std::size_t>(StorageTier::Memory)] = 900ULL << 20;
+
+    auto const capacity = NodeCapacityOf(cfg, small, mem, 900ULL << 20);
+    CHECK(capacity.reservedMemoryBytes == (1ULL << 30));
+}

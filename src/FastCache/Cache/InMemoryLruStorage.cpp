@@ -625,6 +625,10 @@ StorageStats InMemoryLruStorage::Snapshot() const noexcept
     _stats.bytesUsed = _bytesUsed;
     _stats.bytesLimit = _maxBytes;
     _stats.indexBytes = _indexBytes;
+    // Wholly resident, so "now" and "at capacity" are one question with one answer.
+    // Reported rather than left at zero, because a consumer summing the projection
+    // across tiers would otherwise read this tier as costing nothing.
+    _stats.indexBytesAtCapacity = _indexBytes;
     // Fold in the atomic read-path counters (Approximate mode bumps these
     // instead of the plain `_stats` members). Snapshot runs under the shard's
     // exclusive lock, so the structure reads are stable; the atomics are read
