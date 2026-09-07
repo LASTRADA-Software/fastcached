@@ -232,7 +232,8 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
     FastCache::ReactorServerOptions options;
     options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms };
 
-    auto const cycle = FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
+    auto const cycle =
+        FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
     REQUIRE(cycle != nullptr);
     chain.reactor.Drain();
     CHECK(chain.engine.Storage().Snapshot().itemCount == 1U); // Nothing has lapsed yet.
@@ -258,7 +259,8 @@ TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing"
     FastCache::ReactorServerOptions options;
     options.expiry = FastCache::ExpiryReaperOptions { .interval = FastCache::Duration::zero() };
 
-    auto const cycle = FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
+    auto const cycle =
+        FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
     REQUIRE(cycle != nullptr);
     chain.reactor.Drain();
     chain.clock.Advance(1h);
