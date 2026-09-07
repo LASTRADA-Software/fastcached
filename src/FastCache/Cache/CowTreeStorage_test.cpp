@@ -3574,6 +3574,78 @@ TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not in
     CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
 }
 
+TEST_CASE("A reopened store over its bound evicts entries it has never touched", "[cowstorage][evict][capacity]")
+{
+    // #1012. #1006 made `_storeBytes` truthful at `Open`, so a reopened store finally
+    // KNEW it was over its bound -- and could still do nothing about it, because
+    // `EvictToFit` names victims out of `_lru`, which only `TouchOrInsert` populates
+    // and no `Open` path calls. The bound was observable and unenforceable at the same
+    // time, which is the worse half: the gauge an operator watches said "over" while
+    // the store sat there.
+    //
+    // Two things are asserted, and the second is the one that makes this LRU rather
+    // than a scramble for anything erasable.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    constexpr int Objects = 8;
+    constexpr std::size_t ValueLen = 1000;
+    constexpr std::size_t Budget = 3 * ValueLen;
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        for (auto const i: std::views::iota(0, Objects))
+            REQUIRE(
+                (*first)
+                    ->Set(std::format("k-{:02}", i), MakeBytes(std::string(ValueLen, 'x')), 0, FastCache::TimePoint::max())
+                    .has_value());
+        REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
+    }
+
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+    REQUIRE((*second)->Snapshot().bytesUsed == Objects * ValueLen);
+
+    // Touched, so it is the one entry in the mirror. Everything else is cold, and cold
+    // means "not used since this process started" -- strictly less recently used than
+    // this one, whatever order they were written in.
+    FastCache::ManualClock clock;
+    auto const warmed = (*second)->Get("k-00", clock.Now());
+    REQUIRE(warmed.has_value());
+    REQUIRE(warmed->found);
+
+    (*second)->Resize(Budget);
+
+    // **The first half.** Before #1012 this was still 8000: an empty mirror, nothing
+    // to name, and a `while` loop that never ran a single iteration.
+    CHECK((*second)->Snapshot().bytesUsed <= Budget);
+
+    // **The second half**, and it turned out to describe a sharper defect than the
+    // first. Measured against the neutered fix: `bytesUsed` came back 7000, not 8000,
+    // and THIS key was the one missing. The mirror's only member after a reopen is
+    // whatever the session has touched, so the old loop evicted the entry that had
+    // just been read -- the single worst LRU choice available -- and then stopped,
+    // the mirror being empty again. So the bound went unenforced AND the warmest
+    // entry was thrown away, from one cause.
+    //
+    // It also keeps this case honest about the fix: without this assertion it would
+    // pass against an implementation that erased whatever the walk reached first.
+    auto const survivor = (*second)->Get("k-00", clock.Now());
+    REQUIRE(survivor.has_value());
+    CHECK(survivor->found);
+
+    std::size_t present = 0;
+    for (auto const i: std::views::iota(0, Objects))
+    {
+        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.Now());
+        REQUIRE(got.has_value());
+        if (got->found)
+            ++present;
+    }
+    CHECK(present == Budget / ValueLen);
+}
+
 TEST_CASE("The store's byte total follows deletes and replaces, not just writes", "[cowstorage][bytesused][capacity]")
 {
     // The counter is maintained in `StoreEntry` and `EraseEntry`, which every mutation

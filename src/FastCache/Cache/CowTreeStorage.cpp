@@ -1503,6 +1503,73 @@ CacheEntry* CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional
     return nullptr;
 }
 
+bool CowTreeStorage::EvictColdSlice()
+{
+    FC_ZONE_SCOPED_N("CowTreeStorage::EvictColdSlice");
+    if (_coldExhausted)
+        return false;
+
+    // Gathered under a read snapshot and erased after it is gone. `ForEach` does not
+    // tolerate a commit inside the walk, which is the same constraint the migration
+    // slices are shaped around.
+    std::vector<std::string> victims;
+    std::vector<std::byte> lastKey;
+    bool reachedEnd = true;
+    {
+        auto reader = _tree->BeginRead();
+        auto const visit = [&](CowTree::BytesView key, CowTree::BytesView) {
+            lastKey.assign(key.begin(), key.end());
+            if (!IsReservedKey(key))
+            {
+                auto const view = std::string_view { reinterpret_cast<char const*>(key.data()), key.size() };
+                // Present in the mirror means touched this session, so it is warm and
+                // the `_lru` loop below owns it.
+                if (!_index.contains(view))
+                    victims.emplace_back(view);
+            }
+            if (victims.size() >= ColdVictimSliceKeys)
+            {
+                reachedEnd = false;
+                return false;
+            }
+            return true;
+        };
+        auto const walked = _coldCursor.empty()
+                                ? reader.ForEach(visit)
+                                : reader.ForEachAfter(CowTree::BytesView { _coldCursor.data(), _coldCursor.size() }, visit);
+        // A failed walk is not an exhausted one. Report nothing erased and leave the
+        // cursor where it was, so the next call retries rather than concluding the
+        // store has no cold entries left.
+        if (!walked.has_value())
+            return false;
+    }
+
+    if (!lastKey.empty())
+        _coldCursor = lastKey;
+    if (reachedEnd)
+        _coldExhausted = true;
+
+    std::size_t erased = 0;
+    for (auto const& key: victims)
+    {
+        if (_storeBytes <= _options.maxBytes)
+            break;
+        if (auto const r = EraseEntry(key); !r.has_value())
+            continue;
+        // Reported unconditionally, where the mirror path asks about the generation
+        // first: a flush erases the tree, so an entry a walk can still see was never
+        // flushed and there is no second event to avoid naming.
+        RecordReclaim(_reclaim, MutationKind::Evict, key);
+        ++_stats.evictions;
+        // Deliberately NOT counted in `evictedUnfetched`. That bit lives on the mirror
+        // node and a cold entry has none, so whether it was ever read is not something
+        // this process can know -- and an unknown recorded as a "no" is a claim the
+        // data does not support. It undercounts, which is the honest direction.
+        ++erased;
+    }
+    return erased != 0;
+}
+
 void CowTreeStorage::EvictToFit()
 {
     FC_ZONE_SCOPED_N("CowTreeStorage::EvictToFit");
@@ -1513,11 +1580,17 @@ void CowTreeStorage::EvictToFit()
     // to leave the soft cap violated than to mutate the in-memory mirror
     // out of sync with the tree on disk.
     auto remainingAttempts = _lru.size();
-    // Bounded on the STORE, not on what this session touched (#1006). The reach is
-    // still the mirror -- `_lru` is what eviction can name -- so a restarted store
-    // that is over its bound cannot act until entries are touched back in. That
-    // residual is #175's emptiness arriving from the other side, and it is a smaller
-    // wrong than never knowing the bound was exceeded at all.
+    // Bounded on the STORE, not on what this session touched (#1006).
+    //
+    // Cold before warm (#1012). `_lru` reaches only what this session touched, so a
+    // reopened store over its bound used to know it and be unable to name a single
+    // victim -- it shed nothing until traffic happened to touch entries back in. The
+    // cold set is not a fallback for that: an entry the mirror does not hold has not
+    // been used since startup, so it is genuinely the least recently used thing in the
+    // store, and taking it first is what LRU means here. Draining it also converges,
+    // because the slice erases whole entries rather than rotating a fixed set.
+    while (_storeBytes > _options.maxBytes && EvictColdSlice())
+        ;
     while (_storeBytes > _options.maxBytes && !_lru.empty() && remainingAttempts != 0)
     {
         auto victim = std::prev(_lru.end());

@@ -1062,6 +1062,15 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Each slice records its resume point in its own transaction, so an interrupted
   run is refused by name and finished by re-running it.
 - A tree walk is bounded by `PageCount()`, and must not overlap a commit.
+- The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and
+  no `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather
+  than a workaround: an entry the mirror lacks has not been used since startup. Measured
+  (#1012): a store reopened over its bound, with ONE key read back, evicted THAT key, the
+  mirror's only member, then stopped with the bound still violated. One cause, two
+  failures, and a test asserting only the total sees neither. Fourth of a family where
+  state describing the STORE was populated only by touch — #175, #990, #1006 are the
+  others, all closed by finding a durable SOURCE for a number; this one could not be,
+  because eviction needs a VICTIM rather than a figure.
 
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
