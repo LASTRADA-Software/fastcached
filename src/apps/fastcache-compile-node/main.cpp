@@ -1029,7 +1029,8 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // configuration asked for only sometimes. `NodeCapacityOf`'s contract carries the
     // three ways those differ; this is the ordering that lets it be honoured.
     auto const host = MakeSystemHostFacts();
-    auto const capacity = Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()));
+    auto const capacity =
+        Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
     auto const slots = Distributed::OfferableSlots(capacity, cfg.slots);
 
     // Sized to the slot cap, which is what makes an admitted job always find a

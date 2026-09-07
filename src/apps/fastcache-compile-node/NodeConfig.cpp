@@ -1319,11 +1319,25 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
 
 Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
                                          IHostFactsSource const& host,
-                                         Distributed::NodeCacheCapacity const& cache)
+                                         Distributed::NodeCacheCapacity const& cache,
+                                         std::uint64_t indexReserveBytes)
 {
+    // The tiers' own budgets PLUS what their key indexes cost, which is #175: a
+    // disk-only node reserved zero and offered the fleet the whole machine while
+    // holding an index that can run to hundreds of megabytes. Under-reserving is the
+    // direction that over-commits -- the jobs come back as refusals the client retries
+    // locally, so the build gets slower while distribution looks like it is working.
+    //
+    // Added here rather than inside `ResidentCacheBytes`, which folds tier BUDGETS and
+    // is right to refuse a figure that is not one: a disk budget is denominated in
+    // filesystem bytes and this is RAM. Clamped, because both terms are bounded by the
+    // machine and their sum need not be.
+    auto const tiers = ResidentCacheBytes(cache, host.TotalMemoryBytes());
+    auto const reserved = std::min<std::uint64_t>(tiers + indexReserveBytes, host.TotalMemoryBytes());
+
     return Distributed::NodeCapacity { .logicalCores = host.LogicalCores(),
                                        .totalMemoryBytes = host.TotalMemoryBytes(),
-                                       .reservedMemoryBytes = ResidentCacheBytes(cache, host.TotalMemoryBytes()),
+                                       .reservedMemoryBytes = reserved,
                                        .nodeClass = cfg.nodeClass,
                                        // Absent is not zero, and this is the one line
                                        // where the two are told apart: a reserve the

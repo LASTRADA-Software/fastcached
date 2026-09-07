@@ -690,7 +690,8 @@ struct NodeConfig
 /// @return The capacity to advertise, and to size this worker's own limit by.
 [[nodiscard]] Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
                                                        IHostFactsSource const& host,
-                                                       Distributed::NodeCacheCapacity const& cache);
+                                                       Distributed::NodeCacheCapacity const& cache,
+                                                       std::uint64_t indexReserveBytes = 0);
 
 /// Build a configuration from a file and a command line, in that order.
 ///

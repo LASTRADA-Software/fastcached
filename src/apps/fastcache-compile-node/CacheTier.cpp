@@ -233,6 +233,30 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     return tier;
 }
 
+std::uint64_t IndexReserveBytesOf(CacheTier const* tier)
+{
+    if (tier == nullptr)
+        return 0;
+
+    // The projection, not the current cost: `indexBytes` is empty the instant a full
+    // store reopens, so reserving from it reserves nothing on exactly the machine
+    // #175 is about. See `StorageStats::indexBytesAtCapacity`.
+    //
+    // Summed over every tier that reports one rather than singling out the disk tier
+    // by name, for the reason `ResidentCacheBytes` gives about its own fold: the
+    // taxonomy is open, and a resident tier added later reaches this arithmetic by
+    // being a row instead of by somebody remembering.
+    std::uint64_t total = 0;
+    auto const tiers = tier->SnapshotTiers();
+    for (auto const& row: StorageTierTable)
+    {
+        auto const& stats = tiers[static_cast<std::size_t>(row.tier)];
+        if (stats.has_value())
+            total += static_cast<std::uint64_t>(stats->indexBytesAtCapacity);
+    }
+    return total;
+}
+
 Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier)
 {
     Distributed::NodeCacheCapacity out {};

@@ -66,6 +66,31 @@ struct StorageStats
     /// budget is denominated in the same unit as what it omits. A tier reporting zero
     /// here therefore means an EMPTY index, never one that costs nothing.
     std::size_t indexBytes { 0 };
+
+    /// What the index would cost with the WHOLE store resident, rather than what it
+    /// costs now.
+    ///
+    /// `indexBytes` is a true statement about the present and the wrong number to
+    /// reserve against, because the mirror is populated by `TouchOrInsert` and is
+    /// therefore EMPTY the instant a full store reopens -- pinned by "A reopened
+    /// store's index reports what has been TOUCHED, not what is on disk". A node that
+    /// reserved from it would reserve nothing on exactly the machine #175 is about: a
+    /// long-lived worker with a warm disk tier, restarted.
+    ///
+    /// So this is an UPPER BOUND, and deliberately: under-reserving is the direction
+    /// that over-commits a machine, and the jobs then come back as refusals the client
+    /// retries locally -- the build gets slower while distribution looks like it is
+    /// working. Over-reserving costs a slot.
+    ///
+    /// Exact rather than an assumed average key length, which is what this needed
+    /// before #1006 put a key-byte total in the meta: `IndexBytesFor` is
+    /// `fixed + 2 * keyLength`, so the sum over N records is
+    /// `N * fixed + 2 * totalKeyBytes` and both terms are durable.
+    ///
+    /// Equal to `indexBytes` for a tier that is wholly resident already, where the
+    /// two questions have one answer.
+    std::size_t indexBytesAtCapacity { 0 };
+
     std::uint64_t evictions { 0 };
 
     std::uint64_t cmdGet { 0 };
@@ -122,6 +147,10 @@ inline constexpr std::array StorageStatsSizeFields {
     // Summed like the rest, and correctly: a `ShardedStorage` of N disk tiers holds N
     // mirrors, and their RAM adds up the way their item counts do.
     &StorageStats::indexBytes,
+    // The projection sums for the same reason, and omitting it here is exactly the
+    // silent under-report this table exists to prevent -- a sharded node would reserve
+    // one shard's worth of index for N shards.
+    &StorageStats::indexBytesAtCapacity,
 };
 
 /// The counter fields of `StorageStats`, as member pointers.

@@ -320,18 +320,17 @@ is what the conversion does.
 
 ## Open work
 
-- **[#1006](https://github.com/LASTRADA-Software/fastcached/issues/1006)** — a disk
-  tier's BYTE TOTAL resets on restart, so `--cache-disk` is unenforced until the session
-  has rewritten a whole budget, and the gauge reads under the limit exactly while the
-  store is over it. `_bytesUsed` is touched only by `TouchOrInsert` and the erase paths,
-  never at `Open`, and `Snapshot().bytesUsed` is that same field — so the number an
-  operator is told to watch describes the working set since the last restart rather than
-  the store.
+- **[#1012](https://github.com/LASTRADA-Software/fastcached/issues/1012)** — eviction
+  can only name victims the MIRROR holds, so a restarted store that is over its bound
+  now knows it and can still shrink nothing until traffic touches entries back in.
+  `EvictToFit` compares `_storeBytes` -- which #1006 made truthful at `Open` -- against
+  `maxBytes`, but iterates `_lru`, which `TouchOrInsert` populates and `Open` never
+  does.
 
-  This is what SURVIVES #990, which persisted the free list and is closed: pages a
-  previous session freed are reused now, so the file no longer grows without bound, but
-  the accounting that bounds eviction still starts at zero. Third instance of one shape —
-  state that should describe the store is populated only by touch, never at `Open` — with
-  [#175](https://github.com/LASTRADA-Software/fastcached/issues/175) (the index) as the
-  other live one. They are deliberately not one ticket: #990's remedy does not transfer,
-  because bytes used is derivable from the tree rather than a structure to write down.
+  The last live instance of a family this tree has hit four times: **state that should
+  describe the store is populated only by touch, never at `Open`.** #175 (the index cost
+  for capacity), #990 (the free list) and #1006 (the byte total) are all closed, and each
+  was fixed by finding a durable SOURCE for a number. This one is not that shape:
+  eviction needs a VICTIM to name rather than a figure, and the mirror is the only thing
+  that names victims -- so the fix is a tree walk or a seeded mirror, and the second
+  reopens the RAM question #175 exists about.
