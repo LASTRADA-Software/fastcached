@@ -8,8 +8,8 @@
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
-#include <FastCache/Net/WriteSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
+    #include <FastCache/Net/WriteSlot.hpp>
 
     #include <winsock2.h>
 
