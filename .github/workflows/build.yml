@@ -1743,6 +1743,39 @@ jobs:
         with:
           toolset: "14.44"
 
+      # TEMPORARY, and it removes itself: the measurement
+      # [#825](https://github.com/LASTRADA-Software/fastcached/issues/825) asks
+      # for and that nobody on this team can take -- which channel `cl
+      # /showIncludes` writes its notes to, with and without `/EP`. Three sites in
+      # this tree said stderr; the analysis on #700 and the review of #821 said
+      # stdout; neither was measured, and nobody here has a Windows host. This
+      # runner does.
+      #
+      # `continue-on-error` because it is a PROBE: a probe that can redden a build
+      # teaches people to ignore that build. And the half that flag would
+      # otherwise hide is added rather than assumed -- the step asserts it was
+      # REACHED, so "the probe ran and found nothing" and "the probe never
+      # started" are two visible states (#376). The `cl-debug` leg only, because
+      # one reading is the measurement and three are three copies of it.
+      #
+      # This step is deleted in the same pull request once the answer is read; a
+      # diagnostic that outlives the question it answered is cost with no reader.
+      - name: "PROBE (#825): which channel does cl /showIncludes write to?"
+        if: ${{ needs.changes.outputs.code != 'false' && matrix.preset == 'cl-debug' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "::group::cl /showIncludes channel probe"
+          & powershell -ExecutionPolicy Bypass -File scripts/probes/msvc-showincludes-channel.ps1
+          $rc = $LASTEXITCODE
+          Write-Host "::endgroup::"
+          if ($rc -eq 0) {
+            Write-Host "::notice::the #825 probe RAN and reported above (exit 0)"
+          } else {
+            Write-Host "::warning::the #825 probe did not conclude (exit $rc); that is not a reading"
+          }
+
       # TLS on, against the OpenSSL preinstalled on the GitHub Windows runner
       # (vcpkg is the local-dev path; CI uses the runner's OpenSSL to avoid a
       # from-source build). Quoted because the path contains a space.
