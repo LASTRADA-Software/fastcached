@@ -2384,12 +2384,11 @@ TEST_CASE("A connection this node sweeps is not filed as a peer departure", "[no
     //
     // The case that pins `ClosedLocally` structurally is
     // *"A connection this node closes at SHUTDOWN is not filed as a peer departure"*
-    // below: no sweep is configured there, so there is no race to align. A swept connection never reaches `AbandonIfPeerGone` -- the
-    // deferred refusal breaks the loop before it -- so nothing on that path reads the
-    // watch, and the `socket->Close()` that follows reaches the parked watcher looking
-    // exactly like a peer hanging up. Counted, this node's own teardown would arrive
-    // in a row about clients vanishing, which is `TrackedConnection::closedLocally`'s
-    // whole subject one level down and would be reintroduced one row over.
+    // below: no sweep is configured there, so there is no race to align. A swept connection never reaches
+    // `AbandonIfPeerGone` -- the deferred refusal breaks the loop before it -- so nothing on that path reads the watch, and
+    // the `socket->Close()` that follows reaches the parked watcher looking exactly like a peer hanging up. Counted, this
+    // node's own teardown would arrive in a row about clients vanishing, which is `TrackedConnection::closedLocally`'s whole
+    // subject one level down and would be reintroduced one row over.
     Fleet fleet;
     HoldableResponder responder;
     responder.UseReactor(fleet.io.Reactor());
@@ -2515,7 +2514,6 @@ TEST_CASE("A connection this node closes at SHUTDOWN is not filed as a peer depa
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1);
 }
-
 
 TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")
 {
