@@ -1993,6 +1993,16 @@ else
         # Anchored on a separator, with equality its own arm, exactly as case 13's
         # containment guard is -- a bare string prefix calls `/a/b` an ancestor of
         # `/a/b2`.
+        # **`pwd -P` for the COMPARISON and never for the rule.** A prefix-map rule is
+        # matched by the driver as a BYTE PREFIX of the path it is handed, so its
+        # left-hand side has to be spelled the way the source ARGUMENT is. `pwd -P`
+        # resolves symlinks, and macOS's `$TMPDIR` sits under `/var`, which is a link
+        # to `/private/var` -- so a resolved `<from>` matched nothing, the reference
+        # object recorded its raw path, and this case's own bite guard said so on the
+        # first macOS run. Linux's `/tmp` is not a link, which is why it was green
+        # here. Same mechanism as #506's `$PWD`-against-`getcwd(3)`, one layer out: the
+        # disjointness question wants resolved paths and the rule wants the spelling
+        # the compiler will see, and they are not the same string.
         map_abs="$(cd "$mapdir" && pwd -P)"
         src883_abs="$(cd "$src883_root" && pwd -P)"
         if [[ "$map_abs" == "$src883_abs" || "$map_abs" == "$src883_abs"/* || "$src883_abs" == "$map_abs"/* ]]; then
@@ -2000,14 +2010,14 @@ else
         fi
 
         (cd "$mapdir" && "$compiler" -std=c++17 -O1 -g "-fdebug-prefix-map=${mapdir}=." \
-            "-fdebug-prefix-map=${src883_abs}=/MAPPED883" \
+            "-fdebug-prefix-map=${src883_root}=/MAPPED883" \
             -c "$src883" -o "${mapdir}/fourteen-ref.o") \
             || fail "the case 14 reference compile failed"
 
         (
             export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
             cd "$mapdir" && run_launcher "${workdir}/case14.log" -std=c++17 -O1 -g \
-                "-fdebug-prefix-map=${mapdir}=." "-fdebug-prefix-map=${src883_abs}=/MAPPED883" \
+                "-fdebug-prefix-map=${mapdir}=." "-fdebug-prefix-map=${src883_root}=/MAPPED883" \
                 -c "$src883" -o "${mapdir}/fourteen.o"
         ) || { cat "${workdir}/case14.log" >&2 || true; fail "the case 14 dispatched compile failed"; }
 
@@ -2041,7 +2051,7 @@ else
                 # leaves the CLIENT's raw absolute path, where #660's shape leaves the
                 # worker's `job-N` scratch.
                 case "$rem14_name" in
-                    "${src883_abs}"/*) echo "--- this is the pre-#883 shape: the client's raw source path reached the object" >&2 ;;
+                    "${src883_root}"/*) echo "--- this is the pre-#883 shape: the client's raw source path reached the object" >&2 ;;
                     *job-*) echo "--- this is the pre-#660 shape: the worker's per-job scratch reached the object" >&2 ;;
                 esac
                 cat "${workdir}/case14.log" >&2 || true
