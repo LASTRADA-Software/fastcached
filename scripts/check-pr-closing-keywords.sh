@@ -96,11 +96,26 @@ Judge() {
 
     if [ -n "$missing" ]; then
         echo "FAILED: the commits say this closes${missing}, and the body does not." >&2
-        echo "        Under the merge queue only the BODY keyword closes an issue, so those" >&2
-        echo "        tickets would stay OPEN after this merged -- delivered, counted as" >&2
-        echo "        outstanding, and indistinguishable from work nobody started (#974)." >&2
-        echo "        Add a line per ticket to the body; KEEP the commit trailers, which are" >&2
-        echo "        what makes a ticket excisable from a batch branch." >&2
+        echo "        Two causes. They are indistinguishable in the text, so YOU have to" >&2
+        echo "        pick -- neither GitHub nor this check can:" >&2
+        echo >&2
+        echo "        (1) You MEANT to close it and the body is missing the line." >&2
+        echo "            Add a line per ticket to the body; KEEP the commit trailers," >&2
+        echo "            which are what makes a ticket excisable from a batch branch." >&2
+        echo "            Under the merge queue only the BODY keyword closes an issue," >&2
+        echo "            so without it those tickets stay OPEN after this merged --" >&2
+        echo "            delivered, counted as outstanding, and indistinguishable from" >&2
+        echo "            work nobody started (#974)." >&2
+        echo >&2
+        echo "        (2) You did NOT mean to close it: a commit message NARRATES a" >&2
+        echo "            closing -- \"the earlier PR closed #NNNN\" -- and a keyword" >&2
+        echo "            sitting in front of a number is a directive to GitHub whatever" >&2
+        echo "            the sentence around it means. REWORD the prose and add nothing." >&2
+        echo "            Adding the body line here closes a ticket this branch never" >&2
+        echo "            delivered, which is the worse of the two failures: an open" >&2
+        echo "            ticket gets re-triaged, a wrongly closed one does not." >&2
+        echo "            Note that QUOTING the phrase to explain it is still issuing it," >&2
+        echo "            so discuss it with a placeholder rather than a real number." >&2
         return 1
     fi
     # The OTHER direction is reported and never refused, and the asymmetry is the
@@ -139,16 +154,37 @@ if [ "${1:-}" = "--self-test" ]; then
     cases=0
     failures=0
     # @param 1 name  @param 2 expect pass|refuse  @param 3 body  @param 4 commits
+    #        @param 5.. optional: substrings the OUTPUT must all carry
+    #
+    # Those trailing parameters are what makes an advice change testable at all. A case
+    # can otherwise only assert the verdict, and the verdict does not move when the
+    # advice is wrong -- so a case written for the narrating shape would pass just as
+    # happily against the single-cause message #1013 replaced.
+    #
+    # There is deliberately no case asserting that the NARRATING shape gets one remedy
+    # and the forgot-the-body shape gets the other. The check cannot tell them apart --
+    # that is the finding -- so a per-shape assertion would be pinning a discrimination
+    # the code does not make and must not claim to. One message names both, and the
+    # case below asserts exactly that.
     run_case() {
-        local name="$1" want="$2" out="" got=pass
+        local name="$1" want="$2" body="$3" commits="$4" out="" got=pass need=""
+        shift 4
         cases=$((cases + 1))
-        out="$(Judge "$3" "$4" 2>&1)" || got=refuse
+        out="$(Judge "$body" "$commits" 2>&1)" || got=refuse
         if [ "$got" != "$want" ]; then
             echo "  FAIL $name: expected $want, got $got" >&2
             printf '%s\n' "$out" | sed 's/^/       | /' >&2
             failures=$((failures + 1))
             return
         fi
+        for need in "$@"; do
+            if ! grep -qF -- "$need" <<< "$out"; then
+                echo "  FAIL $name: the output does not carry '$need'" >&2
+                printf '%s\n' "$out" | sed 's/^/       | /' >&2
+                failures=$((failures + 1))
+                return
+            fi
+        done
         echo "  ok   $name ($got)"
     }
 
@@ -217,6 +253,22 @@ Closes #12
 fix: b
 
 Closes #13"
+    # A commit that NARRATES a closing rather than ordering one (#1013). It still
+    # refuses, and must: the phrase is a directive to GitHub whatever the sentence
+    # around it means, and no reading of the text can separate the two intents.
+    #
+    # What #1013 changed is the ADVICE. The old message named one cause and told this
+    # author to add the ticket to the body -- which would close a ticket the branch
+    # never delivered, the worse of the two failures. So the assertion is that ONE
+    # refusal carries BOTH remedies; against the old message the second substring is
+    # absent and this case goes red.
+    run_case "the refusal names both causes, because it cannot tell them apart" refuse \
+        "Prose about the change, naming no ticket." \
+        "docs(rules): repoint an entry that went stale
+
+The earlier pull request closed #904, so the entry describing it went stale." \
+        "Add a line per ticket to the body" \
+        "REWORD the prose and add nothing."
     # Case sensitivity: GitHub accepts `fixes`, `FIXES`, `Fixed`.
     run_case "keyword case and tense do not matter" pass \
         "fixes #42" \
