@@ -75,6 +75,26 @@ And where the signals disagree, say **INCONCLUSIVE** and name what is missing. A
 confident wrong diagnosis costs more than an honest missing one -- that is the whole
 lesson of this rulebook, applied to the reporting rather than to the code.
 
+**And an INCONCLUSIVE verdict is a place to ask somebody ELSE, not the end of the
+matter.** `launchctl kickstart` timing out at 60 s having burned almost no CPU is
+`LaunchctlFindingOf`'s `Waiting`, reported honestly as *"this does not say whether that
+was a busy host or a stall"* -- correct, and the end of what the CALLER's own readings
+can establish, because from outside the two causes look identical
+([#965](https://github.com/LASTRADA-Software/fastcached/issues/965)).
+
+What separates them is whether launchd ever moved the job out of pending, and only
+launchd knows. So the fixture asks it, on the FAILURE PATH: `launchctl print` shows
+`state = running` or a non-zero last exit code for a job that started and then went
+wrong, a still-pending job for a host that never got to it, and *no such job* for a
+registration that wrote a plist launchd never took -- a third state neither of the first
+two, and none of the three inferable from the timeout.
+
+Failure path only, every command `|| true`: a diagnostic on an already-failed case must
+be able to EXPLAIN the verdict and never to change it. The Windows spawn bracket (#966)
+follows the same rule from the other side, and the general form is worth stating once --
+**when an instrument correctly reports INCONCLUSIVE, the next move is a different
+instrument, not a better reading of the same one.**
+
 ## What that classifier then got wrong, which is worth more than what it got right
 
 The first version of it shipped, fired on its fifth occurrence, and was wrong:

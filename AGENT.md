@@ -1721,7 +1721,13 @@ and what they may assume.
 - Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
-  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE.
+  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE. **And an
+  INCONCLUSIVE verdict is a place to ask somebody ELSE** (#965): a `launchctl kickstart`
+  timeout with almost no CPU cannot separate a busy host from a stall, and only launchd
+  knows whether the job ever left pending — so the fixture asks `launchctl print` on the
+  FAILURE PATH, every command `|| true`, because a diagnostic on an already-failed case
+  must explain the verdict and never change it. The next move is a different instrument,
+  not a better reading of the same one.
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same window is the same
   number divided by the same 300: 3.4s spread over five minutes and 3.4s burned in the first ten before a wedge are
   opposite diagnoses. Draw the verdict from a RECENT window and print the totals as evidence only. No magnitude bar

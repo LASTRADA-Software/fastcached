@@ -398,6 +398,33 @@ if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service -
         --scheduler=127.0.0.1:6675 \
         --advertise=127.0.0.1:6676 \
         --toolchain=/usr/bin/cc 2>&1)"; then
+    # **Ask launchd what it did with the job before giving up on the reading.**
+    #
+    # This failed once in a merge group with
+    # [#965](https://github.com/LASTRADA-Software/fastcached/issues/965):
+    # `launchctl kickstart` timed out at 60 s having consumed almost no CPU, which
+    # `LaunchctlFindingOf` classifies `Waiting` and reports honestly as "this does
+    # not say whether that was a busy host or a stall". That verdict is correct and
+    # is the end of what the CALLER's own readings can establish -- the two causes
+    # are indistinguishable from outside.
+    #
+    # What separates them is whether launchd ever moved the job out of its pending
+    # state, and only launchd knows. `launchctl print` says: a `state = running`
+    # or a non-zero `last exit code` is a job that STARTED and something else went
+    # wrong, while a job still pending after sixty seconds is a host that never got
+    # to it. Neither is inferable from the timeout.
+    #
+    # Failure path only, and every command is `|| true`: this runs when the case has
+    # already failed, so it must be able to explain the verdict and never to change
+    # it. `2>&1` because `launchctl print` reports a missing label on stderr, and
+    # "no such job" is itself one of the answers -- registration succeeded but the
+    # job is not there, which is a third state neither of the two above.
+    echo "--- what launchd says about ${NODE_LABEL} (#965) ---" >&2
+    sudo launchctl print "system/${NODE_LABEL}" 2>&1 | sed 's/^/    /' >&2 || true
+    echo "--- and whether it is even loaded ---" >&2
+    sudo launchctl list 2>&1 | grep -F "${NODE_LABEL}" | sed 's/^/    /' >&2 || true
+    echo "--- load average at the moment of the failure ---" >&2
+    uptime 2>&1 | sed 's/^/    /' >&2 || true
     fail "worker --install-service --service-scope=system was refused: ${node_log}"
 fi
 
