@@ -2512,14 +2512,6 @@ only thing that would catch an encoding that drops a field on the way.
   drivers is a capability rather than a duplicate -- but it multiplies one machine into
   six registrations, and capacity is per NODE, so it is not a one-line change to the
   layout table.
-- **[#175](https://github.com/LASTRADA-Software/fastcached/issues/175)** — a disk
-  tier's in-memory key index is RAM nothing accounts for. `--cache-disk` and
-  `tierBytesLimit[Disk]` both denominate bytes on the filesystem, while
-  `CowTreeStorage` keeps every live key resident, so a `--cache-memory 0
-  --cache-dir …` node reserves nothing and offers the whole machine. Marking the
-  disk tier resident is NOT the fix — its budget is disk, so summing it into a
-  memory total is wrong by the ratio between the two rather than by the index's
-  size. The fix needs a figure that does not exist yet.
 - **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
   discovered compiler is spawned twice at startup with the same argv, once to learn
   it can be spawned and once for its banner, and the first is in a serial loop in
