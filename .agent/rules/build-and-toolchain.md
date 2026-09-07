@@ -3431,6 +3431,36 @@ turn those jobs into gates by the back door.
   the analysis; the enforcement here is that **the count is not written down**, so there
   is nothing for a scan to check.
 
+**A Windows leg that cannot start processes reports six red smoke tests, not a
+runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
+Observed on `Windows-cl-debug`: six failures, all exit `0xc0000142`
+(`STATUS_DLL_INIT_FAILED`), and they were exactly the six tests that spawn a process
+while every in-process case in the same binary passed.
+
+No defect in the tree selects for "spawns a process" — a broken link, a missing
+runtime or a bad DLL would take the in-process cases with it. But nothing said so, and
+six red smoke tests read as a regression. That matters most on this leg specifically:
+it is the one run for `_ITERATOR_DEBUG_LEVEL=2`, so its smoke tests are where a
+Debug-runtime defect surfaces, and a leg that intermittently reports nothing about the
+property it exists for is worse than one that is simply red.
+
+So `ctest` is BRACKETED by a spawn probe, and the PAIR is what carries the meaning:
+
+<!-- table-total: none -->
+| before | after | what it means |
+|---|---|---|
+| red | — | the runner was broken on arrival; nothing after it is about the tree |
+| green | green | not this shape; read the failures as being about the tree |
+| green | red | the runner degraded DURING the run — #966 exactly |
+
+- The probe is `cmd /c exit 0`: it starts a process and does nothing else, so it
+  cannot redden a green run for any reason but the one it names.
+- The "after" half runs only on a red and is `continue-on-error`: a classifier on an
+  already-failing job must be able to explain the verdict and never to change it.
+- It has **three** outcomes, not two — broken, working, and *could not conclude* —
+  because a probe that can only answer the two you expect will answer one of them
+  whatever it sees. And it says out loud that it is a reading taken after the fact.
+
 ### Doc-subject checks were skipped on doc-only changes (#687)
 
 `ci-scope.sh` answers `code=false` for a `docs/**`, `.agent/**` or `*.md` change
