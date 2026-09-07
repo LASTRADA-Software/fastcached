@@ -1260,3 +1260,40 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
         CHECK(refreshed.served.empty());
     }
 }
+
+TEST_CASE("SurveyVoiceFor: only the timer sweep whispers", "[node][toolchains]")
+{
+    using namespace FastCache::Node;
+
+    // The case #993 is about: the unconditional sweep comes round on a timer and
+    // finds the same compilers it found a quarter of an hour ago. It is the ONLY
+    // combination that whispers, so it is asserted alone rather than as one of a set.
+    CHECK(SurveyVoiceFor(ClaimsReloaded::No, RecheckDepth::Unconditional) == SurveyVoice::Routine);
+
+    // An operator saved a file. Whatever the survey finds, they are watching for it --
+    // and `RecheckDepth` cannot answer this on its own, because a reload and the timer
+    // sweep BOTH arrive as `Unconditional`. That collapse is the whole reason this
+    // function takes two arguments, so it is the assertion that matters most here.
+    CHECK(SurveyVoiceFor(ClaimsReloaded::Yes, RecheckDepth::Unconditional) == SurveyVoice::Announce);
+
+    // At this depth a survey runs only when a witness moved, so its existence means
+    // the machine changed underneath the node.
+    CHECK(SurveyVoiceFor(ClaimsReloaded::No, RecheckDepth::WhenEvidenceMoved) == SurveyVoice::Announce);
+    CHECK(SurveyVoiceFor(ClaimsReloaded::Yes, RecheckDepth::WhenEvidenceMoved) == SurveyVoice::Announce);
+}
+
+TEST_CASE("NarrationLevel: quieting a survey must not quieten what it found", "[node][toolchains]")
+{
+    using namespace FastCache::Node;
+
+    CHECK(NarrationLevel(SurveyVoice::Announce) == FastCache::LogLevel::Info);
+    CHECK(NarrationLevel(SurveyVoice::Routine) == FastCache::LogLevel::Debug);
+
+    // The distinction this rests on: `Routine` lowers the NARRATION only. A toolchain
+    // that changed, one no longer served, and a survey abandoned because the node is
+    // stopping are EVENTS, and stay at Info under either voice. A test cannot read a
+    // level off those sites, so this asserts the property that makes it checkable --
+    // Routine is strictly quieter than Announce, and never silent.
+    CHECK(NarrationLevel(SurveyVoice::Routine) < NarrationLevel(SurveyVoice::Announce));
+    CHECK(NarrationLevel(SurveyVoice::Routine) >= FastCache::LogLevel::Debug);
+}

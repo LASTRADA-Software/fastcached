@@ -22,6 +22,48 @@
 namespace FastCache::Node
 {
 
+/// How loudly a survey narrates itself.
+///
+/// **A survey that changed nothing must not read like the first one.** The periodic
+/// sweep runs every `SweepEveryBeats` beats -- about a quarter of an hour -- and
+/// re-derives every toolchain whether or not anything moved. Narrated at `Info` it
+/// produced roughly 26 lines per sweep, forever, on a node nobody was building
+/// against: measured, 104 survey lines in 40 minutes across 4 surveys of which only 2
+/// followed a restart (#993). A journal that grows steadily with no information in it
+/// stops being read, and then the lines that matter are missed with it.
+///
+/// The sweep itself is not in question -- it is the only way back from serving LESS
+/// than this machine has (#238). What changes is that the routine case whispers.
+///
+/// This governs NARRATION only: the step-by-step account of a survey in progress.
+/// The three lines that report an actual CHANGE -- a toolchain that moved, one no
+/// longer served, a survey abandoned because the node is stopping -- are events, not
+/// narration, and stay at `Info` under either voice. That distinction is the whole
+/// design: quieting a survey must not quieten what a survey FOUND.
+enum class SurveyVoice : std::uint8_t
+{
+    /// Narrate in full, at `Info`.
+    ///
+    /// The startup survey, a survey a moved witness forced, and one an operator's
+    /// reload asked for. In each case something either is new or has changed, and the
+    /// account is what an operator is looking for.
+    Announce,
+
+    /// Narrate at `Debug`.
+    ///
+    /// The timer sweep, which on almost every occasion finds the same compilers it
+    /// found fifteen minutes ago.
+    Routine,
+};
+
+/// The level a survey's narration is emitted at.
+/// @param voice How loudly this survey narrates.
+/// @return `Info` for `Announce`, `Debug` for `Routine`.
+[[nodiscard]] constexpr LogLevel NarrationLevel(SurveyVoice voice) noexcept
+{
+    return voice == SurveyVoice::Announce ? LogLevel::Info : LogLevel::Debug;
+}
+
 /// One toolchain this worker will serve, before its identity is computed.
 struct ToolchainEntry
 {
@@ -207,12 +249,14 @@ struct ServedToolchain
 /// @return Fingerprint to what this worker serves under it -- never empty -- or
 ///         nullopt when a `--toolchain` value is malformed or there is nothing to
 ///         serve.
-[[nodiscard]] std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConfig const& cfg,
-                                                                                      Cc::IToolchainDiscovery* discovery,
-                                                                                      Cc::IProcessRunner& runner,
-                                                                                      Cc::IToolchainHost& host,
-                                                                                      IClock const& clock,
-                                                                                      ILogger& logger);
+[[nodiscard]] std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(
+    NodeConfig const& cfg,
+    Cc::IToolchainDiscovery* discovery,
+    Cc::IProcessRunner& runner,
+    Cc::IToolchainHost& host,
+    IClock const& clock,
+    ILogger& logger,
+    SurveyVoice voice = SurveyVoice::Announce);
 
 /// Decide WHICH compilers this node will serve, without identifying any of them.
 ///
@@ -238,7 +282,8 @@ struct ServedToolchain
 [[nodiscard]] std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& cfg,
                                                                            Cc::IToolchainDiscovery* discovery,
                                                                            Cc::IProcessRunner& runner,
-                                                                           ILogger& logger);
+                                                                           ILogger& logger,
+                                                                           SurveyVoice voice = SurveyVoice::Announce);
 
 /// What identifying the discovered compilers came to.
 ///
@@ -292,7 +337,8 @@ struct SurveyResult
                                                  Cc::IToolchainHost& host,
                                                  IClock const& clock,
                                                  ILogger& logger,
-                                                 std::stop_token const& stop);
+                                                 std::stop_token const& stop,
+                                                 SurveyVoice voice = SurveyVoice::Announce);
 
 /// Which of these toolchains no longer match the machine they were derived from.
 ///
@@ -448,6 +494,37 @@ enum class ClaimsReloaded : std::uint8_t
 /// An unconditional sweep that finds the machine unchanged still answers `changed`
 /// false. It is a recovery path, not a reason to re-register a fleet's worth of
 /// workers every time it runs.
+/// Which voice a heartbeat's survey should use.
+///
+/// A pure function beside `RecheckDepthFor`, and for exactly its reason: `main.cpp`
+/// is in no test target (#909), so a rule left as an expression in the heartbeat loop
+/// can only be checked by reading it. This one is wrong silently in one direction --
+/// a survey that found a real change but whispered it is a change an operator never
+/// sees.
+///
+/// `RecheckDepth` alone cannot answer this: `Unconditional` covers BOTH the timer
+/// sweep and an operator's reload, and those are opposite cases. So the caller's two
+/// facts are asked for directly.
+///
+/// @param claims Whether a reload changed what this worker would advertise.
+/// @param depth How hard this beat is looking.
+/// @return `Routine` only for the timer sweep; `Announce` otherwise.
+[[nodiscard]] constexpr SurveyVoice SurveyVoiceFor(ClaimsReloaded claims, RecheckDepth depth) noexcept
+{
+    // An operator saved a file. Whatever the survey then finds, they are watching.
+    if (claims == ClaimsReloaded::Yes)
+        return SurveyVoice::Announce;
+
+    // At this depth a survey happens ONLY when a witness moved, so the survey's own
+    // existence means the machine changed underneath this node.
+    if (depth == RecheckDepth::WhenEvidenceMoved)
+        return SurveyVoice::Announce;
+
+    // What is left is the timer, which on almost every occasion finds the machine
+    // exactly as it left it.
+    return SurveyVoice::Routine;
+}
+
 [[nodiscard]] ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const& served,
                                                  NodeConfig const& cfg,
                                                  Cc::IToolchainDiscovery* discovery,
@@ -455,6 +532,7 @@ enum class ClaimsReloaded : std::uint8_t
                                                  Cc::IToolchainHost& host,
                                                  IClock const& clock,
                                                  ILogger& logger,
-                                                 RecheckDepth depth = RecheckDepth::WhenEvidenceMoved);
+                                                 RecheckDepth depth = RecheckDepth::WhenEvidenceMoved,
+                                                 SurveyVoice voice = SurveyVoice::Announce);
 
 } // namespace FastCache::Node
