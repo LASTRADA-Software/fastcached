@@ -261,3 +261,67 @@ TEST_CASE("One expiry sweep spends no more than its budget", "[expiry][reaper]")
     CHECK(f.storage.Snapshot().itemCount == 0U);
     CHECK(reaper.Cycles() == 5U);
 }
+
+TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[expiry][reaper]")
+{
+    // #946. `scanBudget` counts ENTRIES, and entries are not work: `DefaultScanBudget`'s
+    // own note calls 512 "small enough that no single cycle is measurable against a
+    // request", which is an assumption about per-entry cost. That cost varies by three
+    // orders of magnitude between a tier of small values and one of multi-megabyte
+    // objects, so a ceiling in entries bounds how many keys a sweep touches and says
+    // nothing about how long the reactor is unavailable -- which is the thing protected.
+    //
+    // The rule is tested where it lives. Driving it through `Run` would need an
+    // `IStorage` fake that consumes clock time: 28 forwarding methods to observe one
+    // behaviour. What that leaves unasserted is the wiring, and the case below on a
+    // real cycle is what covers the call actually happening.
+    InMemoryLruStorage lru;
+    NullLogger logger;
+    ExpiryReaperOptions options;
+    options.scanBudget = 512;
+    options.sweepStallCeiling = std::chrono::milliseconds { 50 };
+    ExpiryReaper reaper { lru, logger, options, nullptr };
+
+    REQUIRE(reaper.CurrentScanBudget() == 512);
+
+    SECTION("an overrun halves it, at once")
+    {
+        // Halve down and step up are deliberately asymmetric: an overrun is a stall an
+        // operator can feel, while being under the ceiling is only slower reclamation.
+        reaper.AdaptScanBudget(std::chrono::milliseconds { 200 });
+        CHECK(reaper.CurrentScanBudget() == 256);
+        reaper.AdaptScanBudget(std::chrono::milliseconds { 200 });
+        CHECK(reaper.CurrentScanBudget() == 128);
+    }
+
+    SECTION("it never decays below the floor, because zero means NO ceiling")
+    {
+        // `PurgeBudget` spells "no ceiling" as 0, so a budget that decayed to it would
+        // become an unbounded scan -- the exact opposite of this mechanism's purpose.
+        for (int i = 0; i < 40; ++i)
+            reaper.AdaptScanBudget(std::chrono::seconds { 5 });
+        CHECK(reaper.CurrentScanBudget() >= 8);
+        CHECK(reaper.CurrentScanBudget() > 0);
+    }
+
+    SECTION("headroom grows it back, and never past what the operator configured")
+    {
+        reaper.AdaptScanBudget(std::chrono::seconds { 5 }); // 256
+        REQUIRE(reaper.CurrentScanBudget() == 256);
+        for (int i = 0; i < 50; ++i)
+            reaper.AdaptScanBudget(std::chrono::milliseconds { 1 });
+        // The configured value is the operator's ceiling: this only ever takes budget
+        // AWAY from it, so no amount of headroom may exceed it.
+        CHECK(reaper.CurrentScanBudget() == 512);
+    }
+
+    SECTION("a zero ceiling disables adaptation rather than meaning `never stall`")
+    {
+        ExpiryReaperOptions off;
+        off.scanBudget = 512;
+        off.sweepStallCeiling = Duration::zero();
+        ExpiryReaper fixed { lru, logger, off, nullptr };
+        fixed.AdaptScanBudget(std::chrono::seconds { 30 });
+        CHECK(fixed.CurrentScanBudget() == 512);
+    }
+}

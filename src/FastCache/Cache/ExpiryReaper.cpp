@@ -14,7 +14,8 @@ ExpiryReaper::ExpiryReaper(IStorage& storage, ILogger& logger, ExpiryReaperOptio
     _logger { logger },
     _metrics { metrics },
     _options { options },
-    _interval { _options.interval }
+    _interval { _options.interval },
+    _scanBudget { _options.scanBudget }
 {
 }
 
@@ -57,7 +58,7 @@ PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
 {
     FC_ZONE_SCOPED_N("ExpiryReaper::SweepOnce");
     auto const outcome =
-        _storage.PurgeExpired(now, PurgeBudget { .maxScanned = _options.scanBudget, .maxPurged = _options.purgeBudget });
+        _storage.PurgeExpired(now, PurgeBudget { .maxScanned = _scanBudget, .maxPurged = _options.purgeBudget });
     ++_cycles;
     if (_metrics != nullptr)
     {
@@ -66,6 +67,41 @@ PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
             _metrics->Increment(IMetricsSink::Counter::ExpiryKeysReclaimed, outcome.purged);
     }
     return outcome;
+}
+
+/// Cut the scan budget when a sweep overran its ceiling, and grow it back while it
+/// did not.
+///
+/// **Halve down, step up.** The two directions are deliberately asymmetric, and it is
+/// the same argument a congestion window makes: overrunning the ceiling is a stall an
+/// operator can feel, so it is corrected at once; being under it is merely slower
+/// reclamation, so recovery is gradual and cannot oscillate a busy tier between two
+/// extremes every cycle.
+///
+/// Never above `options.scanBudget`, which stays the operator's ceiling -- this only
+/// ever takes budget AWAY from what was configured. And never below `MinScanBudget`,
+/// because a budget of zero is `PurgeBudget`'s spelling of *no ceiling* and would
+/// invert the whole mechanism into an unbounded scan.
+///
+/// A sweep that scanned NOTHING is not evidence about cost: an empty tier finishes
+/// instantly whatever the budget, and treating that as headroom would grow the budget
+/// on a cache that has told us nothing.
+/// @param elapsed How long the sweep held the reactor.
+void ExpiryReaper::AdaptScanBudget(Duration elapsed) noexcept
+{
+    if (_options.sweepStallCeiling <= Duration::zero())
+        return; // Adaptation disabled; the configured budget stands.
+
+    if (elapsed > _options.sweepStallCeiling)
+    {
+        auto const halved = _scanBudget / 2;
+        _scanBudget = halved < MinScanBudget ? MinScanBudget : halved;
+        return;
+    }
+    if (_scanBudget >= _options.scanBudget)
+        return;
+    auto const grown = _scanBudget + (_scanBudget / 4) + 1;
+    _scanBudget = grown > _options.scanBudget ? _options.scanBudget : grown;
 }
 
 Task<void> ExpiryReaper::Run(IReactor* reactor, CancellationToken token)
@@ -110,7 +146,13 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, CancellationToken token)
         if (token.IsCancelled())
             break;
 
-        auto const outcome = SweepOnce(reactor->Clock().Now());
+        // Timed, because `scanBudget` counts ENTRIES and entries are not work
+        // (#946). The reactor is held for the whole of `SweepOnce` -- it suspends
+        // nowhere -- so this elapsed time IS how long this reactor was unavailable,
+        // and it is the only quantity the ceiling can honestly be expressed in.
+        auto const startedAt = reactor->Clock().Now();
+        auto const outcome = SweepOnce(startedAt);
+        AdaptScanBudget(reactor->Clock().Now() - startedAt);
         if (outcome.purged != 0)
             _logger.Logf(LogLevel::Debug,
                          "expiry: reclaimed {} lapsed entr{} ({} examined)",
