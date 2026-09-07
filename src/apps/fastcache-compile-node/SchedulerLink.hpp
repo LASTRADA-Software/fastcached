@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Logger.hpp>
+
+#include <cstddef>
+#include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace FastCache::Node
 {
@@ -114,5 +119,77 @@ class SchedulerLink
     /// Redirects followed this round.
     int _hops = 0;
 };
+
+/// What one announcement round did, and how loudly to say it.
+///
+/// **A heartbeat and a registration are different events and one tally cannot carry
+/// both** (#999). `AnnounceOnce` counted only `accepted`, incremented on both paths,
+/// so a steady round of six heartbeats reported "6 of 6 toolchain(s) registered" every
+/// interval forever -- which reads as a node re-announcing its whole toolchain set on a
+/// timer. Measured on a live install: six registrations in the startup second, and every
+/// round after that heartbeats. The line described work nobody was doing, and cost an
+/// operator the question.
+///
+/// A pure function, for `RecheckDepthFor`'s reason: `main.cpp` is in no test target
+/// (#909), so a rule left as an expression in the announce loop can be checked only by
+/// reading it -- and the wording is the whole defect here, so it has to be assertable.
+struct RoundReport
+{
+    LogLevel level;      ///< How loudly to say it.
+    std::string message; ///< What to say, without the endpoint prefix.
+};
+
+/// Describe one announcement round.
+///
+/// Four outcomes, not two, and the third is the one worth catching: a heartbeat that
+/// FELL THROUGH to a registration means the scheduler had forgotten this worker, which
+/// is a real event wearing a steady round's clothes.
+///
+/// The all-heartbeat round is `Trace`, beside `Op::Heartbeat`'s own level (#992) and for
+/// #993's reason: it is narration, it repeats identically forever, and after #992 moved
+/// the heartbeat exchange to `Trace` this line became the only per-round output at
+/// `Debug` -- so it inherited the exact property that argued the heartbeat down.
+///
+/// @param beats         Registrars that heartbeated successfully.
+/// @param registrations Registrars that registered this round.
+/// @param total         Registrars attempted.
+/// @param leaderKnown   Whether a `NotLeader` named somewhere to go next.
+/// @return The level and the sentence.
+[[nodiscard]] inline RoundReport DescribeAnnounceRound(std::size_t beats,
+                                                       std::size_t registrations,
+                                                       std::size_t total,
+                                                       bool leaderKnown)
+{
+    auto const accepted = beats + registrations;
+
+    // **The wording of the ACCEPTED and SHORTFALL forms is a fixture contract** and is
+    // deliberately unchanged. `E2eRegisteredMarker` in `scripts/lib/e2e-common.sh` is
+    // "1 of 1 toolchain(s) registered", and its whole purpose is to tell an accepted
+    // worker from one the scheduler turned away -- `0 of 1` matching the bare word
+    // `registered` is #445, a wait that returned for a worker that never got in.
+    // Rewording either form breaks that distinction in a fixture rather than in a
+    // build, which is a timeout with no failed assertion. #999 is about the STEADY
+    // round, which no fixture waits on, so only that gains a new sentence.
+    if (accepted < total)
+        return { .level = leaderKnown ? LogLevel::Debug : LogLevel::Warn,
+                 .message = std::format("{} of {} toolchain(s) registered", accepted, total) };
+
+    // A heartbeat that fell through to a registration: the scheduler had forgotten this
+    // worker and it re-announced itself. Named rather than folded into either pure case,
+    // because it is the one an operator would want to see in a fleet that keeps losing
+    // workers -- and a round can be entirely successful and still be this. This form is
+    // NEW, so it carries the breakdown the other two do not need.
+    if (registrations > 0 && beats > 0)
+        return { .level = LogLevel::Info,
+                 .message = std::format("{} of {} toolchain(s) re-registered after a heartbeat was refused, {} still live",
+                                        registrations,
+                                        total,
+                                        beats) };
+
+    if (registrations > 0)
+        return { .level = LogLevel::Info, .message = std::format("{} of {} toolchain(s) registered", registrations, total) };
+
+    return { .level = LogLevel::Trace, .message = std::format("{} toolchain(s) still registered", beats) };
+}
 
 } // namespace FastCache::Node

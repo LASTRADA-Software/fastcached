@@ -311,6 +311,20 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // not stop the others from being announced, or a single bad entry silently
     // un-registers the whole worker.
     std::size_t accepted = 0;
+
+    // And counted APART, because a heartbeat and a registration are different events
+    // with different costs, and one number cannot carry both (#999). `accepted` was
+    // the only tally, so a steady round of six heartbeats reported itself as "6 of 6
+    // toolchain(s) registered" every interval forever -- which reads as a node
+    // re-announcing its whole toolchain set on a timer, and prompted exactly that
+    // question from an operator. It was not doing that; measured, six registrations
+    // land in the startup second and every round after is heartbeats.
+    //
+    // The conflation was already known one field down: `handedOver` exists because
+    // "`accepted` also counts a registration, which carries no history at all". That
+    // consequence was fixed and this one was not.
+    std::size_t beats = 0;
+    std::size_t registrations = 0;
     auto const inFlight = static_cast<std::uint32_t>(round.capacity.InFlight());
 
     // Sampled once per round rather than once per registrar: every entry describes
@@ -361,6 +375,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             if (beat.has_value())
             {
                 ++accepted;
+                ++beats;
                 handedOver = true;
                 continue;
             }
@@ -408,6 +423,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
             // else now serves whatever that scheduler leads.
             round.lease.fleet.Pin(registrar.ClusterId());
             ++accepted;
+            ++registrations;
         }
         else
         {
@@ -423,16 +439,13 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     if (handedOver && !outbox.empty())
         round.sampler.HistoryHandedThrough(outbox.back().startMillis);
 
-    // Not logged as a failure when a leader was named: nothing is wrong with a
-    // fleet that has just elected, and the caller is about to follow the redirect
-    // inside this same round. Reporting "0 of 1 registered" at Warn on every
-    // election would train an operator to ignore the line that matters.
-    bool const ok = accepted == round.registrars.size();
-    round.logger.Logf(ok || leader.has_value() ? LogLevel::Debug : LogLevel::Warn,
-                      "scheduler {}: {} of {} toolchain(s) registered",
-                      endpoint,
-                      accepted,
-                      round.registrars.size());
+    // What this round DID, and how loudly to say it -- see `DescribeAnnounceRound`,
+    // which owns both because the wording is the defect it was written for (#999) and
+    // `main.cpp` is in no test target (#909). The shortfall-behind-a-leader rule it
+    // carries is the one that used to live here: nothing is wrong with a fleet that has
+    // just elected, and the caller follows the redirect inside this same round.
+    auto const report = Node::DescribeAnnounceRound(beats, registrations, round.registrars.size(), leader.has_value());
+    round.logger.Logf(report.level, "scheduler {}: {}", endpoint, report.message);
     return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
 }
 
