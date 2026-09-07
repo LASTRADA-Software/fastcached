@@ -100,6 +100,15 @@ Each of these is a scar, not a preference.
   [#974](https://github.com/LASTRADA-Software/fastcached/issues/974); enforced by
   `ctest -R pr-closing-keywords`, which refuses a pull request whose commits name a
   ticket its body does not.
+
+  **And the body keyword becomes part of an EXCISION.** Dropping a ticket from a batch
+  is `rebase --onto`, which removes its commits and leaves the body still promising to
+  close it — which closes something nobody delivered. That is strictly worse than a
+  ticket staying open: an open one gets re-triaged, a wrongly closed one does not. So
+  Step 8 gains a line: **edit the ticket out of the body as well as off the branch.**
+  The check names a body keyword no commit backs on every run and does not refuse it —
+  the ordinary case is a change with no trailer at all, so a refusal would be wrong and
+  silence would hide the dangerous one.
 - **`Closes #A and #B` closes only `#A`.** GitHub needs the keyword before *each*
   number, so `and #B` parses as a plain reference and that ticket stays open after its
   fix has merged. Write `Closes #A, closes #B`.
