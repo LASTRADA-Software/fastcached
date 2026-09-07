@@ -1769,7 +1769,8 @@ namespace
                 // here because here is where every verb on every surface has already
                 // been routed to its owner and answered -- one line covers the cache,
                 // the scheduler and the compile surface without any of them knowing
-                // about logging. See `ExchangeLog.hpp` for why the LEVEL is per verb.
+                // about logging. See `ExchangeLog.hpp` for why the LEVEL is per verb,
+                // and why the level test lives in `LogExchange` rather than here.
                 //
                 // Placed before `ReclaimFromPulse` deliberately: it emits no frame and
                 // cannot suspend, so it does not sit between the pulse reclamation and
@@ -1777,19 +1778,13 @@ namespace
                 // one of the paths below goes on to `break`. What it claims is that the
                 // RESPONDER answered -- not that the reply reached anybody, which is a
                 // different fact and belongs to the write.
-                //
-                // Guarded on `MinLevel` rather than left to `Logf`, which filters but
-                // takes its arguments by value: the rendering would run for every
-                // `fetch` on a node at the default level and be thrown away. `Log` and
-                // not `Logf`, since the line is already formatted.
-                if (auto const level = Node::LogLevelForOp(decoded->opRaw); level >= state->logger.MinLevel())
-                    state->logger.Log(level,
-                                      Node::FormatExchange(decoded->opRaw,
-                                                           peer,
-                                                           frame.size(),
-                                                           reply,
-                                                           std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                               std::chrono::steady_clock::now() - startedAt)));
+                Node::LogExchange(
+                    state->logger,
+                    decoded->opRaw,
+                    peer,
+                    frame.size(),
+                    reply,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt));
 
                 // **Before every write below, and there are three of them.** The pulse is
                 // the only writer while the responder answers; this is where that stops

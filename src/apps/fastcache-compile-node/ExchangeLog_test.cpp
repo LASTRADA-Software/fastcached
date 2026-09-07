@@ -35,7 +35,11 @@ TEST_CASE("ExchangeLog: the high-rate verbs are Debug and the scheduling verbs a
     // scheduling -- which is the state this table was written to end.
     CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Fetch)) == LogLevel::Debug);
     CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Store)) == LogLevel::Debug);
-    CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Heartbeat)) == LogLevel::Debug);
+    // Trace, not Debug: the heartbeat is the only verb that arrives whether or
+    // not anybody is building, so at Debug it is the one line that makes an IDLE
+    // node's journal grow -- and a reader who turns Debug on wants the cache
+    // traffic, not the pulse.
+    CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Heartbeat)) == LogLevel::Trace);
 
     CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Lease)) == LogLevel::Info);
     CHECK(LogLevelForOp(static_cast<std::uint8_t>(Wire::Op::Compile)) == LogLevel::Info);
@@ -84,8 +88,8 @@ TEST_CASE("ExchangeLog: a reply that was never written is its own outcome", "[no
     auto const none = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, {}, 3ms);
     auto const err =
         FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Error), 3ms);
-    CHECK(none.find("no-reply") != std::string::npos);
-    CHECK(err.find("error") != std::string::npos);
+    CHECK(none.contains("no-reply"));
+    CHECK(err.contains("error"));
     CHECK(none != err);
 }
 
@@ -99,33 +103,33 @@ TEST_CASE("ExchangeLog: a miss and an ok are distinguishable in the line", "[nod
         FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Ok, 4096), 12ms);
     auto const miss =
         FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Miss), 1ms);
-    CHECK(hit.find("-> ok") != std::string::npos);
-    CHECK(miss.find("-> miss") != std::string::npos);
+    CHECK(hit.contains("-> ok"));
+    CHECK(miss.contains("-> miss"));
 
     // The sizes are in the line, because "the cache served 4 KiB" and "the cache
     // served nothing" is the same `ok` otherwise.
-    CHECK(hit.find("4097 B out") != std::string::npos);
+    CHECK(hit.contains("4097 B out"));
 }
 
 TEST_CASE("ExchangeLog: a peer the kernel could not name is said so, not left blank", "[node][logging]")
 {
     auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Lease), "", 32, ReplyWith(Wire::Status::Ok), 0ms);
-    CHECK(line.find("<unknown peer>") != std::string::npos);
+    CHECK(line.contains("<unknown peer>"));
 }
 
 TEST_CASE("ExchangeLog: the line names the verb, the peer and the elapsed time", "[node][logging]")
 {
     auto const line = FormatExchange(
         static_cast<std::uint8_t>(Wire::Op::Compile), "192.168.1.7", 1024, ReplyWith(Wire::Status::Ok, 8192), 4210ms);
-    CHECK(line.find("compile") != std::string::npos);
-    CHECK(line.find("192.168.1.7") != std::string::npos);
-    CHECK(line.find("4210 ms") != std::string::npos);
-    CHECK(line.find("1024 B in") != std::string::npos);
+    CHECK(line.contains("compile"));
+    CHECK(line.contains("192.168.1.7"));
+    CHECK(line.contains("4210 ms"));
+    CHECK(line.contains("1024 B in"));
 }
 
 TEST_CASE("ExchangeLog: an unrecognised status byte renders as its byte", "[node][logging]")
 {
     std::vector<std::byte> const weird { static_cast<std::byte>(0x7F) };
     auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "h", 8, weird, 0ms);
-    CHECK(line.find("status-0x7f") != std::string::npos);
+    CHECK(line.contains("status-0x7f"));
 }

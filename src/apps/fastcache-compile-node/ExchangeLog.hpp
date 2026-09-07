@@ -75,10 +75,12 @@ inline constexpr std::array ExchangeLogTable {
                  .rationale = "a worker joining is rare and is what an operator checks first when the fleet "
                               "distributes nothing" },
     VerbLogRow { .code = CompileCacheWire::Op::Heartbeat,
-                 .level = LogLevel::Debug,
-                 .rationale = "periodic per worker, so it scales with fleet size times a fixed interval; the "
-                              "signal an operator wants from it is ABSENCE, which a log line cannot carry and "
-                              "the registry's liveness view can" },
+                 .level = LogLevel::Trace,
+                 .rationale = "the only verb that arrives whether or not anybody is building, so at Debug it is the "
+                              "one line that makes an IDLE node's journal grow; below the cache verbs "
+                              "deliberately, since a reader who turns on Debug wants the traffic, not the "
+                              "pulse. What an operator wants from a heartbeat is ABSENCE, which no line can "
+                              "carry and the registry's liveness view can" },
     VerbLogRow { .code = CompileCacheWire::Op::Lease,
                  .level = LogLevel::Info,
                  .rationale = "the scheduling decision itself -- the verb whose silence prompted this table" },
@@ -140,7 +142,7 @@ static_assert(EveryLogLevelIsExplained(), "a level chosen without a reason canno
 /// @return The level for that verb.
 [[nodiscard]] constexpr LogLevel LogLevelForOp(std::uint8_t opRaw) noexcept
 {
-    auto const it = std::ranges::find_if(
+    auto const* const it = std::ranges::find_if(
         ExchangeLogTable, [&](VerbLogRow const& row) { return static_cast<std::uint8_t>(row.code) == opRaw; });
     return it == ExchangeLogTable.end() ? LogLevel::Debug : it->level;
 }
@@ -154,7 +156,7 @@ static_assert(EveryLogLevelIsExplained(), "a level chosen without a reason canno
 /// @return A name suitable for a log line.
 [[nodiscard]] inline std::string ExchangeVerbName(std::uint8_t opRaw)
 {
-    auto const it = std::ranges::find_if(CompileCacheWire::OpTable, [&](CompileCacheWire::OpDescriptor const& row) {
+    auto const* const it = std::ranges::find_if(CompileCacheWire::OpTable, [&](CompileCacheWire::OpDescriptor const& row) {
         return static_cast<std::uint8_t>(row.code) == opRaw;
     });
     return it == CompileCacheWire::OpTable.end() ? std::format("opcode-0x{:02x}", opRaw) : std::string { it->name };
@@ -189,7 +191,7 @@ inline constexpr std::array StatusNameTable {
 /// @return A name suitable for a log line.
 [[nodiscard]] inline std::string ExchangeStatusName(std::uint8_t statusRaw)
 {
-    auto const it = std::ranges::find_if(
+    auto const* const it = std::ranges::find_if(
         StatusNameTable, [&](StatusNameRow const& row) { return static_cast<std::uint8_t>(row.code) == statusRaw; });
     return it == StatusNameTable.end() ? std::format("status-0x{:02x}", statusRaw) : std::string { it->name };
 }
@@ -227,6 +229,36 @@ inline constexpr std::array StatusNameTable {
                        requestBytes,
                        reply.size(),
                        elapsed.count());
+}
+
+/// Record one exchange, if this logger is listening at that verb's level.
+///
+/// **A function rather than an `if` at the call site**, and that is not a style
+/// preference: `ServeConnection` sits at 58 of clang-tidy's cognitive-complexity
+/// threshold of 60 on master (#675), so one more branch there fails the build. The
+/// level test belongs with the table that decides the level anyway.
+///
+/// Guarded on `MinLevel` rather than left to `Logf`, which filters but takes its
+/// arguments by value: the rendering would otherwise run for every `fetch` on a node
+/// at the default level and be thrown away.
+///
+/// @param logger       Where the line goes.
+/// @param opRaw        The opcode byte as it arrived.
+/// @param peer         The peer's host, as the kernel reports it.
+/// @param requestBytes Length of the request frame.
+/// @param reply        The reply frame, empty when none was produced.
+/// @param elapsed      How long the responder took.
+inline void LogExchange(ILogger& logger,
+                        std::uint8_t opRaw,
+                        std::string_view peer,
+                        std::size_t requestBytes,
+                        std::span<std::byte const> reply,
+                        std::chrono::milliseconds elapsed)
+{
+    auto const level = LogLevelForOp(opRaw);
+    if (level < logger.MinLevel())
+        return;
+    logger.Log(level, FormatExchange(opRaw, peer, requestBytes, reply, elapsed));
 }
 
 } // namespace FastCache::Node
