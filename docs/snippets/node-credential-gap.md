@@ -29,8 +29,9 @@
     **What is still open is the credential itself**, and it is a gap rather than a
     design: what an inbound credential should be spelled, and what `AUTH` should
     mean against a node that has none configured, are the questions
-    [#198](https://github.com/LASTRADA-Software/fastcached/issues/198) is open on
-    ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289) is the
-    scheduler's half). Until it closes, a fleet's boundary is **network
+    [#976](https://github.com/LASTRADA-Software/fastcached/issues/976) is open on.
+    (#198 and #289 asked the worker's and the scheduler's halves separately and are
+    both closed; #976 is the live ticket, and the questions did not change.)
+    Until it closes, a fleet's boundary is **network
     reachability plus membership**, not a secret — so keep these surfaces on a
     network you would run a compiler for.

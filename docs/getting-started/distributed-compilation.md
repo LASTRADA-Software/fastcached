@@ -892,8 +892,13 @@ so a build LAN where addresses can be spoofed is not a boundary this can hold.
 ## Limits worth knowing before you adopt it
 
 - **Preprocessing does not distribute** (see step 1). The ceiling is ~10–40×.
-- **`-g` embeds the worker's scratch path** in DWARF. Use
-  `-fdebug-prefix-map` / `-ffile-prefix-map` if that matters.
+- **`-g` embeds the worker's scratch path** in DWARF. Use **`-fdebug-prefix-map`**,
+  which this launcher recognises and folds into the cache key, so two checkouts still
+  share. **Not `-ffile-prefix-map` or `-fmacro-prefix-map`**: they are deliberately not
+  recognised, and passing either costs cross-checkout sharing for that translation unit
+  — they rewrite `__FILE__` into the preprocessed text the key hashes, so the launcher
+  cannot relativize them without hashing text the real compile never produced. See
+  [the launcher's own account](../tools/fastcache-cc.md#debug-paths-in-a-replayed-object).
 - **Diagnostics from a failed remote compile are not shown.** A worker reporting
   a non-zero exit is retried locally and the local result is what you see —
   which also regenerates the diagnostics with correct line numbers.
