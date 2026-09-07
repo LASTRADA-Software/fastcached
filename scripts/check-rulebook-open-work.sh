@@ -151,6 +151,9 @@ set -uo pipefail
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rules_dir="${source_dir}/.agent/rules"
 mode=""
+# Empty except under `--pr`, where it names the pull request being judged. See
+# `closing_now` below for what it is for.
+pr_number=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -160,6 +163,9 @@ while [ $# -gt 0 ]; do
         --rules-dir)
             [ $# -ge 2 ] || { echo "--rules-dir needs a directory" >&2; exit 2; }
             rules_dir="$2"; shift 2 ;;
+        --pr)
+            [ $# -ge 2 ] || { echo "--pr needs a number" >&2; exit 2; }
+            pr_number="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -432,6 +438,37 @@ if [ "$mode" = "resolve" ]; then
         exit "$SKIP"
     fi
 
+    # Which tickets this pull request closes, asked of the script that owns GitHub's
+    # keyword pattern rather than re-deriving it here (#1016).
+    #
+    # An empty answer is legitimate -- most pull requests close nothing -- so it cannot
+    # be told apart from a failed one by the text. The EXIT STATUS is what separates
+    # them, and a failure refuses: an unreadable closing set would silently disable the
+    # `closing` verdict below and read exactly like a pull request that closes nothing,
+    # which is the shape this whole check exists to stop.
+    closing_now=""
+    if [ -n "$pr_number" ]; then
+        closing_script="${source_dir}/scripts/check-pr-closing-keywords.sh"
+        if [ ! -r "$closing_script" ]; then
+            echo "FAIL could-not-run: --pr ${pr_number} was given and ${closing_script} is not readable," >&2
+            echo "     so which tickets this pull request closes could not be established (#1016)." >&2
+            exit 1
+        fi
+        # `bash <path>`, never a bare path: 15 of the scripts here are mode 644 in git,
+        # and a bare invocation exits 126 -- which inside this guard would be
+        # indistinguishable from the pull request closing nothing (#723).
+        if ! closing_now="$(bash "$closing_script" --list-closing "$pr_number" 2>/dev/null)"; then
+            echo "FAIL could-not-run: could not read which tickets #${pr_number} closes, so the" >&2
+            echo "     entries were NOT checked against them. That is not a pass (#1016)." >&2
+            exit 1
+        fi
+        if [ -n "$closing_now" ]; then
+            echo "rulebook-open-work-state: #${pr_number} closes $(tr '\n' ' ' <<< "$closing_now")"
+        else
+            echo "rulebook-open-work-state: #${pr_number} closes no ticket, so no entry can go stale on it"
+        fi
+    fi
+
     # Every distinct slug the rulebook names, resolved ONCE. A typo in a slug is
     # a 404 on every entry that carries it; reported per entry that is forty
     # findings from one mistake, and each of them says the wrong thing.
@@ -532,6 +569,27 @@ if [ "$mode" = "resolve" ]; then
             echo "     residual it describes is still real -- open an issue for what is left and" >&2
             echo "     point the entry at that." >&2
             note_failure "stale"
+            continue
+        fi
+
+        # The entry names an OPEN issue, which is what the check above wants -- and it
+        # is about to stop being true, because this very pull request closes it (#1016).
+        #
+        # This is the one state no verdict could reach before. On the pull request that
+        # closes #N the issue is still open, so the entry is truthful and `stale` above
+        # correctly passes; the moment the merge lands, the same entry is stale and
+        # MASTER goes red. The check is right at both moments and there was no moment
+        # in between at which it could warn. Three instances in one day, and the third
+        # was an entry in a rule file the change never touched -- so "remember to tidy
+        # the rulebook you are editing" is a habit that holds only while the entry
+        # happens to be nearby.
+        if [ -n "$closing_now" ] && grep -qx -- "$number" <<< "$closing_now"; then
+            echo "FAIL closing: ${base}:${line} names #${number}, which THIS pull request closes." >&2
+            echo "     The entry is true right now and will be stale the moment this merges, which" >&2
+            echo "     is how master goes red on a change that passed every check (#1016)." >&2
+            echo "     Delete the entry here, or -- if a residual survives -- open an issue for what" >&2
+            echo "     is left and point the entry at that, in THIS pull request." >&2
+            note_failure "closing"
         fi
     done < "$entries"
 
@@ -578,6 +636,8 @@ cases_run=0
 _case() {
     local name="$1" want_status="$2" want_re="$3" deny_re="$4" tree="$5" stub="$6"
     local mode_flag="${7:---resolve}"
+    # Extra flags, word-split ON PURPOSE so a case can drive `--pr 42`.
+    local extra="${8:-}"
     local out="" got=0 path="$PATH"
 
     cases_run=$(( cases_run + 1 ))
@@ -587,7 +647,8 @@ _case() {
     # exits 126, and inside a want-fail assertion a shell that REFUSED TO START is
     # indistinguishable from the rule firing -- eight cases passed that way in
     # #723. Naming the interpreter removes the whole class.
-    out="$( PATH="$path" bash "${BASH_SOURCE[0]}" "$mode_flag" --rules-dir "$tree" 2>&1 )"
+    # shellcheck disable=SC2086 -- $extra is split deliberately; see above.
+    out="$( PATH="$path" bash "${BASH_SOURCE[0]}" "$mode_flag" $extra --rules-dir "$tree" 2>&1 )"
     got=$?
 
     if [ "$got" != "$want_status" ]; then
@@ -654,14 +715,28 @@ _tree() {
 #          same file the call sites live in, so it would pass with a branch
 #          deleted, and a guard that cannot fail is worse than none. An
 #          unrecognised value simply makes the stub behave.
+# @param 4 optional: the commit/body text `gh pr view` should report, e.g. 'Fixes #12'.
+#          Empty means the pull request closes nothing, which is the ordinary case and
+#          is a DIFFERENT answer from the call failing (#1016).
 _stub() {
-    local dir="$1" table="$2" fault="$3"
+    local dir="$1" table="$2" fault="$3" closes="${4:-}"
     mkdir -p "$dir"
     {
         echo '#!/usr/bin/env bash'
         echo 'arg="${2:-}"'
         printf 'fault=%s\n' "${fault:-none}"
+        printf 'closes=%s\n' "$(printf '%q' "$closes")"
         cat <<'STUB'
+# `gh pr view <n> --repo R --json body,commits`, which is how the closing set is read.
+if [ "${1:-}" = "pr" ]; then
+    if [ "$fault" = "pr-unreadable" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+    fi
+    printf '{"body":"%s","commits":[{"messageHeadline":"fix: a thing","messageBody":"%s"}]}\n' \
+        "$closes" "$closes"
+    exit 0
+fi
 case "$arg" in
     rate_limit)
         if [ "$fault" = "anchor-down" ]; then
@@ -746,6 +821,43 @@ _tree "${st}/clean" 11 12
 _stub "${st}/bin-clean" "11:open:issue 12:open:issue" ""
 _case "control-passes" 0 "resolved 2 of 2" "FAIL" "${st}/clean" "${st}/bin-clean"
 
+# --- closing: the state no verdict could reach before (#1016) ----------------
+#
+# The entry names an issue that is OPEN, and the pull request under test closes it.
+# `stale` is correct to pass here -- at this moment the entry is true -- so without
+# this verdict the check goes green and master goes red on the merge. Three instances
+# in one day.
+#
+# Both arms use the SAME tree and the same entry, and differ only in which ticket the
+# pull request closes. That is what makes the pair a test of the verdict rather than of
+# the fixture: a check that refused every `--pr` run would pass the first and fail the
+# second.
+_stub "${st}/bin-closing" "11:open:issue 12:open:issue" "" "Fixes #12"
+_case "closing-refuses-an-entry-this-pr-closes" 1 \
+    "FAIL closing: .*#12, which THIS pull request closes" "FAIL stale" \
+    "${st}/clean" "${st}/bin-closing" "--resolve" "--pr 42"
+
+_stub "${st}/bin-closing-other" "11:open:issue 12:open:issue" "" "Fixes #99"
+_case "closing-control-a-pr-closing-nothing-in-the-rulebook" 0 \
+    "resolved 2 of 2" "FAIL" \
+    "${st}/clean" "${st}/bin-closing-other" "--resolve" "--pr 42"
+
+# A pull request that closes NOTHING is the ordinary case, and it must not be confused
+# with one whose closing set could not be read -- the arm below is the other half.
+_stub "${st}/bin-closing-none" "11:open:issue 12:open:issue" "" ""
+_case "closing-control-a-pr-with-no-trailer-at-all" 0 \
+    "closes no ticket" "FAIL" \
+    "${st}/clean" "${st}/bin-closing-none" "--resolve" "--pr 42"
+
+# And the direction that must never be silent: the closing set could not be read, so
+# the `closing` verdict did not run. Reported as a failure rather than skipped, because
+# an unreadable set is indistinguishable from a pull request that closes nothing, and
+# reading it as the latter disables this check exactly when it is needed.
+_stub "${st}/bin-closing-broken" "11:open:issue 12:open:issue" "pr-unreadable" ""
+_case "closing-refuses-when-the-set-could-not-be-read" 1 \
+    "FAIL could-not-run: could not read which tickets #42 closes" "" \
+    "${st}/clean" "${st}/bin-closing-broken" "--resolve" "--pr 42"
+
 # --- stale ------------------------------------------------------------------
 _stub "${st}/bin-stale" "11:open:issue 12:closed:issue" ""
 _case "stale" 1 "FAIL stale: .*#12, which is closed" "could-not-run|bad-reference" \
@@ -791,6 +903,14 @@ _case "could-not-run-unreadable" 1 "which this check cannot read" "FAIL stale|FA
 _stub "${st}/bin-anchor-down" "11:open:issue 12:open:issue" "anchor-down"
 _case "prerequisite-missing-skips" 77 "SKIPPED: gh cannot reach the API" "FAIL" \
     "${st}/clean" "${st}/bin-anchor-down"
+
+# The same, WITH `--pr`. The closing-set acquisition also talks to the API, so putting
+# it before the anchor turns an outage into a red tree instead of a skip -- which is the
+# skipped/failed collapse this repository keeps meeting, introduced by the fix for
+# something else. It was written that way first; this case is why it did not ship.
+_stub "${st}/bin-anchor-down-pr" "11:open:issue 12:open:issue" "anchor-down" "Fixes #12"
+_case "prerequisite-missing-skips-even-under-pr" 77 "SKIPPED: gh cannot reach the API" "FAIL" \
+    "${st}/clean" "${st}/bin-anchor-down-pr" "--resolve" "--pr 42"
 
 # --- a slug that is not a repository: ONE finding, not one per entry ---------
 _stub "${st}/bin-slug404" "11:open:issue 12:open:issue" "slug-404"
