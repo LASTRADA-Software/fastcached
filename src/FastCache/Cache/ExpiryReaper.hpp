@@ -162,9 +162,14 @@ class ExpiryReaper
     ///
     /// The reaper owns the coroutine frame for its whole life, which is what
     /// makes `Stop` able to reclaim it. Call once.
-    /// @param reactor Reactor whose clock paces the cycle and whose thread the
-    ///        sweeps run on. Must outlive this reaper.
-    void Start(IReactor& reactor);
+    /// @param reactor Reactor whose clock paces the cycle. Must outlive this reaper.
+    /// @param sweepOn Where `SweepOnce` runs. Pass the reactor itself to keep the
+    ///        sweep on the loop, which is what every test and every in-memory
+    ///        deployment wants; pass a pool to take it off (#946). `IReactor` IS an
+    ///        `IExecutor`, so there is ONE code path and no null to branch on.
+    ///        Must outlive this reaper -- see `Stop`, which is what makes that
+    ///        orderable.
+    void Start(IReactor& reactor, IExecutor& sweepOn);
 
     /// Stop the cycle and reclaim its coroutine frame.
     ///
@@ -188,17 +193,36 @@ class ExpiryReaper
     /// to one, for the same reason `InterruptibleSleepUntil` spells both that
     /// way: this is a coroutine, so a reference parameter is bound before the
     /// first suspension and then outlives the expression that produced it.
-    /// @param reactor Reactor whose clock paces the cycle and whose thread the
-    ///        sweeps run on. Must not be null, and must outlive the task.
+    /// @param reactor Reactor whose clock paces the cycle. Must not be null, and
+    ///        must outlive the task.
+    /// @param sweepOn Where the sweep body runs; see `Start`. Must not be null.
     /// @param token  Observed at every wake; cancelling it ends the loop.
     /// @return A task that completes when the cycle stops.
-    [[nodiscard]] Task<void> Run(IReactor* reactor, CancellationToken token);
+    [[nodiscard]] Task<void> Run(IReactor* reactor, IExecutor* sweepOn, CancellationToken token);
 
     /// One sweep, with this reaper's budget. Exposed so the sweep can be
     /// exercised without a reactor.
     /// @param now Current clock value.
     /// @return What the sweep did.
     PurgeOutcome SweepOnce(TimePoint now);
+
+    /// Whether a sweep body is executing right now.
+    ///
+    /// **The one fact `Stop` cannot do without.** Once the sweep runs on a pool the
+    /// task's frame is, for that interval, not parked on the reactor -- so
+    /// `CancelPending` cannot retract it and `~Task` would destroy a frame the pool
+    /// thread is still inside. Reading this is how `Stop` waits for that window to
+    /// close before it reclaims anything.
+    ///
+    /// Set on the pool immediately before the sweep and cleared immediately after,
+    /// so it brackets exactly the interval in which the frame is unreachable from
+    /// the reactor. It is NOT "a cycle is running": between sweeps the frame is
+    /// parked on the reactor's timer and perfectly reclaimable.
+    /// @return True while the sweep body is on the executor.
+    [[nodiscard]] bool Sweeping() const noexcept
+    {
+        return _sweeping.load(std::memory_order_acquire);
+    }
 
     /// @return How many sweeps have run.
     [[nodiscard]] std::uint64_t Cycles() const noexcept
@@ -253,6 +277,8 @@ class ExpiryReaper
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
     IReactor* _reactor { nullptr };
+    /// See `Sweeping()`. Atomic because `Stop` reads it from another thread.
+    std::atomic<bool> _sweeping { false };
     CancellationSource _source;
     Task<void> _task;
 };

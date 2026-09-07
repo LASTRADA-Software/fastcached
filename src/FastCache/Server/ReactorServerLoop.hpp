@@ -140,8 +140,12 @@ namespace Detail
     /// @param options Server options; only `expiry` is read.
     /// @param metrics Counter sink, or nullptr.
     /// @return The running cycle. Stops when destroyed.
-    [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(
-        IReactor& reactor, CacheEngine& engine, ILogger& logger, ReactorServerOptions const& options, IMetricsSink* metrics);
+    [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(IReactor& reactor,
+                                                                 IExecutor& sweepOn,
+                                                                 CacheEngine& engine,
+                                                                 ILogger& logger,
+                                                                 ReactorServerOptions const& options,
+                                                                 IMetricsSink* metrics);
 
     /// Start every accept loop in `servers` and report the ones that armed.
     ///

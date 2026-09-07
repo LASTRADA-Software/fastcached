@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
@@ -137,7 +138,18 @@ namespace
         // and it emits it only once every accept loop is parked in `Accept()`.
         Detail::ArmAcceptLoops(servers, "reactor 0", announcer, logger);
 
-        auto const expiry = Detail::StartExpiryCycle(reactor, engine, logger, options, metrics);
+        // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals
+        // are destroyed in reverse, so `~ExpiryReaper` -- which cancels the cycle and
+        // waits out any sweep still on this pool -- runs before `~ThreadPoolExecutor`
+        // joins its thread. Reversed, the pool would be torn down under a sweep it is
+        // still running. This is the shape `main.cpp` already relies on for the
+        // compile pool, stated there as "~WorkerServer runs before
+        // ~ThreadPoolExecutor because `server` is declared after the pool".
+        //
+        // One thread: the sweep is a single cycle, and a second would only let two
+        // sweeps overlap on one store.
+        ThreadPoolExecutor expiryPool { 1 };
+        auto const expiry = Detail::StartExpiryCycle(reactor, expiryPool, engine, logger, options, metrics);
 
         std::atomic<bool> watchdogQuit { false };
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
@@ -360,7 +372,18 @@ namespace
         };
         auto watchdog = MakeWatchdog(watchdogQuit, stopAll);
 
-        auto const expiry = Detail::StartExpiryCycle(*reactors[0], engine, logger, options, metrics);
+        // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals
+        // are destroyed in reverse, so `~ExpiryReaper` -- which cancels the cycle and
+        // waits out any sweep still on this pool -- runs before `~ThreadPoolExecutor`
+        // joins its thread. Reversed, the pool would be torn down under a sweep it is
+        // still running. This is the shape `main.cpp` already relies on for the
+        // compile pool, stated there as "~WorkerServer runs before
+        // ~ThreadPoolExecutor because `server` is declared after the pool".
+        //
+        // One thread: the sweep is a single cycle, and a second would only let two
+        // sweeps overlap on one store.
+        ThreadPoolExecutor expiryPool { 1 };
+        auto const expiry = Detail::StartExpiryCycle(*reactors[0], expiryPool, engine, logger, options, metrics);
 
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
@@ -497,7 +520,18 @@ namespace
             reactors[index]->Run();
         };
 
-        auto const expiry = Detail::StartExpiryCycle(*reactors[0], engine, logger, options, metrics);
+        // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals
+        // are destroyed in reverse, so `~ExpiryReaper` -- which cancels the cycle and
+        // waits out any sweep still on this pool -- runs before `~ThreadPoolExecutor`
+        // joins its thread. Reversed, the pool would be torn down under a sweep it is
+        // still running. This is the shape `main.cpp` already relies on for the
+        // compile pool, stated there as "~WorkerServer runs before
+        // ~ThreadPoolExecutor because `server` is declared after the pool".
+        //
+        // One thread: the sweep is a single cycle, and a second would only let two
+        // sweeps overlap on one store.
+        ThreadPoolExecutor expiryPool { 1 };
+        auto const expiry = Detail::StartExpiryCycle(*reactors[0], expiryPool, engine, logger, options, metrics);
 
         std::vector<std::jthread> threads;
         threads.reserve(reactorCount - 1);
@@ -549,11 +583,15 @@ int RunReactorServer(ReactorServerOptions const& options,
 namespace Detail
 {
 
-    std::unique_ptr<ExpiryReaper> StartExpiryCycle(
-        IReactor& reactor, CacheEngine& engine, ILogger& logger, ReactorServerOptions const& options, IMetricsSink* metrics)
+    std::unique_ptr<ExpiryReaper> StartExpiryCycle(IReactor& reactor,
+                                                   IExecutor& sweepOn,
+                                                   CacheEngine& engine,
+                                                   ILogger& logger,
+                                                   ReactorServerOptions const& options,
+                                                   IMetricsSink* metrics)
     {
         auto reaper = std::make_unique<ExpiryReaper>(engine.Storage(), logger, options.expiry, metrics);
-        reaper->Start(reactor);
+        reaper->Start(reactor, sweepOn);
         return reaper;
     }
 
