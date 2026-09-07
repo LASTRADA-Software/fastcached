@@ -372,18 +372,20 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
     for (std::uint64_t i = 1; i <= _totalDataPages; ++i)
         _live.insert(i);
 
-    // The free-list head lives in `live.freeRoot`. Each free-list page
-    // (when implemented) chains via its first 8 bytes to the next free
-    // page id, with the rest holding additional free ids. For the MVP
-    // we treat freeRoot itself as a leaf-pointer to a singly-linked
-    // chain of free pages (one id per page).
+    // `live.freeRoot` names a chain of DEDICATED free-list pages, each holding a
+    // `next` pointer, a count, and that many page ids. Dedicated is the whole point:
+    // a chain threaded through the FREE PAGES themselves is destroyed the moment
+    // `Allocate` hands one out and its caller writes to it, so a crash between two
+    // commits would leave a broken chain on an otherwise healthy store. Nothing
+    // hands out a list page, so a malformed one here really is damage -- which is
+    // why the refusals below are right, and are the ones #635 pinned.
     //
-    // A visited set + iteration cap guards against a corrupted or
-    // adversarial file whose `next` link forms a cycle — without the
-    // guard Open() loops forever and the in-memory _freeList grows
-    // without bound.
+    // This is the shape btrfs uses for the same reason: free-space metadata lives in
+    // its own blocks and is written copy-on-write, never inside the space it
+    // describes.
     std::unordered_set<std::uint64_t> visited;
     visited.reserve(_totalDataPages);
+    auto const perPage = (_pageSize - 16) / sizeof(std::uint64_t);
     auto cursor = live.freeRoot;
     while (cursor)
     {
@@ -392,21 +394,34 @@ auto FilePageStore::RecoverExistingFile() -> std::expected<void, CowTreeError>
             return std::unexpected(CowTreeError::Corrupt);
         if (!visited.insert(pageIndex).second)
             return std::unexpected(CowTreeError::Corrupt);
-        _live.erase(pageIndex);
-        _freeList.push_back(pageIndex);
 
-        // Chase the chain. Use the little-endian decode path that
-        // every other on-disk field uses; a raw memcpy here would
-        // disagree on a big-endian host.
-        std::array<std::byte, 8> buf {};
-        if (auto const r = ReadAt(DataPageOffset(cursor), BytesSpan { buf.data(), buf.size() }); !r.has_value())
+        std::vector<std::byte> page(_pageSize);
+        if (auto const r = ReadAt(DataPageOffset(cursor), BytesSpan { page.data(), page.size() }); !r.has_value())
             return std::unexpected(r.error());
+
         std::uint64_t nextRaw = 0;
-        std::memcpy(&nextRaw, buf.data(), sizeof(nextRaw));
-        if constexpr (std::endian::native != std::endian::little)
-            nextRaw = std::byteswap(nextRaw);
+        std::uint64_t count = 0;
+        std::memcpy(&nextRaw, page.data(), sizeof(nextRaw));
+        std::memcpy(&count, page.data() + sizeof(nextRaw), sizeof(count));
+        if (count > perPage)
+            return std::unexpected(CowTreeError::Corrupt);
+
+        for (std::uint64_t k = 0; k < count; ++k)
+        {
+            std::uint64_t id = 0;
+            std::memcpy(&id, page.data() + 16 + (k * sizeof(id)), sizeof(id));
+            if (id == 0 || id > _totalDataPages)
+                return std::unexpected(CowTreeError::Corrupt);
+            _live.erase(id);
+            _freeList.push_back(id);
+        }
+
+        // The list's own pages are live and are NOT reusable until the next flush
+        // supersedes the meta that names them.
+        _freeListPages.push_back(pageIndex);
         cursor = PageId { nextRaw };
     }
+
     return {};
 }
 
@@ -510,6 +525,81 @@ auto FilePageStore::Read(PageId id) const -> std::expected<BytesView, CowTreeErr
     return BytesView { _readBuffer.data(), _readBuffer.size() };
 }
 
+namespace
+{
+    /// Bytes of a free-list page before its ids: `next` then `count`.
+    constexpr std::size_t FreeListHeaderBytes = 16;
+} // namespace
+
+auto FilePageStore::ExtendLocked() -> std::expected<PageId, CowTreeError>
+{
+    auto const newIdx = static_cast<std::uint64_t>(_totalDataPages) + 1;
+    _totalDataPages = static_cast<std::size_t>(newIdx);
+    _live.insert(newIdx);
+    std::vector<std::byte> blank(_pageSize, std::byte { 0 });
+    if (auto const r = WriteAt(DataPageOffset(PageId { newIdx }), BytesView { blank.data(), blank.size() }); !r.has_value())
+        return std::unexpected(r.error());
+    return PageId { newIdx };
+}
+
+auto FilePageStore::WriteFreeListLocked() -> std::expected<PageId, CowTreeError>
+{
+    // The pages that held the PREVIOUS list are freed here rather than reused: the
+    // caller frees them only after its new meta is durable, so until then the old
+    // meta is still recoverable and still names them.
+    auto const previous = std::move(_freeListPages);
+    _freeListPages.clear();
+
+    auto const snapshot = _freeList;
+    if (snapshot.empty())
+    {
+        for (auto const idx: previous)
+            _pendingFree.push_back(idx);
+        return PageId::None();
+    }
+
+    auto const perPage = (_pageSize - FreeListHeaderBytes) / sizeof(std::uint64_t);
+    auto const pagesNeeded = (snapshot.size() + perPage - 1) / perPage;
+
+    // Allocated by EXTENDING, never from the free list -- see `ExtendLocked`. This is
+    // also why the snapshot is taken first: extending does not change it.
+    std::vector<PageId> listPages;
+    listPages.reserve(pagesNeeded);
+    for (std::size_t i = 0; i < pagesNeeded; ++i)
+    {
+        auto const page = ExtendLocked();
+        if (!page.has_value())
+            return std::unexpected(page.error());
+        listPages.push_back(*page);
+    }
+
+    // Written back to front so each page can name its successor.
+    std::vector<std::byte> buffer(_pageSize);
+    for (std::size_t i = pagesNeeded; i-- > 0;)
+    {
+        std::ranges::fill(buffer, std::byte { 0 });
+        std::uint64_t const next = (i + 1 < pagesNeeded) ? listPages[i + 1].value : 0;
+        auto const first = i * perPage;
+        auto const count = std::min(perPage, snapshot.size() - first);
+        std::memcpy(buffer.data(), &next, sizeof(next));
+        auto const countRaw = static_cast<std::uint64_t>(count);
+        std::memcpy(buffer.data() + sizeof(next), &countRaw, sizeof(countRaw));
+        for (std::size_t k = 0; k < count; ++k)
+        {
+            auto const id = snapshot[first + k];
+            std::memcpy(buffer.data() + FreeListHeaderBytes + (k * sizeof(id)), &id, sizeof(id));
+        }
+        if (auto const r = WriteAt(DataPageOffset(listPages[i]), BytesView { buffer.data(), buffer.size() }); !r.has_value())
+            return std::unexpected(r.error());
+    }
+
+    for (auto const page: listPages)
+        _freeListPages.push_back(page.value);
+    for (auto const idx: previous)
+        _pendingFree.push_back(idx);
+    return listPages.front();
+}
+
 auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
 {
     std::scoped_lock const lock { _ioMutex };
@@ -524,16 +614,8 @@ auto FilePageStore::Allocate() -> std::expected<PageId, CowTreeError>
             _readBufferPageIdx = 0;
         return PageId { idx };
     }
-    auto const newIdx = static_cast<std::uint64_t>(_totalDataPages) + 1;
-    _totalDataPages = static_cast<std::size_t>(newIdx);
-    _live.insert(newIdx);
-
-    // Extend the file with zeros so a subsequent Read before Write does
-    // not race against a sparse-file allocation pattern.
-    std::vector<std::byte> blank(_pageSize, std::byte { 0 });
-    if (auto const r = WriteAt(DataPageOffset(PageId { newIdx }), BytesView { blank.data(), blank.size() }); !r.has_value())
-        return std::unexpected(r.error());
-    return PageId { newIdx };
+    // One extend path, shared with the free list's own pages -- see `ExtendLocked`.
+    return ExtendLocked();
 }
 
 auto FilePageStore::Write(PageId id, BytesView data) -> std::expected<void, CowTreeError>
@@ -585,7 +667,23 @@ auto FilePageStore::FlushBatchLocked() -> std::expected<void, CowTreeError>
     }
     // Copy the buffered meta out under the has_value() guard, before the Fsync
     // and the reset() below (so the access is provably checked and never dangles).
-    auto const pending = *_pendingMeta;
+    auto pending = *_pendingMeta;
+
+    // **The free list is written HERE, and `freeRoot` is the store's field alone.**
+    // The flush is the only moment at which a list is consistent with the meta that
+    // will name it: recovery lands on this meta, and the list is a snapshot of what
+    // was free at exactly this point, so every page it names is genuinely free in the
+    // world this meta describes. A page allocated after this flush is named by a
+    // transaction that did not commit, so re-handing it out after a crash is correct
+    // rather than a double allocation.
+    //
+    // Written before the data fsync below, so the list pages are durable before the
+    // meta references them -- the same ordering rule the comment beneath states for
+    // every other data page.
+    auto const freeRoot = WriteFreeListLocked();
+    if (!freeRoot.has_value())
+        return std::unexpected(freeRoot.error());
+    pending.freeRoot = *freeRoot;
 
     // Crash-safe group commit, in strict order:
     //   1. fsync the buffered DATA pages so they are durable before any meta
