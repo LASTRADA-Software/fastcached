@@ -227,11 +227,11 @@ compile_once() {
 # calls were never asking for the same cache entry.
 firstOutput="$(compile_once)"
 echo "$firstOutput"
-echo "$firstOutput" | grep -q "fastcache-cc: MISS key=" || fail "first compile against the auto-started daemon was not a MISS"
+grep -q "fastcache-cc: MISS key=" <<< "$firstOutput" || fail "first compile against the auto-started daemon was not a MISS"
 
 secondOutput="$(compile_once)"
 echo "$secondOutput"
-echo "$secondOutput" | grep -q "fastcache-cc: HIT key=" || fail "second compile against the auto-started daemon was not a HIT"
+grep -q "fastcache-cc: HIT key=" <<< "$secondOutput" || fail "second compile against the auto-started daemon was not a HIT"
 
 # --- assertion 3: a second configure must not start a second daemon ---------
 echo "--- second configure: expect the SAME daemon to be found, not a new one ---"

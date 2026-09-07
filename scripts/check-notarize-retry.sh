@@ -55,7 +55,7 @@ run_case() {
     out="$(PATH="$work/bin:$PATH" ART="$work/thing.pkg" HOOK="$hook" \
            cmake -P "$work/drive.cmake" 2>&1)"
     got=fatal
-    printf '%s' "$out" | grep -q 'DRIVER-COMPLETED' && got=completed
+    grep -q 'DRIVER-COMPLETED' <<< "$out" && got=completed
 
     if [[ $got != "$want" ]]; then
         refuse "case '$name' expected $want, got $got"
@@ -63,7 +63,7 @@ run_case() {
         failures=$((failures + 1))
         return
     fi
-    if ! printf '%s' "$out" | grep -q -- "$wantMsg"; then
+    if ! grep -q -- "$wantMsg" <<< "$out"; then
         refuse "case '$name' gave the right outcome for the wrong reason -- expected '$wantMsg'"
         printf '%s\n' "$out" | sed 's/^/    /' >&2
         failures=$((failures + 1))

@@ -485,7 +485,15 @@ if [[ -n "$tls" ]]; then
             # the negative control below is what caught that, and without it this
             # whole block would have passed while asserting nothing.
             checks_name() {
-                openssl x509 -in "$pem" -noout "$1" "$2" 2>/dev/null | grep -q "does match"
+                # CAPTURED, then matched -- never `openssl ... | grep -q`. `grep -q`
+                # exits at its first match, the producer then writes into a closed
+                # pipe and takes SIGPIPE, and under `pipefail` the pipeline reports
+                # the PRODUCER's status: a false negative on the SUCCESS path (#970).
+                # Here that would report a valid certificate as invalid for its own
+                # name, intermittently.
+                local answer=""
+                answer="$(openssl x509 -in "$pem" -noout "$1" "$2" 2>/dev/null || true)"
+                grep -q "does match" <<< "$answer"
             }
 
             checks_name -checkhost localhost \

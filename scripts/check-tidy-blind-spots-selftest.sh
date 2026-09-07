@@ -45,7 +45,7 @@ run_case() {
         failures=$((failures + 1))
         return
     fi
-    if ! printf '%s' "$out" | grep -q -- "$wantMsg"; then
+    if ! grep -q -- "$wantMsg" <<< "$out"; then
         echo "CMake Error: check-tidy-blind-spots-selftest: case '$name' gave the right verdict for the wrong reason -- expected '$wantMsg'" >&2
         echo "$out" | sed 's/^/    /' >&2
         failures=$((failures + 1))

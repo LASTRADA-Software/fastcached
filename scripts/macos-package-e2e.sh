@@ -253,7 +253,13 @@ grep -qx "${PREFIX}/bin" "$PATHS_D" || fail "$PATHS_D does not name ${PREFIX}/bi
 # step-6 check that no receipt survives passes vacuously if they were never
 # registered under this prefix in the first place, which is exactly what an
 # empty CPACK_PRODUCTBUILD_IDENTIFIER produced.
-pkgutil --pkgs | grep -q "^${LABEL}\." \
+# CAPTURED, then matched -- never `pkgutil --pkgs | grep -q`. `grep -q` exits at its
+# first match, `pkgutil` then writes into a closed pipe and takes SIGPIPE, and under
+# `pipefail` the pipeline reports the PRODUCER's status: a false negative on the
+# SUCCESS path (#970), which here fails the package job for a correct package. The
+# more receipts a machine carries, the likelier it is.
+installedPackages="$(pkgutil --pkgs || true)"
+grep -q "^${LABEL}\." <<< "$installedPackages" \
     || fail "no package receipt starts with ${LABEL}; the uninstaller would never find them"
 
 # The symlinks are what make the tools reachable in a shell that is already

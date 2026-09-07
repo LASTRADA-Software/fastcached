@@ -1942,6 +1942,130 @@ if [ "$timeout_scanned" -lt 1 ]; then
     note_failure "timeout-scan"
 fi
 
+# --- no script pipes into `grep -q` under pipefail --------------------------
+#
+# `grep -q` exits at its FIRST match. The producer is then writing into a closed
+# pipe, takes SIGPIPE, and under `pipefail` the pipeline reports the PRODUCER's
+# status -- so the test fails on the SUCCESS path, and only when the producer is
+# still writing when grep leaves. Output size decides that, which is why it passes
+# on a developer's machine and reddens a runner (#970).
+#
+# `.agent/rules/build-and-toolchain.md` has carried this rule since the TSan gate's
+# `nm "$b" | grep -q __tsan_init`, and five scripts here carry a comment explaining
+# why they do NOT do it. It came back in ten files anyway -- which is #627's lesson
+# exactly: a rule stated in the files that obey it never reaches the file that does
+# not. So it is a scan.
+#
+# The remedy is a HERESTRING (`grep -q P <<< "$text"`) when the producer is a
+# variable -- no pipe, so no SIGPIPE -- or capture-then-match when it is a command.
+echo "== no script pipes into grep -q under pipefail"
+
+# Does this script actually TURN pipefail ON? Not "mentions pipefail": five files
+# here name it only in a comment saying why they avoid the idiom, and flagging
+# those would spend the scan's credibility on rows that are already right.
+_enables_pipefail() {
+    grep -qE '^[[:space:]]*set[[:space:]]+-[A-Za-z]*o[A-Za-z]*[[:space:]]+pipefail' "$1"
+}
+
+# A pipe into a `grep` carrying `-q`, in any bundling: `-q`, `-qi`, `-qx`, `-qFf`,
+# `-Fq`. The bundled forms are not decoration -- the hand census that opened #970
+# spelled the pattern `| grep -q` and was blind to the five `grep -Fxq` sites in
+# `check-gated-jobs.sh` and `check-merge-queue-contexts.sh`, which is to say to the
+# two checks that decide which contexts are REQUIRED. This scan found them.
+#
+# Comment lines are stripped first -- a COMMENT is not a call site, and two checks
+# in this tree have already matched their own headers.
+#
+# What it does NOT do, stated rather than left to be discovered: it cannot see that
+# a `| grep -q` inside a double-quoted STRING runs nothing. The `timeout` scan
+# solves its version of that by demanding command position; there is no equivalent
+# here, because the defect's own shape IS a pipe. Such a line would have to be
+# reworded or the file exempted with a reason. None exists today.
+_pipe_into_grep_q() {
+    grep -nE '\|[[:space:]]*grep[[:space:]]+([^|;&]*[[:space:]])?-[A-Za-z]*q' "$1" \
+        | grep -v '^[0-9][0-9]*: *#' || true
+}
+
+# The canary, both directions. A scan nobody has watched refuse is a scan
+# reporting PASS over a set in which nothing could fail.
+grepq_canary_dir="$(mktemp -d)"
+cat > "${grepq_canary_dir}/must-catch.sh" <<'CANARY'
+printf '%s' "$out" | grep -q -- "$want"
+echo "$x" | grep -qi "feature"
+pkgutil --pkgs | grep -q "^${LABEL}\."
+foo | grep -Fq bar
+printf '%s\n' "$t" | grep -qFf "$needles" || return 0
+if ! printf '%s\n' "$legs" | grep -qx -- "$leg"; then :; fi
+CANARY
+cat > "${grepq_canary_dir}/must-not-catch.sh" <<'CANARY'
+grep -q "does match" <<< "$answer"
+hits="$(printf '%s\n' "$text" | grep -n -F -- "$token" || true)"
+# printf '%s' "$out" | grep -q -- "$want"
+out="$(producer)"; case "$out" in *"$want"*) : ;; esac
+grep -q -- "$wantMsg" <<< "$out"
+CANARY
+ran=$(( ran + 1 ))
+grepq_caught="$(_pipe_into_grep_q "${grepq_canary_dir}/must-catch.sh" | grep -c . || true)"
+if [ "$grepq_caught" -ne 6 ]; then
+    echo "FAIL grep-q-scan-canary: the scan caught ${grepq_caught} of 6 staged pipelines," >&2
+    echo "     so it cannot be trusted to have found none in the real scripts" >&2
+    _pipe_into_grep_q "${grepq_canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
+    note_failure "grep-q-scan-canary"
+fi
+ran=$(( ran + 1 ))
+grepq_spurious="$(_pipe_into_grep_q "${grepq_canary_dir}/must-not-catch.sh" || true)"
+if [ -n "$grepq_spurious" ]; then
+    echo "FAIL grep-q-scan-canary: the scan fired on a shape that is not the defect" >&2
+    printf '%s\n' "$grepq_spurious" | sed 's/^/     | /' >&2
+    note_failure "grep-q-scan-canary"
+fi
+# The pipefail predicate needs its own canary, because it is what decides whether a
+# file is EXAMINED at all: read wrong in the quiet direction it exempts everything
+# and the scan reports clean over nothing, which is the failure its neighbours'
+# censuses guard against.
+printf 'set -euo pipefail\n' > "${grepq_canary_dir}/on.sh"
+printf 'set -o pipefail\n' > "${grepq_canary_dir}/on2.sh"
+printf '# set -o pipefail is deliberately NOT used here\nset -u\n' > "${grepq_canary_dir}/off.sh"
+ran=$(( ran + 1 ))
+if ! _enables_pipefail "${grepq_canary_dir}/on.sh" \
+    || ! _enables_pipefail "${grepq_canary_dir}/on2.sh" \
+    || _enables_pipefail "${grepq_canary_dir}/off.sh"; then
+    echo "FAIL grep-q-scan-canary: the pipefail predicate misreads a staged script," >&2
+    echo "     so which files the scan examines is not what it claims" >&2
+    note_failure "grep-q-scan-canary"
+fi
+rm -rf "$grepq_canary_dir"
+
+grepq_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary pipelines above. They are heredoc text and run nothing; the canary asserting all six are caught is what covers them."
+grepq_scanned=0
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    _scan_exempt "$base" "$grepq_allowed" && continue
+    _enables_pipefail "$script" || continue
+    grepq_scanned=$(( grepq_scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_pipe_into_grep_q "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL grep-q-scan: ${base} sets pipefail and pipes into grep -q." >&2
+        echo "     grep -q exits at its first match, the producer takes SIGPIPE, and pipefail" >&2
+        echo "     reports the PRODUCER's status -- a false negative on the SUCCESS path (#970)." >&2
+        echo "     Use a herestring: grep -q PATTERN <<< \"\$text\"; or capture, then match." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        note_failure "grep-q-scan"
+    fi
+done < <( _shell_scripts )
+
+# A census, for the reason its neighbour records: a walk that matched nothing
+# reports clean over zero files and reads exactly like complete coverage.
+ran=$(( ran + 1 ))
+if [ "$grepq_scanned" -lt 1 ]; then
+    echo "FAIL grep-q-scan: no script under scripts/ sets pipefail, which cannot be true." >&2
+    echo "     Either the walk found no files or the pipefail predicate stopped matching;" >&2
+    echo "     either way every script 'passed' without being read." >&2
+    note_failure "grep-q-scan"
+fi
+
 # --- no script keeps its own copy of a shared helper ------------------------
 #
 # The other half of #449, and the half a conversion cannot enforce on its own.
@@ -2260,7 +2384,7 @@ _bash32_readable() {
 _bash32_hits() {
     local file="$1" i=0 token="" hits="" text=""
     text="$(_bash32_readable "$file")"
-    printf '%s\n' "$text" | grep -qFf "$bash32_needles" || return 0
+    grep -qFf "$bash32_needles" <<< "$text" || return 0
     while [ "$i" -lt "${#banned[@]}" ]; do
         token="${banned[$i]%%:*}"
         hits="$(printf '%s\n' "$text" | grep -n -F -- "$token" || true)"

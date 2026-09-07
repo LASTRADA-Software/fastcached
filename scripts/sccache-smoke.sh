@@ -74,7 +74,7 @@ sccache --stop-server >/dev/null 2>&1 || true
 # skip rather than a hard failure.
 if ! start_err="$(sccache --start-server 2>&1)"; then
     echo "$start_err" >&2
-    if echo "$start_err" | grep -qi "feature configuration"; then
+    if grep -qi "feature configuration" <<< "$start_err"; then
         echo "sccache lacks ${protocol} backend support; skipping"
         exit "$SKIP"
     fi
