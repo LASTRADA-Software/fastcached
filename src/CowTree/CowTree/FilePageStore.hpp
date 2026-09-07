@@ -168,6 +168,21 @@ class FilePageStore final: public IPageStore
     void SimulateCrashForTest() noexcept;
 
   private:
+    /// Write the free list to DEDICATED pages and return the head.
+    ///
+    /// Private: `freeRoot` is the STORE's business, and the flush is the only moment
+    /// at which a list is consistent with the meta that will name it.
+    /// @return The head of the new chain, or `PageId::None()` when nothing is free.
+    [[nodiscard]] auto WriteFreeListLocked() -> std::expected<PageId, CowTreeError>;
+
+    /// Extend the file by one page, without drawing on the free list.
+    ///
+    /// **The recursion guard.** The free list's own pages may not come from the free
+    /// list: allocating one would change the very set being written, which is where
+    /// btrfs shipped real bugs in its free space tree.
+    /// @return The new page.
+    [[nodiscard]] auto ExtendLocked() -> std::expected<PageId, CowTreeError>;
+
     explicit FilePageStore(Options options) noexcept;
 
 #if !defined(_WIN32)
@@ -237,6 +252,13 @@ class FilePageStore final: public IPageStore
     /// In-memory free list of recyclable page ids. Populated from the
     /// on-disk free-list chain on Open and updated on Free/Allocate.
     std::vector<std::uint64_t> _freeList;
+
+    /// Pages holding the free list that the LAST DURABLE meta points at.
+    ///
+    /// Kept so the next flush can free them once its own meta supersedes that one.
+    /// They must not be recycled before then: until the new meta is fsynced, the old
+    /// one is still the recoverable copy and its `freeRoot` still names these.
+    std::vector<std::uint64_t> _freeListPages;
 
     /// Group-commit (Batched durability): pages freed since the last flush.
     /// They are NOT reusable yet — reusing a page before its freeing is

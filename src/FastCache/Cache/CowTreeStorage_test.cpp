@@ -3471,3 +3471,51 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
     CHECK((*second)->Snapshot().indexBytes > 0);
     CHECK((*second)->Snapshot().itemCount == 1);
 }
+
+TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][freelist][persist]")
+{
+    // #990's own measurement, inverted into an assertion. Before this the free list
+    // was pinned to `None` on every commit, so a reopened store marked every data page
+    // live: pages a previous session freed were not forgotten but permanently CLAIMED,
+    // and the file grew past its configured bound across restarts.
+    //
+    // Asserted on the FILE SIZE and not on a counter, because the counter is the half
+    // that lied -- `bytesUsed` read 65,536 in both sessions of the original measurement
+    // while the file went 1,114,112 -> 2,179,072.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+    opts.maxBytes = 64 * 1024;
+
+    auto const write300 = [&](FastCache::CowTreeStorage& store) {
+        for (auto const i: std::views::iota(0, 300))
+            REQUIRE(store.Set(std::format("k-{:04}", i), MakeBytes(std::string(1024, 'x')), 0, FastCache::TimePoint::max())
+                        .has_value());
+    };
+
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        write300(**first);
+    }
+    // Read AFTER the close: the store commits on destruction.
+    auto const afterFirst = std::filesystem::file_size(tmp.path);
+
+    // Not vacuous: the first session really did exceed its bound, so there ARE freed
+    // pages for the second to find. Without this the case could pass on a store that
+    // never freed anything, which is the shape that would be silent about the defect.
+    REQUIRE(afterFirst > opts.maxBytes);
+
+    {
+        auto second = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(second.has_value());
+        write300(**second);
+    }
+    auto const afterSecond = std::filesystem::file_size(tmp.path);
+
+    // **The assertion.** A second session of identical work must not double the file.
+    // A ratio rather than a byte figure: the absolute size depends on page size,
+    // compression and the tree's shape, none of which this is about.
+    INFO("file after session 1: " << afterFirst << ", after session 2: " << afterSecond);
+    CHECK(afterSecond < afterFirst * 3 / 2);
+}

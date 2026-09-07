@@ -89,6 +89,21 @@ void PutNextLink(std::span<std::byte> page, std::uint64_t value) noexcept
         page[i] = static_cast<std::byte>((value >> (8 * i)) & 0xFFU);
 }
 
+/// Write a free-list page's id count, which follows its `next` link.
+void PutFreeListCount(std::span<std::byte> page, std::uint64_t count) noexcept
+{
+    for (auto const i: std::views::iota(std::size_t { 0 }, sizeof(count)))
+        page[8 + i] = static_cast<std::byte>((count >> (8 * i)) & 0xFFU);
+}
+
+/// Write the `slot`-th page id of a free-list page.
+void PutFreeListId(std::span<std::byte> page, std::size_t slot, std::uint64_t id) noexcept
+{
+    auto const at = 16 + (slot * sizeof(id));
+    for (auto const i: std::views::iota(std::size_t { 0 }, sizeof(id)))
+        page[at + i] = static_cast<std::byte>((id >> (8 * i)) & 0xFFU);
+}
+
 /// Open -- or reopen -- the free-list fixture's store at `path`.
 ///
 /// One options block for both directions, because a seed and a reopen that
@@ -148,10 +163,23 @@ void SeedFreeListChain(std::filesystem::path const& path, CowTree::PageId nextOf
         REQUIRE(id->value == expected);
     }
 
+    // Two free-list PAGES. Since #990 the list lives in dedicated pages rather than
+    // being threaded through the free pages themselves -- a page holds `next`, a
+    // count, and that many ids -- so the fixture writes that shape. The two damage
+    // cases below are unchanged by it: an out-of-range `next` and a cycle are both
+    // still expressed by the `next` field, which is what they seed.
+    //
+    // Page 1 names nothing and page 2 names page 3, so a walk that RAN is visible as
+    // page 3 having become free while the list pages themselves stay live.
     std::vector<std::byte> page(FreeListPageSize, std::byte { 0 });
     PutNextLink(page, nextOfOne.value);
+    PutFreeListCount(page, 0);
     REQUIRE((*store)->Write(CowTree::PageId { 1 }, CowTree::BytesView { page.data(), page.size() }).has_value());
+
+    std::ranges::fill(page, std::byte { 0 });
     PutNextLink(page, nextOfTwo.value);
+    PutFreeListCount(page, 1);
+    PutFreeListId(page, 0, 3);
     REQUIRE((*store)->Write(CowTree::PageId { 2 }, CowTree::BytesView { page.data(), page.size() }).has_value());
 
     CowTree::Meta meta;
@@ -827,9 +855,13 @@ TEST_CASE("An intact free-list chain is walked at Open and its pages are recycle
     // that is not live, so this says the walk ran and consumed exactly the two
     // pages the chain named.
     REQUIRE((*store)->TotalDataPages() == FreeListFixturePages);
-    REQUIRE_FALSE((*store)->Read(CowTree::PageId { 1 }).has_value());
-    REQUIRE_FALSE((*store)->Read(CowTree::PageId { 2 }).has_value());
-    REQUIRE((*store)->Read(CowTree::PageId { 3 }).has_value());
+    // The list's own pages stay LIVE -- that is what makes the layout safe, since
+    // nothing hands them out for `Allocate` to overwrite. What the walk consumed is
+    // page 3, the one the list NAMED. `Read` rejects a page that is not live, so this
+    // says the walk ran and freed exactly what it was told to.
+    REQUIRE((*store)->Read(CowTree::PageId { 1 }).has_value());
+    REQUIRE((*store)->Read(CowTree::PageId { 2 }).has_value());
+    REQUIRE_FALSE((*store)->Read(CowTree::PageId { 3 }).has_value());
 }
 
 TEST_CASE("A free-list link pointing past the end of the file refuses the store at Open",
