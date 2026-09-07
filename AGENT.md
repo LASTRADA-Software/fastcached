@@ -429,7 +429,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   *unbounded*, so the flag that turns a cache off once turned its limit off.
 - What a node holds back from compiles is what its tier **built**, never what a flag
   asked for — so capacity is derived *below* the tier startup. Which tiers cost RAM
-  is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing.
+  is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing. A
+  disk tier's own key index is RAM that no budget covers (#175), and it is **a working
+  set rather than a store**: `TouchOrInsert` builds the mirror and `Open` never calls
+  it, so a store holding a million objects reports `indexBytes == 0` and
+  `itemCount == 0` the instant it reopens — measured, `ctest -R FastCacheTest`
+  `[index][capacity]`. That rules out the cheapest fix, a reservation taken at startup,
+  on exactly the node the ticket is about: a long-lived worker with a warm disk tier,
+  restarted. `itemCount` is `_index.size()` and starts at zero too, so inferring the
+  opposite from it is the available mistake.
 - A node SERVES while it identifies its toolchains. The cheap half (WHICH compilers)
   stays at startup; the walk (over 300 s cold, at 2.7% CPU duty — a filesystem wall,
   not a thread shortage) moves to the heartbeat thread's first round. It registers

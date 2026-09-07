@@ -3418,3 +3418,56 @@ TEST_CASE("The expiry sweep reads a TTL without inflating the value", "[cowstora
     REQUIRE(lapsed.purged == 1U);
     REQUIRE_FALSE((*storage)->Get("k", clock.Now())->found);
 }
+
+TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is on disk", "[cowstorage][index][capacity]")
+{
+    // The measurement [#175](https://github.com/LASTRADA-Software/fastcached/issues/175)
+    // turns on, taken rather than read. That ticket's cheapest option is to reserve the
+    // index at startup, from `StorageStats` -- and this is what decides whether that
+    // option exists at all.
+    //
+    // The LRU mirror is populated by `TouchOrInsert`, which `Open` never calls. So the
+    // index of a store holding a million objects is EMPTY the instant it reopens, and a
+    // reservation taken at startup would reserve nothing on the very node the ticket is
+    // about: a long-lived worker with a warm disk tier, restarted.
+    //
+    // **This pins a fact, not a policy.** It is equally true and equally load-bearing
+    // whichever way #175 is settled -- a fix that reserves must reserve something other
+    // than a startup reading, and a fix that bounds the index must bound something that
+    // starts empty and grows. Asserting it is what stops the next reader inferring the
+    // opposite from `itemCount`, which is `_index.size()` and therefore starts at zero
+    // too while the tree on disk is full.
+    TempFile tmp;
+    FastCache::CowTreeStorage::Options opts;
+    opts.path = tmp.path;
+
+    constexpr int Objects = 64;
+    {
+        auto first = FastCache::CowTreeStorage::Open(opts);
+        REQUIRE(first.has_value());
+        for (auto const i: std::views::iota(0, Objects))
+            REQUIRE(
+                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+        // Not vacuous: the index really is populated before the close, so a zero after
+        // it is the reopen and not a store that never held anything.
+        REQUIRE((*first)->Snapshot().indexBytes > 0);
+    }
+
+    auto second = FastCache::CowTreeStorage::Open(opts);
+    REQUIRE(second.has_value());
+
+    // Nothing has been touched, so nothing is mirrored -- while every one of the
+    // objects is still on disk, which the read below proves.
+    CHECK((*second)->Snapshot().indexBytes == 0);
+    CHECK((*second)->Snapshot().itemCount == 0);
+
+    FastCache::ManualClock clock;
+    auto const got = (*second)->Get("key-0000", clock.Now());
+    REQUIRE(got.has_value());
+    REQUIRE(got->found);
+
+    // And one read is what puts one entry into the mirror. The index is a function of
+    // the WORKING SET since the last restart, not of the store.
+    CHECK((*second)->Snapshot().indexBytes > 0);
+    CHECK((*second)->Snapshot().itemCount == 1);
+}
