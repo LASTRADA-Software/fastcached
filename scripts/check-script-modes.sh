@@ -115,7 +115,7 @@ Assert() {  # $1 = label, $2 = dir, $3 = expect pass|fail, $4 = expected mode
     out=$(Check "$2" 2>&1) && rc=0 || rc=1
     cases=$((cases + 1))
     case "$4" in
-        ?*) printf '%s\n' "$out" | grep -q "enumerated via $4" \
+        ?*) grep -q "enumerated via $4" <<< "$out" \
                 || { echo "  FAIL: $1 -- expected enumeration '$4', got: $(printf '%s' "$out" | head -1)"; exit 1; } ;;
     esac
     if [ "$3" = pass ] && [ "$rc" -ne 0 ]; then echo "  FAIL: $1 -- expected a pass"; printf '%s\n' "$out"; exit 1; fi
@@ -145,7 +145,7 @@ mkdir -p "$tmp/nogit/scripts"
 printf '#!/usr/bin/env bash\ntrue\n' > "$tmp/nogit/scripts/a.sh"
 out=$(Check "$tmp/nogit" 2>&1 || true)
 cases=$((cases + 1))
-printf '%s\n' "$out" | grep -q "enumerated via walk" \
+grep -q "enumerated via walk" <<< "$out" \
     && echo "  ok: a non-git tree falls back to the walk" \
     || { echo "  FAIL: a non-git tree did not use the walk: $(printf '%s' "$out" | head -1)"; exit 1; }
 

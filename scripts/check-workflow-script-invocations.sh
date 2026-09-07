@@ -141,7 +141,7 @@ Assert() {  # $1 = label, $2 = dir, $3 = pass|fail, $4 = expected mode source
     local out rc
     out=$(FASTCACHED_WORKFLOW_MODE_FILE="$tmp/$2/modes" Check "$tmp/$2" 2>&1) && rc=0 || rc=1
     cases=$((cases + 1))
-    printf '%s\n' "$out" | grep -q "modes from $4" \
+    grep -q "modes from $4" <<< "$out" \
         || { echo "  FAIL: $1 -- expected mode source '$4'"; printf '%s\n' "$out"; exit 1; }
     if [ "$3" = pass ] && [ "$rc" -ne 0 ]; then echo "  FAIL: $1 -- expected a pass"; printf '%s\n' "$out"; exit 1; fi
     if [ "$3" = fail ] && [ "$rc" -eq 0 ]; then echo "  FAIL: $1 -- expected a refusal"; printf '%s\n' "$out"; exit 1; fi

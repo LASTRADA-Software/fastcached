@@ -139,7 +139,7 @@ while IFS=$'\t' read -r path reached _; do
     IFS=',' read -ra names <<< "$reached"
     for leg in "${names[@]}"; do
         leg="${leg// /}"
-        if ! printf '%s\n' "$legs" | grep -qx -- "$leg"; then
+        if ! grep -qx -- "$leg" <<< "$legs"; then
             echo "CMake Error: tidy-blind-spots: '$path' claims coverage by '$leg', which is not a clang-tidy leg in .github/workflows/build.yml." >&2
             echo "  A row naming a leg that does not exist is a claim of coverage nothing provides." >&2
             rc=1

@@ -613,8 +613,8 @@ while IFS=$'\t' read -r context workflow; do
     [[ -n "$context" ]] || continue
     inRequired=no
     inNonBinding=no
-    printf '%s\n' "$requiredNames" | grep -Fxq -- "$context" && inRequired=yes
-    printf '%s\n' "$nonBindingNames" | grep -Fxq -- "$context" && inNonBinding=yes
+    grep -Fxq -- "$context" <<< "$requiredNames" && inRequired=yes
+    grep -Fxq -- "$context" <<< "$nonBindingNames" && inNonBinding=yes
 
     if [[ "$inRequired" == "yes" && "$inNonBinding" == "yes" ]]; then
         Fail "'$context' is in BOTH tables. Required and non-binding are opposite claims; a context carrying both has no verdict at all."
@@ -635,7 +635,7 @@ for row in ${NonBindingContexts[@]+"${NonBindingContexts[@]}"}; do
     verdict="${rest%%|*}"
     reason="${rest#*|}"
 
-    printf '%s\n' "$allProduced" | grep -Fxq -- "$context" \
+    grep -Fxq -- "$context" <<< "$allProduced" \
         || Fail "\`NonBindingContexts\` names '$context', which no job in any workflow produces. A stale row silently excuses nothing and hides the context that replaced it."
 
     case "$verdict" in

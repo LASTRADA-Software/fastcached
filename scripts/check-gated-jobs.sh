@@ -310,7 +310,7 @@ else
             echo "ok: '$DocSubjectRunner' runs ungated in job '$jobKey'"
         fi
 
-        if printf '%s\n' "$requiredNames" | grep -Fxq -- "$jobName"; then
+        if grep -Fxq -- "$jobName" <<< "$requiredNames"; then
             echo "ok: job '$jobKey' produces the required context '$jobName', so a failing doc check blocks the merge"
         else
             Fail "job '$jobKey' runs \`$DocSubjectRunner\` but its name '$jobName' is not a required context. A doc check that reports and does not GATE is #684 -- measured on this repository, five of the last six failing merge-group runs failed an unrequired job and all five pull requests merged with nobody told."
@@ -358,7 +358,7 @@ else
     while IFS="$FieldSep" read -r jobKey cond; do
         [[ -n "$jobKey" ]] || continue
         # Only jobs that gate the release, and only conditions keyed on the event.
-        printf '%s\n' "$releaseNeeds" | grep -Fxq -- "$jobKey" || continue
+        grep -Fxq -- "$jobKey" <<< "$releaseNeeds" || continue
         case "$cond" in
             *github.event_name*|*github.ref*) ;;
             *) continue ;;

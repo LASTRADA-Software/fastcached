@@ -948,6 +948,44 @@ determinism rests on.
     answer is caught by the first person who checks it twice; a racy one is
     attributed to the subject, which is how it survives. Two runs agreeing is
     therefore not evidence that a pipeline of this shape is sound.
+
+    **And it came back, in EIGHTEEN sites across twelve scripts, with the rule already
+    written down here** ([#970](https://github.com/LASTRADA-Software/fastcached/issues/970)).
+    Observed as `clang-asan-ubsan` failing `check-tidy-blind-spots-selftest` with a
+    message saying it could not find a phrase that was in the evidence it printed
+    directly beneath — which is not a contradiction but the diagnosis: the match never
+    failed, the pipeline's STATUS did. It reddens correct branches, intermittently, and
+    a re-run clears it, which is the shape #473 records as teaching people to re-run
+    until a gate is disarmed.
+    - So it is a **SCAN** now, in `check-e2e-helpers.sh` beside the `timeout` and
+      bash-3.2 ones, off the same `_shell_scripts` enumeration. Five scripts already
+      carried a comment explaining why they do NOT do this, and it spread anyway:
+      *a rule stated in the files that obey it never reaches the file that does not*,
+      which is #627 in a different costume.
+    - It examines only scripts that actually `set` pipefail, not ones that MENTION it —
+      those five comments are exactly the text a looser predicate would fire on, and
+      spending a scan's credibility on rows that are already right is how it gets
+      ignored. The predicate has a canary of its own, because it decides which files are
+      examined AT ALL: read wrong in the quiet direction it exempts everything and the
+      scan reports clean over nothing.
+    - **The hand census that opened the ticket missed five of the eighteen**, and they
+      were the worst five: `check-gated-jobs.sh` and `check-merge-queue-contexts.sh`,
+      the two checks that decide which contexts are REQUIRED. It spelled the pattern
+      `| grep -q` and the real spelling was `grep -Fxq`. A pattern is narrower than its
+      author reads it as — the mirror of `pkill -f` being broader — and it is the SCAN
+      that found them, not the person who wrote the ticket.
+      **And that ticket's own header said "11 sites, 10 files" over a table listing
+      13** — a total stated beside a table rather than derived from it, which is the
+      rule two sections down, broken in the act of reporting a broken rule. The final
+      figures here are computed from the diff, not typed.
+    - The remedy is a HERESTRING, `grep -q P <<< "$text"`: no pipe, so no SIGPIPE, and
+      no capture-and-compare boilerplate at the site. Capture-then-match stays right for
+      a producer that is a COMMAND rather than a variable.
+    - What the scan cannot see, stated rather than left to be found: a `| grep -q`
+      inside a double-quoted STRING runs nothing, and no regex over the defect's own
+      shape can tell. The `timeout` scan escapes that by demanding command position;
+      there is no equivalent here. Such a line is reworded or the file is exempted with
+      a reason. None exists today.
   - **An edit script asserts its anchor MATCHED, and a generator that produced
     nothing fails rather than reporting success.** The same family as the two above,
     reached from the authoring side rather than the checking side, and it happened

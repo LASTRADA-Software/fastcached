@@ -1363,7 +1363,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   fails on the SUCCESS path: `grep -q` exits at the first match, the producer dies
   of SIGPIPE, and `pipefail` reports the producer's status. `nm "$b" | grep -q
   __tsan_init` therefore says "absent" precisely *because* the symbol is there.
-  Capture into a variable and match afterwards.
+  Capture into a variable and match afterwards. **It came back in EIGHTEEN sites
+  across twelve scripts** (#970) — including the two checks that decide which contexts
+  are REQUIRED — so it is now a SCAN in `check-e2e-helpers.sh` beside the `timeout` and
+  bash-3.2 ones, over every script that actually turns `pipefail` on. A rule stated in
+  the five files that obey it reaches no file that does not; five of them carry a
+  comment explaining why they avoid the idiom, and it still spread. **And the hand
+  census that opened the ticket missed five of the eighteen**, because it spelled the
+  pattern `| grep -q` and the real spelling was `grep -Fxq` — the scan found those. A
+  pattern is narrower than its author reads it as, which is the mirror of `pkill -f`.
+  The remedy is a HERESTRING (`grep -q P <<< "$text"`), which is not a pipe.
 - The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS`
   table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
   restating it — a second copy is not a cross-check, it is a second thing to be
