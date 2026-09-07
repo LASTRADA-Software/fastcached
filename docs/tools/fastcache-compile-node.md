@@ -1089,7 +1089,11 @@ also lists in its own `--fleet-member` stays admitted to that node's three surfa
 after the forget, because the two are separate routes and forgetting speaks for one
 of them — see [who a node
 admits](../operations/cluster-communication.md#who-a-node-admits). Revoking such a
-host means dropping it from `--fleet-member` on the machines that list it.
+host means dropping it from `--fleet-member` on the machines that list it **and
+restarting them**: that flag is not reloadable, so `SIGHUP` will not take it away.
+Under `--fleet-open` a forget revokes nothing at all, because there is no set to
+remove anybody from
+([#265](https://github.com/LASTRADA-Software/fastcached/issues/265)).
 
 ### Finding peers instead of typing them
 

@@ -467,6 +467,32 @@ Consequences that are each load-bearing:
       `--fleet-member` on a clustered node, on the reasoning that the flag was about to
       be overwritten — which was true and was the bug. A line that steers an operator
       around a defect is one more thing to correct when the defect is fixed.
+    - **Addition is dynamic; REMOVAL is not, and that asymmetry is the composition's
+      standing cost** ([#265](https://github.com/LASTRADA-Software/fastcached/issues/265)).
+      `AnyOfMembership` admits whoever ANY participant admits, and `--fleet-member` is
+      `Reloadable::No`, so a host on both lists cannot be revoked while the node runs:
+      `--cluster-forget` takes it out of the quorum and it keeps the right to spend that
+      machine's CPU and read its cache tier. Revoking it is a config change **and a
+      restart** of every node that lists it. Under `--fleet-open` there is no revocation
+      at all, which is the flag working.
+      - **It does not contradict *absence from `ClusterState` is not removal*.** That
+        rule is about ABSENCE — a member the state never named, which must not be read
+        as a removal — while a forget is a positive act and does revoke what consensus
+        granted. What it cannot reach is a second route a different operator asserted by
+        hand. The two look contradictory to a reader meeting them cold, which is why
+        both are written down here rather than left to be re-derived.
+      - The machine an operator most wants to revoke is the one they stopped trusting,
+        and that is precisely the machine most likely to be in BOTH lists — so this is
+        not an academic corner.
+      - **Pinned by a test rather than only by prose**, and the direction that matters is
+        *worsen*: a change making `Publish` write `_listed` would look like a fix and
+        would discard every client machine the operator named, which is #251 exactly. The
+        case asserts both halves — a listed host survives the forget, a cluster-only host
+        does not — because one alone passes on a node whose `Publish` does nothing.
+      - The real fix is a credential, not a third list: an address list cannot be revoked
+        centrally and cannot describe a host whose address is not stable (a VPN peer,
+        DHCP, a container). Same conclusion #242 reached from the other direction, and
+        it is [#977](https://github.com/LASTRADA-Software/fastcached/issues/977).
 - **An unbounded wait does not avoid an ending, it only chooses who picks it — and
   the supervisor picks `SIGKILL` with no diagnostic.** `~WorkerServer` drained on an
   unbounded condition variable, and the comment defending that was right about its
