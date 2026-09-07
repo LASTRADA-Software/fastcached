@@ -1284,6 +1284,26 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     //
     // **Do not shorten this sleep.** Below `HeaderTimeout` the case stops discriminating
     // and becomes a slower copy of the one above.
+    //
+    // **Its floor is therefore `HeaderTimeout + 2 * SweepInterval` = 7.5 s, and that
+    // number is what a failure REPORT has to be read against**
+    // ([#831](https://github.com/LASTRADA-Software/fastcached/issues/831)). This case
+    // was once seen dying at **5.21 s** under `ctest --parallel 32`, reported as
+    // `Subprocess terminated`, and the coincidence with five seconds made it look like
+    // a deadline. It is not one: nothing in this case can CONCLUDE before the sleep
+    // returns, so a death inside it is neither an assertion failing nor a bound firing
+    // -- both would be later. The only assertions before it are the two instant
+    // `RequestTimeout` reads and `WaitForStarted`, which bounds at 10 s.
+    //
+    // Measured on a clean tree, three consecutive runs: 8.82 s, exit 0. The five in
+    // `HeaderTimeout` is what the arithmetic is BUILT from; it is not a window this
+    // case ever waits on, since the whole point is that the compile's own window is
+    // `DefaultCompileLeaseTimeout` -- ten minutes -- as the two `REQUIRE`s below
+    // assert.
+    //
+    // So a sub-7.5 s termination here is the process being killed from outside: an OOM
+    // kill on a loaded host, another lane's `pkill`, or a stale binary from a tree that
+    // did not finish linking. Read it that way before reading it as this subsystem.
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
