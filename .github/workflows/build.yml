@@ -3025,6 +3025,108 @@ jobs:
       # Return="ignore" and therefore fails in complete silence. A seed that did
       # not happen leaves a service running on built-in defaults and an operator
       # editing a file that is not there.
+      # The POSITIVE CONTROL for the step below, and the half
+      # [#866](https://github.com/LASTRADA-Software/fastcached/issues/866) asks for
+      # by name. That step's assertions are all of the form "no entry matches", and
+      # a mask or a filter that matches NOTHING passes every one of them on a
+      # perfectly broken machine. #866's first half -- making `$planting` mirror
+      # `PlantingRights` bit for bit -- was verified by CORRESPONDENCE, which is
+      # exactly what that ticket found wrong with the mask in the first place: a
+      # check written to mirror a predicate, drifting from it, with a comment
+      # continuing to vouch for the correspondence.
+      #
+      # So this plants a grant the daemon's predicate refuses and requires the
+      # detector to FIND it -- on a throwaway directory, never on the real one. The
+      # control must not be able to leave the machine-wide configuration broken if
+      # this step dies between planting and cleaning up, which is what the
+      # `finally` is for.
+      #
+      # BOTH directions, because either alone is vacuous: a filter matching
+      # everything passes the positive half, and one matching nothing passes the
+      # negative half -- and the second is the failure mode the step below has by
+      # construction.
+      #
+      # It runs BEFORE the real check, so a broken detector is reported as a broken
+      # detector rather than as a clean machine.
+      - name: "Positive control: the planting detector can actually fire (#866)"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The same two definitions the step below uses, duplicated DELIBERATELY
+          # and it is the one duplication this file should have: a control sharing
+          # the mask with its subject would pass on a mask that was empty, which is
+          # the whole thing being controlled for.
+          $broad = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-546')
+          $lowWord = [int64]4294967295
+          $planting = ([int64][Security.AccessControl.FileSystemRights]::CreateFiles) `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::CreateDirectories `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::Delete `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::ChangePermissions `
+                    -bor [int64][Security.AccessControl.FileSystemRights]::TakeOwnership `
+                    -bor [int64]1073741824 `
+                    -bor [int64]268435456
+
+          function Get-Grantees($rules, $sids, $rights) {
+            $mask = ([int64]$rights) -band $lowWord
+            return @($rules | Where-Object {
+              $sids -contains $_.IdentityReference.Value -and
+              ((([int64]$_.FileSystemRights) -band $lowWord) -band $mask) -ne 0
+            })
+          }
+
+          function Get-AllowList($path) {
+            return @((Get-Acl $path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+                     Where-Object { $_.AccessControlType -eq 'Allow' })
+          }
+
+          function New-AllowRule($sid, $rights) {
+            return New-Object System.Security.AccessControl.FileSystemAccessRule(
+              (New-Object System.Security.Principal.SecurityIdentifier $sid),
+              $rights,
+              [Security.AccessControl.InheritanceFlags]::None,
+              [Security.AccessControl.PropagationFlags]::None,
+              [Security.AccessControl.AccessControlType]::Allow)
+          }
+
+          $probe = Join-Path $env:RUNNER_TEMP ("planting-control-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $probe | Out-Null
+          try {
+            # Protected and rebuilt from nothing, so the negative half is a
+            # statement about what this control planted rather than about whatever
+            # the runner's temp directory happens to inherit.
+            $acl = Get-Acl $probe
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule((New-AllowRule 'S-1-5-18' ([Security.AccessControl.FileSystemRights]::FullControl)))
+            $acl.AddAccessRule((New-AllowRule ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) ([Security.AccessControl.FileSystemRights]::FullControl)))
+            Set-Acl -Path $probe -AclObject $acl
+
+            $clean = Get-AllowList $probe
+            if ($clean.Count -eq 0) { throw "control: read no allow entries from $probe" }
+            $before = @(Get-Grantees $clean $broad $planting)
+            if ($before.Count -ne 0) {
+              $before | ForEach-Object { Write-Host "::error::$($_.IdentityReference) ($($_.FileSystemRights))" }
+              throw "control (negative half): a directory granting no broad principal anything came back with $($before.Count) planter(s). The filter matches too much, so the real check's 'no entry matches' proves nothing."
+            }
+
+            # A grant the daemon's own predicate refuses: BUILTIN\Users able to
+            # create files. CreateFiles alone, so this also pins that the mask
+            # covers the most ordinary way to plant a file and not only the exotic
+            # bits #866 added.
+            $acl = Get-Acl $probe
+            $acl.AddAccessRule((New-AllowRule 'S-1-5-32-545' ([Security.AccessControl.FileSystemRights]::CreateFiles)))
+            Set-Acl -Path $probe -AclObject $acl
+
+            $after = @(Get-Grantees (Get-AllowList $probe) $broad $planting)
+            if ($after.Count -eq 0) {
+              throw "control (positive half): BUILTIN\Users was granted CreateFiles and the detector found NOTHING. Every 'no entry matches' assertion in the next step is therefore vacuous, which is #866 exactly and is why correspondence alone was not enough."
+            }
+            Write-Host "::notice::planting detector fired on a planted grant ($($after.Count) grantee(s)) and stayed silent on a clean list"
+          }
+          finally {
+            Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue
+          }
+
       - name: "Verify the seeded configuration and its permissions"
         shell: pwsh
         run: |
