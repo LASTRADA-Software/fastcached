@@ -469,11 +469,33 @@ grep -q "<string>${NODE_ACCOUNT}</string>" "$node_plist" \
 # Every flag in ProgramArguments is re-read by the worker at the next start, so
 # one its own parser rejects is a job that registers and then fails forever. The
 # installer used to bake in the DAEMON's --config and --storage for any service,
-# and the worker accepts neither -- so this is the assertion that the
-# registration survives its own parser, at the level where it actually matters.
-for rejected in --config --storage; do
+# and the worker accepted neither.
+#
+# **`--config` is no longer one of them, and the change of direction is the point.**
+# The worker has accepted `--config` since #291, and since #397 the package ships
+# its file, so `WithScopeDefaults` now applies the system-scope config default and
+# the registration carries `--config=<the worker's own file>`. Asserting its ABSENCE
+# would now fail on a correct install -- and, worse, would have gone on passing for
+# the wrong reason on every release where the file was simply missing.
+#
+# So the hazard the old line was defending -- a worker handed the DAEMON's config --
+# is asserted DIRECTLY below instead of by proxy. `--storage` stays a refusal: the
+# worker has no such flag at all.
+! grep -q -- "--storage" "$node_plist" \
+    || fail "the worker plist carries --storage, which fastcache-compile-node does not accept"
+
+# The positive half. `packagedConfig` is looked up under the SPEC's application
+# name, and hardcoding the daemon's is a bug this project has already had: the
+# worker was handed a file it cannot parse and, once the package tightens that file
+# to 0640 root:_fastcached, cannot even read.
+grep -q -- "--config=${PREFIX}/etc/fastcache-compile-node.yaml" "$node_plist" \
+    || fail "the worker plist does not carry --config for its OWN packaged file"
+! grep -q -- "--config=${PREFIX}/etc/fastcached.yaml" "$node_plist" \
+    || fail "the worker plist carries the DAEMON's config; a worker cannot parse it and its account cannot read it"
+
+for rejected in --requirepass; do
     ! grep -q -- "$rejected" "$node_plist" \
-        || fail "the worker plist carries ${rejected}, which fastcache-compile-node does not accept"
+        || fail "the worker plist carries ${rejected}, which publishes a secret to every local account"
 done
 
 # Deliberately LEFT REGISTERED. Step 6 then exercises the uninstaller against a
