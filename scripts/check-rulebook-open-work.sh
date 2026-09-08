@@ -454,9 +454,11 @@ if [ "$mode" = "resolve" ]; then
             echo "     so which tickets this pull request closes could not be established (#1016)." >&2
             exit 1
         fi
-        # `bash <path>`, never a bare path: 15 of the scripts here are mode 644 in git,
-        # and a bare invocation exits 126 -- which inside this guard would be
-        # indistinguishable from the pull request closing nothing (#723).
+        # `bash <path>`, never a bare path. The mode argument is dead -- every
+        # tracked script with a shebang is 100755, enforced by `ctest -R
+        # script-modes` (#720, #1033) -- and the rule is not: a call that fails to
+        # START, for any reason a chmod never covered, is indistinguishable inside
+        # this guard from the pull request closing nothing (#723).
         if ! closing_now="$(bash "$closing_script" --list-closing "$pr_number" 2>/dev/null)"; then
             echo "FAIL could-not-run: could not read which tickets #${pr_number} closes, so the" >&2
             echo "     entries were NOT checked against them. That is not a pass (#1016)." >&2
@@ -643,10 +645,12 @@ _case() {
     cases_run=$(( cases_run + 1 ))
     [ -n "$stub" ] && path="${stub}:${PATH}"
 
-    # `bash <path>`, never a bare path. A bare invocation of a mode-644 script
-    # exits 126, and inside a want-fail assertion a shell that REFUSED TO START is
-    # indistinguishable from the rule firing -- eight cases passed that way in
-    # #723. Naming the interpreter removes the whole class.
+    # `bash <path>`, never a bare path. Inside a want-fail assertion a shell that
+    # REFUSED TO START is indistinguishable from the rule firing -- eight cases
+    # passed that way in #723, then on a mode-644 script. The modes were repaired
+    # (#720) and are enforced by `ctest -R script-modes`, so that particular 126 is
+    # gone; naming the interpreter removes the whole CLASS, which is why the rule
+    # did not go with its reason (#1033).
     # shellcheck disable=SC2086 -- $extra is split deliberately; see above.
     out="$( PATH="$path" bash "${BASH_SOURCE[0]}" "$mode_flag" $extra --rules-dir "$tree" 2>&1 )"
     got=$?

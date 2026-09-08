@@ -535,10 +535,11 @@ exit 3'
     Case() {
         # $1 = description, $2 = want-pass|want-fail, $3 = tree
         local what="$1" want="$2" tree="$3" out got=0
-        # `bash "$0"`, never a bare `"$0"`: these check scripts are mode 644 in
-        # git and ctest runs them as `bash <path>`, so a bare `"$0"` exits 126
-        # having run nothing -- and every `want-fail` case then passes because
-        # the shell refused rather than because the rule fired. Measured in
+        # `bash "$0"`, never a bare `"$0"`. Not for the mode -- every tracked
+        # script with a shebang is 100755 and `ctest -R script-modes` enforces it
+        # (#720, #1033) -- but because a bare `"$0"` that fails to START runs
+        # nothing, and every `want-fail` case then passes because the shell
+        # refused rather than because the rule fired. Measured in
         # `check-gated-jobs.sh --self-test`, where it made eight negative cases
         # green while testing nothing.
         out="$(bash "$0" --source-dir "$tree" 2>&1)" || got=$?

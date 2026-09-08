@@ -60,9 +60,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # at `$scratch/scripts/` reads `$scratch/.github/workflows/`, and there is no
 # second implementation to drift. Each case asserts its tree DIFFERS from the
 # baseline, so an injection that stopped injecting is a failure rather than a
-# pass, and `bash <path>` is never a bare path -- this file is mode 644, so a
-# bare invocation would exit 126 and every negative case would pass because the
-# SHELL refused.
+# pass, and `bash <path>` is never a bare path. Not because of the mode -- every
+# tracked script with a shebang is 100755 and `ctest -R script-modes` enforces it
+# (#720, #1033) -- but because a bare invocation that fails to START for any
+# reason runs nothing, and every negative case then passes because the SHELL
+# refused rather than because the rule fired.
 if [[ "${1:-}" == "--self-test" ]]; then
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time

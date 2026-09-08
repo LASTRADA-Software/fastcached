@@ -1137,7 +1137,13 @@ determinism rests on.
 ## A retry makes every one of these disappear without fixing it
 
 Eleven separate ways the gate reported something that was not about the tree under
-test have turned up across four tickets — six while fixing
+test turned up across four tickets — a tally over THOSE FOUR, not a running total, and
+it is written that way on purpose: `AGENT.md` carried a second, hand-kept figure for the
+same fact and the two had drifted apart (twelve against eleven) before #1033 removed the
+bare number there. This one at least DERIVES from the breakdown that follows, so a reader
+can check it; a number nothing can derive from the thing it counts is a second source of
+truth. Later instances are enumerated in `AGENT.md`'s list rather than re-counted here.
+Six while fixing
 [#493](https://github.com/LASTRADA-Software/fastcached/issues/493), two more while
 fixing [#247](https://github.com/LASTRADA-Software/fastcached/issues/247), one while
 fixing [#243](https://github.com/LASTRADA-Software/fastcached/issues/243), and two
@@ -3663,6 +3669,21 @@ are recorded together because the shape is one shape.
   across fourteen scripts;
   [#723](https://github.com/LASTRADA-Software/fastcached/issues/723) is the rule
   that survives a chmod.
+
+  **The mode half is CLOSED and the past tense above is deliberate.** `ctest -R
+  script-modes` requires every tracked shell script carrying a shebang to be
+  `100755`, so the 126 described here cannot happen in this tree today. Six
+  comments and one `AGENT.md` bullet went on asserting the present tense long
+  after #720 repaired it, and a manager briefed five lanes from one of them
+  before a lane checked it against `git ls-files -s`
+  ([#1033](https://github.com/LASTRADA-Software/fastcached/issues/1033)). No
+  corrected COUNT replaces them: the property is enforced, so a figure would be a
+  second source of truth for a fact a check already owns. Do not restate the
+  ratio; run the check. What survives untouched is the rule — a call that fails
+  to START fails for reasons a chmod does not cover, and inside a `want-fail`
+  assertion any of them is indistinguishable from the rule firing. **A false
+  concrete reason discredits a true rule**, which is why the reason was corrected
+  rather than the practice dropped with it.
 
   In a workflow it is louder and reaches further. `build.yml`'s new doc-subject
   step shipped as a bare `run: scripts/doc-subject-checks.sh` and CI reported
