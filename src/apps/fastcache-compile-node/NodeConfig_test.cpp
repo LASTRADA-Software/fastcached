@@ -334,6 +334,7 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.advertise = "worker-01.internal:6674";
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
+    cfg.extraAllowedArgs = { "-fanalyzer", "/Qvec-report:2" };
     // Off, because this case gives every field a value differing from its default
     // so that every emitter fires -- and this one's default is on.
     cfg.toolchainDiscovery = false;
@@ -4201,4 +4202,186 @@ TEST_CASE("A reserve larger than the machine is clamped to it", "[node][config][
 
     auto const capacity = NodeCapacityOf(cfg, small, mem, 900ULL << 20);
     CHECK(capacity.reservedMemoryBytes == (1ULL << 30));
+}
+
+// ---------------------------------------------------------------------------
+// The operator's additions to the compile-argument allowlist (#293). The filter
+// itself lives in `CompileJob.cpp` and is tested beside it; what is asked here is
+// everything the CONFIGURATION side owes it -- the shape a spelling must have, that
+// a file and a command line reach the same field through the same applier, that the
+// row is classified as local rather than advertised wiring, and what gets said.
+
+TEST_CASE("The allowlist flag is repeatable and reaches the same field from a file", "[node][config]")
+{
+    // The list-flag contract every repeatable row here has: a file APPENDS, and
+    // naming any on the command line EMPTIES the file's list first rather than
+    // extending it. Asserted for this row rather than assumed from the column,
+    // because a `clear` left off is a flag that silently means the opposite.
+    auto const fromArgv =
+        ParseNodeArgv({ "--allow-compile-arg=-fno-semantic-interposition", "--allow-compile-arg=/Qspectre" });
+    REQUIRE(fromArgv.has_value());
+    CHECK(fromArgv->extraAllowedArgs == std::vector<std::string> { "-fno-semantic-interposition", "/Qspectre" });
+
+    auto const fromFile = FromFileAndArgv({ Setting("allow_compile_arg", { "-fno-plt", "-mno-outline-atomics" }) }, {});
+    REQUIRE(fromFile.has_value());
+    CHECK(fromFile->extraAllowedArgs == std::vector<std::string> { "-fno-plt", "-mno-outline-atomics" });
+
+    auto const both = FromFileAndArgv({ Setting("allow_compile_arg", { "-fno-plt" }) },
+                                      { "--allow-compile-arg=-fno-semantic-interposition" });
+    REQUIRE(both.has_value());
+    CHECK(both->extraAllowedArgs == std::vector<std::string> { "-fno-semantic-interposition" });
+}
+
+TEST_CASE("An allowed compile argument is refused unless it can be one", "[node][config]")
+{
+    // Shape only. The point of the flag is to name a spelling no table here knows, so
+    // there is nothing to check membership against -- which leaves exactly the
+    // properties that make a spelling a spelling at all.
+    SECTION("a bare word is an input FILE on a compiler command line")
+    {
+        // The one refusal with teeth: without it an operator could allow a path, which
+        // is what the whole filter exists to deny.
+        auto const refused = ParseNodeArgv({ "--allow-compile-arg=evil.cpp" });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().context.contains("evil.cpp"));
+    }
+
+    SECTION("a pattern is refused rather than silently matching nothing")
+    {
+        // Matching is whole and exact, so `-f*` would never match anything. Refusing
+        // it is the difference between an operator being told and an operator having a
+        // configuration line that does nothing for as long as it is there.
+        auto const pattern = GENERATE(as<std::string> {}, "-f*", "-X?", "/Q*");
+        INFO("pattern " << pattern);
+        auto const flag = std::string { "--allow-compile-arg=" } + pattern;
+        CHECK_FALSE(ParseNodeArgv({ flag.c_str() }).has_value());
+    }
+
+    SECTION("whitespace means it is more than one argument")
+    {
+        auto const refused = ParseNodeArgv({ "--allow-compile-arg=-wrapper env" });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().context.contains("whitespace"));
+    }
+
+    SECTION("empty names nothing")
+    {
+        CHECK_FALSE(ParseNodeArgv({ "--allow-compile-arg=" }).has_value());
+    }
+
+    SECTION("a path names a file on the WORKER")
+    {
+        // A dispatched compile arrives preprocessed, so nothing it names can be part of
+        // the client's build -- what a path would reach is this machine. Refused here
+        // AND again when the argument arrives, which is two doors; this is the one that
+        // can say why while the operator is looking at their own file.
+        auto const flag = GENERATE(as<std::string> {},
+                                   "--allow-compile-arg=-I/usr/include",
+                                   "--allow-compile-arg=-fplugin=/tmp/evil.so",
+                                   "--allow-compile-arg=/FoC:\\out.obj",
+                                   "--allow-compile-arg=--sysroot=/");
+        INFO(flag);
+        auto const refused = ParseNodeArgv({ flag.c_str() });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().context.contains("path"));
+
+        // And the leading introducer is not a separator, or every MSVC option would be
+        // refused as a path. This is the control that says the rule reads the VALUE.
+        CHECK(ParseNodeArgv({ "--allow-compile-arg=/Qvec-report:2" }).has_value());
+    }
+
+    SECTION("and the shapes that ARE spellings are accepted")
+    {
+        // The other direction, because a rule that refuses everything passes every
+        // case above. Both introducers, a value, and a trailing `-` -- all ordinary.
+        auto const good = GENERATE(as<std::string> {}, "-fno-plt", "/Qspectre", "-mtune=generic", "/permissive-");
+        INFO("spelling " << good);
+        auto const flag = std::string { "--allow-compile-arg=" } + good;
+        CHECK(ParseNodeArgv({ flag.c_str() }).has_value());
+    }
+}
+
+TEST_CASE("The allowlist row is reloadable, and LOCAL rather than advertised", "[node][config][reload]")
+{
+    // Which of the two lists a `Reloadable::Yes` row is on decides whether a change to
+    // it re-registers this worker, and that re-derivation is an include-tree walk
+    // measured over 300 s cold. A registration says which TOOLCHAINS this worker
+    // serves and has no field for which arguments it will accept, so re-registering
+    // would spend those minutes telling the fleet nothing it can act on.
+    auto const rows = NodeOptions();
+    auto const row = std::ranges::find_if(rows, [](auto const& spec) { return spec.primary == "--allow-compile-arg"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->reloadable == Reloadable::Yes);
+    CHECK(std::ranges::contains(LocalReloadableFlags, std::string_view { "--allow-compile-arg" }));
+    CHECK_FALSE(std::ranges::contains(AdvertisedReloadableFlags, std::string_view { "--allow-compile-arg" }));
+
+    // And what those lists MEAN, asked of the functions that read them rather than of
+    // the lists again: a reload that changes only this is accepted, and it does not
+    // move what this worker advertises.
+    NodeConfig previous;
+    previous.scheduler = std::string { SchedulerEndpoint };
+    auto candidate = previous;
+    candidate.extraAllowedArgs = { "-fno-plt" };
+
+    CHECK(ValidateNodeReloadable(previous, candidate).has_value());
+    CHECK_FALSE(AdvertisedClaimsDiffer(previous, candidate));
+}
+
+TEST_CASE("AllowlistAnnouncement says what changed, and stays quiet when nothing did", "[node][config][reload]")
+{
+    // #293's third acceptance clause -- *each extension is logged* -- as a pure
+    // function, because `main.cpp` is in no test target and a rule written there could
+    // only be checked by reading it. The failure this guards is silent in the
+    // direction nobody notices: a widening nobody was told about reads exactly like a
+    // worker nobody widened.
+    using Args = std::vector<std::string>;
+
+    SECTION("a worker that was not widened says nothing at startup")
+    {
+        // The shipped state, on every start of every node. A line here is how the line
+        // that matters gets filtered out.
+        CHECK_FALSE(AllowlistAnnouncement(AllowlistMoment::Startup, {}, Args {}).has_value());
+    }
+
+    SECTION("a widened one names the count and every entry")
+    {
+        auto const said = AllowlistAnnouncement(AllowlistMoment::Startup, {}, Args { "-fno-plt", "/Qspectre" });
+        REQUIRE(said.has_value());
+        // Every entry, not a count: an operator reading a log after an incident needs
+        // to know WHAT was allowed, and "2 entries" answers a different question.
+        CHECK(Unwrap(said).contains("-fno-plt"));
+        CHECK(Unwrap(said).contains("/Qspectre"));
+        CHECK(Unwrap(said).contains("2"));
+    }
+
+    SECTION("a reload that did not move the list is silent")
+    {
+        // A reload is routine -- `--log-level` alone triggers one -- so narrating a
+        // set nobody touched at WARN would train an operator to skip the line.
+        Args const same { "-fno-plt" };
+        CHECK_FALSE(AllowlistAnnouncement(AllowlistMoment::Reload, same, same).has_value());
+        CHECK_FALSE(AllowlistAnnouncement(AllowlistMoment::Reload, Args {}, Args {}).has_value());
+    }
+
+    SECTION("a reload that moved it says so, emptying included")
+    {
+        auto const added = AllowlistAnnouncement(AllowlistMoment::Reload, Args {}, Args { "-fno-plt" });
+        REQUIRE(added.has_value());
+        CHECK(Unwrap(added).contains("-fno-plt"));
+
+        // The half a silent implementation drops, because it looks like good news: an
+        // operator who removed the last entry needs to see that it took effect as much
+        // as one who added the first. And it must not render as a sentence ending in
+        // nothing, which reads as a truncated message rather than as a set with no
+        // members.
+        auto const emptied = AllowlistAnnouncement(AllowlistMoment::Reload, Args { "-fno-plt" }, Args {});
+        REQUIRE(emptied.has_value());
+        CHECK(Unwrap(emptied).contains("(none)"));
+        CHECK_FALSE(Unwrap(emptied).contains("-fno-plt"));
+
+        // A reorder is a change: the file was edited, and an operator watching a
+        // reload they asked for is owed the answer either way.
+        auto const reordered = AllowlistAnnouncement(AllowlistMoment::Reload, Args { "-a1", "-b2" }, Args { "-b2", "-a1" });
+        CHECK(reordered.has_value());
+    }
 }

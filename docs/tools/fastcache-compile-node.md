@@ -1428,7 +1428,11 @@ refusal names every offending setting. You saved once; you get one answer.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+
+`log_level` and `allow_compile_arg` take effect immediately and tell the fleet
+nothing; `toolchain` and `no_toolchain_discovery` re-register this worker, which is
+the next section.
 
 ### Changing what this worker serves
 
@@ -2262,6 +2266,52 @@ lock is free is one whose owner is gone, however it went.
   states the language explicitly (`-x c++-cpp-output`, `/TP`), so a name the
   worker had to invent cannot decide how the text is compiled.
 - **Write to the cache.** Workers get no cache credentials.
+
+### Adding a flag the built-in list does not know
+
+The arguments a worker will pass to its compiler are an **allowlist**, keyed on the
+driver family, and it is deliberately broader than anything this project's own
+builds emit. It still cannot be complete forever, and the failure when it is short
+is the quiet one: the worker refuses the argument, the client compiles locally, and
+the build stays green while that translation unit silently stops being distributed.
+
+`--allow-compile-arg` (`allow_compile_arg:` in the file) adds a spelling, repeatably:
+
+```sh
+fastcache-compile-node --scheduler=sched:6676 \
+    --allow-compile-arg=-fanalyzer \
+    --allow-compile-arg=/Qvec-report:2
+```
+
+Four things are worth knowing before you use it.
+
+**It extends and can never shrink.** Entries are consulted only after the built-in
+table has failed to recognise an argument at all. Everything the table *refuses* —
+every plugin loader, every sub-tool pass-through, every path-valued option, every
+flag that would make the compile write a second file — is refused by a rule that
+returns before this list is reached. Naming one of them here changes nothing.
+
+**Matching is whole and exact.** `-fanalyzer` allows `-fanalyzer` and not
+`-fanalyzer=x`, and there is no prefix or wildcard form: a `-f*` rule would re-admit
+`-fplugin=`, which is the hole the allowlist replaced a denylist to close. A value
+carrying a path separator is refused when you write it and again when it arrives.
+
+**It is reloadable.** `systemctl reload fastcache-compile-node` (or `SIGHUP`) applies
+a change without restarting, so a site that meets an unknown flag mid-build day does
+not wait for a release *or* for a window to drop the compiles in flight. It does not
+re-register the worker, because the set is local — a registration says which
+toolchains this node serves, not which arguments it accepts.
+
+**It is announced at `WARN`.** Every start with a non-empty set, and every reload
+that moves it, logs the whole set at the level a credential change is logged at:
+
+```
+[WARN] compile-argument allowlist extended by configuration with 2 entry/entries: -fanalyzer, /Qvec-report:2
+```
+
+Removing the last entry says so too (`… 0 entry/entries now in force: (none)`). That
+is not noise — this is the one setting that widens what a client may make this
+worker's compiler do, and an incident is read against what was in force at the time.
 
 ## Security
 

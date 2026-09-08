@@ -662,6 +662,35 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
         logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
 }
 
+/// Adopt the compile-argument allowlist an accepted reload asks for, and say so when
+/// it moved.
+///
+/// A function rather than four lines inside the heartbeat loop. `WorkerBody` is the
+/// one place in this binary where a branch is charged twice -- once to
+/// `readability-function-cognitive-complexity`, which this pushed over its threshold,
+/// and once to whoever next has to read the loop whole.
+///
+/// The DECISION is not here: `AllowlistAnnouncement` owns whether anything is said and
+/// what, in a file the test target builds. What is left here is applying it, and the
+/// level -- WARN, because this set decides what a client may make the compiler do.
+/// @param jobs Where the set takes effect.
+/// @param logger Where the change is announced.
+/// @param inForce The set currently applied; replaced when it moves.
+/// @param candidate What the reloaded configuration asks for.
+void AdoptAllowlist(Cc::CompileJobRunner& jobs,
+                    ILogger& logger,
+                    std::vector<std::string>& inForce,
+                    std::vector<std::string> const& candidate)
+{
+    auto const said = Node::AllowlistAnnouncement(Node::AllowlistMoment::Reload, inForce, candidate);
+    if (!said)
+        return;
+
+    inForce = candidate;
+    jobs.ReplaceExtraAllowedArgs(inForce);
+    logger.Log(LogLevel::Warn, *said);
+}
+
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
 {
     // Socket activation is resolved BEFORE the toolchains, and the order is
@@ -799,6 +828,24 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
     // -- instead of `UnknownFingerprint`, which says the fleet is matching the wrong
     // machines and sends an operator to look at the wrong thing (#365).
     Cc::CompileJobRunner jobs { *runner, scratch, compilersOf(toolchains), Cc::ToolchainSurvey::InFlight() };
+
+    // The operator's additions to the compile-argument allowlist, applied before the
+    // surface opens so no job is ever judged by a half-applied set.
+    //
+    // **Announced at WARN, which is the level a credential change is logged at.** This
+    // is the one setting that widens what a client may make this worker's compiler do:
+    // every entry is an argument the built-in table refused to recognise. An operator
+    // reading a log after an incident has to be able to see that the set was extended
+    // and to what, so silence here is not an option even though the usual level for a
+    // configuration line is INFO (#293).
+    //
+    // WHAT to say is `Node::AllowlistAnnouncement`, a pure function in a file the test
+    // target builds, for `RecheckDepthFor`'s reason: this one is in none (#909). All
+    // that is left here is the level and the moment.
+    auto appliedExtraArgs = cfg.extraAllowedArgs;
+    jobs.ReplaceExtraAllowedArgs(appliedExtraArgs);
+    if (auto const said = Node::AllowlistAnnouncement(Node::AllowlistMoment::Startup, {}, appliedExtraArgs))
+        logger.Log(LogLevel::Warn, *said);
 
     // A lease is CHECKED, and by a validator built about a hundred lines below --
     // `MakeWorkerLeaseValidator`, which verifies the grant's MAC, the endpoint it
@@ -1485,6 +1532,19 @@ void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
                                       ? Node::ClaimsReloaded::Yes
                                       : Node::ClaimsReloaded::No;
             actedOn = snapshot;
+
+            // Compared SEPARATELY from `reloaded` above, and that is the point rather
+            // than duplication. `AdvertisedClaimsDiffer` asks whether what this worker
+            // TELLS the fleet has changed, and extending the allowlist changes nothing
+            // it advertises -- so gating this on that answer would be a reload an
+            // operator watched do nothing, which is the failure #403's own row warns
+            // about one setting over.
+            //
+            // Whether anything is said, and what, is `AllowlistAnnouncement`'s rule
+            // rather than this loop's -- an emptied set is said out loud too, because an
+            // operator who removed every entry needs to see that it took effect as much
+            // as one who added the first.
+            AdoptAllowlist(jobs, logger, appliedExtraArgs, liveCfg.extraAllowedArgs);
             auto const depth = Node::RecheckDepthFor(reloaded, beat, SweepEveryBeats);
 
             // How loudly that survey narrates itself. The timer sweep whispers; a

@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -328,6 +329,29 @@ class CompileJobRunner final: public ICompileJobRunner
     /// @param toolchains Fingerprint → compiler path.
     void ReplaceToolchains(std::map<std::string, std::string> toolchains);
 
+    /// Accept these extra argument spellings from now on, in addition to the
+    /// built-in table.
+    ///
+    /// The seam `--allow-compile-arg` reaches, at startup and at every accepted
+    /// reload. It exists because a built-in allowlist cannot be complete forever: a
+    /// site using a legitimate flag the table does not yet name would otherwise wait
+    /// for a release, and the failure is silent -- the build stays green and the
+    /// fleet quietly stops distributing (#293).
+    ///
+    /// **Extends, never replaces.** These are consulted only after the built-in table
+    /// has failed to recognise an argument; a `Deny` row has already refused by then,
+    /// so no configuration can re-admit what the table refuses. That is enforced by
+    /// `IsAcceptableJobArgument`'s order rather than by this comment.
+    ///
+    /// Replaces the previous SET, like `ReplaceToolchains`: an entry an operator
+    /// removed from the file has to stop being honoured, which a merge would leave in
+    /// place forever.
+    ///
+    /// **Safe against concurrent `Run`.** A job already admitted keeps the decision it
+    /// was admitted under; only the next argument check sees the new set.
+    /// @param spellings Whole, exact argument spellings.
+    void ReplaceExtraAllowedArgs(std::vector<std::string> spellings);
+
     /// Where scratch files are written.
     ///
     /// Exposed so a caller can report the space on *that* filesystem rather than
@@ -349,6 +373,18 @@ class CompileJobRunner final: public ICompileJobRunner
     /// thread is replacing.
     mutable std::shared_mutex _toolchainsMutex;
     std::map<std::string, std::string> _toolchains;
+
+    /// Guards `_extraAllowedArgs`. Its own lock rather than `_toolchainsMutex`: the
+    /// two are replaced by different events -- a machine re-survey and an operator
+    /// edit -- and sharing one would make a re-survey wait behind a config reload for
+    /// no reason other than that both happen to be snapshots.
+    mutable std::shared_mutex _extraAllowedArgsMutex;
+
+    /// The operator's additions to the built-in allowlist, whole and exact.
+    ///
+    /// Empty is the shipped state and the ordinary one; a non-empty set is a
+    /// deliberate widening of what a client may make this worker's compiler do.
+    std::vector<std::string> _extraAllowedArgs;
 
     /// Whether `_toolchains` has been answered for. Under `_toolchainsMutex` with
     /// the map it qualifies, because the two are one fact and a reader that saw a
@@ -409,8 +445,17 @@ class CompileJobRunner final: public ICompileJobRunner
 /// exposing the port.
 /// @param arg One argument from a job.
 /// @param driver The descriptor for this worker's configured compiler.
+/// @param operatorAllowed Extra spellings this site has added to the built-in table
+///        (`--allow-compile-arg`). **Consulted last, and only when no built-in row
+///        matched at all** -- a `Deny` row has already returned by then, so a config
+///        cannot re-admit anything the table refuses. Entries are matched WHOLE and
+///        exactly: no prefix, no wildcard, because an `-f` prefix re-admits
+///        `-fplugin=` and an `-X` prefix re-admits `-Xclang -load`, which is the
+///        defect the built-in table is enumerated to avoid.
 /// @return True when the worker will pass it on.
-[[nodiscard]] bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver);
+[[nodiscard]] bool IsAcceptableJobArgument(std::string_view arg,
+                                           DriverSpec const& driver,
+                                           std::span<std::string const> operatorAllowed = {});
 
 /// The file name a job's scratch source may be given, sanitized.
 ///

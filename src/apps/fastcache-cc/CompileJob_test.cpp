@@ -921,6 +921,130 @@ TEST_CASE("IsAcceptableJobArgument refuses the program-invoking options a denyli
     CHECK(IsAcceptableJobArgument("-Wpedantic", DriverOf(Flavor::Gcc)));
 }
 
+TEST_CASE("An operator entry admits exactly the spelling it names", "[compile-job]")
+{
+    // #293's first acceptance clause at the predicate. A built-in table cannot be
+    // complete forever, so a site meeting a legitimate flag this build does not name
+    // can add it -- and the failure it removes is SILENT: the build stays green and
+    // the fleet quietly stops distributing that translation unit.
+    std::vector<std::string> const allowed { "-fanalyzer" };
+
+    // The control, and it is the whole test rather than decoration: the same argument
+    // through the same driver with NO operator list is refused. Without it this case
+    // passes just as well against a table that had grown the row on its own, which is
+    // an assertion about the built-in table wearing this ticket's name.
+    CHECK_FALSE(IsAcceptableJobArgument("-fanalyzer", DriverOf(Flavor::Gcc)));
+    CHECK(IsAcceptableJobArgument("-fanalyzer", DriverOf(Flavor::Gcc), allowed));
+
+    // WHOLE and exact. Neither a longer argument that starts with the entry nor a
+    // shorter one it starts with is admitted -- an entry is a spelling, never a
+    // prefix, and a prefix is how the one flag an operator wanted opens a family.
+    CHECK_FALSE(IsAcceptableJobArgument("-fanalyzer=yes", DriverOf(Flavor::Gcc), allowed));
+    CHECK_FALSE(IsAcceptableJobArgument("-fanaly", DriverOf(Flavor::Gcc), allowed));
+
+    // An entry admits nothing but itself: every other unrecognised flag stays refused.
+    CHECK_FALSE(IsAcceptableJobArgument("-nonsense-option", DriverOf(Flavor::Gcc), allowed));
+
+    // The list is consulted whatever the driver family, because the operator is
+    // describing THEIR compiler and this worker's family is not something they set.
+    // The MSVC spelling of an MSVC-only flag reaches an MSVC driver the same way.
+    std::vector<std::string> const msvc { "/Qvec-report:2" };
+    CHECK_FALSE(IsAcceptableJobArgument("/Qvec-report:2", DriverOf(Flavor::Cl)));
+    CHECK(IsAcceptableJobArgument("/Qvec-report:2", DriverOf(Flavor::Cl), msvc));
+
+    // A worker whose compiler classifies to no family admits nothing, and an operator
+    // entry does not change that: an unknown family has no introducer set, which is
+    // decided ABOVE the operator list, so the fail-safe cannot be configured open.
+    CHECK_FALSE(IsAcceptableJobArgument("-fanalyzer", DriverOf(Flavor::Unknown), allowed));
+}
+
+TEST_CASE("An operator entry cannot remove a built-in refusal", "[compile-job]")
+{
+    // #293's second acceptance clause, and the one that decides whether this feature
+    // is safe at all: a configuration that could SHRINK the allowlist reintroduces
+    // #240, where a local process could reach the credential-free compile port and
+    // make the driver run an arbitrary program.
+    //
+    // Every argument below is named as its own operator entry -- the most direct
+    // attempt an operator (or anyone who can write their config file) could make --
+    // and every one is still refused, because `IsAcceptableJobArgument` consults this
+    // list only after the built-in table has failed to match anything, and a `Deny`
+    // row has already returned by then.
+    for (auto const& hostile: { "-wrapper",
+                                "-fplugin=evil",
+                                "-fplugin-arg-evil-x",
+                                "-fpass-plugin=evil.so",
+                                "-fmodule-mapper=|evil",
+                                "-Wa,--defsym,x=1",
+                                "-Wl,-rpath,x",
+                                "-Wp,-D,x",
+                                "-specs=evil",
+                                "-Bstage",
+                                "-gsplit-dwarf",
+                                "-fprofile-generate",
+                                "-DFOO=/etc/passwd" })
+    {
+        INFO("argument " << hostile);
+        std::vector<std::string> const naming { std::string { hostile } };
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, DriverOf(Flavor::Gcc), naming));
+    }
+    for (auto const& hostile: { "/Zi", "/ZI", "/Ycpch.h", "/link", R"(/DFOO=C:\x)" })
+    {
+        INFO("argument " << hostile);
+        std::vector<std::string> const naming { std::string { hostile } };
+        CHECK_FALSE(IsAcceptableJobArgument(hostile, DriverOf(Flavor::Cl), naming));
+    }
+
+    // A PATH is refused the same way, which is the property that survives if somebody
+    // ever loosens the deny rows: the refusal for a path-shaped argument is decided
+    // above the operator list too.
+    std::vector<std::string> const paths { "-I/usr/include", "@/tmp/args.rsp" };
+    CHECK_FALSE(IsAcceptableJobArgument("-I/usr/include", DriverOf(Flavor::Gcc), paths));
+    CHECK_FALSE(IsAcceptableJobArgument("@/tmp/args.rsp", DriverOf(Flavor::Gcc), paths));
+
+    // And an entry that is a PREFIX of a refused family admits nothing in it. The
+    // configuration parser refuses `*`/`?` outright, so this is the second half of the
+    // same rule: even a spelling that LOOKS like a prefix matches whole or not at all.
+    std::vector<std::string> const prefixes { "-f", "-X", "-W" };
+    CHECK_FALSE(IsAcceptableJobArgument("-fplugin=evil", DriverOf(Flavor::Gcc), prefixes));
+    CHECK_FALSE(IsAcceptableJobArgument("-Xclang", DriverOf(Flavor::Gcc), prefixes));
+    CHECK_FALSE(IsAcceptableJobArgument("-Wl,-rpath,x", DriverOf(Flavor::Gcc), prefixes));
+}
+
+TEST_CASE("A runner dispatches an operator-added argument and refuses it without one", "[compile-job]")
+{
+    // The acceptance clause end to end through the object that decides it: *an
+    // operator-added flag dispatches*. The predicate cases above prove the rule; this
+    // one proves the rule is WIRED -- that `CompileJobRunner::Run` consults the set
+    // `--allow-compile-arg` fills, and that the argument reaches the spawned command
+    // line rather than merely surviving the filter.
+    ScriptedRunner runner;
+    ScratchDirectory scratch { "fc-jobtest" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "/opt/real/g++" } }, ToolchainSurvey::Completed() };
+
+    // Refused before anything is allowed, and NOTHING is spawned. This is the half
+    // that makes the second half mean something.
+    auto const before = jobs.Run(Job({ "-O2", "-fanalyzer" }));
+    REQUIRE_FALSE(before.has_value());
+    CHECK(before.error() == JobRefusal::RejectedArgument);
+    CHECK(before.error().detail.contains("-fanalyzer"));
+    CHECK(runner.Argv().empty());
+
+    jobs.ReplaceExtraAllowedArgs({ "-fanalyzer" });
+
+    REQUIRE(jobs.Run(Job({ "-O2", "-fanalyzer" })).has_value());
+    CHECK(std::ranges::contains(runner.Argv(), "-fanalyzer"));
+
+    // Replaces rather than merges, so an entry removed from the file stops being
+    // honoured. A merging implementation passes every check above and leaves a
+    // widening in force that the operator believes they took away -- which is the
+    // failure with no symptom at all.
+    jobs.ReplaceExtraAllowedArgs({});
+    auto const after = jobs.Run(Job({ "-O2", "-fanalyzer" }));
+    REQUIRE_FALSE(after.has_value());
+    CHECK(after.error() == JobRefusal::RejectedArgument);
+}
+
 TEST_CASE("The allowlist admits the flags this repository's own builds dispatch with", "[compile-job]")
 {
     // Too narrow an allowlist is a SILENT local fallback -- the fleet distributes

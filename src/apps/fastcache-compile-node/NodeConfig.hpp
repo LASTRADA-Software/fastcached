@@ -87,6 +87,15 @@ struct NodeConfig
     /// configuration that has to be redone after every toolchain upgrade.
     std::vector<std::string> toolchains;
 
+    /// Extra compile-argument spellings this site accepts, on top of the built-in
+    /// per-driver-family table.
+    ///
+    /// EXTENDS the table and can never shrink it: `IsAcceptableJobArgument` consults
+    /// these only after no built-in row matched, and a refusing row has already
+    /// answered by then. A config that could remove a refusal would reintroduce #240,
+    /// which is the hole the allowlist replaced a denylist to close.
+    std::vector<std::string> extraAllowedArgs;
+
     /// Whether a worker given no `--toolchain` surveys the machine for compilers.
     ///
     /// On by default, because the whole point is that installing the package is the
@@ -800,7 +809,14 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 ///
 /// A list rather than "whatever is not advertised", so that adding a reloadable row
 /// forces a choice instead of defaulting into the cheap answer.
-inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-level" };
+///
+/// `--allow-compile-arg` is local for a reason worth stating, because it is the row
+/// most likely to be read as advertised: it widens what this worker will RUN, and a
+/// worker's registration says which toolchains it serves, never which arguments it
+/// will accept. The scheduler has no field for this and dispatches no differently
+/// because of it, so re-registering on a change would spend a 300 s include-tree
+/// walk telling the fleet nothing it can act on.
+inline constexpr std::array<std::string_view, 2> LocalReloadableFlags { "--log-level", "--allow-compile-arg" };
 
 /// Whether a reload changed something this worker had TOLD the fleet.
 ///
@@ -828,6 +844,44 @@ inline constexpr std::array<std::string_view, 1> LocalReloadableFlags { "--log-l
 /// @param candidate The configuration just adopted.
 /// @return Whether what this worker advertises has changed.
 [[nodiscard]] bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candidate);
+
+/// Which of the two moments an allowlist is being applied at.
+enum class AllowlistMoment : std::uint8_t
+{
+    Startup, ///< The set the process starts with.
+    Reload,  ///< A set adopted from an accepted reload.
+};
+
+/// The line to log about the operator's compile-argument allowlist, or nothing.
+///
+/// **Pure, and here rather than an expression in `main.cpp`, for `RecheckDepthFor`'s
+/// reason: that file is in no test target (#909), so a rule written there can only be
+/// checked by reading it.** This one is #293's third acceptance clause -- *each
+/// extension is logged* -- and it is a SECURITY announcement, which is the kind that
+/// is wrong silently: a widening nobody was told about reads exactly like a worker
+/// nobody widened.
+///
+/// The two moments answer differently and that is the whole reason the moment is a
+/// parameter rather than something inferred from @p previous being empty:
+///
+/// - **Startup** says nothing for an empty set. That is the shipped state, it is what
+///   almost every worker runs, and a line saying a set was not extended on every start
+///   of every node is how the line that MATTERS gets filtered out.
+/// - **A reload** says something whenever the set MOVED, emptying included. An
+///   operator who removed the last entry needs to see that it took effect as much as
+///   one who added the first -- and *removed the widening* is the half a silent
+///   implementation would drop, since it is the half that looks like good news.
+///
+/// A reload that changed nothing else about this list says nothing, because a reload
+/// is a routine event: `--log-level` alone must not narrate a set nobody touched.
+///
+/// @param moment Whether this is the starting set or one adopted at a reload.
+/// @param previous What was in force before; empty at startup.
+/// @param current What is in force now.
+/// @return The message to log at WARN, or nullopt when there is nothing to say.
+[[nodiscard]] std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
+                                                               std::span<std::string const> previous,
+                                                               std::span<std::string const> current);
 
 /// What a bare `--listen-raft` binds.
 ///

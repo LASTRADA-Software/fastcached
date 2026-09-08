@@ -54,6 +54,21 @@ Type=simple
 # turns it off.
 ExecStart=/usr/bin/fastcache-compile-node --config=/etc/fastcached/fastcache-compile-node.yaml
 
+# SIGHUP re-reads the config file. The binary has handled it since #291 and this
+# unit never offered it, so `systemctl reload fastcache-compile-node` answered
+# "Job type reload is not applicable" and every reloadable setting was reachable
+# only by restarting -- which on this unit means dropping the compiles in flight.
+# The reload channel existing in the binary and not in the service is the whole
+# defect: nothing was broken, nothing logged, and the feature was simply
+# unreachable from the shipped install.
+#
+# Only a subset applies. `toolchain` and `no_toolchain_discovery` re-survey and
+# re-register; `log_level` and `allow_compile_arg` take effect immediately.
+# Everything else is validated as immutable, and a candidate that changes one is
+# refused whole -- the worker logs which key and keeps running on the previous
+# configuration, so a reload never half-applies.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # SIGTERM stops accepting and lets the accept loop finish; the stop flag is
 # polled at 100 ms and jobs are served inline, so a clean stop is bounded by
 # the compile in flight rather than by any drain of its own. TimeoutStopSec is

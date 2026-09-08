@@ -144,8 +144,35 @@ is the reproducible lesson, since no unit test can reach either:
     reply and lands in the client's fallback log, so the argument is capped and
     reduced to printable ASCII at the one producer — which also makes it valid UTF-8
     whatever arrived, as the fleet requires of text a peer sent.
-  - **Operator extension of the allowlist is a follow-up, not this rule.** The table
-    is built-in; there is deliberately no config hook.
+  - **A refusal by ABSENCE and a refusal by ROW are the same answer only while nothing
+    else is consulted.** `--allow-compile-arg` (#293) is the something else, and it
+    turned that sentence from a distinction without a difference into a hole: the
+    operator list is checked after the table fails to MATCH, and the whole `#240` class
+    — `-wrapper`, `-fplugin=`, `-fpass-plugin=`, `-specs=`, `-Xclang`, `-B`, `/link`,
+    `/analyze:` — was refused by not being listed, so naming one in a configuration file
+    admitted it. Caught by the ticket's own acceptance test, on the first run, having
+    been written to check exactly that; the implementation's comment claimed the order
+    made it safe and was reasoning about the four `Deny` rows that existed. The table
+    header had ALWAYS enumerated the class, in prose, under the words *"absent by
+    construction, and therefore refused"* — a rule stated where nothing could read it,
+    which is this rulebook's most-repeated shape and was true here for months before it
+    could bite. They are `Deny` rows now, plus the side-artefact set (`/Zi`, `/ZI`,
+    `-gsplit-dwarf`, `-fprofile-*`) that three test comments also called deliberate.
+  - **A `Deny` row takes `ArgValue::AnySuffix`, never `NoPathSeparator`**, and the
+    difference is the wrong way round from the intuition: a refusal must not be
+    escapable by the shape rule that exists to NARROW an allowance. `-fplugin=evil`
+    carries no separator and `-fplugin=/tmp/evil.so` does, so a `NoPathSeparator` deny
+    matches the harmless-looking spelling and lets the one naming a payload fall
+    through. `static_assert`ed to `Deny` rows, because on an `Allow` row it is the
+    opposite mistake.
+  - **Operator entries EXTEND and can never shrink**, which is a property of the ORDER:
+    they are consulted last, after `ProducesSideArtefact`, after the introducer rule and
+    after every `Deny` row has returned. Matched WHOLE and exactly, with the same
+    no-path-separator rule applied to the match — the config parser refuses a separator
+    too, so it is two doors and the parser is the one that can say why. And the set
+    rides into `MakeNodeServiceSpec`: a registration replays its command line forever,
+    so a dropped entry is a worker that comes back refusing what it was installed to
+    accept, as a silent local fallback — the failure the flag exists to remove.
 
 Three more come from running the worker as a *service* rather than in a
 terminal, and each has already been a bug:

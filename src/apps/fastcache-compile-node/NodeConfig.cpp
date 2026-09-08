@@ -274,6 +274,87 @@ namespace
         return std::string { sv };
     }
 
+    /// Render a compile-argument allowlist for a log line.
+    ///
+    /// Its own function rather than a join written twice, because the EMPTY case is a
+    /// real one at the reload site: an operator who removed every entry is told so,
+    /// and a bare join renders that as a sentence ending in a colon and nothing, which
+    /// reads as a truncated message rather than as a set with no members.
+    /// @param args The spellings in force, possibly none.
+    /// @return `a, b, c`, or `(none)` when there are none.
+    [[nodiscard]] std::string JoinAllowedArgs(std::span<std::string const> args)
+    {
+        if (args.empty())
+            return "(none)";
+
+        std::string out;
+        for (auto const& arg: args)
+        {
+            if (!out.empty())
+                out += ", ";
+            out += arg;
+        }
+        return out;
+    }
+
+    /// One extra compile-argument spelling an operator has allowed.
+    ///
+    /// Validated for the SHAPE a spelling must have, never for membership of any
+    /// list -- the point of the flag is to name something no list here knows.
+    ///
+    /// It must introduce an option. A bare word on a compiler command line is an
+    /// INPUT FILE, so admitting one would let a job name a path, which is the
+    /// property the whole filter exists to deny.
+    ///
+    /// A wildcard is refused rather than ignored. Matching is whole and exact, so
+    /// `-f*` would simply never match anything -- and an operator who wrote it would
+    /// have a flag that silently does nothing, which is worse than a refusal that
+    /// says so. It is also the shape that, if it ever were honoured, would re-admit
+    /// the program-invoking options the built-in table is enumerated to exclude.
+    ///
+    /// A PATH SEPARATOR is refused for the same reason a bare word is: what an entry
+    /// may name is a flag, and a flag carrying a path names a file on the worker.
+    /// `IsAcceptableJobArgument` refuses one again when the argument arrives, so this
+    /// is the first of two doors rather than the only one -- but it is the door that
+    /// can say WHY, at the moment the operator is looking at their own file, instead
+    /// of leaving them an entry that is quietly never matched.
+    /// @param sv The operand as typed.
+    /// @return The spelling, or why it cannot be one.
+    [[nodiscard]] std::expected<std::string, ConfigError> ParseAllowedCompileArg(std::string_view sv)
+    {
+        // The reason travels in `context`, already formatted by the caller, so this
+        // captures nothing: every refusal below names the operand itself, and a
+        // capture that only LOOKED used would be one more thing to keep in step.
+        auto const refuse = [](std::string context) {
+            return std::unexpected(ConfigError {
+                .code = ConfigErrorCode::ParseError, .source = {}, .line = 0, .field = {}, .context = std::move(context) });
+        };
+        if (sv.empty())
+            return refuse("an allowed compile argument cannot be empty");
+        if (sv.front() != '-' && sv.front() != '/')
+            return refuse(std::format("'{}' does not introduce an option: it needs a leading '-' or '/'. A bare word "
+                                      "on a compiler command line is an input file, which this filter exists to "
+                                      "refuse",
+                                      sv));
+        if (sv.find_first_of("*?") != std::string_view::npos)
+            return refuse(std::format("'{}' looks like a pattern, and matching here is whole and exact. Name the "
+                                      "spelling itself; a prefix would re-admit the program-invoking options the "
+                                      "built-in table enumerates in order to exclude",
+                                      sv));
+        if (sv.find_first_of(" \t\r\n") != std::string_view::npos)
+            return refuse(std::format("'{}' contains whitespace, so it is more than one argument. Allow each one "
+                                      "separately",
+                                      sv));
+        // The leading introducer is not a separator: `/O2` is an MSVC option and `/etc`
+        // is a path, and what tells them apart is everything AFTER the first character.
+        if (sv.substr(1).find_first_of("/\\") != std::string_view::npos)
+            return refuse(std::format("'{}' names a path, and a path names a file on the WORKER rather than anything "
+                                      "in the client's build -- a dispatched compile arrives preprocessed, so its "
+                                      "headers are already inlined. Allow the flag, never a value carrying a path",
+                                      sv));
+        return ParseUtf8Text(sv);
+    }
+
     /// A byte count for the local cache tier, accepting the k/m/g suffixes the
     /// daemon's own size flags do.
     ///
@@ -548,6 +629,28 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::toolchains>(),
             .clear = ClearList<&NodeConfig::toolchains>(),
+        },
+        {
+            .primary = "--allow-compile-arg",
+            .arity = Arity::Value,
+            .operand = "=<flag>",
+            .apply = AppendFrom<&NodeConfig::extraAllowedArgs, ParseAllowedCompileArg>(),
+            .description = "accept this compile argument in addition to the built-in\n"
+                           "per-driver-family table; repeatable. EXTENDS the table and\n"
+                           "cannot shrink it -- a refusal the table makes is never\n"
+                           "removable by configuration. Matched WHOLE and exactly, so\n"
+                           "name the spelling rather than a prefix.",
+            .yamlKey = "allow_compile_arg",
+            // Reloadable, and that is the whole ticket rather than a convenience. A
+            // built-in table cannot be complete forever, and a site meeting a
+            // legitimate flag it does not name gets the silent failure: the build
+            // stays green, the worker refuses the argument, and the fleet quietly
+            // stops distributing that translation unit. Waiting for a release to
+            // spell one flag is what #293 exists to remove, so the flag has to be
+            // answerable without a restart or it has only moved the wait.
+            .reloadable = Reloadable::Yes,
+            .same = FieldEq<&NodeConfig::extraAllowedArgs>(),
+            .clear = ClearList<&NodeConfig::extraAllowedArgs>(),
         },
         {
             .primary = "--no-toolchain-discovery",
@@ -1258,6 +1361,26 @@ bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candid
     });
 }
 
+std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
+                                                 std::span<std::string const> previous,
+                                                 std::span<std::string const> current)
+{
+    if (moment == AllowlistMoment::Startup)
+    {
+        if (current.empty())
+            return std::nullopt;
+        return std::format("compile-argument allowlist extended by configuration with {} entry/entries: {}",
+                           current.size(),
+                           JoinAllowedArgs(current));
+    }
+
+    if (std::ranges::equal(previous, current))
+        return std::nullopt;
+
+    return std::format(
+        "compile-argument allowlist reloaded; {} entry/entries now in force: {}", current.size(), JoinAllowedArgs(current));
+}
+
 std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate)
 {
     std::vector<std::string_view> changed;
@@ -1516,6 +1639,14 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // deliberately excluded.
     if (!cfg.toolchainDiscovery)
         argv.emplace_back("--no-toolchain-discovery");
+
+    // Repeatable for the toolchains' reason, and carried for a sharper one: a
+    // registration replays its command line forever, so a dropped entry is a worker
+    // that comes back refusing an argument the operator installed it to accept -- and
+    // that refusal is a SILENT local fallback, the failure #293 exists to remove. The
+    // registration would have removed it right back.
+    for (auto const& allowed: cfg.extraAllowedArgs)
+        argv.push_back(std::format("--allow-compile-arg={}", allowed));
 
     // Directories root will create for an account that is not root. Without the
     // handover the worker's first write fails with EACCES, which launchd surfaces

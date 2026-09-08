@@ -328,6 +328,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   preprocesses a second time, with `#line` markers.
 - A worker is told its input is preprocessed *and* what language it is in; the
   file extension is the last of three answers, never the first.
+- The arguments a worker will pass on are an **allowlist** keyed on the driver family,
+  and the `-f` space is ENUMERATED rather than prefixed — a blanket `-f` with a carve-out
+  reads as an allowlist and behaves as a denylist over the largest and most volatile flag
+  family GCC and Clang have (#240). **A refusal by ABSENCE and a refusal by ROW are the
+  same answer only while nothing else is consulted**, and `--allow-compile-arg` (#293) is
+  the something else: the whole program-invoking class was refused by not being listed,
+  so a configuration file could name one and admit it. The table header had enumerated
+  that class in prose — *"absent by construction, and therefore refused"* — for months,
+  where nothing could read it. They are `Deny` rows now, and a `Deny` row takes
+  `ArgValue::AnySuffix`: a refusal must not be escapable by the shape rule that exists to
+  NARROW an allowance, or `-fplugin=evil` is refused and `-fplugin=/tmp/evil.so` is not.
+  Operator entries are consulted LAST, matched whole and exactly, and ride into
+  `MakeNodeServiceSpec` — a registration replays its command line forever.
 - A cache exchange is bounded by a round trip, a dispatched compile by how long a
   COMPILER runs; sharing one deadline abandoned every TU worth distributing while the
   worker finished the job anyway. And a per-call `SO_RCVTIMEO` is not a bound at all.
