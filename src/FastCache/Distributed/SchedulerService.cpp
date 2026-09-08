@@ -185,6 +185,15 @@ namespace
         // so it is the likeliest field to arrive as bytes that are not text.
         TextField<WorkerRegistration> { .name = "toolchain label",
                                         .project = [](WorkerRegistration const& r) { return r.toolchainLabel; } },
+        // The fifth, and it comes from the same place the fourth does: the machine
+        // itself, not this project. `gethostname` and `GetComputerNameExA` hand back
+        // whatever the host is called, in whatever encoding the host chose -- so this
+        // is a row rather than an exemption, and it is refused where it ENTERS. One
+        // byte that is not UTF-8 makes `/fleet.json` unparseable for the whole fleet,
+        // and a renderer that repaired it would be a second author of the value while
+        // every surface that did not repair still carried the original (#1024).
+        TextField<WorkerRegistration> { .name = "display name",
+                                        .project = [](WorkerRegistration const& r) { return r.displayName; } },
     };
 
     /// Whether a registration's endpoint names the host it arrived from.

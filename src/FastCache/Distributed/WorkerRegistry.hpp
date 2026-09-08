@@ -76,6 +76,15 @@ struct WorkerInfo
     /// override is never probed, so there is no banner to read a label out of.
     std::string toolchainLabel {};
 
+    /// What a person calls this machine, e.g. `buildnode-3`. Empty means it did not say.
+    ///
+    /// **Advisory, and never a key** (#1024). `id`, `fingerprint` and `endpoint` decide
+    /// every match, every route and every admission; this decides nothing at all. It
+    /// exists because a node's identity is minted rather than typed, so an operator
+    /// reading `a3f5...` needs something that tells them which box that is. Node-wide,
+    /// like `version` and unlike `toolchainLabel`.
+    std::string displayName {};
+
     std::uint32_t slots {};    ///< Concurrent jobs it will accept in general.
     std::uint32_t inFlight {}; ///< Jobs currently outstanding on it.
 
@@ -176,6 +185,9 @@ struct NodeReport
     /// What software the machine runs, from the contributing entry. Empty means it
     /// did not say -- see `WorkerInfo::version`.
     std::string version {};
+    /// What a person calls the machine, from the contributing entry. Empty means it
+    /// did not say -- see `WorkerInfo::displayName`, and note it decides nothing.
+    std::string displayName {};
 };
 
 /// One node's cache, as `NodeCaches()` reports it.
@@ -213,6 +225,10 @@ struct WorkerRegistration
     /// What a person calls the toolchain, e.g. `cl 19.44.35207`; empty means it did
     /// not say. Display only -- see `WorkerInfo::toolchainLabel` (#194).
     std::string_view toolchainLabel {};
+
+    /// What a person calls the machine; empty means it did not say. Advisory only --
+    /// see `WorkerInfo::displayName` (#1024).
+    std::string_view displayName {};
     std::uint32_t slots {};           ///< Concurrent job limit it asks for; 0 to derive.
     std::vector<std::uint8_t> codecs; ///< What it can decode.
 

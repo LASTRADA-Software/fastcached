@@ -305,18 +305,25 @@ TEST_CASE("Discovery is the only surface that is not TCP", "[node][surfaces]")
     }
 }
 
-TEST_CASE("Raft binds nothing until consensus is turned on", "[node][surfaces]")
+TEST_CASE("Raft binds exactly when --listen-raft is given", "[node][surfaces]")
 {
-    // `--listen-raft` is configuration, `--node-id` is the switch. A worksheet
-    // listing the raft port for a node running no consensus would have an operator
-    // open a port nothing will ever bind.
+    // `--listen-raft` IS the switch since #1022, and this row is where that is
+    // decided -- `RunsConsensus` reads it here rather than off `cfg.raftListen`, so a
+    // worksheet and the mode cannot disagree about whether the port is served.
+    //
+    // BOTH directions, because the row's gate moved rather than went away: it used to
+    // return nothing unless `--node-id` was given, and a test that only drove the
+    // fully-configured node would pass under either gate.
     NodeConfig cfg;
     cfg.raftListen = "0.0.0.0:6680";
-
-    CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
-
-    cfg.nodeId = "n1";
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).size() == 1);
+
+    // An id with no port names a node in a cluster this process is not opening a door
+    // for, so nothing is bound and the worksheet says so. Under the old gate this was
+    // the served case, which is what makes it the one worth asserting.
+    NodeConfig named;
+    named.nodeId = "n1";
+    CHECK(RowFor(NodeSurface::Raft).Resolve(named).empty());
 }
 
 TEST_CASE("The worksheet describes this configuration, not the defaults", "[node][surfaces]")
@@ -442,19 +449,31 @@ TEST_CASE("A surface that is off is named, with what would turn it on", "[node][
 
 TEST_CASE("A surface that is configured and still off is not answered 'set the flag'", "[node][surfaces]")
 {
-    // The two ways a row goes unserved that are NOT "you did not ask for it", and the
-    // two an operator actually meets -- because `--print-surfaces` runs before
+    // The ways a row goes unserved that are NOT "you did not ask for it", and they are
+    // what an operator actually meets -- because `--print-surfaces` runs before
     // `StartupPolicyRejection`, deliberately, so the map is available exactly while a
-    // port is still wrong. Told to "set --listen-raft", somebody who had just written
-    // it goes looking at the flag rather than at `--node-id`.
+    // port is still wrong.
+    //
+    // **The case this was written for is gone, and saying so is the assertion.** Told
+    // to "set --listen-raft", somebody who had just written it went looking at the
+    // flag rather than at `--node-id`; #1022 made `--listen-raft` the switch, so that
+    // configuration now SERVES. Asserting the served endpoint rather than deleting the
+    // case is what keeps the old behaviour from coming back unremarked -- the wrong
+    // answer and the right one differ by one row's `resolve`.
     NodeConfig raft;
     raft.raftListen = "6680";
 
     auto const waiting = RenderSurfaces(raft);
     CHECK_FALSE(waiting.contains("set --listen-raft"));
-    CHECK(waiting.contains("see the raft note below"));
-    // And the note it points at is the one that names the switch.
-    CHECK(RowFor(NodeSurface::Raft).note.contains("--node-id"));
+    CHECK_FALSE(waiting.contains("see the raft note below"));
+    CHECK(waiting.contains("0.0.0.0:6680"));
+    // And the note names the switch, which is now this row's own flag.
+    CHECK(RowFor(NodeSurface::Raft).note.contains("turns consensus ON"));
+
+    // A row with no spec text at all still gets the first answer, which is the one
+    // that IS right for it.
+    NodeConfig silent;
+    CHECK(RenderSurfaces(silent).contains("set --listen-raft"));
 
     // A malformed value is echoed in the shape the row advertises -- the same sentence
     // `StartupPolicyRejection` produces from the same columns a moment later, rather

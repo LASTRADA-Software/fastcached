@@ -134,15 +134,24 @@
 # --slots names a number, which is the operator's answer already.
 #reserve_cores:
 
-# this node's identity in the cluster. Giving it turns consensus ON; without
-# it this node leads alone, which is right for one machine and is the
-# default.
+# this node's identity in the cluster, and what every vote is counted
+# against. An OVERRIDE: a node with a consensus port mints one into
+# --cluster-dir on its first start and reads it back forever, so this is only
+# needed for a fleet already named by hand. --listen-raft is what turns
+# consensus on; this names the node that runs it.
 #node_id:
 
-# where peers reach this node's consensus port. A bare port binds the
-# WILDCARD: peers are on other machines by definition, so loopback would
-# silently not work.
+# where peers reach this node's consensus port. Giving it turns consensus ON;
+# without it this node leads alone, which is right for one machine and is the
+# default. A bare port binds the WILDCARD: peers are on other machines by
+# definition, so loopback would silently not work.
 #listen_raft:
+
+# the host this node's peers dial it at; the port comes from --listen-raft. How
+# a node names ITSELF when its identity was derived rather than typed, since
+# --raft-peer=<id>=... needs an id somebody wrote. A bare --listen-raft binds
+# the wildcard, so what this node binds is usually not what a peer can dial.
+#raft_self:
 
 # a cluster member and where it answers; repeatable. Both halves in one
 # token because a member id with no address is a node counted towards quorum
@@ -170,7 +179,7 @@
 #cluster_id:
 
 # announce this node on the segment and listen for peers here; off unless
-# given. Needs --node-id and --cluster-key-file. Without it a cluster is
+# given. Needs --listen-raft and --cluster-key-file. Without it a cluster is
 # exactly the --raft-peer list an operator typed.
 #discovery:
 

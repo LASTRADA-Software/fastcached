@@ -56,6 +56,7 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         // kept its fingerprint pinned, and a label held over would name the compiler
         // that is no longer there.
         existing->second.info.toolchainLabel = std::string { registration.toolchainLabel };
+        existing->second.info.displayName = std::string { registration.displayName };
         // Reset rather than kept, both of them, and for one reason: a re-registering
         // worker has restarted, so whatever it was running is gone and whatever its
         // machine was doing is a reading from before that. Carrying either forward
@@ -74,6 +75,7 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
                                                   .endpoint = std::string { registration.endpoint },
                                                   .version = std::string { registration.version },
                                                   .toolchainLabel = std::string { registration.toolchainLabel },
+                                                  .displayName = std::string { registration.displayName },
                                                   .slots = OfferableSlots(registration.capacity, registration.slots),
                                                   .inFlight = 0,
                                                   .capacity = registration.capacity,
@@ -368,7 +370,8 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
                                                                       .registeredSlots = entry.info.slots,
                                                                       .fleetJobsInFlight = entry.info.inFlight,
                                                                       .heartbeatAge = AgeOf(entry.lastSeen, now),
-                                                                      .version = entry.info.version },
+                                                                      .version = entry.info.version,
+                                                                      .displayName = entry.info.displayName },
                                                .lastSeen = entry.lastSeen,
                                                .contributorSaysCache = SaysAnything(entry.info.load.cache) });
         if (inserted)
@@ -408,6 +411,7 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
             // -- and taking it from the same contributor as everything else keeps
             // the whole row one entry's account rather than a blend of several.
             held.report.version = entry.info.version;
+            held.report.displayName = entry.info.displayName;
             held.lastSeen = entry.lastSeen;
             held.contributorSaysCache = saysCache;
         }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
@@ -216,7 +217,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 
     auto const* const self = ClusterSelfMember(cfg);
     if (self == nullptr)
-        return std::unexpected { std::string { NodeIdNamesNoPeerRefusal } };
+        return std::unexpected { std::string { ConsensusNamesNoSelfPeerRefusal } };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the
@@ -255,8 +256,13 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // the reactor and the reactor is a member of the object this has not built yet.
     // The refusal still reaches the operator: `Launch`'s error is this function's.
 
-    auto const stateDirectory =
-        cfg.clusterDir.empty() ? std::filesystem::path { "fastcache-cluster" } / cfg.nodeId : cfg.clusterDir;
+    // `NodeStateDirectory`, not a second spelling of the default: the identity is
+    // recorded in this same directory since #1024, so a default written twice would be
+    // a node reading its identity out of one directory and its log out of another. The
+    // `<node-id>` suffix went with that change -- an identity read FROM the directory
+    // cannot name it -- and what the suffix bought is unchanged, because two nodes on
+    // one machine need two Raft logs and so two directories whatever they are called.
+    auto const stateDirectory = NodeStateDirectory(cfg);
     auto storage = Consensus::FileRaftStorage::Open(stateDirectory);
     if (!storage.has_value())
         return std::unexpected { std::format("cannot open {}: {}", stateDirectory.string(), storage.error().context) };

@@ -20,6 +20,7 @@
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeFrameSurface.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
@@ -405,6 +406,48 @@ void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link,
 /// the live snapshot -- `Node::ReloadedCredential` among them -- do not each respell
 /// `ConfigReloaderOf<NodeConfig>`.
 using Node::NodeReloader;
+
+/// Resolve this node's identity and put it into both configurations.
+///
+/// A function rather than a block in `main` for the reason `StartCacheTierOrExplain`
+/// is one: it is a coherent decision with one answer, and inline it pushed `main` past
+/// clang-tidy's cognitive-complexity limit. What it decides is `NodeIdentity`'s and not
+/// this file's -- `main.cpp` is in no test target, so a rule spelled here is one
+/// nothing can assert.
+///
+/// BOTH configurations, because they are used for two different things and each is
+/// wrong without it: @p cfg is what this process runs with and what the startup table
+/// judges, and @p cliOnly is what a service registration bakes in.
+/// @param cfg The merged configuration, completed in place.
+/// @param cliOnly The command-line-only parse a registration is built from.
+/// @param random Where a minted identity's bits come from.
+/// @param logger Where the identity, or the refusal, is reported.
+/// @return The identity, DISENGAGED when this invocation needs none, or why it could
+///         not be resolved. `std::expected` over a nested optional, because "no
+///         identity is wanted here" and "one was wanted and could not be had" are the
+///         two states a caller acts on differently and two optionals render alike.
+[[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, std::string> AdoptNodeIdentity(NodeConfig& cfg,
+                                                                                              NodeConfig& cliOnly,
+                                                                                              IRandomSource& random,
+                                                                                              ILogger& logger)
+{
+    if (Node::NodeIdentityNeed(cfg) != Node::IdentityNeed::Mint)
+        return std::optional<Node::NodeIdentity> {};
+
+    auto resolved = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
+    if (!resolved.has_value())
+        return std::unexpected { std::move(resolved).error() };
+
+    Node::ApplyNodeIdentity(cfg, *resolved);
+    Node::ApplyNodeIdentity(cliOnly, *resolved);
+
+    // Which of the three it was, said out loud once. "This node kept the identity it
+    // had" and "this node invented one" are the pair that matters and the pair a silent
+    // start cannot tell apart -- the second is a machine the cluster has never
+    // admitted, and an operator who sees it after a restart has lost a state directory.
+    logger.Logf(LogLevel::Info, "node identity {} ({})", resolved->id, Node::DescribeNodeIdentityOrigin(resolved->origin));
+    return std::optional<Node::NodeIdentity> { *std::move(resolved) };
+}
 
 /// Adopt the compile-argument allowlist an accepted reload asks for, and say so when
 /// it moved.
@@ -1056,6 +1099,14 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // travels inside the capacity record because that is REGISTER's one extensible
     // field; the message's own arity is exact and stays that way forever.
     advertisedWire.version = VersionString;
+    // What a person calls this machine, and NOTHING decides from it (#1024). A node's
+    // identity is minted into its state directory rather than typed, so an operator
+    // reading an opaque id off the fleet page needs something that says which box that
+    // is -- and the hostname is exactly the mutable, not-per-node value the identity
+    // was deliberately not built on, which is why it may be a label and may be nothing
+    // else. It rides in the capacity record beside `version` for the same reason:
+    // REGISTER's own arity is exact and stays that way forever.
+    advertisedWire.displayName = host->Facts().hostName;
 
     // A lambda, for the reason `compilersOf` is one: the heartbeat rebuilds this list
     // when the machine's toolchains change underneath the node, and two spellings of
@@ -1708,6 +1759,23 @@ int main(int argc, char** argv)
                 return ExitUsage;
             }
 
+        // The identity the registration will bake in, resolved here because a
+        // registration replays its command line forever: one that omitted it would let
+        // a re-image answer to an identity the cluster never admitted, with both
+        // machines up throughout. AFTER `NodeInstallRejection`, so a command line this
+        // install is about to refuse leaves no state directory behind, exactly as the
+        // start path resolves after its own table.
+        //
+        // An uninstall reaches neither -- `NodeIdentityNeed` declines it -- because
+        // removing a registration is the recovery an operator reaches for when the
+        // configuration is already wrong.
+        SystemRandomSource identityRandom;
+        if (auto const adopted = AdoptNodeIdentity(cfg, cliOnly, identityRandom, *consoleLogger); !adopted.has_value())
+        {
+            consoleLogger->Logf(LogLevel::Error, "{}; refusing to install", adopted.error());
+            return ExitUsage;
+        }
+
         // `cliOnly`, never `cfg`: a registration replays its arguments at every
         // start, so baking in what the FILE said would freeze one reading of that
         // file into launch arguments that then outrank the file itself -- the
@@ -1813,6 +1881,31 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
+    // **This node's identity, resolved once and applied to every configuration this
+    // process builds** (#1024). It is minted into `--cluster-dir` on the first start
+    // and read back on every one after, so a fleet is built without inventing a name
+    // per machine and typing it twice.
+    //
+    // **AFTER the table that judges this command line, and that is not a preference.**
+    // Resolving MINTS: it creates a directory and writes a file. A configuration the
+    // node is about to refuse must not leave one behind -- and worse, an unwritable
+    // `--cluster-dir` would answer with "cannot create ..." in place of the
+    // configuration error that is the operator's actual problem. Which is also what
+    // keeps the startup rules pure functions of the command line, since they never see
+    // an identity: the self-peer row asks `--raft-self` rather than looking for the
+    // member `ApplyNodeIdentity` synthesises.
+    //
+    // The install path resolves at its OWN site, after its own table, for the same
+    // reason and it cannot share this one: `--install-service` returns long before
+    // here, and its refusals are `NodeInstallRejection`'s rather than these.
+    SystemRandomSource identityRandom;
+    auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger);
+    if (!identity.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", identity.error());
+        return ExitUsage;
+    }
+
     // Built only when there IS a file, and holding the SAME argv the startup parse
     // used -- so a reload reproduces the startup order exactly: a fresh configuration,
     // the file applied through the appliers argv reaches, then the command line second.
@@ -1830,7 +1923,8 @@ int main(int argc, char** argv)
         reloader.emplace(
             cfg,
             lookup.path,
-            [argvSpan](std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
+            [argvSpan, identity = identity->value_or(Node::NodeIdentity {})](
+                std::filesystem::path const& path) -> std::expected<NodeConfig, ConfigError> {
                 // A FRESH configuration, never the live one. A file that fails halfway
                 // is then discarded whole rather than leaving the running worker
                 // holding part of a document nobody wrote.
@@ -1841,6 +1935,13 @@ int main(int argc, char** argv)
                     });
                 if (!loaded.has_value())
                     return std::unexpected(loaded.error());
+                // The identity again, through the same function the start used. A
+                // candidate rebuilt without it holds an empty `--node-id`, which is an
+                // unreloadable field that has CHANGED -- so every reload would be
+                // refused by name, on a worker whose configuration was perfectly
+                // valid. Resolved once at startup and applied here, never re-resolved:
+                // this runs on a signal, and a reload must not be able to mint.
+                Node::ApplyNodeIdentity(candidate, identity);
                 return candidate;
             },
             &ValidateNodeReloadable);

@@ -354,7 +354,25 @@ struct NodeConfig
     /// A bare port binds the WILDCARD, like a scheduling node's `--listen-node`
     /// and unlike a worker's: peers are on other machines by definition, so a loopback
     /// default would be one that silently cannot work.
+    ///
+    /// Giving it is what turns consensus ON (#1022); see `RunsConsensus`.
     std::string raftListen;
+
+    /// The HOST this node's peers dial it at, from `--raft-self=<host>`.
+    ///
+    /// **Not a duplicate of `raftListen`, and the difference is why this flag has to
+    /// exist at all.** A bare `--listen-raft` binds the wildcard, so the address this
+    /// node BINDS is routinely not one any peer could dial -- and a member must name
+    /// the endpoint its peers dial. That is what `--raft-peer=<id>=<host>:<port>` says
+    /// about every other member, and it is unwritable for this one since #1024, because
+    /// the id is minted rather than typed. So the host is stated here and the port
+    /// comes from `--listen-raft`, and `ApplyNodeIdentity` is where the two become a
+    /// member.
+    ///
+    /// A HOST and never an endpoint: the port is not the operator's to repeat, and a
+    /// value carrying one would produce `host:port:port`. No grammar row for the same
+    /// reason `--bind` has none -- a host is only checkable by binding it.
+    std::string raftSelf;
 
     /// The cluster's members, from `--raft-peer=<id>=<host>:<port>`; repeatable.
     ///
@@ -559,8 +577,8 @@ struct NodeConfig
     bool nodeClassExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };
-    bool nodeIdExplicit { false };
     bool raftListenExplicit { false };
+    bool raftSelfExplicit { false };
     bool clusterIdExplicit { false };
     bool discoveryAddressExplicit { false };
     bool discoveryReplyPortExplicit { false };
@@ -1038,7 +1056,7 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 /// operator deliberately exposed does.
 inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
 
-/// Why a `--node-id` that names no `--raft-peer` cannot work.
+/// Why a node running consensus that names no `--raft-peer` of its own cannot work.
 ///
 /// A named constant rather than prose written into the policy row it fills, because
 /// `ConsensusTier::Start` answers with **this** string. The invariant is decided by
@@ -1047,23 +1065,30 @@ inline constexpr std::string_view AdminListenDefaultHost = "127.0.0.1";
 /// `NodeConfig` nobody parsed from an argv. Two spellings of one rule is what this
 /// codebase's table idiom exists to prevent.
 ///
+/// It was `NodeIdNamesNoPeerRefusal` and named `--node-id` as the thing that turns
+/// consensus on, which stopped being true at
+/// [#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022). A message
+/// naming the wrong flag sends an operator to add the flag they already have; the
+/// rule itself did not move, only the flag that reaches it.
+///
 /// It ends without a full stop, alone among the rows: `main.cpp` prints a tier's
 /// refusal as `"{}; refusing to start"`, and the tier's other messages are written
 /// as fragments for exactly that. One message serving two callers has to suit the
 /// one that appends.
-inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
-    "--node-id names no --raft-peer: this node must name the endpoint its peers dial, whether it bootstraps a "
-    "cluster or joins one, and consensus cannot start without one";
+inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
+    "--listen-raft turns consensus on and no --raft-peer names this node: it must name the endpoint its peers "
+    "dial, whether it bootstraps a cluster or joins one, and consensus cannot start without one";
 
 /// The `--raft-peer` entry `--node-id` names, if the list names it at all.
 ///
-/// The predicate behind `NodeIdNamesNoPeerRefusal`, shared for the reason that
+/// The predicate behind `ConsensusNamesNoSelfPeerRefusal`, shared for the reason that
 /// constant is: the startup table asks it for a verdict and `ConsensusTier::Start`
 /// asks it for the member itself, and a rule asked two ways is one that drifts.
 ///
 /// Answers for the list as typed, so a node with no `--node-id` at all names no
-/// member -- which is not a refusal on its own: an empty id means this node runs no
-/// consensus, and the table's own row is what decides whether that is a mistake.
+/// member -- which is not a refusal on its own: whether that is a mistake depends on
+/// whether this node runs consensus, which since #1022 is a different flag's
+/// question, and the table's own row is where the two meet.
 /// @param cfg The parsed configuration.
 /// @return A pointer into `cfg.raftPeers`, valid for as long as `cfg` is, or nullptr.
 [[nodiscard]] Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept;
@@ -1084,13 +1109,41 @@ inline constexpr std::string_view NodeIdNamesNoPeerRefusal =
 /// top of it -- leaving a window in which the surface answered `Lease` as a leader that
 /// had not been elected.
 ///
-/// It reads `--node-id` alone, which is exactly what `StartConsensusOrExplain` reads:
-/// a node with no id runs no consensus, which is the one-machine deployment and by far
-/// the common one. Whether the rest of the cluster flags make SENSE is
-/// `StartupPolicyRejection`'s question and is asked before any tier is built.
+/// **The switch is `--listen-raft`, and it moved off `--node-id` at
+/// [#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022).** While the
+/// id's ABSENCE carried the mode, the id could never be given a default: any default
+/// makes `nodeId.empty()` false forever, and the one-machine deployment -- which
+/// names no `--raft-peer` -- would then be refused at every boot. A node runs
+/// consensus if and only if it opens a consensus port, so the port is the fact.
+///
+/// **`--listen-raft` rather than a new boolean**, deliberately: a boolean is a second
+/// thing that can disagree with the port, and both disagreements are states nothing
+/// could describe -- a node that opens a consensus port and runs no consensus, and one
+/// that runs consensus and opens none. That also keeps the rule at one flag, which is
+/// what #613 asks for.
+///
+/// Asked of the surface row rather than of `raftListen` directly, so this and
+/// `--print-surfaces` cannot disagree about whether the raft port is served -- the row
+/// is where "is this surface on" is decided for every surface. A value that is not an
+/// address resolves to nothing here and is refused by the grammar walk at the top of
+/// `StartupPolicyRejection`, which runs before any rule that consults this and before
+/// any tier is built.
 /// @param cfg The parsed configuration.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
+/// The member endpoint `--raft-self` and `--listen-raft` name between them.
+///
+/// **One author for a value two places need**, which is the whole reason it is a
+/// function: `ApplyNodeIdentity` builds this node's own `--raft-peer` entry out of
+/// it, and the startup rule that refuses `--raft-self` beside a `--raft-peer` for
+/// this node has to be able to tell that entry from a DIFFERENT one an operator
+/// typed. Written twice, those two would disagree about IPv6 bracketing and the rule
+/// would refuse every reload of a node it had just accepted at startup -- the reload
+/// path judges a candidate the identity has already been applied to.
+/// @param cfg The parsed configuration.
+/// @return `host:port`, or empty when either half is missing.
+[[nodiscard]] std::string RaftSelfEndpoint(NodeConfig const& cfg);
 
 /// Who this node admits, as one line an operator reads at startup.
 ///

@@ -835,6 +835,20 @@ TEST_CASE("A worker that cannot name itself in UTF-8 is refused", "[distributed]
         refused(registration, "version");
     }
 
+    SECTION("the name a person calls the machine by")
+    {
+        // The fifth, and it comes from the same place the fourth does: the machine
+        // itself. `gethostname` and `GetComputerNameExA` hand back whatever the host is
+        // called, in whatever encoding the host chose -- a Windows machine named in a
+        // legacy code page, a Linux one whose `/etc/hostname` somebody wrote with a
+        // different editor. Advisory or not, one byte of it makes `/fleet.json`
+        // unparseable for the WHOLE fleet, which is why "nothing decides from it" is
+        // not a reason to let it through (#1024).
+        auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
+        registration.displayName = "build\xC3\x28node"; // a lead byte followed by a byte that is no continuation
+        refused(registration, "display name");
+    }
+
     SECTION("the label a person reads the toolchain by")
     {
         // The likeliest of the four to arrive as something that is not text, because
@@ -844,6 +858,94 @@ TEST_CASE("A worker that cannot name itself in UTF-8 is refused", "[distributed]
         auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
         registration.toolchainLabel = "cl 19.44\xC3"; // a lead byte with nothing after it
         refused(registration, "toolchain label");
+    }
+}
+
+TEST_CASE("A machine's display name reaches the fleet page and decides nothing", "[distributed][scheduler][fleetview]")
+{
+    // **The whole contract of the field** (#1024). A node's identity is minted into its
+    // state directory rather than typed, so an operator reading an opaque id needs
+    // something that says which box it is -- and the value that answers that is the
+    // hostname, which is mutable, not unique per node, and the exact property the
+    // identity was deliberately NOT built on. It may be a label and it may be nothing
+    // else. The moment anything routes, admits or dispatches by it, every problem the
+    // minted identity removes comes back.
+    //
+    // So this asserts BOTH halves, and the second is the one that would otherwise be a
+    // comment nothing checks: the same fleet, registered twice under two different
+    // names, must answer every question identically.
+    auto const registerWith = [](Leading& fleet, std::string_view name) {
+        auto registration = OneSlot("gcc-14", "10.0.0.2:7100");
+        registration.displayName = name;
+        return fleet.service.Register(Insider, registration);
+    };
+
+    SECTION("it reaches the page")
+    {
+        Leading fleet;
+        REQUIRE(registerWith(fleet, "buildnode-3").status == Wire::Status::Ok);
+
+        auto const snapshot =
+            CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
+        REQUIRE(snapshot.nodes.size() == 1);
+        CHECK(snapshot.nodes.front().displayName == "buildnode-3");
+
+        // And onto both renderings, because a column that reaches neither is a value
+        // nobody reads -- the two are one table walked twice, so this is what pins the
+        // walk rather than the row.
+        CHECK(RenderFleetHtml(snapshot, FleetHistoryView {}, 0).contains("buildnode-3"));
+        CHECK(RenderFleetJson(snapshot).contains("buildnode-3"));
+    }
+
+    SECTION("a node that says nothing renders as absent, not as blank")
+    {
+        // A peer too old to report one is exactly the node an operator is looking for
+        // during a rolling upgrade, so it must not be the emptiest-looking cell in the
+        // table. The page's own dash, like every other thing nobody told us.
+        Leading fleet;
+        REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+        auto const snapshot =
+            CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
+        REQUIRE(snapshot.nodes.size() == 1);
+        CHECK(snapshot.nodes.front().displayName.empty());
+        CHECK(RenderFleetJson(snapshot).contains("\"name\":null"));
+    }
+
+    SECTION("nothing decides from it")
+    {
+        // Two fleets, identical but for the name, driven through every outcome the name
+        // could plausibly reach: whether the worker is admitted, what id it is assigned,
+        // whether a lease is granted, and which endpoint that lease sends a client to.
+        //
+        // Byte-identical, not merely equivalent. A comparison that read the fields it
+        // expected to be equal would be a list somebody has to keep, and the one it
+        // omitted is the one that would have drifted.
+        auto outcomesUnder = [&registerWith](std::string_view name) {
+            Leading fleet;
+            auto const registered = registerWith(fleet, name);
+            auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+            auto const refused = fleet.service.Lease(Insider, Ask("clang-19", "key-2"));
+
+            return std::tuple { registered.status,
+                                AssignedId(registered),
+                                granted.status,
+                                granted.error,
+                                std::string { Wire::AsStringView(std::span<std::byte const> { granted.payload }) },
+                                refused.status,
+                                refused.error };
+        };
+
+        // Bound to locals and compared inside one set of parentheses: Catch2 decomposes
+        // the expression it is handed, and there is no `tuple_size` for its decomposer,
+        // so the comparison has to happen before the macro sees it.
+        auto const named = outcomesUnder("buildnode-3");
+        CHECK((named == outcomesUnder("some-other-name-entirely")));
+
+        // And against no name at all, which is the case a fleet mid-upgrade is actually
+        // in -- so "two names agree" cannot be passing because both were ignored in the
+        // same way a missing one is not.
+        CHECK((named == outcomesUnder({})));
     }
 }
 

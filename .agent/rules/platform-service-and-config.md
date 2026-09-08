@@ -206,14 +206,14 @@ readable and silently ignored. Every rule below has already been one of them.
   A **cross-flag invariant** goes in `StartupPolicyRejection`, whose messages are
   static prose and so can name flags but no values. When both a row and a tier must
   assert one rule, they share a predicate and a message constant -- `ClusterSelfMember`
-  and `NodeIdNamesNoPeerRefusal` -- because a rule asked two ways is one that drifts,
+  and `ConsensusNamesNoSelfPeerRefusal` -- because a rule asked two ways is one that drifts,
   which is the whole reason for a table. And a new row goes **after** any narrower
   rule about the same flags: first match wins, so `--raft-join needs --raft-peer`
   would otherwise be answered in its place and become a rule nothing reaches.
 
   Two things that look like members of the group and are not. `--cluster-dir` is
   read by `FleetHistoryPath` for the dashboard's history file, so it is *not*
-  refused alongside `--listen-raft` when there is no `--node-id` -- a node running
+  refused alongside `--raft-peer` when there is no `--listen-raft` -- a node running
   no consensus still has a use for it. And a row asks `ParseEndpoint` rather than
   `raftListen.empty()`, so an unusable port is refused with the missing one, the
   way the `--dashboard` row judges the address `AdminEndpoint` will actually take

@@ -247,6 +247,123 @@ Every rule below has already been a bug.
 
 ## Raft
 
+- **A node IS its state directory, and its identity is MINTED there rather than derived
+  from the machine**
+  ([#1024](https://github.com/LASTRADA-Software/fastcached/issues/1024)). An id had to
+  be invented per machine and typed twice -- once as `--node-id` and again inside
+  `--raft-peer=<id>=<host>:<port>`, because a node that does not name itself is refused.
+  It is now written into `--cluster-dir` on the first start and read back on every one
+  after; `--node-id` remains as an override and is RECORDED, so it is typed once.
+  - **Not the hostname**, which is the obvious default and fails on the property that
+    matters: a node id is durable identity in a replicated log, and a
+    `hostnamectl set-hostname` or a re-image would silently re-identify the machine --
+    the cluster counting a member that no longer exists beside a stranger nobody
+    admitted. It is also not unique per node, since one machine may run one node per
+    toolchain.
+  - **Not the OS machine-id either, and NOT AS A SEED.** The ticket proposed seeding
+    from an application-specific derivation of `/etc/machine-id` / `MachineGuid` /
+    `IOPlatformUUID`, and that is unsound in two directions this tree can show. It makes
+    the ticket's own stated property FALSE -- two machines cloned from one image, each
+    with no state yet, mint the SAME id, silently, which is the duplicate the derivation
+    was chosen to avoid. And an identity that survives losing the state directory is
+    worse than one that does not: that directory holds the Raft log and the vote record,
+    so a node returning under its old id having forgotten which term it voted in is
+    `--cluster-dir`'s own documented hazard -- two leaders in one term -- arriving
+    automatically. **A wiped state directory MUST produce a new identity.** So the mint
+    is 128 bits from `IRandomSource` and there is no platform seam for a machine-id at
+    all: folded in beside fresh randomness it changes no outcome, and a three-platform
+    reader whose value decides nothing is a claim with no reader.
+  - **A derived id cannot be typed, so `--raft-self=<host>` is not separable
+    ergonomics.** It states the address peers dial and takes the port from
+    `--listen-raft`, because a bare `--listen-raft` binds the WILDCARD and what a node
+    binds is routinely not what a peer can dial. `RaftSelfEndpoint` is the one author of
+    the pair: the rule that refuses a `--raft-peer` CONTRADICTING it has to recognise the
+    entry `ApplyNodeIdentity` synthesised, or a node accepted at startup has every reload
+    refused by name -- the reload path judges a candidate the identity has already been
+    applied to.
+  - **The startup rules stay pure functions of the command line, so identity resolution
+    runs AFTER them.** The self-peer rule therefore asks `ClusterSelfMember(c) == nullptr
+    && c.raftSelf.empty()` rather than looking for the member afterwards; `--install-service`
+    reaches it, and a rule that needed the filesystem could not be one of the table's.
+  - **The resolved value is applied to EVERY configuration this process builds** -- the
+    running one, the one a registration bakes in, and every reload candidate -- through
+    one function. A candidate rebuilt without it holds an empty `--node-id`, which is an
+    unreloadable field that has CHANGED, so every reload would be refused by name on a
+    worker whose configuration was perfectly valid.
+  - **`--node-id` is the one flag emitted on VALUE rather than on provenance**, and its
+    `explicitBit` is deleted rather than left unread. `emitIfSet` was removed by #713
+    precisely so nobody reaches for it; this row is written out at its call site instead,
+    because the flag no longer has a DEFAULT for a value comparison to be wrong about --
+    it has a value minted on this machine, and a registration omitting it would let a
+    re-image answer to an identity the cluster never admitted.
+  - **A recorded id that is empty or is not text is REFUSED, never re-minted.** Replacing
+    an identity because a file was hard to read makes this node a member the cluster has
+    never heard of while the one it counts is gone, and both machines are up throughout.
+  - **A state directory copied to a second machine copies the node, and that is NOT
+    refused.** It cannot be refused where it would be seen: `--cluster-admit` re-pointing
+    an id at a new address is how an operator records a node that has MOVED, so the
+    request is byte-identical to the honest one, and the fact that separates them --
+    whether the old endpoint still answers -- is wrong in both directions at the moment
+    it is asked. A moved node's old address never answers; a cloned one's answers only
+    while both happen to be running. What IS done is that the case is documented where
+    an operator meets the directory, and that resolution never mints for an invocation
+    that only asks a question (`--print-surfaces`, a cluster verb, `--uninstall-service`)
+    -- a flag whose own comment says it changes nothing must keep saying so.
+- **The hostname is a LABEL on the fleet page and decides nothing.** It reaches the
+  leader on REGISTER's nested capacity record, beside `version` and for the same arity
+  reason, and renders as a `name` column. Nothing keys on it, routes by it, admits by it
+  or dispatches by it -- which is precisely what makes it safe to carry a value that is
+  mutable and not unique per node, the two properties the identity was deliberately not
+  built on. It goes through the same UTF-8 gate as every other string a peer sends, and
+  "it decides nothing" is not a reason to exempt it: one byte makes `/fleet.json`
+  unparseable for the WHOLE fleet, and this is the field most likely to arrive in a
+  legacy code page, because the machine chose it rather than this project.
+  - **And no prefix matching on ids, however tempting `--cluster-forget=a3f5` looks.**
+    An abbreviated identifier is a DISPLAY form; the full one is read, never padded,
+    truncated or re-derived. Full id, or the display name.
+  - The wire seam is where a display name is LOST invisibly: `SchedulerService_test`
+    builds a `WorkerRegistration` in memory, so deleting the line that carries the name
+    off the nested record leaves that whole file green -- measured. The case that fails
+    is in `SchedulerProtocol_test`, driving a real encoded REGISTER.
+
+- **A mode rides on the PORT, never on the absence of a NAME**
+  ([#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022)).
+  `RunsConsensus` read `!cfg.nodeId.empty()`, so consensus was switched by an
+  identity — and an identity whose absence carries a mode can never be given a
+  default. Any default at all makes `nodeId.empty()` false forever, so
+  `ClusterSelfMember` finds no member on a machine that names no `--raft-peer`,
+  `ConsensusNamesNoSelfPeerRefusal` fires, and the one-machine deployment — the
+  common one — refuses to start at every boot AND at `--install-service`, where the
+  registration replays the same command line forever. That is not a tuning problem:
+  the identity cannot be derived while the switch lives on it.
+  - **`--listen-raft` rather than a new `--cluster` boolean.** A boolean is a second
+    thing that can disagree with the port, and both disagreements are states nothing
+    could describe: a node that opens a consensus port and runs no consensus, and one
+    that runs consensus and opens none. The port *is* the fact, which also keeps the
+    rule at one flag.
+  - **Asked of the surface ROW, never of `cfg.raftListen`.** `RowFor(NodeSurface::Raft)
+    .Resolve(cfg)` is where "is this surface served" is decided for every surface, and
+    `--print-surfaces` prints from it. Reading the member directly would be a second
+    author of that, so a worksheet could name a port the mode says is off. A value that
+    is not an address resolves to nothing here and is refused by the grammar walk at the
+    top of `StartupPolicyRejection`, which runs before every rule that consults the
+    predicate and before any tier exists.
+  - **One predicate, still.** #613 was `StartConsensusOrExplain` and `SchedulerTier`
+    authoring this one rule apart, and the symptom was the scheduler answering `Lease`
+    as a leader that had never been elected. A MOVED rule is exactly when a second
+    author reappears — a tier that re-spelled `cfg.nodeId.empty()` would compile, pass
+    every case that gives both flags, and be wrong the day the identity gains a
+    default. `AdmissionSummary` was a third author of it and had to move too, or a
+    clustered node's ready line tells an operator it admits this machine only.
+  - **The five refusals did not all move the same way, and two of them INVERTED.**
+    `--node-id` and `--raft-peer` were things a consensus node needed; they are now
+    things that configure nothing on their own, so each is refused for naming a cluster
+    with the switch off. `--raft-join` and `--discovery` re-point at the new switch and
+    keep their meaning. `--listen-raft` with no `--node-id` becomes the ORDINARY case
+    and is refused by nothing, which is the whole point. Assert the MESSAGE and not the
+    refusal: under the old switch every one of these inputs was refused too, so a test
+    counting refusals passes whichever flag the predicate reads.
+
 - **Consensus had never been RUN, and five defects were waiting where no unit test
   could reach them.** `RaftNode`, `RaftLog`, `RaftDriver` and `RaftClusterHarness`
   are exhaustively tested against a simulated cluster in one process — which is the

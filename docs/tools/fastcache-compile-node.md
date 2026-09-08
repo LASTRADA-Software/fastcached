@@ -11,13 +11,12 @@ about one of them:
 |---|---|---|
 | [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
-| [Consensus member](#a-cluster-and-who-leads-it) | `--node-id`, `--listen-raft` | **off** — a lone node leads itself |
+| [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft` | **off** — a lone node leads itself |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
 
-That is the list of **roles**, and it is not a firewall list — `--node-id` switches
-consensus on but is not a port, and a role's default here is not the address it binds
-for a given command line. For the ports, see
+That is the list of **roles**, and it is not a firewall list — a role's default here
+is not the address it binds for a given command line. For the ports, see
 [Every port it opens](#every-port-it-opens) below, or generate the list from the
 binary with `--print-surfaces`.
 
@@ -83,7 +82,7 @@ The surfaces, and what each is for:
 |---|---|---|---|
 | Node port — cache verbs, compile jobs, and the scheduler's with `--serve-scheduler` | `--listen-node` | `6674` — **always on**; a bare port takes **loopback**, or the **wildcard** with `--serve-scheduler` | TCP |
 | Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
-| Consensus peer | `--listen-raft` | off; a bare port takes the **wildcard**, and needs `--node-id` | TCP |
+| Consensus peer | `--listen-raft` | off; giving it turns consensus **on**, and a bare port takes the **wildcard** | TCP |
 | Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
 
 Three things on that table are easy to get wrong and expensive to get wrong:
@@ -887,11 +886,71 @@ fact. A member id with no address is a node the cluster counts towards every quo
 and cannot reach: the fleet is then one node short of forming one, and nothing says
 why.
 
+### A node's identity is its own
+
+**You do not invent a name per machine.** On its first start a node with a consensus
+port mints an identity and writes it into `--cluster-dir`, beside its Raft log; every
+later start reads it back. That is what the cluster admits, what every vote is
+counted against, and what survives a rename, a re-image and a restart.
+
+It says which it did, once, at startup:
+
+```
+node identity 3f1c…8a02 (newly minted; this node has not been admitted to any cluster yet)
+node identity 3f1c…8a02 (recorded)
+node identity n1 (from --node-id, recorded)
+```
+
+Those three are worth telling apart. **Newly minted** after a restart means the state
+directory was lost — this node is no longer the member the cluster is counting.
+
+`--node-id` still works and is an **override**: give it once and it is recorded, so
+you need not give it again. It is the right answer when you already run a fleet named
+by hand.
+
+**A derived identity cannot be typed into `--raft-peer`**, and a node must name the
+endpoint its peers dial — so `--raft-self=<host>` says it instead, and the port comes
+from `--listen-raft`. That is not a convenience: without it a node with a minted
+identity could not name itself at all.
+
+```sh
+# The whole of a first node
+fastcache-compile-node --listen-raft=6680 --raft-self=10.0.0.1     --cluster-dir=/var/lib/fastcache-node/cluster --serve-scheduler ...
+```
+
+**A second node has to name the first by the id the first actually has**, because every
+Raft message is addressed by member id: a `--raft-peer` entry under a name nobody
+answers to is a joiner that receives the leader's replication and has nowhere to send
+its refusal — admitted, dialled and permanently silent. Read it off the first node's
+startup line, or out of its `--cluster-dir`:
+
+```sh
+grep 'node identity' /var/log/fastcache-compile-node.log
+cat /var/lib/fastcache-node/cluster/node-id
+```
+
+Nothing answers "what is your id" over a port today. If typing ids about is what your
+fleet does, `--node-id` on every node is still the shorter road.
+
+**The identity belongs to the state directory, not to the machine.** Two nodes on one
+machine need two `--cluster-dir`s anyway — two Raft logs cannot share one — so they
+get two identities with nothing to invent. Copy a machine without its state directory
+and the copy mints its own, which is right. Copy the state directory and you have
+copied the node, which is what you asked for and is as dangerous as it sounds: two
+processes holding one identity and one vote record is two voters the cluster believes
+are one. Nothing refuses that today; see the note at the end of this section.
+
+Deleting the identity file gives this node a **new** identity, and the cluster must
+then admit it — the old one stays in the configuration until you `--cluster-forget`
+it. That is the safe direction rather than an inconvenience: the vote record went
+with the file, and a node that came back under its old name having forgotten which
+term it voted in is how one term gets two leaders.
+
 A node must name itself among its own peers, and it is refused if it does not —
 such a node could never win a vote and could never be voted for, so it would stand
 for election forever against a cluster that has never heard of it.
 
-Giving `--node-id` is what turns consensus on, and three things then have to hold.
+Giving `--listen-raft` is what turns consensus on, and four things then have to hold.
 Each is decided by the command line alone, so each is refused at startup **and** at
 `--install-service`, where you are watching, rather than at every boot into a log
 nobody reads:
@@ -899,10 +958,11 @@ nobody reads:
 | What has to hold | Why |
 |---|---|
 | every `--raft-peer` is `<id>=<host>:<port>` | A token that names no member is refused by the parser, which is the only place that can tell you *which* token. `--cluster-admit` takes the same one. |
-| one of them is this node | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
-| `--listen-raft` names a usable port | That is where every peer dials it. Without one nothing binds and no vote could arrive. |
+| this node is named, by a `--raft-peer` of its own or by `--raft-self` | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
+| not both, naming different addresses | Two answers to one question, with nothing to rank them by. |
+| `--listen-raft` names a usable port | That is where every peer dials it, and giving it is what turns consensus on. A value that is not an address is refused with the text you typed. |
 
-The reverse holds too: `--listen-raft` or `--raft-peer` **without** `--node-id` is
+The reverse holds too: `--node-id` or `--raft-peer` **without** `--listen-raft` is
 refused rather than ignored. This node would run no consensus at all, so neither
 flag is read by anybody and nothing would say so. (`--cluster-dir` is not one of
 them — the dashboard keeps its history file there, so a node with no consensus
@@ -1057,7 +1117,7 @@ stranger who could set `upstream` would point the whole fleet's cache at a host 
 their choosing.
 
 **A node running no cluster says so** rather than answering as though it had one. A
-single node started without `--node-id` leads itself and has no replicated state,
+single node started without `--listen-raft` leads itself and has no replicated state,
 which is a different fact from "ask somebody else" — being sent elsewhere would have
 you looking for a node that does not exist.
 
@@ -1180,8 +1240,9 @@ Two consequences worth knowing before you deploy it:
   discovery listening on 0.0.0.0:6681, answering from 0.0.0.0:52341, for cluster build-farm, announcing 10.0.0.1:6680
   ```
 
-Running several nodes on one machine works, and each needs its own `--node-id`,
-`--listen-raft` and — if you pin them — `--discovery-reply-port`.
+Running several nodes on one machine works, and each needs its own `--cluster-dir`,
+`--listen-raft` and — if you pin them — `--discovery-reply-port`. The identity comes
+with the directory: two Raft logs cannot share one, so there is no name to invent.
 
 **Discovery never changes membership by itself.** It answers who proved the key and
 where they answer; the *leader* proposes, and only the leader, because admitting a
@@ -1190,8 +1251,8 @@ one of them do nothing about it.
 
 **A node joining a discovered fleet still needs `--raft-join`**, and nothing else
 about the *cluster*: discovery supplies the addresses a typed join has to list by
-hand. It still names itself — `--node-id`, `--listen-raft` and its own
-`--raft-peer` entry — as every node with an identity does. One
+hand. It still names itself — `--listen-raft` and either `--raft-self` or its own
+`--raft-peer` entry — as every node in a cluster must. One
 node bootstraps the cluster and the rest join it — and exactly one, because two
 nodes that each bootstrapped a cluster of themselves cannot be merged. A membership
 change proposed against such a node never commits, and the leader says so once the
@@ -1205,9 +1266,24 @@ member that does not answer. Removing one stays an operator decision.
 
 ### Where its state lives
 
-`--cluster-dir`, defaulting to `fastcache-cluster/<node-id>`. Durable by necessity
-rather than by preference: a node that answered a vote and forgot it would vote
-twice in one term after a restart, which is two leaders in one term.
+`--cluster-dir`, defaulting to `fastcache-cluster`. Durable by necessity rather than
+by preference: a node that answered a vote and forgot it would vote twice in one term
+after a restart, which is two leaders in one term.
+
+It holds this node's **identity** as well, in a file called `node-id`, which is why
+the default no longer ends in the id — a name read out of a directory cannot name the
+directory. Losing this directory loses both, and losing them together is the safe
+pairing: a node that kept its identity across a lost vote record is the two-leaders
+case above, arriving automatically.
+
+**A state directory copied to a second machine copies the node**, identity and all,
+and nothing refuses that. It cannot be refused where it would be noticed:
+`--cluster-admit=<id>=<host>:<port>` re-pointing an id at a new address is *how you
+record a node that has moved*, so the request is byte-identical to the honest one,
+and what separates them — whether the old address still answers — is wrong in both
+directions at the moment it is asked (a moved node's old address never answers, and a
+cloned one's answers only while both happen to be running). Copy the directory when
+you mean to move a node, not to make a second one.
 
 ## Running it as a service
 
