@@ -45,6 +45,8 @@
 #include <print>
 #include <thread>
 
+#include <tests/WindowsErrorPopups.hpp>
+
 using namespace FastCache;
 using namespace std::chrono_literals;
 
@@ -73,6 +75,10 @@ template <typename Predicate>
 
 int main()
 {
+    // Several canaries here exist to be SEEN aborting, so on Windows the modal
+    // CRT dialog is what happens on a successful run, not an edge case.
+    FastCache::Testing::SuppressWindowsErrorPopups();
+
     SteadyClock clock;
     PlatformReactor reactor { clock };
 

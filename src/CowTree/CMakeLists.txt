@@ -66,6 +66,10 @@ if(FASTCACHED_BUILD_TESTS)
             Catch2::Catch2
     )
 
+    # <tests/WindowsErrorPopups.hpp>: this links CowTree rather than FastCache, and it
+    # is FastCache that carries src/ as a PUBLIC include directory.
+    target_include_directories(CowTreeTests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+
     # Catch.cmake (catch_discover_tests) is placed on CMAKE_MODULE_PATH by the
     # top-level CMakeLists, regardless of whether Catch2 came from CPM source
     # or a system find_package.

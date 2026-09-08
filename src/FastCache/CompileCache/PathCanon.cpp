@@ -75,6 +75,14 @@ namespace
             return true;
 
         // Exact match, or the next byte is a separator (segment boundary).
+        //
+        // **One separator on purpose, and not an oversight.** Both operands are
+        // COMPARISON forms, and `ComparisonForm` folds `\` to `/`, so a backslash
+        // cannot reach this line -- testing for one would be dead code that reads
+        // like thoroughness. Anything unifying separator handling across the
+        // predicates in this file must not reach here; #562 records the same caution
+        // from the other direction, and #575 left this line alone deliberately while
+        // hoisting the folded roots out of the per-span path.
         return pathCmp.size() == rootCmp.size() || pathCmp[rootCmp.size()] == '/';
     }
 
@@ -115,15 +123,46 @@ namespace
         return (!rootCmp.empty() && rootCmp.back() == '/') ? rootCmp.size() - 1 : rootCmp.size();
     }
 
+    /// The comparison forms of a layout's two roots.
+    ///
+    /// A `Layout`'s roots are fixed for the life of an operation while the path
+    /// varies per span, so these belong to the CALLER's scope rather than to
+    /// `CanonicalizeOne`, which is invoked once per path span. Rebuilt per span they
+    /// cost two heap allocations and two transform loops each time to produce the
+    /// same two strings: a translation unit with 100 `/showIncludes` lines pays
+    /// roughly 200 avoidable allocations for a value that never changes.
+    ///
+    /// **Threaded down rather than memoized**, which is what keeps this a change of
+    /// scope rather than of lifetime: there is no cache to invalidate, no hidden
+    /// static, and no clock — the value simply lives where it is invariant. That is
+    /// the shape `AGENT.md`'s caching principle asks for when the cheaper answer is
+    /// to compute once rather than to remember.
+    struct FoldedRoots
+    {
+        std::string sourceRoot; ///< Comparison form of `Layout::sourceRoot`.
+        std::string buildTree;  ///< Comparison form of `Layout::buildTree`.
+    };
+
+    /// Fold a layout's roots into their comparison forms, once.
+    /// @param layout Producing machine's roots.
+    /// @return Both roots' comparison forms.
+    [[nodiscard]] FoldedRoots FoldRoots(Layout const& layout)
+    {
+        return FoldedRoots { .sourceRoot = ComparisonForm(layout.sourceRoot),
+                             .buildTree = ComparisonForm(layout.buildTree) };
+    }
+
     /// Rewrite a single native path to a token. Longest matching root wins.
     /// @param absolutePath Native-form path.
     /// @param layout       Producing machine's roots.
+    /// @param folded       @p layout's roots already in comparison form.
     /// @return The token, or the input verbatim when under neither root.
-    [[nodiscard]] std::string CanonicalizeOne(std::string_view absolutePath, Layout const& layout)
+    [[nodiscard]] std::string CanonicalizeOne(std::string_view absolutePath, Layout const& layout, FoldedRoots const& folded)
     {
+        // Only this one varies per call; the roots arrive already folded.
         std::string const pathCmp = ComparisonForm(absolutePath);
-        std::string const srcCmp = ComparisonForm(layout.sourceRoot);
-        std::string const buildCmp = ComparisonForm(layout.buildTree);
+        std::string_view const srcCmp = folded.sourceRoot;
+        std::string_view const buildCmp = folded.buildTree;
 
         bool const srcMatch = IsSegmentPrefix(pathCmp, srcCmp);
         bool const buildMatch = IsSegmentPrefix(pathCmp, buildCmp);
@@ -669,8 +708,9 @@ RootRelation RelateToLayout(std::string_view path, Layout const& layout)
     // would ask for a `/` that cannot be there and answer "not under root" for
     // every path under every root.
     std::string const pathCmp = ComparisonForm(path);
-    auto const source = RelateFolded(pathCmp, ComparisonForm(layout.sourceRoot));
-    auto const build = RelateFolded(pathCmp, ComparisonForm(layout.buildTree));
+    auto const folded = FoldRoots(layout);
+    auto const source = RelateFolded(pathCmp, folded.sourceRoot);
+    auto const build = RelateFolded(pathCmp, folded.buildTree);
     // Strongest answer wins, and `Under` outranking `NearMiss` is the whole content
     // of this function: with a build tree spelled as the source root's sibling, a
     // path inside it is a near miss of one root and correctly under the other.
@@ -679,7 +719,7 @@ RootRelation RelateToLayout(std::string_view path, Layout const& layout)
 
 std::string Canonicalize(std::string_view absolutePath, Layout const& layout)
 {
-    return CanonicalizeOne(absolutePath, layout);
+    return CanonicalizeOne(absolutePath, layout, FoldRoots(layout));
 }
 
 std::string Localize(std::string_view token, Layout const& layout)
@@ -689,8 +729,12 @@ std::string Localize(std::string_view token, Layout const& layout)
 
 std::string CanonicalizeRegion(std::string_view text, Grammar grammar, Layout const& layout)
 {
+    // Folded ONCE for the whole region rather than per span, which is where this
+    // matters: the walkers below call `xform` once per path, and the roots are the
+    // same for every one of them.
+    auto const folded = FoldRoots(layout);
     auto const xform = [&](std::string_view span) {
-        return CanonicalizeOne(span, layout);
+        return CanonicalizeOne(span, layout, folded);
     };
     // The depfile grammar is multi-token per line, so it needs its own walker.
     if (grammar == Grammar::GccDepfile)

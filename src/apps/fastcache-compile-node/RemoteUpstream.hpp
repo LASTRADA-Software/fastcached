@@ -4,9 +4,13 @@
 #include "LocalCache.hpp"
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Net/IAsyncAddressResolver.hpp>
 #include <FastCache/Net/IConnector.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -66,13 +70,24 @@ class RemoteUpstream final: public ICacheUpstream
     ///        this bounds the whole exchange. It is also the only thing that
     ///        works at all on a reactor socket, whose reads suspend rather than
     ///        block.
+    /// @param resolver How the endpoint's host is turned into an address, at most
+    ///        once per @p addressRefreshInterval. Injected like every other ambient
+    ///        dependency: a cache with a hidden resolver or a hidden clock is
+    ///        untestable by construction.
+    /// @param clock What ages the held address. Injected for the same reason.
+    /// @param addressRefreshInterval How long a resolved address is reused before it
+    ///        is looked up again. See `DefaultAddressRefreshInterval` for both
+    ///        directions this trades off.
     RemoteUpstream(std::string endpoint,
                    Cc::Credential credential,
                    Cc::CredentialNotice::Sink noticeSink,
                    IConnector& connector,
                    IReactor* reactor,
+                   IAsyncAddressResolver& resolver,
+                   IClock& clock,
                    std::chrono::milliseconds connectTimeout,
-                   std::chrono::milliseconds ioTimeout) noexcept;
+                   std::chrono::milliseconds ioTimeout,
+                   std::chrono::milliseconds addressRefreshInterval);
 
     [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override;
     [[nodiscard]] Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override;
@@ -88,7 +103,38 @@ class RemoteUpstream final: public ICacheUpstream
     }
 
   private:
+    /// The endpoint text to dial: the held address once one has been resolved,
+    /// otherwise the configured endpoint verbatim.
+    ///
+    /// Refreshed on an INTERVAL and never on a miss. A miss-triggered refresh would
+    /// hand a remote peer a free amplifier -- one forced `getaddrinfo` per request,
+    /// simply by asking for keys this cache does not have.
+    /// @return Endpoint text for `DialEndpoint`.
+    [[nodiscard]] Task<std::string> DialTarget();
+
     std::string _endpoint;
+
+    /// `_endpoint` split once, at construction, rather than per operation. Empty
+    /// `_host` means it did not split, and every dial then falls back to `_endpoint`
+    /// so the failure stays exactly where it was.
+    std::string _host;
+    std::uint16_t _port {};
+
+    /// The address last resolved for `_host`, already in endpoint form. Disengaged
+    /// until the first SUCCESSFUL lookup.
+    std::optional<std::string> _resolved;
+
+    /// When a lookup was last ATTEMPTED, successful or not; disengaged before the
+    /// first.
+    ///
+    /// The attempt rather than the success, and the distinction is the whole guard: a
+    /// timer that only advanced on success would leave a node whose resolver is down
+    /// looking up once per cache operation -- which is the amplifier the interval
+    /// exists to remove, reached by the other door. Caught by
+    /// `RemoteUpstream_test.cpp`'s failing-resolver case, which is why it is a
+    /// separate member rather than a comment on the old one.
+    std::optional<TimePoint> _lastLookupAt;
+
     Cc::Credential _credential;
     /// Where "your credential went unchecked" is said; the node is a CLIENT here,
     /// and had the same silence the launcher did (#363).
@@ -100,8 +146,11 @@ class RemoteUpstream final: public ICacheUpstream
     Cc::CredentialNotice _notice;
     IConnector& _connector;
     IReactor* _reactor;
+    IAsyncAddressResolver& _resolver;
+    IClock& _clock;
     std::chrono::milliseconds _connectTimeout;
     std::chrono::milliseconds _ioTimeout;
+    std::chrono::milliseconds _addressRefreshInterval;
 };
 
 } // namespace FastCache::Node

@@ -87,6 +87,8 @@
 #include <latch>
 #include <thread>
 
+#include <tests/WindowsErrorPopups.hpp>
+
 namespace
 {
 
@@ -104,6 +106,10 @@ int shared[Cells] {};
 
 int main()
 {
+    // Several canaries here exist to be SEEN aborting, so on Windows the modal
+    // CRT dialog is what happens on a successful run, not an edge case.
+    FastCache::Testing::SuppressWindowsErrorPopups();
+
     // Both threads wait here, so the unsynchronised accesses genuinely overlap
     // rather than merely being unordered.
     std::latch start { 2 };

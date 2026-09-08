@@ -94,6 +94,9 @@ if(ENABLE_SANITIZER_THREAD)
     # sequences the two, and is the only thing that should run this.
     find_package(Threads REQUIRED)
     target_link_libraries(tsan-canary PRIVATE Threads::Threads)
+    # <tests/WindowsErrorPopups.hpp>: this target links no FastCache, which is what
+    # otherwise carries src/ as a PUBLIC include directory.
+    target_include_directories(tsan-canary PRIVATE "${CMAKE_SOURCE_DIR}/src")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -124,6 +127,10 @@ endif()
 # diagnostic, the same way the TSan gate requires "data race".
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(iterator-debug-canary IteratorDebugCanary.cpp)
+    # <tests/WindowsErrorPopups.hpp>. This target links nothing on purpose -- it is a
+    # bare program so that _ITERATOR_DEBUG_LEVEL is the only thing under test -- so it
+    # inherits no include directory either.
+    target_include_directories(iterator-debug-canary PRIVATE "${CMAKE_SOURCE_DIR}/src")
     add_test(
         NAME "iterator-debug-canary"
         COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/iterator-debug-gate.ps1"

@@ -5,6 +5,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace FastCache;
 using PathCanon::Grammar;
@@ -162,6 +163,38 @@ TEST_CASE("CanonicalizeRegion rewrites only the path in a /showIncludes line")
                            "\r\n";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout);
     CHECK(out == "Note: including file: <SRCROOT>/include/foo.h\r\n");
+}
+
+TEST_CASE("CanonicalizeRegion agrees with Canonicalize on every span of a multi-span region")
+{
+    // #575 hoisted the roots' comparison forms out of the per-span path and into the
+    // caller, so the region walker now folds them ONCE and hands the same value to
+    // every span. The hazard that introduces is a region whose later spans are judged
+    // against something other than what a standalone `Canonicalize` would use -- which
+    // a single-span test cannot see, because with one span "once" and "per span" are
+    // the same thing.
+    //
+    // So the region has to be long enough for a stale or mismatched fold to show, and
+    // it deliberately mixes the three outcomes: under the source root, under the build
+    // tree nested inside it, and under neither.
+    Layout const layout { .sourceRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\src\build)" };
+
+    std::vector<std::string> const paths {
+        R"(C:\ci\deep\src\a.h)",           // under the source root
+        R"(C:\ci\deep\src\build\gen\b.h)", // under the nested build tree: longest root wins
+        R"(C:\Program Files\MSVC\c.h)",    // under neither: passes through verbatim
+        R"(C:\ci\deep\src\d.h)",           R"(C:\ci\deep\src\build\e.h)", R"(C:\elsewhere\f.h)",
+    };
+
+    std::string region;
+    std::string expected;
+    for (auto const& path: paths)
+    {
+        region += "Note: including file: " + path + "\r\n";
+        expected += "Note: including file: " + PathCanon::Canonicalize(path, layout) + "\r\n";
+    }
+
+    CHECK(PathCanon::CanonicalizeRegion(region, Grammar::ShowIncludes, layout) == expected);
 }
 
 TEST_CASE("LocalizeRegion round-trips a showIncludes block across layouts")

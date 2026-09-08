@@ -68,6 +68,16 @@ class NodeIoLoop
         return _reactor;
     }
 
+    /// @return The loop's resolver, for a component that holds a resolved address
+    ///         itself rather than re-resolving per operation (`RemoteUpstream`).
+    ///
+    /// The same one `_connector` dials through, deliberately: two resolvers would be
+    /// two thread pools and two answers to one question.
+    [[nodiscard]] IAsyncAddressResolver& Resolver() noexcept
+    {
+        return _resolver;
+    }
+
     /// @return A connector whose sockets belong to `Reactor()`.
     ///
     /// Reactor-driven, so a dial from inside an answer suspends rather than
