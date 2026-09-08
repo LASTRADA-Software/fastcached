@@ -250,9 +250,24 @@ install_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -tar
 # appended it to every file would give the worker a `storage_path:` it has no setting
 # for, and the worker would then refuse to start naming a key it has never heard of --
 # which is the failure a shared loop makes easy and a per-file appendix does not.
-grep -q '^storage_path:' "${PREFIX}/etc/fastcached.yaml" \
+#
+# READ WITH sudo. By the time this runs the daemon's config is `-rw-r----- root` --
+# the mode assertion further down says exactly that, and the reinstall check writes
+# to it with `sudo tee` for the same reason -- so an unprivileged grep here fails on
+# PERMISSION and reports it as content that is not there. Measured: this assertion
+# took `Package (macOS .pkg)` red on its first run for that reason and not for the
+# property it is about, while every existing check passed because they use `stat`,
+# which needs no read.
+sudo grep -q '^storage_path:' "${PREFIX}/etc/fastcached.yaml" \
     || fail "the daemon's seeded config has no live storage_path"
-! grep -q '^storage_path:' "${PREFIX}/etc/fastcache-compile-node.yaml" \
+
+# A negative assertion needs a POSITIVE CONTROL or it passes for the wrong reason: a
+# grep that cannot open the file also fails to match, so "carries no storage_path"
+# and "could not be read at all" are one green. The reference is entirely comments,
+# so a `#` must be found; only then does the absence below mean anything.
+sudo grep -q '^#' "${PREFIX}/etc/fastcache-compile-node.yaml" \
+    || fail "the worker's seeded config could not be read, so the next assertion would prove nothing"
+! sudo grep -q '^storage_path:' "${PREFIX}/etc/fastcache-compile-node.yaml" \
     || fail "the worker's seeded config carries storage_path, a setting it does not have"
 
 # The worker's account comes from the RUNTIME component, so it must exist

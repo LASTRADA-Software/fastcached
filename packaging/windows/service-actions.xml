@@ -107,11 +107,17 @@
                   Return="ignore" />
 
     <!-- The same for the worker, and it is the WORKER that runs it rather than
-         fastcached.exe with a different path. `--seed-config` derives its
+         fastcached.exe with a different path. The seeding flag derives its
          destination from the binary's own application name, so fastcached.exe can
          only ever write the daemon's config wherever it is pointed. That is why
          the MSI shipped no worker configuration at all until #397: there was no
          second action to add, only a first one that could not be reused.
+
+         The flag is named in prose rather than spelled, because an XML comment
+         may not contain a double hyphen at all: writing it out makes this file
+         not well formed, and CPack's WiX step then fails with a parse error that
+         names the line and not the reason. The ExeCommand below carries the real
+         spelling, where it belongs.
 
          Return="ignore" for the first action's reason: a machine that already has
          a worker config is the ordinary upgrade. -->
