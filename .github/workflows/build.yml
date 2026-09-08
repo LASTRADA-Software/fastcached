@@ -326,47 +326,17 @@ jobs:
           fi
           exit "$rc"
 
-      # A pull request whose COMMITS name a ticket its BODY does not would merge and
-      # leave that ticket open (#974). Only the body keyword closes an issue under
-      # the merge queue; the commit trailer is what keeps a ticket excisable from a
-      # batch branch, so both are required and this checks the half that is easy to
-      # forget.
+      # The closing-keyword check used to be a step HERE, and moved to
+      # `.github/workflows/pr-body.yml` in #1045. It reads the pull request BODY, so
+      # its only remedy is editing the body -- and this workflow's `pull_request:`
+      # trigger carries no `types:`, so it does not fire on `edited`. The refusal was
+      # therefore unclearable by the one action it advised: the context stayed red
+      # with the defect already fixed, until an unrelated push.
       #
-      # **In THIS job and ungated**, for the reason every other step here is: the
-      # job's `name:` is the required context `Check C++ style`, so a failure gates.
-      # Reporting without gating is #684.
-      #
-      # Only on a `pull_request` event, and the OTHER events say so out loud rather
-      # than passing quietly: there is no pull request in a `merge_group` or a push,
-      # so the check has nothing to read -- and "did not apply" and "found nothing"
-      # rendering identically is the collapse this repository files five separate
-      # tickets against. The queue does not need it anyway: a body edited between
-      # the pull request check and the merge is not a shape the queue can produce,
-      # because a body edit does not re-enter the queue.
-      #
-      # 77 is the script's "could not reach the API", and here it is a FAILURE for
-      # the reason the step above gives: a guard that could not run is exactly what
-      # this job exists to stop being silent about.
-      - name: "Check the closing keywords the commits promise are in the body"
-        if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "::notice::not a pull_request event (${{ github.event_name }}), so there is no body to read."
-            echo "::notice::This did not run. It is checked on the pull request itself (#974)."
-            exit 0
-          fi
-          set +e
-          bash scripts/check-pr-closing-keywords.sh --pr "${{ github.event.pull_request.number }}"
-          rc=$?
-          set -e
-          if [ "$rc" -eq 77 ]; then
-            echo "::error::the closing-keyword check could not reach the API, so it verified NOTHING."
-            echo "::error::That is not a pass (#974)."
-            exit 1
-          fi
-          exit "$rc"
+      # It is NOT gone and it is still required -- it reports under its own context
+      # now, which also stops a body failure presenting as a `Check C++ style`
+      # failure with clang-format skipped beneath it. Adding `edited` here instead
+      # would have re-run the whole matrix for a prose edit.
 
       - name: "Install clang-format"
         if: ${{ needs.changes.outputs.code != 'false' }}
