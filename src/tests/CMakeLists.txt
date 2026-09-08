@@ -4035,3 +4035,71 @@ set_tests_properties("tools-page-installed-set-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# No C++ source constructs from `std::istreambuf_iterator` (#1029).
+#
+# GCC 14 at -O2 and above inlines that iterator's `sgetc` and reports
+# `-Werror=null-dereference` inside <streambuf>. A false positive, and one this
+# project cannot silence, since warnings are errors and the rule is to fix them at
+# the source. The house spelling is `Cc::ReadFileBytes` or `out << in.rdbuf()`.
+#
+# In the DEFAULT set, where every developer meets it, because only an OPTIMISED
+# build can see the real failure: -Wnull-dereference is in neither -Wall nor
+# -Wextra, `-fsyntax-only` cannot reach it, and both times this shipped the author
+# had green MSVC, clang-tidy, ASan and UBSan runs. The second instance also hid a
+# byte-identical sibling behind it -- a build stops at the first failure -- so
+# fixing the named site alone would have relocated the failure one file along,
+# where it reads as a regression introduced by the fix (#172).
+#
+# The check exists rather than a comment because the comments were already there:
+# `git grep -n "istreambuf_iterator" -- 'src/'` at ed295468 found 8 occurrences in
+# 8 files, one use and SEVEN comments warning against it, one of them the doc
+# comment on the helper header that exists to be the one spelling. #970's shape
+# exactly, where the same argument produced a scan rather than more prose.
+add_test(
+    NAME "istreambuf-iterator"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-istreambuf-iterator.cmake"
+)
+set_tests_properties("istreambuf-iterator" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be SEEN to refuse a use, and seen to stay QUIET over prose.
+#
+# Eleven synthetic trees. The red arm names file AND line; the quiet arm covers all
+# three comment shapes this tree actually uses (`//`, `///`, and a `/* */` block
+# without leading stars); a file that both explains the rule and breaks it is
+# refused, which is the shape a partial fix leaves behind; and both fail-closed
+# arms are driven -- the token gone from the tree entirely, and no C++ under src/.
+#
+# Two properties are asserted that a fixture like this usually misses. The
+# enumeration MODE is asserted on both sides, with the git path staged for real via
+# `git init` plus `git add`, because a synthetic tree is not a git repository and
+# every case would otherwise exercise the directory walk while CI exercises git --
+# which is how `check-catch-skip-return-code` had six green self-test cases and a
+# red CI run with no contradiction between them. And one case plants `;`, `\`, `[`
+# and `]` ABOVE a violation and asserts the exact `file:line`: that case failed on
+# the first implementation, which used the house `fastcached_read_lines` splitting
+# idiom, because a line ending in a backslash merges with the next one there -- the
+# one case that reader's own comment claims it prevents. The merged element began
+# with `//`, so the comment stripper ate the real code and the use was reported
+# nowhere. A filename-only assertion passes under that bug.
+add_test(
+    NAME "istreambuf-iterator-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/istreambuf-iterator-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-istreambuf-iterator-selftest.cmake"
+)
+set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)

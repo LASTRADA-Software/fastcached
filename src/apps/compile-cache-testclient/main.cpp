@@ -38,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include <FileBytes.hpp>
 #include <IProcessRunner.hpp>
 #include <ReplayGuard.hpp>
 
@@ -55,18 +56,29 @@ namespace Wire = FastCache::CompileCacheWire;
     std::exit(2);
 }
 
-/// Read an entire file into a byte vector.
+/// Read an entire file into a byte vector, or exit.
+///
+/// Through `Cc::ReadFileBytes`, which is the one spelling this tree has: sized from
+/// the stream and read in a single call. This was the fourth hand-written copy in this
+/// directory and the last code site still constructing from `std::istreambuf_iterator`
+/// (#1029); that header's own comment carries the argument.
+///
+/// It is converted because the ban is the rule and because the sized read is the
+/// better implementation anyway -- one allocation and one read against a per-character
+/// loop with geometric regrowth and then a full-size copy -- and NOT because this site
+/// was failing. #1029 called it *unknown rather than safe*, since `Linux-gcc-release`
+/// configures this target but died at edge 495 of 691 before reaching it. Measured
+/// since, and it is clean: g++ 14.2.0 compiling this TU alone with the build's own
+/// `-O3 -Werror` command line emits no `-Wnull-dereference`, before the conversion as
+/// well as after. The sites that DID take gcc red read into a `std::string`; whether
+/// that is what makes the difference is untested, so it is not asserted here.
+
 [[nodiscard]] std::vector<std::byte> ReadFileBytes(std::filesystem::path const& path)
 {
-    std::ifstream in { path, std::ios::binary };
-    if (!in)
+    auto bytes = Cc::ReadFileBytes(path);
+    if (!bytes)
         Die("cannot open file: " + path.string());
-    std::vector<char> raw { std::istreambuf_iterator<char> { in }, std::istreambuf_iterator<char> {} };
-    std::vector<std::byte> bytes;
-    bytes.reserve(raw.size());
-    for (char const c: raw)
-        bytes.push_back(static_cast<std::byte>(c));
-    return bytes;
+    return std::move(*bytes);
 }
 
 /// Write a byte vector to a file.
