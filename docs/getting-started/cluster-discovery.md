@@ -4,7 +4,7 @@ How the nodes of a `fastcache-compile-node` cluster find each other on a LAN, an
 how one proves it belongs before the cluster admits it.
 
 It is off unless you ask for it. Turn it on with `--discovery`, which needs
-`--node-id` and `--cluster-key-file` and is refused without them; without it a
+`--listen-raft` and `--cluster-key-file` and is refused without them; without it a
 cluster is exactly the `--raft-peer` list an operator typed, which works and is
 the right answer for a fleet that does not change. The flags, and what a
 deployment looks like end to end, are under

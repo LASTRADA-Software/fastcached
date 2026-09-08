@@ -134,14 +134,15 @@
 # --slots names a number, which is the operator's answer already.
 #reserve_cores:
 
-# this node's identity in the cluster. Giving it turns consensus ON; without
-# it this node leads alone, which is right for one machine and is the
-# default.
+# this node's identity in the cluster, and what every vote is counted
+# against. --listen-raft is what turns consensus on; this names the node that
+# runs it.
 #node_id:
 
-# where peers reach this node's consensus port. A bare port binds the
-# WILDCARD: peers are on other machines by definition, so loopback would
-# silently not work.
+# where peers reach this node's consensus port. Giving it turns consensus ON;
+# without it this node leads alone, which is right for one machine and is the
+# default. A bare port binds the WILDCARD: peers are on other machines by
+# definition, so loopback would silently not work.
 #listen_raft:
 
 # a cluster member and where it answers; repeatable. Both halves in one
@@ -170,7 +171,7 @@
 #cluster_id:
 
 # announce this node on the segment and listen for peers here; off unless
-# given. Needs --node-id and --cluster-key-file. Without it a cluster is
+# given. Needs --listen-raft and --cluster-key-file. Without it a cluster is
 # exactly the --raft-peer list an operator typed.
 #discovery:
 

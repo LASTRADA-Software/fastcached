@@ -247,6 +247,44 @@ Every rule below has already been a bug.
 
 ## Raft
 
+- **A mode rides on the PORT, never on the absence of a NAME**
+  ([#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022)).
+  `RunsConsensus` read `!cfg.nodeId.empty()`, so consensus was switched by an
+  identity — and an identity whose absence carries a mode can never be given a
+  default. Any default at all makes `nodeId.empty()` false forever, so
+  `ClusterSelfMember` finds no member on a machine that names no `--raft-peer`,
+  `ConsensusNamesNoSelfPeerRefusal` fires, and the one-machine deployment — the
+  common one — refuses to start at every boot AND at `--install-service`, where the
+  registration replays the same command line forever. That is not a tuning problem:
+  the identity cannot be derived while the switch lives on it.
+  - **`--listen-raft` rather than a new `--cluster` boolean.** A boolean is a second
+    thing that can disagree with the port, and both disagreements are states nothing
+    could describe: a node that opens a consensus port and runs no consensus, and one
+    that runs consensus and opens none. The port *is* the fact, which also keeps the
+    rule at one flag.
+  - **Asked of the surface ROW, never of `cfg.raftListen`.** `RowFor(NodeSurface::Raft)
+    .Resolve(cfg)` is where "is this surface served" is decided for every surface, and
+    `--print-surfaces` prints from it. Reading the member directly would be a second
+    author of that, so a worksheet could name a port the mode says is off. A value that
+    is not an address resolves to nothing here and is refused by the grammar walk at the
+    top of `StartupPolicyRejection`, which runs before every rule that consults the
+    predicate and before any tier exists.
+  - **One predicate, still.** #613 was `StartConsensusOrExplain` and `SchedulerTier`
+    authoring this one rule apart, and the symptom was the scheduler answering `Lease`
+    as a leader that had never been elected. A MOVED rule is exactly when a second
+    author reappears — a tier that re-spelled `cfg.nodeId.empty()` would compile, pass
+    every case that gives both flags, and be wrong the day the identity gains a
+    default. `AdmissionSummary` was a third author of it and had to move too, or a
+    clustered node's ready line tells an operator it admits this machine only.
+  - **The five refusals did not all move the same way, and two of them INVERTED.**
+    `--node-id` and `--raft-peer` were things a consensus node needed; they are now
+    things that configure nothing on their own, so each is refused for naming a cluster
+    with the switch off. `--raft-join` and `--discovery` re-point at the new switch and
+    keep their meaning. `--listen-raft` with no `--node-id` becomes the ORDINARY case
+    and is refused by nothing, which is the whole point. Assert the MESSAGE and not the
+    refusal: under the old switch every one of these inputs was refused too, so a test
+    counting refusals passes whichever flag the predicate reads.
+
 - **Consensus had never been RUN, and five defects were waiting where no unit test
   could reach them.** `RaftNode`, `RaftLog`, `RaftDriver` and `RaftClusterHarness`
   are exhaustively tested against a simulated cluster in one process — which is the

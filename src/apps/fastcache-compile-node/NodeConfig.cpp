@@ -733,9 +733,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .operand = "=<id>",
             .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
             .explicitBit = &NodeConfig::nodeIdExplicit,
-            .description = "this node's identity in the cluster. Giving it turns\n"
-                           "consensus ON; without it this node leads alone,\n"
-                           "which is right for one machine and is the default.",
+            .description = "this node's identity in the cluster, and what every\n"
+                           "vote is counted against. --listen-raft is what turns\n"
+                           "consensus on; this names the node that runs it.",
             .yamlKey = "node_id",
             .same = FieldEq<&NodeConfig::nodeId>(),
         },
@@ -745,9 +745,12 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .operand = "=[<address>:]<port>",
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
             .explicitBit = &NodeConfig::raftListenExplicit,
-            .description = "where peers reach this node's consensus port. A bare\n"
-                           "port binds the WILDCARD: peers are on other machines\n"
-                           "by definition, so loopback would silently not work.",
+            .description = "where peers reach this node's consensus port. Giving\n"
+                           "it turns consensus ON; without it this node leads\n"
+                           "alone, which is right for one machine and is the\n"
+                           "default. A bare port binds the WILDCARD: peers are on\n"
+                           "other machines by definition, so loopback would\n"
+                           "silently not work.",
             .yamlKey = "listen_raft",
             .same = FieldEq<&NodeConfig::raftListen>(),
         },
@@ -841,7 +844,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::discoveryAddress, ParseText>(),
             .explicitBit = &NodeConfig::discoveryAddressExplicit,
             .description = "announce this node on the segment and listen for peers\n"
-                           "here; off unless given. Needs --node-id and\n"
+                           "here; off unless given. Needs --listen-raft and\n"
                            "--cluster-key-file. Without it a cluster is exactly\n"
                            "the --raft-peer list an operator typed.",
             .yamlKey = "discovery",
@@ -1901,11 +1904,17 @@ Cluster::ClusterMember const* ClusterSelfMember(NodeConfig const& cfg) noexcept
 
 bool RunsConsensus(NodeConfig const& cfg) noexcept
 {
-    // `--node-id` alone, and it must stay the same expression
+    // The consensus PORT, and it must stay the same expression
     // `StartConsensusOrExplain` uses to decide whether to start a driver at all: the
     // scheduler asks this to know whether a role is COMING, and if the two ever
     // disagreed one of them would be wrong about the other (#613).
-    return !cfg.nodeId.empty();
+    //
+    // It read `--node-id` until #1022, which is what made the id undefaultable: any
+    // default makes `nodeId.empty()` false forever, and the one-machine deployment
+    // -- which names no `--raft-peer` -- would then be refused at every boot. Asked
+    // of the surface row rather than of `cfg.raftListen`, so this and
+    // `--print-surfaces` cannot disagree about whether the port is served.
+    return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
 }
 
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
@@ -2377,17 +2386,22 @@ std::string AdmissionSummary(NodeConfig const& cfg)
         // what an operator listed rather than replacing it (#251), so
         // `--fleet-member` is worth giving on a clustered node too -- it is the only
         // route by which a machine that is not a cluster peer is admitted at all.
-        return cfg.nodeId.empty() ? std::string { "this machine only -- give --fleet-member or --fleet-open to "
-                                                  "admit peers" }
-                                  : std::string { "this machine and the cluster's members -- give --fleet-member or "
-                                                  "--fleet-open to admit callers that are not cluster peers" };
+        //
+        // `RunsConsensus` and not a spelling of its own, which is what it was until
+        // #1022 moved the switch off `--node-id`: an id is no longer what turns
+        // consensus on, so `nodeId.empty()` here would have told an operator their
+        // clustered node admits this machine only.
+        return !RunsConsensus(cfg) ? std::string { "this machine only -- give --fleet-member or --fleet-open to "
+                                                   "admit peers" }
+                                   : std::string { "this machine and the cluster's members -- give --fleet-member or "
+                                                   "--fleet-open to admit callers that are not cluster peers" };
 
     // One sentence with a conditional tail rather than two whole ones: written twice
     // they drift, and a phrase an operator reads is exactly the thing nobody notices
     // has drifted.
     return std::format("this machine plus {} member host(s){}",
                        cfg.fleetMembers.size(),
-                       cfg.nodeId.empty() ? "" : " and the cluster's members");
+                       RunsConsensus(cfg) ? " and the cluster's members" : "");
 }
 
 std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
@@ -2873,10 +2887,10 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "dial ITSELF -- the worker registers, heartbeats, is leased out and is never reached, with no "
                      "error at either end. Give --listen-node=0.0.0.0:6674 and --advertise=<this host>:6674. (A "
                      "fleet that really is one machine names --scheduler on loopback too, and is fine.)" },
-        { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.nodeId.empty(); },
-          .message = "--raft-join needs --node-id: a node waiting to be admitted to a cluster still has to have an "
-                     "identity, because that is what the cluster admits and what every vote is counted against. "
-                     "Without one it would listen forever and could never be named." },
+        { .refuses = [](NodeConfig const& c) { return c.raftJoin && !RunsConsensus(c); },
+          .message = "--raft-join waits to be admitted to a cluster, and --listen-raft is what turns consensus ON "
+                     "and where the leader that admits this node dials it. Without it nothing binds, no admission "
+                     "could ever reach this node, and it would wait forever." },
         { .refuses = [](NodeConfig const& c) { return c.raftJoin && c.raftPeers.empty(); },
           .message = "--raft-join needs --raft-peer: at least this node's own address, which is the half only it "
                      "knows, and normally the cluster's as well. A joiner cannot answer the leader that admits it "
@@ -2887,39 +2901,44 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // `ConsensusTier::Start` decided this from inside the tier, which the install
         // path returns long before reaching -- so a registration naming no reachable
         // self was written happily and then died at every boot (#168).
-        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && ClusterSelfMember(c) == nullptr; },
-          .message = NodeIdNamesNoPeerRefusal },
-        // The third refusal `ConsensusTier::Start` made and no table did.
-        // `ParseEndpoint` is asked here rather than `raftListen.empty()` because it
-        // answers nullopt for an unusable port as readily as for a missing one, and
-        // the tier decides on that same answer -- the way the `--dashboard` row
-        // below judges the address `AdminEndpoint` will actually take rather than
-        // the text an operator typed.
-        { .refuses =
-              [](NodeConfig const& c) {
-                  // Asked of the raft row, which is what `ConsensusTier::Start`
-                  // resolves through -- so this rule and the tier decide on one
-                  // answer. The row's own `--node-id` gate is why the id is tested
-                  // first: without it the row resolves to nothing for a reason that
-                  // is not this rule's.
-                  return !c.nodeId.empty() && RowFor(NodeSurface::Raft).Resolve(c).empty();
-              },
-          .message = "--node-id needs a usable --listen-raft: consensus is what --node-id turns on, and that port "
-                     "is where every peer dials this node. Without one nothing binds, no vote could arrive, and "
-                     "the node refuses to start rather than join a cluster that cannot see it." },
-        // The other half of the same flag group: consensus configured with the
-        // switch that turns it on left off. `--cluster-dir` is deliberately NOT
-        // here -- `FleetHistoryPath` reads it for the dashboard's history file, so
+        // The shape rule for a node that HAS asked for consensus: it must name the
+        // endpoint its peers dial. `RunsConsensus` since #1022 -- the predicate moved
+        // from `--node-id` to `--listen-raft` and this rule did not, because "a member
+        // must name itself" is true whichever flag turns the mode on.
+        { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && ClusterSelfMember(c) == nullptr; },
+          .message = ConsensusNamesNoSelfPeerRefusal },
+        // The reverse, and it INVERTED at #1022 rather than moving. `--node-id` used
+        // to be the switch, so a node that gave it and no `--listen-raft` was refused
+        // for having no port; now `--listen-raft` is the switch, so a node that gives
+        // the id and no port has named an identity nothing will ever use -- the same
+        // silent no-op, reached from the other side.
+        //
+        // Not folded into the row below: an operator who typed `--node-id` is telling
+        // this node who it is, and one who typed `--raft-peer` is telling it who else
+        // there is. Those are different mistakes and the remedy sentence differs.
+        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && !RunsConsensus(c); },
+          .message = "--node-id names this node inside a cluster, and --listen-raft is what turns consensus ON: "
+                     "without it this node runs none, so the id is never used, never announced and never voted "
+                     "for. Nothing would say so, which is the silent no-op this list exists to refuse. Give "
+                     "--listen-raft, or drop --node-id -- a node with neither leads itself, which is right for "
+                     "one machine and is the default." },
+        // The other half of the same flag group: the cluster's addresses given with
+        // the switch that turns consensus on left off. `--cluster-dir` is deliberately
+        // NOT here -- `FleetHistoryPath` reads it for the dashboard's history file, so
         // a node running no consensus still has a use for it.
-        { .refuses = [](NodeConfig const& c) { return c.nodeId.empty() && (!c.raftListen.empty() || !c.raftPeers.empty()); },
-          .message = "--listen-raft and --raft-peer configure consensus, and --node-id is what turns consensus ON: "
-                     "without one this node runs none, so the port is never bound and the peers are never dialled. "
-                     "Nothing would say so, which is the silent no-op this list exists to refuse. Give --node-id, "
-                     "or drop them." },
-        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.nodeId.empty(); },
-          .message = "--discovery needs --node-id: discovery finds peers for a CLUSTER, and without an id this "
-                     "node is not in one. It would broadcast, be answered, prove the key and have nowhere to "
-                     "put the answer." },
+        //
+        // `--listen-raft` is gone from this predicate rather than kept, because it is
+        // now the switch: naming it with no `--node-id` is the ORDINARY case #1022
+        // exists to make possible, not a mistake.
+        { .refuses = [](NodeConfig const& c) { return !c.raftPeers.empty() && !RunsConsensus(c); },
+          .message = "--raft-peer names the cluster this node belongs to, and --listen-raft is what turns "
+                     "consensus ON: without it this node runs none, so the peers are never dialled and no vote "
+                     "could arrive. Nothing would say so, which is the silent no-op this list exists to refuse. "
+                     "Give --listen-raft, or drop them." },
+        { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && !RunsConsensus(c); },
+          .message = "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a "
+                     "consensus port this node is not in one. It would broadcast, be answered, prove the key and "
+                     "have nowhere to put the answer." },
         { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && c.clusterKeyFile.empty(); },
           .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
                      "key is the only thing separating a peer from anything else on the segment. With none, no "

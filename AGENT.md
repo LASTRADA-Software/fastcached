@@ -697,6 +697,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.
+- **A mode rides on the PORT, never on the absence of a NAME.** Consensus is on iff
+  `--listen-raft` resolves — asked of the surface row, so `--print-surfaces` and the
+  mode cannot disagree. It read `--node-id` until #1022, and a flag whose ABSENCE
+  carries a mode can never be given a default: any default makes `nodeId.empty()`
+  false forever, so `ClusterSelfMember` names nothing on the one-machine deployment
+  and that node is refused at every boot AND at `--install-service`. A boolean beside
+  the port is the tempting alternative and is worse — two things that can disagree,
+  and both disagreements are states nothing could describe. One predicate,
+  `RunsConsensus`, because #613 was two tiers authoring this one rule.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before

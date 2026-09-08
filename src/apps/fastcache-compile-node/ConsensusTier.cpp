@@ -216,7 +216,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 
     auto const* const self = ClusterSelfMember(cfg);
     if (self == nullptr)
-        return std::unexpected { std::string { NodeIdNamesNoPeerRefusal } };
+        return std::unexpected { std::string { ConsensusNamesNoSelfPeerRefusal } };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the

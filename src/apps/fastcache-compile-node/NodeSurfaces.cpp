@@ -209,17 +209,17 @@ namespace
             .defaultHost = RaftListenDefaultHost,
             .spec = &NodeConfig::raftListen,
             .grammar = ListenEndpointGrammar,
-            .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
-                // Consensus is what `--node-id` turns on, so a `--listen-raft` with no
-                // id binds nothing -- the surface is configured and not served. Then
-                // delegating rather than re-spelling the fallback, which is what
-                // taking the row buys.
-                if (cfg.nodeId.empty())
-                    return {};
-                return ResolveFromSpec(row, cfg);
-            },
+            // Plain `ResolveFromSpec` since #1022, and the gate it lost is the point of
+            // that ticket. It used to return nothing unless `--node-id` was given,
+            // because the id was what turned consensus on -- which is what made the id
+            // undefaultable, since any default makes `nodeId.empty()` false forever and
+            // the one-machine deployment would be refused at every boot. The switch is
+            // this flag now: a node runs consensus if and only if it opens this port,
+            // and `RunsConsensus` reads that off this row rather than off `raftListen`,
+            // so there is no second author of "is the raft surface served".
+            .resolve = ResolveFromSpec,
             .note = "the wildcard for a bare port: peers are on other machines by definition, so a loopback "
-                    "default would be one that silently cannot work. Served only when --node-id is given",
+                    "default would be one that silently cannot work. Giving it is what turns consensus ON",
         },
         SurfaceRow {
             .surface = NodeSurface::Discovery,
@@ -348,12 +348,21 @@ namespace
     /// Three answers rather than one, because "set the flags this row names" is only
     /// the first of them and it is *wrong* for the other two. A row's flags are what
     /// would turn the surface on, so printing them unconditionally told an operator
-    /// who wrote `--listen-raft=6680` -- and got no port, because `--node-id` is what
-    /// switches consensus on -- to set the flag they had just set. The same line met
+    /// who wrote `--listen-raft=6680` -- and got no port, because `--node-id` was what
+    /// switched consensus on -- to set the flag they had just set. The same line met
     /// somebody whose address was malformed, which is a state `--print-surfaces` is
     /// deliberately reachable in: it runs BEFORE `StartupPolicyRejection`, precisely
     /// so the map is available while a port is still wrong, and "set --listen-node"
     /// then describes the wrong problem in the one situation the flag exists for.
+    ///
+    /// **That first case is gone, and the third answer is kept anyway.** #1022 made
+    /// `--listen-raft` itself the switch, so raft -- the one surface that could be
+    /// configured, well-formed and still unserved -- no longer can be, and no row can
+    /// today. It stays because what reaches it is a row whose `grammar` accepts a value
+    /// its own `resolve` refuses, which is two columns that are written apart and are
+    /// only equal by inspection: `--discovery` parses its spec twice, in two functions.
+    /// The alternative is a bare "not served" for a state whose whole difficulty is
+    /// that nothing says why.
     ///
     /// Only the PRIMARY flag is named for a surface that is off, never every flag the
     /// row carries: `--discovery-reply-port` is optional, and listing it beside
@@ -372,9 +381,9 @@ namespace
             // actually starting, rather than a second author of it.
             return std::format("not served; {}={} is not {}", PrimaryFlag(row), cfg.*row.spec, row.grammar.shape);
 
-        // Configured, well-formed, and still nothing bound -- today that is raft
-        // waiting on `--node-id`. Why is not uniform enough to be a column, so the
-        // row's own note carries it and this points at it rather than guessing.
+        // Configured, well-formed, and still nothing bound. No row reaches this since
+        // #1022; see above for why it stays. Why is not uniform enough to be a column,
+        // so the row's own note carries it and this points at it rather than guessing.
         return row.note.empty() ? std::string { "not served" } : std::format("not served; see the {} note below", row.name);
     }
 } // namespace

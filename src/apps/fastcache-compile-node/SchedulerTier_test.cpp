@@ -35,7 +35,7 @@ struct TierFixture
     NullLogger logger;
 };
 
-/// A node that runs consensus: `--node-id`, with a Raft port to serve it on.
+/// A node that runs consensus: a Raft port, which is what turns it on (#1022).
 ///
 /// The shape `StartConsensusOrExplain` accepts, so this is a node whose role WILL be
 /// published by the driver -- which is exactly what makes the interval before that
@@ -51,7 +51,7 @@ struct TierFixture
     return cfg;
 }
 
-/// A node that runs no consensus at all: no `--node-id`.
+/// A node that runs no consensus at all: no `--listen-raft`.
 /// @return The config.
 [[nodiscard]] NodeConfig LoneNode()
 {
@@ -124,4 +124,48 @@ TEST_CASE("A node leading alone still leads from the moment it starts", "[node][
     REQUIRE(tier.has_value());
 
     CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
+}
+
+TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[node][scheduler]")
+{
+    // #1022 moved the switch from `--node-id` to `--listen-raft`, and this tier is one
+    // of the two that has to agree about it. #613 was those two authoring one rule; a
+    // moved rule is exactly when a second author reappears, and a tier that had
+    // re-spelled `cfg.nodeId.empty()` would compile, pass every case above -- both of
+    // which give BOTH flags -- and be wrong the day the identity gains a default.
+    //
+    // The two cases are the ones the old reading answers oppositely, which is what
+    // makes them a test rather than two more happy paths.
+    TierFixture fix;
+
+    SECTION("--listen-raft with no --node-id does not claim leadership")
+    {
+        // A node whose id is derived rather than typed still runs consensus, so a role
+        // IS coming and claiming term 0 in the meantime is #613 again.
+        NodeConfig cfg;
+        cfg.scheduler = "127.0.0.1:6675";
+        cfg.serveScheduler = true;
+        cfg.raftListen = "127.0.0.1:6680";
+        NodeMembership membership { cfg };
+
+        auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+        REQUIRE(tier.has_value());
+        CHECK((*tier)->Service().Role() != Distributed::SchedulerRole::Leader);
+    }
+
+    SECTION("--node-id with no --listen-raft leads alone")
+    {
+        // The mirror: an id nothing turns into a cluster is a node leading itself, and
+        // refusing every verb until an election that will never happen is the failure
+        // the control above exists to prevent.
+        NodeConfig cfg;
+        cfg.scheduler = "127.0.0.1:6675";
+        cfg.serveScheduler = true;
+        cfg.nodeId = "n1";
+        NodeMembership membership { cfg };
+
+        auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+        REQUIRE(tier.has_value());
+        CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
+    }
 }

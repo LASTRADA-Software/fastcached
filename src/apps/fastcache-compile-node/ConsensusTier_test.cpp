@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "NodeMembership.hpp"
+#include "SchedulerTier.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <string>
 
 #include <tests/Unwrap.hpp>
@@ -142,5 +147,53 @@ TEST_CASE("A quorum proposal stops being in flight when the term moves", "[node]
         // must not read as a live proposal made in the current term.
         CHECK_FALSE(QuorumProposalPending(LogIndex {}, Term {}, LogIndex {}, Term {}));
         CHECK_FALSE(QuorumProposalPending(LogIndex {}, Term {}, At(9), In(4)));
+    }
+}
+
+TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node][consensus]")
+{
+    // #613 was two tiers authoring one rule: `StartConsensusOrExplain` deciding
+    // whether there is a cluster to start and `SchedulerTier` deciding whether a role
+    // is COMING. While each spelled `cfg.nodeId.empty()` for itself the scheduler
+    // published standalone leadership at term 0 and consensus published a real term
+    // over the top of it, leaving a window in which the surface answered `Lease` as a
+    // leader that had never been elected.
+    //
+    // #1022 MOVED that rule -- the switch is `--listen-raft` now -- and a moved rule is
+    // exactly when a second author reappears. So this asserts the tier's own decision
+    // at both inputs rather than trusting that it still calls the predicate.
+    //
+    // No I/O in either case. The `--node-id` case returns before anything is built;
+    // the `--listen-raft` case is given no `--raft-peer` naming itself, so it reaches
+    // `ConsensusTier::Start` and is refused there, on the rule the startup table owns
+    // -- which is the observation, because a tier that had skipped the gate would have
+    // returned a null tier instead.
+    NullLogger logger;
+    std::unique_ptr<SchedulerTier> const noScheduler;
+
+    SECTION("--node-id with no --listen-raft builds no tier")
+    {
+        NodeConfig cfg;
+        cfg.nodeId = "n1";
+        cfg.raftPeers = { *Cluster::ParseMemberSpec("n1=10.0.0.1:6680") };
+        NodeMembership membership { cfg };
+
+        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, logger);
+        REQUIRE(tier.has_value());
+        CHECK(*tier == nullptr);
+    }
+
+    SECTION("--listen-raft with no --node-id gets past the gate")
+    {
+        NodeConfig cfg;
+        cfg.raftListen = "6680";
+        NodeMembership membership { cfg };
+
+        // Refused, and refused by NAME: a null tier here would mean the gate is still
+        // reading the id, and any other refusal would mean it got somewhere this test
+        // does not intend to reach.
+        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, logger);
+        REQUIRE_FALSE(tier.has_value());
+        CHECK(tier.error() == ConsensusNamesNoSelfPeerRefusal);
     }
 }

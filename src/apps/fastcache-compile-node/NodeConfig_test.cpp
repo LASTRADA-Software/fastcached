@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LauncherCli.hpp"
 #include "NodeConfig.hpp"
+#include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
@@ -829,24 +830,34 @@ TEST_CASE("NodeConfig: a registered peer list comes back the way it went in", "[
     CHECK(reparsed->raftPeers == cfg.raftPeers);
 }
 
-TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before it is installed", "[node][consensus][policy]")
+TEST_CASE("NodeConfig: a consensus node that names no --raft-peer of its own is refused before it is installed",
+          "[node][consensus][policy]")
 {
     // #168. `ConsensusTier::Start` refuses this, and the install path returns long
     // before any tier is built -- so the registration was written, reported
     // installed, and then exited `ExitUsage` at every boot with nobody watching.
     // It is a pure function of the command line, like every startup rule, so it is
     // one now.
+    //
+    // Every shape carries `--listen-raft`, because that is what turns consensus on
+    // since #1022. Without it the node runs no consensus at all and is answered by a
+    // different rule -- which is the case below, asserted by the text only THAT rule
+    // produces, since "refused, and names --raft-peer" would pass under both.
     auto const shapes = std::to_array<std::pair<char const*, NodeConfig>>({
         { "no --raft-peer at all",
           [] {
               auto cfg = Installable();
               cfg.nodeId = "n1";
+              cfg.raftListen = "6680";
+              cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
               return cfg;
           }() },
         { "peers that name somebody else",
           [] {
               auto cfg = Installable();
               cfg.nodeId = "n1";
+              cfg.raftListen = "6680";
+              cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
               cfg.raftPeers = { Peer("n2=10.0.0.2:6680"), Peer("n3=10.0.0.3:6680") };
               return cfg;
           }() },
@@ -854,6 +865,8 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
           [] {
               auto cfg = Installable();
               cfg.nodeId = "n4";
+              cfg.raftListen = "6680";
+              cfg.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
               cfg.raftJoin = true;
               cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
               return cfg;
@@ -877,12 +890,31 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
     // The tier says the same thing in the same words, because it asks the same
     // predicate. A `NodeConfig` built by hand reaches it without a parser or a
     // policy table in between, and must not hear a second opinion.
-    CHECK(Unwrap(StartupPolicyRejection(shapes[0].second)) == NodeIdNamesNoPeerRefusal);
+    CHECK(Unwrap(StartupPolicyRejection(shapes[0].second)) == ConsensusNamesNoSelfPeerRefusal);
 
     // And it names its own flag, which is what lets `main.cpp` print a tier's
     // refusal without prefixing one -- it used to, and rendered this message as
     // "--node-id --node-id names no --raft-peer".
-    CHECK(NodeIdNamesNoPeerRefusal.starts_with("--node-id"));
+    //
+    // The flag it names moved with the switch at #1022. Pinned as the leading text
+    // rather than as "mentions --listen-raft somewhere", because a message naming the
+    // wrong flag first is what sends an operator to add a flag they already have.
+    CHECK(ConsensusNamesNoSelfPeerRefusal.starts_with("--listen-raft"));
+
+    // The same three shapes with the switch OFF are refused by a DIFFERENT rule, and
+    // that is the half a "refused, and names --raft-peer" assertion cannot see. Under
+    // the old switch these were this rule's own inputs, so a test that only counted
+    // refusals would pass whichever flag the predicate reads.
+    for (auto const& [what, clustered]: shapes)
+    {
+        INFO(what << ", without --listen-raft");
+        auto cfg = clustered;
+        cfg.raftListen.clear();
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("--listen-raft is what turns consensus ON"));
+        CHECK_FALSE(Unwrap(refusal) == ConsensusNamesNoSelfPeerRefusal);
+    }
 
     // A node that names itself is accepted, bootstrapping or joining. The key is
     // part of that shape rather than decoration: consensus grows the set this node's
@@ -896,7 +928,7 @@ TEST_CASE("NodeConfig: a --node-id that names no --raft-peer is refused before i
     CHECK_FALSE(StartupPolicyRejection(bootstrapping).has_value());
 }
 
-TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before it is installed",
+TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused before it is installed",
           "[node][consensus][policy]")
 {
     // The third refusal `ConsensusTier::Start` made and neither table did:
@@ -912,9 +944,13 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     // `--listen-raft` is now in the surface table's grammar loop, because that table
     // holds every surface and leaving one out would need a column meaning "somebody
     // else checks this one". So a MALFORMED address is answered there, echoing what
-    // the operator typed; an ABSENT one still reaches the consensus rule below, which
-    // is the input that rule was written about. Both still fire, for their own
-    // inputs, which is what made the move safe.
+    // the operator typed; an ABSENT one still reaches a cross-flag rule below. Both
+    // still fire, for their own inputs, which is what made the move safe.
+    //
+    // What #1022 changed is which cross-flag rule the ABSENT case reaches. The flag
+    // used to be required BY `--node-id`; now it is the switch, so its absence means
+    // the id and the peer list configure nothing -- the same silent no-op read from
+    // the other side, and a different sentence.
     struct RaftCase
     {
         char const* listen;  ///< What the operator wrote.
@@ -923,8 +959,8 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
 
     for (auto const& [listen, expects]: std::to_array<RaftCase>({
              // Nothing to judge, so the grammar loop skips it and the cross-flag rule
-             // answers: the surface is configured and cannot be served.
-             { .listen = "", .expects = "needs a usable" },
+             // answers: consensus is off, so everything else here is inert.
+             { .listen = "", .expects = "is what turns consensus ON" },
              // Text that is not an address, answered where the value can be echoed.
              { .listen = "nope", .expects = "is not [<address>:]<port>" },
              // Zero is not a port anyone can dial, so it is a malformed address
@@ -948,6 +984,17 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
         CHECK(NodeInstallRejection(cfg).has_value());
     }
 
+    // `--raft-peer` alone reaches its own row rather than `--node-id`'s, and the two
+    // are separate rows because they are separate mistakes: one operator has told
+    // this node who it is, the other who else there is.
+    {
+        auto cfg = Installable();
+        cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).starts_with("--raft-peer"));
+    }
+
     // A bare port is enough, and binds the wildcard -- peers are on other machines
     // by definition.
     auto bare = Installable();
@@ -964,6 +1011,87 @@ TEST_CASE("NodeConfig: a --node-id with no port for its peers is refused before 
     // And a worker with no consensus at all is not asked for a port it has no use
     // for, which is by far the common deployment.
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
+}
+
+TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[node][consensus][policy]")
+{
+    // #1022. `RunsConsensus` read `--node-id`, so the node identity could never be
+    // given a default: any default makes `nodeId.empty()` false forever, and
+    // `ClusterSelfMember` then names no member on the one-machine deployment -- so
+    // that node would be refused at every boot, and at `--install-service`.
+    //
+    // BOTH DIRECTIONS, because this is one expression and a test that only drives
+    // the happy path passes whichever flag it reads. Each case below is one the
+    // OTHER reading answers oppositely; a suite asserting only "consensus runs when
+    // the cluster is fully configured" would agree with the reverted predicate on
+    // every case it contains.
+    //
+    // The two TIERS that have to agree about this are asserted where each is tested
+    // -- `ConsensusTier_test`'s "a tier is built exactly when RunsConsensus says so"
+    // and `SchedulerTier_test`'s pair of cases -- because #613 was those two tiers
+    // authoring one rule, and a moved rule is when that recurs.
+
+    SECTION("--node-id with no --listen-raft runs NO consensus")
+    {
+        // The case that fails if the predicate is left reading the id.
+        auto cfg = Installable();
+        cfg.nodeId = "n1";
+        cfg.raftPeers = { Peer("n1=10.0.0.1:6680") };
+        CHECK_FALSE(RunsConsensus(cfg));
+    }
+
+    SECTION("--listen-raft with no --node-id RUNS consensus")
+    {
+        // The mirror, and the one the identity work needs: an id that is derived
+        // rather than typed cannot be what turns the mode on.
+        auto cfg = Installable();
+        cfg.raftListen = "6680";
+        CHECK(RunsConsensus(cfg));
+    }
+
+    SECTION("neither flag: the single-machine install still starts")
+    {
+        // The regression this ticket exists to make impossible. Asserted as a STARTUP
+        // verdict rather than only as the predicate, because the predicate being false
+        // is not the same fact as the node being allowed to run.
+        auto const cfg = Installable();
+        CHECK_FALSE(RunsConsensus(cfg));
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+        CHECK_FALSE(NodeInstallRejection(cfg).has_value());
+    }
+
+    SECTION("the surface row and the predicate are one answer")
+    {
+        // `--print-surfaces` resolves the raft row and `RunsConsensus` asks that same
+        // row, so a port that is served and a mode that is on cannot disagree. Read
+        // the other way round, this is what stops a second author of "is the raft
+        // surface served" appearing in `NodeConfig.cpp`.
+        //
+        // Both values, because an identity between two expressions that are both
+        // false is satisfied by a predicate that is always false.
+        auto cfg = Installable();
+        cfg.raftListen = "6680";
+        CHECK(RunsConsensus(cfg));
+        CHECK(RunsConsensus(cfg) == !RowFor(NodeSurface::Raft).Resolve(cfg).empty());
+        cfg.raftListen.clear();
+        CHECK_FALSE(RunsConsensus(cfg));
+        CHECK(RunsConsensus(cfg) == !RowFor(NodeSurface::Raft).Resolve(cfg).empty());
+    }
+
+    SECTION("the ready line follows the switch too")
+    {
+        // `AdmissionSummary` spelled `nodeId.empty()` for itself, which is a third
+        // author of the same rule: after the switch moved it would have told an
+        // operator running a clustered node that it admits this machine only, while
+        // consensus was about to admit hosts nobody typed.
+        auto clustered = Installable();
+        clustered.raftListen = "6680";
+        CHECK(AdmissionSummary(clustered).contains("the cluster's members"));
+
+        auto lone = Installable();
+        lone.nodeId = "n1";
+        CHECK_FALSE(AdmissionSummary(lone).contains("the cluster's members"));
+    }
 }
 
 TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][policy]")
@@ -1344,33 +1472,47 @@ TEST_CASE("NodeConfig: the --raft-join rules keep the more specific answer", "[n
 {
     // The new row must not make either of them dead: both describe a joiner more
     // precisely than "names no --raft-peer" does, and both come first.
-    NodeConfig noIdentity;
-    noIdentity.raftJoin = true;
-    noIdentity.raftPeers = { Peer("n1=10.0.0.1:6680") };
-    CHECK(Unwrap(StartupPolicyRejection(noIdentity)).contains("--raft-join needs --node-id"));
+    //
+    // The first re-pointed at #1022's switch and the second did not, so this is also
+    // where their ORDER is pinned: a joiner missing both would otherwise be told about
+    // whichever row happens to be first, and the switch is the one to fix first
+    // because the peer list configures nothing without it.
+    NodeConfig noPort;
+    noPort.raftJoin = true;
+    noPort.raftPeers = { Peer("n1=10.0.0.1:6680") };
+    CHECK(Unwrap(StartupPolicyRejection(noPort)).contains("--raft-join waits to be admitted"));
 
     NodeConfig noPeers;
     noPeers.raftJoin = true;
-    noPeers.nodeId = "n4";
+    noPeers.raftListen = "6680";
     CHECK(Unwrap(StartupPolicyRejection(noPeers)).contains("--raft-join needs --raft-peer"));
+
+    // Missing both: the switch is answered, not the peer list.
+    NodeConfig neither;
+    neither.raftJoin = true;
+    CHECK(Unwrap(StartupPolicyRejection(neither)).contains("--raft-join waits to be admitted"));
 }
 
-TEST_CASE("NodeConfig: consensus flags with no --node-id are refused rather than ignored", "[node][consensus][policy]")
+TEST_CASE("NodeConfig: consensus flags with no --listen-raft are refused rather than ignored", "[node][consensus][policy]")
 {
-    // `StartConsensusOrExplain` returns a null tier when `--node-id` is empty, so
-    // these flags are read by nobody: nothing binds, nothing dials, and nothing
-    // anywhere says the operator's cluster was not configured. That is the silent
-    // no-op this table already refuses for `--cluster-key-file` without
-    // `--discovery` and `--dashboard-token-file` without `--dashboard`.
-    auto listening = Installable();
-    listening.raftListen = "6680";
-    listening.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
-    CHECK(Unwrap(StartupPolicyRejection(listening)).contains("--node-id"));
-    CHECK(NodeInstallRejection(listening).has_value());
+    // `StartConsensusOrExplain` returns a null tier when consensus is off, so these
+    // flags are read by nobody: nothing binds, nothing dials, and nothing anywhere
+    // says the operator's cluster was not configured. That is the silent no-op this
+    // table already refuses for `--cluster-key-file` without `--discovery` and
+    // `--dashboard-token-file` without `--dashboard`.
+    //
+    // The flag whose ABSENCE puts a node in that state moved at #1022. `--listen-raft`
+    // used to be one of the inert flags and is now the switch; `--node-id` used to be
+    // the switch and is now inert without it. So the two rows swapped sides, and each
+    // is asserted by the text only its own row produces.
+    auto named = Installable();
+    named.nodeId = "n1";
+    CHECK(Unwrap(StartupPolicyRejection(named)).starts_with("--node-id names this node inside a cluster"));
+    CHECK(NodeInstallRejection(named).has_value());
 
     auto peered = Installable();
     peered.raftPeers = { Peer("n1=10.0.0.1:6680") };
-    CHECK(Unwrap(StartupPolicyRejection(peered)).contains("--node-id"));
+    CHECK(Unwrap(StartupPolicyRejection(peered)).starts_with("--raft-peer names the cluster"));
 
     // `--cluster-dir` is deliberately NOT one of them: `FleetHistoryPath` reads it
     // for the dashboard's history file, so a node with no consensus at all still
@@ -1427,19 +1569,19 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
         char const* what;                 ///< The shape, for the failure message.
         std::vector<std::string> members; ///< `--fleet-member`, if any.
         bool open;                        ///< Whether `--fleet-open` was given.
-        std::string nodeId;               ///< `--node-id`, i.e. whether consensus runs.
+        std::string raftListen;           ///< `--listen-raft`, i.e. whether consensus runs (#1022).
         char const* says;                 ///< What the line must contain.
         char const* saysNot { nullptr };  ///< What it must NOT contain, if anything.
     };
 
     auto const rows = std::to_array<Row>({
-        { .what = "no policy at all", .members = {}, .open = false, .nodeId = {}, .says = "this machine only" },
+        { .what = "no policy at all", .members = {}, .open = false, .raftListen = {}, .says = "this machine only" },
         // Naming the remedy is the point of that row: an operator who reads "this
         // machine only" and is not told the two flags has been informed of a symptom.
         { .what = "no policy names the flags that give one",
           .members = {},
           .open = false,
-          .nodeId = {},
+          .raftListen = {},
           .says = "--fleet-member" },
         // A node running consensus is about to admit hosts nobody typed, so a line
         // reading as a final answer would mislead -- but both flags are still named,
@@ -1450,7 +1592,7 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
         { .what = "no policy, with consensus running, says the cluster will supply members",
           .members = {},
           .open = false,
-          .nodeId = "n1",
+          .raftListen = "6680",
           .says = "the cluster's members",
           // And never the unclustered phrase: "this machine only" is a final answer,
           // and on a node whose cluster is about to agree a member set it is wrong.
@@ -1458,24 +1600,24 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
         { .what = "no policy, with consensus running, still names --fleet-member",
           .members = {},
           .open = false,
-          .nodeId = "n1",
+          .raftListen = "6680",
           .says = "--fleet-member" },
         { .what = "no policy, with consensus running, still names --fleet-open",
           .members = {},
           .open = false,
-          .nodeId = "n1",
+          .raftListen = "6680",
           .says = "--fleet-open" },
         // And a node that HAS a list says the cluster adds to it, so an operator
         // reading a bare count does not conclude that is the whole policy.
         { .what = "a member list, with consensus running",
           .members = { "10.0.0.1:6676" },
           .open = false,
-          .nodeId = "n1",
+          .raftListen = "6680",
           .says = "the cluster's members" },
         { .what = "a member list",
           .members = { "10.0.0.1:6676", "10.0.0.2:6676" },
           .open = false,
-          .nodeId = {},
+          .raftListen = {},
           .says = "2 member" },
         // "This machine" out loud even when a list exists: that admission is
         // unconditional, and an operator reading a bare count would not know their
@@ -1483,9 +1625,9 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
         { .what = "a member list still says this machine",
           .members = { "10.0.0.1:6676" },
           .open = false,
-          .nodeId = {},
+          .raftListen = {},
           .says = "this machine" },
-        { .what = "--fleet-open", .members = {}, .open = true, .nodeId = {}, .says = "every caller" },
+        { .what = "--fleet-open", .members = {}, .open = true, .raftListen = {}, .says = "every caller" },
     });
 
     for (auto const& row: rows)
@@ -1494,7 +1636,7 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
         NodeConfig cfg;
         cfg.fleetMembers = row.members;
         cfg.fleetOpen = row.open;
-        cfg.nodeId = row.nodeId;
+        cfg.raftListen = row.raftListen;
 
         auto const summary = AdmissionSummary(cfg);
         CHECK(summary.contains(row.says));
@@ -1823,17 +1965,22 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK_FALSE(StartupPolicyRejection(fixed).has_value());
     }
 
-    SECTION("a joiner with no identity")
+    SECTION("a joiner with no consensus port")
     {
-        // The cluster admits an ID and counts every vote against one. A node waiting
-        // to be admitted without one would listen forever and could never be named.
+        // A node waiting to be admitted is still running consensus, and the port is
+        // where the leader that admits it dials it. Without one nothing binds and no
+        // admission could ever arrive, so it would wait forever.
+        //
+        // It used to be `--node-id` this row asked for, which is #1022's move: the id
+        // stopped being the switch, so a joiner missing it is no longer a joiner that
+        // cannot work -- a joiner missing the PORT is.
         NodeConfig cfg;
         cfg.raftJoin = true;
         cfg.raftPeers = { Peer("n1=10.0.0.4:6680") };
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--node-id"));
+        CHECK(Unwrap(refusal).contains("--listen-raft"));
     }
 
     SECTION("a joiner naming nothing at all")
@@ -1844,7 +1991,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // permanently silent.
         NodeConfig cfg;
         cfg.raftJoin = true;
-        cfg.nodeId = "n4";
+        cfg.raftListen = "6680";
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
@@ -3755,6 +3902,100 @@ TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[no
     }
 }
 
+TEST_CASE("An operator who edits --listen-raft is answered by the right rule", "[node][config][reload][consensus]")
+{
+    // **#1022's reload question, driven rather than inferred.** `--listen-raft` is
+    // `Reloadable::No`, so an operator who edits it should be told the setting is
+    // immutable. But `ValidateNodeReloadable` asks `StartupPolicyRejection(candidate)`
+    // FIRST -- deliberately, and the comment there says why -- and four of the rows
+    // #1022 rewrote read `RunsConsensus`, which is exactly what this key decides. So a
+    // startup row can answer in the immutability check's place, and which answer an
+    // operator gets is not obvious from either site alone.
+    //
+    // The measured answer is that the two cases are cleanly separated, and the line
+    // that separates them is whether the edit MOVES `RunsConsensus`:
+    //
+    //   * An edit that leaves consensus on -- a host or a port change -- fires none of
+    //     the five, and the operator is told the setting is immutable. That is the
+    //     right answer: the file describes a node that could start, just not this one
+    //     without a restart.
+    //   * An edit that turns consensus ON or OFF necessarily produces a candidate that
+    //     could not START either, so a startup row answers instead. That is also the
+    //     right answer, and it is the STRONGER one: telling such an operator to restart
+    //     would send them into a refusal at boot. The necessity is the interesting
+    //     half -- a node running no consensus can carry no `--raft-self`, `--node-id`,
+    //     `--raft-peer` or `--discovery` (each is refused at startup without
+    //     `--listen-raft`), so adding the switch alone leaves nothing naming this node;
+    //     and a node running consensus must name itself one of those two ways, so
+    //     dropping the switch alone strands whichever one it used.
+    //
+    // Every section therefore asserts WHICH row answered and that the OTHER one did
+    // not: the messages here share the words "peers dial", so a case matching on that
+    // would pass for either and two refusals would be one passing test.
+    Testing::ScratchDirectory const scratch { "node-listen-raft-reload" };
+
+    SECTION("a port change on a node that already runs consensus is refused as immutable")
+    {
+        // `raft_self` is what names this node, so consensus is legitimately on at both
+        // ends and the only difference between the two files is the port.
+        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
+
+        auto const previous = ReparseNodeConfig(path);
+        REQUIRE(previous.has_value());
+
+        auto reloader = MakeNodeReloader(previous.value(), path);
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7001\nraft_self: 10.0.0.7\n");
+
+        auto const reloaded = reloader.Reload();
+        REQUIRE_FALSE(reloaded.has_value());
+        CHECK(reloaded.error().code == ConfigErrorCode::ImmutableChanged);
+        CHECK(reloaded.error().field == "--listen-raft");
+        CHECK(reloaded.error().context.contains("not reloadable"));
+        // No startup row got there first, which is the whole question.
+        CHECK_FALSE(reloaded.error().context.contains("not applied:"));
+    }
+
+    SECTION("turning consensus ON is refused for naming no self, not for being immutable")
+    {
+        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "log_level: info\n");
+
+        auto const previous = ReparseNodeConfig(path);
+        REQUIRE(previous.has_value());
+        REQUIRE_FALSE(RunsConsensus(previous.value()));
+
+        auto reloader = MakeNodeReloader(previous.value(), path);
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), "log_level: info\nlisten_raft: 0.0.0.0:7000\n");
+
+        auto const reloaded = reloader.Reload();
+        REQUIRE_FALSE(reloaded.has_value());
+        CHECK(reloaded.error().code == ConfigErrorCode::ParseError);
+        CHECK(reloaded.error().context.contains("not applied:"));
+        CHECK(reloaded.error().context.contains("turns consensus on and no --raft-peer names this node"));
+        // Not the row below it, whose sentence is about a host with no port.
+        CHECK_FALSE(reloaded.error().context.contains("no port to pair the host with"));
+    }
+
+    SECTION("turning consensus OFF is refused for stranding --raft-self, not for being immutable")
+    {
+        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
+
+        auto const previous = ReparseNodeConfig(path);
+        REQUIRE(previous.has_value());
+        REQUIRE(RunsConsensus(previous.value()));
+
+        auto reloader = MakeNodeReloader(previous.value(), path);
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), "raft_self: 10.0.0.7\n");
+
+        auto const reloaded = reloader.Reload();
+        REQUIRE_FALSE(reloaded.has_value());
+        CHECK(reloaded.error().code == ConfigErrorCode::ParseError);
+        CHECK(reloaded.error().context.contains("not applied:"));
+        CHECK(reloaded.error().context.contains("no port to pair the host with"));
+        // Not the row above it, which is the one that answers the other direction.
+        CHECK_FALSE(reloaded.error().context.contains("turns consensus on and no --raft-peer names this node"));
+    }
+}
+
 #if !defined(_WIN32)
 
 TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node][config][secret][reload]")
@@ -3915,7 +4156,7 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         cfg.serveScheduler = true;
         cfg.fleetMembers.clear();
         cfg.fleetOpen = false;
-        cfg.nodeId = "n1"; // what RunsConsensus asks about
+        cfg.raftListen = "6680"; // what RunsConsensus asks about (#1022)
         auto const refusal = StartupPolicyRejection(cfg);
         if (refusal.has_value())
             CHECK_FALSE(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
@@ -3927,7 +4168,7 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         cfg.serveScheduler = true;
         cfg.fleetMembers.clear();
         cfg.fleetOpen = false;
-        cfg.nodeId.clear();
+        cfg.raftListen.clear();
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));

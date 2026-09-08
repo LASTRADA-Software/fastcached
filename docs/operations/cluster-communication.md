@@ -403,7 +403,7 @@ Worth stating outright, because every one of these surprises somebody:
 - **Nothing ever dials a client.** `fastcache-cc` opens connections and listens on
   nothing at all.
 - **Only consensus has nodes dialling each other**, and only nodes given
-  `--node-id`.
+  `--listen-raft`.
 
 So a worker needs no inbound rule for the scheduler, and a client needs none for
 anything.
@@ -506,7 +506,7 @@ operate can reach it.
 
 Both of these are off unless configured, and neither carries any compile traffic.
 
-**Consensus** binds `--listen-raft` and is on only for a node given `--node-id`.
+**Consensus** binds `--listen-raft`, and giving that flag is what turns it on.
 Connections between peers are long-lived; the leader speaks to each follower every
 50 ms or so, and a follower that hears nothing for a few hundred milliseconds
 starts an election. It is a private binary protocol, distinct from the compile
@@ -707,7 +707,7 @@ notes:
     `--print-surfaces` runs the **startup policy rules** before it prints, so the
     command has to be one the node would actually accept. Five rules apply to the
     flags above and each refuses a configuration that would start and silently not
-    work: `--serve-scheduler` needs a member set, `--node-id` needs a `--raft-peer`,
+    work: `--serve-scheduler` needs a member set, `--listen-raft` needs a `--raft-peer`,
     `--discovery` needs a `--cluster-key-file`, membership needs an `--advertise`
     peers can dial, and a worker needs a `--scheduler`. An earlier version of this
     transcript omitted all five and the binary refused it with exit 2 — the printed

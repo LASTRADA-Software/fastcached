@@ -398,7 +398,7 @@ else's, needs no configuration, and this is the common deployment.
 Run several and exactly one must schedule at a time — two nodes handing out the
 same machine's slots is not a degraded fleet, it is the one thing the design says
 cannot happen. Electing that one node is what **consensus** is for. It uses Raft,
-it is off until you give a node `--node-id`, and the node holding the election's
+it is off until you give a node `--listen-raft`, and the node holding the election's
 outcome is called the **leader**.
 
 ### What a node does when it starts, in order
@@ -421,7 +421,7 @@ outcome is called the **leader**.
    compile verbs, the cache tier and the scheduler verbs together, plus the admin
    and consensus ports when they are configured.
 
-3. **Starts consensus, if `--node-id` was given**, and says so. The parenthesis is
+3. **Starts consensus, if `--listen-raft` was given**, and says so. The parenthesis is
    the part to read — it tells you whether this node brought a cluster with it:
 
    ```
