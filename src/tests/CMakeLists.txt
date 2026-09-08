@@ -3977,3 +3977,61 @@ set_tests_properties("cache-flow-continuations-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# The Tools page names exactly the binaries a user installs (#1035).
+#
+# `docs/tools/index.md` is the overview a reader lands on to find what they can run,
+# and what belongs there is the INSTALLED set -- the targets a package actually puts
+# on a machine. Everything else under `src/apps/` is contributor tooling shipped to
+# nobody. Nothing connected the two, so `compile-cache-testclient` -- default OFF, no
+# `install()` rule, in no package -- sat there as the third peer of the two real
+# launchers and was published to users for months (#1030).
+#
+# Both directions, because they are different mistakes: a tool documented but not
+# installed is that defect, a reader told to run something no package contains; a
+# tool installed but not documented is the quieter mirror, a binary users get and
+# cannot find.
+#
+# Labelled `docs-subject` as well as `hygiene`: its subject IS prose, and prose
+# drifts by being edited, which is the whole reason that label exists (#687).
+add_test(
+    NAME "tools-page-installed-set"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tools-page-installed-set.cmake"
+)
+set_tests_properties("tools-page-installed-set" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# And that check must be SEEN to refuse each thing it claims to refuse.
+#
+# Eleven synthetic trees. Both mismatch directions; the four ways the scan can stop
+# working, each with its own repair (the app table restructured, an app the table
+# names but the tree lacks, every install rule gone, the page's heading style
+# changed or the page emptied); and the three BRACKET arms -- a violation alone, the
+# same violation behind an unbalanced `[`, and the bracket with no violation. The
+# third is not decoration: without it a check that refused every bracket would pass
+# the second for the wrong reason.
+#
+# Two of those cases earned their place immediately. The app-table one found that the
+# check matched its row SHAPE anywhere in the file rather than inside the named table,
+# so its own "matched no rows" guard could never fire; and writing a literal `[` into
+# the fixture's own row table merged seven rows into one element, which is the
+# bracket-vulnerable reader this check exists to avoid, biting the fixture that tests
+# for it.
+add_test(
+    NAME "tools-page-installed-set-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/tools-page-installed-set-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tools-page-installed-set-selftest.cmake"
+)
+set_tests_properties("tools-page-installed-set-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
