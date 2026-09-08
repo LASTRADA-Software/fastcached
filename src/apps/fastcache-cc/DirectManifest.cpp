@@ -2,6 +2,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
+#include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 
@@ -84,59 +85,6 @@ namespace
         AppendU32(out, static_cast<std::uint32_t>(field.size()));
         out.append(field);
     }
-
-    /// Sequential reader over the encoded form; every read is bounds-checked so a
-    /// truncated or hostile manifest yields Malformed rather than reading past the
-    /// buffer.
-    class Cursor
-    {
-      public:
-        explicit Cursor(std::string_view bytes) noexcept:
-            _bytes { bytes }
-        {
-        }
-
-        [[nodiscard]] bool ReadU8(std::uint8_t& out) noexcept
-        {
-            if (_offset + 1 > _bytes.size())
-                return false;
-            out = static_cast<std::uint8_t>(_bytes[_offset]);
-            ++_offset;
-            return true;
-        }
-
-        [[nodiscard]] bool ReadU32(std::uint32_t& out) noexcept
-        {
-            if (_offset + 4 > _bytes.size())
-                return false;
-            out = (static_cast<std::uint32_t>(static_cast<unsigned char>(_bytes[_offset])) << 24)
-                  | (static_cast<std::uint32_t>(static_cast<unsigned char>(_bytes[_offset + 1])) << 16)
-                  | (static_cast<std::uint32_t>(static_cast<unsigned char>(_bytes[_offset + 2])) << 8)
-                  | static_cast<std::uint32_t>(static_cast<unsigned char>(_bytes[_offset + 3]));
-            _offset += 4;
-            return true;
-        }
-
-        [[nodiscard]] bool ReadField(std::string& out)
-        {
-            std::uint32_t length = 0;
-            if (!ReadU32(length) || _offset + length > _bytes.size())
-                return false;
-            out.assign(_bytes.substr(_offset, length));
-            _offset += length;
-            return true;
-        }
-
-        /// @return Bytes not yet consumed.
-        [[nodiscard]] std::size_t Remaining() const noexcept
-        {
-            return _bytes.size() - _offset;
-        }
-
-      private:
-        std::string_view _bytes;
-        std::size_t _offset { 0 };
-    };
 
     /// What a resolved dependency path is to a manifest.
     ///
@@ -250,7 +198,7 @@ std::string EncodeManifest(DirectManifest const& manifest)
 
 std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes)
 {
-    Cursor cursor { bytes };
+    ByteCursor cursor { std::as_bytes(std::span { bytes }) };
 
     std::uint8_t version = 0;
     if (!cursor.ReadU8(version))
@@ -262,15 +210,13 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     if (!cursor.ReadField(manifest.toolchainStamp) || !cursor.ReadField(manifest.objectKey))
         return std::unexpected(DirectError::Malformed);
 
+    // `ReadCount` rather than `ReadU32` plus a separate check: the count is a claim
+    // about bytes this blob must already carry (issue #267), the bytes come off the
+    // network -- the launcher fetches this manifest from the cache server, so the
+    // number is a peer's rather than its own -- and `ByteCursor` makes stating the
+    // per-element bound the only way to obtain a count at all.
     std::uint32_t count = 0;
-    if (!cursor.ReadU32(count))
-        return std::unexpected(DirectError::Malformed);
-
-    // The count is a claim about bytes this blob must already carry -- see
-    // `WireFields::DeclaredCountFits` (issue #267). The bytes come off the network:
-    // the launcher fetches this manifest from the cache server, so the number is a
-    // peer's rather than its own.
-    if (!WireFields::DeclaredCountFits(count, MinEntryBytes, cursor.Remaining()))
+    if (!cursor.ReadCount(count, MinEntryBytes))
         return std::unexpected(DirectError::Malformed);
 
     // Reserved from what the BYTES IN HAND could hold, never from the peer's count
@@ -278,7 +224,7 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
     // no-op for honest manifests -- which run to hundreds of entries for one C++
     // translation unit, and are worth reserving for -- while a minimum-size hostile
     // blob is clamped to at most its own size rather than eight times it.
-    manifest.entries.reserve(std::min<std::size_t>(count, cursor.Remaining() / sizeof(DirectManifest::Entry)));
+    manifest.entries.reserve(std::min<std::size_t>(count, cursor.CapacityFor(sizeof(DirectManifest::Entry))));
     for (std::uint32_t index = 0; index < count; ++index)
     {
         DirectManifest::Entry entry;
@@ -289,7 +235,10 @@ std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes
 
     // Trailing bytes mean the encoding is not what this version wrote; refuse it
     // rather than silently ignoring a field a newer writer appended.
-    if (cursor.Remaining() != 0)
+    // `AtEnd` rather than a remaining-count comparison: a FAILED cursor also has zero
+    // bytes remaining, so the subtraction spelling reports a malformed manifest as a
+    // clean one.
+    if (!cursor.AtEnd())
         return std::unexpected(DirectError::Malformed);
 
     return manifest;

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace FastCache
 {
@@ -124,6 +125,28 @@ class ByteCursor
         return true;
     }
 
+    /// The most elements of @p bytesEach wire bytes the buffer could still hold.
+    ///
+    /// For sizing a `reserve` from **what is in hand** rather than from a peer's count.
+    /// `ReadCount` already refuses a count the frame cannot carry, so it bounds the
+    /// count by `Remaining() / minBytesEach` -- but a decoder whose element is LARGER
+    /// in memory than on the wire still wants the clamp: `DirectManifest`'s entry costs
+    /// 2 * `FieldPrefixSize` on the wire against 64 bytes in memory, so reserving the
+    /// validated count alone lets a minimum-size hostile blob ask for eight times its
+    /// own length.
+    ///
+    /// This is the member `#304` was told to add rather than guess at: `Remaining()`
+    /// stays private because a count is the only thing a decoder legitimately wants a
+    /// raw byte figure for, and this is that use, named and guarded. A failed cursor
+    /// answers 0, so a reserve after a failed read asks for nothing.
+    ///
+    /// @param bytesEach Wire bytes per element; zero answers 0 rather than dividing.
+    /// @return How many such elements the remaining bytes could carry.
+    [[nodiscard]] constexpr std::size_t CapacityFor(std::size_t bytesEach) const noexcept
+    {
+        return bytesEach == 0 ? 0 : Remaining() / bytesEach;
+    }
+
     /// Read one length-prefixed field: a `u32` length, then that many bytes.
     ///
     /// The grammar `WireFields` describes, walked one field at a time. A length is safe
@@ -138,6 +161,32 @@ class ByteCursor
         if (!ReadU32(length))
             return false;
         return ReadText(length, out);
+    }
+
+    /// Read one length-prefixed field into a byte vector.
+    ///
+    /// `ReadField`'s sibling for a payload that is bytes rather than text --
+    /// `CompileValue`'s object blob is the caller (#304). Identical grammar and
+    /// identical guarantee: the length is checked against the bytes present before a
+    /// single byte is copied, so nothing is sized from a number the peer chose.
+    ///
+    /// Both spellings exist rather than one returning a span, because every caller
+    /// here OWNS what it decodes -- a `CompileValue` outlives the buffer it came from
+    /// -- and `.agent/rules/wire-and-protocol.md` is explicit that a struct a decoder
+    /// returns by value must not borrow from the bytes it decoded.
+    /// @param out Receives the field's bytes, replacing its contents.
+    /// @return True on success; false leaves the cursor failed.
+    [[nodiscard]] bool ReadFieldBytes(std::vector<std::byte>& out)
+    {
+        std::uint32_t length = 0;
+        if (!ReadU32(length))
+            return false;
+        if (!Has(length))
+            return false;
+        auto const chunk = _bytes.subspan(_offset, length);
+        out.assign(chunk.begin(), chunk.end());
+        _offset += length;
+        return true;
     }
 
   private:

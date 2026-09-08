@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -59,69 +60,6 @@ namespace
         out.insert(out.end(), p, p + s.size());
     }
 
-    /// A cursor that reads from a byte span with bounds checking. Every read
-    /// returns false (via the caller) rather than over-reading a short buffer.
-    class Cursor
-    {
-      public:
-        explicit Cursor(std::span<std::byte const> bytes) noexcept:
-            _bytes(bytes)
-        {
-        }
-
-        /// @return Bytes not yet consumed.
-        [[nodiscard]] std::size_t Remaining() const noexcept
-        {
-            return _bytes.size() - _pos;
-        }
-
-        /// Read one byte. @param out [out] the byte. @return false if none left.
-        [[nodiscard]] bool ReadU8(std::uint8_t& out) noexcept
-        {
-            if (Remaining() < 1)
-                return false;
-            out = static_cast<std::uint8_t>(_bytes[_pos]);
-            _pos += 1;
-            return true;
-        }
-
-        /// Read a big-endian u32. @param out [out] value. @return false if short.
-        [[nodiscard]] bool ReadU32(std::uint32_t& out) noexcept
-        {
-            if (Remaining() < sizeof(std::uint32_t))
-                return false;
-            out = ReadBigEndian<std::uint32_t>(_bytes.subspan(_pos, sizeof(std::uint32_t)));
-            _pos += sizeof(std::uint32_t);
-            return true;
-        }
-
-        /// Read `n` bytes into a fresh vector. @return false if fewer than `n` left.
-        [[nodiscard]] bool ReadBytes(std::size_t n, std::vector<std::byte>& out)
-        {
-            if (Remaining() < n)
-                return false;
-            auto const chunk = _bytes.subspan(_pos, n);
-            out.assign(chunk.begin(), chunk.end());
-            _pos += n;
-            return true;
-        }
-
-        /// Read `n` bytes into a fresh string. @return false if fewer than `n` left.
-        [[nodiscard]] bool ReadString(std::size_t n, std::string& out)
-        {
-            if (Remaining() < n)
-                return false;
-            auto const chunk = _bytes.subspan(_pos, n);
-            out.assign(reinterpret_cast<char const*>(chunk.data()), n);
-            _pos += n;
-            return true;
-        }
-
-      private:
-        std::span<std::byte const> _bytes;
-        std::size_t _pos { 0 };
-    };
-
     /// One typed refusal from this decoder.
     /// @param code    Which kind of refusal this is.
     /// @param context What was wrong with the bytes, for a log.
@@ -153,7 +91,7 @@ namespace
     /// Where the generation sits in an encoded value: its leading byte.
     ///
     /// The named form of a position `DecodeCompileValue` also reads, through its
-    /// `Cursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
+    /// `ByteCursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
     /// together -- a field added ahead of the generation changes both. It exists so
     /// that `CanonicalStoredValue`, which needs the number for a refusal that names
     /// it, asks a question with a name rather than writing `front()` a hundred lines
@@ -211,24 +149,30 @@ namespace
     ///
     /// @param cursor Positioned immediately after the generation byte.
     /// @return The decoded value, or why the layout did not hold.
-    [[nodiscard]] std::expected<CompileValue, ProtocolError> DecodeAfterGeneration(Cursor& cursor)
+    [[nodiscard]] std::expected<CompileValue, ProtocolError> DecodeAfterGeneration(ByteCursor& cursor)
     {
         CompileValue value;
 
-        std::uint32_t objectLen {};
-        if (!cursor.ReadU32(objectLen))
+        // One call rather than a length read and a sized read: `ReadFieldBytes` checks
+        // the length against the bytes present before copying any, which is the
+        // guarantee the two-step spelling had to remember to provide.
+        //
+        // The short-buffer case is separated back out first, because folding the two
+        // reads also folds their REFUSALS, and a log reader diagnoses a frame that
+        // stopped before the length from one that declared more than it carried in
+        // different places. `CapacityFor(1)` is the count of bytes still present.
+        if (cursor.CapacityFor(1) < sizeof(std::uint32_t))
             return Malformed("truncated object length");
-        if (!cursor.ReadBytes(objectLen, value.objectBlob))
+        if (!cursor.ReadFieldBytes(value.objectBlob))
             return Malformed("truncated object blob");
 
+        // The count is a claim about bytes this frame must already carry, checked before
+        // anything is sized from it (issue #267). `ReadCount` is the only way to obtain
+        // one, and it cannot be called without stating what an element costs.
         std::uint32_t regionCount {};
-        if (!cursor.ReadU32(regionCount))
+        if (cursor.CapacityFor(1) < sizeof(std::uint32_t))
             return Malformed("truncated region count");
-
-        // The count is a claim about bytes this frame must already carry -- see
-        // `WireFields::DeclaredCountFits` for why that is checkable and why it is checked
-        // before anything is sized from it (issue #267).
-        if (!WireFields::DeclaredCountFits(regionCount, MinRegionBytes, cursor.Remaining()))
+        if (!cursor.ReadCount(regionCount, MinRegionBytes))
             return Malformed("region count exceeds what the remaining bytes can supply");
 
         // No `reserve(regionCount)`: a validated count is still an amplifier, and the
@@ -242,17 +186,17 @@ namespace
             if (!IsKnownGrammar(grammarTag))
                 return Malformed("unknown region grammar tag");
 
-            std::uint32_t textLen {};
-            if (!cursor.ReadU32(textLen))
-                return Malformed("truncated region text length");
-
             TextRegion region { .grammar = static_cast<PathCanon::Grammar>(grammarTag), .bytes = {} };
-            if (!cursor.ReadString(textLen, region.bytes))
+            if (cursor.CapacityFor(1) < sizeof(std::uint32_t))
+                return Malformed("truncated region text length");
+            if (!cursor.ReadField(region.bytes))
                 return Malformed("truncated region text");
             value.textRegions.push_back(std::move(region));
         }
 
-        if (cursor.Remaining() != 0)
+        // `AtEnd` rather than a remaining-count comparison: a FAILED cursor also has zero
+        // remaining, so the subtraction spelling reports a malformed frame as a clean one.
+        if (!cursor.AtEnd())
             return Malformed("trailing bytes after compile-value frame");
 
         return value;
@@ -262,7 +206,7 @@ namespace
 
 std::expected<CompileValue, ProtocolError> DecodeCompileValue(std::span<std::byte const> bytes)
 {
-    Cursor cursor { bytes };
+    ByteCursor cursor { bytes };
 
     std::uint8_t version {};
     if (!cursor.ReadU8(version))

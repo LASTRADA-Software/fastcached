@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
+#include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -39,26 +40,16 @@ namespace
     [[nodiscard]] std::optional<std::vector<std::string>> DecodeKeyList(std::span<std::byte const> bytes)
     {
         std::vector<std::string> keys;
-        std::size_t pos = 0;
-        auto const readU32 = [&](std::uint32_t& out) -> bool {
-            if (bytes.size() - pos < sizeof(std::uint32_t))
-                return false;
-            out = ReadBigEndian<std::uint32_t>(bytes.subspan(pos, sizeof(std::uint32_t)));
-            pos += sizeof(std::uint32_t);
-            return true;
-        };
+        ByteCursor cursor { bytes };
 
+        // Both refusals are one call now. Either there is not even a count field --
+        // `EncodeKeyList` always writes one, so such bytes are no more this build's
+        // than an impossible count is, and answering with an empty list would leave
+        // `AddKey` overwriting them -- or the count is a claim about bytes this value
+        // does not carry (issue #267). `ReadCount` cannot be called without stating
+        // what one key costs, which is what makes the second check unforgettable.
         std::uint32_t count {};
-        if (!readU32(count))
-            // Not even a count field. `EncodeKeyList` always writes one, so these are
-            // no more this build's bytes than an impossible count is -- and answering
-            // with an empty list here would leave `AddKey` overwriting them, which is
-            // exactly the hole the count check below closes.
-            return std::nullopt;
-
-        // The count is a claim about bytes this value must already carry -- see
-        // `WireFields::DeclaredCountFits` (issue #267).
-        if (!WireFields::DeclaredCountFits(count, MinKeyBytes, bytes.size() - pos))
+        if (!cursor.ReadCount(count, MinKeyBytes))
             return std::nullopt;
 
         // Reserved against THIS BUILD's own cap rather than the peer's number: a group
@@ -68,14 +59,14 @@ namespace
         keys.reserve(std::min<std::size_t>(count, PrefetchGroupManifest::MaxKeysPerGroup));
         for ([[maybe_unused]] auto const _: std::views::iota(std::uint32_t { 0 }, count))
         {
-            std::uint32_t len {};
-            if (!readU32(len))
+            // A short tail stops the walk and keeps what was read, which is this
+            // decoder's existing tolerance rather than something the conversion
+            // introduces: `ReadField` fails the cursor, and breaking here is what
+            // turns that into "no more keys" instead of "no keys at all".
+            std::string key;
+            if (!cursor.ReadField(key))
                 break;
-            if (bytes.size() - pos < len)
-                break;
-            auto const chunk = bytes.subspan(pos, len);
-            keys.emplace_back(reinterpret_cast<char const*>(chunk.data()), len);
-            pos += len;
+            keys.emplace_back(std::move(key));
         }
         return keys;
     }
