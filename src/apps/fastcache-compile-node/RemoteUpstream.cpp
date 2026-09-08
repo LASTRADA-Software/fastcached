@@ -20,7 +20,7 @@ namespace
 } // namespace
 
 RemoteUpstream::RemoteUpstream(std::string endpoint,
-                               Cc::Credential credential,
+                               ICredentialSource const& credential,
                                Cc::CredentialNotice::Sink noticeSink,
                                IConnector& connector,
                                IReactor* reactor,
@@ -30,7 +30,7 @@ RemoteUpstream::RemoteUpstream(std::string endpoint,
                                std::chrono::milliseconds ioTimeout,
                                std::chrono::milliseconds addressRefreshInterval):
     _endpoint { std::move(endpoint) },
-    _credential { std::move(credential) },
+    _credential { credential },
     _notice { std::move(noticeSink) },
     _connector { connector },
     _reactor { reactor },
@@ -132,7 +132,7 @@ Task<std::optional<std::vector<std::byte>>> RemoteUpstream::Fetch(std::string_vi
     SocketDeadlineTarget target { .socket = client.get() };
     auto const bound = ArmSocketDeadline(_reactor, _ioTimeout, &target);
 
-    auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential);
+    auto outcome = co_await Cc::CacheFetch(client.get(), &_notice, key, _credential.Current());
     if (!outcome.IsHit())
         co_return std::nullopt;
     co_return std::move(outcome.value);
@@ -172,7 +172,7 @@ Task<UpstreamStore> RemoteUpstream::Store(std::string_view key, std::span<std::b
     CompileCacheWire::StoreRequest const request {
         .key = key, .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = value
     };
-    auto const outcome = co_await Cc::CacheStore(client.get(), &_notice, request, _credential);
+    auto const outcome = co_await Cc::CacheStore(client.get(), &_notice, request, _credential.Current());
 
     // A STORE that succeeded comes back as `Hit`: the wire answers `Ok`, and
     // `CacheOutcomeKind` names the STATUS rather than the verb. Anything else --

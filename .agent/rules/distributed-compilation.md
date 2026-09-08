@@ -1182,12 +1182,48 @@ Consequences that are each load-bearing:
   retires a registry entry, and adding one
   ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)) is therefore a
   latency optimisation over a bounded, self-healing window — not a correctness fix.
+- **An OUTBOUND credential is read at the moment it is presented, through one seam,
+  and a site that captures one is invisible until somebody rotates**
+  ([#404](https://github.com/LASTRADA-Software/fastcached/issues/404)). On this worker
+  `--requirepass` is presented and never required — to the shared `fastcached`, to the
+  scheduler, and by a cluster admin verb — and each of the three built its own
+  `Cc::Credential` from `cfg.token` at construction. Marking the row `Reloadable::Yes`
+  publishes a snapshot none of them reads, which is the "green while doing nothing"
+  failure in the one area where the symptom is an authentication failure nobody can
+  reproduce, on a machine nobody is watching. **A rotation that reaches two of three is
+  worse than one that reaches none**, because none is a restart an operator plans and
+  two is a fleet in a state no file describes.
+  - **The seam is `Node::ICredentialSource`, held by REFERENCE, and the type is the
+    guard**: a site holding one has no field for a stale secret to sit in, so the
+    defect cannot be reintroduced by omission at a site that already reaches for it.
+  - **What the type cannot guard is a site that never reaches for it**, and that is a
+    scan — the rulebook's own split between an obligation to *do something* and an
+    obligation to *say why*. `Cc::Credential` may be constructed from a `NodeConfig`
+    in exactly one file, and `NodeCredential_test`'s seam case walks the node's
+    sources to say so. It carries a positive control on the PATTERN as well as on the
+    file count, because a scan whose spelling has stopped matching reads identically
+    to a clean tree.
+  - **The daemon's `SharedAuthSource` does not transfer, and reaching for it is the
+    available mistake.** That one answers "does this client's credential satisfy what
+    I require"; this one answers "what do I present". They are opposite directions
+    with the same noun, and only the outbound one can be rotated a machine at a time —
+    which is the entire reason this row could become reloadable while the daemon's
+    inbound settings could not.
+  - **Making it reloadable is what forced `HeartbeatRound` and `AnnounceOnce` out of
+    `main.cpp`.** The third site lived in the one translation unit no test reaches, so
+    a case could assert the other two and the missed one was structurally
+    undemonstrable. Both halves of that are the fix: the type makes the defect
+    unwritable, the move makes the absence of it provable.
 - **A file's MODE is in no configuration, so the worker's secret-file check follows
   the RELOAD and not only the start** ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)).
-  None of this binary's five secret settings is `Reloadable::Yes`, so a node file
-  cannot *gain* a secret across a reload the way the daemon's can —
-  `ValidateNodeReloadable` refuses such a candidate by name — and that half of #753
-  genuinely does not exist here. The half that does is the one a snapshot cannot
+  One of this binary's five secret settings is `Reloadable::Yes` since
+  [#404](https://github.com/LASTRADA-Software/fastcached/issues/404), so a node file
+  **can** now gain a `requirepass` across a reload exactly as the daemon's can, and
+  that half of #753 is live here rather than absent — which is not a hole, because
+  `SecretSubjectFiles` is a function of the LIVE snapshot: the re-ask below asks about
+  the configuration in force rather than the one the process started with, so the file
+  that just acquired a token is a subject from that reload onward. The four settings
+  reached BY PATH remain `Reloadable::No`. The half that was always here is the one a snapshot cannot
   answer: an operator edits `log_level:`, sends SIGHUP, the reload is accepted, and
   nothing re-asks the filesystem, so a `--cluster-key-file` that went to 0644 an hour
   after the node started is silent for the rest of the process's life. That key MACs
@@ -1220,11 +1256,16 @@ Consequences that are each load-bearing:
     at the service block — so a run reaching the check either applied its file or never
     had one. In the unreachable case the gate answers false either way: `cfg` IS the
     command-line parse there, so argv named the token or no secret is in force. **It is
-    NOT a reload fix, and saying so would be a reason outrunning its fact**:
-    `--requirepass` is `Reloadable::No` with a `same` comparator, so a SIGHUP that
-    introduces a token is refused and publishes nothing. Dropping the guard buys one
-    expression instead of two; the reload half of the rule is bought by the filesystem
-    re-ask, and by nothing else.
+    NOT a reload fix**, and the REASON for that changed under #404 while the conclusion
+    did not. It used to be that `--requirepass` was `Reloadable::No`, so a SIGHUP
+    introducing a token was refused and published nothing; it is `Reloadable::Yes` now,
+    so a node file CAN gain a secret across a reload exactly as the daemon's can. What
+    covers that is the filesystem re-ask, and it covers it already because
+    `SecretSubjectFiles` is a function of the LIVE snapshot rather than of the
+    configuration the process started with. What the dropped guard could never decide is
+    unchanged: `argvNamedSecret` is a fact about ARGV, which no reload rewrites.
+    **A rule whose stated reason has gone false is worse than no rule**, which is why
+    this paragraph moved with the row rather than being left standing beside it.
 - **A refusal that moves a counter says so in a table.** `RefusalTable` pairs each
   code with the counter it moves, and `std::nullopt` is a legitimate row: a
   malformed frame is a *client* defect, and counting it beside the capacity

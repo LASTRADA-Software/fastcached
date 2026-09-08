@@ -440,6 +440,17 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
   never a silent fallback. Its startup refusal is still open (#303) and must take the
   worker's shape above, or it breaks every single-machine install.
+- An OUTBOUND credential is read where it is PRESENTED, through one seam
+  (`Node::ICredentialSource`), never captured at construction. `--requirepass` on the
+  worker is presented and never required — which is what lets it be `Reloadable::Yes` at
+  all, one machine at a time — and three sites held their own copy, so marking the row
+  reloadable would publish a snapshot none of them read. A rotation reaching two of
+  three is WORSE than one reaching none: none is a restart somebody planned. The
+  reference held by a site is the guard; a site that never reaches for the seam is a
+  SCAN, with a positive control on the pattern. The daemon's `SharedAuthSource` answers
+  the opposite question and does not transfer. It is also what forced `HeartbeatRound`
+  and `AnnounceOnce` out of `main.cpp`: the third site was in the one translation unit
+  no test reaches, so it was undemonstrable rather than merely untested.
 - The worker's five key files are asked about at the START **and at every accepted
   reload**, from `main` and never from `WorkerBody`: `ApplyReloadRequest`'s decline of
   `Subscribe` is about THAT frame's locals, not about the binary. A mode is in no

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "LocalCache.hpp"
+#include "NodeCredential.hpp"
 
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -43,7 +44,15 @@ class RemoteUpstream final: public ICacheUpstream
 {
   public:
     /// @param endpoint `host:port` of the shared cache.
-    /// @param credential Presented on every operation; empty when none is configured.
+    /// @param credential Asked on every operation for what to present. A SEAM rather
+    ///        than a value, and threaded through `CacheTier::Start` and
+    ///        `StartCacheTierOrExplain` to reach here -- which the notice sink next
+    ///        door is deliberately NOT, and the difference is what the two answer.
+    ///        A notice destination is fixed for this process's life, so owning a copy
+    ///        of it costs nothing; a credential is the thing an operator rotates, so
+    ///        a copy is a value that goes stale in silence and keeps presenting a
+    ///        secret the shared cache has stopped accepting (#404). Borrowed; must
+    ///        outlive this object.
     /// @param connector How to dial. Injected, and reactor-driven in production:
     ///        this runs inside the node's cache endpoint, so a blocking dial here
     ///        would stall every other connection sharing that loop -- which is
@@ -79,7 +88,7 @@ class RemoteUpstream final: public ICacheUpstream
     ///        is looked up again. See `DefaultAddressRefreshInterval` for both
     ///        directions this trades off.
     RemoteUpstream(std::string endpoint,
-                   Cc::Credential credential,
+                   ICredentialSource const& credential,
                    Cc::CredentialNotice::Sink noticeSink,
                    IConnector& connector,
                    IReactor* reactor,
@@ -135,7 +144,10 @@ class RemoteUpstream final: public ICacheUpstream
     /// separate member rather than a comment on the old one.
     std::optional<TimePoint> _lastLookupAt;
 
-    Cc::Credential _credential;
+    /// Asked once per operation, never copied into a member. The reference IS the
+    /// guard: there is no field here for a stale secret to sit in.
+    ICredentialSource const& _credential;
+
     /// Where "your credential went unchecked" is said; the node is a CLIENT here,
     /// and had the same silence the launcher did (#363).
     ///

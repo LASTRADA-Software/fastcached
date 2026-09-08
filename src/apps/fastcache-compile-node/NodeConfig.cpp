@@ -1082,6 +1082,27 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::token, ParseText>(),
             .description = "credential presented to the scheduler",
             .yamlKey = "requirepass",
+            // Reloadable since #404, and the whole of what made it possible is that
+            // this secret is presented and never required. An INBOUND credential
+            // cannot be rotated by one machine at a time -- every client would have
+            // to move with it -- while an outbound one is exactly what a fleet-wide
+            // rotation needs: each worker adopts the new secret when its operator
+            // says so, and a worker still holding the old one fails visibly at the
+            // one peer that has already moved.
+            //
+            // It is `LocalReloadableFlags` rather than advertised. A registration
+            // says which toolchains this node serves; the credential it presents
+            // while saying so is not part of the claim, so re-deriving the toolchain
+            // set on a rotation would spend an include-tree walk telling the fleet
+            // nothing.
+            //
+            // The row alone does NOT make a rotation reach anybody. Three sites took
+            // a copy of this field at construction, and the reload publishing a
+            // snapshot none of them read is the "green while doing nothing" failure
+            // in its most expensive form. `Node::ICredentialSource` is what they read
+            // through now, and `node-credential-seam` is what stops a fourth site
+            // taking a copy instead.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::token>(),
         },
         {
@@ -1092,7 +1113,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .explicitBit = &NodeConfig::logLevelExplicit,
             .description = "trace, debug, info, warn, error, fatal (default info)",
             .yamlKey = "log_level",
-            // The ONE reloadable row today, and it earns it: `ILogger::SetMinLevel`
+            // The FIRST reloadable row, and it earns it: `ILogger::SetMinLevel`
             // exists, so raising the level to diagnose something takes effect on a
             // running worker without restarting it mid-build. `logTimestamps` next
             // door is deliberately NOT marked -- `ConsoleLogger` takes its timestamp

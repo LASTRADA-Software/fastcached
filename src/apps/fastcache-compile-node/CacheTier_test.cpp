@@ -81,9 +81,15 @@ struct Fixture
     /// Start a tier over @p cfg.
     /// @param cfg What the node was told to be.
     /// @return The tier, a null tier meaning "carry on without one", or the reason.
+    /// What the tier's upstream client presents. These cases are about WHICH tier is
+    /// built and what it reports, never about the credential -- so this is production's
+    /// own "no configuration file, no secret" source rather than a fake.
+    NodeConfig unauthenticated;
+    ConfiguredCredential credential { unauthenticated, nullptr };
+
     [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeConfig const& cfg)
     {
-        return StartCacheTierOrExplain(io, cfg, locality, clock, metrics, logger);
+        return StartCacheTierOrExplain(io, cfg, credential, locality, clock, metrics, logger);
     }
 };
 

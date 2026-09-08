@@ -827,7 +827,18 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 /// will accept. The scheduler has no field for this and dispatches no differently
 /// because of it, so re-registering on a change would spend a 300 s include-tree
 /// walk telling the fleet nothing it can act on.
-inline constexpr std::array<std::string_view, 2> LocalReloadableFlags { "--log-level", "--allow-compile-arg" };
+///
+/// `--requirepass` is the row most likely to be read as advertised for the OTHER
+/// reason: it is a credential, and a credential travels. What travels is the secret
+/// itself, on the next exchange, through `Node::ICredentialSource` -- and a
+/// registration's CONTENT is unchanged by it. A rotation therefore needs no
+/// re-survey, which matters more here than anywhere else on this list: rotating a
+/// fleet's shared secret is a fleet-wide event, and making every worker walk its
+/// include trees at the same moment is the one way to turn a routine rotation into
+/// an incident.
+inline constexpr std::array<std::string_view, 3> LocalReloadableFlags { "--log-level",
+                                                                        "--allow-compile-arg",
+                                                                        "--requirepass" };
 
 /// Whether a reload changed something this worker had TOLD the fleet.
 ///

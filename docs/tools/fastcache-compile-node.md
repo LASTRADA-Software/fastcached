@@ -1429,11 +1429,35 @@ refusal names every offending setting. You saved once; you get one answer.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `allow_compile_arg`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `requirepass`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
 
-`log_level` and `allow_compile_arg` take effect immediately and tell the fleet
-nothing; `toolchain` and `no_toolchain_discovery` re-register this worker, which is
-the next section.
+`log_level`, `allow_compile_arg` and `requirepass` take effect immediately and tell
+the fleet nothing; `toolchain` and `no_toolchain_discovery` re-register this worker,
+which is the next section.
+
+### Rotating `requirepass`
+
+On this worker the token is **presented and never required** — it is what this node
+shows the shared `fastcached` and the scheduler, and nothing authenticates *against*
+it here. That asymmetry is what makes it rotatable one machine at a time: an inbound
+credential could not be, because every client would have to move with it.
+
+Edit `requirepass:` and reload, and the **next** exchange with each peer presents the
+new secret. Nothing in flight is retried, and there is no handshake to renegotiate —
+a cache fetch, a store, a registration and a heartbeat each open a connection and
+present whatever is in force at that moment.
+
+Rotate the peers first, or at the same time. A worker presenting the new secret to a
+`fastcached` that has not moved is **refused, visibly**, and its compiles fall back to
+building locally; a worker still presenting the old one after the daemon has moved
+fails the same way. Neither silently serves a wrong object, which is the direction to
+fail in.
+
+It cannot be rotated this way on a worker whose **command line** names
+`--requirepass`: a reload applies the file and then the command line over it, exactly
+as a start does, so the file's value would never be in force. That is one more reason
+the secret belongs in the file — see [running it as a
+service](#running-it-as-a-service).
 
 ### Changing what this worker serves
 
