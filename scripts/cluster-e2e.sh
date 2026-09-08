@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end test of a three-node cluster (POSIX). Starts three
-# fastcache-compile-node processes that know each other, waits for them to elect a
-# leader, and drives the cluster-administration verbs against every one of them.
+# End-to-end test of a real cluster (POSIX). Starts three fastcache-compile-node
+# processes that know each other, waits for them to elect a leader, and drives the
+# cluster-administration verbs against every one of them -- then, on a cluster of
+# its own, bootstraps ONE node and adds a SECOND.
 #
 # The properties asserted here are the ones no unit test can reach, because each
-# needs three real processes, a real election and a real socket between them:
+# needs real processes, a real election and a real socket between them:
 #
 #   1. One leader, and it — of three nodes that started together, exactly ONE
 #      keeps leading         answers a cluster verb, the other two refuse, and that
@@ -40,11 +41,16 @@
 #                          stopped, and the survivors agree on who it is. A cluster
 #                          that formed once and could not re-form is one that works
 #                          until the first reboot.
+#   6. One, then two — the path a first-time operator takes: bootstrap ONE node, then
+#                          add a SECOND. Everything above starts at three, so the only
+#                          membership change that makes a cluster LESS available was
+#                          covered by nothing (#1023). It runs last and on a cluster
+#                          of its own; see the section itself for why both.
 #
-# Ports are allocated per run rather than fixed: this fixture needs six of them,
-# and six more fixed ports is six more ways to collide with whatever else a CI
-# runner is doing — a failure that reads as "consensus is broken" when it means
-# "something else was listening".
+# Ports are allocated per run rather than fixed: this fixture needs fourteen of
+# them, and fourteen more fixed ports is fourteen more ways to collide with
+# whatever else a CI runner is doing — a failure that reads as "consensus is
+# broken" when it means "something else was listening".
 #
 # Usage:
 #   cluster-e2e.sh --node <path>
@@ -369,27 +375,49 @@ for index in 0 1 2; do
     peers+=("--raft-peer=n$((index + 1))=127.0.0.1:${raft_ports[$index]}")
 done
 
+# One node's command line, and there is exactly one of it.
+#
+# It was written out twice -- `start_node` for n1..n3 and the n4 launch below --
+# and this section adds three more starts, which would have made five copies of
+# fourteen flags differing in two of them. That is the shape the project's own
+# table rule is about, and it had already cost something here: `--advertise` was
+# `127.0.0.1:1` at BOTH sites, a node telling every client to dial a port nothing
+# listens on, which is #594's misconfiguration and is a startup refusal now. It
+# was harmless only because these tests never dispatch a compile.
+#
 # `--cache-memory=0` turns each node's own cache tier OFF -- the node port stays
-# open, because the scheduler verbs are answered on it too since #290. It defaults to
-# 127.0.0.1:6674, which is right for the one node per machine a real deployment
-# runs and wrong here, where three share a host and would race for it.
-start_node() {
-    local index="$1"
-    local id="n$((index + 1))"
-    local log="${workdir}/${id}.log"
+# open, because the scheduler verbs are answered on it too since #290. It defaults
+# to 127.0.0.1:6674, which is right for the one node per machine a real deployment
+# runs and wrong here, where several share a host and would race for it.
+#
+# SLOT AND ID ARE TWO PARAMETERS, and the section at the end is why. It starts one
+# id -- `m2` -- twice, once wrongly and once correctly, and the two must not share
+# a `--cluster-dir`: the wrong one bootstraps a cluster of itself and writes that
+# into its Raft state, so a second start over the same directory would RECOVER the
+# rival cluster rather than join anything, and the correct leg would then be
+# asserting about the state the incorrect one left. The log is keyed on the slot
+# for the same reason -- two runs of one id must be readable apart.
+#
+# The pid, the log and the ports are stored AT the index rather than appended, so
+# `pids` and `scheduler_ports` cannot fall out of step. Section 6 pairs them by
+# index to find and stop the leader, and section 7 blanks a stopped node's port
+# while leaving its pid in place; both are wrong the moment one array is appended
+# to and the other is not.
+#
+# @param 1 index into the port/pid/log arrays
+# @param 2 slot: what its state directory and log are named after
+# @param 3 the --node-id it runs under
+# @param 4.. whatever else this node's shape needs (--raft-peer, --raft-join)
+launch_node() {
+    local index="$1" slot="$2" id="$3"; shift 3
+    local log="${workdir}/${slot}.log"
     node_logs[index]="$log"
 
-    # `--advertise` names the port this node SERVES. It was `127.0.0.1:1` at both
-    # launch sites with no reason given -- a node telling every client to dial a port
-    # nothing on it listens on, which is #594's exact misconfiguration and is refused
-    # at startup since. It was harmless here only because these tests never dispatch a
-    # compile, so nothing ever tried the address; a fixture configuring a node no
-    # operator should configure is what #386 found nine of.
     "$node" \
         --node-id="$id" \
         --listen-raft="127.0.0.1:${raft_ports[$index]}" \
-        "${peers[@]}" \
-        --cluster-dir="${workdir}/${id}" \
+        "$@" \
+        --cluster-dir="${workdir}/${slot}" \
         --serve-scheduler \
         --listen-node="127.0.0.1:${scheduler_ports[$index]}" \
         --fleet-open \
@@ -400,14 +428,18 @@ start_node() {
         --advertise="127.0.0.1:${scheduler_ports[$index]}" \
         --log-level=info \
         > "$log" 2>&1 &
-    pids+=("$!")
-    # Ready, not merely bound (#634). Nothing this function's own callers assert
-    # needs it -- `find_leader` below is a bounded retry loop and heals a node that
-    # is still starting -- but this is the recipe the n4 start below repeats, and
-    # THAT one asserts immediately. Fixing only the site that asserts would leave
-    # the two copies of one recipe disagreeing about what they establish, and the
-    # next assertion placed after this one would inherit the weaker of them.
-    wait_for_node_ready 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${id}" "$log"
+    pids[index]="$!"
+    # Ready, not merely bound (#634). Nothing n1..n3's own callers assert needs it
+    # -- `find_leader` below is a bounded retry loop and heals a node that is still
+    # starting -- but the n4 start and section 7's three starts assert immediately.
+    # Serving one recipe to sites that establish different things is how the weaker
+    # of them gets inherited, which is what folding the copies together removes.
+    wait_for_node_ready 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${slot}" "$log"
+}
+
+start_node() {
+    local index="$1"
+    launch_node "$index" "n$((index + 1))" "n$((index + 1))" "${peers[@]}"
 }
 
 for index in 0 1 2; do
@@ -768,8 +800,11 @@ echo "cluster E2E: a follower redirects to an endpoint that answers"
 
 # --- 3. a setting reaches every member ---------------------------------------
 
+# Submit a setting and wait for it to become VISIBLE, which is this fixture's way
+# of saying the cluster COMMITTED.
+#
 # `ask_leader` (scripts/lib/e2e-common.sh) is what every leader-pinned MUTATING
-# command below goes through. It puts the command to whoever leads NOW and, if the
+# command here goes through. It puts the command to whoever leads NOW and, if the
 # answer is not the one being asserted, re-derives the leader and asks again.
 #
 # It used to be `submit_setting` here, hard-coded to `--cluster-set`. Generalising
@@ -784,53 +819,77 @@ echo "cluster E2E: a follower redirects to an endpoint that answers"
 # message #117's second occurrence actually carried, and it is why a replication
 # timeout in this section is read as a leadership question first.
 #
-# The one submission this section makes, named once so the poll below re-offers
-# the same setting rather than a second one that drifted from it.
-set_upstream() {
-    ask_leader "--cluster-set=upstream=cache.example:6674" "accepted" \
-        "the leader refused a legitimate setting"
+# WHY VISIBILITY IS THE WITNESS FOR "COMMITTED": a leader advances its commit index
+# only once a MAJORITY holds the entry, and `--cluster-status` renders applied
+# state. At three members that is two of them; at the one-member and two-member
+# clusters section 7 builds it is one and then both, which is the whole property
+# that section exists to assert. A member list proves none of it -- a stalled
+# cluster prints its members perfectly well.
+#
+# THE VALUE MUST BE ONE THIS CLUSTER HAS NEVER HELD, or the poll can be satisfied
+# by an earlier commit's residue and would pass with nothing committed at all. The
+# three call sites use three different values for that reason.
+#
+# ONE OF THIS, not one per section (#1023). Section 7 needs the same property twice
+# more, at a quorum of one and then of two, and three copies of a re-offering
+# replication poll would be three places for a retry rule that is already the
+# subject of #117 and #172 to drift.
+#
+# Re-offered rather than only waited on, and the reason is not impatience: a
+# proposal accepted by a leader that is then deposed may legitimately never commit
+# -- Raft promises nothing about an uncommitted entry across a term change -- so
+# polling forever for it asserts something the algorithm does not offer. The honest
+# property is that a setting a client SUCCESSFULLY sets becomes visible, and a
+# client gets that by asking again. Which is what any real operator tool would do,
+# so it is also the behaviour worth having under test.
+#
+# The first submission is deliberately OUTSIDE the budget armed below, which is
+# where it has always been: `ReplicationSeconds` bounds how long a cluster may take
+# to make an accepted setting visible, and folding the initial hand-off into it
+# would let a slow leader hand-off be reported as a replication stall.
+#
+# @param 1 the setting's name
+# @param 2 the value to commit, unique among this run's calls
+# @param 3 what to report when it is accepted and never becomes visible
+commit_setting() {
+    local key="$1" value="$2" what="$3"
+    local answer settled=0 mark deadline
+
+    ask_leader "--cluster-set=${key}=${value}" "accepted" "the leader refused a legitimate setting (${key})"
+
+    # Replication is asynchronous, so the setting becomes visible a moment after it
+    # is accepted. Bounded rather than unbounded, so a cluster that never replicates
+    # fails saying so instead of timing out the suite.
+    mark="$(probe_mark)"
+    deadline=$(( SECONDS + ReplicationSeconds ))
+    # The nested `find_leader` calls below -- one direct, one reached through
+    # `ask_leader` -- each carry `FormationSeconds`, which is twice this loop's whole
+    # budget. Capped here so the number in the source is the number enforced.
+    enclosing_deadline="$deadline"
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
+        answer="$(cluster "$leader_endpoint" --cluster-status)"
+        if [[ "$answer" == *"$value"* ]]; then
+            settled=1
+            break
+        fi
+
+        # Not visible yet. Either replication is still in flight -- ordinary, wait --
+        # or this node no longer leads, in which case the setting may have died with
+        # its term and has to be offered to whoever leads now.
+        if [[ "$answer" != *"known settings:"* ]]; then
+            find_leader "whoever leads now, to re-offer a setting that may have died with its term"
+            ask_leader "--cluster-set=${key}=${value}" "accepted" \
+                "the new leader refused a legitimate setting (${key})"
+        fi
+        sleep 0.2
+    done
+    enclosing_deadline=""
+
+    [[ "$settled" -eq 1 ]] ||
+        fail "${what}: ${key}=${value} was accepted and never became visible within ${ReplicationSeconds}s ($(probe_summary "$mark"))"
 }
 
-set_upstream
-
-# Replication is asynchronous, so the setting becomes visible a moment after it is
-# accepted. Bounded rather than unbounded, so a cluster that never replicates
-# fails saying so instead of timing out the suite -- and re-submitted rather than
-# only waited on.
-#
-# Re-deriving the leader would not be enough on its own. A proposal accepted by a
-# leader that is then deposed may legitimately never commit -- Raft promises
-# nothing about an uncommitted entry across a term change -- so polling forever
-# for it asserts something the algorithm does not offer. The honest property is
-# that a setting a client SUCCESSFULLY sets becomes visible, and a client gets
-# that by asking again. Which is what any real operator tool would do, so it is
-# also the behaviour worth having under test.
-settled=0
-replication_mark="$(probe_mark)"
-replication_deadline=$(( SECONDS + ReplicationSeconds ))
-# The nested `find_leader` calls below -- one direct, one reached through
-# `set_upstream` -> `ask_leader` -- each carry `FormationSeconds`, which is
-# twice this loop's whole budget. Capped here so the 30 s in the source is the
-# 30 s enforced.
-enclosing_deadline="$replication_deadline"
-while [[ "$SECONDS" -lt "$replication_deadline" ]]; do
-    answer="$(cluster "$leader_endpoint" --cluster-status)"
-    if [[ "$answer" == *"cache.example:6674"* ]]; then
-        settled=1
-        break
-    fi
-
-    # Not visible yet. Either replication is still in flight -- ordinary, wait --
-    # or this node no longer leads, in which case the setting may have died with
-    # its term and has to be offered to whoever leads now.
-    if [[ "$answer" != *"known settings:"* ]]; then
-        find_leader "whoever leads now, to re-offer a setting that may have died with its term"
-        set_upstream
-    fi
-    sleep 0.2
-done
-enclosing_deadline=""
-[[ "$settled" -eq 1 ]] || fail "a setting accepted by the leader never became visible on it within ${ReplicationSeconds}s ($(probe_summary "$replication_mark"))"
+commit_setting upstream cache.example:6674 "a setting accepted by the leader never became visible on it"
 echo "cluster E2E: a setting replicates"
 
 # A setting nobody has heard of is refused where the operator is watching, rather
@@ -864,32 +923,14 @@ echo "cluster E2E: an unknown setting is refused by name"
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 
-"$node" \
-    --node-id=n4 \
-    --raft-join \
-    --listen-raft="127.0.0.1:${raft_ports[3]}" \
-    --raft-peer="n4=127.0.0.1:${raft_ports[3]}" "${peers[@]}" \
-    --cluster-dir="${workdir}/n4" \
-    --serve-scheduler \
-    --listen-node="127.0.0.1:${scheduler_ports[3]}" \
-    --fleet-open \
-    --cluster-key-file="$cluster_key" \
-    --cache-memory=0 \
-    --scheduler="127.0.0.1:${scheduler_ports[3]}" \
-    --toolchain="/bin/sh" \
-    --advertise="127.0.0.1:${scheduler_ports[3]}" \
-    --log-level=info \
-    > "${workdir}/n4.log" 2>&1 &
-pids+=("$!")
-node_logs[3]="${workdir}/n4.log"
-# Ready, not merely bound, and here it is load-bearing (#634). The very next
+# `launch_node`'s readiness wait is load-bearing here (#634). The very next
 # statement asks n4 `--cluster-status` and asserts on its REFUSAL, so a node that
 # has bound and is not yet serving satisfies the assertion without the property
 # ever being observed -- and so does the `$ProbeTimedOut` a bounded probe answers
 # with, which also fails to contain `known settings:`. A negative assertion cannot
 # tell "it does not lead" from "it could not answer", so what it rests on has to
 # be established before it, not by it.
-wait_for_node_ready 127.0.0.1 "${scheduler_ports[3]}" "$!" "n4" "${workdir}/n4.log"
+launch_node 3 n4 n4 --raft-join --raft-peer="n4=127.0.0.1:${raft_ports[3]}" "${peers[@]}"
 
 # It is running and it leads nothing, which is the first half of the property: a
 # node waiting to be admitted must not have formed a cluster of its own. Asked of
@@ -1034,6 +1075,227 @@ done
 
 find_leader "a new leader after the old one was stopped"
 echo "cluster E2E: a new leader is elected at ${leader_endpoint}"
+
+# --- 7. bootstrap ONE, then add a SECOND -------------------------------------
+
+# The path a first-time operator actually takes, and until #1023 it was exercised
+# by nothing end to end: everything above starts at THREE and joins a fourth.
+#
+# Every piece of it is unit-tested -- `Membership::Validate` accepts a one-member
+# set, `RaftConfig_test` and `RaftNode_test` drive `members = { "n1" }`, and the
+# sections above prove join-and-admit from three. What nobody assembled is the
+# composition, which is the shape this repository's rulebook warns about from the
+# other direction: green components, and the arrangement the documentation sends a
+# new operator to is the one nothing built.
+#
+# WHY THE 1 -> 2 BOUNDARY SPECIFICALLY. It is the only membership change that makes
+# a cluster LESS available, and it is the first one anybody makes. At one member
+# that node is a majority of itself and commits alone; at two, both must agree. So
+# a second node that is admitted and cannot be reached takes the cluster from
+# committing to not committing, and the operator's next command hangs rather than
+# failing. From three, one silent joiner still leaves a quorum, so the symptom is
+# invisible -- which is exactly why sections 4 and 5 cannot reach this.
+#
+# WHY IT IS LAST rather than first, which is the order it reads in. `find_leader`,
+# `wait_for_formation` and `ask_leader` all walk ONE global `scheduler_ports`, and
+# they are defined between the executable sections above -- so a section placed
+# before them would have to bring its own copies of three helpers whose whole
+# reason for existing is that there is one of each. Running last, it stops every
+# node the sections above started and blanks their slots, and the shared helpers
+# then see this section's cluster and nothing else.
+
+# Stop the three-node cluster, so the shared leader-finding helpers see only what
+# this section starts.
+#
+# The slot is blanked and the pid is LEFT, which is the convention section 6
+# established: `find_leader` and `wait_for_formation` skip a blank port, `cleanup`
+# still knows about the process, and `dump_logs` still carries its log into any
+# later failure. Resetting the arrays instead would take the three-node cluster's
+# logs away from exactly the failures that need them.
+for index in ${pids+"${!pids[@]}"}; do
+    [[ -n "${scheduler_ports[$index]}" ]] || continue
+    stop_and_require_exit "${pids[$index]}" "the three-node cluster's node in slot ${index}" 15
+    scheduler_ports[$index]=""
+done
+echo "cluster E2E: the three-node cluster is stopped; starting a one-member one"
+
+# Poll ONE endpoint until its answer carries a substring, and echo that answer.
+#
+# A node that is merely READY has not necessarily decided anything: a one-member
+# cluster elects itself in a few hundred milliseconds, not instantly, so a single
+# probe straight after `wait_for_node_ready` reads `the cluster has no leader right
+# now`. Measured -- the first run of this section passed and the second failed on
+# exactly that, because the run that passed had spent two seconds waiting for a
+# port and the run that failed had not.
+#
+# NOT `redirect_from`, which is this shape for the opposite answer: that one FAILS
+# the run the moment it sees `known settings:`, because a follower answering as a
+# leader is a finding. Here `known settings:` is what is being waited for, so a
+# helper shared between them would need one of the two to stop asserting. Two
+# waits, two assertions, one poll loop each.
+#
+# Bounded and it says what it was waiting for, like every wait here. The answer is
+# echoed so the caller can assert further things about the same reading rather than
+# probing again -- two probes are two moments, and a second one can legitimately
+# disagree with the first.
+#
+# @param 1 the scheduler endpoint to ask
+# @param 2 the substring that ends the wait
+# @param 3 the bound, in seconds
+# @param 4 what is being waited for, for the failure message
+await_answer() {
+    local endpoint="$1" wanted="$2" seconds="$3" what="$4"
+    local answer="" deadline
+    local mark; mark="$(probe_mark)"
+    deadline=$(( SECONDS + seconds ))
+    while [[ "$SECONDS" -lt "$deadline" ]]; do
+        answer="$(cluster "$endpoint" --cluster-status)"
+        if [[ "$answer" == *"$wanted"* ]]; then
+            printf '%s\n' "$answer"
+            return 0
+        fi
+        sleep 0.2
+    done
+    fail "${what}: ${endpoint} never answered with '${wanted}' within ${seconds}s. Last answer: ${answer} ($(probe_summary "$mark"))"
+}
+
+# One node, bootstrapping a cluster of itself. `--raft-peer` names ITSELF and
+# nothing else, which is what a bootstrap is: the member set this node starts with.
+#
+# Removing that peer is how this leg is shown red -- without it the node names no
+# member of its own configuration, `NodeIdNamesNoPeerRefusal` fires, and it exits
+# before binding, so `launch_node`'s readiness wait ends the run. A fixture that had
+# silently degenerated into "start two and hope" would still pass its later
+# assertions; it cannot pass this one.
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+one_index=$(( ${#scheduler_ports[@]} - 1 ))
+launch_node "$one_index" m1 m1 --raft-peer="m1=127.0.0.1:${raft_ports[$one_index]}"
+
+find_leader "the one-member cluster to lead itself"
+[[ "$leader_endpoint" == "127.0.0.1:${scheduler_ports[$one_index]}" ]] ||
+    fail "the one-member cluster is led from ${leader_endpoint}, which is not the only node in it"
+echo "cluster E2E: one node bootstraps a cluster of itself and leads it"
+
+commit_setting upstream alone.example:6674 "a one-member cluster cannot commit"
+echo "cluster E2E: a one-member cluster commits alone"
+
+# The mistake `--raft-join` exists to prevent, made on purpose.
+#
+# THIS IS THE CASE A HAPPY-PATH FIXTURE SKIPS, and it is the negative control for
+# the leg below: the two nodes differ in whether they are told they are JOINING,
+# and the observable flips. A node that is not told bootstraps the member set it
+# was given -- here, itself -- elects itself, and afterwards refuses AppendEntries
+# from every leader its own configuration does not name. Admitting it would make
+# the cluster count towards quorum a member that answers nobody, which at two
+# members is the whole cluster.
+#
+# The peer list is its own entry alone, and that is the mistake rather than an
+# arrangement chosen to produce one: it is the recipe the operator has in front of
+# them, because it is exactly how m1 was started one screen above. `--raft-join` is
+# what changes the meaning of that list from "the cluster I belong to" into "the
+# nodes I can reach", which is why the leg below adds m1's address to it.
+#
+# WHAT IS ASSERTED IS NOT "it did not join". A joiner that has not yet been admitted
+# also has not joined, and answers a probe the same way an unreachable one does. What
+# separates a rival cluster from a joiner is that the rival LEADS -- so this asserts
+# that it answers as a leader, and that what it leads is NOT m1's cluster, since the
+# setting m1 committed is nowhere in the state it reports. Both halves are needed:
+# "it leads" alone would be satisfied if it had somehow joined and won an election.
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+rival_index=$(( ${#scheduler_ports[@]} - 1 ))
+launch_node "$rival_index" m2-without-join m2 --raft-peer="m2=127.0.0.1:${raft_ports[$rival_index]}"
+
+# Blanked the moment it is up, and its endpoint kept in a variable instead.
+#
+# A running node that answers `known settings:` for a cluster of its OWN is exactly
+# what `find_leader` is looking for, so leaving this slot live would let any nested
+# `find_leader` adopt the rival as this section's leader -- and every later assertion
+# would then be made about the wrong cluster while passing. Nothing between here and
+# the stop below calls `find_leader`, and the blank makes that a property rather than
+# a thing to remember.
+rival_endpoint="127.0.0.1:${scheduler_ports[$rival_index]}"
+scheduler_ports[$rival_index]=""
+
+rival_answer="$(await_answer "$rival_endpoint" "known settings:" "$FormationSeconds" \
+    "the node started WITHOUT --raft-join to elect itself")"
+[[ "$rival_answer" != *"alone.example:6674"* ]] ||
+    fail "a second node started WITHOUT --raft-join answered with m1's committed state, so it is not the rival cluster this asserts: ${rival_answer}"
+echo "cluster E2E: a second node started WITHOUT --raft-join bootstraps a RIVAL cluster and leads it"
+
+# And m1 is untouched by it, which is the reason this control is safe to run at all:
+# the rival dials nobody, so it cannot disturb the cluster under test.
+[[ "$(cluster "$leader_endpoint" --cluster-status)" == *"known settings:"* ]] ||
+    fail "the one-member cluster stopped leading while a rival node was running beside it"
+
+stop_and_require_exit "${pids[$rival_index]}" "the node started without --raft-join" 15
+
+# Now the same node, told it is joining. Fresh ports and a fresh state directory:
+# the run above wrote a bootstrapped configuration into its own, and a second start
+# over it would RECOVER the rival cluster rather than join anything -- so the leg
+# would be asserting about the state the control left behind.
+#
+# It is given m1's address as well as its own, which is load-bearing rather than
+# convenient: the leader starts replicating at its own last index, an empty log
+# refuses that, and the leader only walks back to the beginning when the refusal
+# reaches it. A joiner that could not send one is admitted, dialled, and permanently
+# silent -- and at two members that is a cluster that has stopped committing.
+raft_ports+=("$(free_port)")
+scheduler_ports+=("$(free_port)")
+two_index=$(( ${#scheduler_ports[@]} - 1 ))
+launch_node "$two_index" m2 m2 --raft-join \
+    --raft-peer="m2=127.0.0.1:${raft_ports[$two_index]}" \
+    --raft-peer="m1=127.0.0.1:${raft_ports[$one_index]}"
+
+# The other half of the control above: the SAME id, the same shape of peer list plus
+# one address, and now it leads nothing.
+answer="$(cluster "127.0.0.1:${scheduler_ports[$two_index]}" --cluster-status)"
+[[ "$answer" != *"known settings:"* ]] ||
+    fail "a joining node answered as a leader; it bootstrapped its own cluster"
+echo "cluster E2E: the same node WITH --raft-join leads nothing, and waits to be admitted"
+
+ask_leader "--cluster-admit=m2=127.0.0.1:${raft_ports[$two_index]}" "accepted" \
+    "the one-member cluster refused to admit a second member"
+
+# Asserted on m2 rather than on the leader, and by ASKING rather than by reading a
+# log: the leader accepting a command proves nothing about the machine it names. A
+# follower's refusal names where the leader answers, and that address is not on m2's
+# command line -- so it can only have been replicated to, which is being counted.
+#
+# m2 WINNING an election is accepted too, for section 4's reason: leading means a
+# majority of the configuration voted for it, which a node outside the configuration
+# cannot obtain. Reading only the redirect would tolerate one of two legitimate
+# outcomes and hang out the whole budget on the other.
+joined=0
+join_mark="$(probe_mark)"
+join_deadline=$(( SECONDS + JoinSeconds ))
+while [[ "$SECONDS" -lt "$join_deadline" ]]; do
+    answer="$(cluster "127.0.0.1:${scheduler_ports[$two_index]}" --cluster-status)"
+    named="$(named_endpoint "$answer")"
+    if [[ "$answer" == *"known settings:"* ]]; then
+        leader_endpoint="127.0.0.1:${scheduler_ports[$two_index]}"
+        joined=1
+        break
+    fi
+    if [[ -n "$named" && "$(cluster "$named" --cluster-status)" == *"known settings:"* ]]; then
+        leader_endpoint="$named"
+        joined=1
+        break
+    fi
+    sleep 0.2
+done
+[[ "$joined" -eq 1 ]] ||
+    fail "the second member never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary "$join_mark"))"
+echo "cluster E2E: the second member is replicated to, and names ${leader_endpoint}"
+
+# THE ASSERTION THIS SECTION EXISTS FOR. A member list is what a stalled cluster
+# prints too, so what is asserted is a COMMIT at the new quorum: the value below is
+# visible only once a majority of TWO holds it, which is both nodes. A cluster whose
+# second member was admitted and cannot be reached fails exactly here, and passes
+# everything above.
+commit_setting upstream quorum2.example:6674 "the cluster stopped committing when its quorum grew from one to two"
+echo "cluster E2E: the cluster still commits with two members, so the quorum moved from 1 to 2 without stalling"
 
 # What the probing actually cost, on the SUCCESS path.
 #
