@@ -406,73 +406,6 @@ void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link,
 /// `ConfigReloaderOf<NodeConfig>`.
 using Node::NodeReloader;
 
-/// Act on one SIGHUP, and say what happened either way.
-///
-/// **Both outcomes are logged, and that is the whole point of the ticket.** A reload
-/// that silently ignored a changed field would leave the operator believing an edit
-/// took effect -- they edited a file, saw no error, and got nothing. So a refusal
-/// names every setting that may not change at runtime, and a success names what is now
-/// in force.
-/// @param reloader The pipeline, or null when this worker has no configuration file.
-/// @param logger Where the outcome is reported.
-///
-/// Returns nothing: the heartbeat thread notices a reload by comparing snapshots, so
-/// there is no signal to hand it. A `ConfigReloaderOf::Subscribe` callback would be the
-/// house idiom for one, and is declined here for a lifetime reason rather than a
-/// stylistic one -- the reloader is declared in `main` and outlives `WorkerBody`, and
-/// `Subscribe` has no unsubscribe, so a subscriber capturing this frame's locals would
-/// outlive them.
-///
-/// **That decline is about THIS frame, and `main` does subscribe.**
-/// `WatchSecretExposure` is attached beside the reloader's own declaration, capturing
-/// only what `main` owns and what outlives the reloader -- which is the arrangement
-/// the paragraph above describes as safe rather than an exception to it
-/// ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)). Read as "the
-/// worker cannot subscribe at all" the rule is one frame too wide, and it would leave
-/// the secret-file check startup-only on the binary that holds five such files.
-void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
-{
-    if (reloader == nullptr)
-    {
-        // Not silence: an operator who sent SIGHUP believes this worker has a file to
-        // re-read, and the useful answer is that it has none.
-        logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
-        return;
-    }
-
-    // Taken BEFORE the swap, because "did the advertised set change" cannot be asked
-    // afterwards: `Reload()` replaces the snapshot, and the previous one is then only
-    // reachable through a reference somebody kept. Each snapshot is immutable, so
-    // holding this one costs nothing and stays valid however the swap goes.
-    auto const before = reloader->Current();
-
-    auto const outcome = reloader->Reload();
-    if (!outcome.has_value())
-    {
-        // One line for both refusals -- a file that would not parse and a file that
-        // changed something immutable -- because the operator's situation is the same:
-        // they saved once, and NOTHING was applied.
-        logger.Logf(LogLevel::Warn, "reload declined, configuration unchanged: {}", outcome.error().ToString());
-        return;
-    }
-
-    auto const current = reloader->Current();
-    logger.SetMinLevel(current->logLevel);
-
-    // Asked here only to say the right thing to the operator, at the moment they
-    // acted: the re-survey is the expensive part (`AdvertisedClaimsDiffer` carries
-    // what it costs and why it is not run unconditionally), and somebody who saved a
-    // file should know it was accepted before it finishes. The heartbeat thread asks
-    // the same question again for itself, from the same function.
-    if (Node::AdvertisedClaimsDiffer(*before, *current))
-        logger.Logf(LogLevel::Info,
-                    "configuration reloaded; log level is now {}. What this worker serves has changed, so it will "
-                    "re-derive its toolchains and re-register on the next heartbeat",
-                    ToStringView(current->logLevel));
-    else
-        logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
-}
-
 /// Adopt the compile-argument allowlist an accepted reload asks for, and say so when
 /// it moved.
 ///
@@ -1489,7 +1422,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         // this call publishes a new configuration and says so, and the next beat picks
         // it up on its own.
         if (DaemonControls::Instance().TakeReloadRequest())
-            ApplyReloadRequest(reloader, logger);
+            Node::ApplyReloadRequest(reloader, membership, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");

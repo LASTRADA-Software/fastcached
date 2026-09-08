@@ -51,6 +51,7 @@ add_executable(fastcache-compile-node
     LocalCache.cpp
     NodeAnnounce.cpp
     NodeConfig.cpp
+    NodeReload.cpp
     NodeFrameSurface.cpp
     NodeSurfaces.cpp
     NodeToolchains.cpp
@@ -109,6 +110,8 @@ if(FASTCACHED_BUILD_TESTS)
         NodeAnnounce.cpp
         NodeConfig.cpp
         NodeCredential_test.cpp
+        NodeReload.cpp
+        NodeReload_test.cpp
         NodeLogging.cpp
         NodeLogging_test.cpp
         NodeFrameSurface.cpp

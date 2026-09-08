@@ -1089,11 +1089,13 @@ also lists in its own `--fleet-member` stays admitted to that node's three surfa
 after the forget, because the two are separate routes and forgetting speaks for one
 of them — see [who a node
 admits](../operations/cluster-communication.md#who-a-node-admits). Revoking such a
-host means dropping it from `--fleet-member` on the machines that list it **and
-restarting them**: that flag is not reloadable, so `SIGHUP` will not take it away.
-Under `--fleet-open` a forget revokes nothing at all, because there is no set to
-remove anybody from
-([#265](https://github.com/LASTRADA-Software/fastcached/issues/265)).
+host means dropping it from `--fleet-member` on the machines that list it and
+**reloading them** — that flag is reloadable since
+[#405](https://github.com/LASTRADA-Software/fastcached/issues/405), so a `SIGHUP` takes
+it away without a restart. Under `--fleet-open` a forget revokes nothing at all, because
+there is no set to remove anybody from
+([#265](https://github.com/LASTRADA-Software/fastcached/issues/265)); dropping the flag
+and reloading is what closes such a node.
 
 ### Finding peers instead of typing them
 
@@ -1429,11 +1431,38 @@ refusal names every offending setting. You saved once; you get one answer.
 
 | Reloadable | Requires a restart |
 |---|---|
-| `log_level`, `allow_compile_arg`, `requirepass`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
+| `log_level`, `allow_compile_arg`, `requirepass`, `fleet_member`, `fleet_open`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
 
-`log_level`, `allow_compile_arg` and `requirepass` take effect immediately and tell
-the fleet nothing; `toolchain` and `no_toolchain_discovery` re-register this worker,
-which is the next section.
+`log_level`, `allow_compile_arg`, `requirepass`, `fleet_member` and `fleet_open` take
+effect immediately and tell the fleet nothing; `toolchain` and `no_toolchain_discovery`
+re-register this worker, which is the section after next.
+
+### Revoking a machine
+
+`fleet_member` and `fleet_open` are the settings a fleet actually edits, and their two
+directions are not alike. **Adding** a host fails closed: until the reload lands that
+machine is refused, which is annoying, self-healing, and obvious from the machine being
+refused. **Removing** one fails open: a machine you have just revoked keeps being
+served, and nothing anywhere reports it, because admission succeeding is what normally
+happens.
+
+So the removal is the direction this path exists for. Drop the host from `fleet_member:`
+and reload, and it is refused from its next connection onward — on the compile port, on
+the cache tier and on the scheduler alike, since all three ask one oracle. The worker
+logs the change at `WARN` and **names the hosts that are no longer admitted**, which is
+the line to check: a revocation that did not take reads exactly like one that did.
+
+Dropping `fleet_open:` from the file and reloading closes the node again. Everybody the
+`fleet_member:` list does not name is refused from that moment; this machine is still
+admitted, always, because a process on this host already has this host's compiler.
+
+**A reload will not widen a node that has no `cluster_key_file:`.** Such a worker chose
+at startup to verify no lease signatures, which is safe only while no machine but its
+own is admitted — and under socket activation nothing it can read tells it whether its
+port faces the network. A reload that would newly admit a remote host is therefore
+refused by name and *nothing* is applied. Give the node a key and restart it, or leave
+the policy as it is. Narrowing stays allowed on such a node, which is the direction that
+closes it.
 
 ### Rotating `requirepass`
 

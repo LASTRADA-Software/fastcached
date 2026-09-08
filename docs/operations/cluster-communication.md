@@ -585,15 +585,31 @@ be in both lists.
 | `--fleet-member` only | **no** — consensus does not speak for that list |
 | **both** | **no** — the static list keeps admitting it |
 
-`--fleet-member` is **not a reloadable setting**, so removing a host from it takes a
-configuration change *and a restart of every node that lists it*. `SIGHUP` will not do
-it: the flag is fixed for the process's life, which is what makes a listed client
-machine survive every membership commit in the first place.
+`--fleet-member` is a **reloadable** setting, so removing a host from it takes a
+configuration change on every node that lists it and a `SIGHUP` — not a restart. Drop
+the host from `fleet_member:` and run `systemctl reload fastcache-compile-node`, and
+that machine is refused from the next connection onward -- on the compile verbs, on
+the cache tier and on the scheduler, which all ask one oracle. The
+worker logs the change at `WARN`, naming the hosts that are no longer admitted, because
+a revocation that did not take looks exactly like one that did.
 
-Under **`--fleet-open` there is no revocation at all.** The flag says "admit
+It is still a change on **every** node that lists the host: the list is per-node
+configuration, and a `--cluster-forget` on the leader speaks for the cluster's set and
+not for anybody's `--fleet-member`. That is what makes a listed client machine survive
+every membership commit in the first place.
+
+Under **`--fleet-open` a forget revokes nothing at all.** The flag says "admit
 everybody", so there is no set for a forget to remove anybody from and a committed
 membership change narrows nothing. That is the flag working rather than a limitation,
-and an operator who wants revocation has to turn it off first.
+and an operator who wants revocation has to turn it off — which is itself a reload:
+drop `fleet_open:` from the file and `SIGHUP`, and the node closes to everybody its
+`fleet_member:` list does not name.
+
+**One thing a reload will not do is widen a node that has no `--cluster-key-file`.**
+Such a worker chose at startup to verify no lease signatures, which is only safe while
+no machine but its own is admitted, so a reload that would newly admit a remote host is
+refused by name and nothing is applied. Give the node a key and restart it, or leave the
+policy alone. Narrowing is always allowed — that is the direction that closes it.
 
 This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it is
 not a regression: before #251 a forget *appeared* to revoke, as a side effect of the

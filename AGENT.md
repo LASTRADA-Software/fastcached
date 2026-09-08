@@ -602,14 +602,28 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   admits *clients* — laptops, CI runners — which never join consensus, so what the
   cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`
   seam (`AnyOfMembership`), because the next route is a credential and not a host list.
-  The admission-layer reading of *absence from `ClusterState` is not removal*. Addition is
-  dynamic and REMOVAL is not (#265): `--fleet-member` is `Reloadable::No`, so a host on
-  both lists survives `--cluster-forget` and revoking it is a config change AND a
-  restart; under `--fleet-open` there is no revocation at all. That does not contradict
-  the absence rule — absence is a member the state never named, a forget is a positive
-  act — and both are written down because they read as contradictory cold. Pinned by a
-  test, in the *worsen* direction: making `Publish` write the listed set would look like
-  a fix and would be #251 again.
+  The admission-layer reading of *absence from `ClusterState` is not removal*. A host on
+  both lists survives `--cluster-forget`, and revoking it is a config change on every
+  node that lists it — a **reload** since #405, where #265 recorded a restart. That does
+  not contradict the absence rule — absence is a member the state never named, a forget
+  is a positive act — and both are written down because they read as contradictory cold.
+  Pinned by a test, in the *worsen* direction: making `Publish` write the listed set
+  would look like a fix and would be #251 again. `NodeMembership::Adopt` is the SECOND
+  publisher and writes only `--fleet-member`'s list, so that pin stands rather than being
+  the thing #405 relaxed.
+- REMOVAL is the direction a live admission path has to get right, and the direction a
+  test skips. Adding a member fails CLOSED — refused until the reload lands, self-healing,
+  visible from the machine being refused; removing one fails **OPEN**, and nothing reports
+  it because admission succeeding is the ordinary case. So `NodeMembership` IS the oracle
+  rather than handing one out: surfaces bind an `IMembershipOracle const&` once, so an
+  `Oracle()` choosing between two owned objects could never see `--fleet-open` change —
+  and a test that re-asks `Oracle()` after the reload passes under exactly that defect.
+  And a reload may not WIDEN admission on a node with no `--cluster-key-file`: that node
+  built an unchecked lease validator at startup, `MakeWorkerLeaseValidator` has already
+  run, and the startup table's reachability rows are blind under socket activation — so
+  widening would open an unauthenticated compile port with every refusal counter at zero,
+  which is #282 through a new door. Asked as a TRANSITION, or it refuses the keyless
+  nodes running happily today.
 - A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
   inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
   the cap it advertises was unreachable while every client still got a correct object.
@@ -1794,6 +1808,23 @@ and what they may assume.
   the test can fail** — neuter the fix and check the failures are the ones you expect AND ONLY THOSE; the
   asymmetry is the evidence. "What would prove this fixed" and "what would fail if it were not" are different
   questions, and only the second one tests anything.
+- **#405 produced THREE fixtures that could not fail, in one batch, none found by reviewing
+  the assertion** — one watched an object no consumer holds, one used a candidate an earlier
+  guard refuses so it never reached the code under test, one asserted a string BOTH refusals
+  contain. One instance reads as bad luck; three read as the default outcome. What found them
+  was neutering the fix, building the neighbouring case, and asking how production ACQUIRES
+  what the fixture acquires. Reading harder finds none of them.
+- A fixture that RE-ACQUIRES a collaborator the production code binds ONCE is testing a
+  different object, and its assertion can be exactly right while the case is green over a
+  live defect. #405's first `--fleet-open` case re-asked `membership.Oracle()` after each
+  reload; every surface binds an `IMembershipOracle const&` at construction and holds it,
+  so an `Oracle()` returning one of two owned objects chosen by a flag read once was
+  invisible to the fixture and fatal in production. Bind it the way the call sites do,
+  before the mutation, and read back through that binding. Covers any cached seam — a
+  reference, an iterator, a `shared_ptr` snapshot, a resolved endpoint. The tell is that
+  the fixture is MORE CONVENIENT than the production code, which is when nobody re-reads
+  it; it is the mirror of *a fake more permissive than the thing it stands for*, with the
+  CALL PATTERN as the fake, so reading the fake never finds it.
 - Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
   A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
   alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone

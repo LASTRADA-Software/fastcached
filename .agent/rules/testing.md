@@ -900,6 +900,58 @@ looks like one and is not: it exists because clang-tidy cannot see the guard thr
 in would put one rule under two headings — which is what the census entry below means
 by an instance filed where nobody looking for it will read it.
 
+### THREE more in one batch, and how each was actually found
+
+[#405](https://github.com/LASTRADA-Software/fastcached/issues/405) produced three, all
+in fixtures its own author had just written and believed, all green. The number is the
+point: **one instance reads as bad luck, three read as the default outcome** — so the
+question to ask of a new fixture is not *is this careful* but *what would make it fail*.
+
+The pattern travels with the figure, because the three are not one mistake repeated:
+
+<!-- table-total: none -->
+| the fixture | why it could not fail | how it was found |
+|---|---|---|
+| re-asked `Oracle()` after each reload | production binds it ONCE, so the case watched an object no consumer holds | asking how production ACQUIRES the collaborator — the subsection below |
+| used a `--raft-peer` candidate to pin a call ORDERING | `StartupPolicyRejection` refuses that candidate before either check runs, so it never reached the code under test | **neutering** — it passed with the fix and with the fix reverted |
+| asserted `contains("--cluster-key-file")` to pin WHICH rule refused | *both* rules say that, so it asserted what both sides produce — this rule's own failure, inside the ticket applying it | **building the neighbouring case**, which made the shared string visible |
+
+**None was found by reviewing the assertion**, which is the common factor and the only
+actionable part: every one of the three has a correct-looking assertion, and two of
+them are correct assertions about the wrong object or an unreached path. Reading harder
+does not find these. What finds them is neutering the fix, or building the case next to
+it, or asking how the production code acquires what the fixture acquires.
+
+### A fixture that RE-ACQUIRES what production binds ONCE is testing a different object
+
+The sixth shape, found in
+[#405](https://github.com/LASTRADA-Software/fastcached/issues/405) and not by review:
+its first `--fleet-open` case called `membership.Oracle()` fresh after each reload and
+passed. Every production surface — `SchedulerTier::Start`, `CompileResponder` — takes an
+`IMembershipOracle const&` at construction and holds it for its lifetime. Against an
+`Oracle()` that still returned one of two owned objects chosen by a flag read once, the
+fixture saw each new answer and the running node saw none: **the defect was live and the
+case was green.**
+
+That is not a weak assertion, which is what makes it worth its own entry. The assertion
+was exactly right; the *acquisition* was wrong, so the case measured an object no
+consumer ever holds. Bind the collaborator the way the call sites bind it, before the
+mutation, and read back through that binding afterwards.
+
+- **The general form covers any seam a consumer caches** — a reference, an iterator, a
+  `shared_ptr` snapshot, a resolved endpoint, a `std::function` copied into a member. Ask
+  what the production code does ONCE and make the fixture do it once too.
+- **The tell is that the fixture is more convenient than the production code.** Re-asking
+  a getter per assertion is what anybody writes first, and it is the version nobody
+  re-reads, because it looks like the careful spelling rather than the lucky one.
+- It is the mirror of *a fake more PERMISSIVE than the thing it stands for*: here the
+  fake is the CALL PATTERN rather than the object, so no amount of reading the fake
+  finds it. Same family as `check-catch-skip-return-code`'s selftest exercising the
+  fallback while CI exercised git — **the mode under test was not the mode in use.**
+- Neutering is what catches it, and only if the neuter is the one the fixture's shape
+  hides: reverting `Oracle()` to the two-object form reddens the corrected case and
+  nothing else, and reddened the original not at all.
+
 ## A query that FAILED is not an observation about the subject
 
 A required-context checker was written for the shape

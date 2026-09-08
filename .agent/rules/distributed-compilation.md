@@ -494,14 +494,50 @@ Consequences that are each load-bearing:
       `--fleet-member` on a clustered node, on the reasoning that the flag was about to
       be overwritten — which was true and was the bug. A line that steers an operator
       around a defect is one more thing to correct when the defect is fixed.
-    - **Addition is dynamic; REMOVAL is not, and that asymmetry is the composition's
-      standing cost** ([#265](https://github.com/LASTRADA-Software/fastcached/issues/265)).
-      `AnyOfMembership` admits whoever ANY participant admits, and `--fleet-member` is
-      `Reloadable::No`, so a host on both lists cannot be revoked while the node runs:
-      `--cluster-forget` takes it out of the quorum and it keeps the right to spend that
-      machine's CPU and read its cache tier. Revoking it is a config change **and a
-      restart** of every node that lists it. Under `--fleet-open` there is no revocation
-      at all, which is the flag working.
+    - **Addition is dynamic; REMOVAL is the direction that fails open**
+      ([#265](https://github.com/LASTRADA-Software/fastcached/issues/265),
+      [#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
+      `AnyOfMembership` admits whoever ANY participant admits, so a host on both lists is
+      not revoked by `--cluster-forget`: that takes it out of the quorum and it keeps the
+      right to spend that machine's CPU and read its cache tier. Revoking it is a config
+      change on every node that lists it — which #265 recorded as needing a **restart**
+      and which is a **reload** since #405, `--fleet-member` and `--fleet-open` both
+      being `Reloadable::Yes` now. Under `--fleet-open` a forget still revokes nothing,
+      which is the flag working; dropping the flag and reloading is what closes the node.
+      - **The asymmetry did not go away, it moved.** Adding a member fails CLOSED: the
+        machine is refused until the reload lands, which is annoying, self-healing and
+        visible from the machine being refused. Removing one fails **OPEN**: a revoked
+        machine keeps being served and nothing reports it, because admission succeeding
+        is the ordinary case. Only the second is worth a live path, and it is the one a
+        test naturally skips — so the acceptance is the removal, and the addition case
+        is there only to stop a change that satisfies the easy half from passing.
+      - **`NodeMembership` IS the oracle rather than handing one out, and that is what
+        makes `--fleet-open` live at all.** Surfaces take an `IMembershipOracle const&`
+        once, at construction, and hold it for their lifetime; an `Oracle()` returning
+        one of two owned objects chosen by a flag read once would leave every surface
+        bound to whichever was right at startup. A test that re-asks `Oracle()` after
+        the reload passes under precisely that defect — so bind the reference BEFORE the
+        reload and classify through it after, which is what the fixture does and what
+        the production call sites do.
+      - **A reload may not WIDEN admission on a node with no `--cluster-key-file`.**
+        Such a node built `Cc::UncheckedLeaseValidator()` at startup, which is safe only
+        while no machine but this one is admitted — and neither guard for that can see a
+        reload. `StartupPolicyRejection` decides reachability from the listen flags,
+        which describe nothing under socket activation, and
+        `MakeWorkerLeaseValidator`'s backstop for exactly that has already run. Widening
+        would hand it an open unauthenticated compile port with every refusal counter
+        reading zero, which is
+        [#282](https://github.com/LASTRADA-Software/fastcached/issues/282) arriving
+        through the door #405 opens. Asked as a TRANSITION — the candidate admits remote
+        peers and the previous configuration did not — because a keyless worker that
+        already admits them passed its own startup rules, is running today, and must
+        stay free to NARROW: a guard refusing its reloads would punish the one edit that
+        makes it safer. A `PairRule` row in `ValidateNodeReloadable`, so the second rule
+        about a transition is a row rather than another `if`.
+      - **`Adopt` writes `--fleet-member`'s list and only that**, exactly as `Publish`
+        writes the cluster's and only that. Two publishers, one per question — #251
+        reached from the other side, and the reason the worsen-direction pin on
+        `Publish` still stands rather than being what #405 relaxed.
       - **It does not contradict *absence from `ClusterState` is not removal*.** That
         rule is about ABSENCE — a member the state never named, which must not be read
         as a removal — while a forget is a positive act and does revoke what consensus
@@ -1169,8 +1205,10 @@ Consequences that are each load-bearing:
   `--node-class` and `--reserve-cores` feed `NodeCapacityOf`, which is derived **below**
   the cache tier (#167) and would have to re-establish that ordering without restarting
   it. And because "we decided not to" and "we forgot" are the same diff, the reloadable
-  set is pinned by a `static_assert` beside the option table: a fourth `Reloadable::Yes`
-  row fails the build until its author classifies it in `AdvertisedClaimsDiffer`.
+  set is pinned by a `static_assert` beside the option table: a further `Reloadable::Yes`
+  row fails the build until its author classifies it in `AdvertisedClaimsDiffer`. That
+  sentence said "a fourth" and now names no number — #404 and #405 each added rows, and
+  a count stated beside a table is a second claim about it.
 
   **The removal direction fails CLOSED, and #403's own text says otherwise.** Admission
   is a single funnel — `WorkerProtocol` is the only caller of `CompileJobRunner::Run`,
