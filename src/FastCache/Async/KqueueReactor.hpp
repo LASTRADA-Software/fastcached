@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/ParkedWork.hpp>
 #include <FastCache/Async/ReactorWorkerIdentity.hpp>
 #include <FastCache/Core/Clock.hpp>
 
@@ -64,7 +65,9 @@ class KqueueReactor: public IReactor
 
     void Stop() noexcept override;
     void Submit(std::coroutine_handle<> handle) override;
+    void Submit(ParkedWork work) override;
     void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
+    void Schedule(TimePoint deadline, ParkedWork work) override;
     [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override;
     [[nodiscard]] IClock& Clock() noexcept override
     {
@@ -104,12 +107,20 @@ class KqueueReactor: public IReactor
     {
         TimePoint deadline {};
         std::uint64_t sequence { 0 };
-        std::coroutine_handle<> handle {};
+        Detail::Parked parked {};
     };
 
   private:
     void FireExpiredTimers();
     void DrainPendingSubmits();
+
+    /// Free every await chain still parked here that nothing else can free.
+    ///
+    /// `EpollReactor::AbandonParkedWork`'s rule on the platform that shares its shape:
+    /// `Stop()` sets a flag, `RunLoop()` returns with both containers exactly where
+    /// they were, and nothing resumes what is in them ever again
+    /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+    void AbandonParkedWork() noexcept;
 
     /// The batch `Run()` is walking, published so `Detach` can withdraw an entry
     /// from it. Null whenever no batch is in flight.
@@ -134,7 +145,7 @@ class KqueueReactor: public IReactor
     std::uint64_t _nextSequence { 0 };
 
     std::mutex _submitMutex;
-    std::deque<std::coroutine_handle<>> _pendingSubmits;
+    std::deque<Detail::Parked> _pendingSubmits;
 
     std::mutex _timerMutex;
     std::vector<TimerEntry> _timers;

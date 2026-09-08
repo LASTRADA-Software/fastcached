@@ -953,6 +953,19 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `Testing::ParkingReadableSocket` parks and COUNTS orphaned watches instead of aborting.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
+- A reactor resumes what it parks or FREES it, and it may free only what nothing else
+  owns. `Stop()` set a flag and `RunLoop()` returned with both containers where they
+  were, so every parked frame and everything reachable from it leaked -- LSan's
+  indirect-ONLY set, the signature of a `Task` chain holding itself through its
+  continuations. A blanket destroy is the tempting fix and is a `heap-use-after-free`
+  on an arrangement already in the suite, because `Schedule` BORROWS; so ownership
+  travels with the park (`ParkedWork::abandon`, derived from the promise type, non-empty
+  exactly for a chain rooted in a `DetachedTask`). What is freed is the chain ROOT --
+  freeing the frame the reactor HOLDS took a four-allocation leak to three and left
+  LSan red, because a `Task` chain's ownership runs downward. Resuming is a hang, not
+  an alternative: a bounded wait re-parks. `Resume()` disowns and resumes in ONE
+  expression, so no fire path can forget it; IOCP's posted submissions have no entry to
+  fold into and keep a side table instead, which is stated rather than left silent.
 - A missing keyspace event has two ends — the tier that never named the victim and
   the observer that never published it. Check both before changing either.
 - A reclaim is reported **before** the call that caused it: `ADD` on a lapsed TTL

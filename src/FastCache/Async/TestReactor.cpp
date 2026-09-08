@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <deque>
 #include <mutex>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 namespace FastCache
 {
@@ -27,6 +30,37 @@ TestReactor::TestReactor(IClock& clock) noexcept:
 {
 }
 
+TestReactor::~TestReactor()
+{
+    // Before the members die, so both containers are alive while chains are freed --
+    // see the declaration for why that ordering is the whole reason this exists.
+    AbandonParkedWork();
+}
+
+void TestReactor::AbandonParkedWork() noexcept
+{
+    // Both taken before either is freed, and looped, for
+    // `EpollReactor::AbandonParkedWork`'s reason: freeing a chain can park again, and a
+    // single fixed-order pass would leave whatever the later pass produced for member
+    // destruction. Freed outside the lock, because a chain's destructors reach back
+    // into this reactor -- `CancelPending` takes `_mutex`, and taking it twice on one
+    // thread is undefined.
+    while (true)
+    {
+        std::deque<Detail::Parked> ready;
+        std::vector<ScheduledEntry> timers;
+        {
+            std::scoped_lock const guard { _mutex };
+            ready.swap(_ready);
+            timers.swap(_timers);
+        }
+        if (ready.empty() && timers.empty())
+            return;
+        ready.clear();
+        timers.clear();
+    }
+}
+
 void TestReactor::RunLoop()
 {
 
@@ -44,18 +78,29 @@ void TestReactor::Stop() noexcept
 
 void TestReactor::Submit(std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Submit(ParkedWork { .resume = handle });
+}
+
+void TestReactor::Submit(ParkedWork work)
+{
+    if (!work.resume)
         return;
     std::scoped_lock const guard { _mutex };
-    _ready.push_back(handle);
+    _ready.emplace_back(work);
 }
 
 void TestReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Schedule(deadline, ParkedWork { .resume = handle });
+}
+
+void TestReactor::Schedule(TimePoint deadline, ParkedWork work)
+{
+    if (!work.resume)
         return;
     std::scoped_lock const guard { _mutex };
-    _timers.push_back(ScheduledEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
+    _timers.push_back(
+        ScheduledEntry { .deadline = deadline, .sequence = _nextSequence++, .parked = Detail::Parked { work } });
     std::ranges::push_heap(_timers, EntryGreater);
 }
 
@@ -65,15 +110,20 @@ bool TestReactor::CancelPending(std::coroutine_handle<> handle) noexcept
         return false;
     std::scoped_lock const guard { _mutex };
 
-    if (auto const found = std::ranges::find(_ready, handle); found != _ready.end())
+    if (auto const found = std::ranges::find(_ready, handle, &Detail::Parked::Handle); found != _ready.end())
     {
+        // Taken rather than only erased: the caller becomes the only one who may resume
+        // or destroy it, so this entry must do neither on its way out.
+        std::ignore = found->Take();
         _ready.erase(found);
         return true;
     }
 
-    auto const found = std::ranges::find(_timers, handle, &ScheduledEntry::handle);
+    auto const found =
+        std::ranges::find(_timers, handle, [](ScheduledEntry const& entry) noexcept { return entry.parked.Handle(); });
     if (found == _timers.end())
         return false;
+    std::ignore = found->parked.Take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -93,9 +143,8 @@ void TestReactor::FireExpiredTimers()
     while (!_timers.empty() && _timers.front().deadline <= now)
     {
         std::ranges::pop_heap(_timers, EntryGreater);
-        auto entry = _timers.back();
+        _ready.push_back(std::move(_timers.back().parked));
         _timers.pop_back();
-        _ready.push_back(entry.handle);
     }
 }
 
@@ -106,7 +155,7 @@ std::size_t TestReactor::Tick()
     // routinely does, since that is how a woken consumer asks to run again --
     // which would deadlock against a lock held across the resume. The platform
     // reactors drain into a local for the same reason.
-    std::deque<std::coroutine_handle<>> batch;
+    std::deque<Detail::Parked> batch;
     {
         std::scoped_lock const guard { _mutex };
         FireExpiredTimers();
@@ -114,12 +163,12 @@ std::size_t TestReactor::Tick()
     }
 
     auto const drained = batch.size();
+    // `Resume()` disowns and resumes in one expression, so work that runs normally is
+    // never also freed by the entry going out of scope here.
     while (!batch.empty())
     {
-        auto handle = batch.front();
+        batch.front().Resume();
         batch.pop_front();
-        if (handle && !handle.done())
-            handle.resume();
     }
     return drained;
 }

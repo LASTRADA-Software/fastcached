@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IExecutor.hpp>
+#include <FastCache/Async/Task.hpp>
 
 #include <coroutine>
 
@@ -31,10 +32,17 @@ struct ResumeOn
     }
 
     /// Post the handle to the target for resumption.
+    ///
+    /// Templated on the promise for `SleepUntil`'s reason: an executor destroyed before
+    /// it runs this has to be told whether anything else can free the chain, and only
+    /// the parking coroutine's own promise type knows
+    /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+    /// @tparam Promise The suspending coroutine's promise type.
     /// @param handle The suspended coroutine to resume there.
-    void await_suspend(std::coroutine_handle<> handle) const
+    template <typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> handle) const
     {
-        target.Submit(handle);
+        target.Submit(Detail::ParkedWorkFor(handle));
     }
 
     void await_resume() const noexcept {}

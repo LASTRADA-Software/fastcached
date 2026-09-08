@@ -12,6 +12,7 @@
     #include <cstdint>
     #include <ranges>
     #include <tuple>
+    #include <utility>
 
     #include <unistd.h>
 
@@ -78,10 +79,55 @@ EpollReactor::EpollReactor(IClock& clock):
 
 EpollReactor::~EpollReactor()
 {
+    // Before the descriptors close: an abandoned connection chain frees its socket on
+    // the way down, and `EpollSocket::Close` detaches from this reactor.
+    AbandonParkedWork();
+
     if (_wakeFd >= 0)
         ::close(_wakeFd);
     if (_epollFd >= 0)
         ::close(_epollFd);
+}
+
+void EpollReactor::AbandonParkedWork() noexcept
+{
+    // Swapped out under the locks and freed OUTSIDE them: destroying a chain runs
+    // arbitrary destructors, and a socket going down there calls back into this
+    // reactor. `~Parked` is the whole of the freeing, so there is no separate destroy
+    // step for a future edit to forget.
+    //
+    // **Looped, and both containers are taken before either is freed.** Freeing a chain
+    // can park again -- `AsyncQueue::Close()` resuming a waiter reaches `Submit` -- so a
+    // single pass in a fixed order leaves whatever the later pass produced for MEMBER
+    // destruction, which runs after the descriptors below are closed: that entry's
+    // `Submit` would have written to an fd on its way out. It terminates because a pass
+    // that takes nothing returns, and teardown frees chains rather than creating them.
+    //
+    // **Not covered by a case, and that is stated rather than papered over.** The only
+    // thing the single-pass version does differently is free the re-parked entry LATER,
+    // and later still frees it -- `swap` leaves the member containers unallocated, so a
+    // re-entrant search over them reads nothing. The difference is visible only as an
+    // `epoll_ctl` on a descriptor `~EpollReactor` has already closed, whose fd number
+    // another thread may by then have reused, and no fixture can stage that
+    // deterministically. A case was written for it and DELETED: it passed with the loop
+    // and without it, which is a test that cannot fail for its reason.
+    while (true)
+    {
+        std::deque<Detail::Parked> submits;
+        std::vector<TimerEntry> timers;
+        {
+            std::scoped_lock const guard { _submitMutex };
+            submits.swap(_pendingSubmits);
+        }
+        {
+            std::scoped_lock const guard { _timerMutex };
+            timers.swap(_timers);
+        }
+        if (submits.empty() && timers.empty())
+            return;
+        submits.clear();
+        timers.clear();
+    }
 }
 
 bool EpollReactor::CancelPending(std::coroutine_handle<> handle) noexcept
@@ -91,17 +137,23 @@ bool EpollReactor::CancelPending(std::coroutine_handle<> handle) noexcept
 
     {
         std::scoped_lock const guard { _submitMutex };
-        if (auto const found = std::ranges::find(_pendingSubmits, handle); found != _pendingSubmits.end())
+        if (auto const found = std::ranges::find(_pendingSubmits, handle, &Detail::Parked::Handle);
+            found != _pendingSubmits.end())
         {
+            // Taken rather than only erased: the caller becomes the only one who may
+            // resume or destroy it, so this entry must do neither on its way out.
+            std::ignore = found->Take();
             _pendingSubmits.erase(found);
             return true;
         }
     }
 
     std::scoped_lock const guard { _timerMutex };
-    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    auto const found =
+        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.Handle(); });
     if (found == _timers.end())
         return false;
+    std::ignore = found->parked.Take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -161,11 +213,16 @@ void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 
 void EpollReactor::Submit(std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Submit(ParkedWork { .resume = handle });
+}
+
+void EpollReactor::Submit(ParkedWork work)
+{
+    if (!work.resume)
         return;
     {
         std::scoped_lock const lock { _submitMutex };
-        _pendingSubmits.push_back(handle);
+        _pendingSubmits.emplace_back(work);
     }
     std::uint64_t one = 1;
     std::ignore = ::write(_wakeFd, &one, sizeof(one));
@@ -173,11 +230,17 @@ void EpollReactor::Submit(std::coroutine_handle<> handle)
 
 void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Schedule(deadline, ParkedWork { .resume = handle });
+}
+
+void EpollReactor::Schedule(TimePoint deadline, ParkedWork work)
+{
+    if (!work.resume)
         return;
     {
         std::scoped_lock const lock { _timerMutex };
-        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
+        _timers.push_back(
+            TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .parked = Detail::Parked { work } });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     std::uint64_t one = 1;
@@ -194,34 +257,33 @@ void EpollReactor::Stop() noexcept
 void EpollReactor::FireExpiredTimers()
 {
     auto const now = _clock.Now();
-    std::vector<std::coroutine_handle<>> due;
+    std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
         while (!_timers.empty() && _timers.front().deadline <= now)
         {
             std::ranges::pop_heap(_timers, EntryGreater);
-            due.push_back(_timers.back().handle);
+            due.push_back(std::move(_timers.back().parked));
             _timers.pop_back();
         }
     }
-    for (auto handle: due)
-        if (handle && !handle.done())
-            handle.resume();
+    // `Resume()` disowns and resumes in one expression, so a timer that fires normally
+    // is never also freed by the entry going out of scope here.
+    for (auto& parked: due)
+        parked.Resume();
 }
 
 void EpollReactor::DrainPendingSubmits()
 {
-    std::deque<std::coroutine_handle<>> drained;
+    std::deque<Detail::Parked> drained;
     {
         std::scoped_lock const lock { _submitMutex };
         drained.swap(_pendingSubmits);
     }
     while (!drained.empty())
     {
-        auto handle = drained.front();
+        drained.front().Resume();
         drained.pop_front();
-        if (handle && !handle.done())
-            handle.resume();
     }
 }
 

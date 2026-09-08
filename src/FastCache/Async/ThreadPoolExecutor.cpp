@@ -45,6 +45,11 @@ void ThreadPoolExecutor::Stop() noexcept
     _wake.notify_all();
 }
 
+void ThreadPoolExecutor::Submit(ParkedWork work)
+{
+    Submit(work.resume);
+}
+
 void ThreadPoolExecutor::Submit(std::coroutine_handle<> handle)
 {
     {

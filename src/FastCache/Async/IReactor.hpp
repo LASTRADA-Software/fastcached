@@ -67,6 +67,25 @@ class IReactor: public IExecutor
     /// @param handle Coroutine to resume.
     virtual void Schedule(TimePoint deadline, std::coroutine_handle<> handle) = 0;
 
+    /// Schedule a coroutine, saying what may be freed if the deadline never arrives.
+    ///
+    /// **A reactor that stops with work still parked resumes none of it**, and until
+    /// [#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025) it also
+    /// freed none of it: `Stop()` sets a flag, `RunLoop()` returns, and the timer heap
+    /// was destroyed as a vector of non-owning handles. Every frame parked there, and
+    /// everything reachable from it, leaked with no diagnostic -- reported by
+    /// LeakSanitizer as an indirect-only set, which is the signature of a `Task` chain
+    /// referring to itself through its continuations.
+    ///
+    /// The reactor still may not free what it merely borrows, so the caller says which
+    /// it is: `ParkedWork::abandon` is the root of an await chain no object owns, and
+    /// `SleepUntil` derives it from the parking coroutine's promise type rather than
+    /// asking anybody to decide. Empty -- what the borrowing overload above passes -- is
+    /// the safe answer and leaves teardown behaving exactly as it did.
+    /// @param deadline Absolute time at which to resume.
+    /// @param work The coroutine to resume, and the chain root to free if it is not.
+    virtual void Schedule(TimePoint deadline, ParkedWork work) = 0;
+
     /// Take a handle back off this reactor while it is still waiting to be resumed.
     ///
     /// The counterpart `Submit` and `Schedule` were missing, and its absence had a

@@ -43,6 +43,13 @@ class BareReactor: public IReactor
     void Submit(std::coroutine_handle<> /*handle*/) override {}
     void Schedule(TimePoint /*deadline*/, std::coroutine_handle<> /*handle*/) override {}
 
+    // The owning forms are pure on `IExecutor`/`IReactor`, so a fifth backend cannot
+    // reach `Run()` without having been shown the question #1025 is about: what happens
+    // to work it never resumes. This one parks nothing, so both are empty here -- and
+    // that is a decision with a reason beside it rather than an omission.
+    void Submit(ParkedWork /*work*/) override {}
+    void Schedule(TimePoint /*deadline*/, ParkedWork /*work*/) override {}
+
     [[nodiscard]] bool CancelPending(std::coroutine_handle<> /*handle*/) noexcept override
     {
         return false;
