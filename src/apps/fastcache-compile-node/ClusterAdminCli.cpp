@@ -117,39 +117,27 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
     return std::unexpected { std::string { "unknown cluster request" } };
 }
 
-std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, ClusterRequest const& request)
+std::expected<std::string, std::string> PutClusterRequest(ISocket& client,
+                                                          Cc::CredentialNotice& notice,
+                                                          ClusterRequest const& request,
+                                                          ICredentialSource const& credential,
+                                                          std::string_view scheduler)
 {
-    if (cfg.scheduler.empty())
-        return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
-
-    // A one-shot CLI on the process main thread: no reactor exists here, so this
-    // legitimately blocks. `DialEndpointBlocking` takes a `BlockingConnector` by
-    // type rather than an `IConnector`, which is what keeps that fact checkable
-    // rather than a comment.
-    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialOptions { .connectTimeout = DialTimeout });
-    if (client == nullptr)
-        return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
-
     // Through the launcher's own exchange rather than a second copy of it. That
     // function exists precisely so the distributed verbs do not grow one: the
     // credential pipelining and the "a daemon that does not know AUTH still served
     // the command" fall-through are each subtle enough that two implementations
     // would differ, and the one that differed would be the untested one.
-    // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
-    // process" and "once per invocation" are the same thing, and the admin surface
-    // has no long-lived object to hang it on. What matters is that the verb reports
-    // at all -- before #363 the cluster verbs discarded this silently, so an operator
-    // running `--cluster-status` with a token against an older scheduler was told
-    // nothing.
-    auto notice =
-        Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
-
-    auto const outcome = SyncRun(Cc::ExchangeFramed(
-        client.get(), &notice, EncodeClusterRequest(request), Cc::Credential { .username = {}, .secret = cfg.token }));
+    //
+    // `Current()` is asked HERE, at the exchange, rather than folded into a value the
+    // caller assembled. There is nothing between the two today -- this verb dials and
+    // exchanges in one breath -- and that is precisely why it is worth spelling: a
+    // site that reads the secret where it SENDS it cannot acquire a gap later without
+    // somebody deliberately putting one there.
+    auto const outcome = SyncRun(Cc::ExchangeFramed(&client, &notice, EncodeClusterRequest(request), credential.Current()));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
-        return std::unexpected { std::format("the scheduler at {} did not answer", cfg.scheduler) };
+        return std::unexpected { std::format("the scheduler at {} did not answer", scheduler) };
 
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
     {
@@ -171,6 +159,34 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg, C
     }
 
     return InterpretClusterReply(request.action, outcome.value);
+}
+
+std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
+                                                        ClusterRequest const& request,
+                                                        ICredentialSource const& credential)
+{
+    if (cfg.scheduler.empty())
+        return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
+
+    // A one-shot CLI on the process main thread: no reactor exists here, so this
+    // legitimately blocks. `DialEndpointBlocking` takes a `BlockingConnector` by
+    // type rather than an `IConnector`, which is what keeps that fact checkable
+    // rather than a comment.
+    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
+    auto client = Cc::DialEndpointBlocking(connector, cfg.scheduler, DialOptions { .connectTimeout = DialTimeout });
+    if (client == nullptr)
+        return std::unexpected { std::format("cannot reach the scheduler at {}", cfg.scheduler) };
+
+    // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
+    // process" and "once per invocation" are the same thing, and the admin surface
+    // has no long-lived object to hang it on. What matters is that the verb reports
+    // at all -- before #363 the cluster verbs discarded this silently, so an operator
+    // running `--cluster-status` with a token against an older scheduler was told
+    // nothing.
+    auto notice =
+        Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
+
+    return PutClusterRequest(*client, notice, request, credential, cfg.scheduler);
 }
 
 } // namespace FastCache::Node

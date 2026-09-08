@@ -7,6 +7,7 @@
 #include <FastCache/Distributed/MembershipOracle.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -88,7 +89,16 @@ namespace FastCache::Node
                                [&](Cluster::ClusterMember const& member) { return remote(member.raftEndpoint); });
 }
 
-class NodeMembership
+/// This node's admission policy, as the seam every surface holds.
+///
+/// **It IS the oracle rather than handing one out, and that is what makes
+/// `--fleet-open` live** ([#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
+/// `Oracle()` used to return one of two owned objects chosen by a `bool` read once,
+/// and the surfaces bind that reference for their lifetime -- so flipping the flag on
+/// a running node would have changed a member nobody reads again. Answering `Classify`
+/// here means the choice is made per request, at the surface, with no call site
+/// changed and nothing to remember.
+class NodeMembership final: public Distributed::IMembershipOracle
 {
   public:
     /// @param cfg The parsed configuration.
@@ -107,7 +117,48 @@ class NodeMembership
     NodeMembership& operator=(NodeMembership const&) = delete;
     NodeMembership(NodeMembership&&) = delete;
     NodeMembership& operator=(NodeMembership&&) = delete;
-    ~NodeMembership() = default;
+    ~NodeMembership() override = default;
+
+    /// Adopt what an accepted reload says about who this node admits.
+    ///
+    /// **The removal direction is what this exists for.** A member ADDED to the file
+    /// and not yet admitted fails closed -- a machine is refused until somebody
+    /// restarts the node, which is annoying, self-healing and visible. A member
+    /// REMOVED from the file and still admitted fails OPEN: a machine the operator has
+    /// just revoked keeps being served, and nothing reports it, because admission
+    /// succeeding is the ordinary case. Only one of those is worth a live path, and it
+    /// is the one a test naturally skips.
+    ///
+    /// **`--fleet-open` is settled BEFORE the list, and the order is not arbitrary.**
+    /// Each half is individually atomic, so no request ever sees a half-written set;
+    /// what the order decides is which stale half a request between them may read.
+    /// Settling the flag first means a NARROWING reload briefly answers from the new
+    /// flag and the old list -- closed, since the list under `--fleet-open` was
+    /// whatever nobody was consulting -- while the other order would leave the node
+    /// OPEN for that instant, which is the one direction this whole path exists to
+    /// avoid.
+    ///
+    /// It writes `--fleet-member`'s list and only that, exactly as `Publish` writes the
+    /// cluster's and only that. Two publishers, one per question, is what keeps a
+    /// reload from discarding what consensus agreed -- which is #251 arriving through
+    /// the other door.
+    ///
+    /// Safe to call while surfaces classify callers on their own threads.
+    /// @param cfg The configuration just adopted.
+    void Adopt(NodeConfig const& cfg)
+    {
+        _isOpen.store(cfg.fleetOpen, std::memory_order_relaxed);
+        _listed.Publish(cfg.fleetMembers);
+    }
+
+    /// @copydoc Distributed::IMembershipOracle::Classify
+    ///
+    /// One atomic read of the flag per request, so a caller is judged by one policy or
+    /// the other and never by half of each.
+    [[nodiscard]] Distributed::Membership Classify(std::string_view peerAddress) const override
+    {
+        return _isOpen.load(std::memory_order_relaxed) ? _open.Classify(peerAddress) : _admitted.Classify(peerAddress);
+    }
 
     /// Record what the cluster agreed, alongside what the operator listed.
     ///
@@ -143,18 +194,23 @@ class NodeMembership
     /// not until #235: the startup table refused `--fleet-member` on any node
     /// without a scheduler, so a pure worker's oracle was an empty list by
     /// construction and its compile port refused every dispatched job.
+    ///
+    /// Answers `*this` since #405. It stays a named accessor rather than surfaces
+    /// binding the object directly, because the name is what says *this is the seam*
+    /// at the call site -- and because a surface that took a `NodeMembership&` could
+    /// reach `Adopt`, which belongs to the reload and to nothing else.
     /// @return The oracle; valid for this object's lifetime.
     [[nodiscard]] Distributed::IMembershipOracle const& Oracle() const noexcept
     {
-        return _isOpen ? static_cast<Distributed::IMembershipOracle const&>(_open)
-                       : static_cast<Distributed::IMembershipOracle const&>(_admitted);
+        return *this;
     }
 
   private:
     Distributed::OpenMembership _open;
 
-    /// What `--fleet-member` named. Fixed for this process's life, and the only
-    /// route by which a machine that is not a cluster peer is admitted at all.
+    /// What `--fleet-member` named. Replaced wholesale by `Adopt` on an accepted
+    /// reload, and the only route by which a machine that is not a cluster peer is
+    /// admitted at all.
     Distributed::ClusterMembership _listed;
 
     /// What the cluster agreed, replaced on every committed membership change.
@@ -164,13 +220,14 @@ class NodeMembership
     /// which it borrows.
     Distributed::AnyOfMembership _admitted;
 
-    /// Whether `--fleet-open` was given.
+    /// Whether `--fleet-open` is in force.
     ///
-    /// A `bool` member rather than a stored reference, deliberately: a reference
-    /// member would delete this type's assignment operators for a choice that is
-    /// fixed at construction anyway, and the branch is one predictable test on a
-    /// path that already crosses a network.
-    bool _isOpen;
+    /// Atomic since #405, because it is no longer fixed at construction: a reload may
+    /// turn it on or off, and the surfaces read it on their own threads. Relaxed
+    /// ordering is enough -- it guards nothing but itself, and the list beside it
+    /// carries its own lock -- and the branch is one predictable test on a path that
+    /// already crosses a network.
+    std::atomic<bool> _isOpen;
 };
 
 } // namespace FastCache::Node

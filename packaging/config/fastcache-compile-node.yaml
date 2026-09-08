@@ -10,7 +10,7 @@
 #   systemctl restart fastcache-compile-node   apply any change
 #   systemctl reload fastcache-compile-node    apply a reloadable one, in place
 #
-# FOUR settings are reloadable and the rest are read once at startup. A reload
+# SEVEN settings are reloadable and the rest are read once at startup. A reload
 # re-reads this file the way the start read it, so a change to anything else is
 # refused BY NAME rather than half-applied -- you are told which key needs the
 # restart instead of running a worker that disagrees with its own file.
@@ -19,6 +19,11 @@
 #                                       every include tree and can take minutes
 #   log_level                           immediate
 #   allow_compile_arg                   immediate
+#   requirepass                         immediate, on the NEXT exchange with each
+#                                       peer -- nothing in flight is retried
+#   fleet_member, fleet_open            immediate, from the next connection; a
+#                                       host you REMOVE is refused straight away,
+#                                       which is what this one is for
 #
 # Every key is one flag, spelled with underscores instead of dashes, and there
 # is no setting that a file can express and a command line cannot. A flag on the
@@ -236,6 +241,16 @@
 # whatever is listed here and whatever listen_node is bound to. Only the
 # host is matched: a peer dials from an ephemeral port, so an endpoint is
 # not something a connection can be compared to.
+#
+# Reloadable, and the REMOVAL direction is why. Adding a host fails closed:
+# it is refused until the reload lands. Removing one fails OPEN -- a machine
+# you just revoked keeps being served and nothing reports it -- so dropping a
+# host here and reloading refuses it from its next connection, on all three
+# surfaces, and the worker logs the hosts no longer admitted at WARN.
+#
+# It is a change on EVERY node that lists the host: this list is per-node
+# configuration, and --cluster-forget speaks for the cluster's member set and
+# not for anybody's fleet_member.
 #fleet_member:
 #  - <host>[:<port>]
 #  - <host>[:<port>]
@@ -244,6 +259,17 @@
 # machine, or a network that is already the boundary. Explicit because 'no
 # policy' and 'admit everybody' must be the same decision -- listing nobody
 # refuses everybody.
+#
+# Reloadable beside fleet_member, with the same asymmetry: turning it on
+# widens, turning it off narrows, and narrowing is the half nothing would
+# otherwise report. Removing this key -- or setting it to false, which is the
+# same thing, since the key spells a flag -- and reloading closes the node to
+# everybody fleet_member does not name.
+#
+# NEITHER can be WIDENED by a reload on a node with no cluster_key_file: such
+# a worker verifies no lease signatures, which is safe only while no machine
+# but its own is admitted, so the reload is refused by name and nothing is
+# applied. Narrowing is always allowed.
 #fleet_open: false
 
 # size of this node's own in-memory cache tier; k/m/g = KiB/MiB/GiB or N% of
@@ -282,9 +308,19 @@
 # credential presented to the scheduler. THIS is where it belongs: a
 # supervisor records launch arguments where every local account can read
 # them, so --install-service refuses the flag outright and registers
-# --config=<path> instead. The mode of this file is not checked by the
-# worker (#384), so a file carrying a token should be readable only by the
-# account the service runs as -- 0640 root:fastcache-node.
+# --config=<path> instead. A file carrying a token should be readable only
+# by the account the service runs as -- 0640 root:fastcache-node -- and the
+# worker WARNS at startup and at every accepted reload when it is not.
+#
+# Reloadable, which is what a fleet-wide rotation needs: edit this key and
+# reload, and the next exchange with the shared cache and with the scheduler
+# presents the new secret. Rotate the peers first or at the same time -- a
+# worker presenting the new secret to a peer that has not moved is refused,
+# visibly, which is the direction to fail in.
+#
+# It cannot be rotated this way on a worker whose COMMAND LINE names
+# --requirepass: the command line wins over this file at a reload exactly as
+# it does at a start, so the file's value would never be in force.
 #requirepass:
 
 # trace, debug, info, warn, error, fatal (default info)

@@ -16,11 +16,14 @@
 #include "CompileResponder.hpp"
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
+#include "NodeCredential.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
+#include "NodeReload.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerLink.hpp"
@@ -91,7 +94,6 @@
 
 namespace
 {
-namespace Wire = FastCache::CompileCacheWire;
 using namespace FastCache;
 using namespace FastCache::Node;
 
@@ -256,198 +258,6 @@ constexpr int ExitUsage = 2;
 
 /// What `main` returns when the worker served until it was asked to stop.
 constexpr int ExitOk = 0;
-/// Everything one heartbeat round reads, so the round itself is a function rather
-/// than a hundred lines nested three deep inside `WorkerBody`.
-///
-/// References throughout: every one of these outlives the heartbeat thread, which is
-/// joined by its `jthread` before any of them goes.
-struct HeartbeatRound
-{
-    NodeConfig const& cfg;                        ///< Where the scheduler is.
-    std::vector<Cc::WorkerRegistrar>& registrars; ///< One per toolchain this node serves.
-    Node::CompileCapacity const& capacity;        ///< For the in-flight count.
-    IHostLoadSampler& loadSampler;                ///< CPU, memory and scratch.
-    Node::CacheTier const* cacheTier;             ///< Null on a node with no cache.
-    IMetricsSink const& metrics;                  ///< Where the cache figures are read.
-    Node::FleetSampler& sampler;                  ///< This machine's own series.
-    Cc::Credential const& credential;             ///< What the scheduler requires.
-    /// Where the fleet this node was admitted to is recorded, so the lease check can
-    /// read it. Registration is the only place that fact arrives (#401).
-    Distributed::WorkerLeaseState& lease;
-    /// Raised when a scheduler registers this node into a fleet other than the one
-    /// `--cluster-id` asserts. Never lowered: the answer will not change by itself.
-    std::atomic<bool>& fleetMismatch;
-    ILogger& logger; ///< Where a refusal is named.
-};
-
-/// What one announcement learned, beyond how many entries landed.
-struct AnnounceOutcome
-{
-    /// Registrars this scheduler accepted.
-    std::size_t accepted = 0;
-    /// Where it said the leader is, when it refused `NotLeader` naming somewhere
-    /// usable. The caller redials rather than waiting a whole heartbeat interval:
-    /// `SchedulerService::Gate()` refuses **every** verb off the leader, `Register`
-    /// included, so a node that merely logged this would keep announcing itself to
-    /// a demoted scheduler and expire out of the real one's registry.
-    std::optional<std::string> leader;
-};
-
-/// Announce this machine to every scheduler entry it serves, once.
-///
-/// Registration and heartbeating are one concern: a worker is registered exactly as
-/// long as it keeps saying so, and a scheduler that has forgotten it answers the
-/// heartbeat by telling it to register again. Splitting them would need the two
-/// halves to agree about which owns recovery.
-/// @param round What to announce and where to read it from.
-/// @param client A connected scheduler.
-/// @param endpoint Where `client` is connected, for the diagnostics -- which must
-///        name the endpoint actually reached, not the configured one, once a
-///        redirect can have moved it.
-/// @return What landed, and where to go next if anywhere.
-AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint)
-{
-    // Counted rather than short-circuited: one toolchain the scheduler refuses must
-    // not stop the others from being announced, or a single bad entry silently
-    // un-registers the whole worker.
-    std::size_t accepted = 0;
-
-    // And counted APART, because a heartbeat and a registration are different events
-    // with different costs, and one number cannot carry both (#999). `accepted` was
-    // the only tally, so a steady round of six heartbeats reported itself as "6 of 6
-    // toolchain(s) registered" every interval forever -- which reads as a node
-    // re-announcing its whole toolchain set on a timer, and prompted exactly that
-    // question from an operator. It was not doing that; measured, six registrations
-    // land in the startup second and every round after is heartbeats.
-    //
-    // The conflation was already known one field down: `handedOver` exists because
-    // "`accepted` also counts a registration, which carries no history at all". That
-    // consequence was fixed and this one was not.
-    std::size_t beats = 0;
-    std::size_t registrations = 0;
-    auto const inFlight = static_cast<std::uint32_t>(round.capacity.InFlight());
-
-    // Sampled once per round rather than once per registrar: every entry describes
-    // the SAME machine, so sampling per toolchain would report several different
-    // views of one host and, worse, would cut the CPU interval into pieces too short
-    // to mean anything.
-    auto const sampled = round.loadSampler.Sample();
-    // The cache is sampled here too, and per ROUND rather than per registrar for the
-    // same reason: a node with two `--toolchain` flags is two registry entries
-    // against one machine and one cache, so both entries carry the same figures.
-    // Summing them across entries counts that cache twice, which is what
-    // `WorkerRegistry::NodeCaches()` exists to prevent on the other end.
-    auto load =
-        Distributed::LoadToWire(Distributed::NodeLoad { .inFlight = inFlight,
-                                                        .cpuBusyPermille = sampled.cpuBusyPermille,
-                                                        .availableMemoryBytes = sampled.availableMemoryBytes,
-                                                        .freeScratchBytes = sampled.freeScratchBytes,
-                                                        .cache = Node::CacheLoadOf(round.cacheTier, round.metrics) });
-
-    // This machine's own closed buckets, so the fleet's record of it survives an
-    // election. Bounded per round: a node absent for a day has 1440 to hand over and
-    // a heartbeat has a payload ceiling, so a catch-up converges across rounds from
-    // the oldest end.
-    //
-    // Attached to the shared load and therefore sent once per registrar, which is
-    // redundant for a machine serving several toolchains and deliberately left so:
-    // the leader's high-water mark already makes a repeat a no-op, and threading a
-    // per-registrar payload through would buy a few kilobytes at the cost of the one
-    // place this is assembled.
-    auto const outbox = round.sampler.NextHistoryBatch(Wire::MaxHistoryBucketsPerHeartbeat);
-    load.history = Distributed::HistoryToWire(outbox);
-    // Set by a HEARTBEAT and by nothing else. `accepted` also counts a registration,
-    // which carries no history at all -- so a round where every heartbeat failed and
-    // one re-register succeeded would step the cursor over a batch never sent.
-    auto handedOver = false;
-
-    // The first leader any entry was pointed at. One per round rather than one per
-    // registrar: every entry here describes the same machine talking to the same
-    // scheduler, so they either all get redirected or none does, and following the
-    // first is what lets the whole round move together.
-    std::optional<std::string> leader;
-
-    for (auto& registrar: round.registrars)
-    {
-        if (!registrar.WorkerId().empty())
-        {
-            auto const beat = registrar.Heartbeat(client, inFlight, load, round.credential);
-            if (beat.has_value())
-            {
-                ++accepted;
-                ++beats;
-                handedOver = true;
-                continue;
-            }
-            if (!leader.has_value())
-                leader = beat.error().leader;
-        }
-
-        // The scheduler's own reason, logged per toolchain. The summary below can
-        // only say how many did not register, and "0 of 1" is exactly as much as an
-        // operator knew about a node that had silently dropped out of the fleet -- a
-        // fingerprint the scheduler will not accept, a cluster this node is not a
-        // member of, a leader that has moved.
-        if (auto const registered = registrar.Register(client, round.credential); registered.has_value())
-        {
-            // `--cluster-id` is an ASSERTION, not a source and not an override. The
-            // identity comes from registration; the flag, when the operator NAMED one,
-            // says which fleet they expected to be admitted to. Disagreement is a
-            // provisioning fault -- this node is serving a fleet somebody did not mean
-            // -- so it is fatal and names both sides rather than silently preferring
-            // either. Preferring the config would put configuration back above
-            // registration and reopen the default-`fastcache` cross-fleet accept;
-            // preferring the registration silently would make the flag a lie.
-            //
-            // Asked on `clusterIdExplicit` rather than on the VALUE, because the
-            // default is a real fleet name and comparing against it cannot see the
-            // operator who typed it. That is the option table's own provenance rule.
-            if (!Node::FleetAssertionHolds(round.cfg.clusterIdExplicit, round.cfg.clusterId, registrar.ClusterId()))
-            {
-                round.logger.Logf(LogLevel::Error,
-                                  "scheduler {} registered this node into fleet '{}', but --cluster-id asserts "
-                                  "'{}'. Refusing to serve a fleet that was not asked for: correct the flag or "
-                                  "the scheduler this node is pointed at",
-                                  endpoint,
-                                  registrar.ClusterId(),
-                                  round.cfg.clusterId);
-                round.fleetMismatch = true;
-                DaemonControls::Instance().RequestStop();
-                return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
-            }
-
-            // The fleet the scheduler named, adopted here rather than configured. Until
-            // this runs the worker is unpinned and refuses every grant, which is the
-            // window #401 closes; from here it refuses every grant naming another fleet.
-            // Re-registration re-pins, because a node that has been accepted somewhere
-            // else now serves whatever that scheduler leads.
-            round.lease.fleet.Pin(registrar.ClusterId());
-            ++accepted;
-            ++registrations;
-        }
-        else
-        {
-            if (!leader.has_value())
-                leader = registered.error().leader;
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} did not register {}: {}",
-                              endpoint,
-                              registrar.Fingerprint(),
-                              registered.error().reason);
-        }
-    }
-    if (handedOver && !outbox.empty())
-        round.sampler.HistoryHandedThrough(outbox.back().startMillis);
-
-    // What this round DID, and how loudly to say it -- see `DescribeAnnounceRound`,
-    // which owns both because the wording is the defect it was written for (#999) and
-    // `main.cpp` is in no test target (#909). The shortfall-behind-a-leader rule it
-    // carries is the one that used to live here: nothing is wrong with a fleet that has
-    // just elected, and the caller follows the redirect inside this same round.
-    auto const report = Node::DescribeAnnounceRound(beats, registrations, round.registrars.size(), leader.has_value());
-    round.logger.Logf(report.level, "scheduler {}: {}", endpoint, report.message);
-    return AnnounceOutcome { .accepted = accepted, .leader = std::move(leader) };
-}
 
 /// Announce this machine once, following `NotLeader` to wherever it points.
 ///
@@ -466,7 +276,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
 /// @param round What to announce and where to read it from.
 /// @param link Where this node believes the leader is; advanced across the round.
 /// @param connector Dials each endpoint the link names.
-void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, BlockingConnector& connector)
+void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link, BlockingConnector& connector)
 {
     for (link.BeginRound();;)
     {
@@ -488,7 +298,7 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
             continue;
         }
 
-        auto const outcome = AnnounceOnce(round, *client, link.Target());
+        auto const outcome = Node::AnnounceOnce(round, *client, link.Target());
         if (!outcome.leader.has_value())
         {
             // Committed only when this endpoint actually took an entry. It answered
@@ -591,76 +401,10 @@ void AnnounceRound(HeartbeatRound const& round, Node::SchedulerLink& link, Block
 /// @param cfg What this worker was told to be.
 /// @param logger Where it reports.
 /// @return Process exit code.
-/// The node's reloader: `NodeConfig`, read through the option table, guarded by its
-/// `reloadable` column.
-using NodeReloader = ConfigReloaderOf<NodeConfig>;
-
-/// Act on one SIGHUP, and say what happened either way.
-///
-/// **Both outcomes are logged, and that is the whole point of the ticket.** A reload
-/// that silently ignored a changed field would leave the operator believing an edit
-/// took effect -- they edited a file, saw no error, and got nothing. So a refusal
-/// names every setting that may not change at runtime, and a success names what is now
-/// in force.
-/// @param reloader The pipeline, or null when this worker has no configuration file.
-/// @param logger Where the outcome is reported.
-///
-/// Returns nothing: the heartbeat thread notices a reload by comparing snapshots, so
-/// there is no signal to hand it. A `ConfigReloaderOf::Subscribe` callback would be the
-/// house idiom for one, and is declined here for a lifetime reason rather than a
-/// stylistic one -- the reloader is declared in `main` and outlives `WorkerBody`, and
-/// `Subscribe` has no unsubscribe, so a subscriber capturing this frame's locals would
-/// outlive them.
-///
-/// **That decline is about THIS frame, and `main` does subscribe.**
-/// `WatchSecretExposure` is attached beside the reloader's own declaration, capturing
-/// only what `main` owns and what outlives the reloader -- which is the arrangement
-/// the paragraph above describes as safe rather than an exception to it
-/// ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)). Read as "the
-/// worker cannot subscribe at all" the rule is one frame too wide, and it would leave
-/// the secret-file check startup-only on the binary that holds five such files.
-void ApplyReloadRequest(NodeReloader* reloader, ILogger& logger)
-{
-    if (reloader == nullptr)
-    {
-        // Not silence: an operator who sent SIGHUP believes this worker has a file to
-        // re-read, and the useful answer is that it has none.
-        logger.Logf(LogLevel::Warn, "reload requested, but this worker was started with no configuration file");
-        return;
-    }
-
-    // Taken BEFORE the swap, because "did the advertised set change" cannot be asked
-    // afterwards: `Reload()` replaces the snapshot, and the previous one is then only
-    // reachable through a reference somebody kept. Each snapshot is immutable, so
-    // holding this one costs nothing and stays valid however the swap goes.
-    auto const before = reloader->Current();
-
-    auto const outcome = reloader->Reload();
-    if (!outcome.has_value())
-    {
-        // One line for both refusals -- a file that would not parse and a file that
-        // changed something immutable -- because the operator's situation is the same:
-        // they saved once, and NOTHING was applied.
-        logger.Logf(LogLevel::Warn, "reload declined, configuration unchanged: {}", outcome.error().ToString());
-        return;
-    }
-
-    auto const current = reloader->Current();
-    logger.SetMinLevel(current->logLevel);
-
-    // Asked here only to say the right thing to the operator, at the moment they
-    // acted: the re-survey is the expensive part (`AdvertisedClaimsDiffer` carries
-    // what it costs and why it is not run unconditionally), and somebody who saved a
-    // file should know it was accepted before it finishes. The heartbeat thread asks
-    // the same question again for itself, from the same function.
-    if (Node::AdvertisedClaimsDiffer(*before, *current))
-        logger.Logf(LogLevel::Info,
-                    "configuration reloaded; log level is now {}. What this worker serves has changed, so it will "
-                    "re-derive its toolchains and re-register on the next heartbeat",
-                    ToStringView(current->logLevel));
-    else
-        logger.Logf(LogLevel::Info, "configuration reloaded; log level is now {}", ToStringView(current->logLevel));
-}
+/// The node's reloader, named once in `NodeReload.hpp` so that the policies reading
+/// the live snapshot -- `Node::ReloadedCredential` among them -- do not each respell
+/// `ConfigReloaderOf<NodeConfig>`.
+using Node::NodeReloader;
 
 /// Adopt the compile-argument allowlist an accepted reload asks for, and say so when
 /// it moved.
@@ -1044,7 +788,20 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     auto const hostAddresses = MakeSystemHostAddresses();
     CachedLocalityOracle const cacheLocality { *hostAddresses, cacheClock };
 
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, cacheLocality, cacheClock, metrics, logger);
+    // ONE source, and every site that presents this worker's credential borrows it.
+    // Declared here because the first of those sites is the cache tier immediately
+    // below and the last is the heartbeat round far further down, and a local declared
+    // between them would be an object two consumers reach and one of them outlives.
+    //
+    // It reads the RELOADER rather than `cfg`, which is the whole of #404: `cfg` is
+    // the configuration this worker STARTED with, and a rotated `--requirepass` lives
+    // in the snapshot the reloader publishes. A worker with no configuration file
+    // passes null and gets `cfg`'s value forever, which is correct rather than a
+    // fallback -- it has no second moment for anything to arrive at.
+    Node::ConfiguredCredential const credential { cfg, reloader };
+
+    auto cacheTierOrRefusal =
+        Node::StartCacheTierOrExplain(nodeIo, cfg, credential, cacheLocality, cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         // No flag prefix here, unlike its neighbours: this tier can fail over two
@@ -1272,8 +1029,6 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // A node with neither surface enabled adopts nothing and starts no thread.
     nodeIo.Start();
 
-    Cc::Credential const credential { .username = {}, .secret = cfg.token };
-
     // One registrar per toolchain, because REGISTER carries ONE fingerprint and
     // `--toolchain` is repeatable. Registering only the first -- which is what
     // this did -- meant a worker configured with g++ and clang++ served exactly
@@ -1374,17 +1129,17 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     /// flag or the scheduler this node is pointed at (#401).
     std::atomic<bool> fleetAssertionFailed { false };
 
-    HeartbeatRound const round { .cfg = cfg,
-                                 .registrars = registrars,
-                                 .capacity = compileCapacity,
-                                 .loadSampler = *loadSampler,
-                                 .cacheTier = cacheTier.get(),
-                                 .metrics = metrics,
-                                 .sampler = sampler,
-                                 .credential = credential,
-                                 .lease = leaseState,
-                                 .fleetMismatch = fleetAssertionFailed,
-                                 .logger = logger };
+    Node::HeartbeatRound const round { .cfg = cfg,
+                                       .registrars = registrars,
+                                       .capacity = compileCapacity,
+                                       .loadSampler = *loadSampler,
+                                       .cacheTier = cacheTier.get(),
+                                       .metrics = metrics,
+                                       .sampler = sampler,
+                                       .credential = credential,
+                                       .lease = leaseState,
+                                       .fleetMismatch = fleetAssertionFailed,
+                                       .logger = logger };
 
     // Counts heartbeats, so the slow sweep below has a cadence of its own. A local of
     // the thread's lambda rather than a member of anything: only this thread reads or
@@ -1667,7 +1422,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
         // this call publishes a new configuration and says so, and the next beat picks
         // it up on its own.
         if (DaemonControls::Instance().TakeReloadRequest())
-            ApplyReloadRequest(reloader, logger);
+            Node::ApplyReloadRequest(reloader, membership, logger);
         std::this_thread::sleep_for(StopPollInterval);
     }
     logger.Logf(LogLevel::Info, "stop requested; no longer accepting compiles");
@@ -1993,7 +1748,12 @@ int main(int argc, char** argv)
     // checks, because a cluster command needs the first and not the second.
     if (cfg.cluster.action != ClusterAction::None)
     {
-        auto const answer = RunClusterAdmin(cfg, cfg.cluster);
+        // No reloader exists at this point and none ever will on this path: a
+        // cluster verb answers and the process returns. The seam is threaded through
+        // anyway, so the day one of these is asked from a running worker it reads the
+        // live secret rather than the one this process was started with.
+        Node::ConfiguredCredential const credential { cfg, nullptr };
+        auto const answer = RunClusterAdmin(cfg, cfg.cluster, credential);
         if (!answer.has_value())
         {
             std::cerr << "fastcache-compile-node: " << answer.error() << '\n';
@@ -2112,11 +1872,15 @@ int main(int argc, char** argv)
     // `cliOnly` there, so either argv named the token (`namedOnCommandLine`) or no
     // secret is in force (`secretInForce`).
     //
-    // What it is NOT is a fix for a reload hole. `--requirepass` is `Reloadable::No`
-    // and carries a `same` comparator, so a SIGHUP that introduces a token is REFUSED
-    // by `ValidateNodeReloadable` and publishes nothing -- a node file cannot GAIN a
-    // secret across a reload the way the daemon's can, which is the half of #753 that
-    // does not exist here. The half that does is the FILESYSTEM re-ask below.
+    // What it is NOT is a fix for a reload hole, and the reason CHANGED with #404
+    // while the conclusion did not. `--requirepass` used to be `Reloadable::No`, so a
+    // SIGHUP that introduced a token was refused and a node file could not GAIN a
+    // secret across a reload the way the daemon's could; it is `Reloadable::Yes` now,
+    // so it can. That makes the FILESYSTEM re-ask below load-bearing rather than
+    // merely tidy -- and the re-ask already covers it, because `secretFiles` is a
+    // function of the LIVE snapshot rather than of the configuration this process
+    // started with. What this expression could never decide is still what it could
+    // never decide: `argvNamedSecret` is about ARGV, which no reload rewrites.
     //
     // **A warning and not a refusal**, for #384's reason: refusing a MISSING
     // credential fails closed and breaks nothing that worked, while refusing an

@@ -202,6 +202,7 @@ CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
 std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
                                                                         NodeConfig const& cfg,
                                                                         std::unique_ptr<IStorage> storage,
+                                                                        ICredentialSource const& credential,
                                                                         ILocalityOracle const& locality,
                                                                         IClock& clock,
                                                                         IMetricsSink& metrics,
@@ -224,7 +225,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
         // socket, which bounds the whole exchange rather than one call.
         upstream = std::make_unique<RemoteUpstream>(
             cfg.upstream,
-            Cc::Credential { .username = {}, .secret = cfg.token },
+            credential,
             // The node is a CLIENT of the shared cache, and had the same
             // silence the launcher did: a token set here against a daemon
             // that does not know AUTH was ignored, and nothing said so.
@@ -335,6 +336,7 @@ Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const
 
 std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
                                                                                NodeConfig const& cfg,
+                                                                               ICredentialSource const& credential,
                                                                                ILocalityOracle const& locality,
                                                                                IClock& clock,
                                                                                IMetricsSink& metrics,
@@ -392,7 +394,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // The bind, and the judgement about a failed one, moved to
     // `StartNodeSurfaceOrExplain` with the surfaces (#290): a listener that carries
     // two components cannot have its failure judged by one of them.
-    return CacheTier::Start(io, cfg, std::move(*storage), locality, clock, metrics, logger);
+    return CacheTier::Start(io, cfg, std::move(*storage), credential, locality, clock, metrics, logger);
 }
 
 std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)

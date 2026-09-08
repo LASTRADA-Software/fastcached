@@ -827,7 +827,24 @@ inline constexpr std::array<std::string_view, 2> AdvertisedReloadableFlags { "--
 /// will accept. The scheduler has no field for this and dispatches no differently
 /// because of it, so re-registering on a change would spend a 300 s include-tree
 /// walk telling the fleet nothing it can act on.
-inline constexpr std::array<std::string_view, 2> LocalReloadableFlags { "--log-level", "--allow-compile-arg" };
+///
+/// `--requirepass` is the row most likely to be read as advertised for the OTHER
+/// reason: it is a credential, and a credential travels. What travels is the secret
+/// itself, on the next exchange, through `Node::ICredentialSource` -- and a
+/// registration's CONTENT is unchanged by it. A rotation therefore needs no
+/// re-survey, which matters more here than anywhere else on this list: rotating a
+/// fleet's shared secret is a fleet-wide event, and making every worker walk its
+/// include trees at the same moment is the one way to turn a routine rotation into
+/// an incident.
+///
+/// `--fleet-member` and `--fleet-open` are local for the reason `--allow-compile-arg`
+/// is, and the parallel is exact: both decide what this worker will do for a caller,
+/// and a registration describes the TOOLCHAINS it serves rather than whom it serves
+/// them to. The scheduler has no field for either, so re-registering on a change would
+/// tell the fleet nothing it could act on -- at the price of an include-tree walk.
+inline constexpr std::array<std::string_view, 5> LocalReloadableFlags {
+    "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-member", "--fleet-open"
+};
 
 /// Whether a reload changed something this worker had TOLD the fleet.
 ///
@@ -890,6 +907,29 @@ enum class AllowlistMoment : std::uint8_t
 /// @param previous What was in force before; empty at startup.
 /// @param current What is in force now.
 /// @return The message to log at WARN, or nullopt when there is nothing to say.
+/// The line to log about a reload that changed who this node admits, or nothing.
+///
+/// **The narrowing half is what this is for, and it is the half a silent
+/// implementation drops** ([#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
+/// An operator who ADDS a member finds out it worked the moment that machine's build
+/// is distributed. An operator who REVOKES one has no such signal: admission
+/// succeeding is the ordinary case, so a revocation that did not take looks exactly
+/// like one that did, forever. So the hosts that are no longer admitted are named
+/// individually, and the ones added are only counted -- what a reader needs to check
+/// is the list they meant to shorten.
+///
+/// A pure function, here rather than an expression in `main.cpp`, for
+/// `AllowlistAnnouncement`'s reason: that file is in no test target (#909), so a rule
+/// written there can only be checked by reading it. And this is a SECURITY
+/// announcement, the kind that is wrong silently.
+///
+/// A reload that touched neither flag says nothing, because a reload is a routine
+/// event and a `--log-level` change must not narrate a policy nobody edited.
+/// @param previous The admission policy that was in force.
+/// @param current The one just adopted.
+/// @return The message to log at WARN, or nullopt when nothing about admission moved.
+[[nodiscard]] std::optional<std::string> AdmissionAnnouncement(NodeConfig const& previous, NodeConfig const& current);
+
 [[nodiscard]] std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
                                                                std::span<std::string const> previous,
                                                                std::span<std::string const> current);

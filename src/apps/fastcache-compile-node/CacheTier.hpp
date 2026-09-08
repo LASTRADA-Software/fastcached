@@ -5,6 +5,7 @@
 #include "FrameEndpoint.hpp"
 #include "LocalCache.hpp"
 #include "NodeConfig.hpp"
+#include "NodeCredential.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Cache/IStorage.hpp>
@@ -59,6 +60,10 @@ class CacheTier
     /// @param io The node's loop; the tier's upstream dials through its connector.
     /// @param cfg The parsed configuration.
     /// @param storage Where this tier keeps objects; already opened.
+    /// @param credential What this node presents to the shared cache upstream, asked
+    ///        per operation rather than copied -- see `RemoteUpstream`'s own note for
+    ///        why this one is threaded through where the notice sink beside it is
+    ///        not. Must outlive the tier.
     /// @param locality Decides whether a caller is on this machine -- the whole of
     ///        who may read this tier, since #287; must outlive it.
     /// @param clock Time source for the tier's expiry; must outlive the tier.
@@ -74,6 +79,7 @@ class CacheTier
     [[nodiscard]] static std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeIoLoop& io,
                                                                                       NodeConfig const& cfg,
                                                                                       std::unique_ptr<IStorage> storage,
+                                                                                      ICredentialSource const& credential,
                                                                                       ILocalityOracle const& locality,
                                                                                       IClock& clock,
                                                                                       IMetricsSink& metrics,
@@ -209,17 +215,21 @@ class CacheTier
 /// that said so.
 /// @param io The node's loop; the tier's upstream dials through its connector.
 /// @param cfg The parsed configuration.
+/// @param credential What this node presents to the shared cache upstream; must
+///        outlive the tier.
 /// @param locality Decides whether a caller is on this machine; must outlive it.
 /// @param clock Time source for the tier's expiry; must outlive it.
 /// @param metrics Where hits, misses and upstream outcomes are counted.
 /// @param logger Where what the tier holds, or why there is none, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
-                                                                                             NodeConfig const& cfg,
-                                                                                             ILocalityOracle const& locality,
-                                                                                             IClock& clock,
-                                                                                             IMetricsSink& metrics,
-                                                                                             ILogger& logger);
+[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(
+    NodeIoLoop& io,
+    NodeConfig const& cfg,
+    ICredentialSource const& credential,
+    ILocalityOracle const& locality,
+    IClock& clock,
+    IMetricsSink& metrics,
+    ILogger& logger);
 
 /// Convert the on-disk half of the tier to this build's record layout, and say
 /// what happened.

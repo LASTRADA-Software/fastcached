@@ -989,6 +989,24 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "a peer dials from an ephemeral port, so an endpoint\n"
                            "is not something a connection can be compared to.",
             .yamlKey = "fleet_member",
+            // Reloadable since #405, and the REMOVAL direction is why. Addition fails
+            // closed: a machine listed and not yet admitted is refused until somebody
+            // restarts the node -- annoying, self-healing, visible. Removal fails OPEN,
+            // and nothing reports it, because admission succeeding is the ordinary
+            // case; a host an operator has just revoked went on being served until the
+            // next restart, and `--cluster-forget` cannot reach this list because the
+            // two are separate routes (#265).
+            //
+            // LOCAL rather than advertised: this decides who this node SERVES, and a
+            // registration says which toolchains it serves rather than to whom. Making
+            // it advertised would spend an include-tree walk on a change the scheduler
+            // has no field for.
+            //
+            // `NodeMembership::Adopt` is what makes the row true, and
+            // `ValidateNodeReloadable` is what keeps it safe: a candidate that WIDENS
+            // admission on a node with no `--cluster-key-file` is refused, because such
+            // a node built an unchecked lease validator at startup.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::fleetMembers>(),
             .clear = ClearList<&NodeConfig::fleetMembers>(),
         },
@@ -1002,6 +1020,13 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "'no policy' and 'admit everybody' must be the same\n"
                            "decision -- listing nobody refuses everybody.",
             .yamlKey = "fleet_open",
+            // Reloadable beside `--fleet-member`, and it has the same two directions
+            // with the same asymmetry: turning it ON widens, turning it OFF narrows,
+            // and narrowing is the half nothing would report. `fleet_open: false` in a
+            // file is how it is turned off, and it works because a reload builds the
+            // candidate FRESH -- the key spells the flag, so a key set to `false`
+            // passes nothing and the fresh configuration is simply not opened.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::fleetOpen>(),
         },
         {
@@ -1082,6 +1107,27 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::token, ParseText>(),
             .description = "credential presented to the scheduler",
             .yamlKey = "requirepass",
+            // Reloadable since #404, and the whole of what made it possible is that
+            // this secret is presented and never required. An INBOUND credential
+            // cannot be rotated by one machine at a time -- every client would have
+            // to move with it -- while an outbound one is exactly what a fleet-wide
+            // rotation needs: each worker adopts the new secret when its operator
+            // says so, and a worker still holding the old one fails visibly at the
+            // one peer that has already moved.
+            //
+            // It is `LocalReloadableFlags` rather than advertised. A registration
+            // says which toolchains this node serves; the credential it presents
+            // while saying so is not part of the claim, so re-deriving the toolchain
+            // set on a rotation would spend an include-tree walk telling the fleet
+            // nothing.
+            //
+            // The row alone does NOT make a rotation reach anybody. Three sites took
+            // a copy of this field at construction, and the reload publishing a
+            // snapshot none of them read is the "green while doing nothing" failure
+            // in its most expensive form. `Node::ICredentialSource` is what they read
+            // through now, and `node-credential-seam` is what stops a fourth site
+            // taking a copy instead.
+            .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::token>(),
         },
         {
@@ -1092,7 +1138,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .explicitBit = &NodeConfig::logLevelExplicit,
             .description = "trace, debug, info, warn, error, fatal (default info)",
             .yamlKey = "log_level",
-            // The ONE reloadable row today, and it earns it: `ILogger::SetMinLevel`
+            // The FIRST reloadable row, and it earns it: `ILogger::SetMinLevel`
             // exists, so raising the level to diagnose something takes effect on a
             // running worker without restarting it mid-build. `logTimestamps` next
             // door is deliberately NOT marked -- `ConsoleLogger` takes its timestamp
@@ -1375,6 +1421,46 @@ bool AdvertisedClaimsDiffer(NodeConfig const& previous, NodeConfig const& candid
     });
 }
 
+std::optional<std::string> AdmissionAnnouncement(NodeConfig const& previous, NodeConfig const& current)
+{
+    if (previous.fleetOpen == current.fleetOpen && previous.fleetMembers == current.fleetMembers)
+        return std::nullopt;
+
+    // Compared as SETS rather than as sequences, because reordering a YAML list is not
+    // a revocation and naming a host as dropped when it merely moved is a false alarm
+    // in the one line an operator reads to confirm one.
+    //
+    // `--fleet-open` turning ON drops nobody -- the list stops being consulted, and
+    // every host on it is still admitted -- so the removed set is asked of the policy
+    // that was actually in force rather than of the two lists side by side. Turning it
+    // OFF is the opposite and the loudest case there is: everybody who was not on the
+    // list has just been revoked, and no list can enumerate that.
+    std::vector<std::string> dropped;
+    if (!previous.fleetOpen && !current.fleetOpen)
+        for (auto const& host: previous.fleetMembers)
+            if (std::ranges::find(current.fleetMembers, host) == current.fleetMembers.end())
+                dropped.push_back(host);
+
+    auto const dropTail = [&dropped] {
+        if (dropped.empty())
+            return std::string {};
+        std::string names;
+        for (auto const& host: dropped)
+            names += (names.empty() ? "" : ", ") + host;
+        return std::format("; no longer admitted: {}", names);
+    }();
+
+    auto const openTail = previous.fleetOpen && !current.fleetOpen
+                              ? std::string { "; --fleet-open is off, so every caller not named above is now refused" }
+                              : std::string {};
+
+    return std::format("admission policy reloaded: {} (was {}){}{}",
+                       AdmissionSummary(current),
+                       AdmissionSummary(previous),
+                       dropTail,
+                       openTail);
+}
+
 std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
                                                  std::span<std::string const> previous,
                                                  std::span<std::string const> current)
@@ -1431,27 +1517,99 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
                                              .field = {},
                                              .context = std::format("not applied: {}", *rejection) });
 
+    // The immutability rule, asked SECOND because it is about the pair.
     auto const changed = UnreloadableChanges(previous, candidate);
-    if (changed.empty())
-        return {};
-
-    std::string names;
-    for (auto const& flag: changed)
+    if (!changed.empty())
     {
-        if (!names.empty())
-            names += ", ";
-        names += flag;
+        std::string names;
+        for (auto const& flag: changed)
+        {
+            if (!names.empty())
+                names += ", ";
+            names += flag;
+        }
+
+        return std::unexpected(ConfigError {
+            .code = ConfigErrorCode::ImmutableChanged,
+            .source = {},
+            .line = 0,
+            // The FIRST name, because the field is one string and something has to go
+            // in it; the whole list is in the context, which is what an operator reads.
+            .field = std::string { changed.front() },
+            .context = std::format("not reloadable, so nothing was applied: {}", names),
+        });
     }
 
-    return std::unexpected(ConfigError {
-        .code = ConfigErrorCode::ImmutableChanged,
-        .source = {},
-        .line = 0,
-        // The FIRST name, because the field is one string and something has to go in
-        // it; the whole list is in the context, which is what an operator reads.
-        .field = std::string { changed.front() },
-        .context = std::format("not reloadable, so nothing was applied: {}", names),
+    // **Rules about the PAIR that the startup table cannot express**, because they are
+    // about a TRANSITION rather than about a configuration. A table rather than an
+    // `if`, so the second one is a row: this is the same shape `StartupPolicyRejection`
+    // and `NodeServiceRejection` have, and the reason is theirs.
+    //
+    // **LAST, and the order decides what an operator is told.** A reload names EVERY
+    // setting that may not change at runtime, because a refusal that reports one and
+    // stops sends the operator round the same loop per field. Asked BEFORE the
+    // immutability check, a save that both widened admission and touched an unreloadable
+    // row was answered by the rule below and that whole answer was lost: the operator
+    // fixed the widening, saved again, and only then learned about the other setting.
+    // Measured, and it is what `A widening refusal names every setting that may not
+    // change` pins.
+    //
+    // A second reason exists and is deliberately stated as UNREACHABLE rather than as
+    // motivation, because it is: `AdmitsRemotePeers` reads four fields and only two are
+    // reloadable, so `--raft-join` and `--raft-peer` move it too, and ahead of the
+    // immutability check such a candidate would be refused by the rule below naming
+    // `--fleet-member` -- a flag nobody edited. It cannot happen today, because a
+    // candidate carrying either raft field without `--node-id` is refused by
+    // `StartupPolicyRejection` above and one carrying `--node-id` cannot reach here with
+    // it changed. Written down because the ordering is what keeps it unreachable, and a
+    // future startup row that stops catching it would otherwise reopen it silently.
+    struct PairRule
+    {
+        bool (*refuses)(NodeConfig const&, NodeConfig const&); ///< Whether this rule objects.
+        std::string_view message;                              ///< What the operator is told.
+    };
+
+    constexpr auto PairRules = std::to_array<PairRule>({
+        // **The hole #405 would otherwise open, and it is the socket-activation one
+        // again** (#282). A keyless worker is legitimate for exactly one shape of node:
+        // one no other machine can dial. The startup table decides that from
+        // `CompilePortFacesTheNetwork`, which reads the listen flags -- and under
+        // socket activation the unit chose the address, so those flags describe
+        // nothing. `MakeWorkerLeaseValidator` is the backstop for that, and it runs
+        // ONCE, at startup, against the configuration the process started with.
+        //
+        // So a reload that made `AdmitsRemotePeers` true on a socket-activated keyless
+        // worker would hand it an open, unauthenticated compile port with every refusal
+        // counter reading zero -- the exact defect, reached through the door #405 adds.
+        // Neither the startup table nor the validator can see it: the first is blind
+        // under activation, the second has already run.
+        //
+        // Asked as a WIDENING rather than as a state, which is what keeps it from
+        // refusing a node that is running happily today: a keyless worker that already
+        // admits remote peers passed its own startup rules and may reload freely,
+        // including to NARROW. Only the transition is refused, and the remedy an
+        // operator needs -- give the node a key, or restart it -- is what the message
+        // says.
+        { .refuses =
+              [](NodeConfig const& previous, NodeConfig const& candidate) {
+                  return candidate.clusterKeyFile.empty() && AdmitsRemotePeers(candidate) && !AdmitsRemotePeers(previous);
+              },
+          .message = "a reload may not widen --fleet-member or --fleet-open on a node with no --cluster-key-file: "
+                     "this worker chose its lease check at startup and built one that verifies nothing, which is "
+                     "only safe while no machine but this one is admitted. Widening now would open an "
+                     "unauthenticated compile port with every refusal counter reading zero. Give "
+                     "--cluster-key-file and restart, or leave the admission policy as it is." },
     });
+
+    for (auto const& rule: PairRules)
+        if (rule.refuses(previous, candidate))
+            return std::unexpected(ConfigError { .code = ConfigErrorCode::ParseError,
+                                                 .source = {},
+                                                 .line = 0,
+                                                 .field = {},
+                                                 .context = std::format("not applied: {}", rule.message) });
+
+    return {};
 }
 
 Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,

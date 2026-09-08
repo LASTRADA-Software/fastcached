@@ -97,11 +97,18 @@ struct Fixture
     FailingConnector connector;
     ManualClock clock;
 
+    /// A node with no `--requirepass`, which is what every case here is about: these
+    /// are the address-holding cases, and the credential is `NodeCredential_test`'s
+    /// subject. `ConfiguredCredential` over an empty configuration and no reloader is
+    /// production's own "no credential", rather than a second spelling of it.
+    NodeConfig unauthenticated;
+    ConfiguredCredential credential { unauthenticated, nullptr };
+
     [[nodiscard]] RemoteUpstream Make(std::string endpoint = "cache.example:6674")
     {
         return RemoteUpstream {
-            std::move(endpoint), Cc::Credential {}, [](std::string_view) {}, connector, nullptr, resolver, clock,
-            ConnectTimeout,      IoTimeout,         RefreshInterval
+            std::move(endpoint), credential, [](std::string_view) {}, connector, nullptr, resolver, clock,
+            ConnectTimeout,      IoTimeout,  RefreshInterval
         };
     }
 };
@@ -228,9 +235,15 @@ TEST_CASE("RemoteUpstream holds only a unique address, so a multi-answer name ke
         auto twice = fixture.answer;
         twice.push_back(fixture.answer.front());
         CountingResolver multi { twice };
-        RemoteUpstream upstream { "cache.example:6674", Cc::Credential {}, [](std::string_view) {},
-                                  fixture.connector,    nullptr,           multi,
-                                  fixture.clock,        ConnectTimeout,    IoTimeout,
+        RemoteUpstream upstream { "cache.example:6674",
+                                  fixture.credential,
+                                  [](std::string_view) {},
+                                  fixture.connector,
+                                  nullptr,
+                                  multi,
+                                  fixture.clock,
+                                  ConnectTimeout,
+                                  IoTimeout,
                                   RefreshInterval };
 
         CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
