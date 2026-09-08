@@ -41,25 +41,11 @@
 #include <cstdlib>
 #include <vector>
 
-#if defined(_MSC_VER)
-    #include <crtdbg.h>
-#endif
+#include <tests/WindowsErrorPopups.hpp>
 
 int main()
 {
-#if defined(_MSC_VER)
-    // Route the diagnostic to stderr and take the process down without a dialog.
-    //
-    // This is the load-bearing half of the file on CI and not defensive padding: a
-    // debug assertion in a Windows GUI session pops a modal "Abort/Retry/Ignore"
-    // box, and on a runner that means the job hangs until its timeout rather than
-    // failing in a second. A canary that wedges CI is worse than no canary.
-    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
-    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-#endif
+    FastCache::Testing::SuppressWindowsErrorPopups();
 
     // Sized from a runtime value and read past the end. Not a constant expression
     // and not a literal index: MSVC folds the obvious spelling away at compile

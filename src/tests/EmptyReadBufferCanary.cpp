@@ -52,6 +52,8 @@
 #include <string>
 #include <string_view>
 
+#include <tests/WindowsErrorPopups.hpp>
+
 namespace
 {
 
@@ -69,6 +71,10 @@ FastCache::Task<bool> StagePendingBytes(FastCache::ISocket* client, std::span<st
 
 int main()
 {
+    // Several canaries here exist to be SEEN aborting, so on Windows the modal
+    // CRT dialog is what happens on a successful run, not an edge case.
+    FastCache::Testing::SuppressWindowsErrorPopups();
+
     auto pair = FastCache::InMemorySocketPair::Create();
     if (!pair.client || !pair.server)
     {
