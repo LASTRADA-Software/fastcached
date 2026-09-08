@@ -94,18 +94,42 @@ UseColor: true
 # for it, which is why this pattern being slightly wrong is expensive rather than
 # annoying.
 #
-# It must match a checkout whatever it is CALLED. CI clones to
-# `.../fastcached/fastcached/src/...`, but a git worktree is not named after the
-# repository: `fastcached-wt-139/src/...` and `.../worktrees/<name>/src/...` are
-# both ordinary, and neither matched a pattern anchored on the literal directory
-# name `fastcached`. The result was a local clang-tidy that checked no headers at
-# all and reported clean -- which has now sent two branches to CI with header
-# findings a local run had called clean.
+# It must match a checkout whatever it is CALLED, and THREE different patterns
+# anchored on the checkout's NAME have now failed that, each fixed by adding the
+# layout in front of the author at the time:
 #
-# It must NOT match dependencies, which carry no `.clang-tidy` of their own and
-# would bury real findings: `_deps/catch2-src/src/...` is the shape to keep out,
-# and it is kept out because `catch2-src` does not begin with `fastcached`.
-HeaderFilterRegex: '.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
+#   `.*/fastcached/src/.*`                        missed `fastcached-wt-139/`
+#   `.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*` missed `fastcached-worktrees/<lane>/`
+#
+# The second is #1040 and is the interesting one, because it looks like it covers
+# the third layout and does not: `fastcached[^/]*` matches the SEGMENT
+# `fastcached-worktrees` and then demands `/src/` immediately, while
+# `worktrees/[^/]+` needs a segment that is literally `worktrees`. Every lane in a
+# team run lives at `.../fastcached-worktrees/<lane>/src/...`, so every lane's
+# local clang-tidy analysed ZERO first-party headers and reported clean. CI was
+# unaffected -- it clones to `.../fastcached/src/...`, which alternative 1 does
+# match -- so the failure was invisible to the one instrument that runs everywhere.
+#
+# So this no longer describes a LAYOUT. The invariant is what it always was:
+# first-party code lives under a `src/` directory, and dependencies do not count.
+# `ExcludeHeaderFilterRegex` (clang-tidy 19+, and both the pinned 22 and the 20
+# on this machine accept it) states the second half directly, instead of leaving
+# it as a side effect of a prefix -- `_deps/catch2-src/src/...` used to be kept
+# out only because `catch2-src` does not begin with `fastcached`, which is a fact
+# about a NAME again.
+#
+# Measured, not reasoned: a `g_`-prefixed global planted in `src/FastCache/Core/
+# Base64.hpp` in a `fastcached-worktrees/<lane>/` checkout is reported 0 times by
+# the old pattern and found by this one, while catch2 goes from 228 reported lines
+# to 0. The two obvious broadenings BOTH leak catch2 -- `.*/src/.*` alone, and
+# `.*/fastcached[^/]*/(.*/)?src/.*` -- which is why the exclusion is not optional.
+#
+# And a pattern matching NOTHING still reports clean, so `scripts/local-gate.sh`
+# now applies this regex to every tracked header and refuses when any is
+# unmatched. That is the part that makes layout number four loud instead of
+# silent; three of these were found by a human noticing, which is not a mechanism.
+HeaderFilterRegex: '.*/src/.*'
+ExcludeHeaderFilterRegex: '.*/_deps/.*'
 FormatStyle:     none
 CheckOptions:
   - key:             readability-function-cognitive-complexity.Threshold

@@ -649,6 +649,139 @@ compiler_shim_verdict() {
     echo "none"
 }
 
+# How many of this tree's headers clang-tidy's header filter would REPORT on
+# (#1040), as `<matched>/<total>` -- or one word naming why it could not be asked.
+#
+# clang-tidy discards a finding in an unmatched header silently, with only a
+# `Suppressed NNN warnings (NNN in non-user code)` line to show for it, so a
+# filter matching NOTHING and a tree with no header findings render identically.
+# Three patterns anchored on the checkout's NAME have now got this wrong, each
+# fixed against the layouts its author happened to have; #1040 is the third, and
+# it hid because CI's own checkout is the one shape that still matched.
+#
+# So the question asked here is not "does the pattern look right" but "how many
+# of the headers in THIS working tree does it actually cover", which is a
+# question a layout nobody has thought of yet still answers.
+#
+# `grep -E` is POSIX ERE and clang-tidy is `llvm::Regex`, which is a MODEL of the
+# tool rather than the tool -- stated because a model more permissive than what
+# it stands for produces confident wrong agreement. It is sound for the patterns
+# this file has carried (character classes, alternation, `.*`) and it is checked
+# against the real analyser by `scripts/check-header-filter.sh`, which plants a
+# violation and asks clang-tidy itself.
+#
+# @param 1 Path to the `.clang-tidy` to read.
+# @param 2 Repository root, since the filter is matched against absolute paths.
+header_filter_coverage() {
+    local config="$1" root="$2"
+    [[ -r "$config" ]] || { echo "no-config"; return 0; }
+
+    local include exclude
+    include="$(sed -n "s/^HeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config" | head -1)"
+    [[ -n "$include" ]] || { echo "no-regex"; return 0; }
+    exclude="$(sed -n "s/^ExcludeHeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config" | head -1)"
+
+    # The tracked set, not a directory walk: a header the repository does not
+    # carry is not one this gate owes an opinion about, and a build directory is
+    # full of headers that are nobody's first-party code.
+    local headers
+    headers="$(git -C "$root" ls-files '*.hpp' '*.h' 2>/dev/null)"
+    [[ -n "$headers" ]] || { echo "no-headers"; return 0; }
+
+    # A dependency must stay OUT, and coverage alone cannot see that: `_deps` is
+    # not tracked, so `git ls-files` never lists it and deleting the exclusion
+    # leaves every coverage count perfect while catch2 floods back in -- measured
+    # at 228 reported lines from one test TU. So the canonical dependency shape is
+    # asked about explicitly, as a path rather than as a file that has to exist:
+    # a build directory may legitimately not be there yet, and a check that only
+    # bites after a build is one that does not bite when it is first needed.
+    local dep="${root}/out/build/gate-clang-debug/_deps/catch2-src/src/catch2/catch_test_macros.hpp"
+    if grep -qE "$include" <<< "$dep" \
+        && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$dep"; }; then
+        echo "deps-leak"
+        return 0
+    fi
+
+    header_filter_match "$include" "$exclude" "$root" <<< "$headers"
+}
+
+# The matching itself, over repo-relative header paths on stdin, as
+# `<matched>/<total>` plus the first unmatched path when there is one.
+#
+# Split from the enumeration so `--self-test` can drive it at a SYNTHETIC root:
+# the outcome under test is a property of where a checkout lives, and a case that
+# used the real root would assert the opposite thing depending on which machine
+# ran it -- passing on CI's `.../fastcached/` for the very layout that fails in a
+# lane worktree, which is #1040's own blind spot rebuilt inside its guard.
+#
+# @param 1 The include regex. @param 2 The exclude regex, possibly empty.
+# @param 3 The root the filter is matched against, since clang-tidy sees absolute paths.
+header_filter_match() {
+    local include="$1" exclude="$2" root="$3"
+    local total=0 matched=0 first_missed="" path
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        total=$((total + 1))
+        if grep -qE "$include" <<< "$root/$path" \
+            && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$root/$path"; }; then
+            matched=$((matched + 1))
+        elif [[ -z "$first_missed" ]]; then
+            first_missed="$path"
+        fi
+    done
+    echo "${matched}/${total}${first_missed:+ $first_missed}"
+}
+
+# What the gate says about that coverage.
+#
+# `all` is the only outcome that carries on. ZERO matched is the #1040 shape and
+# gets its own sentence, because "the filter matched nothing" and "the tree has
+# no header findings" are the two states this whole guard exists to separate --
+# and a PARTIAL match is its own outcome again, since a pattern covering 200 of
+# 285 headers is a gate that is silently blind to 85 files while looking healthy.
+#
+# @param 1 The `.clang-tidy` path, for the sentence. @param 2 The coverage verdict.
+header_filter_report() {
+    local config="$1" verdict="$2"
+    local counts="${verdict%% *}" missed=""
+    [[ "$verdict" == *" "* ]] && missed="${verdict#* }"
+    local matched="${counts%%/*}" total="${counts##*/}"
+
+    case "$verdict" in
+        '')
+            echo "the header-filter coverage check produced NO verdict for $config. That is a bug in the GATE, not a verdict about this tree: header_filter_coverage answers a count or one naming word on every path, so an empty answer means the substitution that read it died. There is a line on stderr above this one naming the variable"
+            return 1
+            ;;
+        no-config)
+            echo "$config is not readable, so which headers clang-tidy would report on cannot be answered; a gate that cannot check must not report"
+            return 1
+            ;;
+        no-regex)
+            echo "$config names no HeaderFilterRegex, so clang-tidy would report findings in NO header at all and say so only as 'Suppressed NNN warnings'. That is the #1040 failure with the pattern removed rather than mis-written"
+            return 1
+            ;;
+        no-headers)
+            echo "no tracked headers were found under this tree, so header-filter coverage could not be measured. That is the CHECK failing, not a clean tree -- git ls-files answered nothing, which in a checkout of this repository cannot be true"
+            return 1
+            ;;
+        deps-leak)
+            echo "clang-tidy's header filter in $config would report findings inside _deps/, which carry no .clang-tidy of their own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage of first-party headers cannot see this, because _deps is untracked and so is absent from the set the count is taken over: deleting ExcludeHeaderFilterRegex leaves every count perfect. Restore the exclusion rather than narrowing HeaderFilterRegex back onto a directory NAME (#1040)"
+            return 1
+            ;;
+        0/*)
+            echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked headers, so every header finding would be discarded as non-user code and the analyser would report clean by analysing nothing (#1040). This is a property of where this checkout LIVES: three patterns anchored on the directory name have now missed a real layout, most recently every lane worktree at .../fastcached-worktrees/<lane>/src/. Fix the pattern, do not delete this check"
+            return 1
+            ;;
+    esac
+
+    if [[ "$matched" == "$total" ]]; then
+        echo "== clang-tidy header filter covers all $total tracked headers"
+        return 0
+    fi
+    echo "clang-tidy's HeaderFilterRegex in $config matches only $matched of this tree's $total tracked headers, so findings in the other $((total - matched)) would be discarded silently -- for example $missed. A partial match is worse than none, because the analyser still reports findings and so looks like it is working (#1040)"
+    return 1
+}
+
 # What the gate SAYS about a verdict, split out from reading one.
 #
 # Both checks below read their verdict out of a command substitution and then
@@ -1196,6 +1329,87 @@ CONTINUED" \
         "$(report_says "reporter 'stub_report_silent' produced no line at all" \
             report_or_refuse stub_report_silent)"
 
+    # -----------------------------------------------------------------------
+    # The clang-tidy header filter (#1040). Driven at SYNTHETIC roots, because
+    # the whole defect is that the answer depends on where a checkout lives: a
+    # case using this run's own root would assert one thing in a lane worktree
+    # and the opposite on CI, which is the blind spot being closed.
+    _hdrs="src/FastCache/Core/Base64.hpp
+src/apps/fastcached/Main.hpp"
+    _old='.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
+    _new='.*/src/.*'
+    _exc='.*/_deps/.*'
+
+    # The three layouts the old pattern covered, which must not regress...
+    expect "the old pattern covered the primary checkout" \
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached <<< "$_hdrs")"
+    expect "the old pattern covered a .claude worktree" \
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached/.claude/worktrees/w1 <<< "$_hdrs")"
+    expect "the old pattern covered a wt-NNN checkout" \
+        "2/2" "$(header_filter_match "$_old" "" /w/fastcached-wt-139 <<< "$_hdrs")"
+
+    # ... and the one it did NOT, which is the ticket. Zero of two, and the
+    # verdict names the first header that would have gone unanalysed.
+    expect "the old pattern covered NO header in a lane worktree" \
+        "0/2 src/FastCache/Core/Base64.hpp" \
+        "$(header_filter_match "$_old" "" /w/fastcached-worktrees/lane-a <<< "$_hdrs")"
+
+    # The replacement covers all four, which is the point of not naming a layout.
+    for _root in /w/fastcached /w/fastcached/.claude/worktrees/w1 \
+                 /w/fastcached-wt-139 /w/fastcached-worktrees/lane-a; do
+        expect "the new pattern covers $_root" \
+            "2/2" "$(header_filter_match "$_new" "$_exc" "$_root" <<< "$_hdrs")"
+    done
+
+    # And a dependency stays out. Without the exclusion the broad pattern takes
+    # it -- measured against the real analyser at 228 reported catch2 lines --
+    # so this pins the exclusion rather than the pattern.
+    expect "a dependency header is excluded" \
+        "0/1 out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp" \
+        "$(header_filter_match "$_new" "$_exc" /w/fastcached-worktrees/lane-a \
+            <<< "out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp")"
+    expect "and WITHOUT the exclusion the same header is taken, which is why it exists" \
+        "1/1" \
+        "$(header_filter_match "$_new" "" /w/fastcached-worktrees/lane-a \
+            <<< "out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp")"
+
+    # A partial match is its own outcome: an analyser blind to 1 of 2 headers
+    # still reports findings, so it looks like it is working.
+    expect "a partial match names how many and which" \
+        "1/2 src/apps/fastcached/Main.hpp" \
+        "$(header_filter_match '.*/src/FastCache/.*' "" /w/fastcached <<< "$_hdrs")"
+
+    # The reporter. `all` is the only arm that carries on -- asserted as the
+    # STATUS beside the text, since a reporter that says the right words and
+    # returns 0 lets the gate analyse nothing and call it clean.
+    expect "full coverage is reported and the gate carries on" \
+        "== clang-tidy header filter covers all 285 tracked headers|0" \
+        "$(text="$(header_filter_report /w/.clang-tidy 285/285)"; printf '%s|%s' "$text" "$?")"
+    expect "zero coverage refuses, naming #1040 and the lane layout" \
+        "said|1" "$(report_says 'matches NONE of this tree' header_filter_report /w/.clang-tidy 0/285)"
+    expect "partial coverage refuses, naming the count and an example" \
+        "said|1" "$(report_says 'matches only 200 of this tree' header_filter_report /w/.clang-tidy '200/285 src/apps/x.hpp')"
+    expect "a config with no HeaderFilterRegex refuses" \
+        "said|1" "$(report_says 'names no HeaderFilterRegex' header_filter_report /w/.clang-tidy no-regex)"
+    expect "a config that cannot be read refuses" \
+        "said|1" "$(report_says 'is not readable' header_filter_report /w/.clang-tidy no-config)"
+    expect "an empty header set refuses as the CHECK failing, not a clean tree" \
+        "said|1" "$(report_says 'That is the CHECK failing' header_filter_report /w/.clang-tidy no-headers)"
+    expect "an empty coverage verdict is refused BY NAME, never as coverage" \
+        "said|1" "$(report_says 'produced NO verdict' header_filter_report /w/.clang-tidy '')"
+    expect "a filter that would take _deps refuses, and says why coverage cannot see it" \
+        "said|1" "$(report_says 'because _deps is untracked' header_filter_report /w/.clang-tidy deps-leak)"
+
+    # THE WIRING, which none of the above can see: the real `.clang-tidy` in this
+    # very tree must cover every header this repository tracks. This is the case
+    # that would have been RED on every lane worktree before #1040, and it is the
+    # one that fires for layout number four without anybody editing this file.
+    _live="$(header_filter_coverage "${repo_root}/.clang-tidy" "$repo_root")"
+    expect "this tree's own .clang-tidy covers every tracked header" \
+        "covers-all" \
+        "$([[ "${_live%% *}" == *"/"* && "${_live%%/*}" == "${_live##*/}" ]] \
+            && echo covers-all || echo "$_live")"
+
     # The per-leg verdict (#501). The renderer is pure, so every state is reachable
     # here without a compiler -- which is the whole reason it takes its input as
     # arguments instead of reading the globals.
@@ -1446,6 +1660,14 @@ for row in "${gate_presets[@]}"; do
         tidy="clang-tidy-${tools_version}"
         tidy_path="$(command -v "$tidy" 2>/dev/null || true)"
         [[ -n "$tidy_path" ]] || fail "$tidy not found, and this gate will not fall back to whatever clang-tidy is on PATH; install it (pip download clang-tidy==${tools_version}.1.0) or set CLANG_TOOLS_VERSION"
+
+        # Asked once and HERE, beside the tool it is about, rather than per preset:
+        # the header filter is a property of `.clang-tidy` and of where this
+        # checkout lives, neither of which a preset changes. Only when some preset
+        # actually tidies -- a gate whose configurations run no analyser has no
+        # reason to have an opinion about which headers it would report on.
+        report_or_refuse header_filter_report "${repo_root}/.clang-tidy" \
+            "$(header_filter_coverage "${repo_root}/.clang-tidy" "$repo_root")"
         break
     fi
 done
