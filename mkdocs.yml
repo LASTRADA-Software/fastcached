@@ -194,6 +194,7 @@ nav:
     - Cluster communication: operations/cluster-communication.md
     - Running a compile cache: operations/compile-cache-server.md
     - Upgrading a store: operations/upgrading-a-store.md
+    - Upgrading a fleet: operations/upgrading-a-fleet.md
     - When a store reports Corrupt: operations/corrupt-store.md
     - Known limitations: operations/known-limitations.md
   - Internals:

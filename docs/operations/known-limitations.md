@@ -126,5 +126,13 @@ lapses.** Everything below follows from that.
   TLS-terminating proxy in that case. Client-certificate (mutual TLS)
   authentication is not yet implemented.
 
+- **A `fastcache-compile-node` fleet has no rolling upgrade.** A build accepts exactly
+  one `0xFC` wire version, so the moment one end moves every peer on the old version is
+  refused. Upgrading is a flag day: stop everything, upgrade every node *and every
+  client*, start again. A mismatch never fails a build — the launcher treats an unusable
+  cache as a miss — so the cost is silent, and the only signal is server-side counters.
+  The procedure and the counters to watch are in
+  [Upgrading a fleet](upgrading-a-fleet.md).
+
 See also [Compatibility with upstream](../protocols/compatibility-with-upstream.md)
 for a per-protocol completeness scorecard.
