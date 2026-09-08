@@ -1166,6 +1166,100 @@ Every rule below has already been a bug.
     assert aborts and can only ever be a canary. Measured: **20 of 20 fail** with the
     fix neutered, **20 of 20 pass** with it, and the three failing assertions are
     exactly the three that describe the defect.
+
+- **A reactor resumes what it parks or FREES it -- and it may free only what nothing
+  else owns.** `Stop()` sets a flag and posts a wakeup, `RunLoop()` returns with the
+  timer heap and the submit queue exactly where they were, and both were destroyed as
+  containers of non-owning `std::coroutine_handle<>`. Every frame parked at that moment,
+  and everything reachable from it, leaked with no diagnostic
+  ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)). LeakSanitizer
+  reports it as an **indirect-only** set -- not an oddity, a signature: nothing in the
+  set is reachable from a root, because a `Task` chain refers to itself through its own
+  continuations.
+  - **The obvious fix is a double free, and this tree already contains the case that
+    proves it.** `IReactor::Schedule` says *resume this* and BORROWS: the caller
+    guarantees the frame outlives the park. `ExpiryReaper` submits `_task.Native()` and
+    keeps the `Task`; `TestReactor::Stop short-circuits the loop` parks a `Task` local,
+    never starts it, and destroys it BEFORE the reactor. Measured, with a blanket
+    destroy in `Submit`: ASan `heap-use-after-free` on that arrangement. So the reactor
+    is TOLD, per park, whether anything else can free the chain -- `ParkedWork::abandon`,
+    which `Detail::ParkedWorkFor` derives from the parking coroutine's promise type and
+    fills in exactly when the chain bottoms out in a `DetachedTask`. Empty is the safe
+    answer and is what every direct `Submit(handle)` still gets.
+  - **What is freed is the chain ROOT, never the frame the reactor is holding**, and
+    the difference is the whole ticket. Ownership in a `Task` chain runs DOWNWARD --
+    each frame's `Awaiter` owns the frame it awaits -- so destroying the parked frame
+    runs its own destructors and stops there, leaving the caller waiting on it holding
+    a dangling handle and itself unreachable. Measured on #1025's own three-frame shape:
+    freeing the parked frame took a four-allocation leak to **three** and LSan stayed
+    red; freeing the root took it to **zero**.
+  - **Resuming instead is not the other half of a choice, it is a hang.** A bounded wait
+    re-parks -- `AwaitWatchQuiet` sleeps in 5 ms steps up to 1250 ms -- so a drain that
+    resumes spins for the rest of the window on a real clock and never terminates on a
+    `ManualClock`. It would also run connection bodies, which can suspend again on a
+    socket, on whatever thread is tearing the reactor down. `destroy()` runs destructors
+    and creates no new work, which is why it is the verb.
+  - **The release is FOLDED into the resume**, per `ReadSlot.hpp`'s rule about which
+    shape a guard takes: `Detail::Parked::Resume()` disowns and resumes in one
+    expression, so no fire path has a line to forget it on, and a container that is
+    simply cleared frees exactly the chains nothing else can. Shown red by resuming
+    WITHOUT disowning: ASan `heap-use-after-free` on the elapsed-timer case alone.
+  - **Both containers, and IOCP's submissions are the exception that had to be stated.**
+    A posted completion packet is held by the kernel and there is no entry to fold the
+    ownership into -- the same fact `CancelPending` reports by answering `false` there --
+    so `IocpReactor` keeps a side table reconciled at the ONE place a
+    `KeyResumeCoroutine` packet is dequeued. That is the only reactor with a forget site
+    rather than a folded one, and it is why it has one.
+  - **Derived rather than listed**: `Submit(ParkedWork)` and `Schedule(TimePoint,
+    ParkedWork)` are pure virtual, so a fifth backend is handed the question instead of
+    inheriting the defect by omission, and `ParkedWork_test.cpp` runs every property
+    against `TestReactor` AND `PlatformReactor`, which is epoll, IOCP or kqueue
+    depending on which leg is running it.
+  - **Shown red six ways, each failing its own cases and only those** -- which is the
+    asymmetry [`testing.md`](testing.md) asks for, and the reason a single neutering
+    would not have been enough. Free nothing: the three abandonment cases fail and the
+    three resume cases stay green. Name the parked frame rather than the root: only the
+    chain case fails. Free whatever is held: only the borrowed case fails, as a
+    use-after-free. Resume without disowning: only the two resume cases fail, as
+    use-after-frees. Drop rather than free what cannot be resumed, and free during member
+    destruction rather than in the destructor body: one case each, the second as a
+    use-after-free.
+  - **A parked entry that cannot RESUME must FREE, and taking the work out before
+    deciding is how that gets lost.** `Parked::Resume()` disowns first -- which is what
+    stops a completed body being freed twice -- so an early return on `handle.done()`
+    discards an owned root without destroying it: a silent leak on the one path the type
+    exists to close. Nothing reaches it through a reactor, because a chain whose
+    `abandon` is set is owned by nobody and so cannot have been resumed to completion by
+    anything else; it is driven at the primitive, which is the honest place for a branch
+    that exists for the contract rather than for a caller.
+  - **Freeing during MEMBER destruction is not the same as freeing in the destructor
+    BODY**, and `TestReactor` is where that distinction bites. Members die in reverse
+    declaration order, so one parked container outlives the other -- and freeing a chain
+    RE-ENTERS the reactor, because a frame holding a `DeadlineTimer` runs `Disarm()` into
+    `CancelPending`, which searches BOTH containers. A chain freed from the later one
+    then reads storage the earlier has released, which is a `heap-use-after-free` and not
+    a leak. The platform reactors have a destructor for two reasons and only the first is
+    closing descriptors; the double owns none, which says WHEN its body must run rather
+    than that it needs none. Also why the freeing happens OUTSIDE the lock: the
+    re-entrant `CancelPending` takes the same mutex.
+  - **The teardown loops rather than walking its containers once**, because freeing a
+    chain can park again. That much is reasoned rather than measured: a case written for
+    it passed with the loop AND without it and was DELETED rather than kept, since `swap`
+    leaves the member containers unallocated and a re-entrant search over them reads
+    nothing. What the single pass actually costs is an `epoll_ctl` on a descriptor the
+    destructor has already closed, whose number another thread may have reused, and no
+    fixture stages that deterministically. Stated on `EpollReactor::AbandonParkedWork`.
+  - **A reactor's owner is now required to outlive the frames it abandons**, and nothing
+    enforces it. `RunSingleReactor` declares its reactor FIRST so it is destroyed LAST --
+    which it must be, since the servers and listeners hold references to it -- so
+    abandoned connection frames are now destroyed after `servers`, `expiryPool` and the
+    per-bind `TlsContext` are gone. It is safe as written: what such a frame's death
+    touches is its own socket, whose `Close()` reaches only the reactor, and
+    `IAdmissionControl::OnConnectionEnded` is on the `co_return` path a destroyed frame
+    does not run. Before this change those frames were never destroyed at all, so the
+    requirement is new; it is written where the reactor is declared.
+  - Epoll was MEASURED, end to end and under LSan. IOCP and kqueue share the shape and
+    were code-read; the Windows leg builds and runs the same cases against `IocpReactor`.
 - **A watchdog may not write to a socket a coroutine owns, and the reason is
   OWNERSHIP rather than interleaving.** `FrameServer::CloseOverdue` closes connections
   past their deadline, so a peer got a bare TCP close it cannot tell from a crash, a

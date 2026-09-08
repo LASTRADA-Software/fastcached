@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #include <algorithm>
@@ -43,11 +44,20 @@ struct SleepUntil
     /// happen when `reactor != nullptr` — the assert states that precondition
     /// (and lets the static analyzer prune the impossible null-deref path the
     /// nullptr-reactor test would otherwise appear to take).
+    ///
+    /// **Templated on the promise, and that is not a generalisation for its own sake**:
+    /// the parking coroutine's promise type is the only thing that can say whether any
+    /// object owns this await chain, and a reactor torn down with this timer still
+    /// parked has to know before it may free anything
+    /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+    /// `Detail::ParkedWorkFor` answers it; nothing here decides.
+    /// @tparam Promise The suspending coroutine's promise type.
     /// @param handle The suspended coroutine to resume once the deadline elapses.
-    void await_suspend(std::coroutine_handle<> handle) const
+    template <typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> handle) const
     {
         assert(reactor != nullptr);
-        reactor->Schedule(deadline, handle);
+        reactor->Schedule(deadline, Detail::ParkedWorkFor(handle));
     }
 
     void await_resume() const noexcept {}
@@ -55,11 +65,20 @@ struct SleepUntil
 
 /// The next instant a bounded wait should sleep to on its way to `deadline`.
 ///
-/// The one place the polling rule is written down. `IReactor::Schedule` cannot
-/// be cancelled, so a wait that must ALSO be woken by something else sleeps in
-/// steps no longer than `wakeBound` and re-reads its own condition at each one
-/// -- which is what makes the sleeping frame *be* the wait, leaving nothing
-/// parked behind it when the reactor stops.
+/// The one place the polling rule is written down. A `Schedule` can only be taken
+/// back by whoever HOLDS the handle (`IReactor::CancelPending`), and the coroutine
+/// doing the waiting is not in a position to hold its own -- so a wait that must ALSO
+/// be woken by something else sleeps in steps no longer than `wakeBound` and re-reads
+/// its own condition at each one, which is what makes the sleeping frame *be* the
+/// wait and keeps the handle a teardown has to name the caller's own.
+///
+/// **It does NOT mean nothing is parked when the reactor stops.** That is what this
+/// said, and it was the exact false belief
+/// [#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025) is about: a
+/// step in progress at that moment IS a frame in the timer heap, and until #1025
+/// nothing resumed or freed it. What is true is the narrower claim above -- the frame
+/// parked is this coroutine's own rather than some inner task's, which is what lets
+/// `ParkedWork::abandon` name a root that covers it.
 ///
 /// Three waits do this (`InterruptibleSleepUntil`, `DeadlineTimer`,
 /// `ExpiryReaper`) and each has to inline its own loop rather than delegate it,

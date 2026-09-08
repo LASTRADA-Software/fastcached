@@ -9,6 +9,8 @@
     #include <cstddef>
     #include <cstdint>
     #include <mutex>
+    #include <ranges>
+    #include <tuple>
     #include <utility>
     #include <vector>
 
@@ -60,11 +62,64 @@ IocpReactor::IocpReactor(IClock& clock):
 
 IocpReactor::~IocpReactor()
 {
+    // Before the port closes, because an abandoned connection chain frees its socket on
+    // the way down and `IocpSocket` asks this reactor about its own teardown.
+    AbandonParkedWork();
+
     if (_iocp)
     {
         CloseHandle(static_cast<HANDLE>(_iocp));
         _iocp = nullptr;
     }
+}
+
+void IocpReactor::AbandonParkedWork() noexcept
+{
+    // Swapped out under the locks and freed OUTSIDE them, and LOOPED, for
+    // `EpollReactor::AbandonParkedWork`'s two reasons: destroying a chain runs arbitrary
+    // destructors that reach back into this reactor, and one of them can park again --
+    // which a single fixed-order pass would leave for member destruction, after the
+    // completion port below is closed.
+    while (true)
+    {
+        std::vector<Detail::Parked> posted;
+        std::vector<TimerEntry> timers;
+        {
+            std::scoped_lock const guard { _postedMutex };
+            posted.swap(_posted);
+            _postedCount.store(0, std::memory_order_release);
+        }
+        {
+            std::scoped_lock const guard { _timerMutex };
+            timers.swap(_timers);
+        }
+        if (posted.empty() && timers.empty())
+            return;
+        posted.clear();
+        timers.clear();
+    }
+}
+
+Detail::Parked IocpReactor::TakePosted(std::coroutine_handle<> handle) noexcept
+{
+    // Checked before the lock is taken, because this runs for EVERY resumption packet
+    // and almost none of them is registered: borrowed submissions -- which is what a
+    // plain `Submit(handle)` posts -- never enter `_posted` at all. Without this, an
+    // owning submission anywhere in the process would put a contended global lock and a
+    // linear scan on the reactor's hot resume path. The count is written under the same
+    // mutex, and a registration is complete before its packet is posted, so a worker
+    // that can see the packet can see the count.
+    if (_postedCount.load(std::memory_order_acquire) == 0)
+        return Detail::Parked { ParkedWork { .resume = handle } };
+
+    std::scoped_lock const guard { _postedMutex };
+    auto const found = std::ranges::find(_posted, handle, &Detail::Parked::Handle);
+    if (found == _posted.end())
+        return Detail::Parked { ParkedWork { .resume = handle } };
+    auto taken = std::move(*found);
+    _posted.erase(found);
+    _postedCount.store(_posted.size(), std::memory_order_release);
+    return taken;
 }
 
 bool IocpReactor::CancelPending(std::coroutine_handle<> handle) noexcept
@@ -78,9 +133,11 @@ bool IocpReactor::CancelPending(std::coroutine_handle<> handle) noexcept
     // answers false -- the honest answer, since the caller must not resume what
     // the reactor is still going to.
     std::scoped_lock const guard { _timerMutex };
-    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    auto const found =
+        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.Handle(); });
     if (found == _timers.end())
         return false;
+    std::ignore = found->parked.Take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -99,19 +156,41 @@ bool IocpReactor::AttachHandle(void* handle) noexcept
 
 void IocpReactor::Submit(std::coroutine_handle<> handle)
 {
-    if (!handle || !_iocp)
+    Submit(ParkedWork { .resume = handle });
+}
+
+void IocpReactor::Submit(ParkedWork work)
+{
+    if (!work.resume || !_iocp)
         return;
+
+    // Registered BEFORE the post, or the worker thread can dequeue the packet and look
+    // for an entry that has not been written yet -- which would resume correctly and
+    // leave a stale root behind to be freed at teardown, on a frame that has since gone.
+    if (work.abandon)
+    {
+        std::scoped_lock const guard { _postedMutex };
+        _posted.emplace_back(work);
+        _postedCount.store(_posted.size(), std::memory_order_release);
+    }
+
     PostQueuedCompletionStatus(
-        static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, reinterpret_cast<LPOVERLAPPED>(handle.address()));
+        static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, reinterpret_cast<LPOVERLAPPED>(work.resume.address()));
 }
 
 void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Schedule(deadline, ParkedWork { .resume = handle });
+}
+
+void IocpReactor::Schedule(TimePoint deadline, ParkedWork work)
+{
+    if (!work.resume)
         return;
     {
         std::scoped_lock const lock { _timerMutex };
-        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
+        _timers.push_back(
+            TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .parked = Detail::Parked { work } });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     // Nudge the reactor in case it's blocked waiting on a later deadline.
@@ -128,19 +207,20 @@ void IocpReactor::Stop() noexcept
 void IocpReactor::FireExpiredTimers()
 {
     auto const now = _clock.Now();
-    std::vector<std::coroutine_handle<>> due;
+    std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
         while (!_timers.empty() && _timers.front().deadline <= now)
         {
             std::ranges::pop_heap(_timers, EntryGreater);
-            due.push_back(_timers.back().handle);
+            due.push_back(std::move(_timers.back().parked));
             _timers.pop_back();
         }
     }
-    for (auto handle: due)
-        if (handle && !handle.done())
-            handle.resume();
+    // `Resume()` disowns and resumes in one expression, so a timer that fires normally
+    // is never also freed by the entry going out of scope here.
+    for (auto& parked: due)
+        parked.Resume();
 }
 
 void IocpReactor::RunLoop()
@@ -217,9 +297,10 @@ void IocpReactor::RunLoop()
             {
                 if (entry.lpOverlapped == nullptr)
                     continue; // pure wake-up, no work
-                auto handle = std::coroutine_handle<>::from_address(entry.lpOverlapped);
-                if (handle && !handle.done())
-                    handle.resume();
+                // Taken and resumed in one expression: `TakePosted` is what hands the
+                // chain back to itself, so there is no line for a future edit to forget
+                // it on and no window where both this and `_posted` claim the frame.
+                TakePosted(std::coroutine_handle<>::from_address(entry.lpOverlapped)).Resume();
                 continue;
             }
             // Socket / listener completion: lpOverlapped points to an

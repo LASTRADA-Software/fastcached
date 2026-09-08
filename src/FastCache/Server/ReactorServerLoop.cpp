@@ -80,6 +80,27 @@ namespace
         FC_THREAD_NAME("fc-reactor");
         SteadyClock ownClock;
         IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
+
+        // **Declared FIRST, so destroyed LAST, and since
+        // [#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025) that
+        // ordering carries a requirement it did not before.** It must outlive the
+        // listeners and servers, which hold references to it -- but its destructor now
+        // FREES the coroutine chains still parked on it, so their frames' destructors
+        // run after `servers`, `expiryPool`, the reaper and the per-bind `TlsContext`
+        // are already gone. Before that change those frames were never destroyed at
+        // all, so nothing depended on what they touch.
+        //
+        // It holds as written, and the reasoning is the requirement: such a frame owns
+        // its `Connection`, whose destruction reaches only the socket -- and
+        // `~EpollSocket` / `~IocpSocket` call back into THIS reactor, which is alive
+        // because it is the object being destroyed and a destructor body runs before
+        // its members. Everything else `Connection` holds is a reference or a raw
+        // pointer with a trivial destructor, and `IAdmissionControl::OnConnectionEnded`
+        // sits on the `co_return` path, which a destroyed frame does not run.
+        //
+        // So: anything handed to a connection whose destructor does more than nothing
+        // must outlive this reactor. Nothing enforces that, which is why it is written
+        // here rather than left to be rediscovered.
         PlatformReactor reactor { clock };
 
         // Declared before the servers it counts and before anything that arms one,

@@ -59,6 +59,18 @@ class ThreadPoolExecutor final: public IExecutor
     /// @param handle Coroutine to resume; must remain alive until it is.
     void Submit(std::coroutine_handle<> handle) override;
 
+    /// Post a coroutine, ignoring the chain root it names.
+    ///
+    /// **This pool never abandons work, which is why it can.** `Submit` drains its
+    /// queue even while stopping and resumes anything handed to it after that inline --
+    /// *an unresumed coroutine never frees its frame* is the rule its own body already
+    /// states -- so there is no moment at which a queued handle stops being resumable
+    /// and nothing for `ParkedWork::abandon` to answer. A reactor is the opposite shape
+    /// and that is where the whole question comes from
+    /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+    /// @param work The coroutine to resume; only `ParkedWork::resume` is used.
+    void Submit(ParkedWork work) override;
+
     /// Ask the threads to finish and stop taking new work. Idempotent.
     void Stop() noexcept;
 

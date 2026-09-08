@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstdio>
 #include <print>
 #include <thread>
@@ -88,11 +89,21 @@ int main()
     std::atomic<bool> entered { false };
     std::thread worker { [&reactor, &entered, &clock] {
         // Keeps `Run()` from returning the instant it finds nothing to do, so the
-        // window this canary is about stays open long enough to observe. A timer
-        // rather than a sleep, because the reactor must be genuinely dequeuing --
-        // a parked thread would report `Running()` while nothing is dispatching,
-        // which is the state that would make this canary lie.
-        reactor.Schedule(clock.Now() + 5s, {});
+        // window this canary is about stays open long enough to observe. The reactor
+        // is genuinely inside its own wait -- not a thread this file put to sleep,
+        // which would report `Running()` while nothing could dispatch.
+        //
+        // **The null handle is DROPPED, and the loop is held open by the wait having
+        // no deadline rather than by this timer.** Every reactor's `Schedule` returns
+        // early on an empty handle, so nothing is ever entered in the heap here; the
+        // comment that stood above claimed a mechanism that was not running. Left as
+        // a null schedule rather than made real: what this canary needs is a reactor
+        // that is dispatching and idle, which is what an infinite `epoll_wait` /
+        // `GetQueuedCompletionStatusEx` IS, and giving it a real deadline would put a
+        // 5-second wakeup into an instrument whose whole job is to sit still. Spelled
+        // with the type rather than `{}` because `Schedule` now also takes a
+        // `ParkedWork` and a braced empty is ambiguous between them.
+        reactor.Schedule(clock.Now() + 5s, std::coroutine_handle<> {});
         entered.store(true, std::memory_order_release);
         reactor.Run();
     } };

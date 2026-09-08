@@ -15,6 +15,8 @@
     #include <cstring>
     #include <iterator>
     #include <ranges>
+    #include <tuple>
+    #include <utility>
 
     #include <fcntl.h>
     #include <unistd.h>
@@ -92,12 +94,42 @@ KqueueReactor::KqueueReactor(IClock& clock):
 
 KqueueReactor::~KqueueReactor()
 {
+    // Before the descriptors close: an abandoned connection chain frees its socket on
+    // the way down, and `KqueueSocket::Close` detaches from this reactor.
+    AbandonParkedWork();
+
     if (_wakePipe[0] >= 0)
         ::close(_wakePipe[0]);
     if (_wakePipe[1] >= 0)
         ::close(_wakePipe[1]);
     if (_kq >= 0)
         ::close(_kq);
+}
+
+void KqueueReactor::AbandonParkedWork() noexcept
+{
+    // Swapped out under the locks and freed OUTSIDE them, and LOOPED, for
+    // `EpollReactor::AbandonParkedWork`'s two reasons: destroying a chain runs arbitrary
+    // destructors that reach back into this reactor, and one of them can park again --
+    // which a single fixed-order pass would leave for member destruction, after the
+    // descriptors below are closed.
+    while (true)
+    {
+        std::deque<Detail::Parked> submits;
+        std::vector<TimerEntry> timers;
+        {
+            std::scoped_lock const guard { _submitMutex };
+            submits.swap(_pendingSubmits);
+        }
+        {
+            std::scoped_lock const guard { _timerMutex };
+            timers.swap(_timers);
+        }
+        if (submits.empty() && timers.empty())
+            return;
+        submits.clear();
+        timers.clear();
+    }
 }
 
 bool KqueueReactor::CancelPending(std::coroutine_handle<> handle) noexcept
@@ -107,17 +139,23 @@ bool KqueueReactor::CancelPending(std::coroutine_handle<> handle) noexcept
 
     {
         std::scoped_lock const guard { _submitMutex };
-        if (auto const found = std::ranges::find(_pendingSubmits, handle); found != _pendingSubmits.end())
+        if (auto const found = std::ranges::find(_pendingSubmits, handle, &Detail::Parked::Handle);
+            found != _pendingSubmits.end())
         {
+            // Taken rather than only erased: the caller becomes the only one who may
+            // resume or destroy it, so this entry must do neither on its way out.
+            std::ignore = found->Take();
             _pendingSubmits.erase(found);
             return true;
         }
     }
 
     std::scoped_lock const guard { _timerMutex };
-    auto const found = std::ranges::find(_timers, handle, &TimerEntry::handle);
+    auto const found =
+        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.Handle(); });
     if (found == _timers.end())
         return false;
+    std::ignore = found->parked.Take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -218,11 +256,16 @@ void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
 
 void KqueueReactor::Submit(std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Submit(ParkedWork { .resume = handle });
+}
+
+void KqueueReactor::Submit(ParkedWork work)
+{
+    if (!work.resume)
         return;
     {
         std::scoped_lock const lock { _submitMutex };
-        _pendingSubmits.push_back(handle);
+        _pendingSubmits.emplace_back(work);
     }
     char one = 1;
     (void) ::write(_wakePipe[1], &one, 1);
@@ -230,11 +273,17 @@ void KqueueReactor::Submit(std::coroutine_handle<> handle)
 
 void KqueueReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    if (!handle)
+    Schedule(deadline, ParkedWork { .resume = handle });
+}
+
+void KqueueReactor::Schedule(TimePoint deadline, ParkedWork work)
+{
+    if (!work.resume)
         return;
     {
         std::scoped_lock const lock { _timerMutex };
-        _timers.push_back(TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .handle = handle });
+        _timers.push_back(
+            TimerEntry { .deadline = deadline, .sequence = _nextSequence++, .parked = Detail::Parked { work } });
         std::ranges::push_heap(_timers, EntryGreater);
     }
     char one = 1;
@@ -251,34 +300,33 @@ void KqueueReactor::Stop() noexcept
 void KqueueReactor::FireExpiredTimers()
 {
     auto const now = _clock.Now();
-    std::vector<std::coroutine_handle<>> due;
+    std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
         while (!_timers.empty() && _timers.front().deadline <= now)
         {
             std::ranges::pop_heap(_timers, EntryGreater);
-            due.push_back(_timers.back().handle);
+            due.push_back(std::move(_timers.back().parked));
             _timers.pop_back();
         }
     }
-    for (auto handle: due)
-        if (handle && !handle.done())
-            handle.resume();
+    // `Resume()` disowns and resumes in one expression, so a timer that fires normally
+    // is never also freed by the entry going out of scope here.
+    for (auto& parked: due)
+        parked.Resume();
 }
 
 void KqueueReactor::DrainPendingSubmits()
 {
-    std::deque<std::coroutine_handle<>> drained;
+    std::deque<Detail::Parked> drained;
     {
         std::scoped_lock const lock { _submitMutex };
         drained.swap(_pendingSubmits);
     }
     while (!drained.empty())
     {
-        auto handle = drained.front();
+        drained.front().Resume();
         drained.pop_front();
-        if (handle && !handle.done())
-            handle.resume();
     }
 }
 
