@@ -112,7 +112,6 @@ nav:
     - Overview: tools/index.md
     - fastcache-cc (compiler launcher): tools/fastcache-cc.md
     - fastcache-compile-node (compile worker): tools/fastcache-compile-node.md
-    - compile-cache-testclient: tools/compile-cache-testclient.md
   - Protocols:
     - Overview: protocols/overview.md
     - Coverage matrix: protocols/coverage-matrix.md
@@ -201,6 +200,7 @@ nav:
     - Architecture: internals/architecture.md
     - Storage primitives: internals/storage-primitives.md
     - Performance: internals/performance.md
+    - compile-cache-testclient: internals/compile-cache-testclient.md
     - macOS code signing: internals/macos-code-signing.md
   - About:
     - License: about/license.md
