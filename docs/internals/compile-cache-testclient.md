@@ -1,7 +1,12 @@
 # compile-cache-testclient
 
 A standalone client and validation harness for the compile cache. This is test
-infrastructure, not a shipped product: it is not built or installed by default.
+infrastructure, not a shipped product: no `install()` rule names it, no package
+carries it, it is not built by default, and it is not supported for general
+use. It is documented here for contributors working on the canonicalization
+contract. If you are looking for something to run, you want
+[fastcache-cc](../tools/fastcache-cc.md) or
+[fastcache-compile-node](../tools/fastcache-compile-node.md).
 
 It is the **reference localizer**. It links the same `PathCanon` /
 `CompileValue` code the server uses, so the canonicalization parity contract is

@@ -1,6 +1,7 @@
 # Tools
 
-The project ships three executables and one test client.
+The project ships three executables, and these are all of them: every target
+carrying an `install()` rule appears below.
 
 ## `fastcached` — the cache daemon
 
@@ -47,14 +48,6 @@ falls back to a local compile, so distribution cannot fail a build.
 
 Full reference: [fastcache-compile-node](fastcache-compile-node.md).
 
-## `compile-cache-testclient` — the protocol probe
-
-Test infrastructure, not a product: a low-level client for the `0xFC` protocol
-used to validate the canonicalization contract end-to-end. It is not built or
-installed by default.
-
-Reference: [compile-cache-testclient](compile-cache-testclient.md).
-
 ## Which do I want?
 
 | Goal | Use |
@@ -63,7 +56,6 @@ Reference: [compile-cache-testclient](compile-cache-testclient.md).
 | Compile on other machines too, not just cache | add `fastcache-compile-node` workers |
 | Back an existing sccache setup, on GCC or Clang | `fastcached` alone, via `SCCACHE_MEMCACHED` / `SCCACHE_REDIS` |
 | A memcached- or Redis-compatible cache | `fastcached` alone |
-| Verify path canonicalization while hacking on the cache | `compile-cache-testclient` |
 
 The sccache row is the one with a condition on it, and the condition is the
 compiler rather than the goal:
