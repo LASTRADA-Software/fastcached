@@ -541,7 +541,7 @@ std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
 FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
                            IMetricsSink const& metrics,
                            AdminHttpServer::SnapshotProvider node,
-                           IWallClock const& wall,
+                           WallClockRef wall,
                            HistoryPaths paths,
                            ILogger& logger):
     _sources { sources },

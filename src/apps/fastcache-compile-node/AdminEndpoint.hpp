@@ -253,7 +253,7 @@ class FleetSampler final: public IFleetHistoryView
     FleetSampler(std::optional<Distributed::FleetSources> sources,
                  IMetricsSink const& metrics,
                  AdminHttpServer::SnapshotProvider node,
-                 IWallClock const& wall,
+                 WallClockRef wall,
                  HistoryPaths paths,
                  ILogger& logger);
 

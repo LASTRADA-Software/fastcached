@@ -16,7 +16,7 @@ namespace FastCache::Node
 
 SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              IClock& clock,
-                             IWallClock const& wallClock,
+                             WallClockRef wallClock,
                              IMetricsSink& metrics,
                              ILogger& logger,
                              std::span<std::byte const> signingKey,
@@ -71,7 +71,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     IClock& clock,
-    IWallClock const& wallClock,
+    WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger)
 {

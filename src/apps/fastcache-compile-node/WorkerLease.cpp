@@ -19,7 +19,7 @@ namespace FastCache::Node
 std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConfig const& cfg,
                                                                         std::string_view advertise,
                                                                         SocketActivation activation,
-                                                                        IWallClock const& clock,
+                                                                        WallClockRef clock,
                                                                         Distributed::WorkerLeaseState& lease,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)

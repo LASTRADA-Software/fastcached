@@ -118,7 +118,7 @@ using LeaseValidator =
 ///        that is not a refusal and would otherwise be visible only in a log.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                                   std::string advertisedEndpoint,
-                                                  IWallClock const& clock,
+                                                  WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics);
 

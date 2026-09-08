@@ -167,6 +167,14 @@ class IWallClock
 {
   public:
     IWallClock() = default;
+    // These two deletions are LOAD-BEARING for a guarantee stated on `WallClockRef`
+    // below, and nothing else enforces it. Because neither a copy nor a move exists,
+    // no function anywhere can return an `IWallClock` BY VALUE -- so the one shape
+    // `WallClockRef` cannot refuse, a borrow of something that was never an lvalue to
+    // begin with, is impossible by construction rather than merely absent from
+    // today's tree. Restoring either constructor reopens that hole SILENTLY: no test
+    // fails, no scan fires, nothing stops compiling. If you need one, read
+    // `WallClockRef`'s note first and give that guarantee a different reader.
     IWallClock(IWallClock const&) = delete;
     IWallClock(IWallClock&&) = delete;
     IWallClock& operator=(IWallClock const&) = delete;
@@ -240,5 +248,62 @@ class ManualWallClock final: public IWallClock
     static SystemWallClock instance;
     return instance;
 }
+
+/// A borrowed `IWallClock` that cannot be built from a temporary.
+///
+/// Every type here that keeps a wall clock keeps a BORROWED one -- it is injected and
+/// outlives its holder -- and nothing said so in a way a compiler could read. A
+/// temporary bound to such a parameter dies at the end of the declaration and leaves
+/// the holder reading freed stack: five release legs answering SIGSEGV while every
+/// debug leg passed, because at `-O0` the dead frame slot still held a usable vptr and
+/// at `-O2` the locals declared after it reuse the slot (#1028).
+///
+/// **The guard is on the PARAMETER, not on the storing type, and that is the point.**
+/// A deleted `Retainer(IWallClock const&&)` overload rejects a DIRECT temporary and
+/// accepts a FORWARDED one -- measured, gcc and clang alike -- because inside a
+/// forwarding constructor the parameter is a named lvalue and binds to the ordinary
+/// overload. #1028 was exactly that shape: the temporary went to `FleetSampler`, which
+/// stores no clock at all and hands the reference to three objects that do. Carrying
+/// the borrow as a VALUE means forwarding copies it rather than re-binding a
+/// reference, so the refusal survives every hop.
+///
+/// Implicitly constructible on purpose: a call site passing a named clock is unchanged,
+/// so adopting the guard costs nothing and there is no incentive to route around it.
+///
+/// It refuses an rvalue, and the reason there is no gap left over is `IWallClock`'s own
+/// deleted copy and move constructors: with neither, nothing can return an `IWallClock`
+/// by value, so there is no legitimate rvalue for this to be too strict about. That is a
+/// property of the interface, not a census of the callers -- and those deletions carry
+/// this guarantee, which is why they say so.
+class WallClockRef
+{
+  public:
+    /// Borrow a wall clock.
+    /// @param wall The clock to borrow. It must outlive every holder of this reference;
+    ///        `DefaultSystemWallClock()` has static storage and any named object will
+    ///        do, while a temporary is refused by the overload below.
+    WallClockRef(IWallClock const& wall) noexcept:
+        _wall { &wall }
+    {
+    }
+
+    /// Refuses a temporary, which is the entire reason this type exists.
+    WallClockRef(IWallClock const&&) = delete;
+
+    /// @return The borrowed clock, for a caller that needs the interface itself.
+    [[nodiscard]] IWallClock const& Get() const noexcept
+    {
+        return *_wall;
+    }
+
+    /// @return What the borrowed clock says the time is, so a holder need not unwrap it.
+    [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept
+    {
+        return _wall->Now();
+    }
+
+  private:
+    IWallClock const* _wall;
+};
 
 } // namespace FastCache

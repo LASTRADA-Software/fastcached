@@ -71,7 +71,7 @@ class SchedulerTier
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         IClock& clock,
-        IWallClock const& wallClock,
+        WallClockRef wallClock,
         IMetricsSink& metrics,
         ILogger& logger);
 
@@ -143,7 +143,7 @@ class SchedulerTier
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
                   IClock& clock,
-                  IWallClock const& wallClock,
+                  WallClockRef wallClock,
                   IMetricsSink& metrics,
                   ILogger& logger,
                   std::span<std::byte const> signingKey,
