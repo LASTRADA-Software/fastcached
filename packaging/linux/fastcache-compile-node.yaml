@@ -8,8 +8,17 @@
 # nothing is uncommented for you.
 #
 #   systemctl restart fastcache-compile-node   apply any change
+#   systemctl reload fastcache-compile-node    apply a reloadable one, in place
 #
-# There is no reloadable subset: every setting here is read once at startup.
+# FOUR settings are reloadable and the rest are read once at startup. A reload
+# re-reads this file the way the start read it, so a change to anything else is
+# refused BY NAME rather than half-applied -- you are told which key needs the
+# restart instead of running a worker that disagrees with its own file.
+#
+#   toolchain, no_toolchain_discovery   re-survey and re-register, which walks
+#                                       every include tree and can take minutes
+#   log_level                           immediate
+#   allow_compile_arg                   immediate
 #
 # Every key is one flag, spelled with underscores instead of dashes, and there
 # is no setting that a file can express and a command line cannot. A flag on the
@@ -73,6 +82,23 @@
 #toolchain:
 #  - <compiler>
 #  - <fingerprint>=<compiler>
+
+# accept this compile argument in addition to the built-in per-driver-family
+# table; repeatable. EXTENDS the table and cannot shrink it -- an argument the
+# built-in table REFUSES stays refused however this is written, because these
+# entries are consulted only after no built-in row matched at all.
+#
+# Matched WHOLE and exactly: name the spelling, not a prefix and not a pattern.
+# `-fplugin=` and `-Xclang` are refused by name because they make the compiler
+# run code this machine did not choose, and a prefix entry would re-open that
+# family through the one flag you meant to allow.
+#
+# THIS IS A SECURITY SETTING. Every entry widens what a client may make this
+# worker's compiler do. The worker logs the whole set at WARN whenever it is
+# applied, at startup and at every reload, so an incident can be read against
+# what was in force at the time.
+#allow_compile_arg:
+#  - -some-flag-this-build-does-not-know
 
 # do not survey this machine for compilers. Without --toolchain this leaves
 # the worker with nothing to serve, so it refuses to start -- and refuses to

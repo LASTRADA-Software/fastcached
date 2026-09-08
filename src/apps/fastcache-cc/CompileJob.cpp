@@ -96,6 +96,16 @@ namespace
         /// the `-f` space is enumerated rather than prefixed -- so it is defence in
         /// depth beneath the allowlist, never a substitute for it.
         NoPathSeparator,
+        /// Anything may follow, path separators included, and the shape is NOT
+        /// consulted.
+        ///
+        /// For `Deny` rows only, `static_assert`ed below. **A refusal must not be
+        /// escapable by the shape rule that exists to narrow an ALLOW.**
+        /// `-fplugin=evil` carries no separator and `-fplugin=/tmp/evil.so` does, so a
+        /// `NoPathSeparator` deny matches the first and lets the SECOND fall through --
+        /// refusing the harmless-looking spelling and passing the one that names a
+        /// payload on to whatever is consulted next.
+        AnySuffix,
     };
 
     /// Whether a row admits an argument or carves one back out of a prefix that
@@ -167,17 +177,24 @@ namespace
     /// option's own value separator, so the row names exactly one option and only its
     /// value is open.
     ///
-    /// Absent by construction, and therefore refused: anything path-valued (`-I`,
-    /// `-isystem`, `-include`, `-B`, `--sysroot`, `-specs=`, MSVC `/Fo`, `/FI`,
-    /// `@response`), every sub-tool pass-through (`-Xclang`, `-Xassembler`,
-    /// `-Xlinker`, MSVC `/link`), and every plugin loader (`-fplugin=`,
-    /// `-fpass-plugin=`, `/analyze:plugin`).
+    /// Anything path-valued (`-I`, `-isystem`, `-include`, `-B`, `--sysroot`,
+    /// `-specs=`, MSVC `/Fo`, `/FI`, `@response`), every sub-tool pass-through
+    /// (`-Xclang`, `-Xassembler`, `-Xlinker`, MSVC `/link`), and every plugin loader
+    /// (`-fplugin=`, `-fpass-plugin=`, `/analyze:plugin`) is refused.
+    ///
+    /// **That class is refused by `Deny` ROWS and not by absence, and the difference
+    /// only became observable with #293.** This paragraph used to say "absent by
+    /// construction, and therefore refused", which was true and unenforceable: absence
+    /// and refusal are the same answer for exactly as long as nothing else is
+    /// consulted, and `--allow-compile-arg` is something else. The rows at the foot of
+    /// the table are this paragraph made executable, so an operator extension cannot
+    /// reach a class the prose here has always said is closed.
     /// The extent is spelled out rather than deduced: `std::array`'s deduction guide
     /// folds a `is_same_v` pack over every element, and at this many rows that fold
     /// exceeds Clang's 256-deep expression nesting limit and fails to compile. A
     /// stated extent only diagnoses rows being ADDED, so the `static_assert` below
     /// the table closes the other direction.
-    constexpr std::array<AllowedArg, 344> AllowedArgs {
+    constexpr std::array<AllowedArg, 387> AllowedArgs {
         // -- optimization ------------------------------------------------------
         AllowedArg { .spelling = "O", .families = DriverFamily::Any },
         AllowedArg { .spelling = "O0", .families = DriverFamily::Any },
@@ -221,12 +238,9 @@ namespace
         // denied below, which is a closed set -- there is no fourth sub-tool a GNU
         // driver forwards options to.
         AllowedArg { .spelling = "W", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
-        AllowedArg {
-            .spelling = "Wa,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
-        AllowedArg {
-            .spelling = "Wl,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
-        AllowedArg {
-            .spelling = "Wp,", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Wa,", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Wl,", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Wp,", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
         // `-w`/`/w` suppresses warnings and is BARE on both families. It was briefly a
         // prefix here so `/wd4996` would match, and that admitted GNU `-wrapper` --
         // the very flag this ticket is about, let back in by a one-letter prefix on
@@ -247,7 +261,7 @@ namespace
         // itself survive this table, and no LLVM option spelling appears in it.
         AllowedArg { .spelling = "m", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator },
         AllowedArg {
-            .spelling = "mllvm", .families = DriverFamily::Any, .value = ArgValue::NoPathSeparator, .rule = ArgRule::Deny },
+            .spelling = "mllvm", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
         AllowedArg { .spelling = "arch:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
         AllowedArg { .spelling = "favor:", .families = DriverFamily::Msvc, .value = ArgValue::NoPathSeparator },
 
@@ -584,6 +598,143 @@ namespace
         AllowedArg { .spelling = "trigraphs", .families = DriverFamily::Any },
         AllowedArg { .spelling = "nostdinc", .families = DriverFamily::Any },
         AllowedArg { .spelling = "nostdinc++", .families = DriverFamily::Any },
+
+        // -- refusals STATED, not merely unlisted ------------------------------
+        //
+        // Every row below was already refused, by being absent from the table above.
+        // Absence and refusal are the same answer for as long as nothing else is
+        // consulted -- and #293 makes something else consulted, because an operator
+        // may extend this list with `--allow-compile-arg`. An extension is only ever
+        // allowed to reach a flag this build has not heard of; the paragraph at the
+        // head of this table has always enumerated a class that must NEVER be
+        // reachable, and until these rows existed there was no way for
+        // `IsAcceptableJobArgument` to tell the two apart. It is the rulebook's own
+        // recurring shape: a rule stated in prose that nothing can read.
+        //
+        // A `Deny` row returns immediately, above the operator list, so naming one of
+        // these in a configuration file changes nothing. That is what makes "operator
+        // entries EXTEND, never replace" a property of the code rather than a comment.
+        //
+        // `AnySuffix` rather than `NoPathSeparator` on every one: a refusal must not
+        // be escapable by the shape rule that exists to narrow an ALLOW. `-fplugin=x`
+        // carries no separator and `-fplugin=/tmp/x.so` does, so a `NoPathSeparator`
+        // deny would match the first and let the SECOND fall through -- refusing the
+        // harmless-looking spelling and admitting the one that names a payload.
+        //
+        // -- the program-invoking and code-loading options #240 is about
+        AllowedArg {
+            .spelling = "wrapper", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "fplugin", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "fpass-plugin", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "fmodule-mapper",
+                     .families = DriverFamily::Any,
+                     .value = ArgValue::AnySuffix,
+                     .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "plugin", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "specs", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // The sub-tool pass-throughs. `-Xclang -load x.so` is two arguments and only
+        // the second names the payload, so BOTH halves are refused: a rule that
+        // stopped one of them would be a rule an operator could complete by allowing
+        // the other.
+        AllowedArg {
+            .spelling = "Xclang", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "Xassembler", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "Xlinker", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Xpreprocessor",
+                     .families = DriverFamily::Any,
+                     .value = ArgValue::AnySuffix,
+                     .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "load", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // MSVC's own two.
+        AllowedArg {
+            .spelling = "link", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "analyze", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+
+        // -- the path-valued options, which name a file on the WORKER
+        //
+        // A preprocessed translation unit has its headers inlined, so none of these
+        // can be a legitimate part of a dispatched compile: what they would reach is
+        // this machine's filesystem, not the client's build. The operator match is
+        // additionally shape-checked, so a value CARRYING a separator is refused
+        // whatever it is spelled -- these rows are what closes the relative spelling
+        // (`-I.`, `/Foout.obj`) that the shape rule cannot see.
+        AllowedArg { .spelling = "B", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "I", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "include", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "imacros", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "idirafter", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "iquote", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "isystem", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "isysroot", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // `--sysroot=` reaches here with ONE introducer stripped, so the row keeps the
+        // second dash. Spelling it `sysroot` would match nothing and read as coverage.
+        AllowedArg {
+            .spelling = "-sysroot", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // MSVC's file options, enumerated rather than denied as a blanket `F`: `/FC`
+        // and `/FS` are ordinary and allowed above, and a prefix row would refuse them.
+        AllowedArg { .spelling = "AI", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "FA", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "FI", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "FR", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fa", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fd", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fe", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fi", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fm", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fo", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fp", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fr", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "Fx", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // The precompiled-header family. `ProducesSideArtefact` already refuses `/Yc`
+        // because it WRITES one; these refuse the rest of the family, which reads one
+        // off this machine.
+        AllowedArg { .spelling = "Y", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+
+        // -- the flags that make the compile write a SECOND artefact
+        //
+        // `ProducesSideArtefact` is the maintained table for this class and is asked
+        // first, but it answers about the ones a compile is REFUSED for outright; these
+        // are the ones this table refused by not listing them, each with a sentence in
+        // `CompileJob_test.cpp` explaining why. Not a security class -- nothing here
+        // runs a program -- and worse in the way this repository cares about most: only
+        // the object comes back, so admitting one produces an object that names a file
+        // its client never receives, under a correct key, and is then shared.
+        AllowedArg {
+            .spelling = "gsplit-dwarf", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "gstabs", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        // The whole profile family, in both directions: `-fprofile-generate` writes a
+        // `.gcda` and `-fprofile-use=` reads one, both at paths the driver derives
+        // rather than at anything on the command line.
+        AllowedArg {
+            .spelling = "fprofile", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg {
+            .spelling = "fcoverage", .families = DriverFamily::Any, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "ftest-coverage",
+                     .families = DriverFamily::Any,
+                     .value = ArgValue::AnySuffix,
+                     .rule = ArgRule::Deny },
+        // MSVC's separate-PDB debug formats. `/Z7` is allowed above and is the whole
+        // reason these two are not: it puts the debug information IN the object, which
+        // is the only place a hit can reproduce it. `RemoteCompileArgs` refuses a
+        // command line carrying one (`MsvcSharedPdb`), and this is the worker's own
+        // answer for a client that never asked it.
+        AllowedArg { .spelling = "Zi", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
+        AllowedArg { .spelling = "ZI", .families = DriverFamily::Msvc, .value = ArgValue::AnySuffix, .rule = ArgRule::Deny },
     };
 
     // The other half of the stated extent. Adding a row past it is a compile error
@@ -592,6 +743,17 @@ namespace
     // set without a diagnostic. An empty spelling is exactly what such a row has.
     static_assert(std::ranges::none_of(AllowedArgs, [](AllowedArg const& row) { return row.spelling.empty(); }),
                   "AllowedArgs' stated extent must equal its row count -- an empty row is a padded one");
+
+    // `AnySuffix` turns the shape rule OFF, which is right for a refusal and would be
+    // a hole in an allowance: an `Allow` row carrying it would admit its own flag with
+    // any value at all, path separators included, which is exactly the class the
+    // `NoPathSeparator` rule exists to keep out. Stated as a table guard rather than as
+    // a sentence on the enumerator, because a sentence cannot fail a build.
+    static_assert(std::ranges::all_of(AllowedArgs,
+                                      [](AllowedArg const& row) {
+                                          return row.value != ArgValue::AnySuffix || row.rule == ArgRule::Deny;
+                                      }),
+                  "ArgValue::AnySuffix is for Deny rows only -- on an Allow row it disables the shape rule");
 
     /// Whether an allowlist row matches an argument.
     /// @param row The row.
@@ -606,6 +768,8 @@ namespace
             return body == row.spelling;
         if (!body.starts_with(row.spelling))
             return false;
+        if (row.value == ArgValue::AnySuffix)
+            return true;
         // The shape rule, composed inside the prefix rather than deleted with it.
         return !body.contains('/') && !body.contains('\\');
     }
@@ -636,7 +800,7 @@ JobError JobError::RejectedArgumentNaming(std::string_view argument)
                                             named) };
 }
 
-bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver)
+bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver, std::span<std::string const> operatorAllowed)
 {
     if (arg.empty())
         return true; // an empty argument names nothing and reaches no file
@@ -687,7 +851,34 @@ bool IsAcceptableJobArgument(std::string_view arg, DriverSpec const& driver)
             return false;
         allowed = true;
     }
-    return allowed;
+    if (allowed)
+        return true;
+
+    // Operator extensions, and the ORDER is the security property rather than a
+    // preference. A `Deny` row returned above, a side-artefact flag returned above
+    // that, and an argument that introduces no option returned before the loop -- so
+    // by here the table has refused nothing and merely failed to RECOGNISE this
+    // spelling. That is the only thing a site may extend, which is what "operator
+    // entries extend, never replace" means written as code instead of as a comment.
+    //
+    // **The `Deny` rows for the program-invoking class exist because of this line.**
+    // Until #293 those options were refused by ABSENCE, which is the same answer as
+    // *unrecognised* for as long as nothing else is consulted; this is the something
+    // else. The table now states them, so an operator naming `-fplugin=evil` is
+    // refused by a row rather than admitted by a gap.
+    //
+    // Whole-argument and exact. A prefix entry would re-admit the very families the
+    // `-f` space is enumerated to exclude, and the operator who wanted one flag would
+    // have opened a family.
+    if (std::ranges::find(operatorAllowed, arg) == operatorAllowed.end())
+        return false;
+
+    // And the shape rule applies to an operator's entry exactly as it applies inside
+    // an `Allow` prefix. Defence in depth for the one class a configuration file can
+    // reach: `--allow-compile-arg` refuses a separator when it is PARSED, so this is
+    // the second of two doors, and a value-bearing spelling only ever reaches this
+    // function through the wire.
+    return !body.contains('/') && !body.contains('\\');
 }
 
 std::string SafeSourceName(std::string_view sourceName)
@@ -1089,6 +1280,12 @@ void CompileJobRunner::ReplaceToolchains(std::map<std::string, std::string> tool
     _survey = ToolchainSurvey::Completed();
 }
 
+void CompileJobRunner::ReplaceExtraAllowedArgs(std::vector<std::string> spellings)
+{
+    std::unique_lock const guard { _extraAllowedArgsMutex };
+    _extraAllowedArgs = std::move(spellings);
+}
+
 std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& job)
 {
     // The compiler comes from THIS worker's configuration, keyed by the fingerprint
@@ -1149,8 +1346,16 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // secured by code running on the caller's machine -- and the client's check is a
     // shape rule that admits every program-invoking option carrying no path
     // separator, which is exactly the surface this must not expose.
-    if (auto const offender =
-            std::ranges::find_if(job.args, [&](std::string const& arg) { return !IsAcceptableJobArgument(arg, driver); });
+    // Copied out under the lock rather than held by reference, for the reason the
+    // toolchain lookup copies: a reload may replace the set while this job is still
+    // deciding, and a job must be judged by one set rather than by two halves of two.
+    std::vector<std::string> extraAllowed;
+    {
+        std::shared_lock const guard { _extraAllowedArgsMutex };
+        extraAllowed = _extraAllowedArgs;
+    }
+    if (auto const offender = std::ranges::find_if(
+            job.args, [&](std::string const& arg) { return !IsAcceptableJobArgument(arg, driver, extraAllowed); });
         offender != job.args.end())
         return std::unexpected(JobError::RejectedArgumentNaming(*offender));
 
