@@ -1213,6 +1213,18 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         // the defaults -- a worksheet that silently describes a different node from
         // the one the operator asked about, which is the misleading-document failure
         // this flag exists to prevent.
+        {
+            .primary = "--seed-config",
+            .arity = Arity::Value,
+            .operand = "=<path>",
+            .apply = AssignFrom<&NodeConfig::seedConfigTemplate, ParseText>(),
+            .description = "copy <path> to the machine-wide config location, but\n"
+                           "only when no config is there yet, then exit (used by\n"
+                           "the installer; needs the same privileges as writing\n"
+                           "that location). This worker seeds its OWN file: the\n"
+                           "destination comes from the table this binary's startup\n"
+                           "lookup walks, so the two cannot drift apart.",
+        },
         { .primary = "--print-surfaces",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::printSurfaces>(),
@@ -1265,6 +1277,8 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--migrate-cache",
           "converts the store and exits; a key would convert at every start, on a store "
           "that after the first run has nothing left to convert" },
+        { "--seed-config",
+          "installs the file a key would be read from, then exits; a key for it would re-seed at every start" },
         { "--print-surfaces", "prints the ports and exits; a key would print them instead of serving them" },
         { "--cluster-status", "asks a running cluster a question and exits" },
         { "--cluster-set", "changes a running cluster's settings and exits" },
@@ -2291,6 +2305,11 @@ std::span<NodePublicPathFlag const> NodePublicPathFlags() noexcept
         { .flag = "--cluster-dir", .why = "a directory of Raft state: log entries and snapshots, no credential" },
         { .flag = "--cache-dir", .why = "compiled objects, which the fleet already shares" },
         { .flag = "--pidfile", .why = "a process id, which every process list already publishes" },
+        // The shipped TEMPLATE, which is payload: it is the annotated reference every
+        // package installs, identical on every machine, and it holds no value at all --
+        // every setting in it is a comment. What is written FROM it can hold a secret,
+        // and that file is `--config`, one row above, where the question is asked.
+        { .flag = "--seed-config", .why = "a shipped reference template in which every setting is a comment" },
         // Explicitly classified rather than left off, because it is the one an
         // author would reach for by symmetry with `--tls-key`. A certificate is
         // handed to every client during the handshake, so it is public BY

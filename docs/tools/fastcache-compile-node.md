@@ -1357,11 +1357,12 @@ root:fastcache-node` for a file that holds one. Where `--install-service` is the
 registration mechanism, pass `--config=<path>` alongside it: what gets baked into
 the launch arguments is then the path, not the secret.
 
-On macOS and Windows there is no packaged copy of that file yet — the `.pkg`
-and the MSI have no conffile mechanism, and the seeding their installers do
-handles `fastcached.yaml` alone
-([#397](https://github.com/LASTRADA-Software/fastcached/issues/397)) — so write
-the file yourself and name it with `--config`.
+Every package ships that file, on every platform. Neither a `.pkg` nor an MSI
+has a conffile mechanism, so their equivalent is a `.default` template plus a
+seed-once step that copies it the first time and never again — which is what
+lets your edits survive an upgrade. The worker seeds its own: the destination
+comes from the same lookup table its startup reads, so the path the installer
+writes and the path the worker reads cannot drift apart.
 
 **macOS scope.** `--service-scope=user` registers a LaunchAgent that runs as
 you, which is the per-developer case. `--service-scope=system` registers a

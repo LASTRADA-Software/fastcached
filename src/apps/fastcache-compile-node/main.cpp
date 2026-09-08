@@ -1897,6 +1897,32 @@ int main(int argc, char** argv)
         return ExitUsage;
     }
 
+    // Seeding, ahead of the startup table for `--print-surfaces`' reason: it is an
+    // INSTALLER step, run before this machine has a working configuration at all, so
+    // refusing it until the configuration is already valid would make it unusable at
+    // the only moment it is wanted.
+    //
+    // The WORKER seeds its own file. `fastcached --seed-config` derives its
+    // destination from `DaemonApplicationName`, so it can only ever write the daemon's
+    // — which is why the MSI shipped no worker configuration and the .pkg shipped none
+    // either (#397). Deriving it here from this binary's own application name is what
+    // makes the seeded path and the path the startup lookup walks one answer rather
+    // than two that agree until somebody edits one.
+    if (!cfg.seedConfigTemplate.empty())
+    {
+        auto const seeded =
+            SystemConfigPath(SystemConfigPathProbe {}, NodeApplicationName).and_then([&](auto const& destination) {
+                return SeedConfigFile(cfg.seedConfigTemplate, destination, DirectoryPolicy::AdministratorsOnly);
+            });
+        if (!seeded.has_value())
+        {
+            consoleLogger->Logf(LogLevel::Error, "{}", seeded.error().ToString());
+            return ExitUsage;
+        }
+        consoleLogger->Logf(LogLevel::Info, "{}", SeedOutcomeSentence(*seeded, cfg.seedConfigTemplate));
+        return ExitOk;
+    }
+
     // Service registration, before anything that costs time. A misconfiguration is
     // decided in microseconds while a toolchain fingerprint takes seconds, which is
     // the same cheap-and-fallible-first ordering the socket-activation check follows.

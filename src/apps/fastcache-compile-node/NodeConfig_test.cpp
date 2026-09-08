@@ -285,11 +285,15 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     constexpr auto NotWorkerState = std::to_array<std::string_view>({
         "--install-service",   // a service must never re-install itself
         "--uninstall-service", //
-        "--service-scope",     // install-time only; not a thing the worker runs with
-        "--service-name",      // emitted unconditionally, above the table
-        "--daemon",            // carried as ServiceSpec::daemonFlag, not an argument
-        "--help",              //
-        "--version",           //
+        // Installs the file a registration would be READ from, then exits (#397). A
+        // registration carrying it would re-seed at every start, which is the same
+        // objection `--install-service` carries and the reason both are one-shot.
+        "--seed-config",
+        "--service-scope", // install-time only; not a thing the worker runs with
+        "--service-name",  // emitted unconditionally, above the table
+        "--daemon",        // carried as ServiceSpec::daemonFlag, not an argument
+        "--help",          //
+        "--version",       //
         // The one field with no safe representation in launch arguments: a
         // supervisor records them where every local account can read them, so
         // emitting the secret would publish it to exactly the accounts it exists
@@ -4384,4 +4388,31 @@ TEST_CASE("AllowlistAnnouncement says what changed, and stays quiet when nothing
         auto const reordered = AllowlistAnnouncement(AllowlistMoment::Reload, Args { "-a1", "-b2" }, Args { "-b2", "-a1" });
         CHECK(reordered.has_value());
     }
+}
+
+TEST_CASE("The worker parses --seed-config, and no file may carry it", "[node][config]")
+{
+    // #397. The verb exists on the WORKER rather than being `fastcached --seed-config`
+    // pointed at a different path, because that action derives its destination from
+    // `DaemonApplicationName` and can therefore only ever write the daemon's file.
+    // That is why the MSI shipped no worker configuration at all: there was no second
+    // action to add, only a first one that could not be reused.
+    auto const parsed = ParseNodeArgv({ "--seed-config=/opt/etc/fastcache-compile-node.yaml.default" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->seedConfigTemplate == "/opt/etc/fastcache-compile-node.yaml.default");
+
+    // Empty means the verb was not asked for, which is what makes an ordinary start
+    // distinguishable from a seeding run without a second flag to keep in step.
+    CHECK(ParseNodeArgv({}).value().seedConfigTemplate.empty());
+
+    // A one-shot verb may carry no yamlKey: a file is read at every start, so a key
+    // for this one would re-seed at every start -- an installer step replayed forever.
+    // The compile-time guard beside the table proves it for the build; this states it
+    // where somebody reading the tests will find it, and pins that the row is on the
+    // exclusion list with a REASON rather than merely absent from the key column.
+    auto const rows = NodeOptions();
+    auto const row = std::ranges::find_if(rows, [](auto const& spec) { return spec.primary == "--seed-config"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->yamlKey.empty());
+    CHECK(row->reloadable == Reloadable::No);
 }

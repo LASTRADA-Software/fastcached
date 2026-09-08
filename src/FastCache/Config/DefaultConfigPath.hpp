@@ -302,4 +302,21 @@ enum class DirectoryPolicy : std::uint8_t
                                                                      std::filesystem::path const& destination,
                                                                      DirectoryPolicy policy);
 
+/// What to tell an operator about @p outcome, naming @p destination.
+///
+/// Here rather than at a call site because there are now TWO binaries seeding
+/// (#397): the daemon's own file and the worker's. Both must say the same thing
+/// about the same three outcomes, and the third one — an upgrade that REPAIRED a
+/// world-readable config's permissions — is the one an operator most needs to
+/// hear, because it is the only case where seed-once modified something. A second
+/// copy of that table is a second chance to describe it as though nothing
+/// happened.
+///
+/// Driven off an `EnumTable` in enumerator order, so a fourth outcome is a row
+/// rather than an arm nobody adds.
+/// @param outcome What `SeedConfigFile` answered.
+/// @param destination The path it answered about.
+/// @return One sentence, with no leading program name — the caller's logger owns that.
+[[nodiscard]] std::string SeedOutcomeSentence(SeedOutcome outcome, std::filesystem::path const& destination);
+
 } // namespace FastCache

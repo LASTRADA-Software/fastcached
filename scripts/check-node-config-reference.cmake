@@ -4,7 +4,7 @@
 # configuration file can carry, and no setting it cannot.
 #
 # `NodeOptions()` is the single source of truth for what the file accepts -- the
-# `yamlKey` column drives the parse -- and `packaging/linux/fastcache-compile-node.yaml`
+# `yamlKey` column drives the parse -- and `packaging/config/fastcache-compile-node.yaml`
 # is what an operator actually reads. Nothing links the two. A flag added with a
 # key and no line in the reference is a setting that works and that nobody can
 # find; a line in the reference for a key the table dropped is worse, because an
@@ -49,7 +49,7 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
 endif()
 
 set(_table "${FASTCACHED_SOURCE_DIR}/src/apps/fastcache-compile-node/NodeConfig.cpp")
-set(_reference "${FASTCACHED_SOURCE_DIR}/packaging/linux/fastcache-compile-node.yaml")
+set(_reference "${FASTCACHED_SOURCE_DIR}/packaging/config/fastcache-compile-node.yaml")
 
 foreach(_file "${_table}" "${_reference}")
     if(NOT EXISTS "${_file}")

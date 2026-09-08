@@ -1862,11 +1862,32 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "-DFASTCACHED_TABLE=src/FastCache/Config/CliParser.cpp"
-        "-DFASTCACHED_REFERENCE=packaging/linux/fastcached.yaml"
+        "-DFASTCACHED_REFERENCE=packaging/config/fastcached.yaml"
         "-DFASTCACHED_LABEL=fastcached"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-config-reference.cmake"
 )
 set_tests_properties("daemon-config-reference" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# Every reference configuration under packaging/config/ must reach the Linux,
+# macOS and Windows payloads. `fastcache-compile-node.yaml` reached only Linux for
+# four releases (#397) and nothing said so: a file missing from two of three
+# payloads reads exactly like a file nobody needs.
+#
+# `docs-subject` as well as `hygiene`, for the two config-reference checks' reason:
+# its SUBJECT is an operator-facing document, and a document drifts by being
+# edited, so a change touching no code must still run it.
+add_test(
+    NAME "config-reference-reach"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-config-reference-reach.cmake"
+)
+set_tests_properties("config-reference-reach" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene;docs-subject"
     TIMEOUT 60

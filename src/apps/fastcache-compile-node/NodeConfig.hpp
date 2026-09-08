@@ -652,6 +652,17 @@ struct NodeConfig
     /// this invocation would bind, and a list showing `127.0.0.1` for a node started
     /// with `--listen-node 0.0.0.0:6674` would tell them a surface is loopback-only
     /// when it is open to the network.
+    /// Template `--seed-config` copies to the machine-wide config location.
+    ///
+    /// Empty means the verb was not asked for. The WORKER seeds its own file
+    /// rather than `fastcached` seeding it, and that is the same argument the
+    /// daemon's own action carries: the destination comes from the table this
+    /// binary's startup lookup walks (`NodeApplicationName`), so the seeded path
+    /// and the read path cannot drift. A packaging format with no conffile
+    /// mechanism -- the MSI, the .pkg -- has no other way to ship a default that
+    /// survives its own upgrades (#397).
+    std::string seedConfigTemplate;
+
     bool printSurfaces { false };
 
     /// What to do to the cluster instead of serving, when anything.

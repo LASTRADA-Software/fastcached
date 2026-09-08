@@ -952,10 +952,4 @@ boot, silently, because a registration replays its command line forever. So:
   file on Windows today, so a narrower grant can be observed neither to work nor to
   break.
 
-- **[#397](https://github.com/LASTRADA-Software/fastcached/issues/397)** — the
-  worker's configuration file is packaged on Linux only. A `.pkg` and an MSI
-  have no conffile mechanism, so their equivalent is a `.default` plus a postinstall
-  that seeds the live file once — and `macos/seed-config.sh.inc` handles exactly one
-  file, appending a `storage_path:` the worker does not have. On those platforms the
-  worker is configured by `--install-service --config=<path>`.
 
