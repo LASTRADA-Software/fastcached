@@ -120,6 +120,23 @@ inline constexpr WireVersion CurrentVersion = 5;
 /// only one version exists; widen the range when a second one ships and this
 /// build can still decode the older shape.
 ///
+/// **The consequence is a flag day, and it is now written down for operators**
+/// rather than left to be discovered during a rollout:
+/// `docs/operations/upgrading-a-fleet.md` carries the supported stop-upgrade-start
+/// procedure and the four counters a mismatch is visible on. That page is the
+/// operator-facing half of what this constant decides, so a change here that opens a
+/// compatibility window updates it in the same commit — a window nobody is told about
+/// buys an operator nothing.
+///
+/// The argument below rests on #332's position that backwards compatibility is not
+/// owed before the production-ready declaration. **That licence expires at the
+/// declaration**, and the release that creates fleets is the release that retires the
+/// premise a flag day rests on
+/// ([#998](https://github.com/LASTRADA-Software/fastcached/issues/998)). Documenting
+/// the flag day is what that ticket calls the cheapest honest option; widening the
+/// range per verb — `Op::Compile` has exact arity and is the binding constraint, the
+/// cache verbs are cheaper — remains open and is a decision rather than a defect.
+///
 /// **It moved with `CurrentVersion` for version 3, and that is the whole
 /// negotiation.** `Status::Progress` is a change to the REPLY, which carries a
 /// status byte and a length and no kind — so the "step over what you do not know"
