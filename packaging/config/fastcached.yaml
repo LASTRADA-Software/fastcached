@@ -1,6 +1,21 @@
 # fastcached configuration
 # SPDX-License-Identifier: Apache-2.0
 #
+# ONE FILE, EVERY PLATFORM. This is not a Linux file: the same bytes are the
+# dpkg conffile / rpm %config on Linux, the seeded `.default` template inside
+# the macOS .pkg, and the seeded template inside the Windows MSI. It lives in
+# `packaging/config/` rather than `packaging/linux/` for exactly that reason --
+# a name that says Linux is a name that gets edited as though only Linux read
+# it, and this file's drift would then be invisible on the two platforms that
+# have no maintainer looking at it.
+#
+# So: NO ABSOLUTE PATH MAY BE LIVE HERE. A path belongs in a comment, and where
+# it differs per platform every platform's spelling is named side by side (the
+# lookup table below does this). A setting that must be live AND per-platform is
+# not written here at all -- the installer appends it while seeding, because the
+# installer is the only thing that knows the prefix. `ctest -R config-reference-paths`
+# enforces the first half; the second is what makes the first possible.
+#
 # Every setting below is commented out and shows the built-in default, so an
 # untouched file behaves exactly like running `fastcached` with no flags.
 # Uncomment only what you actually want to change.

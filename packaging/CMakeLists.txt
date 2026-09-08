@@ -66,7 +66,7 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
         "linux/fastcached-user.service|${FASTCACHED_SYSTEMD_USER_DIR}|data|fastcached.service|Runtime"
         "linux/fastcached.sysusers|${FASTCACHED_SYSUSERS_DIR}|data|fastcached.conf|Runtime"
         "linux/fastcached.tmpfiles|${FASTCACHED_TMPFILES_DIR}|data|fastcached.conf|Runtime"
-        "linux/fastcached.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcached.yaml|Runtime"
+        "config/fastcached.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcached.yaml|Runtime"
         # The compile worker. Its socket unit is what an operator enables, so the
         # service carries no [Install] and is pulled in by the socket -- see the
         # units themselves. The account is its own rather than fastcached's,
@@ -80,14 +80,14 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
         # work at all, and an upgrade that reset it would un-register the worker
         # silently. The unit's ExecStart names this exact path.
         #
-        # Linux only. The .pkg and the MSI have no conffile mechanism, so their
-        # equivalent is a `.default` copy plus a postinstall that seeds the live
-        # file once -- and macos/seed-config.sh.inc handles exactly one file,
-        # fastcached.yaml, appending a `storage_path:` the worker does not have.
-        # Generalising it is #397; on those platforms the worker is
-        # configured by `--install-service --config=<path>`, which registers the
-        # path and reads the current file at every start.
-        "linux/fastcache-compile-node.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcache-compile-node.yaml|Runtime"
+        # Every platform, since #397. The .pkg and the MSI have no conffile
+        # mechanism, so their equivalent is a `.default` copy plus a seed-once
+        # step -- macos/seed-config.sh.inc walks a TABLE of files rather than one
+        # hardcoded name, and the MSI runs `fastcache-compile-node --seed-config`
+        # so the destination comes from the worker's own application name rather
+        # than the daemon's. It was Linux-only for four releases and nothing said
+        # so; `ctest -R config-reference-reach` is what says so now.
+        "config/fastcache-compile-node.yaml|${FASTCACHED_SYSCONF_DIR}|config|fastcache-compile-node.yaml|Runtime"
         #
         # What used to be here was `compile-node.env`, a shell fragment of
         # command-line arguments the unit expanded into ExecStart. It is gone
@@ -104,7 +104,15 @@ elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
         # %config(noreplace) equivalent — so shipping it would silently discard
         # the operator's edits on upgrade. The Runtime postinstall seeds the real
         # file from this .default copy only when it is absent.
-        "linux/fastcached.yaml|${FASTCACHED_MACOS_PREFIX}/etc|data|fastcached.yaml.default|Runtime"
+        "config/fastcached.yaml|${FASTCACHED_MACOS_PREFIX}/etc|data|fastcached.yaml.default|Runtime"
+        # The worker's reference, on exactly the same terms and from exactly the
+        # same file the Linux package installs (#397). It shipped nowhere but
+        # Linux until this row, so a macOS operator configuring a worker had no
+        # annotated reference to start from and no documented home for
+        # `requirepass:` -- which on a worker is the one place its token may live,
+        # since a supervisor records launch arguments where every local account
+        # can read them.
+        "config/fastcache-compile-node.yaml|${FASTCACHED_MACOS_PREFIX}/etc|data|fastcache-compile-node.yaml.default|Runtime"
         "macos/paths.d.fastcached|etc/paths.d|data|fastcached|Runtime"
         "${CMAKE_CURRENT_BINARY_DIR}/macos/fastcached-uninstall|${FASTCACHED_MACOS_PREFIX}/bin|program|fastcached-uninstall|Runtime"
     )
@@ -271,9 +279,16 @@ if(WIN32)
     #
     # etc/ mirrors the macOS layout (<prefix>/etc/fastcached.yaml.default) so
     # both packages spell the template's home the same way.
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/linux/fastcached.yaml"
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcached.yaml"
         DESTINATION "etc"
         RENAME "fastcached.yaml.default"
+        COMPONENT Runtime
+    )
+    # The worker's reference, same terms, same source file (#397). Seeded by the
+    # same custom action, which takes the pair rather than one hardcoded name.
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/config/fastcache-compile-node.yaml"
+        DESTINATION "etc"
+        RENAME "fastcache-compile-node.yaml.default"
         COMPONENT Runtime
     )
 

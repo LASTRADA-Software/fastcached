@@ -142,6 +142,7 @@ for expected in opt/fastcached/bin/fastcached \
                 opt/fastcached/bin/fastcache-compile-node \
                 opt/fastcached/bin/fastcached-uninstall \
                 opt/fastcached/etc/fastcached.yaml.default \
+                opt/fastcached/etc/fastcache-compile-node.yaml.default \
                 etc/paths.d/fastcached; do
     grep -qx "$expected" <<<"$payload" || fail "missing from payload: $expected"
 done
@@ -150,6 +151,8 @@ done
 # its payload on every install, so shipping it would discard operator edits.
 ! grep -qx "opt/fastcached/etc/fastcached.yaml" <<<"$payload" \
     || fail "the live fastcached.yaml is in the payload; an upgrade would overwrite it"
+! grep -qx "opt/fastcached/etc/fastcache-compile-node.yaml" <<<"$payload" \
+    || fail "the live fastcache-compile-node.yaml is in the payload; an upgrade would overwrite it"
 
 # Third-party build artefacts must not leak into a package rooted at /.
 ! grep -qE '^(include|lib)/' <<<"$payload" \
@@ -238,6 +241,34 @@ install_log="$(sudo installer -pkg "$pkg" -applyChoiceChangesXML "$choices" -tar
 [[ -x "${PREFIX}/bin/fastcache-compile-node" ]] || fail "no ${PREFIX}/bin/fastcache-compile-node"
 [[ -x "${PREFIX}/bin/fastcached-uninstall" ]]   || fail "no uninstaller"
 [[ -f "${PREFIX}/etc/fastcached.yaml" ]]        || fail "postinstall did not seed fastcached.yaml"
+# The worker's, which reached no non-Linux package at all until #397. Its own line
+# rather than folded into a loop with the daemon's: they are seeded by one table now,
+# and a loop would pass if that table ever shrank back to the single entry it tests.
+[[ -f "${PREFIX}/etc/fastcache-compile-node.yaml" ]] \
+    || fail "postinstall did not seed fastcache-compile-node.yaml"
+# The daemon's appendix belongs to the daemon's file ALONE. A seeding loop that
+# appended it to every file would give the worker a `storage_path:` it has no setting
+# for, and the worker would then refuse to start naming a key it has never heard of --
+# which is the failure a shared loop makes easy and a per-file appendix does not.
+#
+# READ WITH sudo. By the time this runs the daemon's config is `-rw-r----- root` --
+# the mode assertion further down says exactly that, and the reinstall check writes
+# to it with `sudo tee` for the same reason -- so an unprivileged grep here fails on
+# PERMISSION and reports it as content that is not there. Measured: this assertion
+# took `Package (macOS .pkg)` red on its first run for that reason and not for the
+# property it is about, while every existing check passed because they use `stat`,
+# which needs no read.
+sudo grep -q '^storage_path:' "${PREFIX}/etc/fastcached.yaml" \
+    || fail "the daemon's seeded config has no live storage_path"
+
+# A negative assertion needs a POSITIVE CONTROL or it passes for the wrong reason: a
+# grep that cannot open the file also fails to match, so "carries no storage_path"
+# and "could not be read at all" are one green. The reference is entirely comments,
+# so a `#` must be found; only then does the absence below mean anything.
+sudo grep -q '^#' "${PREFIX}/etc/fastcache-compile-node.yaml" \
+    || fail "the worker's seeded config could not be read, so the next assertion would prove nothing"
+! sudo grep -q '^storage_path:' "${PREFIX}/etc/fastcache-compile-node.yaml" \
+    || fail "the worker's seeded config carries storage_path, a setting it does not have"
 
 # The worker's account comes from the RUNTIME component, so it must exist
 # whichever launchd choice was made for fastcached -- including the per-user
@@ -438,11 +469,33 @@ grep -q "<string>${NODE_ACCOUNT}</string>" "$node_plist" \
 # Every flag in ProgramArguments is re-read by the worker at the next start, so
 # one its own parser rejects is a job that registers and then fails forever. The
 # installer used to bake in the DAEMON's --config and --storage for any service,
-# and the worker accepts neither -- so this is the assertion that the
-# registration survives its own parser, at the level where it actually matters.
-for rejected in --config --storage; do
+# and the worker accepted neither.
+#
+# **`--config` is no longer one of them, and the change of direction is the point.**
+# The worker has accepted `--config` since #291, and since #397 the package ships
+# its file, so `WithScopeDefaults` now applies the system-scope config default and
+# the registration carries `--config=<the worker's own file>`. Asserting its ABSENCE
+# would now fail on a correct install -- and, worse, would have gone on passing for
+# the wrong reason on every release where the file was simply missing.
+#
+# So the hazard the old line was defending -- a worker handed the DAEMON's config --
+# is asserted DIRECTLY below instead of by proxy. `--storage` stays a refusal: the
+# worker has no such flag at all.
+! grep -q -- "--storage" "$node_plist" \
+    || fail "the worker plist carries --storage, which fastcache-compile-node does not accept"
+
+# The positive half. `packagedConfig` is looked up under the SPEC's application
+# name, and hardcoding the daemon's is a bug this project has already had: the
+# worker was handed a file it cannot parse and, once the package tightens that file
+# to 0640 root:_fastcached, cannot even read.
+grep -q -- "--config=${PREFIX}/etc/fastcache-compile-node.yaml" "$node_plist" \
+    || fail "the worker plist does not carry --config for its OWN packaged file"
+! grep -q -- "--config=${PREFIX}/etc/fastcached.yaml" "$node_plist" \
+    || fail "the worker plist carries the DAEMON's config; a worker cannot parse it and its account cannot read it"
+
+for rejected in --requirepass; do
     ! grep -q -- "$rejected" "$node_plist" \
-        || fail "the worker plist carries ${rejected}, which fastcache-compile-node does not accept"
+        || fail "the worker plist carries ${rejected}, which publishes a secret to every local account"
 done
 
 # Deliberately LEFT REGISTERED. Step 6 then exercises the uninstaller against a

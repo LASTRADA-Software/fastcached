@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
@@ -417,6 +418,28 @@ std::expected<SeedOutcome, ConfigError> SeedConfigFile(std::filesystem::path con
     }
 
     return SeedOutcome::Written;
+}
+
+std::string SeedOutcomeSentence(SeedOutcome outcome, std::filesystem::path const& destination)
+{
+    // A table rather than a ternary, because there are three outcomes and the third
+    // is the one an operator most needs to hear: an upgrade that repaired a config's
+    // permissions did MODIFY something, where the other two did not.
+    struct SeedVerb
+    {
+        SeedOutcome outcome;
+        std::string_view text;
+    };
+
+    static constexpr EnumTable<SeedOutcome, SeedVerb> seedVerbs { {
+        { .outcome = SeedOutcome::Written, .text = "wrote" },
+        { .outcome = SeedOutcome::AlreadyPresent, .text = "kept existing" },
+        { .outcome = SeedOutcome::AlreadyPresentRestricted,
+          .text = "kept existing, and restricted to the administrative accounts and this machine's services," },
+    } };
+    static_assert(RowsInEnumeratorOrder(seedVerbs, &SeedVerb::outcome));
+
+    return std::format("{} {}", seedVerbs[static_cast<std::size_t>(outcome)].text, destination.string());
 }
 
 } // namespace FastCache

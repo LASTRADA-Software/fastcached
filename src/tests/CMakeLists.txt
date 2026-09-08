@@ -1862,13 +1862,56 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "-DFASTCACHED_TABLE=src/FastCache/Config/CliParser.cpp"
-        "-DFASTCACHED_REFERENCE=packaging/linux/fastcached.yaml"
+        "-DFASTCACHED_REFERENCE=packaging/config/fastcached.yaml"
         "-DFASTCACHED_LABEL=fastcached"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-config-reference.cmake"
 )
 set_tests_properties("daemon-config-reference" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# Every reference configuration under packaging/config/ must reach the Linux,
+# macOS and Windows payloads. `fastcache-compile-node.yaml` reached only Linux for
+# four releases (#397) and nothing said so: a file missing from two of three
+# payloads reads exactly like a file nobody needs.
+#
+# `docs-subject` as well as `hygiene`, for the two config-reference checks' reason:
+# its SUBJECT is an operator-facing document, and a document drifts by being
+# edited, so a change touching no code must still run it.
+add_test(
+    NAME "config-reference-reach"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-config-reference-reach.cmake"
+)
+set_tests_properties("config-reference-reach" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# The WiX patch fragment's comments. An XML comment may not contain `--`, and every
+# flag this project documents is spelled with two of them -- so naming one in a
+# comment makes the fragment not well formed and takes `Package (Windows .msi)` red
+# with a parse error naming the line and not the reason. Measured: exactly that,
+# on a change whose subject was a configuration file.
+#
+# Runs anywhere, needs nothing, and closes the one failure mode in that file which
+# is invisible while reading. It does NOT validate the document; the Windows job
+# still does. See scripts/check-wix-fragment.cmake for why it is narrow on purpose.
+add_test(
+    NAME "wix-fragment"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-wix-fragment.cmake"
+)
+set_tests_properties("wix-fragment" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
     TIMEOUT 60
 )
 

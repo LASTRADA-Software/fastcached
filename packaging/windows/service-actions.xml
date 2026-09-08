@@ -106,6 +106,28 @@
                   Impersonate="no"
                   Return="ignore" />
 
+    <!-- The same for the worker, and it is the WORKER that runs it rather than
+         fastcached.exe with a different path. The seeding flag derives its
+         destination from the binary's own application name, so fastcached.exe can
+         only ever write the daemon's config wherever it is pointed. That is why
+         the MSI shipped no worker configuration at all until #397: there was no
+         second action to add, only a first one that could not be reused.
+
+         The flag is named in prose rather than spelled, because an XML comment
+         may not contain a double hyphen at all: writing it out makes this file
+         not well formed, and CPack's WiX step then fails with a parse error that
+         names the line and not the reason. The ExeCommand below carries the real
+         spelling, where it belongs.
+
+         Return="ignore" for the first action's reason: a machine that already has
+         a worker config is the ordinary upgrade. -->
+    <CustomAction Id="FastCacheNodeSeedConfig"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --seed-config=&quot;[INSTALL_ROOT]etc\fastcache-compile-node.yaml.default&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
     <!-- Directory + ExeCommand is a type 34 custom action, whose Target must be
          the FULL path to the executable, quoted when it contains spaces (it
          does: "C:\Program Files\fastcached\"). Directory= is NOT a working
@@ -208,7 +230,15 @@
       <!-- Register after the files are on disk (InstallFiles), since the
            action executes the installed binary. NOT REMOVE keeps it off the
            uninstall path; upgrades re-register with a refreshed command line. -->
-      <Custom Action="FastCachedInstallService" After="FastCachedSeedConfig"
+      <!-- Unconditional, unlike the worker's REGISTRATION below: seeding a
+           reference an operator can read costs nothing on a machine that will
+           never run a worker, and withholding it is how somebody who decides to
+           run one later has no annotated file to start from. The registration
+           still needs the two properties it cannot guess. -->
+      <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
+              Condition="NOT REMOVE" />
+
+      <Custom Action="FastCachedInstallService" After="FastCacheNodeSeedConfig"
               Condition="NOT REMOVE" />
 
       <Custom Action="FastCachedStartService" After="FastCachedInstallService"

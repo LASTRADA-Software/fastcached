@@ -214,7 +214,7 @@ fi
 # It is 240 lines nobody compiles, and a stray character in it is a package that
 # installs a worker which cannot start. Located relative to this script so the
 # check follows the file rather than a build layout.
-REFERENCE="$(dirname "$0")/../packaging/linux/fastcache-compile-node.yaml"
+REFERENCE="$(dirname "$0")/../packaging/config/fastcache-compile-node.yaml"
 if [ -f "$REFERENCE" ]; then
     expect_ok "the shipped reference configuration parses" "compile" "$SCHEDULER_FOR_STARTUP" \
         "--config=$REFERENCE"
