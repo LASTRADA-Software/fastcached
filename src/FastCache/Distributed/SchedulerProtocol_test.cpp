@@ -778,6 +778,37 @@ TEST_CASE("A peer that predates the cache record still registers", "[distributed
         CHECK_FALSE(tier.has_value());
 }
 
+TEST_CASE("A machine's display name crosses the wire into the fleet's view of it", "[distributed][scheduler][protocol]")
+{
+    // **The seam the service's own tests cannot see.** `SchedulerService_test` builds a
+    // `WorkerRegistration` in memory, so the name is already in the struct before
+    // anything is asserted -- deleting the line that carries it OFF the nested capacity
+    // record leaves that whole file green, measured. This is the case that fails.
+    //
+    // It rides in the capacity record because REGISTER's own arity is exact and fixed
+    // forever, which is where every node-wide fact this fleet reports has to go.
+    Fixture fixture;
+
+    auto capacity = CapacityToWire(NodeCapacity { .logicalCores = 8 });
+    capacity.displayName = "buildnode-3";
+
+    auto const registration = Wire::EncodeRegister(Wire::RegisterRequest {
+        .fingerprint = "gcc-14", .endpoint = "10.0.0.2:7100", .slots = 2, .acceptedCodecs = {}, .capacity = capacity });
+    REQUIRE(StatusOf(fixture.protocol.Answer(registration, Insider)) == Wire::Status::Ok);
+
+    auto const live = fixture.service.Workers().LiveWorkers();
+    REQUIRE(live.size() == 1);
+    CHECK(live.front().displayName == "buildnode-3");
+
+    // Round-tripped on its own too, and with the rest of the record still readable
+    // afterwards -- which is the half a new TRAILING field is most likely to break.
+    auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(capacity));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).displayName == "buildnode-3");
+    CHECK(Unwrap(back).logicalCores == 8);
+    CHECK(Unwrap(back).version == capacity.version);
+}
+
 TEST_CASE("A node's version rides the capacity record and survives the round trip",
           "[distributed][scheduler][protocol][version]")
 {

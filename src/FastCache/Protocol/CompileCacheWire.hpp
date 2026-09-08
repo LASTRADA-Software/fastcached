@@ -2270,6 +2270,24 @@ struct CapacityFields
     /// struct is returned by value, so a `string_view` here would dangle the moment
     /// the encoded temporary died.
     std::string toolchainLabel {};
+
+    /// What a person calls this machine, e.g. `buildnode-3`. Empty means "did not say".
+    ///
+    /// **A LABEL, and nothing may decide from it**
+    /// ([#1024](https://github.com/LASTRADA-Software/fastcached/issues/1024)). A node's
+    /// identity is minted into its state directory and is what the cluster admits and
+    /// counts votes against; this exists so an operator looking at that opaque id knows
+    /// which box to walk to. Nothing keys on it, compares it, routes by it or admits by
+    /// it -- and that is the whole reason it is safe to carry a value the hostname
+    /// supplies, which is mutable, not unique per node, and the very property the
+    /// identity was deliberately not built on. The moment anything decides from it,
+    /// every problem #1024 removes comes back.
+    ///
+    /// Node-wide rather than per entry, like `version` and unlike `toolchainLabel`: a
+    /// machine with two toolsets is one machine with one name.
+    ///
+    /// **Owned, not a view**, for the reason `version` documents at length.
+    std::string displayName {};
 };
 
 /// Frame a capacity record as one nested field list.
@@ -2305,7 +2323,8 @@ struct CapacityFields
                                 std::span<std::byte const> { cache },
                                 AsBytes(capacity.version),
                                 std::span<std::byte const> { reservedMemory },
-                                AsBytes(capacity.toolchainLabel) });
+                                AsBytes(capacity.toolchainLabel),
+                                AsBytes(capacity.displayName) });
 }
 
 /// Read a capacity record back.
@@ -2386,6 +2405,7 @@ struct CapacityFields
     // fleet. A build predating the field has no eighth index, which `at` answers as
     // empty.
     out.toolchainLabel = std::string { AsStringView(at(7)) };
+    out.displayName = std::string { AsStringView(at(8)) };
     return out;
 }
 

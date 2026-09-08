@@ -515,7 +515,7 @@ membership is still a Raft decision. See
 |---|---|---|
 | Shared cached objects | `fastcached`'s `--storage` path, or memory only without it | Only with `--storage` |
 | A node's own cache | Memory, plus `--cache-dir/objects.cow` if given | Only with `--cache-dir` |
-| Consensus state | `--cluster-dir`, default `fastcache-cluster/<node-id>` | Yes — it must, or a node could vote twice in one term |
+| Consensus state, and the node's identity | `--cluster-dir`, default `fastcache-cluster` | Yes — it must, or a node could vote twice in one term |
 | Dashboard history | `fleet-history.bin` in the cluster dir, else the cache dir, else memory | Where a directory exists |
 | Launcher statistics | `%LOCALAPPDATA%\fastcache-cc` or `$XDG_STATE_HOME/fastcache-cc` | Yes |
 | Cached toolchain fingerprints | `toolchains/*.fingerprint` in that same state directory | Yes, until the toolchain changes |

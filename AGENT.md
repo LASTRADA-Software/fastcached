@@ -697,6 +697,22 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.
+- **A node IS its state directory: its identity is MINTED into `--cluster-dir` and read
+  back forever, never derived from the machine.** Not the hostname (mutable, and one
+  machine may run several nodes), and not the OS machine-id even as a SEED — two clones
+  of one image with no state yet mint the SAME id, and an identity that outlives its own
+  vote record is `--cluster-dir`'s two-leaders hazard arriving automatically. A wiped
+  state directory MUST get a new identity. `--node-id` stays as an override and is
+  recorded; a derived id cannot be typed into `--raft-peer`, so `--raft-self=<host>`
+  states the address and takes the port from `--listen-raft`. The resolved value reaches
+  the running config, the service registration AND every reload candidate, or reloads are
+  refused by name. A recorded id that is empty or not text is refused, never re-minted.
+  A copied state directory copies the node and is NOT refused — `--cluster-admit` at a new
+  address is how a MOVE is recorded, so the two requests are identical.
+- **The hostname is a fleet-page LABEL and decides nothing** — nothing keys, routes,
+  admits or dispatches by it, which is what makes a mutable non-unique value safe to
+  carry. It still passes the UTF-8 gate at `SchedulerService::Register`: one byte makes
+  `/fleet.json` unparseable for the whole fleet. **No prefix matching on ids.**
 - **A mode rides on the PORT, never on the absence of a NAME.** Consensus is on iff
   `--listen-raft` resolves — asked of the surface row, so `--print-surfaces` and the
   mode cannot disagree. It read `--node-id` until #1022, and a flag whose ABSENCE

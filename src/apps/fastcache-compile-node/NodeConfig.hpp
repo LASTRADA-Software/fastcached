@@ -354,7 +354,25 @@ struct NodeConfig
     /// A bare port binds the WILDCARD, like a scheduling node's `--listen-node`
     /// and unlike a worker's: peers are on other machines by definition, so a loopback
     /// default would be one that silently cannot work.
+    ///
+    /// Giving it is what turns consensus ON (#1022); see `RunsConsensus`.
     std::string raftListen;
+
+    /// The HOST this node's peers dial it at, from `--raft-self=<host>`.
+    ///
+    /// **Not a duplicate of `raftListen`, and the difference is why this flag has to
+    /// exist at all.** A bare `--listen-raft` binds the wildcard, so the address this
+    /// node BINDS is routinely not one any peer could dial -- and a member must name
+    /// the endpoint its peers dial. That is what `--raft-peer=<id>=<host>:<port>` says
+    /// about every other member, and it is unwritable for this one since #1024, because
+    /// the id is minted rather than typed. So the host is stated here and the port
+    /// comes from `--listen-raft`, and `ApplyNodeIdentity` is where the two become a
+    /// member.
+    ///
+    /// A HOST and never an endpoint: the port is not the operator's to repeat, and a
+    /// value carrying one would produce `host:port:port`. No grammar row for the same
+    /// reason `--bind` has none -- a host is only checkable by binding it.
+    std::string raftSelf;
 
     /// The cluster's members, from `--raft-peer=<id>=<host>:<port>`; repeatable.
     ///
@@ -559,8 +577,8 @@ struct NodeConfig
     bool nodeClassExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };
-    bool nodeIdExplicit { false };
     bool raftListenExplicit { false };
+    bool raftSelfExplicit { false };
     bool clusterIdExplicit { false };
     bool discoveryAddressExplicit { false };
     bool discoveryReplyPortExplicit { false };
@@ -1113,6 +1131,19 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// @param cfg The parsed configuration.
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
+
+/// The member endpoint `--raft-self` and `--listen-raft` name between them.
+///
+/// **One author for a value two places need**, which is the whole reason it is a
+/// function: `ApplyNodeIdentity` builds this node's own `--raft-peer` entry out of
+/// it, and the startup rule that refuses `--raft-self` beside a `--raft-peer` for
+/// this node has to be able to tell that entry from a DIFFERENT one an operator
+/// typed. Written twice, those two would disagree about IPv6 bracketing and the rule
+/// would refuse every reload of a node it had just accepted at startup -- the reload
+/// path judges a candidate the identity has already been applied to.
+/// @param cfg The parsed configuration.
+/// @return `host:port`, or empty when either half is missing.
+[[nodiscard]] std::string RaftSelfEndpoint(NodeConfig const& cfg);
 
 /// Who this node admits, as one line an operator reads at startup.
 ///

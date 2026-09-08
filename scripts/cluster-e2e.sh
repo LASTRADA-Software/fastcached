@@ -404,17 +404,26 @@ done
 # while leaving its pid in place; both are wrong the moment one array is appended
 # to and the other is not.
 #
+# `-` AS THE ID MEANS "derive one", which is #1024's whole subject: a node mints its
+# identity into its `--cluster-dir` on first start and reads it back afterwards, so
+# `--node-id` is an override rather than something an operator invents per machine and
+# types twice. Passing an EMPTY `--node-id=` would not test that -- that is a value
+# somebody typed -- so the flag has to be absent from the command line entirely.
+#
 # @param 1 index into the port/pid/log arrays
 # @param 2 slot: what its state directory and log are named after
-# @param 3 the --node-id it runs under
+# @param 3 the --node-id it runs under, or `-` to let it derive one
 # @param 4.. whatever else this node's shape needs (--raft-peer, --raft-join)
 launch_node() {
     local index="$1" slot="$2" id="$3"; shift 3
     local log="${workdir}/${slot}.log"
     node_logs[index]="$log"
 
+    local named=()
+    [[ "$id" == "-" ]] || named=(--node-id="$id")
+
     "$node" \
-        --node-id="$id" \
+        ${named+"${named[@]}"} \
         --listen-raft="127.0.0.1:${raft_ports[$index]}" \
         "$@" \
         --cluster-dir="${workdir}/${slot}" \
@@ -1159,23 +1168,40 @@ await_answer() {
     fail "${what}: ${endpoint} never answered with '${wanted}' within ${seconds}s. Last answer: ${answer} ($(probe_summary "$mark"))"
 }
 
-# One node, bootstrapping a cluster of itself. `--raft-peer` names ITSELF and
-# nothing else, which is what a bootstrap is: the member set this node starts with.
+# One node, bootstrapping a cluster of itself -- and it is the node that DERIVES its
+# identity (#1024), which is what a first-time operator gets by typing neither a name
+# for it nor a peer entry naming that name.
 #
-# Removing that peer is how this leg is shown red -- without it the node names no
-# member of its own configuration, `NodeIdNamesNoPeerRefusal` fires, and it exits
-# before binding, so `launch_node`'s readiness wait ends the run. A fixture that had
-# silently degenerated into "start two and hope" would still pass its later
-# assertions; it cannot pass this one.
+# `--raft-self` is what makes that possible and is not optional: a member must name
+# the endpoint its peers dial, and `--raft-peer=<id>=<host>:<port>` cannot be written
+# for an id nobody typed. It states the HOST; the port comes from `--listen-raft`.
+#
+# Removing `--raft-self` is how this leg is shown red -- the node then names itself
+# neither way, `ConsensusNamesNoSelfPeerRefusal` fires, and it exits before binding,
+# so `launch_node`'s readiness wait ends the run. A fixture that had silently
+# degenerated into "start two and hope" would still pass its later assertions; it
+# cannot pass this one.
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 one_index=$(( ${#scheduler_ports[@]} - 1 ))
-launch_node "$one_index" m1 m1 --raft-peer="m1=127.0.0.1:${raft_ports[$one_index]}"
+launch_node "$one_index" m1 - --raft-self=127.0.0.1
 
-find_leader "the one-member cluster to lead itself"
+# What it decided to BE, observed rather than assumed. Without this the whole section
+# would pass identically for a node that had been handed a name, so nothing in it
+# would be about a derived identity at all.
+#
+# The SHAPE is asserted and not the value: it is 32 hex characters drawn from this
+# machine's random source, and a fixture pinning one would be asserting the seed.
+if ! grep -qE "node identity [0-9a-f]{32} \(newly minted" "${workdir}/m1.log"; then
+    echo "what m1 said about its identity:"
+    grep -E "node identity" "${workdir}/m1.log" || echo "  (nothing -- it never reported one)"
+    fail "the one-member node did not mint an identity of its own, so this section is not testing a derived one"
+fi
+
+find_leader "the one-member cluster with a DERIVED identity to lead itself"
 [[ "$leader_endpoint" == "127.0.0.1:${scheduler_ports[$one_index]}" ]] ||
     fail "the one-member cluster is led from ${leader_endpoint}, which is not the only node in it"
-echo "cluster E2E: one node bootstraps a cluster of itself and leads it"
+echo "cluster E2E: one node derives its own identity, bootstraps a cluster of itself and leads it"
 
 commit_setting upstream alone.example:6674 "a one-member cluster cannot commit"
 echo "cluster E2E: a one-member cluster commits alone"
@@ -1241,12 +1267,25 @@ stop_and_require_exit "${pids[$rival_index]}" "the node started without --raft-j
 # refuses that, and the leader only walks back to the beginning when the refusal
 # reaches it. A joiner that could not send one is admitted, dialled, and permanently
 # silent -- and at two members that is a cluster that has stopped committing.
+#
+# **And it must name m1 by the id m1 actually has**, which since #1024 is the one m1
+# MINTED rather than the label this fixture calls it by. `RaftPeerTransport` addresses
+# every outbound message by member id, so a peer entry under a name nobody answers to
+# is a joiner that receives the leader's AppendEntries and has nowhere to send its
+# refusal -- admitted, dialled and permanently silent, which is the exact failure the
+# paragraph above is about, reached through the identity instead of through the list.
+#
+# Read off m1's startup line, which is what an operator does: no surface answers "what
+# is your id", and that residual is worth knowing about rather than papering over here.
+m1_id="$(sed -n 's/.*node identity \([0-9a-f]\{32\}\) .*/\1/p' "${workdir}/m1.log" | head -1)"
+[[ -n "$m1_id" ]] || fail "could not read m1's minted identity out of its log, so the joiner cannot name it"
+
 raft_ports+=("$(free_port)")
 scheduler_ports+=("$(free_port)")
 two_index=$(( ${#scheduler_ports[@]} - 1 ))
 launch_node "$two_index" m2 m2 --raft-join \
     --raft-peer="m2=127.0.0.1:${raft_ports[$two_index]}" \
-    --raft-peer="m1=127.0.0.1:${raft_ports[$one_index]}"
+    --raft-peer="${m1_id}=127.0.0.1:${raft_ports[$one_index]}"
 
 # The other half of the control above: the SAME id, the same shape of peer list plus
 # one address, and now it leads nothing.

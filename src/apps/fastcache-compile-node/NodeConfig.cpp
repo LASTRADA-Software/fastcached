@@ -732,7 +732,14 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .arity = Arity::Value,
             .operand = "=<id>",
             .apply = AssignFrom<&NodeConfig::nodeId, ParseUtf8Text>(),
-            .explicitBit = &NodeConfig::nodeIdExplicit,
+            // **No `explicitBit`, alone among the value flags, and its removal is the
+            // point rather than an omission.** A provenance bit exists so a
+            // registration does not bake in a DEFAULT that a later build might change
+            // -- and since #1024 this flag has no default to bake: it holds a value
+            // RESOLVED on this machine and recorded beside its Raft log, which the
+            // registration must carry whether or not anybody typed it. The bit had
+            // exactly one reader, `MakeNodeServiceSpec`, and that reader now asks the
+            // value; a bit nothing reads is a claim nothing can check.
             .description = "this node's identity in the cluster, and what every\n"
                            "vote is counted against. --listen-raft is what turns\n"
                            "consensus on; this names the node that runs it.",
@@ -753,6 +760,21 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "silently not work.",
             .yamlKey = "listen_raft",
             .same = FieldEq<&NodeConfig::raftListen>(),
+        },
+        {
+            .primary = "--raft-self",
+            .arity = Arity::Value,
+            .operand = "=<host>",
+            .apply = AssignFrom<&NodeConfig::raftSelf, ParseText>(),
+            .explicitBit = &NodeConfig::raftSelfExplicit,
+            .description = "the host this node's peers dial it at; the port comes\n"
+                           "from --listen-raft. How a node names ITSELF when its\n"
+                           "identity was derived rather than typed, since\n"
+                           "--raft-peer=<id>=... needs an id somebody wrote. A\n"
+                           "bare --listen-raft binds the wildcard, so what this\n"
+                           "node binds is usually not what a peer can dial.",
+            .yamlKey = "raft_self",
+            .same = FieldEq<&NodeConfig::raftSelf>(),
         },
         {
             .primary = "--raft-peer",
@@ -1755,7 +1777,31 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
     emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
-    emitIfExplicit("node-id", cfg.nodeId, cfg.nodeIdExplicit);
+    // `emitIfSet`, alone among the identity flags, and the provenance rule is not
+    // being broken so much as answered: `emitIfExplicit` exists so a registration does
+    // not bake a DEFAULT, which an operator can then never change by editing anything.
+    // Since #1024 this flag has no default -- it has a RESOLVED value, minted on this
+    // machine and recorded beside its Raft log -- and a registration that omitted it
+    // would replay a command line whose meaning depends on a file somebody may delete.
+    // A re-image would then resolve a different identity under a registration nobody
+    // edited, and the cluster would count a member that no longer exists beside a
+    // stranger nobody admitted. That is the failure with no symptom.
+    // **The one flag emitted on VALUE rather than on provenance, and NOT through a
+    // general-purpose emitter.** `emitIfSet` existed, fourteen rows used it, and #713
+    // deleted it precisely so that reaching for it is not possible -- an operator who
+    // types a default is indistinguishable from one who did not, and the flag was then
+    // dropped from a registration that replays forever.
+    //
+    // This row is the case that argument does not cover, and it is written out here
+    // rather than behind a name somebody else could reuse. `--node-id` has no default
+    // for a value comparison to be wrong about: since #1024 it holds a RESOLVED
+    // identity, minted on this machine and recorded beside its Raft log. Omitting it
+    // would register a command line whose meaning depends on a file an operator may
+    // delete or a re-image may not carry -- and the node would then answer to an
+    // identity the cluster never admitted, with nothing anywhere saying so.
+    if (!cfg.nodeId.empty())
+        argv.push_back(std::format("--node-id={}", cfg.nodeId));
+    emitIfExplicit("raft-self", cfg.raftSelf, cfg.raftSelfExplicit);
     emitIfExplicit("listen-raft", cfg.raftListen, cfg.raftListenExplicit);
     emitPathIfSet("cluster-dir", cfg.clusterDir.string());
     emitIfExplicit("cluster-id", cfg.clusterId, cfg.clusterIdExplicit);
@@ -1915,6 +1961,20 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     // of the surface row rather than of `cfg.raftListen`, so this and
     // `--print-surfaces` cannot disagree about whether the port is served.
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
+}
+
+std::string RaftSelfEndpoint(NodeConfig const& cfg)
+{
+    if (cfg.raftSelf.empty())
+        return {};
+
+    // The PORT off the surface row, never off `cfg.raftListen`: a bare `--listen-raft`
+    // takes the row's own default host and the row is where that is decided. The HOST
+    // is the flag's, because what this node BINDS is routinely the wildcard.
+    auto const bound = RowFor(NodeSurface::Raft).Resolve(cfg);
+    if (bound.empty())
+        return {};
+    return FormatHostPort(cfg.raftSelf, bound.front().port);
 }
 
 std::string AdvertisedEndpoint(NodeConfig const& cfg)
@@ -2354,6 +2414,27 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// wrong for the fleet they were pointed at.
 /// @param cfg The parsed configuration.
 /// @return Whether a remote scheduler is handed an endpoint only this machine can dial.
+/// Whether `--raft-self` and a `--raft-peer` for this node name different addresses.
+///
+/// A named predicate beside its siblings rather than a lambda in the row, for the
+/// reason they are: written inline it pushed `StartupPolicyRejection` past
+/// clang-tidy's cognitive-complexity limit, and a rule with a branch in it reads
+/// better with a name on it than with a comment.
+///
+/// **The peer `ApplyNodeIdentity` synthesises is not a second answer, it is the same
+/// one**, and it has to be recognised as such: the reload path judges a candidate the
+/// identity has already been applied to, so a rule that refused any self peer beside
+/// `--raft-self` would accept a node at startup and refuse every reload of it by name.
+/// @param cfg The parsed configuration.
+/// @return True when both name this node's consensus port, differently.
+[[nodiscard]] bool RaftSelfContradictsItsOwnPeer(NodeConfig const& cfg)
+{
+    if (cfg.raftSelf.empty())
+        return false;
+    auto const* const self = ClusterSelfMember(cfg);
+    return self != nullptr && self->raftEndpoint != RaftSelfEndpoint(cfg);
+}
+
 [[nodiscard]] bool AdvertisesLoopbackToARemoteScheduler(NodeConfig const& cfg)
 {
     if (!SchedulerIsRemote(cfg))
@@ -2905,8 +2986,34 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // endpoint its peers dial. `RunsConsensus` since #1022 -- the predicate moved
         // from `--node-id` to `--listen-raft` and this rule did not, because "a member
         // must name itself" is true whichever flag turns the mode on.
-        { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && ClusterSelfMember(c) == nullptr; },
+        { .refuses =
+              [](NodeConfig const& c) {
+                  // `--raft-self` is the other way to say it (#1024), and it is what a
+                  // node whose identity was MINTED has: `--raft-peer=<id>=<host>:<port>`
+                  // needs an id somebody typed, and a derived one is not.
+                  //
+                  // Asked of the config as PARSED, before `ApplyNodeIdentity` turns the
+                  // flag into a member -- which is what keeps this rule a pure function
+                  // of the command line and lets `--install-service` reach it, and is
+                  // also why the rule cannot simply look for the member afterwards.
+                  return RunsConsensus(c) && ClusterSelfMember(c) == nullptr && c.raftSelf.empty();
+              },
           .message = ConsensusNamesNoSelfPeerRefusal },
+        // Two ways to say one thing. `--raft-self` exists because a MINTED identity
+        // cannot be typed into `--raft-peer`; an operator who typed the id has already
+        // said where this node answers, and a second answer would have to be ranked
+        // against the first with nothing to rank it by.
+        { .refuses = RaftSelfContradictsItsOwnPeer,
+          .message = "--raft-self and a --raft-peer for this node's own --node-id name DIFFERENT addresses for "
+                     "this node's consensus port, and only one of them can be the one its peers dial. "
+                     "--raft-self is for the node whose identity was derived rather than typed, since "
+                     "--raft-peer=<id>=... needs an id somebody wrote. Drop one." },
+        // A host with no port is not an endpoint, and the port is the half this flag
+        // deliberately does not carry.
+        { .refuses = [](NodeConfig const& c) { return !c.raftSelf.empty() && !RunsConsensus(c); },
+          .message = "--raft-self names the host this node's peers dial, and the port comes from --listen-raft, "
+                     "which is also what turns consensus ON. Without it there is no port to pair the host with "
+                     "and no consensus for the pair to name a member of." },
         // The reverse, and it INVERTED at #1022 rather than moving. `--node-id` used
         // to be the switch, so a node that gave it and no `--listen-raft` was refused
         // for having no port; now `--listen-raft` is the switch, so a node that gives

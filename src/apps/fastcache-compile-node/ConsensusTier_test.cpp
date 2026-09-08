@@ -175,7 +175,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
     {
         NodeConfig cfg;
         cfg.nodeId = "n1";
-        cfg.raftPeers = { *Cluster::ParseMemberSpec("n1=10.0.0.1:6680") };
+        cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
         NodeMembership membership { cfg };
 
         auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, logger);

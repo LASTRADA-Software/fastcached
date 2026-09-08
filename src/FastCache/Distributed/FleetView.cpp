@@ -287,11 +287,25 @@ namespace
     };
 
     /// What a node row shows, before its per-tier cache columns.
-    constexpr std::array<FleetColumn<NodeReport>, 11> NodeColumns {
+    constexpr std::array<FleetColumn<NodeReport>, 12> NodeColumns {
         FleetColumn<NodeReport> { .name = "endpoint",
                                   .help = "host:port the machine answers on.",
                                   .format = CellFormat::Text,
                                   .project = [](NodeReport const& n) { return FleetCell::Of(n.endpoint); } },
+        FleetColumn<NodeReport> { .name = "name",
+                                  .help = "What this machine calls itself, as an operator would recognise it. Advisory: "
+                                          "nothing routes, admits or dispatches by it, and it need not be unique. Absent "
+                                          "when the node predates the field or would not say.",
+                                  .format = CellFormat::Text,
+                                  // Second, right after the endpoint it annotates, because that is the pair
+                                  // an operator reads together: the address is what a machine ANSWERS on and
+                                  // this is what they call it when they go and look at it. Absent rather than
+                                  // blank, for the reason `version` gives below -- a node too old to say is
+                                  // not a node with nothing interesting about it.
+                                  .project =
+                                      [](NodeReport const& n) {
+                                          return n.displayName.empty() ? FleetCell::Nothing() : FleetCell::Of(n.displayName);
+                                      } },
         FleetColumn<NodeReport> {
             .name = "version",
             .help = "Which build of fastcache-compile-node this machine is running. Absent "

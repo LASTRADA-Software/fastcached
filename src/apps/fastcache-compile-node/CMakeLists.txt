@@ -53,6 +53,7 @@ add_executable(fastcache-compile-node
     NodeConfig.cpp
     NodeReload.cpp
     NodeFrameSurface.cpp
+    NodeIdentity.cpp
     NodeSurfaces.cpp
     NodeToolchains.cpp
     RemoteUpstream.cpp
@@ -119,6 +120,8 @@ if(FASTCACHED_BUILD_TESTS)
         AuthRefusalContract_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
+        NodeIdentity.cpp
+        NodeIdentity_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
         NodeMembership_test.cpp
