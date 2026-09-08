@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/EpollReactor.hpp>
+#include <FastCache/Async/ResumeOn.hpp>
+#include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 
 #if defined(__linux__)
@@ -9,12 +12,16 @@
     #include <sys/epoll.h>
     #include <sys/eventfd.h>
 
+    #include <cerrno>
+    #include <chrono>
     #include <cstdint>
     #include <memory>
+    #include <utility>
 
     #include <unistd.h>
 
 using namespace FastCache;
+using namespace std::chrono_literals;
 
 namespace
 {
@@ -205,6 +212,217 @@ TEST_CASE("A handler freed earlier in the same batch is not dispatched", "[epoll
     // batch rather than dispatched.
     REQUIRE(actedAlready);
     REQUIRE(((first == nullptr) != (second == nullptr)));
+}
+
+namespace
+{
+
+/// What one probe frame reported about the reactor that was freeing it.
+///
+/// Four fields rather than one boolean, because a probe that COULD NOT ASK reads
+/// exactly like a probe that asked and was told no. `attempted` says a destructor ran
+/// at all, `hadDescriptor` says it held a descriptor of its own to ask with, and only
+/// with both of those does `sawLiveEpoll` mean anything.
+struct ProbeRecord
+{
+    int attempted { 0 };     ///< Probe frames destroyed.
+    int hadDescriptor { 0 }; ///< ... of which held a descriptor of their own to ask with.
+    int sawLiveEpoll { 0 };  ///< ... of which found this reactor's epoll descriptor open.
+    int refusedWith { 0 };   ///< `epoll_ctl`'s errno from the last probe it refused.
+};
+
+/// A coroutine-frame member that asks the reactor freeing it whether its epoll
+/// descriptor is still open, and records the answer.
+///
+/// **The recorded fact is `Attach()`'s own answer, never the absence of a crash.**
+/// `EpollReactor::Attach` is `epoll_ctl(_epollFd, EPOLL_CTL_ADD, ...)` -- the same
+/// call `~EpollSocket` reaches through `Detach()` on its way down -- so it answers
+/// true exactly while that descriptor is open and false once `~EpollReactor` has
+/// closed it. Watching for a crash instead would prove nothing, which is the whole
+/// reason [#1054](https://github.com/LASTRADA-Software/fastcached/issues/1054) is its
+/// own ticket: `epoll_ctl` on a descriptor number another thread has since reused can
+/// silently succeed, so in production the defect is invisible by construction.
+///
+/// The errno is recorded for that same reason. `EBADF` says the descriptor was
+/// CLOSED; `EINVAL` would say its number had been taken by something that is not an
+/// epoll descriptor, and `EEXIST` that this probe had attached before. Nothing here
+/// opens a descriptor between the closes in `~EpollReactor` and the member
+/// destruction that follows them, so no number can be reused -- and recording the
+/// code is what makes that an observation rather than an assumption.
+class EpollLivenessProbe
+{
+  public:
+    /// @param reactor The reactor to ask as this dies; never null.
+    /// @param record  Where the answer is tallied; never null.
+    EpollLivenessProbe(EpollReactor* reactor, ProbeRecord* record) noexcept:
+        _reactor { reactor },
+        _record { record },
+        _fd { ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) }
+    {
+        _handler.fd = _fd;
+    }
+
+    EpollLivenessProbe(EpollLivenessProbe&& other) noexcept:
+        _reactor { std::exchange(other._reactor, nullptr) },
+        _record { other._record },
+        _fd { std::exchange(other._fd, -1) }
+    {
+        _handler.fd = _fd;
+    }
+
+    EpollLivenessProbe(EpollLivenessProbe const&) = delete;
+    EpollLivenessProbe& operator=(EpollLivenessProbe const&) = delete;
+    EpollLivenessProbe& operator=(EpollLivenessProbe&&) = delete;
+
+    ~EpollLivenessProbe()
+    {
+        if (_reactor != nullptr)
+        {
+            ++_record->attempted;
+            if (_fd >= 0)
+            {
+                ++_record->hadDescriptor;
+                errno = 0;
+                if (_reactor->Attach(&_handler))
+                    ++_record->sawLiveEpoll;
+                else
+                    _record->refusedWith = errno;
+            }
+        }
+        if (_fd >= 0)
+            ::close(_fd);
+    }
+
+  private:
+    EpollReactor* _reactor;
+    ProbeRecord* _record;
+    int _fd;
+    EpollFdHandler _handler {};
+};
+
+/// An abandoned chain carrying one probe, parked on the submit side.
+///
+/// Detached, so nothing owns its frame and `Detail::ParkedWorkFor` gives the reactor
+/// an `abandon` root -- which is what makes the reactor, rather than some caller, the
+/// thing that frees it.
+/// @param reactor The reactor to park on.
+/// @param probe   Asks that reactor about its descriptor when this frame dies.
+DetachedTask ProbeChainOnSubmit(EpollReactor* reactor, EpollLivenessProbe probe)
+{
+    (void) probe;
+    co_await ResumeOn { *reactor };
+    co_return;
+}
+
+/// A frame member that parks a fresh abandoned chain on the reactor as it is freed.
+///
+/// It stands in for the production shape the drain loop exists for: freeing a chain
+/// runs arbitrary destructors, and `AsyncQueue::Close()` resuming a waiter reaches
+/// `IExecutor::Submit`. So a chain freed out of the TIMER heap can put a new entry
+/// into the submit queue after that queue has already been drained once.
+class ReentrantPark
+{
+  public:
+    /// @param reactor The reactor to park the new chain on; never null.
+    /// @param record  Where that chain's probe reports; never null.
+    ReentrantPark(EpollReactor* reactor, ProbeRecord* record) noexcept:
+        _reactor { reactor },
+        _record { record }
+    {
+    }
+
+    ReentrantPark(ReentrantPark&& other) noexcept:
+        _reactor { std::exchange(other._reactor, nullptr) },
+        _record { other._record }
+    {
+    }
+
+    ReentrantPark(ReentrantPark const&) = delete;
+    ReentrantPark& operator=(ReentrantPark const&) = delete;
+    ReentrantPark& operator=(ReentrantPark&&) = delete;
+
+    ~ReentrantPark()
+    {
+        if (_reactor == nullptr)
+            return;
+        ProbeChainOnSubmit(_reactor, EpollLivenessProbe { _reactor, _record });
+    }
+
+  private:
+    EpollReactor* _reactor;
+    ProbeRecord* _record;
+};
+
+/// An abandoned chain parked in the TIMER heap whose frame re-parks as it is freed.
+/// @param reactor The reactor to park on.
+/// @param park    Parks a probe chain on that reactor when this frame dies.
+DetachedTask ParkOnTimerThenRepark(EpollReactor* reactor, ReentrantPark park)
+{
+    (void) park;
+    co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + 1h };
+    co_return;
+}
+
+} // namespace
+
+// `AbandonParkedWork()` loops, and this is what the loop is for: a chain freed out of
+// the timer heap can park a NEW one on the submit side, and only a second pass frees
+// that before `~EpollReactor` closes its descriptors. A single pass leaves it for
+// MEMBER destruction, which runs after `::close(_epollFd)` -- and the entry freed
+// there runs `~EpollSocket` -> `Close()` -> `Detach()` -> `epoll_ctl` on a closed
+// descriptor whose number another thread may by then have reused
+// ([#1054](https://github.com/LASTRADA-Software/fastcached/issues/1054), the residual
+// of [#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+//
+// **A real reactor, because the double cannot express this.** On `TestReactor` the
+// single-pass version is genuinely benign -- it owns no descriptors, so there is no
+// later moment that differs from the earlier one, and a case written there passes with
+// the loop and without it. That case existed and was DELETED rather than kept; this one
+// replaces it. What makes the difference observable here is that `EpollReactor` holds
+// two descriptors it closes in its destructor BODY, so "freed in the body" and "freed
+// at member destruction" are two different answers to one question a probe can ask.
+//
+// **Shown red, in the direction that matters**: with the `while` removed from
+// `AbandonParkedWork` and nothing else changed, `reparked.sawLiveEpoll` is 0 with
+// `refusedWith == EBADF`, while `control` is unmoved at 1. The control is not
+// decoration -- without it a probe that always answered no would look exactly like the
+// defect.
+TEST_CASE("A chain re-parked during teardown is freed before the reactor's descriptors close", "[epoll][reactor][teardown]")
+{
+    SteadyClock clock;
+    ProbeRecord control {};
+    ProbeRecord reparked {};
+
+    {
+        EpollReactor reactor { clock };
+
+        // The control. Parked before teardown begins, so the FIRST pass frees it --
+        // inside the destructor body, with both descriptors still open. It answers yes
+        // in every build, including the broken one, which is what says the probe works.
+        ProbeChainOnSubmit(&reactor, EpollLivenessProbe { &reactor, &control });
+
+        // The subject. Parked in the TIMER heap, which `AbandonParkedWork` frees after
+        // the submit queue, and its frame parks a probe chain on the way down.
+        ParkOnTimerThenRepark(&reactor, ReentrantPark { &reactor, &reparked });
+    }
+
+    // Both probes ran, and both held a descriptor of their own to ask with. Without
+    // this, a probe that could not ask would report the defect's answer for its own
+    // reason -- and the re-parked one is the case's whole subject, so a destructor that
+    // never ran must not read as a pass.
+    REQUIRE(control.attempted == 1);
+    REQUIRE(control.hadDescriptor == 1);
+    REQUIRE(reparked.attempted == 1);
+    REQUIRE(reparked.hadDescriptor == 1);
+
+    // Unmoved between the two builds: the reactor's epoll descriptor is open when the
+    // first pass frees a chain, whether or not there is ever a second pass.
+    CHECK(control.sawLiveEpoll == 1);
+    CHECK(control.refusedWith == 0);
+
+    // And this is the pair that distinguishes them.
+    CHECK(reparked.sawLiveEpoll == 1);
+    CHECK(reparked.refusedWith == 0);
 }
 
 #endif // __linux__

@@ -1243,12 +1243,41 @@ Every rule below has already been a bug.
     than that it needs none. Also why the freeing happens OUTSIDE the lock: the
     re-entrant `CancelPending` takes the same mutex.
   - **The teardown loops rather than walking its containers once**, because freeing a
-    chain can park again. That much is reasoned rather than measured: a case written for
-    it passed with the loop AND without it and was DELETED rather than kept, since `swap`
-    leaves the member containers unallocated and a re-entrant search over them reads
-    nothing. What the single pass actually costs is an `epoll_ctl` on a descriptor the
-    destructor has already closed, whose number another thread may have reused, and no
-    fixture stages that deterministically. Stated on `EpollReactor::AbandonParkedWork`.
+    chain can park again -- and it is MEASURED, on `EpollReactor`, which is the only
+    subject that can show it. The single pass does not LOSE the re-parked entry, it frees
+    it LATER, and later is member destruction: after the destructor body's `::close`
+    calls. So the difference is no leak and no number any container reports -- it is
+    whether a descriptor was still open at the moment a chain died. A probe in the
+    re-parked frame calls `Attach()` (`epoll_ctl` on `_epollFd`, the call `~EpollSocket`
+    reaches through `Detach()`) and records the answer WITH its errno. Delete the `while`
+    and it reports **EBADF** while a control chain freed on the first pass is unmoved at
+    yes -- the asymmetry, not the red. The errno is what rules out the reading the ticket
+    was filed for: a reused descriptor number answering yes for the wrong reason would be
+    `EINVAL`, and nothing here opens a descriptor between those closes and the member
+    destruction that follows them
+    ([#1054](https://github.com/LASTRADA-Software/fastcached/issues/1054)).
+  - **The case it replaces could not fail because it was written against the DOUBLE**,
+    and the transferable part is not *use a real reactor*. `TestReactor` owns no
+    descriptors, so it has no later moment differing from the earlier one and the single
+    pass is genuinely benign there; the case passed with the loop and without it and was
+    deleted rather than kept. **A behaviour whose only trace is a RESOURCE needs a
+    subject that holds one** -- a double chosen for being deterministic can be
+    deterministic about nothing. It also says what the prose said instead: *no fixture
+    stages that deterministically* stood here for a while, which is the shape
+    [`build-and-toolchain.md`](build-and-toolchain.md) warns about, an entry instructing
+    the next session not to try.
+  - **Kqueue and IOCP run the same loop and have no such case, and the obvious port is
+    VACUOUS on one of them.** `IocpReactor::AttachHandle` is a true equivalent: it calls
+    `CreateIoCompletionPort` against `_iocp`, which `~IocpReactor` sets to `nullptr`
+    after closing. `KqueueReactor::Attach` is not, and its signature says nothing about
+    that -- `[[nodiscard]] bool Attach(KqueueFdHandler*) const noexcept` on both, and the
+    kqueue one makes no kernel call at all, returning `handler->fd >= 0 && _kq >= 0`
+    while `~KqueueReactor` closes `_kq` WITHOUT resetting it. So the same probe answers
+    yes in both builds there and passes for no reason; kqueue's equivalent question is
+    `UpdateInterest`, which does call `kevent`. Asserted from the signatures and caught
+    by reading the bodies, which is the whole lesson: **an equivalent is a call that
+    ASKS the kernel, not a member with a matching declaration.** Measured on one reactor
+    of three and code-read on two, the same split as the bullet below.
   - **A reactor's owner is now required to outlive the frames it abandons**, and nothing
     enforces it. `RunSingleReactor` declares its reactor FIRST so it is destroyed LAST --
     which it must be, since the servers and listeners hold references to it -- so
