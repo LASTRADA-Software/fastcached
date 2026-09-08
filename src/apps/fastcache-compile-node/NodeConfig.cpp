@@ -1777,28 +1777,24 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
     emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
-    // `emitIfSet`, alone among the identity flags, and the provenance rule is not
-    // being broken so much as answered: `emitIfExplicit` exists so a registration does
-    // not bake a DEFAULT, which an operator can then never change by editing anything.
-    // Since #1024 this flag has no default -- it has a RESOLVED value, minted on this
-    // machine and recorded beside its Raft log -- and a registration that omitted it
-    // would replay a command line whose meaning depends on a file somebody may delete.
-    // A re-image would then resolve a different identity under a registration nobody
-    // edited, and the cluster would count a member that no longer exists beside a
-    // stranger nobody admitted. That is the failure with no symptom.
     // **The one flag emitted on VALUE rather than on provenance, and NOT through a
-    // general-purpose emitter.** `emitIfSet` existed, fourteen rows used it, and #713
-    // deleted it precisely so that reaching for it is not possible -- an operator who
-    // types a default is indistinguishable from one who did not, and the flag was then
-    // dropped from a registration that replays forever.
+    // general-purpose emitter.** The provenance rule is not being broken here so much
+    // as answered: `emitIfExplicit` exists so a registration does not bake a DEFAULT an
+    // operator can then never change by editing anything. `emitIfSet` was the general
+    // way to say what this row needs, fourteen rows used it, and #713 deleted it
+    // precisely so that reaching for it is not possible -- an operator who types a
+    // default is indistinguishable from one who did not, and the flag was then dropped
+    // from a registration that replays forever.
     //
-    // This row is the case that argument does not cover, and it is written out here
-    // rather than behind a name somebody else could reuse. `--node-id` has no default
-    // for a value comparison to be wrong about: since #1024 it holds a RESOLVED
-    // identity, minted on this machine and recorded beside its Raft log. Omitting it
-    // would register a command line whose meaning depends on a file an operator may
-    // delete or a re-image may not carry -- and the node would then answer to an
-    // identity the cluster never admitted, with nothing anywhere saying so.
+    // This row is the case that argument does not cover, so it is written out at the
+    // call site rather than behind a name somebody else could reuse. Since #1024
+    // `--node-id` has no default for a value comparison to be wrong about: it holds a
+    // RESOLVED identity, minted on this machine and recorded beside its Raft log.
+    // Omitting it would replay a command line whose meaning depends on a file an
+    // operator may delete or a re-image may not carry -- the node would then answer to
+    // an identity the cluster never admitted, the cluster would count a member that no
+    // longer exists beside a stranger nobody admitted, and nothing anywhere would say
+    // so. That is the failure with no symptom.
     if (!cfg.nodeId.empty())
         argv.push_back(std::format("--node-id={}", cfg.nodeId));
     emitIfExplicit("raft-self", cfg.raftSelf, cfg.raftSelfExplicit);
