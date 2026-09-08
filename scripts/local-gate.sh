@@ -688,19 +688,32 @@ header_filter_coverage() {
     headers="$(git -C "$root" ls-files '*.hpp' '*.h' 2>/dev/null)"
     [[ -n "$headers" ]] || { echo "no-headers"; return 0; }
 
-    # A dependency must stay OUT, and coverage alone cannot see that: `_deps` is
-    # not tracked, so `git ls-files` never lists it and deleting the exclusion
-    # leaves every coverage count perfect while catch2 floods back in -- measured
-    # at 228 reported lines from one test TU. So the canonical dependency shape is
-    # asked about explicitly, as a path rather than as a file that has to exist:
-    # a build directory may legitimately not be there yet, and a check that only
-    # bites after a build is one that does not bite when it is first needed.
-    local dep="${root}/out/build/gate-clang-debug/_deps/catch2-src/src/catch2/catch_test_macros.hpp"
-    if grep -qE "$include" <<< "$dep" \
-        && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$dep"; }; then
-        echo "deps-leak"
-        return 0
-    fi
+    # A dependency must stay OUT, and coverage alone cannot see that: dependency
+    # trees are not tracked, so `git ls-files` never lists them, and a filter that
+    # takes catch2 leaves every coverage count perfect while the sweep drowns --
+    # measured at 228 reported lines from one test translation unit.
+    #
+    # EVERY layout this project unpacks dependencies into is asked about, not only
+    # the one on this machine. The first fix for #1040 got this wrong: it
+    # excluded `_deps`, where FetchContent unpacks locally; `build.yml` sets
+    # `CPM_SOURCE_CACHE` to `.cache/CPM`, so CI's catch2 sits at
+    # `.cache/CPM/catch2/<hash>/src/catch2/...`, which contains `/src/` and is not
+    # under `_deps`. It was taken, the sweep failed inside catch2, and no developer
+    # machine could see it. A local guard that models one layout reproduces the
+    # defect it exists to catch.
+    #
+    # Asked as PATHS rather than as files that must exist: a build directory may
+    # legitimately not be there yet, and a check that only bites after a build does
+    # not bite when it is first needed.
+    local dep
+    for dep in "${root}/out/build/gate-clang-debug/_deps/catch2-src/src/catch2/catch_test_macros.hpp" \
+               "${root}/.cache/CPM/catch2/0123456789abcdef/src/catch2/catch_test_macros.hpp"; do
+        if grep -qE "$include" <<< "$dep" \
+            && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$dep"; }; then
+            echo "deps-leak"
+            return 0
+        fi
+    done
 
     header_filter_match "$include" "$exclude" "$root" <<< "$headers"
 }
@@ -765,7 +778,7 @@ header_filter_report() {
             return 1
             ;;
         deps-leak)
-            echo "clang-tidy's header filter in $config would report findings inside _deps/, which carry no .clang-tidy of their own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage of first-party headers cannot see this, because _deps is untracked and so is absent from the set the count is taken over: deleting ExcludeHeaderFilterRegex leaves every count perfect. Restore the exclusion rather than narrowing HeaderFilterRegex back onto a directory NAME (#1040)"
+            echo "clang-tidy's header filter in $config would report findings inside a DEPENDENCY tree, which carries no .clang-tidy of its own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage cannot see this, because dependency trees are untracked and so are absent from the set the count is taken over: a filter that takes catch2 still reports perfect coverage. Both layouts are checked, because they disagree -- FetchContent unpacks into out/build/*/_deps/ locally while build.yml sets CPM_SOURCE_CACHE to .cache/CPM, and a pattern excluding only the first passed every developer machine and failed CI inside catch2. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, not by adding another dependency location to exclude -- an exclusion bets on where the world puts things, and that bet has now lost once"
             return 1
             ;;
         0/*)
@@ -1337,8 +1350,8 @@ CONTINUED" \
     _hdrs="src/FastCache/Core/Base64.hpp
 src/apps/fastcached/Main.hpp"
     _old='.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
-    _new='.*/src/.*'
-    _exc='.*/_deps/.*'
+    _new='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _exc=''
 
     # The three layouts the old pattern covered, which must not regress...
     expect "the old pattern covered the primary checkout" \
@@ -1361,17 +1374,28 @@ src/apps/fastcached/Main.hpp"
             "2/2" "$(header_filter_match "$_new" "$_exc" "$_root" <<< "$_hdrs")"
     done
 
-    # And a dependency stays out. Without the exclusion the broad pattern takes
-    # it -- measured against the real analyser at 228 reported catch2 lines --
-    # so this pins the exclusion rather than the pattern.
-    expect "a dependency header is excluded" \
-        "0/1 out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp" \
-        "$(header_filter_match "$_new" "$_exc" /w/fastcached-worktrees/lane-a \
-            <<< "out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp")"
-    expect "and WITHOUT the exclusion the same header is taken, which is why it exists" \
+    # And a dependency stays out -- in EVERY layout this project unpacks into, not
+    # just the one on the machine running this. `_deps` is FetchContent's default
+    # locally; `build.yml` sets `CPM_SOURCE_CACHE` to `.cache/CPM`, so CI's catch2
+    # is at `.cache/CPM/<name>/<hash>/src/catch2/...`. Both contain `/src/`.
+    _dep_deps="out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp"
+    _dep_cpm=".cache/CPM/catch2/0123456789abcdef/src/catch2/catch_test_macros.hpp"
+    for _dep in "$_dep_deps" "$_dep_cpm"; do
+        expect "a dependency header is not matched: $_dep" \
+            "0/1 $_dep" \
+            "$(header_filter_match "$_new" "" /w/fastcached-worktrees/lane-a <<< "$_dep")"
+    done
+
+    # Pinned as the inequality it is. The first #1040 fix -- broad
+    # `.*/src/.*` with `_deps` excluded -- is correct for one layout and takes the
+    # other, which is why CI failed inside catch2 on a tree every local run called
+    # clean. A case driven only against `_deps` passes under that bug.
+    expect "the old broad+exclude pattern kept _deps out" \
+        "0/1 $_dep_deps" \
+        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a <<< "$_dep_deps")"
+    expect "... and TOOK the CPM layout, which is the defect CI caught" \
         "1/1" \
-        "$(header_filter_match "$_new" "" /w/fastcached-worktrees/lane-a \
-            <<< "out/build/x/_deps/catch2-src/src/catch2/catch_test_macros.hpp")"
+        "$(header_filter_match '.*/src/.*' '.*/_deps/.*' /w/fastcached-worktrees/lane-a <<< "$_dep_cpm")"
 
     # A partial match is its own outcome: an analyser blind to 1 of 2 headers
     # still reports findings, so it looks like it is working.
@@ -1398,7 +1422,7 @@ src/apps/fastcached/Main.hpp"
     expect "an empty coverage verdict is refused BY NAME, never as coverage" \
         "said|1" "$(report_says 'produced NO verdict' header_filter_report /w/.clang-tidy '')"
     expect "a filter that would take _deps refuses, and says why coverage cannot see it" \
-        "said|1" "$(report_says 'because _deps is untracked' header_filter_report /w/.clang-tidy deps-leak)"
+        "said|1" "$(report_says 'dependency trees are untracked' header_filter_report /w/.clang-tidy deps-leak)"
 
     # THE WIRING, which none of the above can see: the real `.clang-tidy` in this
     # very tree must cover every header this repository tracks. This is the case
