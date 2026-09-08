@@ -39,6 +39,32 @@ namespace
     /// per-operation bound and a very long time to wait for a TCP handshake.
     constexpr std::chrono::milliseconds UpstreamConnectTimeout { 1'000 };
 
+    /// How long the upstream's resolved address is reused before it is looked up
+    /// again.
+    ///
+    /// **Both directions this trades off, because that asymmetry is what makes any
+    /// particular number defensible.** `--upstream` names one endpoint for the life
+    /// of the process, and it used to be resolved on EVERY `Fetch` and `Store` -- one
+    /// `getaddrinfo` per cache operation, which on a Linux with `hosts: files dns`
+    /// and no local caching resolver is a full round trip every time.
+    ///
+    /// - **Too old, address REMOVED** (the machine went away): the dial fails, `Fetch`
+    ///   reports a miss and `Store` declines, and the build proceeds. It fails CLOSED
+    ///   and self-heals at the next refresh. Cheap.
+    /// - **Too old, address REASSIGNED to a machine that answers**: this node reads and
+    ///   writes a *different* cache. Keys are content-derived, so a hit is by
+    ///   construction the same compilation -- but that rests entirely on the trust
+    ///   boundary `--upstream` already assumes, and a held address can outlive the
+    ///   machine's ownership in a way a fresh lookup cannot. Cloud address recycling
+    ///   is the realistic case.
+    ///
+    /// The second direction is why this is a bounded refresh rather than "resolve once
+    /// at construction": a node runs for weeks, and resolving once would mean never
+    /// noticing a re-address at all. Thirty seconds keeps the exposure to roughly one
+    /// DNS TTL while removing essentially all of the per-operation cost, since a build
+    /// issues far more than one cache operation per thirty seconds.
+    constexpr std::chrono::milliseconds UpstreamAddressRefreshInterval { 30'000 };
+
     /// What the on-disk tier's B+tree is called inside `--cache-dir`.
     ///
     /// A file inside the directory rather than the directory itself, because the
@@ -205,8 +231,11 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
             [&logger](std::string_view text) { logger.Logf(LogLevel::Warn, "upstream cache: {}", text); },
             io.Connector(),
             &io.Reactor(),
+            io.Resolver(),
+            clock,
             UpstreamConnectTimeout,
-            UpstreamIoTimeout);
+            UpstreamIoTimeout,
+            UpstreamAddressRefreshInterval);
 
     auto tier =
         std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };

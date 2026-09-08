@@ -104,6 +104,7 @@ if(FASTCACHED_BUILD_TESTS)
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp
+        RemoteUpstream_test.cpp
         NodeConfig.cpp
         NodeLogging.cpp
         NodeLogging_test.cpp
