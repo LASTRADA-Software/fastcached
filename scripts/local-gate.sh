@@ -649,6 +649,118 @@ compiler_shim_verdict() {
     echo "none"
 }
 
+# What the gate SAYS about a verdict, split out from reading one.
+#
+# Both checks below read their verdict out of a command substitution and then
+# decide what to say about it, and the two halves fail in different ways: a reader
+# can be wrong about the tree, while a REPORTER can be wrong about the reader. The
+# decision is a pure function of the verdict here for the reason `leg_summary` is
+# one -- every state is then reachable from `--self-test` with no compiler, no
+# build directory and no cache installed, which is the only way the states can be
+# shown to be DISTINGUISHABLE rather than merely each printing something.
+#
+# Each prints its sentence and returns 0 to carry on or 1 to refuse. The refusal
+# itself stays at `run_preset`'s statement level, through `report_or_refuse`,
+# because `fail` inside a `$( )` ends the substitution's subshell and not the gate
+# -- a reporter cannot refuse on its own behalf, and one that tried would print
+# `GATE FAILED` and let the build run.
+#
+# THE EMPTY ARM IS THE POINT (#1031). Every path of both readers echoes a word, so
+# an empty verdict does not mean "the tree is like this" -- it means the
+# substitution that read it DIED. Under `set -u` an unbound variable inside `$( )`
+# kills that subshell, writes one line to stderr and hands the caller "", which the
+# `*)` arm then reported as `the resolved C++ compiler IS  (a compiler cache)`: a
+# cache named nothing, refusing correct trees, with a blank as the only tell. So
+# the empty verdict is its own named outcome. What is left on `*)` is exact rather
+# than a default -- `compiler_shim_verdict`'s remaining answers are cache NAMES and
+# `launcher_verdict`'s are counts -- which is the point of naming it, since the
+# repair for one collapse is the prime site for the next.
+#
+# @param 1 The preset.
+# @param 2 Path to the generated build, named in the sentences that mention it.
+# @param 3 The verdict from `launcher_verdict`.
+launcher_report() {
+    local preset="$1" ninja="$2" verdict="$3"
+    case "$verdict" in
+        '')
+            echo "$preset: the launcher check produced NO verdict for $ninja. That is a bug in the GATE, not a verdict about this tree: launcher_verdict answers a count, \`unknown\` or \`unreadable\` on every path, so an empty answer means the substitution that read it died -- an unbound variable under set -u is how that happened to the shim check one clause down (#1031), and this arm names the same state here rather than waiting for its turn. There is a line on stderr above this one naming the variable. Do not read this as a launcher"
+            return 1
+            ;;
+        0)
+            echo "== $preset: no compiler-cache launcher in the generated build"
+            return 0
+            ;;
+        unknown)
+            echo "$preset: $ninja is not there after configuring, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report"
+            return 1
+            ;;
+        unreadable)
+            echo "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
+            return 1
+            ;;
+        *)
+            echo "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (LAUNCHER bindings: $verdict), so its objects need not match this tree (#319, #368). This REFUSES rather than warns because it is wrong in BOTH directions: the observed case (#626) was five metrics tests failing in files the branch never touched, which costs somebody an investigation -- and the same substituted object can equally HIDE a real failure, with nothing to say so. A verdict about a tree that was not built cannot be read in either direction, so there is no safe way to continue past it. Something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
+            return 1
+            ;;
+    esac
+}
+
+# The same, for the resolved compiler.
+# @param 1 The preset.
+# @param 2 The build directory, named in the sentence that says where to look.
+# @param 3 The verdict from `compiler_shim_verdict`.
+shim_report() {
+    local preset="$1" build_dir="$2" shim="$3"
+    case "$shim" in
+        '')
+            echo "$preset: the compiler-shim check produced NO verdict for $build_dir. That is a bug in the GATE, not a verdict about this tree: compiler_shim_verdict answers \`none\`, \`unknown\` or a cache NAME on every path, so an empty answer means the substitution that read it died -- which is #1031 exactly, \$dir where \$build_dir was meant, reported by the default arm as a cache with no name. There is a line on stderr above this one naming the variable. Do not read this as a cache"
+            return 1
+            ;;
+        none)
+            echo "== $preset: the resolved compiler is not a compiler cache"
+            return 0
+            ;;
+        unknown)
+            echo "$preset: the resolved compiler cannot be read from $build_dir/CMakeFiles/*/CMakeCXXCompiler.cmake, so whether a cache fronts this build cannot be answered; a gate that cannot check must not report"
+            return 1
+            ;;
+        *)
+            echo "$preset: the resolved C++ compiler IS $shim (a compiler cache), so this is not a reference build and its objects need not match this tree (#319, #368, #716, #804, #887). USE_COMPILER_CACHE=OFF and zero LAUNCHER bindings are both TRUE here and neither can see this: a distribution can put a cache ahead of the real compiler on PATH -- Fedora ships /usr/lib64/ccache/ with symlinks to ccache and puts it on PATH from a profile snippet nobody opted into -- and then there is no launcher to count. This REFUSES rather than warns for the same reason the launcher clause does: a verdict about a tree that was not built cannot be read in EITHER direction, so a substituted object can equally invent a failure or hide one. Point CMAKE_CXX_COMPILER at the real compiler (readlink -f will tell you where the shim goes), or take the shim directory off PATH for this run"
+            return 1
+            ;;
+    esac
+}
+
+# Say what a reporter said, or refuse the gate with it.
+#
+# The status is what decides, never the text: a reporter whose sentence is right
+# and whose `return` is wrong would print a refusal and let the build run, which is
+# the same shape of quiet-wrong-verdict the reporters exist to stop. Written once
+# because both call sites differ only by which reporter they name.
+#
+# The two kinds of argument fail differently, and both are covered rather than one
+# standing in for the other. A PLAIN one -- the preset, the directory -- is expanded
+# in the gate's own shell, so an unbound name there kills the gate loudly and names
+# itself. The VERDICT argument is a substitution, so an unbound name inside it dies
+# in that subshell and arrives as "" instead: quiet, and exactly #1031. That one is
+# caught by the reporters' empty arm, not here, which is why the arm exists at all.
+#
+# @param 1.. The reporter and its arguments.
+report_or_refuse() {
+    local line status
+    line="$("$@")"
+    status=$?
+    # And the same collapse one level up, in the repair for it: a reporter that
+    # said NOTHING would reach `fail ""`, which prints `GATE FAILED:` and stops
+    # having named no reason at all -- a refusal with a blank where the cause goes,
+    # which is #1031's shape exactly. Every arm of every reporter echoes, so an
+    # empty line means the reporter did not RUN: a name typed wrong is status 127
+    # with `command not found` on stderr and nothing here.
+    [[ -n "$line" ]] || fail "the gate's own reporter '$1' produced no line at all (exit $status), so there is no verdict to read. That is a bug in the GATE, not a verdict about this tree -- every arm of every reporter echoes, so this means the reporter did not run. There is a line on stderr above this one saying why"
+    [[ "$status" -eq 0 ]] || fail "$line"
+    echo "$line"
+}
+
 # Why this preset has to be configured, or empty when it does not.
 #
 # Split out because it is exactly what `--self-test` can check without a toolchain,
@@ -963,6 +1075,126 @@ if [[ "$self_test" -eq 1 ]]; then
     : > "$scratch/empty-compiler-file/CMakeFiles/3.28.0/CMakeCXXCompiler.cmake"
     expect "a file naming no compiler is unknown, never none" \
         "unknown" "$(compiler_shim_verdict "$scratch/empty-compiler-file")"
+
+    # -----------------------------------------------------------------------
+    # What the gate SAYS about those verdicts (#1031), which is a different
+    # question from what it reads and had no check of its own. The reader above
+    # was correct throughout; the two clauses that ACT on it were where a correct
+    # tree got refused.
+    #
+    # What a reporter answered, reduced to the two things a caller acts on: the
+    # words that tell one outcome from another, and the STATUS, which is what
+    # actually decides. Pinning the paragraphs whole would be a test of the prose;
+    # pinning only the words would miss a reporter that says the right thing and
+    # returns 0 -- which prints a refusal and then lets the gate build the tree it
+    # just refused, and no text-only assertion can see it.
+    #
+    # @param 1 A substring that must appear. @param 2.. The reporter and its arguments.
+    # stderr is merged in, or the one case whose subject WRITES there -- `fail`,
+    # which is the whole of `report_or_refuse`'s refusal path -- would be read as a
+    # reporter that said nothing. The reporters themselves write to stdout only, so
+    # nothing else is affected.
+    report_says() {
+        local want="$1"; shift
+        local text status
+        text="$("$@" 2>&1)"
+        status=$?
+        case "$text" in
+            *"$want"*) printf 'said|%s' "$status" ;;
+            *)         printf 'DID NOT SAY [%s], said [%s]|%s' "$want" "$text" "$status" ;;
+        esac
+    }
+
+    # The three verdicts a healthy gate can reach, each asserted on its own,
+    # because the defect was two of the four outcomes arriving at one arm. A case
+    # that only checked "the gate said OK" is what let it ship.
+    expect "a real compiler is reported as no cache, and the gate carries on" \
+        "== gate-clang-debug: the resolved compiler is not a compiler cache|0" \
+        "$(text="$(shim_report gate-clang-debug "$scratch/real-compiler" none)"; printf '%s|%s' "$text" "$?")"
+    expect "a cache is NAMED, and refuses" \
+        "said|1" "$(report_says 'IS ccache (a compiler cache)' shim_report gate-clang-debug /b ccache)"
+    expect "a compiler that cannot be read refuses, and says where it looked" \
+        "said|1" "$(report_says '/b/CMakeFiles/*/CMakeCXXCompiler.cmake' shim_report gate-clang-debug /b unknown)"
+
+    # And the fourth, which is the ticket. Driven rather than described: `dir` is
+    # `local` to `configure_reason` and therefore unset here exactly as it was
+    # unset in `run_preset`, so this is the expression that clause used to hold.
+    # Under `set -u` bash kills the substitution's subshell and hands the caller
+    # "", putting the diagnosis on stderr -- quiet at the point that ACTS on it,
+    # which is the whole reason a wrong variable name presented as a verdict about
+    # the tree rather than as a crash. stderr is dropped so the self-test's own
+    # output stays readable; the point being made is about the VALUE.
+    shim_verdict_of_unbound_dir() { compiler_shim_verdict "$dir"; }
+    expect "an unbound build directory yields an empty verdict, not a diagnosis" \
+        "" "$(shim_verdict_of_unbound_dir 2>/dev/null)"
+    expect "and an empty verdict is refused BY NAME, never as a nameless cache" \
+        "said|1" \
+        "$(report_says 'produced NO verdict' \
+            shim_report gate-clang-debug "$scratch/real-compiler" "$(shim_verdict_of_unbound_dir 2>/dev/null)")"
+
+    # The assertion that actually separates fixed from broken, and it is NOT the
+    # inequality it looks like it should be: under the bug the empty verdict
+    # rendered as `IS  (a compiler cache)` and a named one as `IS ccache (a
+    # compiler cache)`, so those two DIFFER and an inequality check passes while
+    # the defect is live. A signal that cannot be false in the failing case is not
+    # evidence. What must hold is the positive claim: an outcome meaning "this
+    # check did not run" must make no claim about a cache at all.
+    expect "an empty verdict makes no claim about a compiler cache" \
+        "no" "$([[ "$(shim_report gate-clang-debug /b '')" == *"a compiler cache"* ]] && echo yes || echo no)"
+
+    # The launcher clause is the same shape three lines up, reading a different
+    # file, and it had the same open default arm. Its four healthy states plus the
+    # empty one, so the pair is covered rather than the half that happened to fire.
+    expect "a build with no launcher edge is reported clean, and the gate carries on" \
+        "== gate-clang-debug: no compiler-cache launcher in the generated build|0" \
+        "$(text="$(launcher_report gate-clang-debug /b/build.ninja 0)"; printf '%s|%s' "$text" "$?")"
+    expect "a launcher-fronted build refuses, quoting the count" \
+        "said|1" "$(report_says 'LAUNCHER bindings: 2' launcher_report gate-clang-debug /b/build.ninja 2)"
+    expect "a build.ninja that is not there refuses, naming the file" \
+        "said|1" "$(report_says '/b/build.ninja is not there' launcher_report gate-clang-debug /b/build.ninja unknown)"
+    expect "a build.ninja that cannot be read refuses as a permission problem" \
+        "said|1" "$(report_says 'not a launcher one' launcher_report gate-clang-debug /b/build.ninja unreadable)"
+    expect "an empty launcher verdict is refused BY NAME, never as a launcher" \
+        "said|1" "$(report_says 'produced NO verdict' launcher_report gate-clang-debug /b/build.ninja '')"
+    expect "an empty launcher verdict claims no launcher bindings" \
+        "no" "$([[ "$(launcher_report gate-clang-debug /b/build.ninja '')" == *"LAUNCHER bindings:"* ]] && echo yes || echo no)"
+
+    # THE PLUMBING, which none of the above can see: a reporter's STATUS has to
+    # reach `fail`. Dropping the status check leaves every check above green while
+    # letting the gate build a tree it has just refused -- the reporters print, so
+    # the refusal is even in the log. Both stubs are reporters in shape only, which
+    # is the point: what is under test is the caller.
+    #
+    # `fail` exits, and inside `$( ... )` that ends the substitution's subshell
+    # rather than this script, so the refusal can be read rather than killing the
+    # self-test. `; echo CONTINUED` is the sentinel for the mutation the text alone
+    # cannot see. `leg_states` is reset inside the subshell so the leg block is the
+    # same whatever has run before this point.
+    stub_report_ok()     { echo "== a check says something"; return 0; }
+    stub_report_refuse() { echo "a check refuses for a reason"; return 1; }
+    stub_report_silent() { return 1; }
+
+    expect "a reporter that returns 0 is printed, and the gate carries on" \
+        "== a check says something
+CONTINUED" \
+        "$( (report_or_refuse stub_report_ok; echo CONTINUED) 2>&1 )"
+    expect "a reporter that returns non-zero refuses through fail(), and stops" \
+        "GATE FAILED: a check refuses for a reason
+== gate legs:
+==   gate-clang-debug   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING
+==   gate-gcc-release   NOT RUN -- the gate stopped before this leg, so it has reported NOTHING" \
+        "$( (leg_states=(); report_or_refuse stub_report_refuse; echo CONTINUED) 2>&1 )"
+
+    # A reporter that produced no line is the same collapse inside the repair for
+    # it: `fail "$line"` with an empty line prints `GATE FAILED:` and a blank where
+    # the cause goes. The reporter is named instead. A typo'd reporter name is the
+    # way this is actually reached -- status 127, `command not found` on stderr and
+    # nothing on stdout -- and a stub that returns without echoing is that state
+    # without depending on the shell's wording for a missing command.
+    expect "a reporter that produced no line is refused by NAME, not by a blank" \
+        "said|1" \
+        "$(report_says "reporter 'stub_report_silent' produced no line at all" \
+            report_or_refuse stub_report_silent)"
 
     # The per-leg verdict (#501). The renderer is pure, so every state is reachable
     # here without a compiler -- which is the whole reason it takes its input as
@@ -1316,22 +1548,13 @@ run_preset() {
     # build that has not happened yet. The flag above states the intent; this reads
     # the fact out of the generated build, and they are not the same -- see
     # launcher_verdict.
-    local verdict
-    verdict="$(launcher_verdict "$ninja")"
-    case "$verdict" in
-        0)
-            echo "== $preset: no compiler-cache launcher in the generated build"
-            ;;
-        unknown)
-            fail "$preset: $ninja is not there after configuring, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report"
-            ;;
-        unreadable)
-            fail "$preset: $ninja cannot be read, so whether a compiler cache fronts this build cannot be answered; a gate that cannot check must not report. This is a permission or filesystem problem, not a launcher one -- no configure will repair it"
-            ;;
-        *)
-            fail "$preset: the generated build is fronted by a compiler-cache launcher despite the gate preset's USE_COMPILER_CACHE=OFF (LAUNCHER bindings: $verdict), so its objects need not match this tree (#319, #368). This REFUSES rather than warns because it is wrong in BOTH directions: the observed case (#626) was five metrics tests failing in files the branch never touched, which costs somebody an investigation -- and the same substituted object can equally HIDE a real failure, with nothing to say so. A verdict about a tree that was not built cannot be read in either direction, so there is no safe way to continue past it. Something set CMAKE_CXX_COMPILER_LAUNCHER externally -- a preset, a toolchain file, or an older -D -- and cmake/portable/CompileCache.cmake leaves such a value untouched. Reconfigure with --fresh, or unset it"
-            ;;
-    esac
+    #
+    # The directory each check reads is spelled from the two names this function
+    # declares, `$build_dir` and the `$ninja` derived from it. #1031 was the shim
+    # clause below spelling it `$dir`, which is `local` to `configure_reason` and
+    # unbound here -- and the substitution swallowed the error, so a correct tree
+    # was refused as a compiler cache with no name.
+    report_or_refuse launcher_report "$preset" "$ninja" "$(launcher_verdict "$ninja")"
 
     # And the OTHER way a cache fronts a reference build, which the check above
     # cannot see: no launcher at all, because the resolved compiler IS the cache.
@@ -1339,19 +1562,7 @@ run_preset() {
     # read different files and answer different questions -- and a single verdict
     # would have to collapse "a launcher is configured" and "the compiler is a
     # shim" into one word, which is how the first one came to stand for both.
-    local shim
-    shim="$(compiler_shim_verdict "$dir")"
-    case "$shim" in
-        none)
-            echo "== $preset: the resolved compiler is not a compiler cache"
-            ;;
-        unknown)
-            fail "$preset: the resolved compiler cannot be read from $dir/CMakeFiles/*/CMakeCXXCompiler.cmake, so whether a cache fronts this build cannot be answered; a gate that cannot check must not report"
-            ;;
-        *)
-            fail "$preset: the resolved C++ compiler IS $shim (a compiler cache), so this is not a reference build and its objects need not match this tree (#319, #368, #716, #804, #887). USE_COMPILER_CACHE=OFF and zero LAUNCHER bindings are both TRUE here and neither can see this: a distribution can put a cache ahead of the real compiler on PATH -- Fedora ships /usr/lib64/ccache/ with symlinks to ccache and puts it on PATH from a profile snippet nobody opted into -- and then there is no launcher to count. This REFUSES rather than warns for the same reason the launcher clause does: a verdict about a tree that was not built cannot be read in EITHER direction, so a substituted object can equally invent a failure or hide one. Point CMAKE_CXX_COMPILER at the real compiler (readlink -f will tell you where the shim goes), or take the shim directory off PATH for this run"
-            ;;
-    esac
+    report_or_refuse shim_report "$preset" "$build_dir" "$(compiler_shim_verdict "$build_dir")"
 
     echo "== $preset: build"
     if ! cmake --build --preset "$preset" > "$log" 2>&1; then
