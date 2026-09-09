@@ -45,6 +45,7 @@ target_sources(FastCache
         Consensus/RaftPeerTransport.cpp
         Core/Crc32c.cpp
         Core/PathKind.cpp
+        Core/SecureBytes.cpp
         Core/Sha256.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
@@ -201,6 +202,7 @@ target_sources(FastCache
             Core/Errors/StorageError.hpp
             Core/Errors/ConfigError.hpp
             Core/Bytes.hpp
+            Core/SecureBytes.hpp
             Core/Compression.hpp
             Core/Endian.hpp
             Core/StringHash.hpp

@@ -12,6 +12,7 @@ transport, a manual clock and a scripted reactor.
 src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
+                SecureBytes (the one zeroing primitive, and the allocator credentials live in),
                 Utf8 (the one strict decoder), Compression, WireFrame + WireFields
                 (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
@@ -399,6 +400,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   present; counted, it would claim a bound is too short for an event that says nothing
   about the bound. Acceptance is a discrimination case; per-arm sections all pass when
   all three answer alike.
+- A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a
+  destructor: every release goes through one door, so the several COPIES (the validator
+  takes the key by value) need no holder to remember anything. It also covers a vector
+  that grows, which none here does today — say so, rather than citing a growing holder
+  this tree does not have. `std::memset` is DELETED at -O2 by both compilers — measured,
+  same `main`, both inlined. Container-agnostic is not SUFFICIENT: SSO keeps a short secret
+  inside the object where no allocator is called — measured, inline capacity **15 on
+  libstdc++ AND on MSVC, 22 on libc++**, so a 16-to-22-byte secret is on the heap on Linux
+  and Windows and inline on macOS. libc++ is the sole outlier, which makes **macOS the
+  platform to write the failing test against**. Secret STRINGS need an inline wipe too
+  (#1125), and a destructor-based one still misses the inline-to-heap transition. Holders
+  are found by NAME, so a row that has stopped matching is a refusal.
 - A lease token is a credential, and its MAC covers the granted **endpoint** or it is
   a credential for every worker that trusts the key. Fields length-prefixed, never
   joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery

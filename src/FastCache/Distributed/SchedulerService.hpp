@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
@@ -675,7 +676,7 @@ class SchedulerService
     /// a file by a tier that has no reason to outlive this service, and a signing key
     /// that quietly becomes a dangling view is the kind of defect that authenticates
     /// nothing while every test passes.
-    std::vector<std::byte> _signingKey;
+    SecureByteBuffer _signingKey;
 
     /// Which fleet this scheduler leads; empty when the operator named none.
     ///

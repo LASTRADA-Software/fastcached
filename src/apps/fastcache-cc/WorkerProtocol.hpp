@@ -6,6 +6,7 @@
 #include "CompileJob.hpp"
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/ISocket.hpp>
@@ -170,7 +171,7 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        counted here -- the surface converts one `LeaseRefusalTable` row into the
 ///        wire code and the counter together -- so this sink exists for the one event
 ///        that is not a refusal and would otherwise be visible only in a log.
-[[nodiscard]] LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
+[[nodiscard]] LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
                                                   std::string advertisedEndpoint,
                                                   WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,

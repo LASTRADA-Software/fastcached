@@ -36,6 +36,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/CompileValue.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Base64.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Compression.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
@@ -66,6 +67,17 @@ set(_fc_cc_core
 # yaml-cpp, OpenSSL and the reactor, and can link the CRT statically -- and these
 # four reach only Net/NetError.hpp, Async/Task.hpp and Core/Profiling.hpp,
 # all header-only and all std-only. ws2_32 was already linked below.
+
+# Core/SecureBytes.cpp is here because `SignedLeaseValidator` holds the cluster key,
+# and it is in WorkerProtocol.cpp -- this directory's file, compiled into both
+# binaries -- so the type the key lives in has to be linkable in a launcher build
+# too. It is one row for the same reason Sha256 is: the alternative is a second
+# zeroing primitive, and two of those is one that gets it wrong.
+#
+# It costs nothing the rule above protects. SecureBytes.hpp reaches <cstddef>,
+# <memory> and <vector>; the .cpp adds <cstring> and, on Windows, windows.h -- which
+# is why the platform selection is in a .cpp at all and not in the header every
+# credential holder includes.
 
 # Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token is made of:
 # HMAC-SHA256 over the granted endpoint, fingerprint, key and expiry, rendered as

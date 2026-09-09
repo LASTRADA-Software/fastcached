@@ -4,6 +4,7 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 #include <FastCache/Net/SharedPortDatagram.hpp>
 
@@ -30,9 +31,9 @@ using namespace std::chrono_literals;
 namespace
 {
 /// A key, as the config wants it.
-[[nodiscard]] std::vector<std::byte> Key(std::string_view text)
+[[nodiscard]] SecureByteBuffer Key(std::string_view text)
 {
-    std::vector<std::byte> out;
+    SecureByteBuffer out;
     out.reserve(text.size());
     for (auto const ch: text)
         out.push_back(static_cast<std::byte>(ch));

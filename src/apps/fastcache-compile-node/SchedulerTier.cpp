@@ -83,7 +83,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     //
     // Absent is legal and means unsigned grants; unreadable is not, and is fatal for
     // the reason the header states.
-    std::vector<std::byte> signingKey;
+    SecureByteBuffer signingKey;
     if (!cfg.clusterKeyFile.empty())
     {
         auto key = ReadClusterKey(cfg.clusterKeyFile);

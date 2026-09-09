@@ -126,7 +126,7 @@ namespace
                   "a refusal row for COMPILE is dead: the lookup never reaches it");
 } // namespace
 
-LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
+LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
                                     std::string advertisedEndpoint,
                                     WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,

@@ -10,6 +10,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IDatagramSocket.hpp>
 
 #include <chrono>
@@ -44,7 +45,7 @@ namespace FastCache::Node
 /// a message about a bad proof rather than about a newline.
 /// @param path Where the key is.
 /// @return The key bytes, or why the file cannot serve as one.
-[[nodiscard]] std::expected<std::vector<std::byte>, std::string> ReadClusterKey(std::filesystem::path const& path);
+[[nodiscard]] std::expected<SecureByteBuffer, std::string> ReadClusterKey(std::filesystem::path const& path);
 
 /// LAN discovery, running.
 ///

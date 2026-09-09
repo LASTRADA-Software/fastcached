@@ -34,7 +34,7 @@ namespace
     }
 } // namespace
 
-std::expected<std::vector<std::byte>, std::string> ReadClusterKey(std::filesystem::path const& path)
+std::expected<SecureByteBuffer, std::string> ReadClusterKey(std::filesystem::path const& path)
 {
     auto error = std::error_code {};
     auto const size = std::filesystem::file_size(path, error);
@@ -48,7 +48,7 @@ std::expected<std::vector<std::byte>, std::string> ReadClusterKey(std::filesyste
     if (file == nullptr)
         return std::unexpected { std::format("cannot open {}", path.string()) };
 
-    auto key = std::vector<std::byte>(static_cast<std::size_t>(size));
+    auto key = SecureByteBuffer(static_cast<std::size_t>(size));
     if (!key.empty() && std::fread(key.data(), 1, key.size(), file.get()) != key.size())
         return std::unexpected { std::format("cannot read {} in full", path.string()) };
 
