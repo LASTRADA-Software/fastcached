@@ -2993,3 +2993,67 @@ TEST_CASE("The listener an endpoint owns is freed with its reactor stopped, not 
     CHECK(witness->ruleHeld.load(std::memory_order_acquire));
     CHECK_FALSE(witness->reactorRunning.load(std::memory_order_acquire));
 }
+
+TEST_CASE("A connection parked on a TIMER at shutdown does not hold the drain to its ceiling", "[node][frame][teardown]")
+{
+    // **#1042, filed as a reading and refuted by measurement.** The reading was that a
+    // connection parked in `AwaitWatchQuiet` -- a TIMER wait, which `State::CloseAll`
+    // cannot resolve, since closing a socket resolves socket waits and nothing else --
+    // could only be released by `DrainWithin` expiring, because
+    // `NodeIoLoop::NoteLoopFinished` stops the reactor once the adopted loops end.
+    //
+    // The premise is wrong in a way that is invisible unless you count the
+    // registrations. **`FrameServer::Run` adopts TWO loops, not one**: it counts itself
+    // and the sweeper, and calls `NoteLoopStarted()` for the second. So the accept loop
+    // ending takes `_loopsRunning` from 2 to 1, `Stop()` is not called, the reactor goes
+    // on turning, and the parked connection keeps receiving the 5 ms ticks that let it
+    // observe its watch finish. The comment at that second increment already says why it
+    // is there: a frame parked on the timer wheel is exactly what the reactor must not
+    // return over.
+    //
+    // What actually bounds this shutdown is the SWEEPER's own wake latency -- it sleeps
+    // up to `SweepInterval` before it observes `shuttingDown` -- and not the connection,
+    // which was the thing under suspicion and is the fast part. Measured across offsets
+    // of 0 to 1240 ms between the endpoint starting and the request arriving,
+    // `offset + elapsed` was constant at ~1250 ms, never approaching the 5 s ceiling.
+    //
+    // **The assertion is the BOUND, not completion.** A case asserting only that
+    // shutdown finishes passes under the very defect the ticket described: the ceiling
+    // does fire eventually, and the symptom was always a slow stop rather than a hang.
+    //
+    // Shown red by deleting the `NoteLoopStarted()` beside the sweeper's `loopsAlive`
+    // increment -- the mechanism this case exists for. With it gone the accept loop
+    // stops the reactor, the connection is never ticked again, and this reaches the
+    // ceiling. One offset rather than the six the investigation swept: the curve
+    // identified the mechanism, a regression only has to be sensitive to it.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    // Sent and READ, so the answer is delivered and the connection proceeds into
+    // `AwaitWatchQuiet`; then held open and idle, so the watch cannot finish because the
+    // peer left. Anything that releases this connection is therefore this node's own
+    // teardown, which is the state the ticket is about.
+    Conversation client { port };
+    REQUIRE_FALSE(client.Send(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")).empty());
+
+    auto const before = std::chrono::steady_clock::now();
+    endpoint->reset(); // ~FrameEndpoint IS the shutdown, and it blocks on the drain
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before);
+
+    // DERIVED from both constants rather than restated, and they agree: the healthy
+    // bound is the sweeper's wake, so twice `SweepInterval` is a margin of one whole
+    // sweep -- and it is also exactly half the drain's own ceiling. A literal here would
+    // be a third number to keep in step with two that already move together.
+    auto const generous = 2 * FrameServer::SweepInterval;
+    static_assert(std::chrono::milliseconds { 2 * FrameServer::SweepInterval } < DrainBound {}.ceiling,
+                  "the margin must sit strictly inside the ceiling, or this case cannot tell them apart");
+    CHECK(elapsed < generous);
+}
