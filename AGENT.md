@@ -809,6 +809,29 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
   does not link `FastCache`. It therefore carries cache tiers **positionally**,
   which makes `StorageTier`'s enumerator order a wire contract.
+- **And an enum SAYS which kind it is at its declaration** — transmitted or persisted, or
+  private — because *no comment* meant both, in a tree holding both (#308). A mid-enum
+  insertion shifts every later ordinal: free in one file, and in the other every record
+  already written comes back with each field attributed to the NEXT enumerator, silently,
+  for as long as the file exists. Eighteen enums have an ordinal that is read from bytes or
+  from a position, and **eight said nothing** — `PathCanon::Grammar`, the region tag of every
+  object this cache has ever stored, and `Consensus::EntryKind`, which is on disk in
+  `raft.log` AND on the peer wire, both with every enumerator implicit.
+  The explicit `= N` is the enforcement (a renumbering then shows up in review as a changed
+  literal rather than as an invisible consequence of one added line) and on a PRIVATE enum
+  it is harmful, asserting a contract that does not exist. **`RowsInEnumeratorOrder` is not
+  that guard although it reads like one**: it fires on a row omitted or misplaced, and an
+  insertion whose row goes in at the matching position leaves the table perfectly
+  consistent while every record already written decodes shifted. The census pattern —
+  `static_cast<T>(byte)` — is NARROWER than it reads, in three ways: `Op` and `MessageType`
+  are decoded by a table walk that ENCODES each row; a positional carrier is no cast at all
+  (`MetaSlot` is MULTIPLIED into a file offset, `KeyPiece` folded into a digest and decoded
+  nowhere); and `DecodeWireEnum<E>` casts to a TEMPLATE PARAMETER, so one grep hit spelled
+  `E` stands for three Raft wire enums. **Nine of eighteen rows sit outside the pattern, and
+  this ticket's own first pass found three of the nine** — it shipped a table stating 12,
+  checked against itself by `table-total` and against the tree by nothing. Nothing checks
+  the comments and an approximate scan would refuse correct declarations, so this bullet is
+  the guard.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
 - So is keepalive, and for the mirror reason: `ApplyHotSocketOptions` is where every
