@@ -1462,35 +1462,44 @@ expect() {
 # the middle -- at the boundary and one second past it -- because that is where a
 # comparison mistake lives. Arguments are:
 #
-#     what  bound  elapsed  polls  alive  exit  logGrew  stall
+#     what  bound  elapsed  polls  alive  exit  logGrew  stall  requestedMs
 #
-# all durations in MEASURED seconds. With bound=20 the "recent" window is 20/4 =
-# 5s, so a 5s stall is progressing and a 6s one is stalled; and the overrun note
-# fires above bound + max(1, bound/10), so 22s is quiet and 23s is not.
+# all durations in MEASURED seconds except the last, which is the total the loop
+# ASKED FOR in milliseconds and is the one figure here that consults no clock
+# (#1066). With bound=20 the "recent" window is 20/4 = 5s, so a 5s stall is
+# progressing and a 6s one is stalled; and the starvation note fires BELOW
+# bound x 500 ms, so 10000 is quiet and 9999 is not.
+#
+# Every row states the last field even where it is irrelevant, rather than letting
+# it default: a row that omits a field is one nobody can read the intent of, and
+# `-` here is a THIRD state -- the caller took no such reading -- which gets its own
+# row rather than being the shape every other row happens to have.
 verdicts=(
-    "died|worker|20|20|98|no|3|no|-|the process DIED"
-    "died-status-unknown|worker|20|20|98|no|-|no|-|exit=-"
-    "no-process|worker|20|20|98|unknown|-|unknown|-|INCONCLUSIVE|No process was watched"
-    "no-log|worker|20|20|98|yes|-|unknown|-|INCONCLUSIVE|no log was watched"
-    "silent|worker|20|20|98|yes|-|no|-|logged NOTHING for the whole 20s"
-    "progressing-at-bound|worker|20|20|98|yes|-|yes|5|still making progress"
-    "stalled-one-second-past|worker|20|20|98|yes|-|yes|6|stopped making observable progress"
-    "progressing-fresh|worker|20|20|98|yes|-|yes|0|still making progress"
-    "stalled-cold|worker|20|20|98|yes|-|yes|20|stopped making observable progress"
+    "died|worker|20|20|98|no|3|no|-|19000|the process DIED"
+    "died-status-unknown|worker|20|20|98|no|-|no|-|19000|exit=-"
+    "no-process|worker|20|20|98|unknown|-|unknown|-|19000|INCONCLUSIVE|No process was watched"
+    "no-log|worker|20|20|98|yes|-|unknown|-|19000|INCONCLUSIVE|no log was watched"
+    "silent|worker|20|20|98|yes|-|no|-|19000|logged NOTHING for the whole 20s"
+    "progressing-at-bound|worker|20|20|98|yes|-|yes|5|19000|still making progress"
+    "stalled-one-second-past|worker|20|20|98|yes|-|yes|6|19000|stopped making observable progress"
+    "progressing-fresh|worker|20|20|98|yes|-|yes|0|19000|still making progress"
+    "stalled-cold|worker|20|20|98|yes|-|yes|20|19000|stopped making observable progress"
     # The measured elapsed is what gets printed, never the budget.
-    "reports-measured-not-nominal|worker|20|37|61|yes|-|no|-|waited 37s (measured, over 61 polls) of a 20s budget"
-    # And the overrun note, pinned on both sides of bound + max(1, bound/10).
-    "overrun-quiet-at-slack|worker|20|22|98|yes|-|no|-|!NOTE: the loop overran"
-    "overrun-named-past-slack|worker|20|23|98|yes|-|no|-|NOTE: the loop overran its own budget by 3s"
+    "reports-measured-not-nominal|worker|20|37|61|yes|-|no|-|19000|waited 37s (measured, over 61 polls) of a 20s budget"
+    # The starvation note, pinned on both sides of bound x 500 ms and one unit apart,
+    # plus the reading the caller did not take.
+    "starved-quiet-at-threshold|worker|20|22|98|yes|-|no|-|10000|!NOTE: the loop asked"
+    "starved-named-below-threshold|worker|20|22|98|yes|-|no|-|9999|NOTE: the loop asked for only 9999ms of pauses inside a 20s budget"
+    "starved-unknown-claims-nothing|worker|20|22|98|yes|-|no|-|-|!NOTE: the loop asked"
 )
 
 echo "== the verdict, against staged records"
 for row in "${verdicts[@]}"; do
     old="$IFS"
-    IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vrest <<< "$row"
+    IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vreq vrest <<< "$row"
     IFS="$old"
     out="$( . "$library"
-            _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" 2>&1 )"
+            _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" "$vreq" 2>&1 )"
     ran=$(( ran + 1 ))
     expect "${vname}|0|${vrest}" "$out" 0 || note_failure "${vname}"
 done
@@ -1502,10 +1511,10 @@ done
 distinct="$(
     for row in "${verdicts[@]}"; do
         old="$IFS"
-        IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vrest <<< "$row"
+        IFS='|' read -r vname vwhat vbound vsecs vpolls valive vstatus vgrew vstall vreq vrest <<< "$row"
         IFS="$old"
         ( . "$library"
-          _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" 2>&1 ) \
+          _e2e_verdict "$vwhat" "$vbound" "$vsecs" "$vpolls" "$valive" "$vstatus" "$vgrew" "$vstall" "$vreq" 2>&1 ) \
             | grep 'FINDING:'
     done | sort -u | grep -c .
 )"
@@ -1517,24 +1526,37 @@ ran=$(( ran + 1 ))
 
 # --- the drain's verdict, against staged readings ---------------------------
 #
-# `_e2e_read_hit_bound` decides whether OUR bound or the PEER ended a read, from
-# the CLOCK. `read -t`'s exit status cannot carry that: a timeout is above 128 on
-# bash 4.0+ and a plain `1` -- byte-identical to EOF -- on the 3.2 that macOS ships.
-# The status-based version therefore failed on macOS ALONE and passed everywhere
-# else, which is why the decision is driven DIRECTLY here rather than through a
-# staged listener: on this platform the real path cannot exhibit the difference.
-# `.agent/rules/testing.md`, on splitting the decision out as a pure function over
-# a record so a verdict needing a rare machine to reproduce needs one line here.
+# `_e2e_read_ended_at_bound` decides whether OUR bound or the PEER ended a read. It
+# is driven DIRECTLY here rather than through a staged listener because half of it
+# cannot be exhibited on this platform at all: bash 3.2, which macOS ships as
+# `/bin/bash`, answers a plain `1` for both a timeout and EOF, so the status arm is
+# unreachable there and the probe arm is unreachable on bash 4+.
+# `.agent/rules/testing.md`, on splitting the decision out as a pure function over a
+# record so a verdict needing a rare machine to reproduce needs one line here.
 #
-# The listener-backed arm of the same property is `http-silence-inconclusive`,
-# which spends the whole five-second bound. These cost nothing and cover the
-# branch on every platform, which that case cannot.
+# **These rows no longer carry an elapsed time, and that is #1048.** The predicate
+# used to read `elapsed >= bound`, timed with `SECONDS` -- which is `CLOCK_REALTIME`,
+# and the host steps it. Measured against `CLOCK_MONOTONIC`, 7 of 45 reads reported a
+# `SECONDS` elapsed of 4 while the monotonic clock measured 5.01-5.06 s: full-bound
+# timeouts carrying status 142, which only LOOKED short. `4 >= 5` was false, so a
+# server that held perfectly was reported as having closed. 9 failures in 60 probes
+# against one settled node.
+#
+# The two staged readings are the read's exit status and whether the follow-up probe
+# BLOCKED -- 1 it did, 0 it came back at once, `-` no probe was taken because the peer
+# had already spoken. Neither is a clock reading, which is the whole repair.
+#
+# The listener-backed arm of the same property is `http-silence-inconclusive`, which
+# spends the whole bound. These cost nothing and cover both branches on every
+# platform, which that case cannot.
 echo "== the drain's verdict, against staged readings"
 read_bound_rows=(
-    "hit-bound-exact|5|5|0|a read that consumed its whole bound is the bound's"
-    "hit-bound-over|6|5|0|a read that overran its bound is still the bound's"
-    "hit-bound-eof|0|5|1|a peer that closed at once is the peer's"
-    "hit-bound-early|4|5|1|a peer that closed inside the bound is the peer's"
+    "ended-timeout-status|142|-|0|a status above 128 is a timeout, so the bound's"
+    "ended-timeout-status-shortread|142|-|0|a read a stepped clock made LOOK short still carries 142, and is still the bound's"
+    "ended-eof-status|1|0|1|EOF status with an instant follow-up probe is the peer's"
+    "ended-32-held|1|1|0|bash 3.2 cannot say, and a probe that BLOCKED is the bound's"
+    "ended-32-closed|1|0|1|bash 3.2 cannot say, and an instant probe is the peer's"
+    "ended-spoke|0|-|1|a peer that spoke needs no probe and is the peer's"
 )
 # Two empty lists agree perfectly: a table that loses its rows reports every
 # reading clean, exactly like a scan that found no readings.
@@ -1546,12 +1568,12 @@ fi
 
 for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
     old="$IFS"
-    IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+    IFS='|' read -r rname rstatus rprobe rwant rwhat <<< "$row"
     IFS="$old"
-    ( . "$library"; _e2e_read_hit_bound "$relapsed" "$rbound" ) && rgot=0 || rgot=$?
+    ( . "$library"; _e2e_read_ended_at_bound "$rstatus" "$rprobe" ) && rgot=0 || rgot=$?
     ran=$(( ran + 1 ))
     if [ "$rgot" -ne "$rwant" ]; then
-        echo "FAIL ${rname}: ${rwhat} -- elapsed ${relapsed}s against a ${rbound}s bound returned ${rgot}, wanted ${rwant}" >&2
+        echo "FAIL ${rname}: ${rwhat} -- status ${rstatus} with probe delta ${rprobe} returned ${rgot}, wanted ${rwant}" >&2
         note_failure "${rname}"
     fi
 done
@@ -1562,7 +1584,7 @@ done
 read_bound_answers="$(
     for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
         old="$IFS"
-        IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+        IFS='|' read -r rname rstatus rprobe rwant rwhat <<< "$row"
         IFS="$old"
         printf '%s\n' "$rwant"
     done | sort -u | grep -c .
@@ -1572,6 +1594,122 @@ if [ "$read_bound_answers" -ne 2 ]; then
     echo "FAIL read-bound-branches: the readings produced ${read_bound_answers} distinct answers, not 2" >&2
     note_failure "read-bound-branches"
 fi
+
+# --- a bound is a DURATION, and not a clock reading -------------------------
+#
+# #1066. Every bound in the library used to be `SECONDS`, which is
+# `CLOCK_REALTIME`, and this host steps it. Three arms, because no one of them can
+# carry the property on its own:
+#
+#   1. the deleted rule, driven over STAGED clock traces, shown answering wrongly
+#      in BOTH directions. Staged rather than waited for: a backward step happens
+#      about once in fourteen reads here and a forward one has never been observed
+#      at all, so a test that waits for one is a test that usually does not run.
+#   2. the replacement primitive, exercised for real, reading no clock.
+#   3. a DERIVED scan over the library, so a fourth bound cannot arrive on
+#      `SECONDS` by omission.
+#
+# The deleted rule is spelled out here as a negative control. That is a copy of
+# code that no longer exists, which is normally the defect this file has rules
+# about -- but a check that only drives the SURVIVING rule cannot show that the
+# rule was changed for a reason, and `testing.md` asks for the asymmetry rather
+# than for a green run.
+
+# The rule that was removed: `elapsed >= bound`, over two readings of a clock.
+# NOT a wrapper for anything in the library -- there is nothing left to wrap.
+_e2e_deleted_clock_bound() { [ $(( $2 - $1 )) -ge "$3" ]; }
+
+echo "== a bound is a duration, not a clock reading"
+#     name | first | last | bound | real seconds elapsed | deleted rule | a duration
+#
+# `deleted` and `duration` are the two verdicts, 0 for expired and 1 for not. Every
+# row is a case where they DISAGREE, which is the whole point: a row where they
+# agree says nothing about which one is being used.
+clock_bound_rows=(
+    "step-backward|0|3|5|5|1|0|a backward step makes the reading short, so the bound SILENTLY LENGTHENS and a wedged process is waited on past its ceiling"
+    "step-forward|0|7|5|2|0|1|a forward step makes the reading long, so the bound SHORTENS and a healthy client is killed early"
+    "step-backward-late|10|12|5|6|1|0|the step lands near the end of the wait, which is where a wait spends most of its time"
+    "step-forward-huge|0|3600|5|1|0|1|a resync is not bounded in size, so neither is the error"
+)
+ran=$(( ran + 1 ))
+if [ "${#clock_bound_rows[@]}" -lt 1 ]; then
+    echo "FAIL clock-bound: the reading table is empty, so every row 'passed'." >&2
+    note_failure "clock-bound"
+fi
+for row in ${clock_bound_rows[@]+"${clock_bound_rows[@]}"}; do
+    old="$IFS"
+    IFS='|' read -r cname cfirst clast cbound creal cdeleted cduration cwhy <<< "$row"
+    IFS="$old"
+    # THE PROPERTY, asserted directly on the ROW rather than inferred from a count.
+    # Every row here exists because the deleted rule and a true duration DISAGREE on
+    # it; a row where they agree demonstrates nothing about which of the two is in
+    # use, and would sit in the table looking like coverage forever. The branch guard
+    # below counts distinct answers, which catches most ways this breaks and is a
+    # proxy -- this is the thing itself.
+    ran=$(( ran + 1 ))
+    if [ "$cdeleted" -eq "$cduration" ]; then
+        echo "FAIL ${cname}: the row expects the deleted rule and a duration to AGREE (${cdeleted}), so it" >&2
+        echo "     asserts nothing about which one the bound is read from. Every row must disagree." >&2
+        note_failure "${cname}"
+    fi
+    _e2e_deleted_clock_bound "$cfirst" "$clast" "$cbound" && gotDeleted=0 || gotDeleted=$?
+    [ "$creal" -ge "$cbound" ] && gotDuration=0 || gotDuration=$?
+    ran=$(( ran + 1 ))
+    if [ "$gotDeleted" -ne "$cdeleted" ] || [ "$gotDuration" -ne "$cduration" ]; then
+        echo "FAIL ${cname}: ${cwhy} -- deleted rule said ${gotDeleted} (wanted ${cdeleted}), a duration said ${gotDuration} (wanted ${cduration})" >&2
+        note_failure "${cname}"
+    fi
+done
+# BOTH DIRECTIONS ARE PRESENT. With every row now asserted to disagree, the only
+# pairs reachable are `(1,0)` and `(0,1)` -- a bound silently lengthened and a
+# healthy client killed early -- so requiring two distinct pairs is what stops the
+# table drifting to a set that only exercises the backward step. That is the
+# direction every measurement on this host has produced, and the forward one is the
+# half nobody would notice going missing.
+#
+# It is NOT a duplicate of the per-row assertion above: that one says each row
+# discriminates, this one says the rows between them cover both ways the clock can
+# move.
+clock_bound_answers="$(
+    for row in ${clock_bound_rows[@]+"${clock_bound_rows[@]}"}; do
+        old="$IFS"
+        IFS='|' read -r cname cfirst clast cbound creal cdeleted cduration cwhy <<< "$row"
+        IFS="$old"
+        printf '%s%s\n' "$cdeleted" "$cduration"
+    done | sort -u | grep -c .
+)"
+ran=$(( ran + 1 ))
+if [ "$clock_bound_answers" -ne 2 ]; then
+    echo "FAIL clock-bound-branches: the rows produced ${clock_bound_answers} distinct (deleted,duration) pairs, not 2" >&2
+    note_failure "clock-bound-branches"
+fi
+
+# --- the replacement primitive, for real -----------------------------------
+#
+# One second, and the two readings that matter: not passed the moment it is armed,
+# passed once it has elapsed. No clock is read on either side -- `sleep` counts a
+# relative interval and `[ -e ]` is a file test -- which is the property, so a
+# version of this that timed anything would be testing something else.
+# Driven inline rather than as a `--case`, so it adds no row to the case table --
+# that array is shared with another lane this round, and appending to it is the one
+# edit guaranteed to conflict.
+echo "== the deadline primitive answers without a clock"
+out="$( . "$library"
+        _e2e_workdir="$(mktemp -d)"
+        _e2e_deadline_arm 1
+        primed="$_e2e_deadline_armed"
+        ppid="${primed%% *}"
+        pmark="${primed#* }"
+        if _e2e_deadline_passed "$pmark"; then echo "BUG: passed the moment it was armed"; else echo "armed: not passed"; fi
+        sleep 2
+        if _e2e_deadline_passed "$pmark"; then echo "elapsed: passed"; else echo "BUG: not passed two seconds into a one-second deadline"; fi
+        _e2e_deadline_disarm "$ppid" "$pmark"
+        if [ -e "$pmark" ]; then echo "BUG: the marker outlived the disarm"; else echo "disarmed: cleaned up"; fi
+        rmdir "$_e2e_workdir" 2>/dev/null || true )"
+status=$?
+ran=$(( ran + 1 ))
+expect "deadline-primitive|0|armed: not passed|elapsed: passed|disarmed: cleaned up|!BUG:" "$out" "$status" \
+    || note_failure "deadline-primitive"
 
 # --- the cases -------------------------------------------------------------
 
@@ -1755,23 +1893,30 @@ fi
 #                             only two mentions of `elapsed` -- it reports the
 #                             figure and compares it against nothing.
 #   * `cluster-e2e.sh`        `SECONDS` bounds waits (`deadline=$(( SECONDS + N ))`)
-#                             and `firstNamedAt` feeds diagnostic prose. A budget
-#                             and a sentence, neither a discriminator.
+#                             and `firstNamedAt` feeds diagnostic prose. Neither is
+#                             a discriminator, and the BUDGET is now a known
+#                             remaining site: #1066 established that a bound read
+#                             from `SECONDS` is not a duration, and this file's
+#                             scan covers the library rather than the fixtures.
 #   * `migrate-storage-e2e.sh`
 #                             does NOT use it. Its one `SECONDS` is a comment
 #                             about `wait_until`'s bound; the script itself polls
 #                             through the shared helper.
 #   * `lib/e2e-common.sh`     the library this whole file guards, and the biggest
-#                             match count of any of them -- thirteen. Every one is
-#                             a clock read INSIDE the loop it bounds:
-#                             `deadline=$(( SECONDS + seconds ))` in `run_bounded`,
-#                             `elapsed=$(( SECONDS - started ))` reported by
-#                             `wait_until` and `stop_and_require_exit` and judged
-#                             by `_e2e_verdict` with a second of slack. Not one
-#                             wraps a whole process from outside, which is the
-#                             defect; listed anyway, because "the file with the
-#                             most matches is absent from the survey" is not a
-#                             thing a reader should have to re-derive.
+#                             match count of any of them. Every match is a clock
+#                             read INSIDE the loop it bounds rather than a wrapper
+#                             around a whole process, which is what this survey was
+#                             looking for; listed anyway, because "the file with the
+#                             most matches is absent from the survey" is not a thing
+#                             a reader should have to re-derive.
+#
+#                             THE ROW USED TO SAY THIRTEEN AND USED TO CALL THEM
+#                             SAFE. #1066 is why it no longer does: the reads that
+#                             BOUND a loop have gone, and what is left only REPORTS.
+#                             `no bound is decided from SECONDS` below is the check
+#                             that keeps it that way, and it carries the live count
+#                             so this prose does not have to hold a number that
+#                             drifts.
 #   * `tsan-gate.sh`, `node-socket-activation-e2e.sh`, `doc-subject-checks.sh`
 #                             matched by the WORD and not by the idiom: a comment
 #                             about `run_bounded`'s integer `SECONDS`, a
@@ -1779,8 +1924,23 @@ fi
 #                             `..._SECONDS` CMake variable named in prose.
 #
 # The scan behind those rows is `grep -rn SECONDS scripts/ --include=*.sh`, which
-# also matches `deadline=$(( SECONDS + N ))` -- the CORRECT idiom, reading a clock
-# rather than timing a process from outside. State the pattern with the count: the
+# also matches `deadline=$(( SECONDS + N ))`.
+#
+# **THAT USED TO BE CALLED THE CORRECT IDIOM HERE, and #1066 is the ticket that
+# made it false.** The sentence was "reading a clock rather than timing a process
+# from outside", and it was right about the distinction it drew and wrong about the
+# conclusion: `SECONDS` is `CLOCK_REALTIME`, so a deadline computed from it
+# lengthens on a backward step and shortens on a forward one, and neither is
+# distinguishable from what the bound exists to detect. A checker whose own comment
+# argues against the change it is checking is a citation for reverting that change,
+# which is why this is corrected in the same commit rather than left as a residual.
+#
+# It also makes the scan this block DECLINED tractable. The objection was that the
+# word cannot separate the idiom from the correct one -- but after #1066 there is no
+# correct one in the library, so `no bound is decided from SECONDS` below can require
+# every remaining read to be a named REPORTED reading and refuse the rest.
+#
+# State the pattern with the count: the
 # two are not distinguishable by grepping for the word, and the pattern matches
 # SIX files under `scripts/` where the idiom this block is about lives in one.
 # Enumerating three of the six and stopping is the shape this repository already
@@ -2686,6 +2846,240 @@ elif [ -z "$bash32_read_uses" ]; then
 else
     echo "   bash 3.2: every 'read -t' bound in ${library##*/} is a whole number (literals and variables)"
 fi
+
+# The third arm of `a bound is a DURATION, and not a clock reading` (#1066). The
+# other two -- the deleted rule driven over staged clock traces, and the
+# replacement primitive exercised for real -- are staged-record tables and live
+# with the others above the case divider. This one is a SCAN, so it lives here
+# with its three siblings and reuses their `_shell_scripts` generator and
+# `_scan_exempt`, for the reason that generator's own header gives.
+# --- no bound is decided from SECONDS --------------------------------------
+#
+# DERIVED from the tree rather than from a list of the four functions that were
+# converted: a list is exact about what it names and silent about what it does not,
+# and the next bound is the one nobody adds to the list.
+#
+# It walks `_shell_scripts` like the three scans above rather than reading the
+# library alone -- one enumeration for all of them, for the reason that generator's
+# own header gives -- and it splits its subjects two ways:
+#
+#   * a file on the EXEMPTION list is skipped with a stated reason. Those are the
+#     fixtures, which #1066 did not convert; the reasons name what is true of each.
+#   * everything else must have every non-comment `SECONDS` read match a listed
+#     REPORTED reading, with the reason it is not a bound. A read that matches no
+#     row is refused.
+#
+# It fails closed four ways: no scripts walked, no reads examined, an exemption for
+# a file the walk never saw (an allowlist that has outlived its subject), and an
+# empty reported-reading table. Two empty lists agree perfectly, and each of those
+# is a way to become one.
+# seconds-scan: data-begin
+echo "== no bound is decided from SECONDS"
+
+#
+# EVERYTHING from here to the matching `data-end` is this scan's own implementation,
+# and it holds the text being scanned for -- in the exemption reasons, in the table,
+# in two canary heredocs and in three failure messages. Declared as data so the scan
+# does not match itself, and declared as a REGION rather than a whole-file exemption
+# so the rest of this file, its own two timings above included, stays scanned.
+
+# One row per exemption, `basename:reason`, matched per row by `_scan_exempt`.
+seconds_exempt="cluster-e2e.sh:a fixture, and outside #1066, which converted the library. Its deadlines are the same idiom and are known remaining sites rather than sound ones; the survey above says so in the same words.
+tsan-canary-rate.sh:computes a delta and echoes it. It reports the figure and compares it against nothing, so there is no bound to be wrong.
+node-socket-activation-e2e.sh:a READY_SECONDS budget handed to wait_until, which is a NAME matched by the word rather than a clock read of its own."
+
+# Every `SECONDS` read that is not a bound decided INSIDE the loop it bounds, with
+# the reason. TWO kinds appear and the distinction is the point:
+#
+#   * readings the library only REPORTS -- a bound COMPARES, and these only ever
+#     subtract into a variable that is printed;
+#   * this file's own timings of a whole process from OUTSIDE, which is the one
+#     measurement the library cannot make about itself and is what `wait-clock-bound`
+#     and `bounded-outlasts-a-trapped-term` exist to take. The survey above argues
+#     each: a lower bound that load pushes AWAY from its threshold, and an upper one
+#     with a 3-4x margin.
+#
+seconds_reported=(
+    'local started="$SECONDS" grewAt="$SECONDS"|wait_until: the two origins for the durations it REPORTS'
+    'grewAt="$SECONDS"|wait_until: when the log last grew, for the stall reading'
+    'elapsed=$(( SECONDS - started ))|the elapsed a verdict PRINTS, so it is measured rather than assumed'
+    'stall=$(( SECONDS - grewAt ))|how long since the log grew, a reported reading'
+    'local started="$SECONDS" elapsed=0 armed dpid dmark|stop_and_require_exit: the origin for the duration it reports'
+    'before=$SECONDS|_http_drain_fd3: the observation #1048 left with no reader'
+    '_http_drain_elapsed=$(( SECONDS - before ))|_http_drain_fd3: that same observation, marked not to be read'
+    'clock_started="$SECONDS"|check-e2e-helpers.sh: times wait-clock-bound from OUTSIDE the process under test'
+    'clock_took=$(( SECONDS - clock_started ))|check-e2e-helpers.sh: the same, and a LOWER bound, which load pushes away from its threshold'
+    'bounded_started="$SECONDS"|check-e2e-helpers.sh: times bounded-outlasts-a-trapped-term from OUTSIDE'
+    'bounded_took=$(( SECONDS - bounded_started ))|check-e2e-helpers.sh: the same, an upper bound with a 3-4x margin'
+)
+ran=$(( ran + 1 ))
+if [ "${#seconds_reported[@]}" -lt 1 ]; then
+    echo "FAIL seconds-bounds: the reported-reading table is empty, so every read would be refused" >&2
+    note_failure "seconds-bounds"
+fi
+
+# Every `SECONDS` read in one file that is on no list, as `<lineno>:<text>`.
+#
+# A FUNCTION rather than a loop body, so the canary below can drive it over staged
+# files. A scan nobody has watched refuse is a scan reporting PASS over nothing, and
+# the two scans above already learnt that.
+#
+# Read through `_bash32_readable`, which blanks comment lines AND declared data
+# regions while keeping line numbers: this file's own tables hold the very text being
+# scanned for, so a scan without that filter matches itself.
+# The same filter `_bash32_readable` is, over a DIFFERENT data vocabulary, and that
+# difference is the whole reason this is not a call to that one. Both blank comment
+# lines and declared data regions while keeping line numbers -- but the marker says
+# which SCAN a region is data FOR. Reusing `bash32-scan` markers here would blank
+# this scan's own implementation for the bash-3.2 check as well, exempting it from a
+# check it needs. And a region is needed: this file holds the very text this scan
+# looks for, in a table, in two canary heredocs and in three failure messages, so
+# without one the scan matches itself. AGENT.md's rule, and #492's shape -- a file
+# that matches its own scan by construction exempts a REGION, never itself. The other
+# 3000 lines stay scanned, which is exactly what a whole-file row would have cost.
+_seconds_readable() {
+    awk '
+        /^[[:space:]]*# seconds-scan: data-begin[[:space:]]*$/ { skip = 1; print ""; next }
+        /^[[:space:]]*# seconds-scan: data-end[[:space:]]*$/   { skip = 0; print ""; next }
+        skip                                                  { print ""; next }
+        /^[[:space:]]*#/                                      { print ""; next }
+        { print }
+    ' "$1"
+}
+
+_seconds_unlisted() {
+    local file="$1" line="" body="" trimmed="" pair="" matched=0 out=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        body="${line#*:}"
+        trimmed="${body#"${body%%[![:space:]]*}"}"
+        matched=0
+        for pair in ${seconds_reported[@]+"${seconds_reported[@]}"}; do
+            if [ "$trimmed" = "${pair%%|*}" ]; then matched=1; break; fi
+        done
+        [ "$matched" -eq 1 ] && continue
+        out="${out}${out:+
+}${line}"
+    done <<EOF
+$( _seconds_readable "$file" | grep -n 'SECONDS' || true )
+EOF
+    printf '%s' "$out"
+}
+
+seconds_files=0
+seconds_exempted=0
+seconds_reads=0
+seconds_seen=""
+seconds_hit=""
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    seconds_seen="${seconds_seen}${base}
+"
+    hits="$(_seconds_readable "$script" | grep -n 'SECONDS' || true)"
+    [ -n "$hits" ] || continue
+    seconds_files=$(( seconds_files + 1 ))
+    seconds_hit="${seconds_hit}${base}
+"
+    if _scan_exempt "$base" "$seconds_exempt"; then
+        seconds_exempted=$(( seconds_exempted + 1 ))
+        continue
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        seconds_reads=$(( seconds_reads + 1 ))
+    done <<EOF
+$hits
+EOF
+    ran=$(( ran + 1 ))
+    unlisted="$(_seconds_unlisted "$script")"
+    if [ -n "$unlisted" ]; then
+        echo "FAIL seconds-bounds: ${base} reads SECONDS on a line that is on no list:" >&2
+        printf '%s
+' "$unlisted" | sed 's/^/     | /' >&2
+        echo "     A bound is a duration, not a clock reading (#1066). If this is a reported" >&2
+        echo "     reading and not a bound, add it to seconds_reported WITH the reason." >&2
+        note_failure "seconds-bounds"
+    fi
+done < <( _shell_scripts )
+
+# An exemption that outlives its subject is an allowlist nobody can read, so a row
+# naming a file the walk never saw is refused rather than ignored.
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    exempt_base="${row%%:*}"
+    ran=$(( ran + 1 ))
+    case "
+${seconds_hit}" in
+        *"
+${exempt_base}
+"*) : ;;
+        *) echo "FAIL seconds-bounds: the exemption for '${exempt_base}' names a file with no SECONDS read left in it" >&2
+           note_failure "seconds-bounds" ;;
+    esac
+    ran=$(( ran + 1 ))
+    case "
+${seconds_seen}" in
+        *"
+${exempt_base}
+"*) : ;;
+        *) echo "FAIL seconds-bounds: the exemption for '${exempt_base}' names a file the walk never saw" >&2
+           note_failure "seconds-bounds" ;;
+    esac
+done <<EOF
+$seconds_exempt
+EOF
+
+# THE CANARY, both directions, because either alone passes a broken scan: one that
+# catches nothing passes the must-not-catch half, and one that fires on everything
+# passes the must-catch half.
+#
+# The staged bounds are the three shapes this ticket converted -- a deadline, the
+# comparison against it, and a grace window -- and the must-not-catch file holds the
+# listed reported readings plus a COMMENT containing a bound, which is the shape the
+# filter has to remove rather than the shape the scan has to forgive.
+seconds_canary_dir="$(mktemp -d)"
+cat > "${seconds_canary_dir}/must-catch.sh" <<'CANARY'
+deadline=$(( SECONDS + 5 ))
+while [ "$SECONDS" -lt "$deadline" ]; do :; done
+grace=$(( SECONDS + 2 ))
+CANARY
+cat > "${seconds_canary_dir}/must-not-catch.sh" <<'CANARY'
+# a comment that names a bound: deadline=$(( SECONDS + 5 ))
+elapsed=$(( SECONDS - started ))
+stall=$(( SECONDS - grewAt ))
+CANARY
+ran=$(( ran + 1 ))
+seconds_caught="$(_seconds_unlisted "${seconds_canary_dir}/must-catch.sh" | grep -c . || true)"
+if [ "${seconds_caught:-0}" -ne 3 ]; then
+    echo "FAIL seconds-scan-canary: the scan caught ${seconds_caught} of 3 staged bounds," >&2
+    echo "     so it cannot be trusted to have found none in the real scripts" >&2
+    _seconds_unlisted "${seconds_canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
+    note_failure "seconds-scan-canary"
+fi
+ran=$(( ran + 1 ))
+seconds_spurious="$(_seconds_unlisted "${seconds_canary_dir}/must-not-catch.sh" || true)"
+if [ -n "$seconds_spurious" ]; then
+    echo "FAIL seconds-scan-canary: the scan fired on a listed reading or on a comment" >&2
+    printf '%s
+' "$seconds_spurious" | sed 's/^/     | /' >&2
+    note_failure "seconds-scan-canary"
+fi
+rm -rf "$seconds_canary_dir"
+
+ran=$(( ran + 1 ))
+if [ "$seconds_files" -lt 1 ]; then
+    echo "FAIL seconds-bounds: the walk found no script mentioning SECONDS at all, which is what a" >&2
+    echo "     broken walk and a converted tree look like alike" >&2
+    note_failure "seconds-bounds"
+fi
+ran=$(( ran + 1 ))
+if [ "$seconds_reads" -lt 1 ]; then
+    echo "FAIL seconds-bounds: every file with a SECONDS read was exempted, so nothing was examined" >&2
+    note_failure "seconds-bounds"
+fi
+echo "   SECONDS: ${seconds_reads} read(s) examined across $(( seconds_files - seconds_exempted )) file(s), ${seconds_exempted} exempted by name"
+# seconds-scan: data-end
 
 # --- every failure is recorded BY NAME ------------------------------------
 #
