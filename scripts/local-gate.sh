@@ -305,6 +305,14 @@ gate_start_marker="== LOCAL GATE STARTED"
 gate_passed_marker="LOCAL GATE PASSED"
 gate_failed_marker="GATE FAILED:"
 
+# ctest's own totals line, which three readers here hinge on: it is what
+# `skip_report` requires before it will conclude anything from a missing block,
+# what terminates the failure excerpt's alternation, and what the green path
+# prints. It sits beside the markers above for their reason -- a string that is
+# both written and read in several places, spelled independently in each, goes on
+# agreeing with itself after the thing it looks for has changed.
+gate_totals_marker="tests passed"
+
 # Outcome, exit status, and what a reader should do about it.
 #
 # A table, so the statuses are DERIVED from one place and the self-test can assert
@@ -445,12 +453,20 @@ gate_outcome_status() {
 #
 # The pointer is SUPPLEMENTARY and the names are the record: an inlined list is
 # read months later, on another machine, after the build tree is gone, which is
-# most of when a gate log is read at all. It cannot go stale either, because it
-# is written by the run it describes -- the staleness hazard belongs to the
-# POINTER here, which is why the one offered below names `LastTest.log`, refreshed
-# every run, and never `LastTestsDisabled.log`, which is not. A pointer alone
-# would have cost the whole ticket: the log would still carry no skip data, and
-# the reader would still need a tree that may not exist.
+# most of when a gate log is read at all. It cannot go stale, because it is
+# written by the run it describes. A pointer alone would have cost the whole
+# ticket: the log would still carry no skip data, and the reader would still need
+# a tree that may not exist.
+#
+# **The pointer is good only until the next run in that build directory, and that
+# is accepted rather than solved.** `LastTest.log` is REWRITTEN every run, so a
+# reader returning after any later gate reads a different run's per-test output
+# with nothing saying so -- this repository has already lost evidence that way.
+# It is still the better of the two to name: `LastTestsDisabled.log` is not
+# rewritten at all when nothing was skipped, so it hands back a PREVIOUS run's
+# skips after a clean one, which is worse than being overwritten. Being replaced
+# is not safety; it is a different failure, and the names above are what carries
+# the answer either way.
 #
 # @param 1 Label to report against, normally the preset.
 # @param 2 Optional build directory, named in the pointer line when given.
@@ -461,7 +477,7 @@ skip_report() {
 
     # Herestrings rather than pipes throughout: `producer | grep -q` is a false
     # negative under `pipefail`, which this script sets.
-    if ! grep -q 'tests passed' <<< "$text"; then
+    if ! grep -q "$gate_totals_marker" <<< "$text"; then
         echo "== ${label}: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
         echo "==   it cannot support 'nothing was skipped'. Whether the run finished is"
         echo "==   the question to answer first."
@@ -497,13 +513,27 @@ skip_report() {
 # hand-kept lists that drift apart is how one instrument starts describing a
 # different run from the other.
 #
-# **The list is hand-kept, and saying so is the honest answer rather than a
-# missing feature.** #1158 asks that it be derived from something; it cannot be.
-# ctest enumerates its own verdict words nowhere reachable at runtime -- not in
-# `--help`, not in any file the gate can read -- so a derivation would mean
-# restating them somewhere else and calling the copy a source. What actually
-# closes the omission is not a longer list but the reconcile, which compares a SUM
-# against a total and therefore has no list to be incomplete (#1159).
+# **The list is hand-kept, and this is the argument for that rather than an
+# admission.** #1158 asks that it be derived from something.
+#
+# ctest enumerates its verdict WORDS nowhere the gate can read them, so there is
+# no source to derive this list from as it stands. But there IS a machine-readable
+# route and an earlier version of this comment denied it, which would have been
+# refuted by the first person to run `ctest --help`: **`--output-junit <file>`
+# exists, it is CMake 3.21+, and this project's floor is 3.28**, so it is
+# available on every configuration here.
+#
+# It is declined, on three grounds rather than on ignorance of it. JUnit's
+# per-case vocabulary is NARROWER than the console's -- pass, `<failure>`,
+# `<skipped>` -- so the excerpt would name less, not more, and `***Exception`
+# versus `***Failed` is the distinction #1158 is about. A side file's ABSENCE is
+# ambiguous, where `skip_report` turns on the PRESENCE of a totals line, which is
+# the one property separating "finished and skipped nothing" from "killed". And
+# reading it means an XML parser with attribute unescaping under bash 3.2.
+#
+# What closes the omission is not a longer list and not a different format: it is
+# the reconcile, which compares a SUM against a total and therefore has no list to
+# be incomplete (#1159).
 #
 # `Exception` is #1158: a segfault is `***Exception`, never `***Failed`, so a leg
 # failed by a crash printed a correct verdict and named no test. Measured on a
@@ -521,26 +551,49 @@ skip_report() {
 # thousands of lines. Skipped is reported by `skip_report` with its own names and
 # its own three outcomes, so repeating it here would put the same fact in two
 # places with two formats and one of them would go stale.
+# Columns: the state's NAME, the text ctest actually prints for it, and whether
+# the excerpt shows it.
+#
+# The printed form is a COLUMN and not a rule applied by each reader, which is the
+# correction that makes this table's own claim true. Both readers used to derive
+# the marker themselves -- the excerpt always prefixing `***`, the reconcile
+# prefixing it except for `Passed` -- so the vocabulary was shared and the
+# SPELLING was duplicated. A state whose printed form is not `***<name>`, marked
+# `yes`, would have made the excerpt grep for something that matches nothing, with
+# no way to notice. `Passed` is already that state; it is simply the one that was
+# special-cased rather than tabulated.
 gate_ctest_states=(
-    "Passed|no"
-    "Failed|yes"
-    "Skipped|no"
-    "Timeout|yes"
-    "Exception|yes"
-    "Not Run|yes"
+    "Passed|Passed|no"
+    "Failed|\\*\\*\\*Failed|yes"
+    "Skipped|\\*\\*\\*Skipped|no"
+    "Timeout|\\*\\*\\*Timeout|yes"
+    "Exception|\\*\\*\\*Exception|yes"
+    "Not Run|\\*\\*\\*Not Run|yes"
 )
+
+# One column of a `gate_ctest_states` row, by position, so no caller spells the
+# field separator. 1 = name, 2 = printed marker, 3 = in-excerpt.
+# @param 1 row. @param 2 field number.
+gate_state_field() {
+    local rest="$1"
+    case "$2" in
+        1) echo "${rest%%|*}" ;;
+        2) rest="${rest#*|}"; echo "${rest%%|*}" ;;
+        *) echo "${rest##*|}" ;;
+    esac
+}
 
 # The alternation the failure excerpt greps for, built from the table above so a
 # new state is a row rather than an edit here.
 gate_excerpt_pattern() {
     local row pattern=""
     for row in "${gate_ctest_states[@]}"; do
-        [[ "${row#*|}" == "yes" ]] || continue
-        pattern="${pattern}\\*\\*\\*${row%%|*}|"
+        [[ "$(gate_state_field "$row" 3)" == "yes" ]] || continue
+        pattern="${pattern}$(gate_state_field "$row" 2)|"
     done
     # The totals line is not a per-test state and is not in the table; it is here
     # because a reader needs the count beside the names.
-    echo "${pattern}tests passed"
+    echo "${pattern}${gate_totals_marker}"
 }
 
 # The lines the gate shows a reader when a leg's tests fail.
@@ -583,15 +636,32 @@ failure_excerpt() {
 # total cannot drift out of step with what actually ran, and a number emitted by
 # the run beside each result cannot.
 #
-# ## Why it counts with `grep` rather than walking lines
+# ## Why it counts with `grep`, and the honest comparison
 #
-# Seven passes over the log instead of a bash loop doing six regex tests on each
-# of ~7000 lines. The states are made mutually exclusive by anchoring each verdict
-# to the trailing `N.NN sec` through `[^0-9*]*`, which cannot span the `***` of a
-# following marker -- so a test whose NAME ends in a verdict word is not counted
-# twice. That exclusivity is not assumed: when the per-state counts do not sum to
-# the number of result lines, this says so rather than reporting a total it cannot
-# stand behind.
+# EIGHT passes over the log: one for the result lines, one for the total, and one
+# per row of the table.
+#
+# An earlier version of this paragraph said seven, and compared them against a
+# bash loop doing six regex tests on each of ~7000 lines -- which is the worst
+# alternative available and not the one anybody would propose. The real
+# alternative is a single `awk`, and it WINS on speed: measured on a synthetic
+# 7001-line, 592 KB ctest log, 9.0 ms against 71 ms for this. Roughly 8x.
+#
+# The greps stay anyway, and the reason is the table rather than the clock. One
+# awk pass would have to carry the state vocabulary inside its own program text,
+# where `gate_excerpt_pattern` cannot read it -- and one table both readers take
+# from is the whole argument for #1158 and #1159 being one change. The cost of
+# keeping it is about 60 ms per call against a test phase this project measures in
+# minutes, which is under a tenth of a percent of one leg.
+#
+# A comparison against a straw alternative is worse than no comparison, because it
+# reads as though the choice was measured. This one now names the option that
+# actually beats it.
+#
+# The states are made mutually exclusive by anchoring each verdict to the trailing
+# `N.NN sec` through `[^0-9*]*`, which cannot span the `***` of a following marker
+# -- so a test whose NAME ends in a verdict word is not counted twice. That is
+# driven by a self-test case rather than assumed.
 #
 # @param 1 Label to report against, normally the preset.
 # Reads a ctest run's output on stdin. Echoes `ok`, or a multi-line report.
@@ -610,7 +680,12 @@ states_reconcile() {
         return 0
     fi
 
-    total=$(grep -oE "$resultLine" <<< "$text" | head -1 | sed 's|.*/||; s| .*||')
+    # One `awk` and no pipe. This was `grep -oE ... | head -1 | sed`, which is the
+    # exact `producer | head` shape `failure_excerpt`'s comment refuses twenty
+    # lines above -- `head` exits first, the producer dies of SIGPIPE, and
+    # `pipefail` reports the death rather than the search. Written by the same
+    # hand, in the same change, six lines under the paragraph stating the rule.
+    total=$(awk -v re="$resultLine" '$0 ~ re { sub(/^ *[0-9]+\//, ""); sub(/[^0-9].*/, ""); print; exit }' <<< "$text")
 
     # A total this cannot read is its own outcome, and making it one is what gives
     # the guard above something to protect. `[[ 0 -eq "" ]]` is TRUE in bash --
@@ -629,12 +704,8 @@ states_reconcile() {
     fi
 
     for row in "${gate_ctest_states[@]}"; do
-        word="${row%%|*}"
-        if [[ "$word" == "Passed" ]]; then
-            marker="$word"
-        else
-            marker="\\*\\*\\*$word"
-        fi
+        word="$(gate_state_field "$row" 1)"
+        marker="$(gate_state_field "$row" 2)"
         count=$(grep -cE "${marker}[^0-9*]*[0-9]+\\.[0-9]+ sec *$" <<< "$text" || true)
         accounted=$((accounted + count))
         detail="${detail}
@@ -1994,11 +2065,13 @@ $gate_passed_marker"
     expect "two runs skipping the SAME NUMBER of tests report differently" \
         "different" \
         "$([[ "$(skip_report leg <<< "$_skip_a")" == "$(skip_report leg <<< "$_skip_b")" ]] && echo same || echo different)"
-    # And the control that makes the line above mean something: a report compared
-    # with itself is the same, so the check is not simply always saying different.
-    expect "... while a run compared with itself reports identically" \
-        "same" \
-        "$([[ "$(skip_report leg <<< "$_skip_a")" == "$(skip_report leg <<< "$_skip_a")" ]] && echo same || echo different)"
+    # There WAS a case here comparing a report with itself, offered as the control
+    # that the check is "not simply always saying different". It was vacuous: a
+    # pure text function's output compared with itself can only be equal, so it
+    # asserted bash's `==` and nothing about the gate. Removed rather than
+    # reworded. What actually supplies that discriminating power is the case above
+    # that pins `skip_report`'s exact output byte for byte -- if the reporter
+    # printed a constant, that one fails.
 
     # The pointer is supplementary and appears only when there is a directory to
     # name. It points at `LastTest.log`, which every run rewrites -- never at
@@ -2058,7 +2131,7 @@ $gate_passed_marker"
     # Every row parses, and the two columns are the only two spellings. A row that
     # stopped parsing would silently drop its state from the excerpt.
     for _row in "${gate_ctest_states[@]}"; do
-        case "${_row#*|}" in
+        case "$(gate_state_field "$_row" 3)" in
             yes|no) ;;
             *) echo "SELF-TEST FAILED: unknown excerpt column in '$_row'" >&2
                self_test_failures=$((self_test_failures + 1)) ;;
@@ -2335,6 +2408,7 @@ run_preset() {
     #
     # getconf rather than nproc: this gate runs on macOS too.
     local jobs="${FASTCACHE_GATE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+    local _reconcile
 
     echo "== $preset: test (--parallel $jobs)"
     if ! ctest --preset "$preset" --parallel "$jobs" > "$log" 2>&1; then
@@ -2359,7 +2433,7 @@ run_preset() {
         fail "$preset tests: the per-test states do not account for every test that ran"
     fi
 
-    grep -E 'tests passed' "$log" | head -1
+    grep -E -m 1 "$gate_totals_marker" "$log"
     # #1130: the totals line above is the one #1128 makes untrustworthy, so the
     # skipped NAMES go in the log beside it, before the log this read is deleted.
     skip_report "$preset" "$build_dir" < "$log"
