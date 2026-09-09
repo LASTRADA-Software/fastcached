@@ -227,7 +227,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin
         std::function<void(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term)>;
 
     /// Told the cluster's member endpoints whenever they change.
-    using MembersObserver = std::function<void(std::vector<std::string> const& endpoints)>;
+    /// Told the cluster state at every commit.
+    ///
+    /// The STATE rather than the endpoint list since #1112: admission reads the
+    /// `fleet-open` row as well as the members, and an observer handed only the
+    /// endpoints is one the openness half has to reach by a second route somebody can
+    /// forget. One commit, one call, both facts.
+    using MembersObserver = std::function<void(Cluster::ClusterState const& state)>;
 
     /// Start consensus, or explain why the node must not start.
     /// @param cfg The parsed configuration.
