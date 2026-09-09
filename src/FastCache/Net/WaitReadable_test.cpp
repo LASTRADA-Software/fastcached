@@ -15,20 +15,9 @@
 #include <memory>
 #include <span>
 #include <thread>
-
-#if defined(_WIN32)
-    #include <winsock2.h>
-
-    #include <ws2tcpip.h>
-#else
-    #include <sys/socket.h>
-
-    #include <unistd.h>
-
-    #include <arpa/inet.h>
-    #include <netinet/in.h>
-#endif
 #include <vector>
+
+#include <tests/AbortiveClient.hpp>
 
 /// What `ISocket::WaitReadable` reports, on a REAL socket, on this platform.
 ///
@@ -419,51 +408,38 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ true);
 
     std::atomic<bool> unresolvedBeforeReset { false };
-    std::jthread client { [port, &observed, &unresolvedBeforeReset] {
-#if defined(_WIN32)
-        using RawSocket = SOCKET;
-        auto const invalid = INVALID_SOCKET;
-        auto const closeRaw = [](RawSocket s) {
-            ::closesocket(s);
-        };
-        using OptValue = char const*;
-#else
-        using RawSocket = int;
-        auto const invalid = -1;
-        auto const closeRaw = [](RawSocket s) {
-            ::close(s);
-        };
-        using OptValue = void const*;
-#endif
-        RawSocket const fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd == invalid)
+    std::atomic<bool> resetArmed { false };
+    std::jthread client { [port, &observed, &unresolvedBeforeReset, &resetArmed] {
+        // One shared implementation of the abortive close, in `src/tests/`, because a
+        // second consumer arrived with #817's coverage work. The assertion below --
+        // that this really does report an ERROR and not a `0` -- is what guards every
+        // other user of it, since a consumer whose close silently degrades to a FIN
+        // still counts a departure and still passes.
+        FastCache::Testing::AbortiveClient peer { port };
+        if (!peer.Connected())
             return;
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (::connect(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
-        {
-            closeRaw(fd);
-            return;
-        }
 
         (void) WaitForFlag(observed.arming);
         unresolvedBeforeReset.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
-        // Zero linger on close is what turns FIN into RST, on both stacks.
-        linger const abortive { .l_onoff = 1, .l_linger = 0 };
-        // `reinterpret_cast`, not a hop through `void const*`: the two-step is what
-        // `bugprone-casting-through-void` refuses, and setsockopt's `char const*` on
-        // Winsock against `void const*` on POSIX is exactly the shape that invites it.
-        ::setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<OptValue>(&abortive), static_cast<int>(sizeof(abortive)));
-        closeRaw(fd);
+        resetArmed.store(peer.Reset(), std::memory_order_relaxed);
     } };
 
     reactor.Run();
     client.join();
 
     CHECK(unresolvedBeforeReset.load(std::memory_order_relaxed));
+
+    // **What `Reset` REPORTED, asserted rather than discarded.** A `setsockopt` that
+    // does not take degrades this close to an ordinary FIN, and every assertion below
+    // still passes -- the watcher resolves, a departure is counted, and the case goes
+    // green having measured the graceful close it exists to distinguish itself from.
+    // That is the silent degradation `AbortiveClient`'s own doc names, and this case is
+    // where it has to be caught: the comment in the thread above calls this assertion
+    // the guard for every other user of the helper, which it can only be if the arming
+    // is checked here. Carried out as an atomic because Catch2's macros are not safe off
+    // the main thread, which is the same reason `unresolvedBeforeReset` is one.
+    REQUIRE(resetArmed.load(std::memory_order_relaxed));
     REQUIRE(observed.resolved.load(std::memory_order_acquire));
 
     // **The assertion, and it was a measurement first.** #899's acceptance said to

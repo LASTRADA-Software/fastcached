@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/AbortiveClient.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -262,11 +263,13 @@ constexpr auto WatchWait = 15s;
 /// waits nearer 45. `DrainWithin` reads a clock instead. Blocking is right here: this
 /// runs on the Catch2 thread, never on a reactor.
 /// The ceiling is a PARAMETER because a helper that bakes one in is a helper the next
-/// wait cannot use, and what that author writes instead is the loop this replaces. Two
-/// waits here needed 30 s and 60 s, so the only options were to raise `WatchWait` for
-/// every caller or to hand-roll -- and hand-rolling loses the `DrainResult`, which is
-/// the one thing a spin cannot recover: *the condition held* and *the ceiling ran out*
-/// are different failures, and a loop has no result to keep them apart.
+/// wait cannot use, and what that author writes instead is the loop this replaces. The
+/// sweep cases here need 30 s and 60 s -- a count is deliberately not stated, since a
+/// figure beside a set of call sites is a second source of truth that drifts -- so the
+/// only options were to raise `WatchWait` for every caller or to hand-roll, and
+/// hand-rolling loses the `DrainResult`, which is the one thing a spin cannot recover:
+/// *the condition held* and *the ceiling ran out* are different failures, and a loop
+/// has no result to keep them apart.
 /// @param ready What is being waited for; called until it answers true.
 /// @param ceiling How long to keep asking. Defaults to `WatchWait`.
 /// @return True when it happened inside @p ceiling, false when it never did.
@@ -1965,10 +1968,7 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     INFO("request-deadline sweeps: " << requests << " (was " << requestsBefore << ")");
     INFO("answer-deadline sweeps: " << answers << " (was " << answersBefore << ")");
 
-    // The ceiling and the readings are asserted SEPARATELY, which is what routing
-    // through `DrainWithin` buys: "it never swept" and "it swept the wrong rows" are
-    // different failures, and the hand-rolled loop reported both as the latter.
-    REQUIRE(swept);
+    REQUIRE(swept); // separately from the readings below; see `WaitFor`
 
     // Each arm raised its OWN row, exactly once. Asserted as equality rather than as
     // "rose", because a conflated implementation that raised both rows for both peers
@@ -2101,7 +2101,11 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
         },
         60s); // waited for: both arms to be swept
     INFO("answer-deadline sweeps: " << sweeps << " (was " << sweepsBefore << ")");
-    REQUIRE(bothSwept); // separately from the count, for the reason given above
+    // The ceiling and the reading are asserted SEPARATELY: "it never swept" (the
+    // ceiling ran out) and "it swept the wrong number of times" are different
+    // failures, and only `DrainResult` keeps them apart -- the hand-rolled loop this
+    // replaces reported both as the latter.
+    REQUIRE(bothSwept);
     REQUIRE(sweeps == sweepsBefore + 2);
 
     // Released only now, so `Answer` returns AFTER the sweep. This is the instant the
@@ -2261,6 +2265,82 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     // The node's own teardown is not a client-side story: nothing this case does
     // after the delivery was abandoned may move the row again.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+}
+
+TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
+{
+    // The case above leaves by FIN, which reaches `WatchPeer` as `WaitReadable`
+    // answering `0`. This one leaves by RST, which reaches it as an ERROR -- the other
+    // arm, and the one #817 measured as exercised by nothing. Why the close has to be
+    // real rather than a fake returning an error is on `Testing::AbortiveClient`.
+    //
+    // **Runs on all three reactors**: nothing here is reactor-specific, the client
+    // being a plain BSD/Winsock socket and the verdict a counter.
+    //
+    // Asserts the same three rows as the FIN case above, and for its reason -- the
+    // watcher SAW the departure, the compiler still ran and this machine paid for it,
+    // and only the handover found nobody there. Folded, an abandoned delivery would
+    // read as a compile that never happened.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+
+    Testing::AbortiveClient client { port };
+    REQUIRE(client.Connected());
+    REQUIRE(client.Send(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
+
+    // The client is reset while the answer is still running -- a killed CI runner, a
+    // machine that lost its route, a process the kernel tore down without a FIN.
+    REQUIRE(client.Reset()); // the socket really was armed for an abortive close
+
+    // Waited for BEFORE the answer is released, which is #691's ordering fix: the
+    // departure and the answer are two reactor events with no order between them, so
+    // releasing first leaves the case asserting whichever won.
+    // Asked as EQUALITY rather than as "rose", for `RequireNoDepartureFiled`'s reason:
+    // a caller that grew a second watched connection then fails here instead of
+    // satisfying the wait on the wrong watcher.
+    REQUIRE(WaitFor([&fleet, observedBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1;
+    })); // waited for: the watcher to reach its verdict
+
+    responder.Hold(false);
+
+    // And the compile still completed, which is the half the title claims and the
+    // watcher cannot show. Bounded, and asserted after the release because that is
+    // when the answer is allowed to finish.
+    auto const recorded = WaitFor([&fleet, before] {
+        return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1;
+    }); // waited for: the delivery to be recorded as abandoned
+
+    INFO("departure delta=" << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) - seenBefore)
+                            << "; observed delta="
+                            << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) - observedBefore)
+                            << "; abandoned delta="
+                            << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - before)
+                            << "; responder entered=" << responder.Entered() << " answered=" << responder.Answered());
+
+    // A reset peer is a departure exactly as a vanished one is: the watcher saw it, and
+    // it was filed rather than suppressed as a local close.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+
+    // The object was NOT written, and the compile was still paid for. Two rows,
+    // because folding them would let "the compiler never ran" pass as "the delivery
+    // was abandoned".
+    REQUIRE(recorded);
+    CHECK(responder.Answered() == 1);
 }
 
 /// Assert that a connection whose watcher has spoken filed no departure.
