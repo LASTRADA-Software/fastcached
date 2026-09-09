@@ -309,8 +309,13 @@ void IocpReactor::RunLoop()
             auto* completion = reinterpret_cast<IocpCompletion*>(entry.lpOverlapped);
             if (completion && completion->dispatch)
             {
-                auto const err = static_cast<DWORD>(completion->overlapped.Internal);
-                completion->dispatch(completion, entry.dwNumberOfBytesTransferred, err);
+                // `Internal` is an NTSTATUS and this reactor cannot translate it --
+                // `WSAGetOverlappedResult` needs the SOCKET, which lives one layer up.
+                // So it travels as an `IocpStatus` rather than a `DWORD`, and the
+                // consumer converts. See the type's own comment for what handing this
+                // over as a bare number cost.
+                auto const status = IocpStatus { static_cast<LONG>(completion->overlapped.Internal) };
+                completion->dispatch(completion, entry.dwNumberOfBytesTransferred, status);
             }
         }
 

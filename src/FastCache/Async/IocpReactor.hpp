@@ -22,6 +22,65 @@
 namespace FastCache
 {
 
+/// The completion status of an overlapped operation, as the kernel wrote it.
+///
+/// **A distinct type because the value is an NTSTATUS and every consumer of it here
+/// wants a Win32/WSA code.** `OVERLAPPED::Internal` holds an NTSTATUS -- a cancelled
+/// operation reports `STATUS_CANCELLED`, 0xC0000120 -- while `NetError`'s taxonomy is
+/// written in `WSAE*` / `ERROR_*` values, where the same fact is
+/// `ERROR_OPERATION_ABORTED`, 995. The two spaces share no values, so handing the raw
+/// number to a `WSAE*` table matches no row and lands on `SystemError`: every IOCP
+/// error, not merely cancellation, reported as *we do not know*.
+///
+/// That had already happened. `IocpConnector::OnConnectComplete` found it, wrote the
+/// mechanism into its own comment, and converted -- at that ONE call site, while the
+/// reactor went on handing every other consumer a bare `DWORD`. `IocpSocket`, which
+/// carries every read and write this product does on Windows, was the consumer that
+/// did not know, and `NetErrorCode::Cancelled` -- whose doc comment names *"IOCP
+/// CancelIoEx"* as the case it exists for -- had never once been produced on this
+/// platform.
+///
+/// **So the fix is the TYPE, not a third copy of the conversion.** A guard folded into
+/// the operation is self-enforcing; a guard called alongside one needs a scan. There is
+/// no `DWORD` to pass along any more: a consumer that wants an error code has to reach
+/// for `Detail::WsaErrorOf` (`Net/IocpStatus.hpp`) to get one, and the fourth consumer
+/// nobody has written yet cannot omit the step by not knowing about it. The reactor
+/// still cannot do the conversion itself -- `WSAGetOverlappedResult` needs the SOCKET,
+/// which the reactor does not have -- which is exactly why the obligation is pushed to
+/// the consumers rather than discharged here.
+///
+/// `RawNtStatus()` exists because a diagnostic sometimes wants the untranslated value.
+/// It is named so that spelling the mistake takes saying `RawNtStatus` out loud.
+class IocpStatus
+{
+  public:
+    IocpStatus() = default;
+
+    /// @param status The raw NTSTATUS, as read from `OVERLAPPED::Internal`.
+    explicit IocpStatus(LONG status) noexcept:
+        _status { status }
+    {
+    }
+
+    /// Whether the operation failed.
+    /// @return True when the kernel recorded anything but success.
+    [[nodiscard]] bool Failed() const noexcept
+    {
+        return _status != 0;
+    }
+
+    /// The untranslated NTSTATUS, for diagnostics that want the number the kernel
+    /// wrote. **Not** a Win32 or WSA error code; see the class comment.
+    /// @return The raw NTSTATUS.
+    [[nodiscard]] LONG RawNtStatus() const noexcept
+    {
+        return _status;
+    }
+
+  private:
+    LONG _status { 0 };
+};
+
 /// Header struct that every IOCP socket-completion OVERLAPPED extends.
 /// The reactor reinterprets each socket completion's LPOVERLAPPED as an
 /// IocpCompletion* and calls dispatch(); the socket / listener layer
@@ -29,7 +88,7 @@ namespace FastCache
 struct IocpCompletion
 {
     OVERLAPPED overlapped {};
-    void (*dispatch)(IocpCompletion* self, DWORD bytesTransferred, DWORD err) { nullptr };
+    void (*dispatch)(IocpCompletion* self, DWORD bytesTransferred, IocpStatus status) { nullptr };
 };
 
 /// Windows IOCP-based reactor.

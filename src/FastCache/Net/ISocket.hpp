@@ -309,14 +309,46 @@ class ISocket
     /// and completed it exactly this way, and they do it to `RunBlockingRead`'s own
     /// trampoline on every close that finds one parked.
     ///
-    /// **Retirement is not synchronous on every platform and a caller must not assume it
-    /// is.** Epoll and kqueue detach and complete inline, so the slot is free when this
-    /// returns. IOCP cannot: the kernel owns the read op's single `OVERLAPPED`, so the
-    /// override there retracts the operation with `CancelIoEx` and the reactor completes
-    /// the awaitable when the aborted completion is dequeued. A caller that arms another
-    /// read in the SAME reactor turn is therefore still double-arming on Windows --
-    /// narrower than not cancelling at all, and not closed
-    /// ([#884](https://github.com/LASTRADA-Software/fastcached/issues/884)).
+    /// **This makes two promises, and they are not the same promise.**
+    ///
+    /// **One: the read SLOT is free when this returns, on every transport.** A caller may
+    /// arm the next read in the same reactor turn. That is the guarantee `RunBlockingRead`
+    /// needs, and the one #884 is named for -- on IOCP it is what stops the next `Read`
+    /// arming over an `OVERLAPPED` the kernel still owns.
+    ///
+    /// **Two: the WAITER is resolved before this returns, except for a real `Read` on a
+    /// completion-based transport.** Epoll and kqueue resolve everything inline; their
+    /// readiness model consumes nothing, so retiring a wait there cannot lose anything.
+    /// IOCP resolves a `WaitReadable` probe inline for the same reason -- a zero-byte
+    /// receive carries no data -- but a real `Read` there has already been issued, and a
+    /// receive that completes cannot be un-received. Answering it `Cancelled` would drop
+    /// bytes the kernel had taken out of the stream and written into the caller's buffer.
+    /// So a retired real read keeps its own answer and resolves on the next reactor turn.
+    ///
+    /// **Why the asymmetry is not simplifiable away.** `CancelIoEx` reports
+    /// `ERROR_NOT_FOUND` for an operation that already completed and TRUE for one it
+    /// merely marked -- and a mark is a request, not a result, so that one can still
+    /// complete with bytes. Neither is distinguishable at the moment of the call:
+    /// `WSAGetOverlappedResult` answers `WSA_IO_INCOMPLETE` for a pending receive AND for
+    /// a completed-but-not-dequeued one, measured, because the status is not published to
+    /// the `OVERLAPPED` until the completion is dequeued. There is no discriminator, so
+    /// there is no correct place to branch, so a real read is never answered before its
+    /// operation has answered. An implementation that branches on `ERROR_NOT_FOUND` closes
+    /// the half a test can force and leaves the other silent.
+    ///
+    /// So a caller must read this as *I may arm another read*, never as *my read is over*.
+    /// Every caller here uses only the first, which is why the weaker promise costs
+    /// nothing.
+    ///
+    /// **`TlsSocket::CancelRead` is the one that already retires a real read, and it is
+    /// not an exemption.** It forwards to `_raw->CancelRead()` while the pump may be
+    /// parked on a real `_raw->Read(_inScratch)` -- a `WaitReadable` there decrypts and
+    /// parks on a RAW read whenever OpenSSL wants more bytes, which `Net/WriteSlot.hpp`
+    /// records. It is safe because a real read now ALWAYS settles, so its ciphertext
+    /// arrives rather than being dropped; it is not safe because TLS is special, and it
+    /// was not safe before. A reader who takes it as evidence that retiring a real read
+    /// is harmless will draw exactly the wrong conclusion, and dropped ciphertext
+    /// truncates a record stream rather than losing one message.
     ///
     /// **The default does nothing, and that is for FAKES** -- a scripted double whose
     /// reads resolve inline has no frame to free, and making this pure virtual would
