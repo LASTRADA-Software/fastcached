@@ -322,6 +322,15 @@ class ISocket
     /// fresh one. Anything that retracts an operation the kernel is still writing into
     /// owes the same.
     ///
+    /// **And retirement is not free of bytes on a completion-based transport.** A
+    /// readiness transport consumes nothing, so retiring a wait there loses nothing. On
+    /// IOCP the receive has already been issued: a retraction that loses the race with
+    /// the receive completing takes bytes out of the stream and has nowhere to put
+    /// them, since this call has already answered the waiter. So retiring over a real
+    /// `Read` may DROP data, silently; retiring over a `WaitReadable` cannot, its
+    /// receive being zero-length. Prefer retiring a probe, and treat a retired `Read`
+    /// as having left the stream in an unknown position.
+    ///
     /// **The default does nothing, and that is for FAKES** -- a scripted double whose
     /// reads resolve inline has no frame to free, and making this pure virtual would
     /// reach into eleven test files across four lanes to say so.

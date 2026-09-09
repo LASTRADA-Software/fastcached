@@ -271,8 +271,12 @@ struct IocpSocket::Impl
         // nothing -- the same thing the POSIX sockets do inline. A negative peek is a
         // spurious readiness or an error the caller's own `Read` will surface, so it
         // keeps the old answer.
+        // `keepAlive` is checked for the same reason the `WsaErrorOf` call above checks
+        // it: the two readings must agree about whether a null block is reachable, and
+        // a guard on one line beside a bare dereference on the next says the author
+        // held both positions. No socket to peek is the spurious-readiness answer.
         char probe = 0;
-        auto const peeked = ::recv(keepAlive->native, &probe, 1, MSG_PEEK);
+        auto const peeked = keepAlive ? ::recv(keepAlive->native, &probe, 1, MSG_PEEK) : -1;
         awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
     }
 
@@ -394,6 +398,18 @@ void IocpSocket::CancelRead() noexcept
     // Retract first, so the kernel is told before control leaves this function. The
     // completion still arrives, on a later turn, and `Dispatch` finds no awaitable and
     // releases the node -- which is why nothing here waits for it.
+    //
+    // **What that costs, stated rather than left to be found.** `CancelIoEx` is
+    // best-effort and cannot un-receive: an operation that has already completed, or
+    // that completes while this call runs, arrives at `Dispatch` carrying real bytes
+    // and finds no awaitable to hand them to, so those bytes are consumed from the TCP
+    // stream and dropped. Epoll and kqueue have no such window -- readiness consumes
+    // nothing -- so this is the one respect in which a caller CAN tell the platforms
+    // apart, and `ISocket::CancelRead` says so. It is silent, so it belongs at the two
+    // call sites that could ever meet it: retiring a `WaitReadable` probe cannot
+    // (a zero-byte receive transfers nothing), and only a retirement over a real
+    // `Read` -- today `TlsSocket::CancelRead` forwarding to a pump parked on
+    // `_inScratch` -- is exposed to it.
     static_cast<void>(::CancelIoEx(reinterpret_cast<HANDLE>(_impl->native), reinterpret_cast<LPOVERLAPPED>(&op.completion)));
 
     // **The retirement is synchronous, which is the contract `ISocket::CancelRead`

@@ -580,28 +580,31 @@ TEST_CASE("A reset IOCP read is reported as ConnReset, not Cancelled", "[net][io
 
 // #884, the ticket's own acceptance item 1: EXHIBIT the reuse rather than argue it.
 //
-// **This one deliberately DOES double-arm**, which is what the case above refuses to do
-// -- so the two are different claims and neither implies the other. The one above
-// asserts the CONTRACT (retirement is synchronous); this one exhibits the CONSEQUENCE
-// of the contract being broken, and can only run where `assert` is compiled out.
+// **This one deliberately DOES arm a second read in the same turn**, which is what the
+// case above refuses to do -- so the two are different claims and neither implies the
+// other. The one above asserts the CONTRACT (retirement is synchronous); this one
+// asserts its CONSEQUENCE: the retired read keeps its own answer and the next read gets
+// its own operation and its own bytes.
 //
-// **Why it is release-only, stated rather than left to be discovered.** `IocpSocket::Read`
-// calls `Detail::ClaimReadSlot` two lines before it touches the `OVERLAPPED`, and
-// `CancelRead` leaves `op.awaitable` set until `Dispatch` clears it on a later turn. So
-// in a build where `assert` is live the second read aborts on #663's tripwire -- in the
-// right file, two lines from the right site, for a DIFFERENT defect -- and that abort
-// reads exactly like a successful reproduction of this one. Skipped rather than absent,
-// so "did not run here" is a state somebody can see.
+// **It runs in every build, and the reason it used to be release-only is dead.** That
+// reason was that `CancelRead` left `op.awaitable` set until `Dispatch` cleared it on a
+// later turn, so the second `Read` hit `Detail::ClaimReadSlot`'s #663 tripwire -- in the
+// right file, two lines from the right site, for a DIFFERENT defect. The fix is exactly
+// that `CancelRead` detaches the awaitable before it returns, so the slot is empty here
+// and the assertion has nothing to fire on. Leaving the `SKIP` behind would have hidden
+// the fix's own consequence from the DEFAULT (debug) preset and from CI's Windows Debug
+// leg -- a skip whose stated cause no longer exists reads exactly like a skip that is
+// still needed.
 //
 // **What is observed, precisely, and what turned out NOT to be.** Not the `OVERLAPPED`
 // bytes, which no public interface exposes, but what reusing them does to the parked
-// coroutines. The second `Read` overwrites `readOp.awaitable` while the kernel still
-// owns the first operation's `OVERLAPPED`, so when the aborted completion for the first
-// `WSARecv` is dequeued, `Dispatch` finds the SECOND read's awaitable in the slot -- and
-// the first coroutine is never resumed and never freed. That is the leak `CancelRead`
-// exists to prevent, and it is what this case is red on.
+// coroutines. Before the fix, the second `Read` overwrote `readOp.awaitable` while the
+// kernel still owned the first operation's `OVERLAPPED`, so when the aborted completion
+// for the first `WSARecv` was dequeued, `Dispatch` found the SECOND read's awaitable in
+// the slot -- and the first coroutine was never resumed and never freed. That is the
+// leak `CancelRead` exists to prevent, and it is what this case was red on.
 //
-// **And the second read is answered with a spurious EOF**, which is worse than the
+// **And the second read was answered with a spurious EOF**, which is worse than the
 // consequence this case was first written to predict. `IocpReactor` reads the operation's
 // error from `completion->overlapped.Internal` (`IocpReactor.cpp`, the socket-completion
 // arm) -- a field of the very `OVERLAPPED` that `IocpSocket::Read` clears with
@@ -625,12 +628,8 @@ TEST_CASE("A reset IOCP read is reported as ConnReset, not Cancelled", "[net][io
 // `Op::inFlight` already released by the first completion, so the kernel would write
 // into a freed block and the case would end in a use-after-free rather than a
 // reportable failure.
-TEST_CASE("A read armed in the same turn as CancelRead orphans the cancelled one", "[net][iocp][socket][cancelread]")
+TEST_CASE("A read armed in the same turn as CancelRead gets its own completion", "[net][iocp][socket][cancelread]")
 {
-    #if !defined(NDEBUG)
-    SKIP("release-only: with `assert` live, #663's double-arm tripwire fires before the reuse is "
-         "reachable, and its abort is indistinguishable from this reproduction");
-    #else
     FastCache::Detail::EnsureNetworkInitialised();
     FastCache::SteadyClock clock;
     FastCache::IocpReactor reactor { clock };
@@ -678,7 +677,6 @@ TEST_CASE("A read armed in the same turn as CancelRead orphans the cancelled one
     CHECK(first.code.has_value());
     if (first.code.has_value())
         CHECK(FastCache::Testing::Unwrap(first.code) == FastCache::NetErrorCode::Cancelled);
-    #endif
 }
 
 #endif // _WIN32

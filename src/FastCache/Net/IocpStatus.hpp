@@ -64,13 +64,18 @@ namespace FastCache::Detail
         == FALSE)
         return static_cast<DWORD>(WSAGetLastError());
 
-    // Unreachable as far as the documentation goes: a non-zero NTSTATUS is a failed
-    // operation, and `WSAGetOverlappedResult` on a finished failed operation returns
-    // FALSE. It is spelled out rather than left to fall off the end because the
-    // alternative -- returning the raw NTSTATUS here, which is what the single-site
-    // version this replaces did -- puts the untranslated number back into the taxonomy
-    // through the one path nobody tests.
-    return static_cast<DWORD>(ERROR_OPERATION_ABORTED);
+    // **Winsock has just said the operation SUCCEEDED, so this answers 0.** The
+    // documentation makes this rare rather than impossible: `Failed()` is `_status != 0`
+    // and NOT every non-zero NTSTATUS is a failure -- the warning-severity ones
+    // (`STATUS_BUFFER_OVERFLOW`, 0x80000005, and its neighbours) are successes carrying
+    // a note. Answering `ERROR_OPERATION_ABORTED` here would turn one of those into a
+    // `Cancelled` read and throw away the bytes it transferred, which is a wrong answer
+    // rather than a vague one.
+    //
+    // Not the raw NTSTATUS either, which is what the single-site version this replaces
+    // did: that puts the untranslated number back into the taxonomy through the one
+    // path nobody tests.
+    return 0;
 }
 
 } // namespace FastCache::Detail
