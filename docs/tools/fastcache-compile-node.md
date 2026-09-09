@@ -1101,6 +1101,57 @@ knows** — because the question an operator usually has is "what *can* I set", 
 report listing only what somebody had already set would answer it wrongly by
 omission.
 
+### `lease-lifetime`: telling the fleet your translation units are long
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=lease-lifetime=2400000
+```
+
+Milliseconds. The default is 600000 (ten minutes) and the ceiling is 3600000 (one
+hour).
+
+**It is the lifetime of a LEASE, end to end — not how long a compiler may run.** The
+span it covers is the whole dispatched job: uploading the preprocessed translation
+unit, waiting for a slot on the worker, the compile itself, and the object coming
+back. Sizing it to your slowest *compile* sizes it too small, and the symptom is the
+one this setting exists to remove — a translation unit that is distributed, compiled,
+and then thrown away because everybody stopped waiting.
+
+**One number, because three machines have to agree on it.** The scheduler reclaims the
+key at that bound, the worker stops serving at it, and the client stops waiting at it.
+There is deliberately no node-side flag: a worker told to serve longer than the fleet
+agreed produces an object for a key the scheduler has already re-granted, so the work
+is done twice and one result is discarded, with every counter reading normal. Being
+replicated is what makes two members disagreeing about the value impossible rather
+than merely unlikely — there is one value, in the state every member reads.
+
+**In-flight leases keep the bound they were granted under.** Changing this does not
+move the expiry of a grant already issued, so a build running when you change it
+finishes under the old value at all three ends.
+
+**Two things stop being free as it grows, which is why there is a ceiling.** A worker
+restart empties its record of which grants have already been spent, so a captured
+grant is replayable once afterwards for whatever is left of its lifetime — the expiry
+is what bounds that window, and a rolling upgrade is a fleet of restarts. And a
+member uploading a translation unit may hold a compile socket for up to the ceiling.
+Both are bounded by this number, so it is an hour rather than something rounder: six
+times the default covers "our translation units are long" with room, and a site whose
+*single* translation unit exceeds an hour has a build problem no lease lifetime fixes.
+
+A value at or below the 30-second silence budget is refused, not clamped: below it a
+healthy worker's own scheduling jitter outlives the job, and the fleet reads as
+stopped. So is a value above the ceiling, and so is anything that is not a plain
+number of milliseconds — `600000ms` and `600 000` are both refused rather than
+half-read. Refusals arrive from the leader before the change is replicated, so a
+rejected value is an error you see rather than a setting that quietly does nothing.
+
+**What tells you it is too short**: `fastcached_dispatch_leases_released_late_total`
+on the scheduler — a client reporting back after its own lease had expired, which is
+a real compile that outran the bound — and
+`fastcache_worker_jobs_refused_lease_expired_total` on the workers. Both mean a job
+outlived its lease, and both are the signal to raise this number. Neither counts
+leases that merely expired: a client that never reports back reaches neither.
+
 **They go through the same gate as everything else on that port**, which for a read
 is worth stating: a follower's copy of the state is perfectly valid and merely
 older, so `--cluster-status` could have been answered by any member. Refusing and

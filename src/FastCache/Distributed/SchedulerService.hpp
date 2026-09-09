@@ -12,6 +12,7 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -624,6 +625,40 @@ class SchedulerService
     /// field. Relaxed because nothing is ordered against it: an exact cut-off is not
     /// the point, and the counter beside it is what carries the rate anyway.
     std::atomic<std::uint64_t> _mismatchLines { 0 };
+
+    /// How long a lease granted right now should live, as the cluster agrees.
+    ///
+    /// **The first reader of a replicated setting this repository has ever had**, and
+    /// the shape is the point rather than the lookup. `ClusterState::SettingOf` had no
+    /// production caller at all and `state.settings` reached exactly one site, which
+    /// printed it -- so both existing rows were settable, replicated, snapshotted and
+    /// acted on by nothing, which is the failure `SettingTable`'s own header names for
+    /// a MISSPELLED key arriving at a correctly spelled one.
+    ///
+    /// Asked per lease rather than cached, and that is not an oversight: this runs once
+    /// per dispatched compile, which is once per multi-second process spawn -- the same
+    /// argument `SpentLeases` makes for taking a lock there. A cached answer would be
+    /// the `--fleet-open` defect, where a surface binds one answer at construction and
+    /// can never see the setting change.
+    ///
+    /// Falls back to the table's own default in the three ways there is no answer: no
+    /// cluster (the one-machine deployment, which must work with no configuration at
+    /// all), no such setting (nobody has set one), and a value this build cannot read.
+    /// Only the third is worth saying out loud, and it is said ONCE.
+    /// @return The lifetime to grant under.
+    [[nodiscard]] std::chrono::milliseconds AgreedLeaseLifetime() const;
+
+    /// Whether the "this cluster's lease-lifetime does not parse" line has been written.
+    ///
+    /// Once for the life of the process, like `_warnedUnsigned`: the fact is about
+    /// replicated state that changes rarely, and a line per dispatched compile would
+    /// bury it under itself on the first parallel build.
+    ///
+    /// It is reachable only from a cluster whose value was written by a build with
+    /// wider bounds than this one, since `Validate` refuses everything else on the
+    /// leader before the append. That makes it a rolling-upgrade diagnostic rather
+    /// than an operator error, so it names the value and what is being used instead.
+    mutable std::atomic<bool> _warnedLeaseLifetime { false };
 
     /// Whether the "these grants are unsigned" line has already been written.
     ///

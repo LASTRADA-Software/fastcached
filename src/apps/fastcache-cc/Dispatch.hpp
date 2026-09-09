@@ -224,6 +224,39 @@ struct DispatchBudgetKnobs
     };
 }
 
+/// The compile leg, bounded by the grant the scheduler actually issued.
+///
+/// **The client is the third reader of the fleet's lease lifetime, and it was the one
+/// left behind.** The scheduler reclaims at the granted bound and the worker stops
+/// serving at it; a client still counting down a compile-time constant gives up
+/// mid-compile on a job both other machines consider live, which is #522's premise in
+/// the one place an operator watches. So a dispatched compile's total comes from the
+/// grant in hand, never from this process's configuration.
+///
+/// That is why `FASTCACHE_DISPATCH_TIMEOUT_MS` no longer decides a dispatched compile:
+/// **a client-side knob overriding the fleet's agreed bound is a worker-side override
+/// wearing a client's clothes**, and the ticket forbids one of those exactly one
+/// machine along. It stays as the fallback below and as the bound on the paths that
+/// hold no grant.
+///
+/// Only `total` is replaced, and naming it is the point rather than an accident: #247
+/// was a copy of a DIFFERENT leg's budget that silently carried the wrong `keepAlive`,
+/// and the lesson written above is to name what differs. Here the leg is the same leg
+/// -- same connect, same idle, same keepalive -- and one field of it is now known
+/// better by the fleet than by this process.
+///
+/// @param compile The compile leg as configured.
+/// @param granted What the scheduler said this lease lives for; zero means it named
+///        none, which no version-6 peer does -- so the configured value stands rather
+///        than a zero budget failing the compile instantly.
+/// @return The budget this compile actually runs under.
+[[nodiscard]] constexpr ExchangeBudget UnderGrantedLease(ExchangeBudget compile, std::chrono::milliseconds granted) noexcept
+{
+    if (granted > std::chrono::milliseconds::zero())
+        compile.total = granted;
+    return compile;
+}
+
 /// The compile leg's intent is now written twice -- here, which production uses, and
 /// `DispatchBudgets`'s own default member initializers, which every test that takes
 /// the default argument uses. Two independent statements of one rule is what #247 was,

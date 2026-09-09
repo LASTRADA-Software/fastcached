@@ -188,11 +188,17 @@ constexpr std::string_view Scheduler = "sched:6675";
 constexpr std::string_view Worker = "worker:6676";
 
 /// A lease reply granting `Worker`.
-[[nodiscard]] std::vector<std::byte> GrantReply(Wire::CodecList codecs = {})
+///
+/// @param codecs What the granted worker can decode.
+/// @param lifetime How long the scheduler says the lease lives. Zero is what a grant
+///        naming none looks like, and is the default here because most cases in this
+///        file are about routing and codecs rather than about budgets.
+[[nodiscard]] std::vector<std::byte> GrantReply(Wire::CodecList codecs = {}, std::chrono::milliseconds lifetime = {})
 {
-    return Wire::EncodeReply(Wire::Status::Ok,
-                             Wire::EncodeLeaseGrant(Wire::LeaseGrant {
-                                 .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs) }));
+    return Wire::EncodeReply(
+        Wire::Status::Ok,
+        Wire::EncodeLeaseGrant(Wire::LeaseGrant {
+            .endpoint = Worker, .leaseToken = "l1", .workerCodecs = std::move(codecs), .lifetime = lifetime }));
 }
 
 /// The source name as the client sends it and the worker digests it: the WHOLE path.
@@ -1327,4 +1333,65 @@ TEST_CASE("A crossed reply is refused before its object is expanded", "[dispatch
 
     CHECK(result.status == DispatchStatus::Mismatched);
     CHECK_FALSE(result.detail.contains("declared decompressed size"));
+}
+
+TEST_CASE("The client waits for as long as the GRANT says, not for as long as it was configured",
+          "[launcher][dispatch][lease]")
+{
+    // **The client is the third reader of the fleet's agreed lease lifetime, and the
+    // one an operator actually watches.** The scheduler reclaims the key at the granted
+    // bound and the worker stops serving at it; a client still counting down its own
+    // compile-time constant abandons the compile while both other machines consider the
+    // job live -- and then compiles locally, which is exactly the waste distribution
+    // exists to remove (#522).
+    //
+    // Asserted on the budget the compile EXCHANGE ran under rather than on an outcome,
+    // because an outcome is the same either way until the wait is long enough to matter:
+    // a case that merely dispatched successfully would pass against a client that
+    // ignored the grant entirely.
+    std::vector<std::string> const args { "-O2" };
+
+    SECTION("a grant naming a lifetime is what bounds the compile leg")
+    {
+        constexpr auto granted = std::chrono::milliseconds { 2'400'000 };
+        static_assert(granted != DefaultDispatchTotal,
+                      "the assertion below is only meaningful while the granted value differs from the default");
+
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply({}, granted));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
+
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.Ran());
+
+        // The compile leg is the LAST exchange to the worker; the control legs go to the
+        // scheduler. Read positionally against `Dialled()` so a reordering cannot make
+        // this assert about the wrong exchange.
+        auto const dialled = fleet.Dialled();
+        auto const budgets = fleet.Budgets();
+        REQUIRE(dialled.size() == budgets.size());
+        auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
+        REQUIRE(compileLeg != dialled.end());
+        CHECK(budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin())).total == granted);
+    }
+
+    SECTION("a grant naming none leaves this process's own value standing")
+    {
+        // Not a fallback anybody should reach -- no version-6 peer sends a zero -- but
+        // the alternative is a zero budget, which fails every compile instantly. The
+        // control also states what `FASTCACHE_DISPATCH_TIMEOUT_MS` still does: it bounds
+        // the legs that hold no grant, and nothing else.
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, GrantReply());
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
+
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.Ran());
+
+        auto const dialled = fleet.Dialled();
+        auto const budgets = fleet.Budgets();
+        auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
+        REQUIRE(compileLeg != dialled.end());
+        CHECK(budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin())).total == DefaultDispatchTotal);
+    }
 }

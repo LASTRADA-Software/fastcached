@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -356,4 +357,85 @@ TEST_CASE("An IPv6 peer keeps its address rather than its last colon group", "[c
     REQUIRE(peer.has_value());
     CHECK(Unwrap(peer).id == "n1");
     CHECK(Unwrap(peer).raftEndpoint == "[2001:db8::1]:6680");
+}
+
+TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it may is accepted", "[cluster][state]")
+{
+    namespace Wire = FastCache::CompileCacheWire;
+
+    // **Both directions, and the accepting one is not decoration.** A guard nobody has
+    // watched ACCEPT is not known to work (#1031): a validator that refused every value
+    // would pass every refusal assertion below and make the setting unsettable, which is
+    // this ticket delivering nothing while looking delivered.
+    SECTION("a value the cluster may agree on")
+    {
+        CHECK(Validate(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "1800000")).has_value());
+
+        // The two ends of the legal range, exactly. Inside-the-range values alone would
+        // pass against a validator whose bounds are off by any amount.
+        CHECK(Validate(Cmd(CommandKind::SetSetting,
+                           std::string { LeaseLifetimeSetting },
+                           std::to_string(Wire::MaxCompileLeaseLifetime.count())))
+                  .has_value());
+        CHECK(Validate(Cmd(CommandKind::SetSetting,
+                           std::string { LeaseLifetimeSetting },
+                           std::to_string(Wire::DefaultCompileIdleTimeout.count() + 1)))
+                  .has_value());
+
+        // The shipped default must itself be settable, or an operator cannot type the
+        // value their fleet is already running.
+        CHECK(Validate(Cmd(CommandKind::SetSetting,
+                           std::string { LeaseLifetimeSetting },
+                           std::to_string(Wire::DefaultCompileLeaseTimeout.count())))
+                  .has_value());
+    }
+
+    SECTION("one millisecond past the ceiling is refused, and the refusal names the ceiling")
+    {
+        // Just past, rather than absurdly past: a bound tested only against a wild value
+        // passes against an off-by-a-lot bound, which is the one that would let a site
+        // set a lease lifetime that widens the post-restart replay window well beyond
+        // what `MaxCompileLeaseLifetime` argues is acceptable.
+        auto const refusal = Refused(Cmd(CommandKind::SetSetting,
+                                         std::string { LeaseLifetimeSetting },
+                                         std::to_string(Wire::MaxCompileLeaseLifetime.count() + 1)));
+        CHECK(refusal.contains(std::to_string(Wire::MaxCompileLeaseLifetime.count())));
+        // The REASON travels, because an operator meeting a bare "too large" has no way
+        // to know this is a replay bound rather than a number somebody rounded.
+        CHECK(refusal.contains("replayable"));
+    }
+
+    SECTION("a value at or below the idle bound is refused, which the static_assert can no longer cover")
+    {
+        // `CompileCacheWire` asserts `DefaultCompileIdleTimeout < DefaultCompileLeaseTimeout`
+        // at build time, and that now covers the DEFAULT alone: a cluster can agree on a
+        // lifetime the constant never had. Below the idle bound a healthy worker's own
+        // reactor jitter outlives the job, so the fleet reads as stopped -- the exact
+        // failure the build-time assertion exists to prevent, reachable at run time.
+        CHECK(Refused(Cmd(CommandKind::SetSetting,
+                          std::string { LeaseLifetimeSetting },
+                          std::to_string(Wire::DefaultCompileIdleTimeout.count())))
+                  .contains("silence"));
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "1")).empty());
+    }
+
+    SECTION("what is not a number at all")
+    {
+        // Parsed WHOLE. `from_chars` stops at the first byte it cannot read, so a
+        // prefix-parse would adopt 600000 from "600000ms" -- a number the operator did
+        // not write, accepted silently, replicated to the whole fleet.
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600000ms")).empty());
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "600 000")).empty());
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "-1")).empty());
+        CHECK_FALSE(Refused(Cmd(CommandKind::SetSetting, std::string { LeaseLifetimeSetting }, "")).empty());
+    }
+
+    SECTION("the settings this build constrains nothing about are unaffected")
+    {
+        // The control for the column itself: a `refuse` wired to the wrong row, or run
+        // for every row, would refuse these -- and every assertion above would still
+        // pass.
+        CHECK(Validate(Cmd(CommandKind::SetSetting, "upstream", "not-a-number")).has_value());
+        CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "1")).has_value());
+    }
 }
