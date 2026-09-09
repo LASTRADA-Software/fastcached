@@ -59,6 +59,26 @@ class ScriptedToolchainHost final: public IToolchainHost
         return _leadingSlashIsDriveRelative;
     }
 
+    /// Claim a native architecture.
+    ///
+    /// This is what makes #146 testable at all. The real answer comes from an OS
+    /// call that reports whatever the runner happens to be, so without it every
+    /// case asserts one architecture -- and, before the fix, the table asserted
+    /// whatever the BUILD was, which is the defect re-derived rather than a test.
+    ///
+    /// @param architecture What this scripted machine runs natively.
+    /// @return This host, for chaining.
+    ScriptedToolchainHost& WithNativeArchitecture(HostArchitecture architecture)
+    {
+        _nativeArchitecture = architecture;
+        return *this;
+    }
+
+    [[nodiscard]] HostArchitecture NativeArchitecture() const noexcept override
+    {
+        return _nativeArchitecture;
+    }
+
     /// The suffix a bare executable name gains on a Windows-shaped machine.
     ///
     /// Named here rather than taken from the host this test binary runs on: a
@@ -319,6 +339,9 @@ class ScriptedToolchainHost final: public IToolchainHost
     std::set<std::string> _directories;
     std::set<std::string> _executables;
     bool _leadingSlashIsDriveRelative { false };
+    /// `X64` by default because it is what nearly every case means by "a machine",
+    /// and a case about architecture says so with `WithNativeArchitecture`.
+    HostArchitecture _nativeArchitecture { HostArchitecture::X64 };
 
     std::map<std::string, std::string> _files;
     std::map<RegistryEntry, std::string> _registry;

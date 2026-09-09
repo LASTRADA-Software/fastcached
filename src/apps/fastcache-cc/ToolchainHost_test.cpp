@@ -10,6 +10,13 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
+
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <sys/utsname.h>
+#endif
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -242,6 +249,55 @@ TEST_CASE("The real host resolves this process's own executable on PATH", "[tool
     CHECK(std::filesystem::path { FastCache::Testing::Unwrap(resolved) }.filename() == executable.filename());
 
     CHECK_FALSE(host->ResolveOnSearchPath("fc-definitely-not-installed").has_value());
+}
+
+TEST_CASE("The real host answers for the machine, and agrees with a second reading of it", "[toolchain-host]")
+{
+    auto const host = MakeToolchainHost();
+
+    // **Reachability first, and it is not decoration.** Before this case nothing
+    // called `NativeArchitecture()` on the real host at all -- the scripted host
+    // answered every other test -- so a production implementation that failed to
+    // link, faulted, or was never wired would have been invisible. That is the
+    // `PurgeExpired` shape: correct, tested, and with no production caller.
+    auto const architecture = host->NativeArchitecture();
+    CHECK(architecture <= HostArchitecture::X86);
+
+#if defined(_WIN32)
+    // **A genuine second derivation.** `NativeArchitecture` reads
+    // `IsWow64Process2`'s `nativeMachine`; this reads `GetNativeSystemInfo`. They
+    // are different APIs answering one question, so agreement means something --
+    // and both see PAST the emulation, which is the property under test. Asserting
+    // against `GetSystemInfo` instead would pass on an x64 host and pin the defect
+    // on the ARM64 one, so it is deliberately not the comparison.
+    SYSTEM_INFO info {};
+    ::GetNativeSystemInfo(&info);
+    switch (info.wProcessorArchitecture)
+    {
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            CHECK(architecture == HostArchitecture::Arm64);
+            break;
+        case PROCESSOR_ARCHITECTURE_AMD64:
+            CHECK(architecture == HostArchitecture::X64);
+            break;
+        default:
+            CHECK(architecture == HostArchitecture::X86);
+            break;
+    }
+#else
+    // **Weaker on purpose, and said rather than dressed up.** The POSIX
+    // implementation reads `uname`, so comparing it against `uname` here would be
+    // the code checked against itself. What this asserts instead is the one thing
+    // that arm CAN establish without a second source: the answer is derived at RUN
+    // time from a machine name rather than baked in, so a build whose
+    // `NativeArchitecture` collapsed to a compile-time constant would still be
+    // caught by the Windows arm above and by the discovery cases, not here.
+    utsname machine {};
+    REQUIRE(::uname(&machine) == 0);
+    auto const name = std::string_view { static_cast<char const*>(machine.machine) };
+    CAPTURE(name);
+    CHECK(!name.empty());
+#endif
 }
 
 TEST_CASE("The real host reaches the same registry the platform leaf does", "[toolchain-host]")

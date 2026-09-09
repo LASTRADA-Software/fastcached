@@ -3,6 +3,7 @@
 
 #include <FastCache/Platform/Registry.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,6 +12,29 @@
 
 namespace FastCache::Cc
 {
+
+/// The instruction set a machine executes NATIVELY.
+///
+/// **This is not the architecture this binary was built for, and the two differ on
+/// exactly the machines that matter.** An x64 build running under emulation on an
+/// ARM64 Windows host is the ordinary way an x64 binary runs there, and it can still
+/// spawn arm64 executables: a child process is not bound by its parent's emulation.
+///
+/// So `Platform/HostInfo`'s `HostFacts::architecture` answers the OPPOSITE question
+/// and is deliberately compile-time -- it reports what THIS process can run, because
+/// a scheduler matches a worker to a job by what its own code executes as. That
+/// reasoning is correct there and does not transfer here: a compiler is a separate
+/// process, so which compiler binaries this machine can run is a fact about the
+/// MACHINE. Both questions are live and they have different answers.
+///
+/// Ordered by preference, which is what makes it an index into a layout's bin paths.
+enum class HostArchitecture : std::uint8_t
+{
+    Arm64, ///< 64-bit ARM.
+    X64,   ///< 64-bit x86.
+    X86,   ///< 32-bit x86, and the fallback for an architecture nothing here names.
+    Last,  ///< Enumerator count, for `EnumTable`.
+};
 
 /// The ambient facts a machine answers about which toolchains it holds.
 ///
@@ -64,6 +88,19 @@ class IToolchainHost
     ///
     /// @return True when a leading `/` is drive-relative.
     [[nodiscard]] virtual bool LeadingSlashIsDriveRelative() const noexcept = 0;
+
+    /// The instruction set this MACHINE runs natively.
+    ///
+    /// Asked of the host rather than settled with a `#if`, for the reason
+    /// `LeadingSlashIsDriveRelative` above is -- the layout table describes machines,
+    /// not the one it was compiled for -- and for a second reason that one does not
+    /// have. A `#if _WIN32` is sound because build time and run time agree on it;
+    /// build architecture and host architecture do NOT agree, and #146 is what that
+    /// cost: an x64 build searched `bin/Hostx64/x64` on every machine, so an ARM64
+    /// Windows host never offered the native arm64 toolset it actually had.
+    ///
+    /// @return This machine's native architecture; `X86` when nothing here names it.
+    [[nodiscard]] virtual HostArchitecture NativeArchitecture() const noexcept = 0;
 
     /// Whether @p path names an existing directory.
     /// @param path Directory path.

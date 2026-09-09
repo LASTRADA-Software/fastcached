@@ -2672,10 +2672,19 @@ only thing that would catch an encoding that drops a field on the way.
   it can be spawned and once for its banner, and the first is in a serial loop in
   front of the pool built to hide exactly that. `CompilerBanner` knows both facts
   and reports neither, so two callers reconstruct what it discarded.
-- **[#146](https://github.com/LASTRADA-Software/fastcached/issues/146)** — the MSVC
-  bindir a layout row searches is chosen by `#if` on the architecture this binary was
-  COMPILED for, so an x64 build on an ARM64 Windows host never offers that machine's
-  native toolset. Moving the fact onto `IToolchainHost` costs the row its
-  `constexpr` span, and it is only fully correct once a fingerprint can tell one
-  toolset's target variants apart -- which today it cannot, since they share an
-  include tree and a fallback banner and therefore digest identically.
+- **[#1126](https://github.com/LASTRADA-Software/fastcached/issues/1126)** — every
+  target variant of one MSVC toolset digests IDENTICALLY, so a client can be matched
+  to a worker whose `cl` generates for another target and get the wrong object under a
+  key both ends agree on. They share an include tree, and `cl` answers no `--version`
+  so the banner is the normalized basename: the fingerprint's three inputs -- banner,
+  driver grammar, and each include file's relative path and content hash -- do not
+  differ between them. A GNU driver is NOT exposed, because its include tree is
+  per-architecture and the contents differ; that asymmetry is the whole ticket and is
+  the opposite of what it was first filed as. **The obvious fix is forbidden**: the key
+  folds the target and the fingerprint must not, or #145 reopens -- and the escape that
+  rule relies on, the dispatch line stating the target, is exactly what a fixed-target
+  driver lacks, since `cl` and `gcc` take no `--target=`. So the rule is sound and
+  simply does not reach those rows. #146 made this REACHABLE on new hardware rather
+  than creating it: a node now offers its machine's native toolset, which on an ARM64
+  host is an arm64-targeting `cl` advertised under an identity that cannot say so.
+  Accepted deliberately, because before #146 that machine offered nothing at all.

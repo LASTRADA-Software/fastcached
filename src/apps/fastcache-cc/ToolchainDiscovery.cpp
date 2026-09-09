@@ -3,6 +3,7 @@
 #include "ToolchainProbe.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
 #include <array>
@@ -23,23 +24,27 @@ namespace
     /// same table find different things depending on who compiled it.
     constexpr std::string_view WindowsExecutableSuffix = ".exe";
 
-    /// The MSVC bindir for the architecture this process was built for.
+    /// The MSVC bindir for each host architecture, indexed by `HostArchitecture`.
     ///
-    /// One row rather than every `Host<a>/<b>` combination a Visual Studio install
-    /// contains, and the restraint is deliberate. Every target variant of one
-    /// toolset -- x64, x86, arm64 -- shares an include tree AND, because `cl` has no
-    /// `--version`, a banner of the normalized basename, so all of them fingerprint
-    /// IDENTICALLY. Offering them all would register one machine several times under
-    /// one identity, and hand the scheduler a worker that might compile for the
-    /// wrong target. The native one is what a client on this machine invokes.
-    constexpr std::string_view MsvcNativeBinPath =
-#if defined(_M_ARM64) || defined(__aarch64__)
-        "bin/Hostarm64/arm64";
-#elif defined(_M_X64) || defined(__x86_64__)
-        "bin/Hostx64/x64";
-#else
-        "bin/Hostx86/x86";
-#endif
+    /// One directory is searched rather than every `Host<a>/<b>` combination a Visual
+    /// Studio install contains, and the restraint is deliberate. Every target variant
+    /// of one toolset -- x64, x86, arm64 -- shares an include tree AND, because `cl`
+    /// has no `--version`, a banner of the normalized basename, so all of them
+    /// fingerprint IDENTICALLY (#1126). Offering them all would register one machine
+    /// several times under one identity, and hand the scheduler a worker that might
+    /// compile for the wrong target.
+    ///
+    /// **Which one is the MACHINE's, not this build's** (#146). It was a `#if` on
+    /// `_M_ARM64`/`_M_X64`, so an x64 build searched `bin/Hostx64/x64` wherever it
+    /// ran: on an ARM64 Windows host -- the ordinary way an x64 binary runs there --
+    /// it never offered the native arm64 toolset that machine actually had. The
+    /// table now describes machines, like every other row, and a scripted host can
+    /// exercise all three from a Linux runner.
+    constexpr EnumTable<HostArchitecture, std::string_view> MsvcBinByHost { {
+        "bin/Hostarm64/arm64",
+        "bin/Hostx64/x64",
+        "bin/Hostx86/x86",
+    } };
 
     /// The bindir a Visual Studio install keeps its BUNDLED LLVM in.
     ///
@@ -56,23 +61,27 @@ namespace
     /// directory holds a compiler built for a different HOST, which this machine
     /// cannot run. `VC/Tools/Llvm/bin` is where a 32-bit host's copy sits, matching
     /// the layout Visual Studio used before it grew per-architecture directories.
-    constexpr std::string_view VsLlvmNativeBinPath =
-#if defined(_M_ARM64) || defined(__aarch64__)
-        "VC/Tools/Llvm/ARM64/bin";
-#elif defined(_M_X64) || defined(__x86_64__)
-        "VC/Tools/Llvm/x64/bin";
-#else
-        "VC/Tools/Llvm/bin";
-#endif
+    constexpr EnumTable<HostArchitecture, std::string_view> VsLlvmBinByHost { {
+        "VC/Tools/Llvm/ARM64/bin",
+        "VC/Tools/Llvm/x64/bin",
+        "VC/Tools/Llvm/bin",
+    } };
 
     /// The bindir every non-MSVC layout keeps its compilers in.
     constexpr std::array<std::string_view, 1> BinOnly { "bin" };
 
-    /// MSVC's, for the architecture this build targets.
-    constexpr std::array<std::string_view, 1> MsvcBin { MsvcNativeBinPath };
+    /// MSVC's, one per host architecture -- read through `ByHostArchitecture`.
+    ///
+    /// `EnumTable` is what gets the LENGTH right: the extent comes from
+    /// `HostArchitecture::Last`, so adding an architecture leaves a value-initialized
+    /// row rather than an out-of-range index. `RowsInEnumeratorOrder` cannot help
+    /// here -- a bare `string_view` row carries no enumerator to project back out --
+    /// so the order is stated in the tables above and asserted by the cases that
+    /// drive all three architectures through a scripted host.
+    constexpr std::span<std::string_view const> MsvcBin { MsvcBinByHost };
 
-    /// The LLVM Visual Studio bundles, for the architecture this build targets.
-    constexpr std::array<std::string_view, 1> VsLlvmBin { VsLlvmNativeBinPath };
+    /// The LLVM Visual Studio bundles, likewise one per host architecture.
+    constexpr std::span<std::string_view const> VsLlvmBin { VsLlvmBinByHost };
 
     /// The three MSYS2 environments that ship a usable compiler.
     ///
@@ -157,6 +166,7 @@ namespace
           .versionRoot = "VC/Tools/MSVC",
           .versionHintFile = "VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt",
           .binPaths = MsvcBin,
+          .binPathSelection = BinPathSelection::ByHostArchitecture,
           .binaries = MsvcBinaries,
           .match = NameMatch::Exact },
         // The same installation, one directory over. No `versionRoot`: the bundled
@@ -171,6 +181,7 @@ namespace
           .versionRoot = {},
           .versionHintFile = {},
           .binPaths = VsLlvmBin,
+          .binPathSelection = BinPathSelection::ByHostArchitecture,
           .binaries = LlvmBinaries,
           .match = NameMatch::Exact },
         { .name = "llvm-registry",
@@ -425,6 +436,38 @@ namespace
         return {};
     }
 
+    /// The bin paths of @p layout that THIS machine should search.
+    ///
+    /// The whole of `BinPathSelection`, in one place, so the walk above has no
+    /// per-layout arm and a third reading would be a third enumerator rather than a
+    /// third branch threaded through the caller.
+    ///
+    /// `ByHostArchitecture` indexes rather than searches: the other directories hold
+    /// compilers built for a different HOST, which this machine cannot run, so
+    /// searching them would offer toolchains that cannot execute here. A row whose
+    /// span is too short for the machine's architecture falls back to searching
+    /// nothing rather than reading past the end -- unreachable while `EnumTable`
+    /// sizes both tables, and cheaper to state than to prove unreachable.
+    ///
+    /// @param layout The row.
+    /// @param host The machine, asked for its native architecture.
+    /// @return The subrange of `layout.binPaths` to search.
+    [[nodiscard]] std::span<std::string_view const> BinPathsFor(ToolchainLayout const& layout, IToolchainHost& host)
+    {
+        switch (layout.binPathSelection)
+        {
+            case BinPathSelection::All:
+                return layout.binPaths;
+            case BinPathSelection::ByHostArchitecture: {
+                auto const index = static_cast<std::size_t>(host.NativeArchitecture());
+                if (index >= layout.binPaths.size())
+                    return {};
+                return layout.binPaths.subspan(index, 1);
+            }
+        }
+        return layout.binPaths;
+    }
+
     /// The directories beneath one root that a layout searches for binaries.
     ///
     /// Where a row has a `versionRoot`, that is one bindir per installed version --
@@ -464,9 +507,12 @@ namespace
                 prefixes.push_back(JoinPath(versionRoot, version));
         }
 
+        // Which of the row's bin paths are searched is the row's own business
+        // (`BinPathSelection`), so this loop stays one expression rather than
+        // growing a per-layout special case.
         std::vector<std::string> directories;
         for (auto const& prefix: prefixes)
-            for (auto const& binPath: layout.binPaths)
+            for (auto const& binPath: BinPathsFor(layout, host))
                 directories.push_back(JoinPath(prefix, binPath));
         return directories;
     }
