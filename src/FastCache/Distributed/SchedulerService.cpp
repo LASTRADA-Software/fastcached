@@ -47,11 +47,14 @@ namespace
                             .counter = IMetricsSink::Counter::DispatchLeasesDuplicate },
         RefusalDescriptor { .code = Wire::ErrorCode::MalformedRegistration,
                             .counter = IMetricsSink::Counter::DispatchWorkerRegistrationsMalformed },
-        // Counted, unlike `UnknownLease` beside it, and the split is the diagnostic:
-        // that one is a lease this scheduler issued and has since forgotten, which is
-        // a statement about one client's timing. This one was never issued at all, so
-        // a rise is somebody forging releases -- or, far more likely, a launcher from
-        // before signed leases still handing back the bare serial it was given.
+        // Its own counter, and the split is the diagnostic: `UnknownLease` beside it
+        // names a lease this scheduler issued and has since forgotten, while this one
+        // was never issued at all -- so a rise is somebody forging releases, or, far
+        // more likely, a launcher from before signed leases still handing back the
+        // bare serial it was given. This comment used to draw the contrast as
+        // counted-against-uncounted, which stopped being true when one of the three
+        // release refusals gained a counter of its own (#1074); the contrast that
+        // matters is WHO is described, and that is unchanged.
         RefusalDescriptor { .code = Wire::ErrorCode::LeaseUnauthorized,
                             .counter = IMetricsSink::Counter::DispatchLeasesUnauthorized },
     };
@@ -65,6 +68,14 @@ namespace
     /// restarted, and the two gate refusals are policy answers -- counting any of them
     /// beside the capacity refusals would put noise into the numbers a fleet is sized
     /// from, which is the very split those counters exist to preserve.
+    ///
+    /// `UnknownLease` is listed here as a statement about THIS table, and it is no
+    /// longer the whole story about that code. A release refused reaches
+    /// `ReleaseRefusalTable` below instead, which is keyed on what was observed
+    /// rather than on the code and counts one of its three rows; the entry here is
+    /// what keeps the code-keyed lookup from counting it a second time, and
+    /// `ReleaseRefusalsCountOnce` is what enforces that rather than leaving it to
+    /// this comment (#1074).
     constexpr std::array UncountedRefusals { Wire::ErrorCode::NotLeader,
                                              Wire::ErrorCode::NotAMember,
                                              Wire::ErrorCode::MalformedFrame,
@@ -93,6 +104,82 @@ namespace
     }
 
     static_assert(RefusalsAreDisjoint(), "a refusal either moves a counter or is listed as moving none, never both");
+
+    /// What one way of resolving nothing answers with, and whether anything rises.
+    ///
+    /// **A second table because the one above is keyed on the CODE, and this is the
+    /// case a code-keyed table provably cannot hold.** All three release refusals
+    /// answer `UnknownLease` -- a client acts on them identically, and telling it
+    /// apart would be a wire change for every deployed launcher -- while an operator
+    /// does not: one of the three is the only evidence a fleet has that its lease
+    /// bound does not fit its work, and the other two have several causes each. One
+    /// code, three rows. That is the same shape `SurfaceRefusal` records for the two
+    /// refusals sharing `MalformedFrame`, arriving at this service (#1074).
+    ///
+    /// The `rationale` is never sent and never read at run time. It is the forcing
+    /// function `UncountedRefusal` carries for the same purpose: an author adding a
+    /// fourth row cannot write it without answering "would a rise here mean
+    /// something happened", and a bare row with no counter would otherwise spell
+    /// *forgot* in the vocabulary of *decided*.
+    struct ReleaseRefusalRow
+    {
+        LeaseTable::ReleaseRefusal reason;            ///< What the table observed.
+        Wire::ErrorCode code;                         ///< What the client is told.
+        std::optional<IMetricsSink::Counter> counter; ///< What rises, or nothing at all.
+        std::string_view rationale;                   ///< Why it rises, or why nothing does.
+        std::string_view detail;                      ///< Words for a person.
+    };
+
+    /// One row per `LeaseTable::ReleaseRefusal`, in enumerator order.
+    constexpr EnumTable<LeaseTable::ReleaseRefusal, ReleaseRefusalRow> ReleaseRefusalTable { {
+        { .reason = LeaseTable::ReleaseRefusal::Expired,
+          .code = Wire::ErrorCode::UnknownLease,
+          .counter = IMetricsSink::Counter::DispatchLeasesReleasedLate,
+          .rationale = "the one release refusal with a single cause: this client held its lease longer than "
+                       "the fleet's bound, which is the only evidence a site has that the bound is too short",
+          .detail = "this lease had already expired; the job outlived it" },
+        { .reason = LeaseTable::ReleaseRefusal::UnknownToken,
+          .code = Wire::ErrorCode::UnknownLease,
+          .counter = std::nullopt,
+          .rationale = "four causes share it -- an ordinary second release, a token from an instance that no "
+                       "longer exists whose number is not yet reissued, an unissued serial on a keyless fleet, "
+                       "and a lease ReleaseWorker reclaimed from a client that was still compiling -- so a "
+                       "rise would name no one condition, and counting the last beside Expired would claim a "
+                       "bound is too short for an event that says nothing about the bound",
+          .detail = "unknown or already-resolved lease" },
+        { .reason = LeaseTable::ReleaseRefusal::KeyMismatch,
+          .code = Wire::ErrorCode::UnknownLease,
+          .counter = std::nullopt,
+          .rationale = "a token from a previous instance whose number this one has since reissued, or a client "
+                       "naming the wrong key for its own token; the two are indistinguishable from here, and "
+                       "the first is what an ordinary scheduler restart looks like",
+          .detail = "this lease token belongs to another key" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(ReleaseRefusalTable, &ReleaseRefusalRow::reason),
+                  "ReleaseRefusalTable must hold one row per LeaseTable::ReleaseRefusal, in enumerator order");
+
+    /// Whether a release refusal's counter is the only one its answer can move.
+    ///
+    /// These rows carry their own counter, so a code that ALSO appears in
+    /// `RefusalTable` would be counted twice for one refusal -- once from the row and
+    /// once from the code-keyed lookup. It is safe today only because `UnknownLease`
+    /// is not in that table, and "safe by coincidence of another table's contents" is
+    /// what this file's own release path already records as the failure worth
+    /// guarding: a credential honoured on one verb and ignored on another is trusted
+    /// by accident of which verb ran.
+    /// @return True when no release refusal's code carries a code-keyed counter.
+    [[nodiscard]] consteval bool ReleaseRefusalsCountOnce() noexcept
+    {
+        for (auto const& row: ReleaseRefusalTable)
+            for (auto const& counted: RefusalTable)
+                if (row.code == counted.code)
+                    return false;
+        return true;
+    }
+
+    static_assert(ReleaseRefusalsCountOnce(),
+                  "a release refusal carries its own counter, so its code must not also carry a code-keyed one");
 
     /// What a consensus refusal becomes on the wire.
     struct ProposalRefusalRow
@@ -729,15 +816,28 @@ SchedulerReply SchedulerService::Release(CallerContext const& caller, std::strin
 
     auto const lease = _leases.Release(serial, key);
     if (!lease.has_value())
-        // Already gone: it expired under a job that outlived its lease, this is a
-        // second release of one token, or the token belongs to a scheduler instance
-        // that no longer exists and this one has since reissued the number.
-        // Answered rather than accepted silently, because the first of those is a
-        // fleet whose `DefaultLeaseTimeout` is shorter than its slowest translation
-        // unit -- and a client that is told nothing has nothing to report.
-        // Uncounted by design: it is a statement about one client's timing, not
-        // about the fleet's capacity.
-        return Refuse(Wire::ErrorCode::UnknownLease, "unknown or already-resolved lease");
+    {
+        // Already gone, and WHICH of the three ways decides whether anything rises.
+        // This used to be one refusal for all three, uncounted on the grounds that it
+        // is a statement about one client's timing rather than about the fleet's
+        // capacity -- right about capacity, and beside the point about fit. Fit is
+        // what nothing else can observe: a job that outlived its lease is the only
+        // evidence a site has that `DefaultCompileLeaseTimeout` is shorter than its
+        // slowest translation unit, and this file's own `LeaseTable` names it as the
+        // one condition worth telling an operator about (#1074).
+        //
+        // The counter travels on the ROW, and `RowsInEnumeratorOrder` is what makes
+        // it unforgettable rather than the shape of this call: a fourth way of
+        // resolving nothing cannot be added without a row, and a row cannot be
+        // written without deciding whether anything rises and saying why. That is
+        // the same guarantee `RefusalTable` gets from being consulted by `Refuse`,
+        // reached differently -- there is exactly one call site here, so the
+        // decision lives in the table rather than in what this line remembers.
+        auto const& row = ReleaseRefusalTable[static_cast<std::size_t>(lease.error())];
+        if (row.counter.has_value())
+            _metrics.Increment(*row.counter);
+        return Refuse(row.code, std::string { row.detail });
+    }
 
     // The registry's speculative count, undone. `JobStarted` at `Lease` above is what
     // stops the scheduler over-assigning a worker inside one heartbeat window, and

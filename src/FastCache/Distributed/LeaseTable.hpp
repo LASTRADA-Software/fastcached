@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -126,6 +127,75 @@ class LeaseTable
         AlreadyInFlight ///< Another client holds a live lease for this key.
     };
 
+    /// Why a release resolved nothing.
+    ///
+    /// Three enumerators because `Release` has three distinct ways of resolving
+    /// nothing, and they used to be one `nullopt`. The scheduler above answered all
+    /// three with one wire code and no counter at all, so the single condition worth
+    /// telling an operator about -- a `leaseTimeout` shorter than the slowest
+    /// translation unit, which this type's own `Release` documentation already named
+    /// as such -- had nowhere to be observed
+    /// ([#1074](https://github.com/LASTRADA-Software/fastcached/issues/1074)).
+    ///
+    /// **Every enumerator names what was OBSERVED, never the cause inferred from
+    /// it**, and that is deliberate rather than fussy. The mapping from observation
+    /// to cause is not one-to-one: a token from a scheduler instance that no longer
+    /// exists arrives as `UnknownToken` when this instance has not yet reissued its
+    /// number and as `KeyMismatch` when it has, so an enumerator called
+    /// `SchedulerRestarted` would be a claim this table cannot make. That is the
+    /// `KnownSchedulerTerm` lesson from the same subsystem: a monotonic term standing
+    /// in for replay protection reported a legitimate reset as an attack, and the
+    /// correction was to report the observation and name the causes beside it. A
+    /// confident wrong signal is worse than a vague right one.
+    ///
+    /// The consequence is what makes the counter policy above decidable at all: only
+    /// `Expired` has a single cause, so only `Expired` is worth counting.
+    enum class ReleaseRefusal : std::uint8_t
+    {
+        /// The caller's own lease, past its lifetime.
+        ///
+        /// Present under this token, naming this key, and outside the timeout. The
+        /// one unambiguous outcome of the three: whatever the client was doing, it
+        /// held the lease longer than the fleet's bound allows, which is exactly the
+        /// evidence a site needs before it can argue that bound is too short. Nothing
+        /// else reaches here -- a second release found no entry, and another
+        /// instance's token names another key.
+        Expired,
+
+        /// No entry under this token.
+        ///
+        /// Four causes share it, which is why it is not counted: an ordinary second
+        /// release of one token (the first erased the entry), a token from a
+        /// scheduler instance that no longer exists whose number this one has not yet
+        /// reissued, a number that was never issued at all -- on a fleet with no
+        /// cluster key, where the token is the bare serial -- and a lease
+        /// `ReleaseWorker` reclaimed out from under a client that was still
+        /// compiling.
+        ///
+        /// **That last one is live today and is the reason this row must stay
+        /// uncounted even if the others were somehow separated.** `ExpireStale` drops
+        /// a worker that has stopped heartbeating and reclaims what was held against
+        /// it, so its client resolves a token naming a lease nobody has any more --
+        /// through no fault of its timing. Counting it beside `Expired` would move a
+        /// number an operator reads as *the lease bound is too short* in exactly the
+        /// direction that claim points, for an event that says nothing of the kind.
+        /// It cannot happen by construction rather than by anyone remembering:
+        /// `ReleaseWorker` ERASES the entry, and `Expired` is reachable only for one
+        /// still present and naming this key.
+        UnknownToken,
+
+        /// An entry under this token, naming another key.
+        ///
+        /// `_nextToken` restarts at one with the process while tokens outlive it, so
+        /// the reachable cause is a client holding a number from a previous instance
+        /// that this one has since reissued for different work. A client naming the
+        /// wrong key for its own token reaches here too. Refusing rather than
+        /// resolving is what stops the release freeing somebody else's live lease.
+        KeyMismatch,
+
+        Last, ///< Not a refusal, and has no row: the length of a table keyed by one.
+    };
+
     /// Take a lease on `key` for `workerId`, unless one is already outstanding.
     /// @param key The object key about to be compiled.
     /// @param workerId The worker the job will go to.
@@ -160,11 +230,20 @@ class LeaseTable
     /// operator about, since it means `leaseTimeout` is shorter than their slowest
     /// translation unit. The entry is dropped either way; nothing else ever visits
     /// an expired token but an `Acquire` for the same key.
+    ///
+    /// **Which of the three it was is part of the answer**, and it did not used to
+    /// be. This returned a bare `nullopt` for all three, so the sentence above --
+    /// naming one of them as the condition worth reporting -- described something no
+    /// caller could act on, and the scheduler above duly left every release refusal
+    /// uncounted (#1074). An outcome that has several causes is an enum rather than
+    /// an empty optional, which is the same rule `NoUpstream` was fixed under: a
+    /// `bool` that has to carry *not attempted* alongside *failed* reports one as
+    /// the other.
     /// @param token The token.
     /// @param key The object key the caller believes it holds that token on.
-    /// @return The lease that was released, or nullopt when it named another key,
-    ///         had expired, or was already gone.
-    [[nodiscard]] std::optional<Lease> Release(std::string_view token, std::string_view key);
+    /// @return The lease that was released, or which of the three ways it resolved
+    ///         nothing.
+    [[nodiscard]] std::expected<Lease, ReleaseRefusal> Release(std::string_view token, std::string_view key);
 
     /// Release every lease held against a worker.
     ///

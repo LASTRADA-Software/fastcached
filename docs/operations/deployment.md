@@ -499,6 +499,7 @@ is where they are explained one by one.
 | `fastcached_dispatch_leases_duplicate_total` | Duplicate-work suppression is doing its job. |
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job and the keys it was building were freed. |
 | `fastcached_dispatch_leases_unauthorized_total` | A lease token this cluster never signed was handed back. |
+| `fastcached_dispatch_leases_released_late_total` | A compile outran the lease timeout and reported back too late. Read as a fraction of `released_total`; a steady fraction means the lease bound is too short for this site's slowest translation unit. |
 | `fastcached_dispatch_worker_registrations_total` | Workers registering. A steady rise means heartbeats are not arriving. |
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. |
 | `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was admitted while advertising an endpoint whose host is not the address it connected from. |

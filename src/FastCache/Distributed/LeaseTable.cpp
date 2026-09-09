@@ -72,12 +72,12 @@ void LeaseTable::Forget(std::unordered_map<std::string, Entry>::iterator entry)
     _byToken.erase(entry);
 }
 
-std::optional<Lease> LeaseTable::Release(std::string_view token, std::string_view key)
+std::expected<Lease, LeaseTable::ReleaseRefusal> LeaseTable::Release(std::string_view token, std::string_view key)
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _byToken.find(std::string { token });
     if (it == _byToken.end())
-        return std::nullopt;
+        return std::unexpected { ReleaseRefusal::UnknownToken };
 
     // A token that names a different key is not this caller's, so nothing is
     // resolved AND nothing is erased -- erasing would free the lease of whoever
@@ -85,7 +85,7 @@ std::optional<Lease> LeaseTable::Release(std::string_view token, std::string_vie
     // restarted: `_nextToken` began again at one, and a client still holding `l3`
     // from the previous instance is describing a lease that no longer exists.
     if (it->second.lease.key != key)
-        return std::nullopt;
+        return std::unexpected { ReleaseRefusal::KeyMismatch };
 
     // Liveness, not mere presence -- the same rule `Find` and `IsInFlight` follow,
     // and it is what makes a refusal here mean something. An expired token belongs
@@ -99,7 +99,12 @@ std::optional<Lease> LeaseTable::Release(std::string_view token, std::string_vie
     // `Acquire` for the same key, so answering without erasing would leave one
     // entry in each map for every lease a client reported late.
     Forget(it);
-    return live ? std::optional { std::move(lease) } : std::nullopt;
+    if (!live)
+        return std::unexpected { ReleaseRefusal::Expired };
+    // No `std::move`: the return type differs from `lease`, so C++20's extended
+    // implicit-move rules already treat it as an rvalue here, and spelling the move
+    // is `-Werror=redundant-move` on GCC.
+    return lease;
 }
 
 std::size_t LeaseTable::ReleaseWorker(std::string_view workerId)

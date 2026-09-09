@@ -680,9 +680,13 @@ TEST_CASE("A lease that is already gone is refused, not waved through", "[distri
     CHECK(again.error == Wire::ErrorCode::UnknownLease);
     CHECK(fleet.service.Release(Insider, "no-such-token", "key-1").error == Wire::ErrorCode::UnknownLease);
 
-    // Uncounted by design: it is a statement about one client's timing, not about
-    // the capacity an operator sizes a fleet from.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 1);
+
+    // Both of these stay uncounted, and that is a decision rather than an omission:
+    // each has several causes, so a rise in either would name no one condition. Only
+    // the expired case earns a counter, and the case that pins the difference is
+    // "Only a job that outlived its lease moves the late-release counter" (#1074).
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleasedLate) == 0);
 }
 
 TEST_CASE("A machine that goes away takes its leases with it", "[distributed][scheduler]")
@@ -772,8 +776,8 @@ TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]"
     // cannot reach: nothing re-leased this key, so the entry is still sitting in the
     // lease table when its holder finally reports -- presence rather than liveness.
     // Answering `Ok` would leave a fleet whose lease timeout is shorter than its
-    // slowest translation unit with no diagnostic anywhere, which is the shape of
-    // silence this whole issue was.
+    // slowest translation unit with nothing to say so, which is the shape of silence
+    // this whole issue was.
     Leading fleet;
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const slow = fleet.service.Lease(Insider, Ask("gcc-14", "slow-key"));
@@ -782,6 +786,131 @@ TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]"
     fleet.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
 
     CHECK(fleet.service.Release(Insider, TokenOf(slow), "slow-key").error == Wire::ErrorCode::UnknownLease);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
+
+    // Telling the CLIENT was the whole of the answer until #1074; the operator now
+    // has it too, which is what makes the condition observable across a fleet rather
+    // than in one build's stderr. Asserted here as well as in the discrimination
+    // case, because this is the case whose name claims the condition is reported.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleasedLate) == 1);
+}
+
+TEST_CASE("Only a job that outlived its lease moves the late-release counter", "[distributed][scheduler][lease]")
+{
+    // The arrangement IS the case. All three of these answer `UnknownLease` -- and
+    // must, since telling them apart on the wire would be a change every deployed
+    // launcher has to understand -- so a section per arm asserting the wire code
+    // passes on a build that counts all three, one that counts none, and one that
+    // counts the wrong one. The counter is the only thing that differs, so all three
+    // readings are taken and compared here rather than each being checked where it
+    // is expected to rise.
+    //
+    // Counting all three is the tempting fix and is the one that makes the series
+    // useless: a second release is ordinary client behaviour and a reissued token is
+    // what an ordinary restart looks like, so either would bury the one signal a
+    // site can act on under traffic that means nothing (#1074).
+
+    // (1) The client came back, and was too late. The only one of the three with a
+    // single cause, and the only evidence a site has that its lease bound is
+    // shorter than its slowest translation unit.
+    Leading outlived;
+    REQUIRE(outlived.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const slow = outlived.service.Lease(Insider, Ask("gcc-14", "slow-key"));
+    REQUIRE(slow.status == Wire::Status::Ok);
+    outlived.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
+    auto const late = outlived.service.Release(Insider, TokenOf(slow), "slow-key");
+
+    // (2) A second release of one token. The first erased the entry, so this one
+    // finds nothing -- ordinary, and nothing an operator would act on.
+    Leading twice;
+    REQUIRE(twice.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const once = twice.service.Lease(Insider, Ask("gcc-14", "key-1"));
+    REQUIRE(once.status == Wire::Status::Ok);
+    REQUIRE(twice.service.Release(Insider, TokenOf(once), "key-1").status == Wire::Status::Ok);
+    auto const repeated = twice.service.Release(Insider, TokenOf(once), "key-1");
+
+    // (3) A token minted by an instance that no longer exists, whose number this one
+    // has since reissued for other work. Two schedulers is exactly that: `_nextToken`
+    // starts again at one in every freshly constructed table.
+    Leading before;
+    REQUIRE(before.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const stale = TokenOf(before.service.Lease(Insider, Ask("gcc-14", "old-key")));
+    Leading restarted;
+    REQUIRE(restarted.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const reissuedGrant = restarted.service.Lease(Insider, Ask("gcc-14", "new-key"));
+    REQUIRE(reissuedGrant.status == Wire::Status::Ok);
+    REQUIRE(TokenOf(reissuedGrant) == stale); // the collision this depends on, spelled out
+    auto const reissued = restarted.service.Release(Insider, stale, "old-key");
+
+    // No client learns more than it does today: one code, all three.
+    CHECK(late.error == Wire::ErrorCode::UnknownLease);
+    CHECK(repeated.error == Wire::ErrorCode::UnknownLease);
+    CHECK(reissued.error == Wire::ErrorCode::UnknownLease);
+
+    // And the operator learns which. One counter, three readings, and the two zeroes
+    // are the half of this that a build counting everything would fail.
+    constexpr auto Late = IMetricsSink::Counter::DispatchLeasesReleasedLate;
+    CHECK(outlived.metrics.Read(Late) == 1);
+    CHECK(twice.metrics.Read(Late) == 0);
+    CHECK(restarted.metrics.Read(Late) == 0);
+
+    // None of the three is a completed release, or the ratio an operator reads this
+    // counter as -- late against released -- would be measured against a total that
+    // already includes the late ones.
+    constexpr auto Released = IMetricsSink::Counter::DispatchLeasesReleased;
+    CHECK(outlived.metrics.Read(Released) == 0);
+    CHECK(twice.metrics.Read(Released) == 1); // the first, legitimate release only
+    CHECK(restarted.metrics.Read(Released) == 0);
+}
+
+TEST_CASE("A lease reclaimed with its worker is not counted as a job that outlived it", "[distributed][scheduler][lease]")
+{
+    // A FOURTH cause behind `UnknownLease`, and it is live today rather than
+    // hypothetical: `ExpireStale` calls `LeaseTable::ReleaseWorker` when a machine
+    // stops heartbeating, so a client still compiling against that worker resolves
+    // its token afterwards and finds nothing. #573 adds a second and DELIBERATE
+    // route to the same state -- a worker withdrawing a toolchain it is still
+    // running work for -- so this case pins the property that change must preserve,
+    // before the change exists.
+    //
+    // It must not reach `DispatchLeasesReleasedLate`. That counter is read as "the
+    // lease bound is shorter than this site's slowest translation unit", and a
+    // reclaim is the fleet doing something deliberate; counted together it moves the
+    // number in the direction that says the bound is too short, for an event that
+    // says nothing of the kind. A confident wrong signal, which is worse than a
+    // vague right one.
+    //
+    // Safe by CONSTRUCTION rather than by a rule somebody remembers: `ReleaseWorker`
+    // erases the entry, and `Expired` is reachable only for one still present and
+    // naming this key. The arrangement is what proves that is load-bearing -- the
+    // clock stops WELL INSIDE the lease's own lifetime, so a build answering
+    // `Expired` here would be answering about a lease that had not expired, and the
+    // case would fail rather than pass for the wrong reason.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "in-progress"));
+    REQUIRE(granted.status == Wire::Status::Ok);
+
+    // Past the heartbeat timeout and well inside the lease's own, so the lease is
+    // still live at the moment its worker is dropped.
+    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
+
+    // A replacement machine, and then a request for UNRELATED work: the reap runs
+    // on a `Lease`, not on a registration, and that is what drops the dead worker
+    // and reclaims what was held against it. Unrelated deliberately -- re-leasing
+    // the same key would free it as a side effect and leave the case unable to say
+    // which mechanism did the work.
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "unrelated")).status == Wire::Status::Ok);
+    REQUIRE(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 1);
+
+    // The client knows none of this and reports its job done, as it must on every
+    // path out of a compile.
+    auto const late = fleet.service.Release(Insider, TokenOf(granted), "in-progress");
+
+    CHECK(late.error == Wire::ErrorCode::UnknownLease);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleasedLate) == 0);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
 }
 

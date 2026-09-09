@@ -83,7 +83,7 @@ TEST_CASE("Releasing a lease frees its key for the next client", "[distributed][
 
     auto const released = fix.leases.Release(Unwrap(lease).token, "objkey-1");
     REQUIRE(released.has_value());
-    CHECK(Unwrap(released).key == "objkey-1");
+    CHECK(released->key == "objkey-1");
     CHECK(fix.leases.LiveLeases(0).total == 0);
     CHECK(fix.leases.Acquire("objkey-1", "w2").has_value());
 }
@@ -92,6 +92,62 @@ TEST_CASE("Releasing an unknown token is a no-op, not a crash", "[distributed][l
 {
     Fixture fix;
     CHECK_FALSE(fix.leases.Release("nope", "objkey-1").has_value());
+}
+
+TEST_CASE("The three ways a release resolves nothing are told apart", "[distributed][lease]")
+{
+    // Asserted against EACH OTHER in one case rather than one section per arm, which
+    // is the whole point: all three used to be one `nullopt`, so every per-arm
+    // assertion available at the time passed on a table that could not tell them
+    // apart -- and the scheduler above, having nothing to distinguish, duly counted
+    // none of them and left a fleet unable to observe the one condition this file
+    // already documented as worth reporting (#1074).
+    //
+    // Three refusals in one fixture, in an order that keeps each arrangement honest:
+    // the key mismatch is taken while its lease is still LIVE, so it is answering
+    // about the key rather than about expiry -- `Release` checks the key first, so a
+    // mismatched release of an already-expired token would pass this case while
+    // proving nothing about which check fired.
+    Fixture fix;
+
+    auto const mine = fix.leases.Acquire("objkey-1", "w1");
+    REQUIRE(mine.has_value());
+    auto const other = fix.leases.Acquire("objkey-2", "w1");
+    REQUIRE(other.has_value());
+
+    // Never issued: no entry under that token at all. What a second release of one
+    // token also looks like, the first having erased the entry.
+    auto const unknown = fix.leases.Release("no-such-token", "objkey-1");
+
+    // Issued, live, and naming somebody else's key -- what a token minted by a
+    // previous instance looks like once this one has reissued its number.
+    auto const mismatched = fix.leases.Release(Unwrap(mine).token, "objkey-2");
+
+    // Resolved nothing WITHOUT erasing, or the refusal would have freed the live
+    // lease whose number it collided with, letting a third client dispatch work
+    // somebody is already doing. Asked here rather than at the end of the case,
+    // because the clock advance below expires this lease too and the question stops
+    // meaning anything the moment it does.
+    CHECK_FALSE(fix.leases.Acquire("objkey-1", "w2").has_value());
+
+    // Issued, this caller's own key, and past its lifetime: the job outlived it.
+    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    auto const expired = fix.leases.Release(Unwrap(other).token, "objkey-2");
+
+    REQUIRE_FALSE(unknown.has_value());
+    REQUIRE_FALSE(mismatched.has_value());
+    REQUIRE_FALSE(expired.has_value());
+
+    CHECK(unknown.error() == LeaseTable::ReleaseRefusal::UnknownToken);
+    CHECK(mismatched.error() == LeaseTable::ReleaseRefusal::KeyMismatch);
+    CHECK(expired.error() == LeaseTable::ReleaseRefusal::Expired);
+
+    // The discrimination itself. Each assertion above names one enumerator and would
+    // go on passing if two of the three collapsed into it; only comparing them
+    // rejects a table that answers any pair identically.
+    CHECK(unknown.error() != mismatched.error());
+    CHECK(mismatched.error() != expired.error());
+    CHECK(unknown.error() != expired.error());
 }
 
 TEST_CASE("An abandoned lease expires and the key becomes leasable again", "[distributed][lease]")

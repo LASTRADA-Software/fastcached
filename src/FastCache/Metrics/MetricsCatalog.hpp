@@ -149,6 +149,15 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "Never sum with unknown-lease refusals: those name a lease this "
               "scheduler issued and has forgotten, this one was never issued.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchLeasesReleasedLate,
+      .prometheusName = "fastcached_dispatch_leases_released_late_total",
+      .help = "Releases that arrived after their own lease had expired: a real "
+              "compile outran the lease timeout. Not a count of leases that "
+              "expired, since a client that never reports back reaches this "
+              "nowhere. Read as a fraction of released_total; a steady fraction "
+              "means the lease bound is shorter than this site's slowest "
+              "translation unit.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchFramesRefusedUnsupportedVersion,
       .prometheusName = "fastcached_dispatch_frames_refused_unsupported_version_total",
       .help = "Frames refused at the fleet scheduler's port for naming a protocol "

@@ -145,10 +145,40 @@ class IMetricsSink
         /// The scheduler's own half of `WorkerJobsRefusedLeaseUnauthorized`, and its
         /// own counter for the same reason the worker's refusals are split: this one
         /// is about **who** asked, not about what the fleet could do. Deliberately
-        /// not folded into the uncounted `UnknownLease` refusal beside it, which is
-        /// a statement about one client's timing -- a token this cluster issued and
-        /// has since forgotten. This one was never issued at all.
+        /// not folded into the `UnknownLease` refusals beside it, which name a token
+        /// this cluster issued and has since forgotten. This one was never issued at
+        /// all.
+        ///
+        /// Those refusals are no longer uncounted, and this sentence used to say they
+        /// were: one of the three now moves `DispatchLeasesReleasedLate` (#1074). The
+        /// split above is unaffected -- it was never about whether the neighbour
+        /// counted, but about who is being described -- and summing the two is still
+        /// wrong.
         DispatchLeasesUnauthorized,
+        /// Releases that arrived after their own lease had already expired.
+        ///
+        /// **The fleet's only evidence that its lease bound is shorter than its
+        /// slowest translation unit**, and the reason this counter exists at all: the
+        /// release path answered all three of its refusals with one wire code and no
+        /// counter, on the stated grounds that it is "a statement about one client's
+        /// timing, not about the fleet's capacity". That is right about capacity and
+        /// beside the point about fit -- and fit is what nothing else here can
+        /// observe, so a site asking whether `DefaultCompileLeaseTimeout` suits its
+        /// build had no instrument to ask with (#1074).
+        ///
+        /// **Not a count of leases that expired.** One that is never reported at all
+        /// -- the client died, which is the ordinary reason a lease lapses -- reaches
+        /// nothing here; `DispatchLeasesReclaimed` is the nearest thing to that, and
+        /// it answers a different question again. This counts a client that *did*
+        /// come back and was too late, which is the only shape that says a real
+        /// compile ran longer than the bound. Read it as a ratio against
+        /// `DispatchLeasesReleased`: a fleet where it is a steady fraction of
+        /// releases has a bound that does not fit its work.
+        ///
+        /// Its two siblings on that path stay uncounted, and deliberately: each has
+        /// several causes, so a rise in either would name no one condition. See
+        /// `LeaseTable::ReleaseRefusal`, which carries the enumeration.
+        DispatchLeasesReleasedLate,
 
         /// Frames refused at the FLEET SCHEDULER's port for naming a protocol version
         /// this build does not serve.

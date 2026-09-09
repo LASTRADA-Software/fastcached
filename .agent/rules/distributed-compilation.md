@@ -1121,6 +1121,55 @@ Consequences that are each load-bearing:
   either way, through the one helper `Release` and `ReleaseWorker` share: the key
   index is erased only when it still points at *this* token, and two copies of that
   guard is how one of them comes to evict the client that replaced the lease.
+- **And a resolve that answers nothing says WHICH nothing.** `Release` had three ways
+  of resolving nothing and returned one `nullopt` for all of them, so the scheduler
+  answered one `UnknownLease` and counted none — leaving the condition the bullet
+  above calls *the one worth naming* observable to a single client's stderr and to no
+  fleet anywhere (#1074). The stated reason was that it is a statement about one
+  client's timing rather than about the fleet's capacity, which is **right about
+  capacity and beside the point about fit**: fit is what nothing else can measure, and
+  #522 cannot choose a lease lever without it. One code — telling a client apart here
+  is a wire change every deployed launcher must understand — and three rows.
+  - The counter is keyed on the **outcome**, never the code. Second instance of
+    *the row is the REFUSAL, not the code*, now at the scheduler rather than the
+    worker: `RefusalTable` maps code→counter and provably cannot hold three refusals
+    sharing `UnknownLease`. `ReleaseRefusalsCountOnce` is what stops the row's counter
+    and the code-keyed lookup both firing, because that safety was otherwise a
+    coincidence of `UnknownLease` not appearing in the other table.
+  - **Only ONE of the three is counted, and counting all three is the tempting fix
+    that makes the series useless.** A second release is ordinary client behaviour and
+    a reissued token is what an ordinary restart looks like; either would bury the one
+    signal a site can act on. The two that stay uncounted carry their reason at the
+    row, or *forgot* is spelled in the vocabulary of *decided*.
+  - **A lease RECLAIMED from a live client lands in `UnknownToken`, and must.**
+    `ReapExpiredWorkers` drops a machine that stopped heartbeating and calls
+    `ReleaseWorker`, so a client still compiling resolves a token naming a lease
+    nobody holds — through no fault of its own timing. #573's `Withdraw` adds a
+    second and DELIBERATE route to the same state. Counted beside `Expired` it moves
+    a number an operator reads as *your lease bound is too short* in exactly the
+    direction that claim points, for an event that says nothing about the bound.
+    It cannot happen by construction rather than by anyone remembering — `ReleaseWorker`
+    ERASES the entry and `Expired` needs one still present and naming this key — and
+    `A lease reclaimed with its worker is not counted as a job that outlived it` pins
+    that, with the clock stopped WELL INSIDE the lease's own lifetime so a build
+    answering `Expired` there is answering about a lease that had not expired. It is
+    the fourth cause behind one code, and the ticket that split the first three
+    believed there were only three: **the causes are not enumerable from the outcomes,
+    which is the whole argument for naming outcomes after observations.**
+  - **The enumerators name what was OBSERVED, and the map from observation to cause
+    is many-to-many** — which is why they cannot name causes. A token from a scheduler
+    instance that no longer exists arrives as `UnknownToken` when this instance has not
+    yet reissued its number and as `KeyMismatch` when it has, so an enumerator called
+    `SchedulerRestarted` would be a claim the table cannot make. The ticket itself
+    assumed a clean 1:1 split of three causes onto three outcomes; it is not one, and
+    only `Expired` has a single cause — which is exactly why it is the only one worth
+    counting. Same lesson as `KnownSchedulerTerm` adopting a lower term rather than
+    calling it a reset: report the observation, name the causes beside it.
+  - Acceptance is a **discrimination** case, not one section per arm: all three answer
+    the same wire code, so per-arm sections pass on a build that counts all three,
+    none, or the wrong one. Assert the three counter readings against each other, and
+    show the counter **not** moving for the two — a test that only checks it rises is
+    green on a build that counts everything.
 - **A refusal is only ever as good as what the table it consults can SAY.**
   `RemoteCompileArgs` refused any command line naming the input language, on sound
   reasoning: the launcher appends "this text is preprocessed <language>" LAST so it

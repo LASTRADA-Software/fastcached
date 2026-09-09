@@ -385,6 +385,20 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `UnknownLease` — that is the scheduler's code.
 - A resolve answers on liveness, not presence — an unknown token is refused, because
   that is the only place "this job outlived its lease" can be observed.
+- And it says WHICH nothing it resolved. `Release` returned one `nullopt` for three
+  outcomes, so one `UnknownLease` was answered and none was counted — the condition
+  the line above calls the one worth naming, visible to a single client and to no
+  fleet (#1074). One wire code, three rows, keyed on the OUTCOME because a code-keyed
+  table cannot hold three refusals sharing a code. Only `Expired` is counted: the
+  other two have several causes each, so counting them buries the one signal a site
+  can act on — and the enumerators name what was OBSERVED, since a token from a dead
+  scheduler instance arrives as *unknown* or as *key mismatch* depending only on
+  whether its number was reissued. A lease RECLAIMED from a live client — a worker
+  dropped mid-compile, and #573's `Withdraw` next — is a fourth cause behind that one
+  code, safe only because `ReleaseWorker` erases the entry and `Expired` needs one
+  present; counted, it would claim a bound is too short for an event that says nothing
+  about the bound. Acceptance is a discrimination case; per-arm sections all pass when
+  all three answer alike.
 - A lease token is a credential, and its MAC covers the granted **endpoint** or it is
   a credential for every worker that trusts the key. Fields length-prefixed, never
   joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
