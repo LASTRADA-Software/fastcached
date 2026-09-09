@@ -223,6 +223,59 @@ endif()
 # -Werror -Wconversion is not our problem to fix.
 
 set(CPM_USE_LOCAL_PACKAGES ON CACHE BOOL "Prefer system-installed packages over CPM downloads")
+
+# Share fetched dependency SOURCES across build trees, per machine (#545).
+#
+# Without this every fresh build tree re-clones Catch2, yaml-cpp, zstd and lz4 -- and
+# this project is worked in throwaway git worktrees, so that is not a once-per-machine
+# cost, it is once per branch. MEASURED on this tree, native NTFS via Git Bash, Windows
+# 11, CMake 4.3.1, cold build tree each time:
+#
+#     no cache          45 s, 118 MB fetched into <build>/_deps
+#     populated cache   24 s
+#
+# 21 s and 118 MB per fresh worktree, and worse where the ticket found it: over DrvFs
+# (a WSL build against /mnt) the same fetch is slow enough to read as a hang, which is
+# what makes it worth defaulting rather than documenting.
+#
+# ONLY when nothing has said otherwise. An explicit `-DCPM_SOURCE_CACHE=`, a cache entry
+# from an earlier configure, and the environment variable CI sets all win -- CI points
+# it inside the workspace on purpose, so that its own cache action can save and restore
+# it, and silently relocating that would be a cache that stops restoring with nothing to
+# say so.
+#
+# It degrades to TODAY's behaviour rather than failing: if no home directory can be
+# determined the variable is left unset and every fetch goes into the build tree exactly
+# as before. A dependency cache is an optimisation, and an optimisation that can refuse
+# to configure is a worse trade than the fetch it saves.
+if(NOT DEFINED CPM_SOURCE_CACHE AND NOT DEFINED ENV{CPM_SOURCE_CACHE})
+    set(_fastcachedCpmHome "")
+    if(DEFINED ENV{FASTCACHED_CPM_CACHE})
+        # The escape hatch, named rather than implied: a machine that wants the cache
+        # somewhere else (a different volume, a RAM disk) says so without having to set
+        # CPM_SOURCE_CACHE on every invocation.
+        set(_fastcachedCpmHome "$ENV{FASTCACHED_CPM_CACHE}")
+    elseif(WIN32 AND DEFINED ENV{LOCALAPPDATA})
+        set(_fastcachedCpmHome "$ENV{LOCALAPPDATA}/fastcached/cpm")
+    elseif(DEFINED ENV{XDG_CACHE_HOME})
+        set(_fastcachedCpmHome "$ENV{XDG_CACHE_HOME}/fastcached/cpm")
+    elseif(DEFINED ENV{HOME})
+        set(_fastcachedCpmHome "$ENV{HOME}/.cache/fastcached/cpm")
+    endif()
+    if(NOT _fastcachedCpmHome STREQUAL "")
+        # `file(TO_CMAKE_PATH)` because `%LOCALAPPDATA%` arrives with backslashes, and
+        # CPM splices this into paths it later quotes.
+        file(TO_CMAKE_PATH "${_fastcachedCpmHome}" _fastcachedCpmHome)
+        set(CPM_SOURCE_CACHE "${_fastcachedCpmHome}" CACHE PATH
+            "Shared source cache for CPM dependencies (#545)")
+        message(STATUS "[CPM] sharing dependency sources via ${CPM_SOURCE_CACHE}")
+    else()
+        message(STATUS
+            "[CPM] no home directory found, so dependency sources are fetched into this "
+            "build tree as before; set FASTCACHED_CPM_CACHE to share them")
+    endif()
+endif()
+
 include(cmake/CPM.cmake)
 
 # yaml-cpp 0.8.0 declares cmake_minimum_required(VERSION 3.4) which CMake 4.x
