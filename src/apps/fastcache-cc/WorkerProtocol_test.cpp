@@ -1722,6 +1722,51 @@ TEST_CASE("A heartbeat refused NotLeader keeps its worker id", "[cc][registrar][
     CHECK(registrar.WorkerId() == "w-1");
 }
 
+TEST_CASE("A withdrawal an older scheduler cannot answer is survivable", "[cc][registrar]")
+{
+    // The compatibility direction of #573, and the one that decides whether the verb
+    // is safe to add at all. A scheduler that predates `Op::Withdraw` has no row for
+    // the byte and answers `UnknownOpcode` -- which is the CORRECT signal, saying this
+    // daemon is too old rather than that the request was wrong.
+    //
+    // What must follow is that the worker steps over it. Treating an unimplemented
+    // verb as fatal is #283 and #340, where a launcher read one as terminal and took a
+    // permanent 0% hit rate. Here the fallback is the behaviour that existed before
+    // this verb: the entry stops being heartbeated and expires on its own.
+    //
+    // **The id is NOT cleared, and that is what distinguishes this from a heartbeat.**
+    // `Heartbeat`'s `UnknownLease` arm clears it precisely so the retry re-registers;
+    // a withdrawal has nothing to retry, and clearing here would only lose the
+    // diagnostic naming which registration failed to retire.
+    auto registrar = MakeRegistrar();
+    Testing::ScriptedSocket scheduler { Testing::Replies(
+        { RegisterOk("w-1"), Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, {}) }) };
+
+    REQUIRE(registrar.Register(scheduler).has_value());
+    REQUIRE(registrar.WorkerId() == "w-1");
+
+    auto const retired = registrar.Withdraw(scheduler);
+    REQUIRE_FALSE(retired.has_value());
+    CHECK_FALSE(retired.error().leader.has_value());
+    CHECK(registrar.WorkerId() == "w-1");
+}
+
+TEST_CASE("A registrar that never registered has nothing to withdraw", "[cc][registrar]")
+{
+    // Named rather than silent, and asserted because the caller filters on it: only a
+    // registrar the scheduler actually accepted is moved onto the withdrawal list, so
+    // this arm is what makes that filter's other side reachable at all.
+    auto registrar = MakeRegistrar();
+    Testing::ScriptedSocket scheduler { Testing::Replies({}) };
+
+    auto const retired = registrar.Withdraw(scheduler);
+    REQUIRE_FALSE(retired.has_value());
+    CHECK(retired.error().reason == "not registered");
+    // Nothing was sent: a worker with no id has no id to name, so the verb never
+    // reaches the wire rather than reaching it with an empty field.
+    CHECK(scheduler.Sent().empty());
+}
+
 TEST_CASE("A heartbeat refused UnknownLease forgets its worker id and names no leader", "[cc][registrar][notleader]")
 {
     auto registrar = MakeRegistrar();

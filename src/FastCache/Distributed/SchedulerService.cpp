@@ -573,6 +573,42 @@ SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,
     return SchedulerReply::Success();
 }
 
+SchedulerReply SchedulerService::Withdraw(CallerContext const& caller, std::string_view workerId)
+{
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    // **An unknown id is `Ok`, and this is where it diverges from `Heartbeat` on
+    // purpose.** That one refuses `UnknownLease` in order to PROVOKE re-registration,
+    // which is the opposite of what a withdrawal wants: the end state the caller is
+    // asking for -- this registration is gone -- is already true. A worker that lost
+    // the race to its own expiry, or that is talking to a scheduler which has
+    // restarted, has succeeded rather than failed, and refusing it would have a node
+    // log a refusal for getting what it asked for. It also keeps the reply set at
+    // `Ok | Error`, which is what leaves `MinSupportedVersion` where it is.
+    if (!_workers.Remove(workerId))
+        return SchedulerReply::Success();
+
+    // Two locks one after the other rather than one spanning both, for
+    // `ReapExpiredWorkers`' reason, and the follow-up is not optional: a worker being
+    // dropped is an EVENT, or nothing releases what was held against it. Reached
+    // deliberately here instead of by timeout, but the obligation is identical.
+    //
+    // **A client mid-compile under one of these leases will resolve its token on the
+    // way out and meet `UnknownLease`.** That is a fourth cause for that code, and it
+    // is NOT the operator-actionable "this job outlived its lease" timing signal --
+    // nothing here says the lease bound is too short. Whatever splits those causes
+    // must not fold this one in with them
+    // ([#1074](https://github.com/LASTRADA-Software/fastcached/issues/1074)).
+    auto const reclaimed = _leases.ReleaseWorker(workerId);
+
+    _metrics.Increment(IMetricsSink::Counter::DispatchWorkersWithdrawn);
+    if (reclaimed != 0)
+        _metrics.Increment(IMetricsSink::Counter::DispatchLeasesReclaimed, static_cast<std::uint64_t>(reclaimed));
+
+    return SchedulerReply::Success();
+}
+
 void SchedulerService::ReapExpiredWorkers()
 {
     // Two locks, taken one after the other rather than one spanning both, and the

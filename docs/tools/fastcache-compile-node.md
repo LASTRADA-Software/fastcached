@@ -317,8 +317,9 @@ hand is how you force a fleet to agree while a machine is being repaired. And a
 machine whose only compiler an upgrade removed or broke keeps running while serving
 nothing, rather than exiting — the compiler may come back with the next package, and
 a routine upgrade must not be able to take a machine out of the fleet permanently.
-It says so, its registry entries expire on their own within 90 seconds, and the
-next sweep is what brings it back:
+It says so, it retires its registry entries at once so the scheduler stops picking
+it rather than dispatching for up to 90 seconds to a worker that would refuse every
+job, and the next sweep is what brings it back:
 
 ```
 [WARN] this machine now has no usable toolchain; serving nothing until one returns

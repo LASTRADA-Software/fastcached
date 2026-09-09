@@ -945,11 +945,37 @@ TEST_CASE("A LEASE grant and a COMPILE result round-trip")
     }
 }
 
+TEST_CASE("A WITHDRAW round-trips, and its byte is pinned")
+{
+    // The value as well as the name. A symbol both ends spell can only test the first,
+    // and this end is the only one that can be recompiled: a launcher or node already
+    // deployed tolerates `0x0D` and nobody here can rebuild it, so moving the
+    // enumerator consistently would leave every in-tree test agreeing while every
+    // deployed peer broke.
+    CHECK(static_cast<std::uint8_t>(Op::Withdraw) == 0x0D);
+
+    auto const frame = EncodeWithdraw("w-1");
+    auto const header = DecodeRequestHeader(std::span<std::byte const> { frame }.first(RequestHeaderSize));
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Op::Withdraw));
+
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    CHECK(payload.size() == Unwrap(header).payloadLength);
+
+    auto const fields = DecodeWithdrawPayload(payload);
+    REQUIRE(fields.has_value());
+    CHECK(AsStringView(Unwrap(fields).workerId) == "w-1");
+
+    // One field exactly. An empty payload cannot carry the id this verb IS, and is
+    // refused rather than read as a withdrawal naming nothing.
+    CHECK_FALSE(DecodeWithdrawPayload(std::span<std::byte const> {}).has_value());
+}
+
 TEST_CASE("No distributed verb is reachable before authentication")
 {
     // Causing a compiler to run on another machine is the last thing an
     // unauthenticated peer should reach.
-    for (auto const op: { Op::Register, Op::Heartbeat, Op::Lease, Op::Compile })
+    for (auto const op: { Op::Register, Op::Heartbeat, Op::Withdraw, Op::Lease, Op::Compile })
     {
         INFO("op 0x" << static_cast<unsigned>(op));
         CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(op)));
@@ -975,7 +1001,7 @@ TEST_CASE("Every verb states which family it belongs to")
     // surface makes rather than a fact about the verb.
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Auth)) == VerbFamily::Session);
 
-    for (auto const op: { Op::Register, Op::Heartbeat, Op::Lease, Op::Release })
+    for (auto const op: { Op::Register, Op::Heartbeat, Op::Withdraw, Op::Lease, Op::Release })
     {
         INFO("op 0x" << static_cast<unsigned>(op));
         CHECK(FamilyOf(static_cast<std::uint8_t>(op)) == VerbFamily::Scheduler);

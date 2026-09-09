@@ -273,6 +273,17 @@ std::vector<std::string> WorkerRegistry::ExpireStale()
     return dropped;
 }
 
+bool WorkerRegistry::Remove(std::string_view workerId)
+{
+    std::scoped_lock const guard { _mutex };
+    // Erased whether or not `IsLive` would still say yes. A worker that withdraws a
+    // registration it has already let go stale is asking for the same end state, and
+    // leaving the entry to a later `ExpireStale` would mean the caller released the
+    // leases held against it and the registry went on reporting it to `LiveWorkers`
+    // until its timeout -- two halves of one event, minutes apart.
+    return _workers.erase(std::string { workerId }) != 0;
+}
+
 std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
 {
     std::scoped_lock const guard { _mutex };

@@ -577,4 +577,26 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& schedul
     return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(ISocket& scheduler, Credential const& credential)
+{
+    if (_workerId.empty())
+        // Never registered, so there is nothing on the other end to retire. Named
+        // rather than silent for `Heartbeat`'s reason: a caller that cannot tell this
+        // from a refused withdrawal cannot report either.
+        return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
+
+    auto const frame = Wire::EncodeWithdraw(_workerId);
+    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    if (outcome.IsHit())
+        return {};
+
+    // No arm clears `_workerId` and no arm is fatal -- deliberately, and this is where
+    // the two differ from `Heartbeat`. There, `UnknownLease` means *register again*
+    // and clearing the id is what makes the retry work. Here every refusal, including
+    // an `UnknownOpcode` from a scheduler too old to know the verb, leaves the same
+    // fallback standing: the entry stops being heartbeated and expires on its own.
+    // A withdrawal is an optimisation over that, never a replacement for it.
+    return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
+}
+
 } // namespace FastCache::Cc

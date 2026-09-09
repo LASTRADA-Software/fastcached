@@ -137,6 +137,12 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "rising registration count is a fleet whose heartbeats are not "
               "arriving, not one that is growing.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::DispatchWorkersWithdrawn,
+      .prometheusName = "fastcached_dispatch_workers_withdrawn_total",
+      .help = "Registrations a worker retired deliberately. Distinct from the expiry "
+              "counter beside it: a withdrawal is a machine that re-surveyed and said "
+              "so, an expiry is one that stopped answering.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::DispatchLeasesReclaimed,
       .prometheusName = "fastcached_dispatch_leases_reclaimed_total",
       .help = "Leases freed because the worker holding them was dropped. Work "
