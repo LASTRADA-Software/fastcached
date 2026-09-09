@@ -594,9 +594,13 @@ REQ
     # The baseline. Every negative case below is evidence only if this passes --
     # and it is not decoration: it is what caught the whole self-test running
     # nothing at all. See the note on `bash "$0"` above.
-    # `bash "$0"` and never a bare `"$0"`. This file is mode 644 in git -- ctest
-    # runs it as `bash <path>` and nothing here needs the executable bit -- so a
-    # bare `"$0"` exits **126, Permission denied**, having run no check at all.
+    # `bash "$0"` and never a bare `"$0"`. This file WAS mode 644, and that is no
+    # longer the reason: `ctest -R script-modes` requires every tracked shell
+    # script with a shebang to be 100755 (#720, corrected here by #1033), so the
+    # 126 below is history rather than a live hazard. The rule outlives it -- a
+    # call that fails to START fails for reasons a chmod does not cover. What
+    # happened, and what it costs, is why the interpreter is still named:
+    # a bare `"$0"` exited **126, Permission denied**, having run no check at all.
     # Every `want-fail` case then passes because the SHELL refused, not because
     # the rule fired: a self-test that is entirely green while testing nothing,
     # which is the exact defect this file exists to stop shipping. It was caught

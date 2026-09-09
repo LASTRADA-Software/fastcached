@@ -255,11 +255,13 @@ REQ
         done
     }
 
-    # `bash "$Decider"` rather than executing it: these scripts are mode 644 in
-    # git and ctest runs them as `bash <path>`. A bare exec exits 126 having run
-    # nothing, and every negative case then passes because the SHELL refused --
-    # measured, in this branch, where it made eight cases green while testing
-    # nothing.
+    # `bash "$Decider"` rather than executing it. The reason is no longer the
+    # mode -- `ctest -R script-modes` requires every tracked shell script with a
+    # shebang to be 100755 (#720; #1033 corrected this comment) -- but the rule
+    # stands on what a chmod never covered: a bare exec that fails to START, for
+    # ANY reason, runs nothing, and every negative case then passes because the
+    # SHELL refused. Measured in #723, where it made eight cases green while
+    # testing nothing.
     Decide() {
         FASTCACHED_REQUIRED_CONTEXTS_FILE="$required" \
             bash "$Decider" "$1" "https://example.invalid/run" "$2" ${3+"$3"} ${4+"$4"}

@@ -1307,9 +1307,16 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare
-  path**, which is this file's own #723 rule and is load-bearing here: the script is mode
-  **644 in git** (15 of 31 under `scripts/` are), so a bare invocation exits **126**, and a
-  reader who checks only *did the gate pass* reads that as a red branch. One configuration
+  path**, which is this file's own #723 rule. It used to be argued from the file MODE, and
+  that reason has gone false: `ctest -R script-modes` requires every tracked shell script
+  carrying a shebang to be `100755`, so the **126** this bullet used to cite cannot happen
+  here any more (#720 repaired the modes and added the guard; #1033 is this correction).
+  The count that stood here was wrong in both halves and is not replaced by a corrected
+  one — a restated figure is a second source of truth that drifts again, and the property
+  is enforced rather than remembered. **The rule outlives its dead reason**: a call that
+  fails to START fails for reasons a chmod does not cover, and inside a `want-fail`
+  assertion any of them is indistinguishable from the rule firing. Name the interpreter
+  regardless. One configuration
   is not the gate. A RED run
   stops at the first failing leg — correct, and it now NAMES the legs it skipped, because
   "GATE FAILED: clang-debug tests" alone read as "the rest passed" and two `-Werror`
@@ -1325,9 +1332,16 @@ what differs between compilers, standard libraries, hosts and tool versions.
   direction: four defects in four tickets were reachable only by the analyser or a
   sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
   them. A platform's leg answers a different question, not a weaker version of the same one.
-- **A retry makes an instrument's own failures disappear without fixing them.** Twelve ways
-  the gate reported on something other than the tree under test have turned up across five
-  tickets — `| tail` reporting the pipe's status, quoting collapsing through three parsers
+- **A retry makes an instrument's own failures disappear without fixing them.** The ways
+  the gate has reported on something other than the tree under test are enumerated below
+  and deliberately NOT tallied. This bullet used to open "Twelve ways … across five
+  tickets" while `.agent/rules/build-and-toolchain.md` opened "Eleven separate ways …
+  across four tickets" — two hand-kept numbers for one fact, and they had already drifted
+  apart (#1033). The rules file's figure is at least DERIVED, being the sum of the
+  per-ticket breakdown it states; this one was a bare number over a prose list, which
+  nothing can check and #780 watched drift three commits running. A number no check can
+  derive from the thing it counts is a second source of truth, so the list is the claim:
+  `| tail` reporting the pipe's status, quoting collapsing through three parsers
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
   `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
@@ -1347,7 +1361,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
   value check agreed with it. And a run that was KILLED mid-build is discarded rather than
   read — an unfinished run has told you nothing, which is not the same as telling you the
   tree is fine. None
-  announces itself; each looks like a flake; a re-run clears all twelve. **And a gate that
+  announces itself; each looks like a flake; a re-run clears every one of them. **And a gate that
   DIED partway writes no verdict at all** — two full gates ran concurrently on one host,
   swap went to 7G of 7G with no OOM kill logged, and one died mid-build with exit **144**.
   A nonzero exit from a KILLED gate is not a red tree, and 144 turned up twice that day in
@@ -1357,6 +1371,21 @@ what differs between compilers, standard libraries, hosts and tool versions.
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a
   finding fixed at the line rather than at the rule comes back.
+- **A red gate reads as "my branch is bad", never as "the gate is broken" — so a gate that
+  fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it.** This is not
+  another entry in the list above: every one of those is the gate reporting on the WRONG
+  TREE, and this is the gate refusing EVERY tree, at its first leg, with a confidently
+  worded false cause. #1031 shipped in the change that added the guard (#926) and stood for
+  two days — `run_preset` read `$dir`, which is `local` to `configure_reason` and unbound
+  there, and under `set -uo pipefail` with no `-e` the expansion killed only the
+  substitution's subshell, so the caller carried on with `""` and the `*)` arm reported
+  *"the resolved C++ compiler IS  (a compiler cache)"*. All THREE are needed for that to be
+  quiet — `-u` making it an error, the ABSENCE of `-e` letting the parent continue, and a
+  default arm accepting the empty result; remove any one and it is a loud failure naming
+  the variable. Two lanes hit it and worked around it by hand before anybody suspected the
+  instrument. Its `none` arm had, on the evidence, never once been observed answering. The
+  lesson the list above does not carry: **a guard nobody has watched ACCEPT is not known to
+  work**, so assert the passing direction, not only the refusing one.
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
   reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
   process is attributed by its ancestor chain and never by a cmdline match or a leaf `cwd`,

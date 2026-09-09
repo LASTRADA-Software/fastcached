@@ -454,10 +454,31 @@ if [ "$mode" = "resolve" ]; then
             echo "     so which tickets this pull request closes could not be established (#1016)." >&2
             exit 1
         fi
-        # `bash <path>`, never a bare path: 15 of the scripts here are mode 644 in git,
-        # and a bare invocation exits 126 -- which inside this guard would be
-        # indistinguishable from the pull request closing nothing (#723).
-        if ! closing_now="$(bash "$closing_script" --list-closing "$pr_number" 2>/dev/null)"; then
+        # `bash <path>`, never a bare path. The mode argument is dead -- every
+        # tracked script with a shebang is 100755, enforced by `ctest -R
+        # script-modes` (#720, #1033) -- and the rule is not: a call that fails to
+        # START, for any reason a chmod never covered, is indistinguishable inside
+        # this guard from the pull request closing nothing (#723).
+        #
+        # The STATUS is read, not just its zero-ness. `check-pr-closing-keywords.sh`
+        # answers 78 for "a tool I need is not installed" and 77 for "I ran and could
+        # not get an answer", and collapsing those turns an empty toolbox into a
+        # verdict about a pull request: a host with `gh` and no `jq` reported
+        # `FAIL could-not-run` here for two days, on master, with the whole local gate
+        # red behind it (#1038). The byte is the contract, so it is spelled here as a
+        # named constant and pinned by a self-test case that drives the real producer.
+        ClosingToolMissing=78
+        closing_now="$(bash "$closing_script" --list-closing "$pr_number" 2>/dev/null)"
+        closing_status=$?
+        if [ "$closing_status" -eq "$ClosingToolMissing" ]; then
+            echo "rulebook-open-work-state SKIPPED: ${closing_script} is missing a tool it" >&2
+            echo "     needs, so which tickets #${pr_number} closes was never established." >&2
+            echo "     The check did not RUN -- that is neither a pass nor a failure, and it" >&2
+            echo "     is repaired by installing the tool it named above, not by editing an" >&2
+            echo "     entry (#1038). CI has these tools, so nothing is being waved through." >&2
+            exit "$SKIP"
+        fi
+        if [ "$closing_status" -ne 0 ]; then
             echo "FAIL could-not-run: could not read which tickets #${pr_number} closes, so the" >&2
             echo "     entries were NOT checked against them. That is not a pass (#1016)." >&2
             exit 1
@@ -618,6 +639,8 @@ fi
 # rather than silent.
 
 cases_run=0
+cases_skipped=0
+skip_reason=""
 
 # The `must not` half is not decoration. Every arm below fails the run, so an exit
 # status alone cannot tell `stale` from `could-not-run` -- and those two are the
@@ -643,10 +666,12 @@ _case() {
     cases_run=$(( cases_run + 1 ))
     [ -n "$stub" ] && path="${stub}:${PATH}"
 
-    # `bash <path>`, never a bare path. A bare invocation of a mode-644 script
-    # exits 126, and inside a want-fail assertion a shell that REFUSED TO START is
-    # indistinguishable from the rule firing -- eight cases passed that way in
-    # #723. Naming the interpreter removes the whole class.
+    # `bash <path>`, never a bare path. Inside a want-fail assertion a shell that
+    # REFUSED TO START is indistinguishable from the rule firing -- eight cases
+    # passed that way in #723, then on a mode-644 script. The modes were repaired
+    # (#720) and are enforced by `ctest -R script-modes`, so that particular 126 is
+    # gone; naming the interpreter removes the whole CLASS, which is why the rule
+    # did not go with its reason (#1033).
     # shellcheck disable=SC2086 -- $extra is split deliberately; see above.
     out="$( PATH="$path" bash "${BASH_SOURCE[0]}" "$mode_flag" $extra --rules-dir "$tree" 2>&1 )"
     got=$?
@@ -821,42 +846,73 @@ _tree "${st}/clean" 11 12
 _stub "${st}/bin-clean" "11:open:issue 12:open:issue" ""
 _case "control-passes" 0 "resolved 2 of 2" "FAIL" "${st}/clean" "${st}/bin-clean"
 
-# --- closing: the state no verdict could reach before (#1016) ----------------
+# Whether the `closing` cases below can run AT ALL in this environment.
 #
-# The entry names an issue that is OPEN, and the pull request under test closes it.
-# `stale` is correct to pass here -- at this moment the entry is true -- so without
-# this verdict the check goes green and master goes red on the merge. Three instances
-# in one day.
+# They drive the real `check-pr-closing-keywords.sh`, which shells out to tools this
+# machine may not have -- and a case that cannot run must SKIP rather than fail, or a
+# missing interpreter reads as a broken rulebook. That is #1038's own collapse one
+# level up, and it bit: on a host with no `jq` these cases went red on pristine master
+# and two lanes read it as their branch.
 #
-# Both arms use the SAME tree and the same entry, and differ only in which ticket the
-# pull request closes. That is what makes the pair a test of the verdict rather than of
-# the fixture: a check that refused every `--pr` run would pass the first and fail the
-# second.
-_stub "${st}/bin-closing" "11:open:issue 12:open:issue" "" "Fixes #12"
-_case "closing-refuses-an-entry-this-pr-closes" 1 \
-    "FAIL closing: .*#12, which THIS pull request closes" "FAIL stale" \
-    "${st}/clean" "${st}/bin-closing" "--resolve" "--pr 42"
+# The condition is DERIVED by asking the producer, with a stub `gh` on PATH exactly as
+# a case has, rather than by keeping a second copy of its tool list here. A tool added
+# to its `RequiredTools` table is then covered with no edit to this file -- a list
+# restated is a list that drifts, which is the defect this check exists to catch.
+_stub "${st}/bin-closing-probe" "11:open:issue 12:open:issue" "" ""
+_closing_can_run() {
+    local status=0
+    PATH="${st}/bin-closing-probe:${PATH}" bash "${source_dir}/scripts/check-pr-closing-keywords.sh" --list-closing 42 >/dev/null 2>&1 || status=$?
+    [ "$status" -ne 78 ]
+}
 
-_stub "${st}/bin-closing-other" "11:open:issue 12:open:issue" "" "Fixes #99"
-_case "closing-control-a-pr-closing-nothing-in-the-rulebook" 0 \
-    "resolved 2 of 2" "FAIL" \
-    "${st}/clean" "${st}/bin-closing-other" "--resolve" "--pr 42"
+if _closing_can_run; then
+    # --- closing: the state no verdict could reach before (#1016) ----------------
+    #
+    # The entry names an issue that is OPEN, and the pull request under test closes it.
+    # `stale` is correct to pass here -- at this moment the entry is true -- so without
+    # this verdict the check goes green and master goes red on the merge. Three instances
+    # in one day.
+    #
+    # Both arms use the SAME tree and the same entry, and differ only in which ticket the
+    # pull request closes. That is what makes the pair a test of the verdict rather than of
+    # the fixture: a check that refused every `--pr` run would pass the first and fail the
+    # second.
+    _stub "${st}/bin-closing" "11:open:issue 12:open:issue" "" "Fixes #12"
+    _case "closing-refuses-an-entry-this-pr-closes" 1 \
+        "FAIL closing: .*#12, which THIS pull request closes" "FAIL stale" \
+        "${st}/clean" "${st}/bin-closing" "--resolve" "--pr 42"
 
-# A pull request that closes NOTHING is the ordinary case, and it must not be confused
-# with one whose closing set could not be read -- the arm below is the other half.
-_stub "${st}/bin-closing-none" "11:open:issue 12:open:issue" "" ""
-_case "closing-control-a-pr-with-no-trailer-at-all" 0 \
-    "closes no ticket" "FAIL" \
-    "${st}/clean" "${st}/bin-closing-none" "--resolve" "--pr 42"
+    _stub "${st}/bin-closing-other" "11:open:issue 12:open:issue" "" "Fixes #99"
+    _case "closing-control-a-pr-closing-nothing-in-the-rulebook" 0 \
+        "resolved 2 of 2" "FAIL" \
+        "${st}/clean" "${st}/bin-closing-other" "--resolve" "--pr 42"
 
-# And the direction that must never be silent: the closing set could not be read, so
-# the `closing` verdict did not run. Reported as a failure rather than skipped, because
-# an unreadable set is indistinguishable from a pull request that closes nothing, and
-# reading it as the latter disables this check exactly when it is needed.
-_stub "${st}/bin-closing-broken" "11:open:issue 12:open:issue" "pr-unreadable" ""
-_case "closing-refuses-when-the-set-could-not-be-read" 1 \
-    "FAIL could-not-run: could not read which tickets #42 closes" "" \
-    "${st}/clean" "${st}/bin-closing-broken" "--resolve" "--pr 42"
+    # A pull request that closes NOTHING is the ordinary case, and it must not be confused
+    # with one whose closing set could not be read -- the arm below is the other half.
+    _stub "${st}/bin-closing-none" "11:open:issue 12:open:issue" "" ""
+    _case "closing-control-a-pr-with-no-trailer-at-all" 0 \
+        "closes no ticket" "FAIL" \
+        "${st}/clean" "${st}/bin-closing-none" "--resolve" "--pr 42"
+
+    # And the direction that must never be silent: the closing set could not be read, so
+    # the `closing` verdict did not run. Reported as a failure rather than skipped, because
+    # an unreadable set is indistinguishable from a pull request that closes nothing, and
+    # reading it as the latter disables this check exactly when it is needed.
+    _stub "${st}/bin-closing-broken" "11:open:issue 12:open:issue" "pr-unreadable" ""
+    _case "closing-refuses-when-the-set-could-not-be-read" 1 \
+        "FAIL could-not-run: could not read which tickets #42 closes" "" \
+        "${st}/clean" "${st}/bin-closing-broken" "--resolve" "--pr 42"
+else
+    # Its own outcome, and VISIBLE: a passing test shows its output to nobody, so a
+    # skip announced only in a comment is a case that silently did not run -- which is
+    # the exact collapse this file spends its length refusing. It rides the final line
+    # too, beside the case count.
+    cases_skipped=$(( cases_skipped + 4 ))
+    skip_reason="the closing cases need a tool check-pr-closing-keywords.sh could not find"
+    echo "rulebook-open-work-selftest: SKIPPING 4 closing case(s) -- ${skip_reason}." >&2
+    echo "     They drive the real script, which answered 78 (a required tool is not" >&2
+    echo "     installed). That is not a pass and not a failure (#1038)." >&2
+fi
 
 # --- stale ------------------------------------------------------------------
 _stub "${st}/bin-stale" "11:open:issue 12:closed:issue" ""
@@ -1065,7 +1121,12 @@ _case "subheading-does-not-close-the-section" 1 "FAIL stale: .*#12" "#99" \
 # `[[ ... ]] && echo` truncated a run at eight cases with no case named, and the
 # run read as a pass.
 echo
-echo "rulebook-open-work-selftest: ${cases_run} cases ran, ${failures} failed"
+# `:+` tests for a non-EMPTY value and "0" is not empty, so the suffix is built
+# from the NUMBER. Getting that wrong prints ", 0 skipped -- " on every clean run,
+# which is a skip notice for no skip.
+skip_suffix=""
+[ "$cases_skipped" -gt 0 ] && skip_suffix=", ${cases_skipped} skipped -- ${skip_reason}"
+echo "rulebook-open-work-selftest: ${cases_run} cases ran, ${failures} failed${skip_suffix}"
 if [ "$failures" -gt 0 ]; then
     echo "  failed: ${failed_cases}" >&2
     exit 1

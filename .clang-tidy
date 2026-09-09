@@ -94,18 +94,41 @@ UseColor: true
 # for it, which is why this pattern being slightly wrong is expensive rather than
 # annoying.
 #
-# It must match a checkout whatever it is CALLED. CI clones to
-# `.../fastcached/fastcached/src/...`, but a git worktree is not named after the
-# repository: `fastcached-wt-139/src/...` and `.../worktrees/<name>/src/...` are
-# both ordinary, and neither matched a pattern anchored on the literal directory
-# name `fastcached`. The result was a local clang-tidy that checked no headers at
-# all and reported clean -- which has now sent two branches to CI with header
-# findings a local run had called clean.
+# It must match a checkout whatever it is CALLED, and it must not depend on where
+# DEPENDENCIES are unpacked either. Both halves have now been got wrong:
 #
-# It must NOT match dependencies, which carry no `.clang-tidy` of their own and
-# would bury real findings: `_deps/catch2-src/src/...` is the shape to keep out,
-# and it is kept out because `catch2-src` does not begin with `fastcached`.
-HeaderFilterRegex: '.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*'
+#   `.*/fastcached/src/.*`                        missed `fastcached-wt-139/`
+#   `.*/(fastcached[^/]*|worktrees/[^/]+)/src/.*` missed `fastcached-worktrees/<lane>/`
+#   `.*/src/.*` + exclude `.*/_deps/.*`           missed CI's `.cache/CPM/`
+#
+# The second is #1040: `fastcached[^/]*` matches the SEGMENT `fastcached-worktrees`
+# and then demands `/src/` immediately, while `worktrees/[^/]+` needs a segment that
+# is literally `worktrees`. Every lane worktree analysed ZERO first-party headers and
+# reported clean, invisibly, because CI clones to `.../fastcached/src/...` -- the one
+# shape that still matched.
+#
+# The THIRD was the fix for the second, and it is the same mistake wearing the other
+# hat. Excluding `_deps` is right on a developer machine, where FetchContent unpacks
+# there; `build.yml` sets `CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/CPM`, so
+# CI's catch2 sits at `.cache/CPM/catch2/<hash>/src/catch2/...` -- which contains
+# `/src/` and is not under `_deps`. The broad pattern took it, and the sweep failed
+# inside catch2. An EXCLUSION bets on where the world puts things; only CI could see
+# that bet lose, and it did.
+#
+# So the pattern now states what is OURS and mentions no dependency location at all.
+# The roots under `src/` are this repository's own directories, and a dependency
+# unpacked anywhere -- `_deps`, `.cache/CPM`, or a location nobody has invented yet --
+# cannot match, because catch2's headers live under `src/catch2/` and `catch2` is not
+# one of these names. Measured across both layouts: reported 1 and 0 under the old
+# pattern, 0 and 0 under this one, with a first-party control finding still reported
+# in every case.
+#
+# The cost of enumerating roots is that a FIFTH root would go unanalysed in silence,
+# and that is exactly what `scripts/local-gate.sh` now refuses: it applies this regex
+# to every tracked header and reports `<matched>/<total>`, so a new root shows up as
+# `286/287` with the missed file named. The enumeration is safe only because that
+# check exists -- do not weaken one without the other.
+HeaderFilterRegex: '.*/src/(CowTree|FastCache|apps|tests)/.*'
 FormatStyle:     none
 CheckOptions:
   - key:             readability-function-cognitive-complexity.Threshold

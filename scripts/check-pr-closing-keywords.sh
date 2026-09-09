@@ -43,6 +43,11 @@ set -uo pipefail
 
 REPO="${FASTCACHED_REPO:-LASTRADA-Software/fastcached}"
 SkipUnavailable=77
+# A FIFTH outcome, distinct from 77 on purpose. 77 says "this ran and could not get an
+# answer"; 78 says "this never ran at all". They are fixed by different people -- an
+# unreachable API is waited out, a missing tool is installed -- and a caller that cannot
+# separate them turns an empty toolbox into a verdict about a pull request (#1038).
+MissingPrerequisite=78
 
 usage() {
     cat >&2 <<'USAGE'
@@ -57,6 +62,7 @@ usage: check-pr-closing-keywords.sh --pr <number>
 exit 0 every ticket the commits name is in the body
      1 one or more are missing, or the body could not be read
     77 the API could not be reached, so NOTHING was verified
+    78 a required tool is not installed, so this check did not run at all
 
 `--list-closing` exists so `check-rulebook-open-work.sh` can ask which tickets a pull
 request will close WITHOUT restating GitHub's keyword pattern. A second copy of that
@@ -297,10 +303,22 @@ esac
 [ -n "${2:-}" ] || { usage; exit 2; }
 pr="$2"
 
-command -v gh >/dev/null 2>&1 || {
-    echo "check-pr-closing-keywords: no gh on PATH, so NOTHING was verified" >&2
-    exit "$SkipUnavailable"
-}
+# Every tool this script shells out to, as a TABLE. Guarding the one you thought of
+# is exactly how #1038 happened: `gh` was guarded here and `jq` -- used twice, twenty
+# lines below -- was not. A host with `gh` and no `jq` reached the acquisition, got
+# empty strings out of both `jq` calls, and reported "#N reported no commits at all,
+# which cannot be true": the API blamed for a missing interpreter, and the caller
+# escalating that to a failed read. Adding a tool is adding a row, so the two cannot
+# drift apart again.
+RequiredTools=(gh jq)
+for tool in "${RequiredTools[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "check-pr-closing-keywords: no ${tool} on PATH, so NOTHING was verified" >&2
+        echo "check-pr-closing-keywords: that is a MISSING PREREQUISITE and not an answer" >&2
+        echo "     about #${pr} -- this check did not run, which is its own outcome (#1038)." >&2
+        exit "$MissingPrerequisite"
+    }
+done
 
 # A LIVENESS anchor before the question, so "the API said no trailers" and "the API did
 # not answer" are two outcomes rather than one silent pass. `rate_limit` is the cheapest
