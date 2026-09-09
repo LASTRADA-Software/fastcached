@@ -118,14 +118,21 @@ void EpollReactor::AbandonParkedWork() noexcept
     // `Submit` would have written to an fd on its way out. It terminates because a pass
     // that takes nothing returns, and teardown frees chains rather than creating them.
     //
-    // **Not covered by a case, and that is stated rather than papered over.** The only
-    // thing the single-pass version does differently is free the re-parked entry LATER,
-    // and later still frees it -- `swap` leaves the member containers unallocated, so a
-    // re-entrant search over them reads nothing. The difference is visible only as an
-    // `epoll_ctl` on a descriptor `~EpollReactor` has already closed, whose fd number
-    // another thread may by then have reused, and no fixture can stage that
-    // deterministically. A case was written for it and DELETED: it passed with the loop
-    // and without it, which is a test that cannot fail for its reason.
+    // **Covered, and only a reactor that owns descriptors could cover it.** The single
+    // pass does not lose the re-parked entry, it frees it LATER -- and `later` is MEMBER
+    // destruction, which runs after the two closes below. So the difference is no leak
+    // and no value a container reports; it is whether a descriptor was still open at the
+    // moment a chain died. `A chain re-parked during teardown is freed before the
+    // reactor's descriptors close` asks exactly that, through `Attach()` -- `epoll_ctl`
+    // on `_epollFd`, the call `~EpollSocket` reaches by way of `Detach()` -- and records
+    // the answer with its errno. Delete the `while` and the re-parked probe reports
+    // EBADF while a control chain freed on the first pass is unmoved
+    // ([#1054](https://github.com/LASTRADA-Software/fastcached/issues/1054)).
+    //
+    // The case this replaces was written against `TestReactor` and passed with the loop
+    // AND without it. That is not a fact about the loop: the double owns no descriptors,
+    // so it has no later moment that differs from the earlier one, and the single pass
+    // is genuinely benign there.
     while (true)
     {
         std::deque<Detail::Parked> submits;
