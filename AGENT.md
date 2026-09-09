@@ -1030,6 +1030,12 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   an alternative: a bounded wait re-parks. `Resume()` disowns and resumes in ONE
   expression, so no fire path can forget it; IOCP's posted submissions have no entry to
   fold into and keep a side table instead, which is stated rather than left silent.
+- Re-declaring ONE overload in a derived interface HIDES the base's others, and here it hid
+  the one carrying ownership: `IReactor` re-declared `Submit(std::coroutine_handle<>)` and
+  not `IExecutor::Submit(ParkedWork)`, so seven sites could not hand ownership over rather
+  than forgetting to. Nothing diagnoses it -- every call still compiles and binds to the
+  borrowing overload. The detection is the compiler: convert the sites to pass the owning
+  type, and the `no viable conversion` errors enumerate the defect's reach.
 - A missing keyspace event has two ends — the tier that never named the victim and
   the observer that never published it. Check both before changing either.
 - A reclaim is reported **before** the call that caused it: `ADD` on a lapsed TTL

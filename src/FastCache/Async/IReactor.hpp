@@ -75,6 +75,22 @@ class IReactor: public IExecutor
     /// @param handle Coroutine to resume. Must remain alive until resumed.
     void Submit(std::coroutine_handle<> handle) override = 0;
 
+    /// Post a coroutine, saying what may be freed if it is never resumed.
+    ///
+    /// **Redeclared here, and that is load-bearing rather than tidiness.** Declaring
+    /// any `Submit` in this class HIDES every `IExecutor::Submit` from lookup through
+    /// an `IReactor`, so without this line the owning overload is unreachable from the
+    /// one interface every parking site in this tree holds -- and the seven sites of
+    /// [#1041](https://github.com/LASTRADA-Software/fastcached/issues/1041) borrowed
+    /// not because anybody decided they should, but because the reachable overload was
+    /// the borrowing one. `Schedule` already declares both for the same reason, which
+    /// is why `SleepUntil` could hand ownership over and nothing that submits could.
+    ///
+    /// Deleting this as a duplicate of the base declaration reopens all seven, silently:
+    /// the call still compiles, against the overload that drops what it is given.
+    /// @param work The coroutine to resume, and the chain root to free if it is not.
+    void Submit(ParkedWork work) override = 0;
+
     /// Resume a coroutine handle when the reactor's clock advances to or
     /// past the given deadline. Ordering between concurrently-scheduled
     /// timers with the same deadline is FIFO.

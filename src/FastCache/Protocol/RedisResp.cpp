@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/SleepUntil.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
@@ -128,7 +129,7 @@ namespace
         struct WakeLatch
         {
             std::mutex mu;
-            std::coroutine_handle<> handle {};
+            ParkedWork handle {};
             bool resolved { false };
 
             /// Resume the parked loop if no arm has resolved yet. Thread-safe.
@@ -136,20 +137,25 @@ namespace
             ///        resume inline (non-reactor transports / same thread).
             void WakeOnce(IReactor* reactor)
             {
-                std::coroutine_handle<> toWake {};
+                // `Detail::Parked` rather than a bare handle, so every way of
+                // leaving this function accounts for the chain: handed to the
+                // reactor, resumed inline, or -- if it is somehow neither -- freed
+                // by the guard rather than dropped. Nothing changes for a BORROWED
+                // handle, whose `abandon` is empty.
+                Detail::Parked toWake;
                 {
                     std::scoped_lock const lock { mu };
                     if (resolved)
                         return;
                     resolved = true;
-                    toWake = std::exchange(handle, {});
+                    toWake = Detail::Parked { std::exchange(handle, ParkedWork {}) };
                 }
-                if (toWake)
+                if (toWake.Handle())
                 {
                     if (reactor != nullptr)
-                        reactor->Submit(toWake);
+                        reactor->Submit(toWake.Take());
                     else
-                        toWake.resume();
+                        toWake.Resume();
                 }
             }
         };
@@ -167,13 +173,24 @@ namespace
             {
                 return self->HasPending() || self->_readablePending;
             }
-            [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const
+            /// Templated on the promise for `ResumeOn`'s reason: `WakeOnce` posts
+            /// this chain to a reactor that may be destroyed before it dequeues it,
+            /// and only the parking coroutine's own promise type knows whether
+            /// anything else can free it
+            /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+            /// By the time `WakeOnce` runs the handle is erased, so this is the last
+            /// place the question can be asked.
+            /// @tparam Promise The suspending coroutine's promise type.
+            /// @param handle The suspended command loop.
+            /// @return true to stay suspended; false when work arrived first.
+            template <typename Promise>
+            [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const
             {
                 std::scoped_lock const lock { self->_mu };
                 if (!self->_queue.empty() || self->_readablePending)
                     return false; // raced: work is already available.
                 auto const latch = std::make_shared<WakeLatch>();
-                latch->handle = handle;
+                latch->handle = Detail::ParkedWorkFor(handle);
                 self->_latch = latch;
                 return true;
             }
@@ -391,12 +408,19 @@ namespace
             {
                 return false;
             }
-            [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const
+            /// Templated on the promise, for the reason on `PushOrReadable` above:
+            /// this parks on the SAME latch, so a bare handle here would put an
+            /// unowned chain into a slot `WakeOnce` can only hand on as borrowed.
+            /// @tparam Promise The suspending coroutine's promise type.
+            /// @param handle The suspended watcher.
+            /// @return true to stay suspended; false when the latch had resolved.
+            template <typename Promise>
+            [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const
             {
                 std::scoped_lock const lock { latch->mu };
                 if (latch->resolved)
                     return false;
-                latch->handle = handle;
+                latch->handle = Detail::ParkedWorkFor(handle);
                 return true;
             }
             void await_resume() const noexcept {}
@@ -601,12 +625,21 @@ namespace
                 std::scoped_lock const lock { self->_mu };
                 return self->_resolved;
             }
-            [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const
+            /// Templated on the promise for `ResumeOn`'s reason: `WakeOnce` posts
+            /// this chain to a reactor that may be destroyed before it dequeues it,
+            /// and only the parking coroutine's own promise type knows whether
+            /// anything else can free it
+            /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+            /// @tparam Promise The suspending coroutine's promise type.
+            /// @param handle The suspended blocking read.
+            /// @return true to stay suspended; false when it resolved first.
+            template <typename Promise>
+            [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const
             {
                 std::scoped_lock const lock { self->_mu };
                 if (self->_resolved)
                     return false; // raced: resolved between await_ready and here.
-                self->_handle = handle;
+                self->_handle = Detail::ParkedWorkFor(handle);
                 return true;
             }
             void await_resume() const noexcept {}
@@ -637,7 +670,9 @@ namespace
         /// @param disconnected True when resolved by the client-disconnect arm.
         void WakeOnce(bool timedOut = false, bool disconnected = false) noexcept
         {
-            std::coroutine_handle<> toWake {};
+            // `Detail::Parked` for the reason on `WakeLatch::WakeOnce`: handed on,
+            // resumed inline, or freed -- never dropped.
+            Detail::Parked toWake;
             {
                 std::scoped_lock const lock { _mu };
                 if (_resolved)
@@ -645,20 +680,20 @@ namespace
                 _resolved = true;
                 _timedOut = timedOut;
                 _disconnected = disconnected;
-                toWake = std::exchange(_handle, {});
+                toWake = Detail::Parked { std::exchange(_handle, ParkedWork {}) };
             }
-            if (toWake)
+            if (toWake.Handle())
             {
                 if (_reactor != nullptr)
-                    _reactor->Submit(toWake);
+                    _reactor->Submit(toWake.Take());
                 else
-                    toWake.resume();
+                    toWake.Resume();
             }
         }
 
         IReactor* _reactor;
         mutable std::mutex _mu;
-        std::coroutine_handle<> _handle {};
+        ParkedWork _handle {};
         bool _resolved { false };
         bool _timedOut { false };
         bool _disconnected { false };

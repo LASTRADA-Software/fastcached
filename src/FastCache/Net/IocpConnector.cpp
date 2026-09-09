@@ -4,6 +4,7 @@
 #if defined(_WIN32)
 
     #include <FastCache/Async/DeadlineTimer.hpp>
+    #include <FastCache/Async/Task.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ConnectFlow.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
@@ -56,7 +57,7 @@ namespace
     {
         IocpCompletion completion {};
         IocpReactor* reactor { nullptr };
-        std::coroutine_handle<> waiter {};
+        ParkedWork waiter {};
         SOCKET socket { INVALID_SOCKET };
         DWORD error { 0 };
         bool settled { false };
@@ -73,11 +74,22 @@ namespace
             return op->settled;
         }
 
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const noexcept
+        /// Templated on the promise for `ResumeOn`'s reason: the completion below
+        /// posts this chain to a reactor that may be destroyed before it dequeues
+        /// it, and only the parking coroutine's own promise type knows whether
+        /// anything else can free it
+        /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+        /// By the time the completion runs the handle is erased, so this is the
+        /// last place the question can be asked.
+        /// @tparam Promise The suspending coroutine's promise type.
+        /// @param handle The suspended dial.
+        /// @return true to stay suspended; false when the dial settled first.
+        template <typename Promise>
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const noexcept
         {
             if (op->settled)
                 return false;
-            op->waiter = handle;
+            op->waiter = Detail::ParkedWorkFor(handle);
             return true;
         }
 
@@ -112,7 +124,7 @@ namespace
         }
         op->error = err;
 
-        if (auto waiter = std::exchange(op->waiter, {}); waiter)
+        if (auto waiter = std::exchange(op->waiter, ParkedWork {}); waiter.resume)
             op->reactor->Submit(waiter);
     }
 
