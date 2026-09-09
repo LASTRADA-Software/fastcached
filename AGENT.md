@@ -1230,7 +1230,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
   a separate assertion that the good things exist. **That reaches any probe you TYPE — a `grep`, a `find`, a
   `gh api --jq`, a throwaway script — which is where it is skipped**: ask it for something it must find before
-  believing what it did not find, and read its exit status — and note **134** is not `2`, so anything neither `0`
+  believing what it did not find — **and the mirror, which is the half that gets acted on: a positive finding
+  settles nothing when it is true under BOTH readings of the claim**, as a `grep -c` for a timer that is present
+  in the healthy code and in the broken code alike, run as a control while correcting somebody else — and read
+  its exit status — and note **134** is not `2`, so anything neither `0`
   nor `1` is the instrument failing (`grep -c -i -F` aborted, no stdout, and read as dropped hunks in a merge
   just declared clean). Where the answer cannot be determined, report that as
   its own outcome rather than the nearest neighbour.

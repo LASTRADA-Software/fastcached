@@ -80,6 +80,45 @@ FastPathCeilingMs=2000
 # written out, a ceiling of 10000ms was caught by nothing.
 FastPathDefectFloorMs=$(( FastPathCeilingMs * 3 / 2 ))
 
+# What a HEALTHY run may ask for before the ceiling above has stopped separating
+# anything.
+#
+# `bounded-fast-path-bites` re-derives the DEFECT end on the machine that is
+# running -- it stages the defect and asserts it clears the floor. Nothing re-derived
+# the HEALTHY end: the case asserted only *healthy <= ceiling*, never that healthy sat
+# FAR below it. The requested totals are quantised at 200 / 400 / 800 / 1800 / 3800 ms
+# for twenty commands when every command consumes the same number of poll ticks, so
+# **1800 ms was a legal passing verdict** -- nine times healthy, four ticks per command
+# against one. A regression producing it passed this case AND `-bites`, which stages a
+# FLAT pause and is therefore anchored at 4000 ms whatever the host does. Both guards
+# green, separation collapsed from 20x to 2.2x, and no `SLOW:` line because the wall
+# clock never moved. That is the ceiling's own defect at the other end: the floor's
+# comment above argues that "over" is not "separated", and this end never got the
+# same treatment.
+#
+# **The number is defensible because of the MARGIN, not because of the symmetry.**
+# `ceiling * 2/3` mirrors the floor's `ceiling * 3/2`, which is tidy and is still one
+# number justified by another number. What defends it is the size of the gap in the
+# quantity that actually varies -- `f`, the fraction of commands consuming four ticks
+# rather than one, where the total is `200 + 1600f`:
+#
+#     healthy, best                       200 ms     f = 0%
+#     healthy, worst measured at load 34-62   230 ms     f = 1.9%
+#     this bound                         1333 ms     f = 70.8%
+#     the regression that must fail      1800 ms     f = 100%
+#
+# **A 38-fold margin.** To trip this a host would need seven commands in ten to
+# survive four polls, against under two in a hundred at a load average of 62 on 32
+# cores. That is not a slow host; that is the regression. The general worry -- that a
+# threshold at the healthy end reintroduces the host sensitivity this case exists to
+# remove -- is sound and does not bite at this magnitude, which is a figure rather
+# than a hope.
+#
+# It admits 800 ms, four times healthy and a real regression that will go unnoticed
+# here. Left deliberately: this bounds the SEPARATION collapsing, not every regression,
+# and widening it is how a derived bound turns back into a tuned one.
+FastPathHealthyMaxMs=$(( FastPathCeilingMs * 2 / 3 ))
+
 # What `run_bounded` costs per call when nothing is wrong, which is what makes the
 # `SLOW:` reading a NUMBER rather than an adjective.
 #
@@ -96,6 +135,16 @@ FastPathDefectFloorMs=$(( FastPathCeilingMs * 3 / 2 ))
 #     call. Measured as a PAIRED step and not as two independent readings, the
 #     two trees alternated within each pair so load drift cannot masquerade as
 #     the difference: +2ms per call, 7 of 8 pairs positive, N=8, load ~26.
+#   * ANOTHER MACHINE, same tree, minutes apart, reported by another lane rather
+#     than measured here: WSL2 reads **5.5ms** per call and Git Bash **128ms** --
+#     a 23x spread on one box, with the requested total at 200ms in BOTH. WSL2's
+#     5.5ms lands inside this range and is the first independent check the figure
+#     has had; it had rested on one machine.
+#
+#     That row is here for the reader rather than for the number. Somebody on Git
+#     Bash meeting `128ms per call against a 6-7ms baseline` in the `SLOW:` line
+#     below has nothing telling them it is their SHELL and not a broken host --
+#     the MSYS fork path, on hardware that is otherwise ordinary.
 #
 # The figure below is DERIVED from that step rather than re-measured on an idle
 # host, which is said out loud because it is the weaker of the two claims and a
@@ -1050,6 +1099,15 @@ run_case() {
             echo "BUG: so the ledger was lost and this case asserted nothing"
         elif [ "$asked_ms" -gt "$FastPathCeilingMs" ]; then
             echo "BUG: the bound is sleeping through commands that have already finished"
+        elif [ "$asked_ms" -gt "$FastPathHealthyMaxMs" ]; then
+            # NOT the same failure as the arm above, and the two are fixed by
+            # different people. Over the CEILING says the bound is broken. Over this
+            # bound says the bound still passes and has stopped separating anything --
+            # the healthy end has drifted up towards a ceiling that is standing still,
+            # which no reading in this file would otherwise report.
+            echo "BUG: a healthy run asked for ${asked_ms}ms, over the ${FastPathHealthyMaxMs}ms"
+            echo "BUG: bound, so the ${FastPathCeilingMs}ms ceiling no longer separates a healthy"
+            echo "BUG: run from a broken one even though this case still passes it"
         elif [ "$reading" -eq 1 ] && [ "$fast_ms" -gt "$FastPathCeilingMs" ]; then
             # THE FOURTH READING. Three causes can put the measured cost over the
             # ceiling while the pause asked for stays normal, and they are fixed
