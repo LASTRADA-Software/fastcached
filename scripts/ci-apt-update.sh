@@ -73,6 +73,16 @@ set -euo pipefail
 #      25  dl.google.com                nobody asked for this -- #1160
 #       4  packages.microsoft.com       nobody asked for this -- #550
 #
+# That census is correct about hosts and was BLIND to how the archive is configured, which
+# is what the first real run of this allowlist then failed on. Its pattern was "hostnames
+# on `Get:`/`Hit:` lines", and the line that mattered names no host:
+#
+#     Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+#
+# The four Ubuntu hosts below are reached THROUGH that file, not named in any source. A
+# census states its pattern, not only its number, and this one's pattern could not see the
+# indirection it was being read to justify. `SourceFilesFor` is what follows it.
+#
 # `apt.llvm.org` is on the list because five jobs install clang from it through
 # `llvm.sh`. Today every `ci-apt-update.sh` call happens to run BEFORE its job's
 # `llvm.sh`, so the source is not yet configured when the sweep runs and omitting it
@@ -122,22 +132,69 @@ Refuse() {
     exit 1
 }
 
-# Every host a source file names, one per line. Handles the one-line `deb` format and
-# deb822 `URIs:` alike, because 24.04 ships the Ubuntu archive as the latter.
+# Every URL-ish token in a file, one per line, full-line comments stripped first. A COMMENT
+# is not a call site, and apt does not read one either -- a vendor file mentioning the
+# Ubuntu archive in a comment must not read as ours, which is the direction that would
+# keep it.
+#
+# `file:` is matched alongside `http`/`https` because a source may name its URIs
+# INDIRECTLY; see `SourceFilesFor`. Its slash run is `/+` rather than `//` for the same
+# reason -- `mirror+file:/etc/apt/apt-mirrors.txt` has one.
+# $1: file to read
+UrlTokensIn() {
+    # No `producer | grep -q` and no bare pipeline verdict: under `pipefail` a `grep`
+    # finding nothing fails the pipeline, and an empty answer here is meaningful.
+    sed -e 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null \
+        | grep -oE '(mirror\+)?(https?|file):/+[^[:space:]"]+' || true
+}
+
+# Every file whose http(s) URLs describe what a source actually fetches: the source file
+# itself, plus any mirrorlist it points at.
+#
+# The indirection is not a corner case, it is the layout of the runner this script exists
+# to run on. A GitHub-hosted Ubuntu image ships the archive as deb822 naming
+# `mirror+file:/etc/apt/apt-mirrors.txt`, and the hosts are one level down in that file.
+# A parser reading only the source file finds NO host in it, `IsOurs` answers false, and
+# the sweep removes the Ubuntu archive -- which is what `VerifyArchiveSurvives` caught on
+# the first real run of the allowlist, and what case 10 pins.
+#
+# ONE level, deliberately. It is the depth the image uses, and a bounded walk cannot loop
+# on a mirrorlist that names itself. A path this cannot read contributes no host rather
+# than an objection, so the file falls to the same "names none" rule as any other -- the
+# over-removal direction, which guard two turns into a refusal.
+# $1: source file to read
+SourceFilesFor() {
+    local token path
+    printf '%s\n' "$1"
+    for token in $(UrlTokensIn "$1"); do
+        case "$token" in
+            *file:*)
+                path=$(printf '%s' "$token" | sed -e 's#^.*file:/*#/#')
+                if [ -f "$path" ]; then
+                    printf '%s\n' "$path"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Every host a source file names, one per line. Handles the one-line `deb` format, deb822
+# `URIs:` and a `mirror+file:` indirection alike.
 # Prints nothing for a file that names none -- which the caller treats as a REASON to
 # remove, never as "no objection".
 # $1: file to read
 HostsIn() {
-    local urls
-    # No `producer | grep -q` and no bare pipeline verdict: under `pipefail` a `grep`
-    # finding nothing fails the pipeline, and this function's empty answer is meaningful.
-    # Full-line comments are stripped first. A COMMENT is not a call site, and apt does
-    # not read one either -- a vendor file mentioning the Ubuntu archive in a comment must
-    # not read as ours, which is the direction that would keep it.
-    urls=$(sed -e 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null \
-        | grep -oE 'https?://[^[:space:]"]+' || true)
-    [ -n "$urls" ] || return 0
-    printf '%s\n' "$urls" \
+    local file urls all
+    all=""
+    for file in $(SourceFilesFor "$1"); do
+        urls=$(UrlTokensIn "$file" | grep -E '^https?://' || true)
+        if [ -n "$urls" ]; then
+            all="${all}${urls}
+"
+        fi
+    done
+    [ -n "$all" ] || return 0
+    printf '%s' "$all" \
         | sed -e 's#^[a-z][a-z]*://##' -e 's#^[^/@]*@##' -e 's#/.*$##' -e 's#:[0-9][0-9]*$##' \
         | sort -u
 }
@@ -242,6 +299,10 @@ VerifyArchiveSurvives() {
 # ---------------------------------------------------------------------------
 
 SelfTestCases=0
+# A case that could not be ARRANGED is not a case that passed and not one that failed, and
+# it is not one that was never reached either. Counting it separately is what lets the run
+# end with a tally that distinguishes all three -- see the note on `return 77` below.
+SelfTestUnarrangeable=0
 SelfTestTmp=""
 
 # $1: directory to build an apt root in. Plants a healthy Ubuntu source in deb822 form.
@@ -322,12 +383,16 @@ RunSelfTest() {
         Ok "case 4: a source the sweep could not remove is a REFUSAL, not a tally"
     else
         chmod u+w "$tmp/d/sources.list.d" 2>/dev/null || true
+        SelfTestUnarrangeable=$((SelfTestUnarrangeable + 1))
         printf 'SKIP case 4: a read-only directory does not bite here (root, or a filesystem\n'
         printf '     that ignores modes), so guard one could not be arranged. This run does NOT\n'
         printf '     establish the property #1160 is about. Re-run as a non-root user on a\n'
         printf '     filesystem that honours permissions.\n'
-        printf '\nself-test: %d case(s) ran, 1 could not be arranged\n' "$SelfTestCases"
-        return 77
+        # Falls THROUGH rather than returning. Returning here ended the run at case 4, so on
+        # Windows and as root the eight cases after it never executed while the tally said
+        # `3 case(s) ran, 1 could not be arranged` -- true, and silent about the eight. That
+        # is unstarted rendered as skipped, and it is why the mirrorlist cases below could
+        # not be exercised on the machine this fix was written on.
     fi
 
     # Case 5 -- GUARD ONE, unreadable survivor. A directory named like a source file cannot
@@ -398,6 +463,68 @@ RunSelfTest() {
         Bad "case 9: rc=$rc" "$out"
     fi
 
+    # Case 10 -- the layout of the runner this actually runs on. The archive is deb822
+    # naming `mirror+file:`, and its hosts are one level down in the mirrorlist. This is
+    # the case the allowlist shipped without: on its first real run the sweep removed
+    # `ubuntu.sources`, guard two refused, and every Linux job died at `Install build
+    # tools`. Without `SourceFilesFor` this case FAILS -- the source names no host the
+    # parser can read, so it is swept and guard two fires.
+    mkdir -p "$tmp/j/sources.list.d"
+    printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\n' \
+        > "$tmp/j/apt-mirrors.txt"
+    printf 'Types: deb\nURIs: mirror+file:%s/apt-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/j" > "$tmp/j/sources.list.d/ubuntu.sources"
+    printf 'deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/j/sources.list.d/google-chrome.list"
+    out=$(bash "$0" --apt-root "$tmp/j" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -e "$tmp/j/sources.list.d/ubuntu.sources" ] \
+        && [ ! -e "$tmp/j/sources.list.d/google-chrome.list" ]; then
+        Ok "case 10: an archive reached through mirror+file: is kept, and the vendor beside it swept"
+    else
+        Bad "case 10: rc=$rc" "$out"
+    fi
+
+    # Case 11 -- the OTHER direction, and the reason case 10 is not sufficient on its own.
+    # Following an indirection must not become a hole in the allowlist: a mirrorlist naming
+    # a host nobody allowed is still a source this repository does not install from. A
+    # `SourceFilesFor` that returned the mirrorlist's hosts as automatically ours, or one
+    # that kept any file it could not resolve, passes case 10 and fails here.
+    mkdir -p "$tmp/k/sources.list.d"
+    printf 'deb http://azure.archive.ubuntu.com/ubuntu noble main\n' > "$tmp/k/sources.list"
+    printf 'https://apt.example-vendor.invalid/repo\n' > "$tmp/k/vendor-mirrors.txt"
+    printf 'Types: deb\nURIs: mirror+file:%s/vendor-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/k" > "$tmp/k/sources.list.d/vendor.sources"
+    out=$(bash "$0" --apt-root "$tmp/k" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/k/sources.list.d/vendor.sources" ]; then
+        Ok "case 11: a mirrorlist naming a disallowed host is swept, not admitted by the indirection"
+    else
+        Bad "case 11: rc=$rc" "$out"
+    fi
+
+    # Case 12 -- an indirection this cannot follow names no host, so the file is removed by
+    # the same rule as any other unreadable source, and guard two is what makes that safe.
+    # Pins the decision rather than leaving it to fall out of the parser: keeping such a
+    # file would be #1160 exactly, a source nobody decided about surviving in silence.
+    mkdir -p "$tmp/l/sources.list.d"
+    printf 'deb http://azure.archive.ubuntu.com/ubuntu noble main\n' > "$tmp/l/sources.list"
+    printf 'Types: deb\nURIs: mirror+file:%s/nonexistent-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/l" > "$tmp/l/sources.list.d/dangling.sources"
+    out=$(bash "$0" --apt-root "$tmp/l" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/l/sources.list.d/dangling.sources" ]; then
+        Ok "case 12: a mirrorlist that cannot be read names no host, so its source is removed"
+    else
+        Bad "case 12: rc=$rc" "$out"
+    fi
+
+    if [ "$SelfTestUnarrangeable" -gt 0 ]; then
+        printf '\nself-test: %d case(s) ran and passed, %d could not be arranged\n' \
+            "$SelfTestCases" "$SelfTestUnarrangeable"
+        # 77 is the script-driven skip convention, and it is right even though most cases
+        # passed: guard one is the property #1160 turns on, so a run that could not arrange
+        # it has not established what this file is for. The other cases still RAN, which is
+        # the half the old early return threw away.
+        return 77
+    fi
     printf '\nself-test: %d case(s) ran, all passed\n' "$SelfTestCases"
     return 0
 }

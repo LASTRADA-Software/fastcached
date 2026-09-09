@@ -1043,6 +1043,31 @@ set_tests_properties("apt-update-wrapped-selftest" PROPERTIES
     TIMEOUT 60
 )
 
+# The SWEEP's own self-test, which is a different subject from the scan above: that one
+# asserts every workflow goes THROUGH the wrapper, this one asserts the wrapper decides
+# correctly about a source once it is reached.
+#
+# It was unregistered until #1160. Twelve cases existed and nothing ran any of them, so
+# the allowlist shipped with the runner's actual layout untested and took every Linux job
+# down at `Install build tools` -- the ticket's acceptance asks that something FAIL when a
+# source is present and not removed, and a self-test no target invokes is not that
+# something. `ctest -R apt-sweep-selftest`.
+#
+# `SKIP_RETURN_CODE 77` is load-bearing rather than copied from its neighbours (#499):
+# case 4 arranges guard one with a read-only directory, which does not bite as root or on
+# a filesystem that ignores modes, and the run reports 77 when it could not be arranged.
+# Without the property that is a false RED on exactly those runners -- and on Windows,
+# where this suite runs and NTFS is one of them.
+add_test(
+    NAME "apt-sweep-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/ci-apt-update.sh" --self-test
+)
+set_tests_properties("apt-sweep-selftest" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 60
+)
+
 # `mkdocs build --strict` must be able to fail the way two files promise it does
 # (#560).
 #
