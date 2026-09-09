@@ -1,52 +1,550 @@
 #!/usr/bin/env bash
 # `apt-get update` that a third-party source cannot fail.
 #
-# The GitHub `ubuntu-24.04` image ships `packages.microsoft.com` PREINSTALLED.
-# Nothing in this repository wants anything from it, but `apt-get update` exits
-# non-zero when ANY configured source is unreachable -- so a 403 from that mirror
-# failed a step that only wanted `sccache` and `g++-14` from the Ubuntu archive
-# (#550).
+# The GitHub runner image ships vendor sources PREINSTALLED -- `packages.microsoft.com`
+# and `dl.google.com` among them. Nothing in this repository installs from either, but
+# `apt-get update` exits non-zero when ANY configured source is unreachable, so a 403
+# from Microsoft's mirror failed a step that only wanted the Ubuntu archive (#550), and
+# Google's Chrome source did the same thing again afterwards (#1160). It presents as an
+# unrelated red check on whatever branch happened to be building.
 #
-# The cost is not the 25 seconds a re-run takes. A red `clang-tidy` or a red
-# `Linux-clang-release` reads as "this change broke something", and it is
-# indistinguishable from a real failure until somebody opens the log. Established
-# as a flake by an A/B inside ONE run: two jobs with byte-identical install steps,
-# same image, same moment -- one passed, the other took the 403.
+# ## Why an ALLOWLIST of hosts, and not a longer list of vendors to remove
+#
+# This was a list of two named FILES until #1160, and the Chrome source walked straight
+# past it: the step printed `1 third-party source(s) removed of 2 known` and did exactly
+# what it was told while the job died on the vendor nobody had listed. A third row would
+# fix that vendor and leave the next one, and the runner image adds one whenever it likes.
+#
+# So the direction is inverted, on this project's own rule: **an exclusion list bets on
+# the world's layout; an inclusion list states your own.** `AllowedHosts` is the whole set
+# of hosts this repository installs from, and anything else configured on the runner is
+# removed unread. That keeps the old header's claim and strengthens it -- it used to say
+# *nothing we ask for comes from these vendors*, which is a claim about them, and now says
+# *everything we ask for comes from these hosts*, which is a claim about us.
+#
+# A file this parser can read no host out of is removed too. Keeping it would be the #1160
+# failure exactly: a source nobody decided about, surviving in silence. Over-removal is the
+# safe direction here only because `VerifyArchiveSurvives` below turns it into a refusal.
 #
 # ## What this does NOT do
 #
-# It does not make `apt-get update` tolerant. A failure of the UBUNTU ARCHIVE is
-# still fatal, because that one means the install below cannot work and a job that
-# continued would fail later and less clearly. Only sources this repository does
-# not use are removed, and they are removed BEFORE the update rather than having
-# their errors ignored afterwards -- ignoring errors is how a real archive failure
-# becomes a silent one.
+# It does not make `apt-get update` tolerant. A failure of the UBUNTU ARCHIVE is still
+# fatal, because that one means the install that follows cannot work, and a job that
+# continued would fail later and less clearly. Sources are removed BEFORE the update rather
+# than having their errors ignored afterwards -- ignoring apt errors is how a real archive
+# failure becomes a silent one.
 #
-# ## Why a script rather than a step
+# It does not touch `/etc/apt/sources.list`. That file is the distribution's own; vendor
+# packages drop files in `sources.list.d/`, which is the whole population this sweeps.
 #
-# Eleven `apt-get update` call sites in `build.yml`, and this tree has no
-# `.github/actions/`, no `workflow_call` and no local `uses: ./`, so a composite
-# action would be the first of its kind. A script is a home the next Linux job can
-# reach, and `check-apt-update.sh` refuses a workflow that calls `apt-get update`
-# directly -- which is what stops the next job added from missing it.
+# And it does not trust its own sweep, because the failure it replaces was silent in
+# exactly the way a `-e` test on a guessed filename is silent -- the step reports success
+# whether or not anything happened. Two guards run afterwards and REFUSE rather than tally:
+#
+#   * `VerifySwept` -- nothing outside `AllowedHosts` may survive. A removal that did not
+#     happen (no permission, a read-only tree, a format this parser cannot read) looks
+#     exactly like a removal that was never needed, and that is the bug this file is about.
+#   * `VerifyArchiveSurvives` -- an Ubuntu archive source must still be there. If the
+#     allowlist is wrong about this image's layout, `apt-get update` would otherwise
+#     succeed against a partial index and the install would fail later, somewhere else.
+#
+# ## Why a script rather than a workflow step
+#
+# Eleven `apt-get update` call sites in `build.yml`, and `scripts/check-apt-update.sh`
+# refuses a workflow that calls `apt-get update` directly -- which is what stops the
+# twelfth call site from missing this.
+#
+# bash 3.2: macOS ships a 2007 /bin/bash and the self-test runs in the default ctest set.
+#
+# Usage:
+#   bash scripts/ci-apt-update.sh
+#   bash scripts/ci-apt-update.sh --self-test
+#   bash scripts/ci-apt-update.sh --apt-root <dir> --sweep-only   # against a tree you own
 set -euo pipefail
 
-# Sources this repository never installs from. Removed, not ignored: an entry here
-# is a claim that nothing we ask for comes from it.
-ThirdParty=(
-    /etc/apt/sources.list.d/microsoft-prod.list
-    /etc/apt/sources.list.d/microsoft.list
-)
+# Hosts this repository is willing to install from. An entry here is a claim that a job
+# here asks this host for packages; anything not named is removed from the runner.
+#
+# Derived from a real run rather than guessed -- every apt source contacted across run
+# 34368983218 (master, 071f7079, 2026-09-09), counted off the `Get:`/`Hit:` lines:
+#
+#     229  azure.archive.ubuntu.com     the Ubuntu archive
+#     118  apt.llvm.org                 clang/clang-tidy at the pinned version
+#      25  dl.google.com                nobody asked for this -- #1160
+#       4  packages.microsoft.com       nobody asked for this -- #550
+#
+# That census is correct about hosts and was BLIND to how the archive is configured, which
+# is what the first real run of this allowlist then failed on. Its pattern was "hostnames
+# on `Get:`/`Hit:` lines", and the line that mattered names no host:
+#
+#     Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+#
+# The four Ubuntu hosts below are reached THROUGH that file, not named in any source. A
+# census states its pattern, not only its number, and this one's pattern could not see the
+# indirection it was being read to justify. `SourceFilesFor` is what follows it.
+#
+# `apt.llvm.org` is on the list because five jobs install clang from it through
+# `llvm.sh`. Today every `ci-apt-update.sh` call happens to run BEFORE its job's
+# `llvm.sh`, so the source is not yet configured when the sweep runs and omitting it
+# would change nothing -- which is exactly why it must be named anyway. Relying on that
+# ordering is a bet on the workflow's layout, and a second wrapper call added after an
+# LLVM install would silently sweep the source the next step needs. Its outage CAN now
+# fail a job, and that is correct: we genuinely cannot build without clang, which is the
+# whole distinction this file draws.
+#
+# The four Ubuntu rows are one archive under the spelling a given image picks: Azure-
+# hosted runners answer everything from `azure.archive.ubuntu.com`, a plain image splits
+# security out, and arm64 is served from `ports`. Only the first is contacted today.
+AllowedHosts="
+archive.ubuntu.com
+azure.archive.ubuntu.com
+security.ubuntu.com
+esm.ubuntu.com
+ports.ubuntu.com
+apt.llvm.org
+"
 
-removed=0
-for source in "${ThirdParty[@]}"; do
-    if [ -e "$source" ]; then
-        sudo rm -f "$source"
-        echo "ci-apt-update: removed $source (unused here, and its outages are ours to eat otherwise)"
-        removed=$((removed + 1))
-    fi
+AptRoot=/etc/apt
+Sudo=sudo
+SelfTest=0
+SweepOnly=0
+
+while [ $# -gt 0 ]; do
+    case "${1:-}" in
+        --self-test)
+            SelfTest=1; shift ;;
+        --sweep-only)
+            SweepOnly=1; shift ;;
+        --apt-root)
+            # Relocating the tree is how the self-test drives the REAL logic instead of a
+            # fixture reimplementing it. A tree you name is a tree you own, so no sudo.
+            AptRoot="${2:-}"; Sudo=""; shift 2 ;;
+        *)
+            printf 'ci-apt-update: unknown argument: %s\n' "${1:-}" >&2; exit 2 ;;
+    esac
 done
-echo "ci-apt-update: ${removed} third-party source(s) removed of ${#ThirdParty[@]} known"
+
+SourcesDir="${AptRoot}/sources.list.d"
+MainSourcesList="${AptRoot}/sources.list"
+
+Refuse() {
+    printf 'ci-apt-update: REFUSED: %s\n' "$1" >&2
+    exit 1
+}
+
+# Every URL-ish token in a file, one per line, full-line comments stripped first. A COMMENT
+# is not a call site, and apt does not read one either -- a vendor file mentioning the
+# Ubuntu archive in a comment must not read as ours, which is the direction that would
+# keep it.
+#
+# `file:` is matched alongside `http`/`https` because a source may name its URIs
+# INDIRECTLY; see `SourceFilesFor`. Its slash run is `/+` rather than `//` for the same
+# reason -- `mirror+file:/etc/apt/apt-mirrors.txt` has one.
+# $1: file to read
+UrlTokensIn() {
+    # No `producer | grep -q` and no bare pipeline verdict: under `pipefail` a `grep`
+    # finding nothing fails the pipeline, and an empty answer here is meaningful.
+    sed -e 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null \
+        | grep -oE '(mirror\+)?(https?|file):/+[^[:space:]"]+' || true
+}
+
+# Every file whose http(s) URLs describe what a source actually fetches: the source file
+# itself, plus any mirrorlist it points at.
+#
+# The indirection is not a corner case, it is the layout of the runner this script exists
+# to run on. A GitHub-hosted Ubuntu image ships the archive as deb822 naming
+# `mirror+file:/etc/apt/apt-mirrors.txt`, and the hosts are one level down in that file.
+# A parser reading only the source file finds NO host in it, `IsOurs` answers false, and
+# the sweep removes the Ubuntu archive -- which is what `VerifyArchiveSurvives` caught on
+# the first real run of the allowlist, and what case 10 pins.
+#
+# ONE level, deliberately. It is the depth the image uses, and a bounded walk cannot loop
+# on a mirrorlist that names itself. A path this cannot read contributes no host rather
+# than an objection, so the file falls to the same "names none" rule as any other -- the
+# over-removal direction, which guard two turns into a refusal.
+# $1: source file to read
+SourceFilesFor() {
+    local token path
+    printf '%s\n' "$1"
+    for token in $(UrlTokensIn "$1"); do
+        case "$token" in
+            *file:*)
+                path=$(printf '%s' "$token" | sed -e 's#^.*file:/*#/#')
+                if [ -f "$path" ]; then
+                    printf '%s\n' "$path"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Every host a source file names, one per line. Handles the one-line `deb` format, deb822
+# `URIs:` and a `mirror+file:` indirection alike.
+# Prints nothing for a file that names none -- which the caller treats as a REASON to
+# remove, never as "no objection".
+# $1: file to read
+HostsIn() {
+    local file urls all
+    all=""
+    for file in $(SourceFilesFor "$1"); do
+        urls=$(UrlTokensIn "$file" | grep -E '^https?://' || true)
+        if [ -n "$urls" ]; then
+            all="${all}${urls}
+"
+        fi
+    done
+    [ -n "$all" ] || return 0
+    printf '%s' "$all" \
+        | sed -e 's#^[a-z][a-z]*://##' -e 's#^[^/@]*@##' -e 's#/.*$##' -e 's#:[0-9][0-9]*$##' \
+        | sort -u
+}
+
+# $1: host. Exit 0 when it is a host this repository installs from.
+IsAllowed() {
+    local candidate
+    for candidate in $AllowedHosts; do
+        if [ "$1" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Exit 0 when the file names only allowed hosts AND names at least one.
+# $1: file to read
+IsOurs() {
+    local host found
+    found=0
+    for host in $(HostsIn "$1"); do
+        found=1
+        IsAllowed "$host" || return 1
+    done
+    [ "$found" -eq 1 ]
+}
+
+SweptCount=0
+KeptCount=0
+# Decided-to-remove-and-still-here is its own state, not a missing removal and not a keep.
+# Folding it into either would undercount the total in exactly the case that matters, and
+# a tally that cannot count the failure is the shape of the bug this file is about.
+StuckCount=0
+
+SweepSources() {
+    local file
+    SweptCount=0
+    KeptCount=0
+    StuckCount=0
+    [ -d "$SourcesDir" ] || return 0
+
+    for file in "$SourcesDir"/*.list "$SourcesDir"/*.sources; do
+        [ -e "$file" ] || continue
+        if IsOurs "$file"; then
+            KeptCount=$((KeptCount + 1))
+            continue
+        fi
+        # The removal's exit status is deliberately NOT the verdict. `VerifySwept` re-reads
+        # the tree afterwards, which is strictly stronger: it also catches an `rm` that
+        # reported success over a file that is still there.
+        $Sudo rm -f "$file" 2>/dev/null || true
+        if [ -e "$file" ]; then
+            StuckCount=$((StuckCount + 1))
+            continue
+        fi
+        printf 'ci-apt-update: removed %s (not a host this repository installs from)\n' "$file"
+        SweptCount=$((SweptCount + 1))
+    done
+}
+
+# GUARD ONE. Nothing this repository does not install from may survive the sweep.
+VerifySwept() {
+    local file hosts
+    [ -d "$SourcesDir" ] || return 0
+    for file in "$SourcesDir"/*.list "$SourcesDir"/*.sources; do
+        [ -e "$file" ] || continue
+        IsOurs "$file" && continue
+        hosts=$(HostsIn "$file" | tr '\n' ' ')
+        [ -n "$hosts" ] || hosts="(none this parser can read)"
+        Refuse "${file} survived the sweep, naming: ${hosts}
+       The sweep decided to remove it and it is still here, so removing it by hand is not
+       the fix -- find out why. A source left standing is an outage this repository eats
+       for a vendor it never asked for, which is the whole of #1160."
+    done
+}
+
+# GUARD TWO. The Ubuntu archive must have survived, or the allowlist is wrong about this
+# image and `apt-get update` below would succeed against nothing.
+VerifyArchiveSurvives() {
+    local file host
+    for file in "$SourcesDir"/*.list "$SourcesDir"/*.sources "$MainSourcesList"; do
+        [ -e "$file" ] || continue
+        for host in $(HostsIn "$file"); do
+            case "$host" in
+                *.ubuntu.com|ubuntu.com) return 0 ;;
+            esac
+        done
+    done
+    Refuse "no Ubuntu archive source survives in ${SourcesDir} or ${MainSourcesList}.
+       Either the sweep removed something it should not have, or this image does not lay
+       its sources out where this script looks. Either way \`apt-get update\` would now
+       succeed against a partial index and the install would fail later and less clearly,
+       which is the failure this script exists to prevent."
+}
+
+# ---------------------------------------------------------------------------
+# Self-test.
+#
+# Every case drives THIS script over a tree it owns, through `--apt-root`. A fixture that
+# reimplemented the sweep would be a second thing to be wrong rather than a test of this
+# one. Each case states which of the two guards, or which behaviour, it establishes.
+# ---------------------------------------------------------------------------
+
+SelfTestCases=0
+# A case that could not be ARRANGED is not a case that passed and not one that failed, and
+# it is not one that was never reached either. Counting it separately is what lets the run
+# end with a tally that distinguishes all three -- see the note on `return 77` below.
+SelfTestUnarrangeable=0
+SelfTestTmp=""
+
+# $1: directory to build an apt root in. Plants a healthy Ubuntu source in deb822 form.
+StageRoot() {
+    mkdir -p "$1/sources.list.d"
+    printf 'Types: deb\nURIs: http://azure.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\n' \
+        > "$1/sources.list.d/ubuntu.sources"
+}
+
+Ok()  { SelfTestCases=$((SelfTestCases + 1)); printf 'ok   %s\n' "$1"; }
+Bad() { printf 'FAIL %s\n' "$1"; [ -z "${2:-}" ] || printf '%s\n' "$2" | sed 's/^/     /'; exit 1; }
+
+RunSelfTest() {
+    local tmp out rc arrangeable
+    tmp=$(mktemp -d) || { printf 'ci-apt-update: mktemp failed\n' >&2; exit 1; }
+    SelfTestTmp="$tmp"
+    trap 'chmod u+w "$SelfTestTmp"/d/sources.list.d 2>/dev/null || true; rm -rf "$SelfTestTmp"' EXIT
+
+    # Case 1 -- the vendor that caused #1160. The whole point of the ticket.
+    StageRoot "$tmp/a"
+    printf 'deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/a/sources.list.d/google-chrome.list"
+    out=$(bash "$0" --apt-root "$tmp/a" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/a/sources.list.d/google-chrome.list" ] \
+        && [ -e "$tmp/a/sources.list.d/ubuntu.sources" ]; then
+        Ok "case 1: the Chrome source is removed and the Ubuntu source is kept"
+    else
+        Bad "case 1: rc=$rc" "$out"
+    fi
+
+    # Case 2 -- the vendor the two named rows already handled, kept so the inversion is
+    # shown not to have lost the case it replaced.
+    StageRoot "$tmp/b"
+    printf 'deb [arch=amd64] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n' \
+        > "$tmp/b/sources.list.d/microsoft-prod.list"
+    out=$(bash "$0" --apt-root "$tmp/b" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/b/sources.list.d/microsoft-prod.list" ]; then
+        Ok "case 2: the source the named-file version handled is still handled"
+    else
+        Bad "case 2: rc=$rc" "$out"
+    fi
+
+    # Case 3 -- a vendor on nobody's list. This is the case a named table cannot have, and
+    # the only reason to prefer an allowlist at all.
+    StageRoot "$tmp/c"
+    printf 'deb https://apt.example-vendor.invalid/repo noble main\n' \
+        > "$tmp/c/sources.list.d/some-future-vendor.list"
+    out=$(bash "$0" --apt-root "$tmp/c" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/c/sources.list.d/some-future-vendor.list" ]; then
+        Ok "case 3: a vendor named on no list is removed, which a named table cannot do"
+    else
+        Bad "case 3: rc=$rc" "$out"
+    fi
+
+    # Case 4 -- GUARD ONE, disallowed host. The requirement this ticket turns on: something
+    # must FAIL when the source is present and not removed. Arranged with a read-only
+    # parent, and the arrangement is MEASURED rather than assumed -- as root, or on a
+    # filesystem that ignores modes, `chmod a-w` does not bite and the case would pass for
+    # the wrong reason, which is the defect this whole file is about.
+    StageRoot "$tmp/d"
+    printf 'deb https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/d/sources.list.d/google-chrome.list"
+    chmod a-w "$tmp/d/sources.list.d"
+    if touch "$tmp/d/sources.list.d/.arrangement-canary" 2>/dev/null; then
+        arrangeable=0
+        rm -f "$tmp/d/sources.list.d/.arrangement-canary" 2>/dev/null || true
+    else
+        arrangeable=1
+    fi
+    if [ "$arrangeable" -eq 1 ]; then
+        out=$(bash "$0" --apt-root "$tmp/d" --sweep-only 2>&1) && rc=0 || rc=$?
+        chmod u+w "$tmp/d/sources.list.d"
+        case "$out" in
+            *"survived the sweep, naming: dl.google.com"*) : ;;
+            *) Bad "case 4: guard one did not name the survivor (rc=$rc)" "$out" ;;
+        esac
+        [ "$rc" -ne 0 ] || Bad "case 4: guard one printed its complaint and exited 0" "$out"
+        Ok "case 4: a source the sweep could not remove is a REFUSAL, not a tally"
+    else
+        chmod u+w "$tmp/d/sources.list.d" 2>/dev/null || true
+        SelfTestUnarrangeable=$((SelfTestUnarrangeable + 1))
+        printf 'SKIP case 4: a read-only directory does not bite here (root, or a filesystem\n'
+        printf '     that ignores modes), so guard one could not be arranged. This run does NOT\n'
+        printf '     establish the property #1160 is about. Re-run as a non-root user on a\n'
+        printf '     filesystem that honours permissions.\n'
+        # Falls THROUGH rather than returning. Returning here ended the run at case 4, so on
+        # Windows and as root the eight cases after it never executed while the tally said
+        # `3 case(s) ran, 1 could not be arranged` -- true, and silent about the eight. That
+        # is unstarted rendered as skipped, and it is why the mirrorlist cases below could
+        # not be exercised on the machine this fix was written on.
+    fi
+
+    # Case 5 -- GUARD ONE, unreadable survivor. A directory named like a source file cannot
+    # be removed by `rm -f` for ANY user, so this arm always bites. It also pins the
+    # decision that a file naming no readable host is removed rather than silently kept.
+    StageRoot "$tmp/e"
+    mkdir -p "$tmp/e/sources.list.d/opaque.list"
+    out=$(bash "$0" --apt-root "$tmp/e" --sweep-only 2>&1) && rc=0 || rc=$?
+    case "$out" in
+        *"survived the sweep, naming: (none this parser can read)"*) : ;;
+        *) Bad "case 5: an unreadable survivor was not refused (rc=$rc)" "$out" ;;
+    esac
+    [ "$rc" -ne 0 ] || Bad "case 5: exited 0 while complaining" "$out"
+    Ok "case 5: a source this parser cannot read is removed, and refused if it survives"
+
+    # Case 6 -- GUARD TWO. An allowlist that is wrong about the image's layout must refuse
+    # rather than leave apt updating against nothing.
+    mkdir -p "$tmp/f/sources.list.d"
+    printf 'deb https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/f/sources.list.d/google-chrome.list"
+    out=$(bash "$0" --apt-root "$tmp/f" --sweep-only 2>&1) && rc=0 || rc=$?
+    case "$out" in
+        *"no Ubuntu archive source survives"*) : ;;
+        *) Bad "case 6: guard two did not fire (rc=$rc)" "$out" ;;
+    esac
+    [ "$rc" -ne 0 ] || Bad "case 6: exited 0 while complaining" "$out"
+    Ok "case 6: a sweep that leaves no Ubuntu archive is a REFUSAL"
+
+    # Case 7 -- the passing direction. A guard nobody has watched ACCEPT is not known to
+    # work (#1031), and this one refuses on two independent conditions.
+    StageRoot "$tmp/g"
+    printf 'deb http://security.ubuntu.com/ubuntu noble-security main\n' \
+        > "$tmp/g/sources.list.d/security.list"
+    out=$(bash "$0" --apt-root "$tmp/g" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -e "$tmp/g/sources.list.d/ubuntu.sources" ] \
+        && [ -e "$tmp/g/sources.list.d/security.list" ]; then
+        Ok "case 7: an already-clean tree is accepted and nothing is removed"
+    else
+        Bad "case 7: a clean tree was refused or lost a source (rc=$rc)" "$out"
+    fi
+
+    # Case 8 -- the main sources.list is the distribution's and is never swept, and it can
+    # satisfy guard two on its own. That is the layout of the runner image this runs on.
+    mkdir -p "$tmp/h/sources.list.d"
+    printf 'deb http://azure.archive.ubuntu.com/ubuntu noble main\n' > "$tmp/h/sources.list"
+    printf 'deb https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/h/sources.list.d/google-chrome.list"
+    out=$(bash "$0" --apt-root "$tmp/h" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -e "$tmp/h/sources.list" ] \
+        && [ ! -e "$tmp/h/sources.list.d/google-chrome.list" ]; then
+        Ok "case 8: sources.list is untouched and satisfies guard two by itself"
+    else
+        Bad "case 8: rc=$rc" "$out"
+    fi
+
+    # Case 9 -- the LLVM source SURVIVES. Five jobs install clang from apt.llvm.org, and
+    # the only thing standing between this sweep and removing it today is that every
+    # wrapper call happens to run before its job's `llvm.sh`. This pins the allowlist row
+    # rather than the ordering, so moving a call site cannot quietly break the clang
+    # install.
+    StageRoot "$tmp/i"
+    printf 'deb https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main\n' \
+        > "$tmp/i/sources.list.d/llvm.list"
+    out=$(bash "$0" --apt-root "$tmp/i" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -e "$tmp/i/sources.list.d/llvm.list" ]; then
+        Ok "case 9: the LLVM source a clang job needs is kept, not swept"
+    else
+        Bad "case 9: rc=$rc" "$out"
+    fi
+
+    # Case 10 -- the layout of the runner this actually runs on. The archive is deb822
+    # naming `mirror+file:`, and its hosts are one level down in the mirrorlist. This is
+    # the case the allowlist shipped without: on its first real run the sweep removed
+    # `ubuntu.sources`, guard two refused, and every Linux job died at `Install build
+    # tools`. Without `SourceFilesFor` this case FAILS -- the source names no host the
+    # parser can read, so it is swept and guard two fires.
+    mkdir -p "$tmp/j/sources.list.d"
+    printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\n' \
+        > "$tmp/j/apt-mirrors.txt"
+    printf 'Types: deb\nURIs: mirror+file:%s/apt-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/j" > "$tmp/j/sources.list.d/ubuntu.sources"
+    printf 'deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main\n' \
+        > "$tmp/j/sources.list.d/google-chrome.list"
+    out=$(bash "$0" --apt-root "$tmp/j" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -e "$tmp/j/sources.list.d/ubuntu.sources" ] \
+        && [ ! -e "$tmp/j/sources.list.d/google-chrome.list" ]; then
+        Ok "case 10: an archive reached through mirror+file: is kept, and the vendor beside it swept"
+    else
+        Bad "case 10: rc=$rc" "$out"
+    fi
+
+    # Case 11 -- the OTHER direction, and the reason case 10 is not sufficient on its own.
+    # Following an indirection must not become a hole in the allowlist: a mirrorlist naming
+    # a host nobody allowed is still a source this repository does not install from. A
+    # `SourceFilesFor` that returned the mirrorlist's hosts as automatically ours, or one
+    # that kept any file it could not resolve, passes case 10 and fails here.
+    mkdir -p "$tmp/k/sources.list.d"
+    printf 'deb http://azure.archive.ubuntu.com/ubuntu noble main\n' > "$tmp/k/sources.list"
+    printf 'https://apt.example-vendor.invalid/repo\n' > "$tmp/k/vendor-mirrors.txt"
+    printf 'Types: deb\nURIs: mirror+file:%s/vendor-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/k" > "$tmp/k/sources.list.d/vendor.sources"
+    out=$(bash "$0" --apt-root "$tmp/k" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/k/sources.list.d/vendor.sources" ]; then
+        Ok "case 11: a mirrorlist naming a disallowed host is swept, not admitted by the indirection"
+    else
+        Bad "case 11: rc=$rc" "$out"
+    fi
+
+    # Case 12 -- an indirection this cannot follow names no host, so the file is removed by
+    # the same rule as any other unreadable source, and guard two is what makes that safe.
+    # Pins the decision rather than leaving it to fall out of the parser: keeping such a
+    # file would be #1160 exactly, a source nobody decided about surviving in silence.
+    mkdir -p "$tmp/l/sources.list.d"
+    printf 'deb http://azure.archive.ubuntu.com/ubuntu noble main\n' > "$tmp/l/sources.list"
+    printf 'Types: deb\nURIs: mirror+file:%s/nonexistent-mirrors.txt\nSuites: noble\nComponents: main\n' \
+        "$tmp/l" > "$tmp/l/sources.list.d/dangling.sources"
+    out=$(bash "$0" --apt-root "$tmp/l" --sweep-only 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ ! -e "$tmp/l/sources.list.d/dangling.sources" ]; then
+        Ok "case 12: a mirrorlist that cannot be read names no host, so its source is removed"
+    else
+        Bad "case 12: rc=$rc" "$out"
+    fi
+
+    if [ "$SelfTestUnarrangeable" -gt 0 ]; then
+        printf '\nself-test: %d case(s) ran and passed, %d could not be arranged\n' \
+            "$SelfTestCases" "$SelfTestUnarrangeable"
+        # 77 is the script-driven skip convention, and it is right even though most cases
+        # passed: guard one is the property #1160 turns on, so a run that could not arrange
+        # it has not established what this file is for. The other cases still RAN, which is
+        # the half the old early return threw away.
+        return 77
+    fi
+    printf '\nself-test: %d case(s) ran, all passed\n' "$SelfTestCases"
+    return 0
+}
+
+if [ "$SelfTest" -eq 1 ]; then
+    RunSelfTest
+    exit $?
+fi
+
+SweepSources
+# What was FOUND and what was REMOVED, with no denominator. `removed 1 of 2 known` was a
+# tally against the size of a hand-kept table, which is why it read as thorough while the
+# vendor that failed the job was not in the table at all. There is no fixed M here: the
+# population is whatever the image configured, and that is the number worth printing.
+printf 'ci-apt-update: %d source(s) found, %d removed, %d kept, %d could not be removed\n' \
+    "$((SweptCount + KeptCount + StuckCount))" "$SweptCount" "$KeptCount" "$StuckCount"
+VerifySwept
+VerifyArchiveSurvives
+
+[ "$SweepOnly" -eq 0 ] || exit 0
 
 # The Ubuntu archive is still allowed to fail the job, loudly.
-sudo apt-get update
+$Sudo apt-get update
