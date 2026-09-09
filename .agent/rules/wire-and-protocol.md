@@ -1955,10 +1955,16 @@ consequence rather than a precaution.
   completion in `IocpSocket`'s I/O core, on a platform nobody in this run can compile.
   The ticket carries the mechanism and the acceptance, and the residual is stated on
   `CancelRead` itself rather than only here.
-- **[#711](https://github.com/LASTRADA-Software/fastcached/issues/711)** — three
-  comment blocks in `src/apps/fastcache-compile-node/` still state the pre-#671
-  doctrine and the pre-#677 socket behaviour. Listed here rather than only with the
-  compile surface because what they contradict is the EOF rule above, and because one
-  of them is the stated reason that surface takes "the opposite rule" — a contrast
-  that no longer exists.
+- **[#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090)** —
+  `WatchPeer`'s 512-byte probe `Read`, `PeerWatch::pulled` and the `ByteReader`
+  priming that undoes the consumption exist to tell a readable edge from EOF.
+  `WaitReadable` has answered that directly since #677 — `0` for EOF, `>0` for data,
+  consuming nothing — on all five overrides, IOCP included, which does the peek in
+  `Dispatch` under `readPeekOnly`. So the mechanism is redundant rather than wrong:
+  it reaches the same verdict one syscall later, and the EOF path runs through it to
+  no effect. Listed here because what justified it was a claim about the EOF rule
+  above. Its own acceptance carries the constraint that matters — the collapse to a
+  single `!readable.has_value() || *readable == 0` cannot tell an error from a zero,
+  which is the distinction #1092 would need, so whichever lands second has to know
+  about the other.
 

@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/AbortiveClient.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -261,12 +262,21 @@ constexpr auto WatchWait = 15s;
 /// a 5 ms request costs about 15 ms -- so a hand-rolled `3000 x 5ms` reads as 15 s and
 /// waits nearer 45. `DrainWithin` reads a clock instead. Blocking is right here: this
 /// runs on the Catch2 thread, never on a reactor.
+/// The ceiling is a PARAMETER because a helper that bakes one in is a helper the next
+/// wait cannot use, and what that author writes instead is the loop this replaces. The
+/// sweep cases here need 30 s and 60 s -- a count is deliberately not stated, since a
+/// figure beside a set of call sites is a second source of truth that drifts -- so the
+/// only options were to raise `WatchWait` for every caller or to hand-roll, and
+/// hand-rolling loses the `DrainResult`, which is the one thing a spin cannot recover:
+/// *the condition held* and *the ceiling ran out* are different failures, and a loop
+/// has no result to keep them apart.
 /// @param ready What is being waited for; called until it answers true.
-/// @return True when it happened inside `WatchWait`, false when it never did.
+/// @param ceiling How long to keep asking. Defaults to `WatchWait`.
+/// @return True when it happened inside @p ceiling, false when it never did.
 template <std::predicate Predicate>
-[[nodiscard]] bool WaitFor(Predicate ready)
+[[nodiscard]] bool WaitFor(Predicate ready, std::chrono::milliseconds ceiling = WatchWait)
 {
-    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = WatchWait, .poll = 5ms })
+    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = ceiling, .poll = 5ms })
            == DrainResult::Drained;
 }
 
@@ -1427,16 +1437,14 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
 
     // First client: reaches the responder and is held there.
     auto first = std::async(std::launch::async, [port] { return Exchange(port, Fetch("first")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
     REQUIRE(responder.Answered() == 0);
 
     // Second client, while the first is still held. It must reach the responder --
     // which is what serialization made impossible.
     auto second = std::async(std::launch::async, [port] { return Exchange(port, Fetch("second")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     CHECK(responder.Entered() == 2);
 
     responder.Hold(false);
@@ -1769,8 +1777,7 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
     REQUIRE(declared > 0); // Or the assertions below hold vacuously.
 
     auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
     // Released BEFORE the answer began. Read from inside `Answer`, which is the
@@ -1817,8 +1824,7 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
     auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
 
     auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
     auto const atEntry = responder.InFlightAtEntry();
@@ -1869,16 +1875,14 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     // Two long answers in flight, which under the defect is the whole budget spent.
     auto firstBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
     auto secondBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     REQUIRE(responder.Entered() == 2);
 
     // The small verb: a heartbeat's shape, arriving while both compiles run. It must
     // REACH the responder -- passing the budget gate is exactly what it could not do
     // under the defect, and a refusal is answered before `Answer` is entered at all.
     auto small = std::async(std::launch::async, [port] { return Exchange(port, Fetch("k")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 3; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 3; })); // waited for: the third answer to begin
     CHECK(responder.Entered() == 3);
 
     responder.Hold(false);
@@ -1951,20 +1955,20 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     // ONE wait for both, bounded and reporting what it waited for. The bound is
     // generous against `HeaderTimeout` plus a sweep interval, because what this case
     // asserts is which counter moved and never how fast.
-    auto const deadline = std::chrono::steady_clock::now() + 60s;
     auto requests = requestsBefore;
     auto answers = answersBefore;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        requests = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
-        answers = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
-        if (requests > requestsBefore && answers > answersBefore)
-            break;
-        std::this_thread::sleep_for(100ms);
-    }
+    auto const swept = WaitFor(
+        [&] {
+            requests = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
+            answers = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            return requests > requestsBefore && answers > answersBefore;
+        },
+        60s); // waited for: both rows to move
 
     INFO("request-deadline sweeps: " << requests << " (was " << requestsBefore << ")");
     INFO("answer-deadline sweeps: " << answers << " (was " << answersBefore << ")");
+
+    REQUIRE(swept); // separately from the readings below; see `WaitFor`
 
     // Each arm raised its OWN row, exactly once. Asserted as equality rather than as
     // "rose", because a conflated implementation that raised both rows for both peers
@@ -2084,23 +2088,24 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
 
     // Arm one must actually be INSIDE the responder before the sweep, or it is arm two
     // in disguise. Bounded, and it says which stage it was waiting for.
-    auto const entered = std::chrono::steady_clock::now() + 30s;
-    while (responder.Entered() < 1 && std::chrono::steady_clock::now() < entered)
-        std::this_thread::sleep_for(10ms);
-    REQUIRE(responder.Entered() >= 1);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; },
+                    30s)); // waited for: arm one to be inside the responder
 
     // Then both arms are swept. Bounded, generous against the sweep interval, and
     // asserting only that both were seen -- never how fast.
-    auto const deadline = std::chrono::steady_clock::now() + 60s;
     auto sweeps = sweepsBefore;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        sweeps = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
-        if (sweeps >= sweepsBefore + 2)
-            break;
-        std::this_thread::sleep_for(50ms);
-    }
+    auto const bothSwept = WaitFor(
+        [&] {
+            sweeps = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            return sweeps >= sweepsBefore + 2;
+        },
+        60s); // waited for: both arms to be swept
     INFO("answer-deadline sweeps: " << sweeps << " (was " << sweepsBefore << ")");
+    // The ceiling and the reading are asserted SEPARATELY: "it never swept" (the
+    // ceiling ran out) and "it swept the wrong number of times" are different
+    // failures, and only `DrainResult` keeps them apart -- the hand-rolled loop this
+    // replaces reported both as the latter.
+    REQUIRE(bothSwept);
     REQUIRE(sweeps == sweepsBefore + 2);
 
     // Released only now, so `Answer` returns AFTER the sweep. This is the instant the
@@ -2260,6 +2265,82 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     // The node's own teardown is not a client-side story: nothing this case does
     // after the delivery was abandoned may move the row again.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+}
+
+TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
+{
+    // The case above leaves by FIN, which reaches `WatchPeer` as `WaitReadable`
+    // answering `0`. This one leaves by RST, which reaches it as an ERROR -- the other
+    // arm, and the one #817 measured as exercised by nothing. Why the close has to be
+    // real rather than a fake returning an error is on `Testing::AbortiveClient`.
+    //
+    // **Runs on all three reactors**: nothing here is reactor-specific, the client
+    // being a plain BSD/Winsock socket and the verdict a counter.
+    //
+    // Asserts the same three rows as the FIN case above, and for its reason -- the
+    // watcher SAW the departure, the compiler still ran and this machine paid for it,
+    // and only the handover found nobody there. Folded, an abandoned delivery would
+    // read as a compile that never happened.
+    Fleet fleet;
+    HoldableResponder responder;
+    responder.UseReactor(fleet.io.Reactor());
+    responder.WatchPeerWhileAnswering(true);
+    responder.Hold(true);
+
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
+    auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
+    auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+
+    Testing::AbortiveClient client { port };
+    REQUIRE(client.Connected());
+    REQUIRE(client.Send(Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes")));
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
+
+    // The client is reset while the answer is still running -- a killed CI runner, a
+    // machine that lost its route, a process the kernel tore down without a FIN.
+    REQUIRE(client.Reset()); // the socket really was armed for an abortive close
+
+    // Waited for BEFORE the answer is released, which is #691's ordering fix: the
+    // departure and the answer are two reactor events with no order between them, so
+    // releasing first leaves the case asserting whichever won.
+    // Asked as EQUALITY rather than as "rose", for `RequireNoDepartureFiled`'s reason:
+    // a caller that grew a second watched connection then fails here instead of
+    // satisfying the wait on the wrong watcher.
+    REQUIRE(WaitFor([&fleet, observedBefore] {
+        return fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) == observedBefore + 1;
+    })); // waited for: the watcher to reach its verdict
+
+    responder.Hold(false);
+
+    // And the compile still completed, which is the half the title claims and the
+    // watcher cannot show. Bounded, and asserted after the release because that is
+    // when the answer is allowed to finish.
+    auto const recorded = WaitFor([&fleet, before] {
+        return fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == before + 1;
+    }); // waited for: the delivery to be recorded as abandoned
+
+    INFO("departure delta=" << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) - seenBefore)
+                            << "; observed delta="
+                            << (fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved) - observedBefore)
+                            << "; abandoned delta="
+                            << (fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) - before)
+                            << "; responder entered=" << responder.Entered() << " answered=" << responder.Answered());
+
+    // A reset peer is a departure exactly as a vanished one is: the watcher saw it, and
+    // it was filed rather than suppressed as a local close.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+
+    // The object was NOT written, and the compile was still paid for. Two rows,
+    // because folding them would let "the compiler never ran" pass as "the delivery
+    // was abandoned".
+    REQUIRE(recorded);
+    CHECK(responder.Answered() == 1);
 }
 
 /// Assert that a connection whose watcher has spoken filed no departure.
@@ -2518,11 +2599,17 @@ TEST_CASE("A connection this node closes at SHUTDOWN is not filed as a peer depa
 TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")
 {
     // **The clause that stops the fix being a worse bug than the one it closes**, and
-    // it is red twice over. A readable edge is EOF *or* pending data:
-    // `EpollSocket::WaitReadable` probes with `recv(MSG_PEEK)` and reports readiness
-    // for `got >= 0`, and IOCP's zero-byte `WSARecv` cannot separate the two either.
-    // So this fails against a watcher that reads the bytes and drops them, AND against
-    // one that calls any readable edge a disconnect and discards a good object.
+    // it is red twice over: this fails against a watcher that reads the bytes and drops
+    // them, AND against one that calls any readable edge a disconnect and discards a
+    // good object.
+    //
+    // It used to say the two were indistinguishable -- that `WaitReadable` reported
+    // readiness for `got >= 0` and IOCP could not separate them. #677 made that false
+    // and #711 corrected it here and at the three sites in `FrameEndpoint.{hpp,cpp}`
+    // that said the same thing. `WaitReadable` now answers `0` for EOF and `>0` for
+    // data on every transport, so what this case pins is no longer *that the watcher
+    // disambiguates* but *that it reaches the right verdict* -- which is the assertion
+    // that survives #1090 removing the probe `Read` the old wording justified.
     Fleet fleet;
     HoldableResponder responder;
     responder.UseReactor(fleet.io.Reactor());

@@ -581,21 +581,42 @@ class IFrameResponder
     /// here as a client that left: its object is not written and the counter names it
     /// as abandoned.
     ///
-    /// The opposite rule is taken one directory away, and states its reason:
-    /// `RedisResp`'s `ArmDisconnect` counts only a socket ERROR as a disconnect,
-    /// because on a surface whose loop still owns the reader, mere readability may be
-    /// a pipelined command or exactly this half-close. That rule cannot be taken here:
-    /// a killed client surfaces as EOF and not as an error -- which is the whole case
-    /// this watch is for -- so requiring an error would detect essentially nothing.
+    /// **The cache surface one directory away applies the SAME rule and reaches a
+    /// different outcome**, which is worth stating precisely because this paragraph
+    /// used to claim the opposite. It said `RedisResp`'s `ArmDisconnect` counted only
+    /// a socket ERROR as a disconnect, and offered that contrast as the REASON the
+    /// compile surface departs from it. #673 made that false: `ArmDisconnect` is
+    /// `if (!readable.has_value() || *readable == 0)` (`RedisResp.cpp`), because an
+    /// error is an abortive close while `0` is EOF -- the ORDINARY way a client leaves
+    /// -- so the error-only arm it used to have never once fired and leaked the socket
+    /// it existed to free.
+    ///
+    /// So there is no disagreement between the surfaces to justify. Both read EOF as
+    /// *this peer has finished sending*; what differs is what is already DETERMINED at
+    /// that moment. A cache command's reply is determined, so it is answered; a
+    /// compile's is not -- the object does not exist yet -- so there is nothing to
+    /// serve and the delivery is abandoned. One rule, two outcomes, and the wire is
+    /// what picks which.
     ///
     /// **The check that would falsify the trade-off**: does any client half-close after
-    /// sending? None in this tree can. `ISocket` has no `ShutdownWrite` at all --
-    /// `InMemorySocket` declares one, and its forty-odd users are tests standing in for
-    /// "the client is done sending" over the in-memory transport, never a production
-    /// socket. A third-party client speaking `0xFC` over a raw socket could, and would
-    /// lose distribution silently while this counter blamed it. If one ever does, the
-    /// answer is not to soften the rule -- it is that EOF-without-close needs a meaning
-    /// this wire agrees on, in one place, for both surfaces.
+    /// sending? None in this tree does -- and that is now an absence of exercise rather
+    /// than an impossibility, which is a materially weaker guard than this paragraph
+    /// used to claim.
+    ///
+    /// It said `ISocket` had no `ShutdownWrite` at all, so nothing here *could*
+    /// half-close. #671 put `ShutdownWrite` on the interface itself
+    /// (`ISocket.hpp`, virtual with a default no-op), precisely so the question would
+    /// be askable in production rather than only over the in-memory transport. So every
+    /// transport can half-close today; the reason this concession stays free is only
+    /// that no client in this tree chooses to.
+    ///
+    /// A reader who checks the old sentence finds it satisfied and stops. The current
+    /// check is the weaker one and has to be run rather than reasoned: does any caller
+    /// of a `0xFC` client actually call `ShutdownWrite` before awaiting its reply? A
+    /// third-party client speaking `0xFC` over a raw socket could, and would lose
+    /// distribution silently while this counter blamed it. If one ever does, the answer
+    /// is not to soften the rule -- it is that EOF-without-close needs a meaning this
+    /// wire agrees on, in one place, for both surfaces.
     ///
     /// ## Why it answers a COUNTER rather than a bool
     ///
