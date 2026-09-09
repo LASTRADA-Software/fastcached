@@ -2185,6 +2185,23 @@ and what they may assume.
   rule firing* — a mode bit is #723, an empty array under `set -u` is #793/#794 — and
   the empty array is deliberately NOT scanned: measured ~110 sites across 22 scripts,
   essentially all never-empty, and no regex can tell the two apart.
+- **A background helper in these scripts runs the fixture's CLEANUP until you have watched
+  it not.** Anything forked into the background inherits the shell's traps, and in a
+  fixture the EXIT trap IS the cleanup — so a helper signalled catchably `rm -rf`s the
+  workdir of the run still using it, and nothing in the failure names a trap, a timer or a
+  cleanup (`node-ready-waits-for-marker`, a third of runs, reported as *"cannot arm a 15s
+  deadline: not a directory"* — the SECOND wait refusing because the FIRST wait's timer had
+  deleted the directory). `trap - EXIT TERM INT HUP` first in the subshell is the fix
+  everybody reaches for and is **insufficient**: it covers a subshell that has STARTED, and
+  the window that fires is the one BEFORE that, because the disarm follows the arm by
+  microseconds and an inherited `trap 'exit 1' TERM` goes straight to the inherited EXIT
+  trap. Measured interleaved and order-alternated, `trap -` alone is 10/2 against an
+  unfixed 9/3 — indistinguishable — while `kill -KILL` is 12/0 against 7/5. BOTH guards
+  stay, each naming the window it closes, or the redundant-looking one is deleted. It is
+  also VERSION-DEPENDENT: on bash 5.2 a background subshell runs no inherited EXIT trap and
+  the shape does not reproduce at all, so this lives on macOS's 3.2 and a green Linux run
+  is not evidence. Two standalone probes reproduced none of it — the first having sent the
+  subshell's output to `/dev/null`, which is where its evidence went.
 - A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
   `OnCompile` places the interleaving rather than waiting for one. It is in
   `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library

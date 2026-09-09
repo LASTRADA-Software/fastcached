@@ -1820,6 +1820,41 @@ if(NOT WIN32)
         NAME "e2e-helpers-selftest"
         COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
     )
+    # Neither guard against a background helper running the fixture's cleanup may be
+    # removed (#1084).
+    #
+    # A background subshell inherits the shell's traps, and in a fixture the EXIT trap IS
+    # the cleanup -- so a helper signalled catchably `rm -rf`s the workdir the caller is
+    # still using. It presented as `node-ready-waits-for-marker` failing about a third of
+    # the time with `cannot arm a 15s deadline: not a directory`, which names no trap, no
+    # timer and no cleanup.
+    #
+    # The fix is TWO guards for TWO windows and only the second is load-bearing, so the
+    # first looks redundant and is what a reader deletes: measured interleaved and
+    # order-alternated, `trap -` ALONE is 10 pass / 2 fail against an unfixed 9 / 3, while
+    # `kill -KILL` is 12 / 0 against 7 / 5. This asserts both are still there.
+    #
+    # It is a PRESENCE scan and not a behavioural test, stated rather than glossed: the
+    # inheritance is version-dependent, and on bash 5.2 a background subshell runs no
+    # inherited EXIT trap at all, so the shape cannot be reproduced on any Linux or
+    # Windows host here. macOS's 3.2 is where it lives. Both guards were shown red by
+    # removing each from the real library in turn.
+    add_test(
+        NAME "fixture-cleanup-guards"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-fixture-cleanup-guards.sh"
+    )
+    set_tests_properties("fixture-cleanup-guards" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+    add_test(
+        NAME "fixture-cleanup-guards-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-fixture-cleanup-guards.sh" --self-test
+    )
+    set_tests_properties("fixture-cleanup-guards-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
     # It stages several deliberate timeouts of a couple of seconds each, one
     # four-second wait that must really take four seconds -- the check that the
     # bound comes from a clock rather than from an iteration count -- and one
