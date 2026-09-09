@@ -21,6 +21,14 @@ namespace FastCache::Cc
 /// The two lists these distinguish are adjacent and both hold path-shaped
 /// strings, so a dependency path must not be able to read as a trailing
 /// argument.
+///
+/// **ORDINALS ARE A SHARED-KEY CONTRACT. Append only; never insert, reorder or
+/// reuse.** (#308) The byte goes into the digest, so it is not decoded anywhere and
+/// no census of `static_cast<KeyPiece>(...)` can find it — every launcher in a fleet
+/// has to fold the same number or the same compile keys differently. Renumbering is
+/// the cheap direction (a fleet-wide miss); SWAPPING two is the expensive one, since
+/// two pieces this enum exists to keep apart then digest identically and one value is
+/// served under the other's key.
 enum class KeyPiece : std::uint8_t
 {
     Field = 0x00,    ///< A standalone field.

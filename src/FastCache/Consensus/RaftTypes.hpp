@@ -105,11 +105,27 @@ using NodeId = std::string;
 /// Distinguishing them by a tag rather than by an empty payload is deliberate:
 /// an empty payload is a legitimate thing for an application to commit, so
 /// inferring the difference would make one indistinguishable from the other.
+///
+/// **ORDINALS ARE A TRANSMITTED AND PERSISTED CONTRACT. Append only; never insert or
+/// reorder.** (#308) The enumerator's numeric value IS the entry's kind byte in both
+/// directions: `FileRaftStorage` writes it into every log record on disk and
+/// `RaftWire` puts it on the peer wire, and `DecodeWireEnum<EntryKind>` casts it back.
+///
+/// Inserting an enumerator mid-enum therefore does not fail to load. `WireEnumBound`
+/// is raised, the build is green, every test passes -- and every record already in
+/// `raft.log` comes back one kind along, so a committed `Configuration` reads as the
+/// entry below it and the membership change is ordered, committed and never adopted.
+/// A leader and a follower on either side of the change disagree about what every
+/// frame means with nothing anywhere reporting a fault.
+///
+/// The explicit `= N` is the enforcement rather than decoration: without it a mid-enum
+/// insertion is one added line with nothing else visible, and with it the same edit
+/// shows up in review as a renumbered literal on every row below it.
 enum class EntryKind : std::uint8_t
 {
-    Command = 0,   ///< Application bytes, delivered through `RaftOutput::applied`.
-    NoOp,          ///< Consensus' own; ordered and committed, but never delivered.
-    Configuration, ///< The cluster's member set; adopted on append, never delivered.
+    Command = 0,       ///< Application bytes, delivered through `RaftOutput::applied`.
+    NoOp = 1,          ///< Consensus' own; ordered and committed, but never delivered.
+    Configuration = 2, ///< The cluster's member set; adopted on append, never delivered.
 };
 
 /// One entry in the replicated log.
@@ -147,17 +163,27 @@ enum class Role : std::uint8_t
 /// The wire calls this field `voteGranted` and a `bool` is what it holds there;
 /// inside the library it is named after the decision, so a call site reading
 /// `VoteDecision::Denied` cannot be misread as the success it is not.
+///
+/// **ORDINALS ARE A WIRE CONTRACT. Append only; never insert or reorder.** (#308) The
+/// enumerator's value is the byte `RaftWire` puts on a vote response and
+/// `DecodeWireEnum<VoteDecision>` casts back, between builds that upgrade at different
+/// times. A swap here is a denied vote read as granted, which is two leaders.
 enum class VoteDecision : std::uint8_t
 {
-    Denied = 0, ///< The vote was refused; the response's term says why it may have been.
-    Granted,    ///< The voter has committed its one vote for this term to the candidate.
+    Denied = 0,  ///< The vote was refused; the response's term says why it may have been.
+    Granted = 1, ///< The voter has committed its one vote for this term to the candidate.
 };
 
 /// Whether a follower accepted an AppendEntries.
+///
+/// **ORDINALS ARE A WIRE CONTRACT. Append only; never insert or reorder.** (#308) The
+/// enumerator's value is the byte `RaftWire` puts on an append response and
+/// `DecodeWireEnum<AppendResult>` casts back. A swap here is a rejected append read as
+/// accepted, so a leader advances `matchIndex` for a log that does not match.
 enum class AppendResult : std::uint8_t
 {
     Rejected = 0, ///< Term too old, or the consistency check at `prevLogIndex` failed.
-    Accepted,     ///< The follower's log now matches the leader's through the entries sent.
+    Accepted = 1, ///< The follower's log now matches the leader's through the entries sent.
 };
 
 /// The largest enumerator of an enum that travels on the wire or on disk.
@@ -204,6 +230,11 @@ struct WireEnumBound<AppendResult>
 /// handles and no invariant covers, and the byte is not this process's to trust —
 /// so an out-of-range one is a malformed record to refuse, never a precondition
 /// to assert on.
+///
+/// **Every enum reaching here has ordinals that leave this process**, and the cast
+/// below spells the enum as `E` — so a census of `static_cast<SomeEnum>(byte)` finds
+/// none of them, and the three specializations above have to be reached by reading
+/// (#308). Each says so at its own declaration; a fourth must too.
 /// @tparam E The enumeration, which must specialize `WireEnumBound`.
 /// @param raw The byte as read.
 /// @return The enumerator, or nullopt when the byte names none.

@@ -29,13 +29,31 @@ namespace FastCache
 /// wire, anything positional -- inherits that indexing. Renumbering would read
 /// one tier's numbers under another's name with nothing anywhere reporting a
 /// fault, which is the shape of failure this whole file exists to prevent.
+/// **ORDINALS ARE A WIRE CONTRACT. Append only; never insert or reorder.** (#308)
+///
+/// The paragraph above says these values are an index; this says who else reads that
+/// index. `CompileCacheWire.hpp` carries cache tiers POSITIONALLY, so the ordinals cross
+/// the network to a peer built from a different commit -- AGENT.md already records that
+/// its enumerator order is part of the protocol, and this is that fact at the
+/// declaration, where somebody adding a tier is actually looking.
+///
+/// The explicit `= N` is the enforcement: a mid-enum insertion is otherwise one added
+/// line with nothing else visible, and the consequence -- one tier's numbers read under
+/// another's name, on a peer -- shows up in no test here.
+///
+/// `Last` carries one too, because `readability-enum-initial-value` accepts all, none or
+/// only-the-first and this tree does not silence clang-tidy. That is not merely the
+/// lint's price: forgetting to bump it while adding a tier makes the new enumerator
+/// COLLIDE with `Last`, which shortens `EnumeratorCount` and fails
+/// `RowsInEnumeratorOrder`'s static_assert against `StorageTierTable`. The friction is
+/// one line, and it is caught at compile time rather than on a peer.
 enum class StorageTier : std::uint8_t
 {
     /// Held in this process's memory. Lost when it exits.
     Memory = 0,
     /// Held on a filesystem. Survives a restart.
-    Disk,
-    Last, ///< Not a tier, and has no row: `StorageTierTable`'s length.
+    Disk = 1,
+    Last = 2, ///< Not a tier, and has no row: `StorageTierTable`'s length.
 };
 
 /// One row per tier: what it is, what it is called, and where it lives.

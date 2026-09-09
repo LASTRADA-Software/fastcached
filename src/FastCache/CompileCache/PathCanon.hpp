@@ -45,11 +45,29 @@ struct Layout
 /// The line grammars that locate path spans inside captured compiler text
 /// output. Each captured region is tagged with the grammar the producer knows
 /// applies to it; the canonicalizer only rewrites spans that grammar identifies.
+///
+/// **ORDINALS ARE A STORED AND TRANSMITTED CONTRACT. Append only; never insert or
+/// reorder.** (#308) The enumerator's numeric value IS the region's grammar tag byte in
+/// an encoded `CompileValue` -- `EncodeCompileValue` writes it, `IsKnownGrammar` and
+/// `DecodeCompileValue` read it back -- so it sits in every cached object this project
+/// has ever stored and in every value that crosses to a peer.
+///
+/// Inserting an enumerator mid-enum therefore does not fail to decode: every stored
+/// value comes back with each region attributed to the NEXT grammar, and the
+/// canonicalizer then rewrites a `/showIncludes` region under GCC depfile rules. The
+/// spans it fails to recognise are left carrying the producing checkout's absolute
+/// paths, which is #229's failure with a green build and no counter moving.
+///
+/// The explicit `= N` is the enforcement rather than decoration: without it a mid-enum
+/// insertion is one added line with nothing else visible, and with it the same edit shows
+/// up in review as a renumbered literal on every row below it. There is no `Last` and
+/// none is wanted -- `IsKnownGrammar` is an exhaustive `switch`, so an added enumerator
+/// is a `-Werror` warning at the one place that decides whether a tag is legal.
 enum class Grammar : std::uint8_t
 {
-    ShowIncludes,    ///< MSVC/clang-cl `/showIncludes`: `Note: including file: <path>`.
-    MsvcDiagnostics, ///< Diagnostics: `<path>(line[,col]): ...` — the leading path.
-    GccDepfile,      ///< GCC/Clang `-MF` depfile: `target: dep dep \` continuation.
+    ShowIncludes = 0,    ///< MSVC/clang-cl `/showIncludes`: `Note: including file: <path>`.
+    MsvcDiagnostics = 1, ///< Diagnostics: `<path>(line[,col]): ...` — the leading path.
+    GccDepfile = 2,      ///< GCC/Clang `-MF` depfile: `target: dep dep \` continuation.
 
     /// GCC/Clang diagnostics: `<path>:<line>:<col>: ...`, plus the
     /// `In file included from <path>:<line>[,:]` header and its
@@ -61,7 +79,7 @@ enum class Grammar : std::uint8_t
     /// real possibility in this repository, whose tests carry path literals. Only
     /// a path at one of the three positions above is a path; everything else on
     /// the line is somebody's code.
-    GccDiagnostics,
+    GccDiagnostics = 3,
 };
 
 /// The marker a `/showIncludes` note carries **in a stored value**.
