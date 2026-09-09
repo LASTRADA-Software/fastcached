@@ -3534,14 +3534,54 @@ endif()
 # own startup costs 0.2-0.5s. The decision is now a pure function over a readings
 # record and the cases are rows -- 17 of them, both sides of every bound, in about
 # a third of a second. See `.agent/rules/testing.md`.
-if(WIN32)
+# Gated on an INTERPRETER, not on the platform (#837).
+#
+# `if(WIN32)` was narrower than the thing it guarded. The end-to-end fixture needs
+# Windows -- it drives real processes and a real scratch-directory claim -- but its
+# decision table does not: `Invoke-SelfTest` is a pure function over synthesised
+# readings, which is exactly why it was split out of the fixture in the first place
+# (53 s + RUN_SERIAL became 0.3 s). The registration never followed the split, so a
+# classifier that had already been wrong in production could only be exercised on one
+# platform. GitHub's `ubuntu-*` images carry `pwsh`, so the coverage costs ~1.2 s.
+#
+# `powershell` is in the list on evidence rather than on hope: the script carries no
+# `#requires` and no PowerShell 7 syntax, and both interpreters were RUN against it --
+# 23 of 23 cases pass under pwsh 7.6.5 and under Windows PowerShell 5.1. An interpreter
+# that could not run it would turn this skip into a failure, which is worse than the
+# `if(WIN32)` it replaces.
+find_program(FASTCACHED_PWSH NAMES pwsh pwsh-preview powershell)
+
+if(FASTCACHED_PWSH)
     add_test(
         NAME "node-scratch-isolation-e2e-selftest"
-        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
     )
     set_tests_properties("node-scratch-isolation-e2e-selftest" PROPERTIES
         LABELS "hygiene"
         TIMEOUT 120
+    )
+else()
+    # A host with no interpreter reports SKIPPED, and that is the whole of why this
+    # arm exists rather than simply not registering.
+    #
+    # Not registering makes the test ABSENT, and absent is not skipped: it vanishes
+    # from the run with nothing saying it was ever expected, which is the state
+    # `if(WIN32)` left every non-Windows runner in for as long as it stood. A count
+    # cannot carry that distinction and neither can silence. This way the row is in
+    # every run, and says which of the two it is.
+    #
+    # `SKIP_REGULAR_EXPRESSION` rather than `SKIP_RETURN_CODE`: `cmake -E echo` exits
+    # 0 whatever it prints, so there is no status to key on, and a `SUCCEED`-shaped
+    # pass here would report coverage for a property nothing established (#685).
+    add_test(
+        NAME "node-scratch-isolation-e2e-selftest"
+        COMMAND ${CMAKE_COMMAND} -E echo
+            "SKIP: no PowerShell interpreter found (pwsh, pwsh-preview, powershell), so the wait classifier's decision table was not exercised on this host"
+    )
+    set_tests_properties("node-scratch-isolation-e2e-selftest" PROPERTIES
+        LABELS "hygiene"
+        SKIP_REGULAR_EXPRESSION "SKIP: "
+        TIMEOUT 60
     )
 endif()
 
