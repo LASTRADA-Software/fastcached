@@ -19,6 +19,21 @@ namespace FastCache
 /// cross-thread wake mechanism), but Run() must be called from exactly one
 /// thread for the lifetime of the loop, and resumed coroutines run on that
 /// thread.
+///
+/// **Descriptor registration is deliberately NOT on this interface**, and looking
+/// for it here is the mistake this paragraph exists to stop. `Attach`,
+/// `UpdateInterest` and `Detach` are concrete members of `EpollReactor` and
+/// `KqueueReactor`, never virtual and never declared here, because the operations
+/// a backend HAS differ: epoll can add a descriptor carrying no interest, kqueue
+/// cannot -- there interest arrives per filter -- and IOCP associates a handle
+/// once under a different name again. An interface promising one shape would be
+/// promising something two of the three cannot deliver.
+///
+/// The two readiness backends are held together by a TEMPLATE rather than by
+/// inheritance, so the contract they must both satisfy is stated where it is
+/// relied upon: `ReadinessDial` in `Net/ReactorDial.hpp`. Read that before
+/// assuming what `Attach` means from whichever body you opened first -- inferring
+/// it from one has cost a porting trap and one wrong bug report (#1054, #1057).
 class IReactor: public IExecutor
 {
   public:
