@@ -98,6 +98,21 @@ KqueueReactor::~KqueueReactor()
     // the way down, and `KqueueSocket::Close` detaches from this reactor.
     AbandonParkedWork();
 
+    // **The descriptors are closed and NOT reset to -1, unlike `~IocpReactor`, which
+    // nulls `_iocp`.** That asymmetry is deliberate and is recorded because it has
+    // already been read as a bug once (#1057, refuted): every remaining reader of the
+    // `>= 0` guards is a call on a destroyed object, which is undefined behaviour
+    // whatever the member holds, so a reset would buy nothing a caller could rely on.
+    //
+    // The one window where it could have bought something is member destruction after
+    // this body, and it has no reader: `AbandonParkedWork` above loops precisely so
+    // nothing is left to re-enter, and neither reactor owns a member whose destruction
+    // resumes a coroutine. A reset here would be a plausible claim nothing checks.
+    //
+    // The guards are still load-bearing BEFORE destruction, which is why they stay:
+    // `::kqueue()` answers -1 under descriptor exhaustion, and a reactor whose
+    // construction failed refuses `Attach`/`UpdateInterest` by that term.
+
     if (_wakePipe[0] >= 0)
         ::close(_wakePipe[0]);
     if (_wakePipe[1] >= 0)
@@ -163,10 +178,33 @@ bool KqueueReactor::CancelPending(std::coroutine_handle<> handle) noexcept
     return true;
 }
 
+/// Validate the handler. **This registers NOTHING with the kernel, and that is
+/// correct rather than missing** -- kqueue has no "add this descriptor with no
+/// filters" operation, so interest arrives per filter through `EV_ADD`, which is
+/// what `UpdateInterest` below does. `EpollReactor::Attach` genuinely calls
+/// `epoll_ctl(EPOLL_CTL_ADD)` because epoll HAS that operation; the shapes differ
+/// because the two kernels differ, not because one of them forgot.
+///
+/// The comment that used to sit here said the same thing and was not enough:
+/// #1057 was filed against this body as a missing kernel call, with epoll named
+/// as the control, and the porting trap it cites happened to somebody who had
+/// read it. So the reason is stated where the misreading lands rather than only
+/// where the code is, and the caller's side of it is on `ReadinessDial` in
+/// `Net/ReactorDial.hpp` -- the one place a body written against epoll's meaning
+/// is compiled against this one.
+///
+/// **The `_kq >= 0` term is not decoration**, and it is worth naming because it
+/// looks like it: `::kqueue()` answers -1 under descriptor exhaustion and the
+/// member default is -1, so a reactor whose construction failed refuses here, and
+/// `ReadinessDial` turns that into a named dial failure instead of arming a
+/// filter on -1. What it cannot catch is a call after `~KqueueReactor`, which is
+/// undefined behaviour whatever this member holds -- see the destructor.
+///
+/// @param handler Handler whose `fd` is about to be used with this reactor.
+/// @return Whether that handler and this reactor are usable; never whether the
+///         kernel now knows about the descriptor, which only `UpdateInterest` can say.
 bool KqueueReactor::Attach(KqueueFdHandler* handler) const noexcept
 {
-    // kqueue doesn't have a separate "add fd without filter" call; we
-    // register filters on UpdateInterest. Return true if the fd is sane.
     return handler != nullptr && handler->fd >= 0 && _kq >= 0;
 }
 

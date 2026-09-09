@@ -83,6 +83,21 @@ EpollReactor::~EpollReactor()
     // the way down, and `EpollSocket::Close` detaches from this reactor.
     AbandonParkedWork();
 
+    // **The descriptors are closed and NOT reset to -1, unlike `~IocpReactor`, which
+    // nulls `_iocp`.** That asymmetry is deliberate and is recorded because it has
+    // already been read as a bug once (#1057, refuted): every remaining reader of the
+    // `>= 0` guards is a call on a destroyed object, which is undefined behaviour
+    // whatever the member holds, so a reset would buy nothing a caller could rely on.
+    //
+    // The one window where it could have bought something is member destruction after
+    // this body, and it has no reader: `AbandonParkedWork` above loops precisely so
+    // nothing is left to re-enter, and neither reactor owns a member whose destruction
+    // resumes a coroutine. A reset here would be a plausible claim nothing checks.
+    //
+    // The guards are still load-bearing BEFORE destruction, which is why they stay:
+    // `::epoll_create1` answers -1 under descriptor exhaustion, and a reactor whose
+    // construction failed refuses `Attach`/`UpdateInterest` by that term.
+
     if (_wakeFd >= 0)
         ::close(_wakeFd);
     if (_epollFd >= 0)

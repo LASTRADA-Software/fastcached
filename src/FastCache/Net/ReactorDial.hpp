@@ -118,6 +118,28 @@ void SettleDial(ReadinessDialOp<Traits>& op, std::expected<void, NetError> outco
 /// either with no `#if` in here at all. Two near-identical connectors differing
 /// only by a type is exactly what the data-driven rule forbids.
 ///
+/// **`Attach` means different things on the two backends, and this is the only
+/// place that has to be right about both.** There is no `IReactor::Attach`: it is
+/// not virtual anywhere, the interface declares nothing of the kind, and the two
+/// reactors are held together here by a TEMPLATE rather than by inheritance. So
+/// the contract is whatever this body relies on, and it is deliberately weak:
+///
+///   * `EpollReactor::Attach` registers the descriptor -- `epoll_ctl(EPOLL_CTL_ADD)`
+///     with no interest -- and reports what the kernel said.
+///   * `KqueueReactor::Attach` registers nothing and validates. kqueue has no
+///     add-without-filter operation, so the epoll shape is unavailable there by
+///     construction; interest arrives per filter through `UpdateInterest`.
+///
+/// What a `true` here may be read as, on either backend, is only *this handler and
+/// this reactor are usable*. **It may NOT be read as "the kernel now knows about
+/// this descriptor"** -- that is `UpdateInterest`, which is checked on the very
+/// next statement below and is what actually arms the dial on both platforms.
+///
+/// Inferring the contract from one body has already cost two mistakes: the #1054
+/// porting trap, and #1057, filed as a missing kernel call on kqueue with epoll
+/// named as the control. An equivalent is a call that ASKS the kernel, not a
+/// member with a matching declaration.
+///
 /// @tparam Traits `{ Reactor, Handler, Socket }` for the platform.
 /// @param reactor Reactor the resulting socket is pinned to.
 /// @param endpoint Candidate to dial. By value: this is a coroutine, so a
