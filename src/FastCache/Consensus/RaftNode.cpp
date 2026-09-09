@@ -182,6 +182,23 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
         // was, since the two sides stamp contact half a round trip apart.
         auto const found = _followerContact.find(peer);
         if (found != _followerContact.end() && now - found->second < _config.electionTimeoutMin)
+        {
+            ++live;
+            continue;
+        }
+
+        // A member admitted moments ago has not gone quiet: adopting the
+        // configuration counted it before this leader had asked it anything, so
+        // there is no silence yet to measure. Owed the same window as everybody
+        // else and not one instant more -- past that, a leader whose quorum answers
+        // nothing must give up, or `--cluster-admit` naming an address nothing
+        // listens on would pin leadership on a node that can commit nothing.
+        //
+        // One election timeout is also the right size rather than a number picked
+        // to be generous: a leader that cannot get an answer inside one is a leader
+        // its followers are already timing out on, and being deposed then is
+        // CheckQuorum working rather than this defect.
+        if (_admitted.has_value() && _admitted->id == peer && now - _admitted->at < _config.electionTimeoutMin)
             ++live;
     }
 
@@ -527,6 +544,13 @@ void RaftNode::AdoptMembers(std::vector<NodeId> members)
     std::erase_if(_followerContact, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsMember(id); });
     std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsMember(id); });
+
+    // By the same rule, and it is why the record is dropped here rather than only
+    // when it expires: a member admitted and then removed again before it ever
+    // answered would otherwise go on being counted toward a quorum it is not part
+    // of, which is the one direction this must never be wrong in.
+    if (_admitted.has_value() && !IsMember(_admitted->id))
+        _admitted.reset();
 }
 
 void RaftNode::RefreshConfiguration()
@@ -721,6 +745,13 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
         if (voter != _config.self)
             _followerContact[voter] = now;
 
+    // And with it, whatever a previous leadership had admitted and not heard from.
+    // Evidence about a term this node no longer holds cannot excuse a member in
+    // this one -- and a member that has still not answered will not have voted
+    // here either, so the quorum that just elected this node is already a quorum
+    // without it.
+    _admitted.reset();
+
     // A no-op of this leader's own term, and it is the companion to the §5.4.2
     // guard rather than a nicety. That guard refuses to commit an earlier term's
     // entry by replica count, so a leader whose log ends in fully-replicated
@@ -857,6 +888,11 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(st
     if (HasUncommittedConfiguration())
         return std::unexpected { InvalidConfiguration("a membership change is already in flight; wait for it to commit") };
 
+    // Named BEFORE the adoption below makes it an ordinary member, and from the one
+    // query that answers it, so "exactly one was added" and "this one was added"
+    // cannot come to disagree.
+    auto admitted = Membership::AddedMember(_members, members);
+
     switch (Membership::Classify(_members, members))
     {
         case Membership::ChangeShape::Unchanged:
@@ -878,6 +914,12 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(st
     // configuration that waited for commitment could not be used to REACH it:
     // committing this entry needs a quorum of the very set it describes.
     AdoptMembers(std::move(members));
+
+    // After the adoption, because `AdoptMembers` drops a record naming somebody who
+    // is no longer a member and this one names somebody who has just become one.
+    // Absent for a removal, which takes nothing away from the quorum's evidence.
+    if (admitted.has_value())
+        _admitted = AdmittedMember { .id = *std::move(admitted), .at = now };
 
     RecordLogAppend(output, index);
     ReplicateToPeers(output);

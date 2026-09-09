@@ -94,24 +94,33 @@ enum class ChangeShape : std::uint8_t
     Unsafe,        ///< Anything else: more than one change, or both at once.
 };
 
+/// Whether a member set names `who`.
+///
+/// Its own function because three separate questions are asked of a member set
+/// -- how it differs, which member it gained, and whether an id is in it -- and a
+/// lambda re-spelled per question is where one of them comes to disagree.
+/// @param where The member set.
+/// @param who The id to look for.
+/// @return True when the set contains it.
+[[nodiscard]] inline bool Contains(std::span<NodeId const> where, NodeId const& who)
+{
+    return std::ranges::find(where, who) != where.end();
+}
+
 /// Classify the difference between two member sets.
 /// @param from The current members.
 /// @param to The proposed members.
 /// @return What kind of change this would be.
 [[nodiscard]] inline ChangeShape Classify(std::span<NodeId const> from, std::span<NodeId const> to)
 {
-    auto const contains = [](std::span<NodeId const> where, NodeId const& who) {
-        return std::ranges::find(where, who) != where.end();
-    };
-
     std::size_t added = 0;
     for (auto const& member: to)
-        if (!contains(from, member))
+        if (!Contains(from, member))
             ++added;
 
     std::size_t removed = 0;
     for (auto const& member: from)
-        if (!contains(to, member))
+        if (!Contains(to, member))
             ++removed;
 
     if (added == 0 && removed == 0)
@@ -121,6 +130,33 @@ enum class ChangeShape : std::uint8_t
     if (added == 0 && removed == 1)
         return ChangeShape::RemovedOne;
     return ChangeShape::Unsafe;
+}
+
+/// The member `to` gains over `from`, when it gains exactly one.
+///
+/// The companion question to `Classify`, and it is asked because "one member was
+/// added" and "*this* member was added" are answered at the same moment and used
+/// in different places: `ProposeMembership` refuses on the first and has to name
+/// the second, since the member it admits is the one thing this leader has yet to
+/// hear from. Answered from `to` rather than by subtraction, so the id handed back
+/// is the one the configuration will actually carry.
+///
+/// A disengaged result for every shape but `AddedOne`, including the swap that
+/// `Classify` refuses -- a set that gains one member and loses another names no
+/// single addition a caller could act on.
+/// @param from The current members.
+/// @param to The proposed members.
+/// @return The added id, or nullopt when the change is not exactly one addition.
+[[nodiscard]] inline std::optional<NodeId> AddedMember(std::span<NodeId const> from, std::span<NodeId const> to)
+{
+    if (Classify(from, to) != ChangeShape::AddedOne)
+        return std::nullopt;
+
+    auto const found = std::ranges::find_if(to, [from](NodeId const& id) { return !Contains(from, id); });
+    if (found == to.end())
+        return std::nullopt;
+
+    return *found;
 }
 
 /// Whether `members` is a set a cluster could operate as.

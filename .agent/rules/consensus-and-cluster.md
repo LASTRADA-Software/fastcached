@@ -584,12 +584,21 @@ Every rule below has already been a bug.
     "matching the follower side exactly", on the reasoning that a leader answering
     on a window of its own is how two nodes disagree at the same instant — **and
     that reasoning was exactly backwards.** See the entry below.
-  - **This is not leader step-down, deliberately.** CheckQuorum elsewhere also
-    *deposes* a leader that has lost its majority. That is a separate mechanism
-    with its own safety argument, and it is not needed for the hole above: an
-    isolated leader's contact ages out, so it grants and blocks nothing.
-    `RaftCluster_test` and `RaftClusterHarness::Leader` still record that nothing
-    here deposes a leader, which is what their assertions actually rest on.
+  - **This WAS not leader step-down, and #437 made it one.** The paragraph that
+    stood here said CheckQuorum elsewhere also *deposes* a leader that has lost its
+    majority, that this was a separate mechanism, and that "`RaftCluster_test` and
+    `RaftClusterHarness::Leader` still record that nothing here deposes a leader,
+    which is what their assertions actually rest on". #437 then added exactly that
+    deposition — `Tick` calls `RelinquishLeadership` when `HasQuorumContact` fails
+    — and this file was not touched, so for the whole of that time the rulebook
+    told every session the mechanism did not exist. That is the shape this file's
+    own `## Open work` rule is about, reached the other way: an entry saying
+    something *cannot* happen instructs the next session not to look for it, and
+    #1061 is what it cost. The reason it is deposition rather than a nicety is
+    #437's: Raft needs none of it for safety, since a partitioned leader commits
+    nothing, and everything that READS from a leader needs all of it — two nodes
+    answering `--cluster-status`, a `--cluster-set` reported `accepted` that can
+    never commit, a fleet page served `200` by a node that no longer leads.
   - **No cluster case covers it, and why is worth recording rather than
     apologising for.** `RaftClusterHarness` is this module's oracle, so the first
     attempt was a one-way link cut — written for exactly this, and then removed,
@@ -701,6 +710,67 @@ Every rule below has already been a bug.
     peer is a follower knowing no leader before and after each one, so a report
     keyed on (role, leader) alone is silent during precisely the storm somebody
     is reading the dump for.
+- **CheckQuorum measures SILENCE, and a member admitted a moment ago has not been
+  silent — it has not been asked
+  ([#1061](https://github.com/LASTRADA-Software/fastcached/issues/1061)).**
+  `ProposeMembership` adopts the new member set the instant the entry is appended,
+  which is the §4.3 rule that makes the change committable at all — so `Quorum()`
+  grows before the member it adds has been asked anything, while `_followerContact`
+  gains nothing, because nothing could have arrived. Read as silence by the entry
+  above, the leader deposes itself at its very next heartbeat, for a lack of
+  contact that could not have existed. `RaftNode` therefore records the member it
+  admitted and when, and counts **that one peer** for one `electionTimeoutMin`.
+  - **At two members it is unsatisfiable by construction, and there is no
+    recovery.** Growing from one member to two doubles the quorum, and the second
+    member is the one that has never answered — so the arithmetic can only fail.
+    The deposed leader then needs a vote from a node holding no configuration,
+    which grants none (`OnPreVote` refuses a non-member), and that node is excused
+    from every deadline by `HasCluster()`, so it does not campaign either. Both
+    machines up, both listening, every verb answering `not-leader`, in term 1,
+    forever. At three members and above somebody else can campaign, so the SAME
+    defect presents as an election storm that settles — four terms for one
+    membership change — which is why it read as a slow formation for as long as it
+    did, and why a case asserting only that *a leader exists eventually* passes
+    under it. **The two-member arrangement is the discriminator; the larger one is
+    the control.**
+  - **The member it never received is why nothing repairs itself.** A leader
+    replicates from its own last index, a joiner's empty log rejects, and the
+    walk-back lives in `OnAppendEntriesResponse` behind `_role != Leader`. So the
+    rejection arrives at a node that has already relinquished, the configuration
+    entry never lands, and the member the change was about stays a joiner.
+  - **NOT seeded into `_followerContact`.** That is the shorter fix and the field's
+    own comment refuses it: absence there means *has not answered since this
+    leadership began*, and `BecomeLeader` fills it from the votes actually cast for
+    exactly that reason. A stamp for a response nobody sent is a false record, and
+    pre-vote reads the same map through `HasLiveLeader` — so the lie would decide a
+    second question nobody was thinking about. The two records are kept apart and
+    `HasQuorumContact` prefers the real one.
+  - **The id, never just the instant.** "Some member was admitted recently" excuses
+    whichever peer happens to be silent, which is a different rule and a wrong one:
+    a four-member leader that admits `d` while `b` is dead would go on counting
+    `b`. The pair cannot be split, so it is one struct.
+  - **One election timeout, and the size is an argument rather than a margin.** A
+    leader that cannot get an answer inside one is a leader its followers are
+    already timing out on, so being deposed *then* is CheckQuorum working. Anything
+    longer would let `--cluster-admit` naming an address nothing listens on pin
+    leadership on a node that can commit nothing — which is why the case asserting
+    that the grace ENDS is not decoration.
+  - **The harness could not see it as written, and that is the reportable part.**
+    `RaftClusterHarness` delivers in one to three steps, so the admitted member's
+    first answer beat the leader's own heartbeat and the case stepped straight over
+    the defect — measured green against it. It partitions the leader for four steps
+    after the proposal now: long enough that no contact can exist at the first
+    heartbeat, short enough to land inside the window the fix grants. What produces
+    that delay in the field is ordinary — a leader's durability write and a
+    joiner's first reply, on a sanitizer build, are not reliably done inside one
+    50 ms heartbeat. The exact `RaftNode` cases are still where the rule lives.
+  - **`undecided` is not a Raft role, and reading it as one sends you to the wrong
+    file.** It is `SchedulerRole::Undecided` — *not leader AND names no leader* —
+    so it spells Follower-with-no-leader, PreCandidate and Candidate alike. The
+    node that logs it here is a plain **Follower**: `RelinquishLeadership` leaves
+    the term untouched and reports no `TermAdoption`, which is exactly why the log
+    shows a leadership lost with nothing named as having taken it.
+
 - **A round-trip test that omits a message type omits the arm most likely to be
   wrong.** Five of `RaftWire`'s eight encoder arms are near-copies of another —
   PreVote of RequestVote, `InstallSnapshotResponse` of `AppendEntriesResponse` —
