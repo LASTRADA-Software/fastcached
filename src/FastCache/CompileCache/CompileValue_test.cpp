@@ -14,9 +14,12 @@
 #include <cstdint>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <tests/ForeignGenerationValue.hpp>
 
 using namespace FastCache;
 using PathCanon::Grammar;
@@ -58,10 +61,13 @@ TEST_CASE("DecodeCompileValue rejects truncated input")
 
 TEST_CASE("DecodeCompileValue refuses another generation, and does not call it malformed")
 {
-    auto bytes = EncodeCompileValue({ .objectBlob = {}, .textRegions = {} });
-    REQUIRE_FALSE(bytes.empty());
-    REQUIRE(static_cast<std::uint8_t>(bytes[0]) == CompileValueVersion);
-    bytes[0] = std::byte { CompileValueVersion + 1 }; // what a newer build writes
+    // An EMPTY value on purpose -- this case is about the DECODER, which reaches its
+    // generation check before there is anything else to read. `StampGeneration` is what
+    // knows the generation is the leading byte, here and in the three other places this
+    // was hand-rolled (#649); it refuses an encoder that produced nothing rather than
+    // reading off the end.
+    auto const bytes =
+        Testing::StampGeneration(EncodeCompileValue({ .objectBlob = {}, .textRegions = {} }), Testing::ForeignGeneration);
 
     auto const decoded = DecodeCompileValue(bytes);
     REQUIRE_FALSE(decoded.has_value());
@@ -73,6 +79,33 @@ TEST_CASE("DecodeCompileValue refuses another generation, and does not call it m
     // foreign-generation value verbatim (#483).
     CHECK(decoded.error().code == ProtocolErrorCode::UnsupportedFeature);
     CHECK(decoded.error().context.contains("generation"));
+}
+
+TEST_CASE("The shared foreign-generation helper refuses to stamp a value it does not recognise")
+{
+    // It lives here rather than beside an implementation because there is no
+    // implementation: `src/tests/ForeignGenerationValue.hpp` is a builder for the four
+    // cases that need a value from a generation this build does not implement, and the
+    // property under test is a fact about THIS file's encoder (#649).
+    //
+    // The guard is the whole point of consolidating them. All four hand-rolled copies
+    // wrote the leading byte unconditionally, so a generation that moved off byte 0 would
+    // have them stamping some other field: the value is then damaged rather than foreign,
+    // every case still asserts a refusal, and every case still passes.
+    //
+    // Both directions, because a guard nobody has watched ACCEPT is not known to work --
+    // a helper that threw unconditionally would satisfy the refusing half alone.
+    CHECK_NOTHROW(Testing::ForeignGenerationValue());
+
+    // Already carrying a generation this build does not implement, which is what a
+    // second stamp of the same bytes looks like and what a moved generation byte looks
+    // like from here: the helper cannot tell the difference and must not guess.
+    CHECK_THROWS_AS(Testing::StampGeneration(Testing::ForeignGenerationValue(), Testing::ForeignGeneration),
+                    std::logic_error);
+
+    // Nothing to stamp is its own arm: indexing it is the read off the end that the
+    // hand-rolled copies each had to guard against on their own.
+    CHECK_THROWS_AS(Testing::StampGeneration({}, Testing::ForeignGeneration), std::logic_error);
 }
 
 TEST_CASE("DecodeCompileValue rejects empty input")
@@ -209,16 +242,15 @@ TEST_CASE("CanonicalStoredValue tells a foreign generation from bytes that are n
         // it anyway would put `/home/dev/proj/inc/a.hpp` into a shared cache under a
         // key every machine computes. Before this outcome existed the two SECTIONs
         // below were one `std::nullopt` and no caller could separate them.
-        auto foreign = wire;
-        // `wire` is encoded above, so it is never empty; GCC cannot see that through
-        // the copy and reads `foreign[0]` as a null dereference (#805). Stating it
-        // also keeps the SECTION honest if the encoder above ever returns nothing.
-        REQUIRE_FALSE(foreign.empty());
-        foreign[0] = std::byte { CompileValueVersion + 1 };
+        // `wire` is encoded above, so it is never empty; GCC cannot see that through the
+        // copy and read the subscript as a null dereference (#805). `StampGeneration`
+        // refuses an empty vector rather than indexing one, which answers that and keeps
+        // the SECTION honest if the encoder above ever returns nothing (#649).
+        auto const foreign = Testing::StampGeneration(wire, Testing::ForeignGeneration);
 
         auto const canonical = CanonicalStoredValue(foreign, "/home/dev/proj", "/home/dev/proj/build");
         CHECK(canonical.outcome == CanonicalizationOutcome::ForeignGeneration);
-        CHECK(canonical.generation == CompileValueVersion + 1);
+        CHECK(canonical.generation == Testing::ForeignGeneration);
         // Nothing to store: a server has no bytes it may write, which is what makes
         // "store it verbatim" unavailable rather than merely discouraged.
         CHECK(canonical.bytes.empty());

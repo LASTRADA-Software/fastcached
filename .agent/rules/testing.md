@@ -550,6 +550,51 @@ sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
 
+### A value from another generation is BUILT by the shared helper, never by hand
+
+`tests/ForeignGenerationValue.hpp` (#649). Four cases across two test binaries need a
+stored value carrying a generation this build does not implement, and all four built one
+the same way and separately: encode through the real encoder, assert the leading byte is
+`CompileValueVersion`, write `CompileValueVersion + 1` over it. Three lines, no
+collaborator, nothing that looks like it wants a helper -- which is why it spread.
+
+**What makes it worth consolidating is that the copies fail SILENTLY.** Every one of those
+cases asserts a REFUSAL, and a value damaged in some other way is refused too. So a
+generation that moves off byte 0 leaves each copy stamping a different field: the value
+stops being a foreign generation, the case goes on passing, and the name still says what
+it no longer builds. That is the shape `Assert what DISTINGUISHES` describes, arriving
+through a construction rather than through an assertion -- and an assertion review does
+not find it, because every assertion is correct.
+
+Two facts live in the helper and nowhere else:
+
+- **Which byte carries the generation.** `StampGeneration` refuses bytes whose leading
+  byte is not `CompileValueVersion`, so a moved generation is a thrown `logic_error`
+  naming the two numbers rather than four cases quietly testing something else. A
+  precondition violation is the one thing this project throws for.
+- **Which generation is foreign.** `ForeignGeneration` is DERIVED, not spelled
+  `CompileValueVersion + 1`. That arithmetic stops being right at the top of the reserved
+  range: a leading byte outside `[1, MaxCompileValueGeneration]` is not a compile value of
+  any generation (#552), so at version 15 all four copies would have built a
+  `NotACompileValue` -- a different outcome under a different policy, in cases named for
+  the one they no longer build. A `static_assert` proves the derived byte stays inside the
+  range, so the failure is a build error rather than four confusing reds.
+
+The guard is proved in both directions by
+`The shared foreign-generation helper refuses to stamp a value it does not recognise`, in
+`CompileValue_test.cpp` -- a `CHECK_NOTHROW` on the ordinary path beside the two refusals,
+because a guard nobody has watched ACCEPT is not known to work and a helper that threw
+unconditionally would satisfy the refusing half alone. Neutering the precondition reddens
+that one arm and nothing else: measured, the empty-vector arm, the `CHECK_NOTHROW`, and
+both neighbouring cases stay green.
+
+**A hand-built frame is NOT this helper's job and must not be routed through it.**
+`CompileValue_test`'s `futureFramed` synthesises a value whose FRAMING this build cannot
+parse -- a generation byte followed by a field that does not exist here -- which is #552's
+subject and cannot come out of this build's encoder at all. The helper takes an encoder
+output; a frame this build could not have written is a different thing that happens to
+share a leading byte.
+
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 
 `scripts/lib/e2e-common.sh` holds `fail`, `free_port`, `port_answers`,

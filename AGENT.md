@@ -2185,6 +2185,19 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
   copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
   them, found a day apart — a fake nothing exercises does not report its own bugs.
+- So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp` (#649).
+  Four cases in two binaries each hand-rolled a stored value carrying a generation this
+  build does not implement — three lines, no collaborator, nothing that looks like it
+  wants a helper. They fail SILENTLY, which is what makes them worth consolidating: every
+  one asserts a REFUSAL and a value damaged another way is refused too, so a generation
+  moving off byte 0 leaves each copy stamping a different field while every case goes on
+  passing under a name for what it no longer builds. An assertion review finds none of
+  them, because every assertion is correct. Two facts live in the helper alone: WHICH
+  byte carries the generation (a violated precondition throws, naming both numbers), and
+  WHICH generation is foreign — DERIVED, never `CompileValueVersion + 1`, which stops
+  being right at the top of the reserved range and would build a `NotACompileValue`
+  (#552) in four cases named for the opposite. A hand-built FRAME this build could never
+  have encoded is a different subject and must not be routed through it.
 - The POSIX shell fixtures share `scripts/lib/e2e-common.sh`, tested by
   `ctest -R e2e-helpers-selftest`. It was seven copies that had already diverged three
   ways, one of them a `wait_for_port` with no liveness check at all. A wait's bound is
