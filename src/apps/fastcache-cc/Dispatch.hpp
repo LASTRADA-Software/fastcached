@@ -6,6 +6,7 @@
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -271,10 +272,191 @@ enum class DispatchStatus : std::uint8_t
     Last,
 };
 
+/// Why a dispatch was declined, at the grain an operator ACTS on.
+///
+/// `DispatchStatus::Declined` is one state and was one sentence -- "the fleet
+/// declined this compile" -- for every way a fleet can say no. A wall of those tells
+/// nobody whether to add a machine, wait, or fix a credential, and those are not
+/// adjacent remedies
+/// ([#618](https://github.com/LASTRADA-Software/fastcached/issues/618)).
+///
+/// **The rows are operator ACTIONS, not wire codes.** Several codes share a row
+/// where the answer is the same, and one code can mean the same thing from either
+/// end -- `FingerprintMismatch` from a scheduler is "nothing serves your compiler"
+/// and from a worker is "the lease named a toolchain I do not have", which an
+/// operator fixes in one place. What must never share a row is what this
+/// repository's own metrics rules already refuse to sum: `NoWorker`, `NoCapacity`
+/// and `Withdrawn` are a misconfigured fleet, a fleet that is too small, and a fleet
+/// that is unavailable.
+///
+/// It is a SECOND field beside `DispatchStatus`, never a widening of it. The four
+/// states #427 established -- dispatched, declined, unreachable, and a crossed reply
+/// -- are what a reader buckets by; this says which kind of *declined*, and asking
+/// it of any other status is meaningless rather than wrong.
+enum class DeclineCause : std::uint8_t
+{
+    /// Nothing in the fleet serves this compiler.
+    ///
+    /// A machine is missing, or a fingerprint has drifted -- a toolchain upgrade on
+    /// the clients and not the workers looks exactly like this.
+    NoToolchain,
+    /// Every matching machine is full of this fleet's own work: the fleet is too
+    /// small. Never summed with the two rows either side of it.
+    NoCapacity,
+    /// Matching machines have slots free on paper and are not offering them --
+    /// somebody is using them, or a scratch disk is full. The fleet is big enough
+    /// and unavailable, which is a different purchase from being too small.
+    Withdrawn,
+    /// Another client already holds the lease for this key.
+    ///
+    /// **Not a fault, and its own row for exactly that reason.** This is duplicate
+    /// suppression working: sixty clients missing one key after a header change is
+    /// the ordinary shape of a shared cache, and fifty-nine of them compiling
+    /// locally is the design. Tallied beside "no machine serves your compiler" it
+    /// reads as a fleet in trouble.
+    AlreadyBuilding,
+    /// A credential, membership or lease refusal: this client was not allowed to ask.
+    ///
+    /// Fixed where the client is configured, or on the scheduler's member list --
+    /// never by adding machines, which is what every other row above points at.
+    NotPermitted,
+    /// One machine declined the job it was handed.
+    ///
+    /// The fleet found a worker and the worker said no: a lease it would not honour,
+    /// a toolchain it no longer has, a scratch root it cannot write. One machine to
+    /// go and look at, rather than a fleet-shaped problem.
+    WorkerRefused,
+    /// The fleet could not name a leader to ask.
+    ///
+    /// Its own row rather than a share of `NotPermitted`, because it is transient by
+    /// nature -- an election in progress -- and permanent only when a fleet is
+    /// misconfigured. A rate separates those two; a bucket shared with a credential
+    /// refusal separates nothing.
+    NoLeader,
+    /// This launcher and the fleet disagree about the wire.
+    ///
+    /// A staggered upgrade produces this and stops producing it when the upgrade
+    /// finishes, so a rise that persists names a machine that never came back.
+    ProtocolMismatch,
+    /// A refusal this build has no row for.
+    ///
+    /// Reachable only from a peer NEWER than this launcher, because
+    /// `DeclineCausesAreTotal` requires a row for every code this build's own wire
+    /// header knows. It is not a default arm for codes somebody forgot: it is the
+    /// honest answer to a sentence this build cannot read, and the same answer
+    /// `ParseDispatchOutcome` gives a log column from a later build.
+    Unrecognised,
+    /// The enumerator count, so a table over this enum takes its extent from the
+    /// enum. Never a cause a `DispatchResult` carries.
+    Last,
+};
+
+/// One wire refusal, and the operator action it belongs to.
+struct DeclineCauseRow
+{
+    CompileCacheWire::ErrorCode code; ///< What the peer answered.
+    DeclineCause cause;               ///< What an operator would do about it.
+};
+
+/// Every refusal this launcher can meet, classified.
+///
+/// A scan rather than an `EnumTable`, because `ErrorCode`'s values are neither
+/// contiguous nor in declaration order -- `NoCluster = 0x15` is declared after
+/// `InvalidClusterChange = 0x16` -- so an extent taken from the enum would index
+/// the wrong rows. `CompileCacheWire::FindOp` and `Wire::Describe` scan their own
+/// tables for the same reason, so this is the tree's existing idiom.
+///
+/// The completeness guard below is what makes this a classification rather than a
+/// list somebody remembers to extend.
+inline constexpr std::array DeclineCauseTable {
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnsupportedVersion, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownOpcode, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedFrame, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::PayloadTooLarge, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedValue, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::StorageWriteFailed, .cause = DeclineCause::WorkerRefused },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Unauthenticated, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NoWorker, .cause = DeclineCause::NoToolchain },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NoCapacity, .cause = DeclineCause::NoCapacity },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::AlreadyInFlight, .cause = DeclineCause::AlreadyBuilding },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::DispatchNotPermitted, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownLease, .cause = DeclineCause::NotPermitted },
+    // From either end this is "the fleet does not have your compiler": a scheduler
+    // saying no worker carries the fingerprint, or a worker saying the lease named a
+    // toolchain it does not serve. One thing to fix, so one row.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::FingerprintMismatch, .cause = DeclineCause::NoToolchain },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnsupportedCodec, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerScratchUnavailable, .cause = DeclineCause::Withdrawn },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerSpawnFailed, .cause = DeclineCause::WorkerRefused },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotLeader, .cause = DeclineCause::NoLeader },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotAMember, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Withdrawn, .cause = DeclineCause::Withdrawn },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NoCluster, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::InvalidClusterChange, .cause = DeclineCause::NotPermitted },
+    // Slots were free and MEMORY was not, which the worker's own rule calls a
+    // momentary fullness the peer retries past -- the same answer as a withdrawn
+    // slot, and not a machine to go and inspect.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EndpointBusy, .cause = DeclineCause::Withdrawn },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::MalformedRegistration, .cause = DeclineCause::ProtocolMismatch },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseUnauthorized, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseEndpointMismatch, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::LeaseExpired, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerToolchainSurveyInFlight, .cause = DeclineCause::Withdrawn },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RequestDeadlineExceeded, .cause = DeclineCause::Withdrawn },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ForeignValueGeneration, .cause = DeclineCause::ProtocolMismatch },
+};
+
+/// Whether every refusal this build's wire header knows carries a classification.
+///
+/// Derived from `CompileCacheWire::ErrorTable` rather than restated, so a code added
+/// there cannot silently arrive as `Unrecognised` -- which would read exactly like a
+/// peer from the future while being this build forgetting a row. That is the
+/// silence-reads-as-coverage failure one level up, and an opt-in list is how it
+/// happens.
+/// @return True when every wire error code has exactly one row here.
+[[nodiscard]] consteval bool DeclineCausesAreTotal() noexcept
+{
+    for (auto const& known: CompileCacheWire::ErrorTable)
+    {
+        std::size_t rows = 0;
+        for (auto const& row: DeclineCauseTable)
+            if (row.code == known.code)
+                ++rows;
+        if (rows != 1)
+            return false;
+    }
+    return true;
+}
+
+static_assert(DeclineCausesAreTotal(),
+              "every CompileCacheWire::ErrorCode needs exactly one DeclineCauseTable row, or a refusal this "
+              "build knows would be reported as one it has never heard of");
+
+/// What an operator would do about the refusal a peer answered with.
+/// @param code What the peer answered.
+/// @return The operator action, or `Unrecognised` for a code this build has no row
+///         for -- which `DeclineCausesAreTotal` limits to a NEWER peer.
+[[nodiscard]] constexpr DeclineCause DeclineCauseFor(CompileCacheWire::ErrorCode code) noexcept
+{
+    for (auto const& row: DeclineCauseTable)
+        if (row.code == code)
+            return row.cause;
+    return DeclineCause::Unrecognised;
+}
+
 /// The result of one dispatch attempt.
 struct DispatchResult
 {
     DispatchStatus status { DispatchStatus::Unavailable };
+    /// Which kind of decline, when `status` is `Declined`. Meaningless otherwise.
+    ///
+    /// The seed is `Unrecognised` because it is the row that claims least, and it is
+    /// never observed on a real decline: `DeclinedBy` is the only way to build one
+    /// and it always classifies. There is deliberately no "not classified" row --
+    /// nothing could reach it, and a refusal nothing reaches is a series reading
+    /// zero because the event is impossible rather than because it did not happen,
+    /// which is why `EpochMismatch` was retired rather than left standing.
+    DeclineCause decline { DeclineCause::Unrecognised };
     int exitCode { 0 };            ///< The remote compiler's exit code (Compiled only).
     std::vector<std::byte> object; ///< The compiled object, already decoded.
     std::string stdoutText;        ///< The remote compiler's stdout.

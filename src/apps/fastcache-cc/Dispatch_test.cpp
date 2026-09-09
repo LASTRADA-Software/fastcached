@@ -595,6 +595,87 @@ TEST_CASE("A worker refusing the job is a decline, not a compile", "[dispatch]")
     CHECK(result.detail.contains("unknown-lease"));
 }
 
+TEST_CASE("A decline says WHICH kind, from either end of the fleet", "[dispatch][decline]")
+{
+    // The wiring, asserted rather than assumed. `DeclineCauseFor` being a correct
+    // table proves nothing about whether `Dispatch` consults it: a classifier with
+    // no production caller is the defect it was written to fix, which this
+    // repository has already paid for once.
+    //
+    // Compared against EACH OTHER in one case rather than one section per code.
+    // Every one of these returns `Declined`, so a section asserting the STATUS
+    // passes on the build this ticket is about -- the one where all of them mean
+    // "the fleet declined this compile" and an operator cannot tell which remedy to
+    // reach for (#618).
+    auto declineFor = [](Wire::ErrorCode schedulerAnswer) {
+        ScriptedFleet fleet;
+        fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(schedulerAnswer, {}));
+        std::vector<std::string> const args { "-O2" };
+        auto const result = Dispatch(fleet, Request(args));
+        REQUIRE(result.status == DispatchStatus::Declined);
+        return result.decline;
+    };
+
+    auto const noWorker = declineFor(Wire::ErrorCode::NoWorker);
+    auto const noCapacity = declineFor(Wire::ErrorCode::NoCapacity);
+    auto const withdrawn = declineFor(Wire::ErrorCode::Withdrawn);
+    auto const duplicate = declineFor(Wire::ErrorCode::AlreadyInFlight);
+
+    CHECK(noWorker == DeclineCause::NoToolchain);
+    CHECK(noCapacity == DeclineCause::NoCapacity);
+    CHECK(withdrawn == DeclineCause::Withdrawn);
+    CHECK(duplicate == DeclineCause::AlreadyBuilding);
+
+    // The discrimination. Each assertion above still holds if two of them collapse
+    // into the third; only comparing them refuses that. These three in particular
+    // are what this repository's metrics rules already refuse to sum -- a
+    // misconfigured fleet, a fleet too small, and a fleet unavailable.
+    CHECK(noWorker != noCapacity);
+    CHECK(noCapacity != withdrawn);
+    CHECK(noWorker != withdrawn);
+
+    // And the WORKER's half, which is the other source and reaches the same field
+    // through a different call site. A refusal after a lease was granted is one
+    // machine to look at, not a fleet-shaped problem.
+    ScriptedFleet workerRefusing;
+    workerRefusing.Serve(std::string { Scheduler }, GrantReply());
+    workerRefusing.Serve(std::string { Worker }, Wire::EncodeErrorReply(Wire::ErrorCode::WorkerSpawnFailed, {}));
+    std::vector<std::string> const args { "-O2" };
+    auto const refused = Dispatch(workerRefusing, Request(args));
+    REQUIRE(refused.status == DispatchStatus::Declined);
+    CHECK(refused.decline == DeclineCause::WorkerRefused);
+    CHECK(refused.decline != noWorker);
+}
+
+TEST_CASE("An exhausted redirect chain declines as no-leader, not as a refusal", "[dispatch][decline][redirect]")
+{
+    // The case the ticket's own asymmetry got wrong. `NotLeader` carries the
+    // leader's ENDPOINT as its message, and `LeaseFromFleet` returns that outcome as
+    // it stands once the hops run out -- so this is the one decline whose peer text
+    // is unbounded, and it must be classified by its CODE rather than described by
+    // its words.
+    //
+    // Its own cause rather than a share of `NotPermitted`: an election in progress
+    // is transient and a misconfigured fleet is permanent, and a rate separates
+    // those two only if they are not already summed.
+    constexpr std::string_view Other = "other:6675";
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Other));
+    fleet.Serve(std::string { Other }, Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Scheduler));
+
+    std::array<std::string, 1> const args { "-c" };
+    auto const result = Dispatch(fleet, Request(args));
+
+    REQUIRE(result.status == DispatchStatus::Declined);
+    CHECK(result.decline == DeclineCause::NoLeader);
+
+    // The endpoint still reaches an operator, on the verbose line, where variable
+    // text belongs. What must never happen is it reaching the TALLY -- which is why
+    // the cause is what `RecordingFor` reads and the detail is not.
+    CHECK(result.detail.contains(Other));
+}
+
 TEST_CASE("The lease is handed back however the job ended", "[dispatch]")
 {
     // The client is the party the lease was issued to, and every branch below is a
