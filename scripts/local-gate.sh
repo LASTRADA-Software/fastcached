@@ -311,7 +311,21 @@ gate_failed_marker="GATE FAILED:"
 # prints. It sits beside the markers above for their reason -- a string that is
 # both written and read in several places, spelled independently in each, goes on
 # agreeing with itself after the thing it looks for has changed.
-gate_totals_marker="tests passed"
+#
+# **ANCHORED, and that is the whole point rather than tidiness.** It was the bare
+# substring `tests passed`, which is the only thing standing between
+# `skip_report`'s `SKIPS UNKNOWN` and its `no tests skipped`. Both gate presets
+# set `outputOnFailure`, so a failing test's own output is interleaved into this
+# same log -- and `scripts/launcher-replay-e2e.sh` prints
+# `control suite: All tests passed (N assertions in M test cases)`, which contains
+# it. A leg KILLED mid-run after any such line would have reported "no tests
+# skipped" for a run that never finished: the reassuring answer, from the guard
+# whose own comment says it exists to stop exactly that.
+#
+# The anchor also keeps those interleaved lines out of the failure excerpt, where
+# they would have burned the `-m 30` budget before ctest's own verdict lines
+# reached it.
+gate_totals_pattern='^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+'
 
 # Outcome, exit status, and what a reader should do about it.
 #
@@ -477,7 +491,7 @@ skip_report() {
 
     # Herestrings rather than pipes throughout: `producer | grep -q` is a false
     # negative under `pipefail`, which this script sets.
-    if ! grep -q "$gate_totals_marker" <<< "$text"; then
+    if ! grep -qE "$gate_totals_pattern" <<< "$text"; then
         echo "== ${label}: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
         echo "==   it cannot support 'nothing was skipped'. Whether the run finished is"
         echo "==   the question to answer first."
@@ -562,13 +576,22 @@ skip_report() {
 # `yes`, would have made the excerpt grep for something that matches nothing, with
 # no way to notice. `Passed` is already that state; it is simply the one that was
 # special-cased rather than tabulated.
+# **ORDER IS LOAD-BEARING.** `states_reconcile` classifies each result line by the
+# FIRST row whose marker matches, so the starred markers must be tried before
+# `Passed`, whose marker is a bare word that also appears inside a test NAME. A
+# case called `a lookup some Passed task owns` that FAILS would otherwise be
+# counted as passed. `Passed` is therefore last, and moving it changes a verdict
+# rather than a listing.
+#
+# The excerpt pattern is unaffected by this order: it takes only the `yes` rows,
+# and `Passed`/`Skipped` are both `no`.
 gate_ctest_states=(
-    "Passed|Passed|no"
     "Failed|\\*\\*\\*Failed|yes"
     "Skipped|\\*\\*\\*Skipped|no"
     "Timeout|\\*\\*\\*Timeout|yes"
     "Exception|\\*\\*\\*Exception|yes"
     "Not Run|\\*\\*\\*Not Run|yes"
+    "Passed|Passed|no"
 )
 
 # One column of a `gate_ctest_states` row, by position, so no caller spells the
@@ -593,7 +616,7 @@ gate_excerpt_pattern() {
     done
     # The totals line is not a per-test state and is not in the table; it is here
     # because a reader needs the count beside the names.
-    echo "${pattern}${gate_totals_marker}"
+    echo "${pattern}${gate_totals_pattern}"
 }
 
 # The lines the gate shows a reader when a leg's tests fail.
@@ -666,59 +689,132 @@ failure_excerpt() {
 # @param 1 Label to report against, normally the preset.
 # Reads a ctest run's output on stdin. Echoes `ok`, or a multi-line report.
 states_reconcile() {
-    local label="$1" text row word marker count
-    local accounted=0 lines=0 total=0 detail=""
+    local label="$1" text row rows="" report
     text="$(cat)"
 
-    local resultLine='^ *[0-9]+/[0-9]+ Test +#[0-9]+:'
-    lines=$(grep -cE "$resultLine" <<< "$text" || true)
+    # The table, flattened for awk. The vocabulary still lives in exactly one
+    # place; awk is handed it rather than carrying its own copy.
+    #
+    # The backslashes come out HERE rather than inside awk, because `awk -v`
+    # processes escape sequences in the value it is given: handed `\*\*\*Failed`
+    # it prints `escape sequence \* treated as plain *` on stderr before any
+    # program of mine runs, and that warning would land in the gate's log on every
+    # leg. The marker column is regex-escaped for `gate_excerpt_pattern`, which
+    # splices it into an ERE; awk matches it literally with `index()`, which is
+    # what a verdict marker is.
+    #
+    # And the rows are joined with a UNIT SEPARATOR rather than a newline, because
+    # `awk -v` will not take one on every awk. macOS's BSD awk lexes the value as a
+    # string literal and refuses a raw newline inside it -- `awk: newline in string
+    # Failed|***Failed`, once per invocation, on stderr, with the program never
+    # running and `states_reconcile` then reporting on nothing. GNU awk accepts it,
+    # so it is green on Linux and on Git Bash and red only where a BSD awk is, which
+    # is the one platform whose `/bin/bash` this file is already constrained by.
+    # 0x1F cannot appear in a state name or a verdict marker, and it is not an ERE
+    # metacharacter, so `split` treats it literally whichever reading an awk takes.
+    local marker
+    for row in "${gate_ctest_states[@]}"; do
+        marker="$(gate_state_field "$row" 2)"
+        rows="${rows}$(gate_state_field "$row" 1)|${marker//\\/}"$'\037'
+    done
+
+    # ONE pass, and the classification is off the result-line PREFIX plus the
+    # marker -- never off the trailing `N.NN sec`.
+    #
+    # Anchoring on the time was wrong twice, both measured against real ctest. A
+    # `FAIL_REGULAR_EXPRESSION` failure puts the REASON between the verdict and
+    # the time:
+    #
+    #   1/2 Test #1: withdigit ...***Failed  Error regular expression found in
+    #   output. Regex=[error 42]  0.03 sec
+    #
+    # whose digits break `[^0-9*]*`, so a `***Failed` the excerpt named correctly
+    # was counted as zero and the alarm fired on a run with nothing unaccounted.
+    # And a `PASS_REGULAR_EXPRESSION` failure makes ctest WRAP the line, putting
+    # the time on the next one, where no single-line regex can reach it at all.
+    #
+    # It only ever reached the red path because all 71 first-party
+    # `FAIL_REGULAR_EXPRESSION` registrations happen to share the digit-free
+    # `CMake Error|CMake Warning`. That is not reassurance: a red leg is exactly
+    # when this gets read, and a wrong reading there is what teaches people to
+    # ignore it.
+    #
+    # First match wins, so each result line is counted once and the order of the
+    # table is load-bearing -- see the comment on it.
+    report="$(awk -v prefix='^ *[0-9]+/[0-9]+ Test +#[0-9]+:' -v rows="$rows" '
+        BEGIN {
+            n = split(rows, raw, "\037")
+            for (i = 1; i <= n; i++) {
+                if (raw[i] == "") continue
+                p = index(raw[i], "|")
+                k++
+                name[k] = substr(raw[i], 1, p - 1)
+                pat[k]  = substr(raw[i], p + 1)
+            }
+        }
+        $0 ~ prefix {
+            lines++
+            if (total == "") {
+                t = $0
+                sub(/^ *[0-9]+\//, "", t)
+                sub(/[^0-9].*/, "", t)
+                total = t
+            }
+            for (i = 1; i <= k; i++) {
+                if (index($0, pat[i]) > 0) { cnt[i]++; next }
+            }
+            unclassified++
+        }
+        END {
+            printf "%d %d %d", lines + 0, total + 0, unclassified + 0
+            # COUNT first, name second: `Not Run` contains a space, and a
+            # `read -r name count` splits it into `Not` and `Run`, which then
+            # reaches arithmetic as `accounted + Run`. With the count leading, a
+            # plain `read -r count name` takes the whole remainder as the name.
+            for (i = 1; i <= k; i++) printf "\n%d %s", cnt[i] + 0, name[i]
+        }
+    ' <<< "$text")"
+
+    local lines total unclassified accounted=0 detail=""
+    read -r lines total unclassified <<< "${report%%$'\n'*}"
+
+    # No result lines at all is not a reconcile failure: it is a run this cannot
+    # read, which `skip_report` reports in its own words. Saying "0 of 0
+    # accounted" here would be a second, vaguer voice for one fact.
     if [[ "$lines" -eq 0 ]]; then
-        # No result lines at all is not a reconcile failure: it is a run this
-        # cannot read, which `skip_report` reports in its own words. Saying
-        # "0 of 0 accounted" here would be a second, vaguer voice for one fact.
         echo "ok"
         return 0
     fi
 
-    # One `awk` and no pipe. This was `grep -oE ... | head -1 | sed`, which is the
-    # exact `producer | head` shape `failure_excerpt`'s comment refuses twenty
-    # lines above -- `head` exits first, the producer dies of SIGPIPE, and
-    # `pipefail` reports the death rather than the search. Written by the same
-    # hand, in the same change, six lines under the paragraph stating the rule.
-    total=$(awk -v re="$resultLine" '$0 ~ re { sub(/^ *[0-9]+\//, ""); sub(/[^0-9].*/, ""); print; exit }' <<< "$text")
+    local name count
+    while read -r count name; do
+        [[ -z "$name" ]] && continue
+        accounted=$((accounted + count))
+        detail="${detail}
+==     ${name}: ${count}"
+    done <<< "$(printf '%s' "${report#*$'\n'}")"
 
-    # A total this cannot read is its own outcome, and making it one is what gives
-    # the guard above something to protect. `[[ 0 -eq "" ]]` is TRUE in bash --
-    # an empty operand evaluates to 0 -- so an unreadable total silently compared
-    # equal to an empty count and answered `ok`. That is this instrument reporting
-    # a clean reconcile about a run it could not read, which is the exact species
-    # it was written to catch, one level up.
-    #
-    # Found by mutation rather than by review: deleting the no-result-lines guard
-    # changed no verdict, so the case asserting it was passing under both readings.
-    if ! [[ "$total" =~ ^[1-9][0-9]*$ ]]; then
+    # A total this cannot read is its OWN outcome, and it is emitted with its own
+    # status word so the caller cannot collapse it into the other one. `[[ 0 -eq
+    # "" ]]` is TRUE in bash -- an empty operand evaluates to 0 -- so an unreadable
+    # total once compared equal to an empty count and answered `ok`, which is this
+    # instrument reporting a clean reconcile about a run it could not read.
+    if [[ "$total" -eq 0 ]]; then
+        echo "unreadable-total"
         echo "== ${label}: cannot read the registered total from this output, so the"
         echo "==   states cannot be reconciled against anything. This is not a clean"
         echo "==   reconcile and must not be read as one."
         return 0
     fi
 
-    for row in "${gate_ctest_states[@]}"; do
-        word="$(gate_state_field "$row" 1)"
-        marker="$(gate_state_field "$row" 2)"
-        count=$(grep -cE "${marker}[^0-9*]*[0-9]+\\.[0-9]+ sec *$" <<< "$text" || true)
-        accounted=$((accounted + count))
-        detail="${detail}
-==     ${word}: ${count}"
-    done
-
     if [[ "$accounted" -eq "$total" ]]; then
         echo "ok"
         return 0
     fi
 
+    echo "unaccounted"
     echo "== ${label}: the per-test states do not account for every test ctest ran."
-    echo "==   accounted ${accounted}, registered ${total}, result lines seen ${lines}${detail}"
+    echo "==   accounted ${accounted}, registered ${total}, result lines seen ${lines}, unclassified ${unclassified}${detail}"
     echo "==   This says THAT something is unaccounted for and never WHAT: a state no"
     echo "==   reader here enumerates, or a run that stopped early, produce the same"
     echo "==   alarm. Read the full log; do not add a state to make this quiet until"
@@ -2125,7 +2221,7 @@ $gate_passed_marker"
     # against the whole string rather than by searching it: a check that only looks
     # for the tokens it expects cannot notice one that should not be there.
     expect "the excerpt pattern is derived from the state table" \
-        '\*\*\*Failed|\*\*\*Timeout|\*\*\*Exception|\*\*\*Not Run|tests passed' \
+        '\*\*\*Failed|\*\*\*Timeout|\*\*\*Exception|\*\*\*Not Run|^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' \
         "$(gate_excerpt_pattern)"
 
     # Every row parses, and the two columns are the only two spellings. A row that
@@ -2158,8 +2254,8 @@ $gate_passed_marker"
     # the point -- and the sum does, without having been told what it is.
     _unlisted="$(printf '1/3 Test #1: alpha ...   Passed    0.01 sec\n2/3 Test #2: beta ....   ***Bananas 0.02 sec\n3/3 Test #3: gamma ...   Passed    0.03 sec\n66%% tests passed, 1 tests failed out of 3\n')"
     expect "a state nobody enumerated is caught by the SUM" \
-        "==   accounted 2, registered 3, result lines seen 3" \
-        "$(states_reconcile leg <<< "$_unlisted" | sed -n '2p')"
+        "==   accounted 2, registered 3, result lines seen 3, unclassified 1" \
+        "$(states_reconcile leg <<< "$_unlisted" | sed -n '3p')"
 
     # And the excerpt is blind to that same input, which is why both exist. If
     # this ever starts matching, the two instruments have stopped being
@@ -2171,8 +2267,8 @@ $gate_passed_marker"
     # does not add up. A checker keyed only on unknown MARKERS would pass this.
     _truncated="$(printf '1/9 Test #1: alpha ...   Passed    0.01 sec\n2/9 Test #2: beta ....   Passed    0.02 sec\n')"
     expect "a run that stopped early does not reconcile either" \
-        "==   accounted 2, registered 9, result lines seen 2" \
-        "$(states_reconcile leg <<< "$_truncated" | sed -n '2p')"
+        "==   accounted 2, registered 9, result lines seen 2, unclassified 0" \
+        "$(states_reconcile leg <<< "$_truncated" | sed -n '3p')"
 
     # Output with no result lines is NOT a reconcile failure -- `skip_report`
     # already reports an unreadable run in its own words, and a second vaguer
@@ -2190,6 +2286,49 @@ $gate_passed_marker"
     # reason nobody should read its silence as a claim about which states ran.
     expect "the report refuses to name the state" "yes" \
         "$([[ "$(states_reconcile leg <<< "$_unlisted")" == *"never WHAT"* ]] && echo yes || echo no)"
+
+    # A `FAIL_REGULAR_EXPRESSION` failure puts the REASON between the verdict and
+    # the time, and a reason with DIGITS in it broke the old trailing-time anchor:
+    # the `***Failed` was counted as zero and the alarm fired on a run with nothing
+    # unaccounted, directly under an excerpt that had named that same test
+    # correctly. Real ctest output, reduced.
+    _reasoned="$(printf '1/2 Test #1: withdigit ...***Failed  Error regular expression found in output. Regex=[error 42]  0.03 sec\n2/2 Test #2: other ...   Passed    0.01 sec\n50%% tests passed, 1 tests failed out of 2\n')"
+    expect "a failure REASON containing digits is still counted" "ok" \
+        "$(states_reconcile leg <<< "$_reasoned")"
+
+    # And a `PASS_REGULAR_EXPRESSION` failure makes ctest WRAP the result line, so
+    # the time lands on the next one where no single-line regex can reach it. The
+    # verdict is still on the prefix line, which is why classification moved there.
+    _wrapped="$(printf '1/2 Test #1: wrapped ...***Failed  Required regular expression not found. Regex=[never]\n  0.02 sec\n2/2 Test #2: other ...   Passed    0.01 sec\n50%% tests passed, 1 tests failed out of 2\n')"
+    expect "a wrapped result line is still counted" "ok" \
+        "$(states_reconcile leg <<< "$_wrapped")"
+
+    # A test whose NAME contains a verdict word, FAILING. First-match-wins over a
+    # table with `Passed` last is what makes this one Failed rather than two
+    # states at once -- reordering the table breaks it.
+    expect "a name containing 'Passed' on a failing test counts once, as Failed" "ok" \
+        "$(states_reconcile leg <<< "$(printf '1/1 Test #1: a lookup some Passed task owns ...***Failed  0.01 sec\n')")"
+
+    # The THIRD outcome, kept distinct from the second by a status word so the
+    # caller cannot collapse them: an unreadable total sends a reader somewhere
+    # else entirely from an unenumerated state.
+    expect "an unreadable registered total is its own status" "unreadable-total" \
+        "$(states_reconcile leg <<< "$(printf '1/0 Test #1: x ...   Passed    0.01 sec\n')" | sed -n '1p')"
+    expect "... and an unaccounted state is the other one" "unaccounted" \
+        "$(states_reconcile leg <<< "$_unlisted" | sed -n '1p')"
+
+    # #1130's guard, anchored. `outputOnFailure` interleaves a failing test's own
+    # output into this log, and `launcher-replay-e2e.sh` prints a line containing
+    # `All tests passed (N assertions in M test cases)`. Unanchored, a leg KILLED
+    # after any such line reported "no tests skipped" -- the reassuring answer for
+    # a run that never finished, from the guard whose comment says it exists to
+    # stop precisely that.
+    expect "a dumped 'All tests passed' line does not satisfy the finished check" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "control suite: All tests passed (3 assertions in 2 test cases)" | head -1)"
+    expect "... while ctest's real totals line does" \
+        "== gate-clang-debug: no tests skipped" \
+        "$(skip_report gate-clang-debug <<< "100% tests passed, 0 tests failed out of 10")"
 
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
@@ -2424,19 +2563,40 @@ run_preset() {
         fail "$preset tests (full log: $log)"
     fi
 
-    # #1159, and on the GREEN path is where it earns its place: a leg that ctest
-    # reports as passing while some test landed in a state no reader here
-    # enumerates would otherwise go by silently, which is the whole species.
-    _reconcile="$(states_reconcile "$preset" < "$log")"
-    if [[ "$_reconcile" != "ok" ]]; then
-        printf '%s\n' "$_reconcile"
-        fail "$preset tests: the per-test states do not account for every test that ran"
-    fi
-
-    grep -E -m 1 "$gate_totals_marker" "$log"
+    grep -E -m 1 "$gate_totals_pattern" "$log"
     # #1130: the totals line above is the one #1128 makes untrustworthy, so the
     # skipped NAMES go in the log beside it, before the log this read is deleted.
     skip_report "$preset" "$build_dir" < "$log"
+
+    # #1159, and on the GREEN path is where it earns its place: a leg that ctest
+    # reports as passing while some test landed in a state no reader here
+    # enumerates would otherwise go by silently, which is the whole species.
+    #
+    # AFTER the totals line and the skipped names, not before. `fail` exits, so
+    # running this first suppressed both on the one run that most needed them --
+    # in the branch whose own ticket is "the gate log carries no skip data".
+    #
+    # The two non-ok outcomes are kept APART here, because collapsing them is the
+    # defect this function exists to prevent, one level up: an unreadable total
+    # and an unenumerated state send a reader to different places, and reporting
+    # the second when the first happened sends them hunting for a state that is
+    # not there. `fail` also names the log, like every other refusal in this
+    # function -- it exits before the `rm` below, so the file survives, and a
+    # message telling somebody to read a log whose `mktemp` name it never prints
+    # is an instruction that cannot be followed.
+    _reconcile="$(states_reconcile "$preset" < "$log")"
+    case "${_reconcile%%$'\n'*}" in
+        ok) ;;
+        unreadable-total)
+            printf '%s\n' "${_reconcile#*$'\n'}"
+            fail "$preset tests: the registered total could not be read, so nothing was reconciled (full log: $log)"
+            ;;
+        *)
+            printf '%s\n' "${_reconcile#*$'\n'}"
+            fail "$preset tests: the per-test states do not account for every test that ran (full log: $log)"
+            ;;
+    esac
+
     rm -f "$log"
 }
 
