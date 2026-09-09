@@ -1400,6 +1400,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   instrument. Its `none` arm had, on the evidence, never once been observed answering. The
   lesson the list above does not carry: **a guard nobody has watched ACCEPT is not known to
   work**, so assert the passing direction, not only the refusing one.
+- **Verifying the FACT a check is about is not verifying the CHECK**, and that is the
+  version that feels like diligence — you doubt an instrument, answer its question a
+  second way, and report the agreement, but two spellings are two instruments and only
+  one was under test. **Run both directions: which one you skipped decides which way it
+  lies** — skip the negative case and a predicate fails toward *present* (the direction
+  that gets acted on), skip the positive and it fails toward *refuted* (the direction
+  that gets believed, because refuting looks like rigour). And measure an idiom at REAL
+  size: `producer | grep -q` under `pipefail` is size-dependent — wrong 20 of 20 at
+  101 KB, right 20 of 20 at 1.1 KB — so a small fixture reports it working.
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
   reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
   process is attributed by its ancestor chain and never by a cmdline match or a leaf `cwd`,

@@ -2810,6 +2810,172 @@ carriage return, so such a script does not misbehave — it fails to start at al
   **copied** outward rather than moved, a subject that no longer adds `-pedantic`,
   and an MSVC arm that adds nothing.
 
+- **Verifying the FACT a check is about is not verifying the CHECK, and that is the
+  version that feels like diligence.** The shape is always the same: you doubt an
+  instrument, so you answer its question a second way, and report the agreement.
+  **Two spellings of one question are two instruments, and only one of them was under
+  test.** Validate a check by running *its* implementation, on inputs whose answer is
+  already known. Six instances in one session, none of which errored and all of which
+  produced well-formed output (#1093).
+  - **`producer | grep -q` under `pipefail` is SIZE-DEPENDENT, so a small fixture
+    reports it working.** That is why the idiom survives review, and why five files
+    carrying comments explaining the defect went on spreading it. Measured, N=20 per
+    row, pattern present on an early line:
+
+    ```
+    producer                                     correct   WRONG (status 141)
+    git show e2e-common.sh   (101 KB)                 0      20
+    git show .gitattributes  (1.1 KB)                20       0
+    synthetic ~60 KB (just under the 64 KB buf)       2      18
+    synthetic 200 KB                                  0      20
+    herestring remedy, 101 KB                        20       0   (20/0 on true ABSENCE too)
+    ```
+
+    The premise the rule needs is that the producer must still be WRITING when
+    `grep -q` exits; one that has already finished exits 0 and the pipeline is right.
+    So *"it answers absent precisely because the content is there"* is true of a large
+    file and false as a general law. The 60 KB row is the finding: one command, one
+    machine, both answers. **Not reliably broken is worse than broken.** #970's remedy
+    stands -- a HERESTRING, which is not a pipe.
+  - **There is no blanket setting, because the option that makes one idiom lie is what
+    makes the other tell the truth.** With `pipefail` OFF, `timeout ... | head -N` then
+    `$?` reports **0** for a producer that really returned **124** -- success, for a
+    command that timed out. With it ON, the same line reports 124. So the rule is not
+    an option: **never read a pipeline's `$?` as a verdict about one member.**
+    `PIPESTATUS` is what answers -- **and it has its own footgun, which is not optional
+    to state, because recommending the remedy without it hands people a defective one.**
+    `PIPESTATUS` is rebuilt by the next command, and a variable assignment is a command:
+
+    ```
+    read PIPESTATUS first:   1 0    (2 elements: producer failed, head succeeded)
+    st=$?; then read it:     0      (1 element -- the ASSIGNMENT reset it)
+    ```
+
+    The wrong spelling yields a plausible one-element array, which is the same
+    well-formed wrong answer this entry is about. Found while measuring the `| head`
+    case *for this entry*.
+  - **Run BOTH directions. Which one you skipped decides which way your instrument
+    lies.** Skip the negative case and a content predicate fails toward *present / it
+    merged*, the direction that gets **acted on**; skip the positive case and it fails
+    toward *absent / refuted*, the direction that gets **believed**, because refuting
+    reads as rigour rather than as convenience. Measured pair: a predicate for *has
+    #1091 merged*, keyed on `Withdraw` in `CompileCacheWire.hpp`, answered **3
+    occurrences on a master that did not contain it** -- all three the pre-existing
+    `Withdrawn` error code, a background of **3 on both sides of the merge** -- while a
+    rebase gate keyed on `_e2e_deadline_arm`, spelled `git show ... | grep -q` under
+    `pipefail`, could only ever answer **NO**. A predicate that works is evidence about
+    the **token**, never about the technique: the second discriminated only because its
+    symbol happened to be new.
+  - **Two instruments agreeing on the only case either has run is not corroboration.**
+    That gate was "verified" by asking `grep -c` instead of `grep -q` and reporting
+    0-on-master / 19-on-branch as confirmation. The two agreed on the one case both had
+    run -- master, where the true answer is *refuse* -- so a coincidence was read as a
+    second opinion. This tree already carries the mirror (*agreement between a fresh
+    measurement and a source you have not read is worth nothing*); this is that rule
+    pointed at instruments instead of sources, and it needs saying because "somebody
+    checked it independently" is precisely what retires the suspicion.
+  - **A guard whose only observed behaviour is refusal is indistinguishable from one
+    that always refuses -- and a TRUE refusal is what makes it so.** That gate's
+    refusal was correct on the day it was tested, which is exactly why nobody looked
+    again. Watch it accept: that is the positive case, and it is half the obligation
+    rather than the whole of it.
+  - **The unit of validation is the READER, not the command and not the person.** In
+    one command, two readers, and only one was sound: an explicit-ref
+    `git show origin/master:<file> | grep -c` carrying its own positive control, and in
+    the very next clause a grep of the **working tree** -- a primary checkout parked on
+    `master`, 25 commits behind, reporting clean. Care in one clause bought nothing in
+    the next, and the careless clause was the one being sent to somebody else as a
+    correction. The stale-tree mechanism is already recorded above (*the tree you
+    measured is not necessarily the tree in question*) and is not restated; what this
+    adds is that a positive control on one reader says nothing whatever about a second
+    reader on the same line. **And a reader that TRUNCATES is a reader too**: a `head -8`
+    over 13 matching lines was reported as a complete enumeration, in the ticket whose
+    own acceptance clause demands a derived answer (#1104) -- this tree's existing
+    *a listing that came back AT its limit* rule, self-inflicted rather than imposed by
+    a tool.
+  - **And WHERE an instrument reports is not where the fault is.** A desynchronised
+    scanner reports at the first construct it cannot reduce, which may be arbitrarily
+    far from the cause and may be a line that is correct and unchanged. Measured:
+    `e2e-helpers-selftest` died at PARSE in **0.02 s** on `macOS-clang-release` with
+    `syntax error near unexpected token '('` -- at a line that **is on master too and
+    parses there**, 135 lines downstream of the real fault. The cause was an apostrophe
+    in a comment inside `$( )`: bash 3.2's command-substitution scanner does not skip
+    comments, so `lane's` opens a single-quoted string as far as that scanner is
+    concerned and swallows the closing paren. Five of them, an **odd** count. Reading
+    the reported line is the natural move and it is wrong here. Bisected on a real bash
+    3.2.39 rather than reasoned, because the two likelier-looking candidates are both
+    innocent:
+
+    ```
+    function definition inside $( )            3.2 PARSES   5.2 PARSES
+    multi-line single-quoted awk inside $( )   3.2 PARSES   5.2 PARSES
+    backtick in a comment inside $( )          3.2 PARSES   5.2 PARSES
+    apostrophe in a comment inside $( )        3.2 FAILS    5.2 PARSES
+    ```
+
+    **A TOKEN scan cannot see this and is not at fault**: the bash-3.2 scan checks
+    `mapfile`, `declare -A`, `local -n`, `${var^^}` and passed correctly, because this
+    is a composition of individually legal tokens -- a different question, not a missed
+    one, and saying so is what stops the next reader distrusting the scan. That gap is
+    #880; nothing in the tree parse-checks a script at all, which is #1100, and
+    `check-table-totals.sh` already carries the same hazard through a different door
+    (*"no apostrophes here -- it is a single-quoted shell string, and one ends it"*),
+    three thousand lines from the file that needed it.
+  - **And sometimes there is no right reader in that tool at all** -- a stronger claim
+    than *pick the right one*, and the remedy is a different instrument rather than a
+    better pattern. Measured, asking one question two ways on Git Bash:
+
+    ```
+    grep -c $'\r' <file>                     -> the LINE COUNTS: $'\r' expanded EMPTY,
+                                                so the pattern matched every line
+    CR=$(printf '\r'); grep -c "$CR" <file>  -> 0 on a KNOWN-CRLF file: text mode eats
+                                                the CR before grep ever sees it
+    ```
+
+    Two spellings, opposite failure directions, neither erroring, both returning a
+    plausible number. `od -c` and `file(1)` answered correctly; **on this platform
+    `grep` cannot answer a line-endings question in either direction.** What caught it
+    was **the number disagreeing with a fact already in hand**: those scripts had *run*
+    under bash, and a CRLF `.sh` fails to start at all, so either the census was wrong
+    or the runs were impossible. That cross-check costs nothing, needs no second
+    instrument, and is the only thing in this family that catches an error *before* it
+    leaves the room rather than after. The detector was then confirmed against a
+    known-LF file **and** a known-CRLF file -- *watch it accept as well as refuse*,
+    applied to a one-line census. A related unit error travels with it: a read-back
+    showing **4916** against a local **4926** looks exactly like truncation and is not
+    -- `jq`'s `length` counts CODEPOINTS where `wc -c` counts BYTES, and five em-dashes
+    at two extra bytes each reconcile it to the byte. Resolve such a gap exactly, or
+    the truncation question stays open forever.
+  - **An instrument can be blind to the phenomenon by construction, and then its clean
+    answer means nothing.** `gh api rate_limit` reports the GraphQL bucket as
+    `5000/5000, used=0` while a live GraphQL call in the same minute returns
+    `X-Ratelimit-Resource: graphql, Used: 5000, Remaining: 0` and refuses. So a
+    `core 5000/5000` reading was used to rule out *lanes are spending a shared budget*
+    and could never have seen it. **The correction is that the instrument was blind,
+    NOT that the original guess was vindicated**: the live reading is from a different
+    hour and that bucket resets hourly, so it establishes a mechanism and not a
+    history. Taking the flattering half would be this same error pointed the other way,
+    and it arrives as somebody handing you credit. The same call answers **HTTP 200**
+    with the error in the BODY, so there the **exit code is the sound reader and the
+    HTTP status is not** -- the two readers disagreed and the wrapper was the one that
+    lied, which inverts the usual advice rather than replacing it.
+  - **A scan cannot cover what is not in the repository, and that is the entire gap --
+    no new check is proposed.** Measured against the real scan in four arms: the defect
+    in an **untracked** `.sh` inside `scripts/` is **caught**; the same file tracked is
+    caught; a tracked `.sh` **outside** `scripts/` is invisible to the `grep -q` scan,
+    but `bash32-scope` **refuses the tree by name**, so it cannot happen silently. The
+    one blind spot is a script outside the repository -- a scratchpad file, which is
+    where that rebase gate lived -- and no enumeration can reach it: untracked, outside
+    every walk, gone by the next session. Widening the scan there is unsound rather
+    than merely noisy, and that is stated so it is not re-proposed as an oversight. The
+    remedy is self-testing by hand, in both directions.
+  - **A comment sitting near a check is not that check's contract.** Found while
+    auditing this very rule: the `git ls-files '*.sh'` comment belongs to the **scope
+    guard**, and was read as the `grep -q` scan's file set -- producing a confident and
+    wrong account of the coverage boundary, corrected only by running the four arms
+    above. The mirror of this tree's *a COMMENT is not a call site*, and the same
+    lesson: what settles a check's behaviour is the check, executed.
+
 - **The copied case is why the difference is a COUNT and not a set.** A suppression
   added outside the block *and* left inside it is present at both `WERROR`
   settings, so as sets the difference is empty and the check passes -- permanently
