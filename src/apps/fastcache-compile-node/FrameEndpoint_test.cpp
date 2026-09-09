@@ -261,12 +261,19 @@ constexpr auto WatchWait = 15s;
 /// a 5 ms request costs about 15 ms -- so a hand-rolled `3000 x 5ms` reads as 15 s and
 /// waits nearer 45. `DrainWithin` reads a clock instead. Blocking is right here: this
 /// runs on the Catch2 thread, never on a reactor.
+/// The ceiling is a PARAMETER because a helper that bakes one in is a helper the next
+/// wait cannot use, and what that author writes instead is the loop this replaces. Two
+/// waits here needed 30 s and 60 s, so the only options were to raise `WatchWait` for
+/// every caller or to hand-roll -- and hand-rolling loses the `DrainResult`, which is
+/// the one thing a spin cannot recover: *the condition held* and *the ceiling ran out*
+/// are different failures, and a loop has no result to keep them apart.
 /// @param ready What is being waited for; called until it answers true.
-/// @return True when it happened inside `WatchWait`, false when it never did.
+/// @param ceiling How long to keep asking. Defaults to `WatchWait`.
+/// @return True when it happened inside @p ceiling, false when it never did.
 template <std::predicate Predicate>
-[[nodiscard]] bool WaitFor(Predicate ready)
+[[nodiscard]] bool WaitFor(Predicate ready, std::chrono::milliseconds ceiling = WatchWait)
 {
-    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = WatchWait, .poll = 5ms })
+    return DrainWithin([&ready] { return !ready(); }, DrainBound { .ceiling = ceiling, .poll = 5ms })
            == DrainResult::Drained;
 }
 
@@ -1427,16 +1434,14 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
 
     // First client: reaches the responder and is held there.
     auto first = std::async(std::launch::async, [port] { return Exchange(port, Fetch("first")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
     REQUIRE(responder.Answered() == 0);
 
     // Second client, while the first is still held. It must reach the responder --
     // which is what serialization made impossible.
     auto second = std::async(std::launch::async, [port] { return Exchange(port, Fetch("second")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     CHECK(responder.Entered() == 2);
 
     responder.Hold(false);
@@ -1769,8 +1774,7 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
     REQUIRE(declared > 0); // Or the assertions below hold vacuously.
 
     auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
     // Released BEFORE the answer began. Read from inside `Answer`, which is the
@@ -1817,8 +1821,7 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
     auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
 
     auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() == 0; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
     auto const atEntry = responder.InFlightAtEntry();
@@ -1869,16 +1872,14 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     // Two long answers in flight, which under the defect is the whole budget spent.
     auto firstBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
     auto secondBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 2; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     REQUIRE(responder.Entered() == 2);
 
     // The small verb: a heartbeat's shape, arriving while both compiles run. It must
     // REACH the responder -- passing the budget gate is exactly what it could not do
     // under the defect, and a refusal is answered before `Answer` is entered at all.
     auto small = std::async(std::launch::async, [port] { return Exchange(port, Fetch("k")); });
-    for (auto spin = 0; spin < 2000 && responder.Entered() < 3; ++spin)
-        std::this_thread::sleep_for(1ms);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 3; })); // waited for: the third answer to begin
     CHECK(responder.Entered() == 3);
 
     responder.Hold(false);
@@ -1951,20 +1952,23 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     // ONE wait for both, bounded and reporting what it waited for. The bound is
     // generous against `HeaderTimeout` plus a sweep interval, because what this case
     // asserts is which counter moved and never how fast.
-    auto const deadline = std::chrono::steady_clock::now() + 60s;
     auto requests = requestsBefore;
     auto answers = answersBefore;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        requests = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
-        answers = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
-        if (requests > requestsBefore && answers > answersBefore)
-            break;
-        std::this_thread::sleep_for(100ms);
-    }
+    auto const swept = WaitFor(
+        [&] {
+            requests = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
+            answers = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            return requests > requestsBefore && answers > answersBefore;
+        },
+        60s); // waited for: both rows to move
 
     INFO("request-deadline sweeps: " << requests << " (was " << requestsBefore << ")");
     INFO("answer-deadline sweeps: " << answers << " (was " << answersBefore << ")");
+
+    // The ceiling and the readings are asserted SEPARATELY, which is what routing
+    // through `DrainWithin` buys: "it never swept" and "it swept the wrong rows" are
+    // different failures, and the hand-rolled loop reported both as the latter.
+    REQUIRE(swept);
 
     // Each arm raised its OWN row, exactly once. Asserted as equality rather than as
     // "rose", because a conflated implementation that raised both rows for both peers
@@ -2084,23 +2088,20 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
 
     // Arm one must actually be INSIDE the responder before the sweep, or it is arm two
     // in disguise. Bounded, and it says which stage it was waiting for.
-    auto const entered = std::chrono::steady_clock::now() + 30s;
-    while (responder.Entered() < 1 && std::chrono::steady_clock::now() < entered)
-        std::this_thread::sleep_for(10ms);
-    REQUIRE(responder.Entered() >= 1);
+    REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; },
+                    30s)); // waited for: arm one to be inside the responder
 
     // Then both arms are swept. Bounded, generous against the sweep interval, and
     // asserting only that both were seen -- never how fast.
-    auto const deadline = std::chrono::steady_clock::now() + 60s;
     auto sweeps = sweepsBefore;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        sweeps = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
-        if (sweeps >= sweepsBefore + 2)
-            break;
-        std::this_thread::sleep_for(50ms);
-    }
+    auto const bothSwept = WaitFor(
+        [&] {
+            sweeps = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
+            return sweeps >= sweepsBefore + 2;
+        },
+        60s); // waited for: both arms to be swept
     INFO("answer-deadline sweeps: " << sweeps << " (was " << sweepsBefore << ")");
+    REQUIRE(bothSwept); // separately from the count, for the reason given above
     REQUIRE(sweeps == sweepsBefore + 2);
 
     // Released only now, so `Answer` returns AFTER the sweep. This is the instant the
