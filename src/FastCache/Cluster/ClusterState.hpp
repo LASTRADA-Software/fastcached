@@ -122,6 +122,19 @@ struct SettingSpec
 /// spelling it separately is exactly how they drift apart.
 inline constexpr std::string_view LeaseLifetimeSetting = "lease-lifetime";
 
+/// The key naming whether this fleet admits every caller or only its members.
+///
+/// A named constant for `LeaseLifetimeSetting`'s reason, and #1112 is what it costs
+/// when there is not one: the row was spelled here and read NOWHERE, so
+/// `--cluster-set fleet-open=1` was accepted, replicated, snapshotted and carried
+/// across restarts while changing no admission decision. `FindSetting` closes that
+/// for a misspelled key; nothing closed it for a correctly spelled one.
+///
+/// **Searching for this row is itself a trap**: `--fleet-open` names a per-node FLAG
+/// of the same words, so a grep for the name finds the flag and reads as a reader.
+/// The reliable question is who passes this constant to `SettingOf`.
+inline constexpr std::string_view FleetOpenSetting = "fleet-open";
+
 /// Read a `lease-lifetime` value, or say why it is not one.
 ///
 /// **The one predicate both the validator and every reader ask**, rather than one
@@ -155,7 +168,8 @@ inline constexpr std::string_view LeaseLifetimeSetting = "lease-lifetime";
 /// machine's size on all of them.
 inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = "upstream", .summary = "host:port of the shared fastcached every member reads through to" },
-    SettingSpec { .name = "fleet-open", .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+    SettingSpec { .name = FleetOpenSetting,
+                  .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
     SettingSpec { .name = LeaseLifetimeSetting,
                   .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
                              "compile, and the object coming back -- not how long a compiler may run",
