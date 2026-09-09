@@ -1070,6 +1070,54 @@ set_tests_properties("mkdocs-validation" PROPERTIES
     TIMEOUT 60
 )
 
+# The `.clang-format` row that keeps `<windows.h>` ahead of every other Windows SDK
+# header (#1135) still does what it was added to do.
+#
+# The remedy for #1135 was a CONFIGURATION row, which makes the wrong ordering
+# impossible rather than detected -- and the configuration is then the guard, with
+# nothing watching the guard. A row can be deleted, renumbered, or overtaken by one
+# added above it, and the only symptom is Windows CI going red at the Build step on a
+# change that has nothing to do with it, which is exactly how #1135 arrived.
+#
+# **Not the scan that was rejected, and the difference decides the shape.** A scan over
+# source files cannot work here: whether an SDK header tolerates being included first is
+# per-header and not knowable from its name, so it would refuse the three correct files
+# standing in the tree today and still admit tomorrow's. This asks whether the ROW sorts
+# `<windows.h>` first, reads no source file, and has nothing to say about any of them.
+#
+# `smoke` and `SKIP_RETURN_CODE 77` because it needs a real clang-format, which is the
+# shape this repository already uses for an external prerequisite. A formatter of the
+# WRONG version is a refusal rather than a skip -- successive releases disagree about
+# include order, so that verdict would describe a tool nobody runs, and it would be
+# wrong in the reassuring direction.
+add_test(
+    NAME "windows-header-order"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"
+            "${CMAKE_SOURCE_DIR}/scripts/check-windows-header-order.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("windows-header-order" PROPERTIES
+    LABELS "hygiene;smoke"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# Both directions, because a guard nobody has watched refuse is not a guard and one
+# nobody has watched accept is not known to work. The shipped configuration must ACCEPT,
+# and a configuration with the row deleted -- restored to what master spelled before
+# #1135, not merely the row absent -- must REFUSE. Without the second case this check
+# passes with the row gone and reports nothing, which is the failure it exists to
+# prevent, one level up.
+add_test(
+    NAME "windows-header-order-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"
+            "${CMAKE_SOURCE_DIR}/scripts/check-windows-header-order.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("windows-header-order-selftest" PROPERTIES
+    LABELS "hygiene;smoke"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"

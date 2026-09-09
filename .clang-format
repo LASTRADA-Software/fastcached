@@ -85,7 +85,42 @@ IncludeCategories:
     Priority:  80
   - Regex:     '^<[[:alnum:]_]+>'
     Priority:  81
-  - Regex:     '<[[:alnum:]_]+\.h>'
+  # windows.h establishes the target architecture every other Windows SDK header
+  # depends on, so it must be #included BEFORE them. It is not, by default: it lands
+  # in the generic `.h` bucket below and is sorted ALPHABETICALLY among its peers, so
+  # any SDK header whose name sorts earlier is placed in front of it and the build
+  # stops at `winnt.h(169): fatal error C1189: #error: "No Target Architecture"`.
+  #
+  # That is the identical hazard the winsock2.h row above already names -- and names
+  # `windows.h` explicitly as one of the headers depending on winsock2 -- while
+  # leaving windows.h itself in the alphabetical bucket. A rule stated in the file
+  # that obeys it, one row above the case that did not (#1135).
+  #
+  # It cost five Windows CI jobs on #146, at the Build step, on both `cl` and
+  # `clang-cl`, after a green Linux gate. Nothing local can see it: the block is
+  # inside `#if defined(_WIN32)`, so on Linux it is preprocessed away and the
+  # formatter's rewrite is invisible. `IncludeBlocks: Regroup` also deletes the blank
+  # line an author would use to hold the two apart, so writing them in the right
+  # order by hand does not survive a format run.
+  #
+  # 82 rather than a number just above winsock2's 60, which is where this rule would
+  # naturally go. Both satisfy the requirement; the difference is blast radius, and it
+  # was measured rather than argued: at 61 windows.h also moves ahead of `<catch2/>`,
+  # `<sys/>` and the standard `<name>` bucket, reformatting 8 files, where here it
+  # moves ahead of the generic `.h` bucket ALONE and reformats exactly the 3 that
+  # carry the hazard. A configuration change should reorder what the hazard requires
+  # and nothing else.
+  #
+  # Rejected alternatives, so nobody re-derives them: a `// clang-format off` pragma
+  # is droppable by the next edit and leaves the hazard live; reordering the three
+  # sites by hand does not survive the next format run, which is how #146 got here.
+  # This makes the ordering impossible rather than detected -- a scan cannot work,
+  # because whether an SDK header tolerates being first is per-header and not
+  # knowable from its name, so it would refuse the three correct files today and
+  # still admit tomorrow's.
+  - Regex:     '^<windows\.h>'
     Priority:  82
+  - Regex:     '<[[:alnum:]_]+\.h>'
+    Priority:  83
   - Regex:     '.*'
     Priority:  99
