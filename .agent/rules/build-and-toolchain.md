@@ -3356,6 +3356,73 @@ cross-check, it is a second thing to be wrong — and the only copied datum is t
 required-context list itself, whose provenance and the `gh api` call that reads
 the live one are in the script header.
 
+### A CONFLICTING pull request dispatches nothing, and that is the fourth door (#1068)
+
+The three above are a workflow saying *do not run*: a `paths-ignore` filter, a
+`branches:` filter, a missing `merge_group:` row. Each is found by reading the
+workflow, and each is fixed there.
+
+**This one is not.** The workflow configuration is correct, and the run cannot exist:
+a `pull_request` workflow runs off the MERGE REF, GitHub cannot compute one for a
+conflicting pull request, so it dispatches nothing at all. Twelve required contexts
+are then **absent** — not pending, not failed, not skipped. A reader who checks all
+three documented doors finds all three correct and is no closer, which is what makes
+it worth its own entry rather than a sentence appended to theirs.
+
+Measured on one pull request, same workflow configuration, two heads:
+
+<!-- table-total: none -->
+
+| head | `mergeable` | `Build [pull_request]` |
+|---|---|---|
+| conflicting | `CONFLICTING` / `DIRTY` | **none**, on `opened` AND on `reopened` |
+| rebased | `MERGEABLE` / `BLOCKED` | queued within one second |
+
+The `reopened` half is what makes it a property of the STATE rather than a dispatch
+that was dropped once: closing and reopening while still conflicting produced the
+label workflow again and still no `Build`.
+
+- **The asymmetry is the whole tell, and it points the wrong way.** `pr-labels.yml`
+  is `pull_request_target`, which runs off the BASE and therefore needs no merge ref
+  — so it reports normally throughout. One workflow reporting while twelve contexts
+  are missing reads as *CI is slow*, not as *this cannot merge*. Nothing on the pull
+  request page says otherwise; there is no red, because there is no run.
+- **A conflicting branch is silent in BOTH directions**, which is why it can sit for
+  a long time. There is no run to fail, and there is no signal that no run exists.
+  The lane that pushed it has no reason to look, and the manager notices only when a
+  context count reads oddly beside its siblings. Neither party is watching the thing
+  that would tell them. The count is the cheap version of that glance: **2 contexts
+  where every sibling pull request that night had 26**, which needs no API call a
+  conflicting pull request would answer differently.
+- **The diagnostic ORDER is the part that saves the time.** Contexts **absent**
+  rather than pending is the signal to ask `mergeable` FIRST, before reading a
+  workflow. Twenty minutes went into re-checking `paths-ignore`, the `branches:`
+  filter and the `merge_group:` row on the run that produced this entry; all three
+  were correct, and correctly documented, and none of them was the answer.
+- **Cheapest tell that needs no pull request at all: `git merge-tree --write-tree
+  <branch> origin/master`.** It answers the same question locally, on PUSH, before a
+  pull request exists — where the context count needs the pull request and needs
+  somebody to notice an absence, and `mergeable` itself reports `UNKNOWN` for a
+  window after every push, which is indistinguishable from a state nobody asked
+  about. A lane can check its own branches in one loop.
+- **`src/tests/CMakeLists.txt` is where this arrives.** Every check registers at the
+  end of that file, so two lanes landing checks in one evening collide there by
+  construction; it is the file that produced this instance. That is an argument for
+  checking the state on push rather than for a convention about where to append,
+  because the append point is not the problem — the collision is ordinary and the
+  invisibility is the defect.
+- **Resolving it, the marker scan is not enough.** This repository sets
+  `merge.conflictStyle = diff3`, so a conflict has FOUR marker kinds and a
+  three-way grep reports "0 markers left" over a file containing a literal
+  `|||||||` line — which then fails the configure on every leg. Assert the ORDERING
+  of the four (`<<<<<<<` before `|||||||` before `=======` before `>>>>>>>`) rather
+  than counting them: a count answers "is this conflict shaped the way I expect",
+  where the ordering turns a nested or rearranged one into an abort instead of a
+  silent mis-resolve. And the check that actually proves the resolution is
+  `git diff origin/master HEAD -- <file>` having **no deletion lines**: it catches
+  losing the other side AND a stray marker, both as additions that are not yours,
+  where a marker scan sees only the second and only when it knows to look for it.
+
 ## A gate that does not report reads as a gate that passed
 
 The three doors above are all about a required context that never arrives. These
