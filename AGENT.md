@@ -1562,6 +1562,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   so a leg checked against it is concluded *unrequired* rather than merely miscounted, and it carries no number
   for a count-shaped search to find. Nothing GUARDS this — the obvious scan was measured and is unsound (#830) —
   so the rule is all there is; the sites, the figures and the argument are in the rule file.
+- A **CONFLICTING** pull request is the fourth door, and the only one the workflow files
+  cannot explain: a `pull_request` workflow runs off the MERGE REF, GitHub computes none
+  for a conflicting pull request, and it therefore dispatches NOTHING — required contexts
+  ABSENT rather than pending, no run to fail and no signal that no run exists. Silent in
+  both directions, so neither the lane nor the manager is watching it. Measured, one pull
+  request, two heads: conflicting gave zero `Build` runs on `opened` **and** on
+  `reopened`; rebased queued within a second. The tell points the wrong way — `pr-labels`
+  is `pull_request_target`, runs off the BASE, needs no merge ref, and reports normally
+  throughout, so it reads as CI being slow. **Order matters more than the fact**: contexts
+  absent rather than pending → ask `mergeable` BEFORE reading a workflow, and on push ask
+  `git merge-tree --write-tree <branch> origin/master`, which needs no pull request and
+  no API. Resolving it, assert the ORDERING of diff3's four markers rather than counting
+  three, and prove the resolution with `git diff origin/master HEAD -- <file>` showing no
+  deletion lines.
 - A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING — measured: three required contexts came
   back `skipped` on `b4777aa`, which merged. A skipped **matrix** job is the opposite: it never expands, so its
   per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.
