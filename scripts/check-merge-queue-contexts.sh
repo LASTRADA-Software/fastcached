@@ -509,13 +509,37 @@ for row in "${RequiredContexts[@]}"; do
     workflow="${row##*|}"
     [[ -f "$workflow" ]] || continue
 
-    # `grep -F` on the derived list rather than a pipeline into `grep -q`: under
-    # `pipefail` a `grep -q` that exits at its first match kills the producer with
-    # SIGPIPE and the pipeline then reports the PRODUCER's status -- a false
-    # negative on the success path. That trap is in the rulebook and this is the
-    # shape that avoids it.
+    # A HERESTRING, not a pipeline: under `pipefail` any consumer that exits at its
+    # first match kills the producer with SIGPIPE and the pipeline reports the
+    # PRODUCER's status -- a false negative, and one that fires on the SUCCESS path,
+    # because the earlier the match the more data is left queued.
+    #
+    # This comment used to cite that rule and vouch for the line below it, which was
+    # `printf ... | awk '$1 == want { print; exit }'`. Swapping `grep -q` for an awk
+    # `exit` changes the tool and keeps the defect: same early exit, same signal, same
+    # false negative. The rule was known, quoted, and reintroduced on the next line --
+    # so the remedy is the one #970 actually prescribes, which is not piping at all.
+    #
+    # Measured on this check, N=80 each, conditions stated because the rate is not a
+    # property of the script alone -- scheduling decides the race:
+    #
+    #     piped, interleaved with a second copy      48 of 80 failed, all exit 141
+    #     piped, under the herestring run's load       9 of 80 failed, all exit 141
+    #     herestring, interleaved with a second copy   0 of 80
+    #
+    # The middle row is the control, and it is why the zero means anything: the same
+    # unpatched script under the SAME load the fixed one saw still failed, so the zero
+    # is the fix rather than a quiet machine. It is also why the conditions are stated
+    # rather than a single percentage being quoted -- 48 and 9 are the same script, and
+    # the ticket that filed this measured 29 of 80 again. The rate belongs to the
+    # scheduling, and only the ZERO belongs to the code.
+    #
+    # 141 is 128+13, and neither 0 nor 1: the shape this repository already reads as
+    # the instrument failing rather than the tree being bad. It died mid-loop with no
+    # diagnostic, having printed its `ok:` lines up to that point, so the output read
+    # like a check that had reached a verdict.
     produced="$(EmitJobContexts "$workflow")"
-    match="$(printf '%s\n' "$produced" | awk -F'\t' -v want="$context" '$1 == want { print; exit }')"
+    match="$(awk -F'\t' -v want="$context" '$1 == want { print; exit }' <<< "$produced")"
 
     if [[ -z "$match" ]]; then
         Fail "no job in $workflow produces the required context '$context' -- a rename or a deleted job leaves it unreportable and the branch unmergeable"
