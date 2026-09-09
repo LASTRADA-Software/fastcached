@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The checks that read a pull request's BODY, and nothing else.
+#
+# ## Why these are not steps in build.yml, which is where they started
+#
+# A body check's only remedy is editing the body, and `build.yml`'s trigger is a bare
+# `pull_request:` — which defaults to `opened, synchronize, reopened` and does **not**
+# include `edited`. So the closing-keyword check refused correctly, the author fixed the
+# body, and nothing re-ran: the context stayed red with the defect already repaired, and
+# cleared only on an unrelated push. `gh run rerun --job` is refused while the parent run
+# is still in progress, so there was no way out that did not involve pushing something
+# ([#1045](https://github.com/LASTRADA-Software/fastcached/issues/1045)).
+#
+# That is worse than the bug it replaced. A refusal naming an action that does not work
+# leaves a reader three conclusions -- the check is broken, my fix was wrong, or I should
+# force-push a no-op to satisfy CI -- and all three are worse than the original defect.
+# The last one is the behaviour this repository least wants to teach.
+#
+# Adding `edited` to `build.yml` is the obvious fix and the wrong one: it re-runs the
+# whole matrix -- every Windows leg, TSan, both end-to-end suites, all packaging -- for a
+# change to prose. These checks need no build, no toolchain and no history; they read the
+# API. So they get their own workflow, which can carry `edited` because re-running it
+# costs one runner start.
+#
+# ## Why a WORKFLOW and not a new job in build.yml
+#
+# `check-release-gate` asserts that every job in `build.yml` appears in `release.needs`,
+# so a new job there would gate the release too -- which is why the doc-subject and
+# rulebook checks are steps rather than siblings. That constraint is scoped to
+# `build.yml` (it reads that one file by name), so a separate workflow is outside it.
+# `pr-labels.yml` is the existing precedent: a required context, produced outside
+# `build.yml`, gating nothing it should not.
+#
+# ## The merge queue, which is how this shape goes wrong
+#
+# A required context that cannot report inside a merge queue leaves a queued pull request
+# sitting forever with nothing saying why -- the never-arrives failure `build.yml`
+# records three times, and splitting a context out is exactly the change that reopens it.
+# Hence the `merge_group:` trigger below and the row in
+# `scripts/check-merge-queue-contexts.sh`, which is the ONE place the required set lives.
+#
+# `pull_request` rather than `pull_request_target`: this only READS, through the API,
+# with a token scoped to `pull-requests: read`. `pull_request_target` would run
+# fork-authored changes against a writable token for no benefit here -- and it does not
+# fire on `merge_group` either, so it buys nothing on that side.
+
+name: PR body
+
+on:
+  pull_request:
+    # `edited` is the whole point of this file. The other three keep the check running
+    # on the events it already ran on, so moving it out of `build.yml` loses no coverage.
+    types: [opened, reopened, synchronize, edited]
+  merge_group:
+    branches: [master]
+
+# A body edit does not re-enter the queue, so two runs of this workflow on one pull
+# request answer for the same body; the later one wins and the earlier is not worth a
+# runner. Not keyed on the run id, which would make every entry its own group and cancel
+# nothing.
+concurrency:
+  group: pr-body-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  closing-keywords:
+    # `name:` is the required context `Check the PR body's closing keywords`, listed in
+    # `scripts/check-merge-queue-contexts.sh`. It is a wire constant in the sense that
+    # file's own header gives: renaming it renames a required context, the ruleset then
+    # waits on a name nothing produces, and every branch becomes unmergeable.
+    #
+    # It says what it checks, which the old home did not. This ran as step 3 of 5 inside
+    # a job named `Check C++ style`, with `clang-format` skipped beneath it, so a body
+    # failure presented as a formatting failure and a reader went looking for a problem
+    # that was not there.
+    name: "Check the PR body's closing keywords"
+    runs-on: ubuntu-24.04
+    # `!cancelled()` rather than a bare condition: this job has no `needs:`, so nothing
+    # can skip it into a false green -- but a skipped REQUIRED context is read by the
+    # ruleset as PASSING, and stating the rule here is what stops a `needs:` being added
+    # later without it.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # No `fetch-depth: 0`: the check reads the pull request from the API and needs no
+      # history. This checkout exists only to bring the script itself.
+      - uses: actions/checkout@v4
+
+      - name: "Check the closing keywords the commits promise are in the body"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          # `refs/heads/gh-readonly-queue/master/pr-358-<base sha>` inside a queue,
+          # empty otherwise. Same shape `pr-labels.yml` reads.
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        # `bash <path>`, never a bare path. The mode is 755 today, so the bare form would
+        # work; naming the interpreter is what keeps holding when it is not, and a call
+        # that fails to START is indistinguishable from the rule firing.
+        run: |
+          set -uo pipefail
+
+          # Which pull requests this run answers for. One on a `pull_request`; whatever
+          # the queue branch names on a `merge_group`, written to survive a batched ref
+          # naming several even though today it names one.
+          numbers=()
+          if [[ -n "$PR" ]]; then
+            numbers=("$PR")
+          elif [[ -n "$QUEUE_REF" ]]; then
+            # Re-checked in the queue rather than trusted from entry, and that is not
+            # belt-and-braces: a body edit does not re-enter the queue, so a keyword
+            # REMOVED while the entry sat there would otherwise merge unexamined. This is
+            # the one thing entry cannot establish, and it is the same hole
+            # `pr-labels.yml` closes for the type label.
+            #
+            # `mapfile < <(grep ...)` and not `grep | mapfile`: a `grep` matching nothing
+            # exits 1, and in a pipeline under `pipefail` that would take the step down.
+            # Process substitution reports `mapfile`'s status, so "no match" arrives as
+            # an empty array and is handled immediately below.
+            mapfile -t numbers < <(grep -oE 'pr-[0-9]+' <<< "$QUEUE_REF" | cut -d- -f2)
+            if [[ ${#numbers[@]} -eq 0 ]]; then
+              echo "::notice::merge candidate '$QUEUE_REF' names no pull request, so the body cannot be re-read here. It was checked as a condition of entering the queue; this leg reports that and asserts nothing more."
+              exit 0
+            fi
+            echo "merge candidate '$QUEUE_REF' -> re-checking #${numbers[*]}"
+          else
+            # Never a quiet pass. "Did not apply" and "found nothing" rendering
+            # identically is the collapse this repository files separate tickets against.
+            echo "::error::neither a pull request number nor a merge-queue ref is present on a '${{ github.event_name }}' event, so this check cannot tell what it is checking. Refusing rather than passing."
+            exit 1
+          fi
+
+          failed=0
+          for number in "${numbers[@]}"; do
+            bash scripts/check-pr-closing-keywords.sh --pr "$number"
+            rc=$?
+            # 77 is the script's "could not reach the API". Here it is a FAILURE, not a
+            # skip: in ctest a missing prerequisite must skip (#499), but on the machine
+            # whose verdict gates master a guard that could not run is precisely what
+            # must not be silent (#957, #974).
+            if [[ "$rc" -eq 77 ]]; then
+              echo "::error::the closing-keyword check could not reach the API for #${number}, so it verified NOTHING. That is not a pass (#974)."
+              failed=1
+            elif [[ "$rc" -ne 0 ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"

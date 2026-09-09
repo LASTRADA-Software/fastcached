@@ -254,6 +254,16 @@ RequiredContexts=(
     "sccache smoke (redis RESP2)|.github/workflows/build.yml"
     "Check C++ style|.github/workflows/build.yml"
     "Require a type label|.github/workflows/pr-labels.yml"
+    # Split out of `Check C++ style` by #1045. It reads the pull request BODY, so its
+    # only remedy is a body edit -- and `build.yml` does not fire on `edited`, which
+    # made the refusal unclearable by the one action it advised. Its own workflow can
+    # carry `edited` because re-running it costs a runner start rather than the matrix.
+    #
+    # Required for the reason it was a step in a required job before: reporting without
+    # gating is #684. Its `merge_group:` row is what keeps this promotion from being the
+    # never-arrives failure -- a new required context with no queue leg leaves a queued
+    # pull request waiting on a check that never reports.
+    "Check the PR body's closing keywords|.github/workflows/pr-body.yml"
 )
 
 # ---------------------------------------------------------------------------

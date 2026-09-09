@@ -108,6 +108,20 @@ Judge() {
 
     if [ -n "$missing" ]; then
         echo "FAILED: the commits say this closes${missing}, and the body does not." >&2
+        # The context this is reported under, named here because the reader is looking at
+        # a check name and not at this script. It used to fail as step 3 of 5 inside
+        # `Check C++ style`, with clang-format skipped beneath it, so a body problem
+        # presented as a formatting problem (#1045).
+        echo "        Reported as: Check the PR body's closing keywords" >&2
+        # And the remedy has to say that it WORKS. Until #1045 this refusal advised an
+        # edit that re-ran nothing -- `build.yml` does not fire on `edited` -- so the
+        # context stayed red with the body already fixed, and the three conclusions a
+        # reader could draw were "the check is broken", "my fix was wrong" and "I must
+        # push something to satisfy CI". The last is the one worth spending a sentence to
+        # prevent.
+        echo "        Editing the body is enough: this check re-runs on an edit, with no" >&2
+        echo "        push and no empty commit." >&2
+        echo >&2
         echo "        Two causes. They are indistinguishable in the text, so YOU have to" >&2
         echo "        pick -- neither GitHub nor this check can:" >&2
         echo >&2
@@ -287,6 +301,28 @@ The earlier pull request closed #904, so the entry describing it went stale." \
         "fix: x
 
 FIXED #42"
+    # #1045. Two claims a reader acts on, and neither moves the verdict -- so without
+    # these substrings the case would pass against a message carrying neither, which is
+    # the trap the `run_case` header describes.
+    #
+    # The CONTEXT name, because the reader is looking at a check name rather than at this
+    # script: this failed as step 3 of 5 inside `Check C++ style` with clang-format
+    # skipped beneath it, so a body problem read as a formatting problem. If the context
+    # is ever renamed, this case is what notices that the advice now names a check nobody
+    # can find -- the name is a wire constant in `check-merge-queue-contexts.sh` and this
+    # is its second reader.
+    #
+    # And that the remedy WORKS, which is the whole ticket: until #1045 the refusal
+    # advised a body edit that re-ran nothing, so the context stayed red with the body
+    # already fixed and the available conclusions were "the check is broken", "my fix was
+    # wrong", or "I must push something to satisfy CI".
+    run_case "the refusal names its context and says the edit alone re-runs it" refuse \
+        "Prose about the change, naming no ticket." \
+        "feat: a
+
+Closes #7" \
+        "Reported as: Check the PR body's closing keywords" \
+        "this check re-runs on an edit"
     # selftest-data: end
 
     echo "check-pr-closing-keywords self-test: $cases case(s) ran, $failures failure(s)"
