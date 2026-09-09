@@ -181,7 +181,22 @@ export XDG_STATE_HOME="${workdir}/state"
 # probe is itself another sanitizer-instrumented process on the same cores.
 readonly ClusterProbeSeconds=5
 
-# What the waits below are allowed, in SECONDS of wall clock.
+# What the waits below are allowed, in seconds of MONOTONIC time.
+#
+# Not `SECONDS`, which is `CLOCK_REALTIME` and which a VM guest's host time sync
+# steps -- measured on one such host at ~2.03 s backwards, periodically, so ~12%
+# of any 4 s window contains a step (#1108). Every wait here is armed with
+# `_e2e_deadline_arm`, a background `sleep` that counts down on `CLOCK_MONOTONIC`
+# and cannot be stepped, and asked `_e2e_deadline_passed` rather than compared
+# against a clock reading.
+#
+# These eight are converted as a HAZARD rather than as an observed failure, and
+# the distinction is worth keeping: they are all UPPER bounds, so only a FORWARD
+# step reaches them, and no forward step has been measured by anybody -- #1108
+# saw 18 backward steps and none forward over 600 s, and #1080's forward case is
+# a red test read as a step rather than a step observed. But that measurement is
+# WSL2, and this fixture runs on Linux and macOS, whose host sync is a different
+# implementation. Converting costs one armed timer per wait.
 #
 # Seconds and not passes, which is the other half of #457. `for _ in $(seq 1 150)`
 # with a `sleep 0.2` reads as thirty seconds and enforces no such thing: each pass
@@ -465,7 +480,12 @@ done
 # longer; a cluster that has not settled inside `FormationSeconds` has not settled.
 leader_endpoint=""
 
-# An absolute `SECONDS` value past which no NESTED wait may run, or empty.
+# An armed co-timer MARKER past which no NESTED wait may run, or empty.
+#
+# A marker rather than the absolute `SECONDS` value this used to hold: the bound
+# it caps is monotonic now, and an enclosing bound has to be asked the same
+# question the inner one is, or the composition reintroduces the clock read that
+# was removed from each half.
 #
 # A wait called inside another wait's loop carries its own bound, and two bounds
 # compose by the inner one winning -- so the replication loop below declared 30 s
@@ -478,7 +498,7 @@ leader_endpoint=""
 # is also reached indirectly, through `ask_leader`, so a parameter would have
 # to be carried by functions that have no opinion about it and would be forgotten
 # by the next one added.
-enclosing_deadline=""
+enclosing_mark=""
 
 # @param $1 What was being waited for, named by the caller.
 #
@@ -498,24 +518,36 @@ find_leader() {
     local what="${1:-a leader}"
     leader_endpoint=""
     local index answer summary
-    local started="$SECONDS" budget
     local mark; mark="$(probe_mark)"
-    local deadline=$(( SECONDS + FormationSeconds ))
-    if [[ -n "$enclosing_deadline" && "$enclosing_deadline" -lt "$deadline" ]]; then
-        deadline="$enclosing_deadline"
-    fi
-    budget=$(( deadline - started ))
-    while [[ "$SECONDS" -lt "$deadline" ]]; do
+    # Two bounds compose by whichever expires FIRST, which with a co-timer is a
+    # question about two markers rather than the smaller of two clock readings.
+    # `budget` is now the bound that ENDED the wait rather than a computed
+    # remainder -- naming it is what the remainder was for, and a remainder is
+    # exactly the subtraction of two clock readings this fixture stopped doing.
+    local budget="${FormationSeconds}s"
+    [[ -z "$enclosing_mark" ]] || budget="${FormationSeconds}s capped by an enclosing ${ReplicationSeconds}s"
+    local armed dpid dmark
+    _e2e_deadline_arm "$FormationSeconds"
+    armed="$_e2e_deadline_armed"
+    dpid="${armed%% *}"
+    dmark="${armed#* }"
+    while ! _e2e_deadline_passed "$dmark" \
+        && { [[ -z "$enclosing_mark" ]] || ! _e2e_deadline_passed "$enclosing_mark"; }; do
         for index in "${!scheduler_ports[@]}"; do
             [[ -n "${scheduler_ports[$index]}" ]] || continue
             answer="$(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
             if [[ "$answer" == *"known settings:"* ]]; then
                 leader_endpoint="127.0.0.1:${scheduler_ports[$index]}"
+                # Retired on the HOT path too, or every successful find_leader
+                # leaves a live `sleep` and a marker behind -- and this function
+                # is called from inside another wait's loop.
+                _e2e_deadline_disarm "$dpid" "$dmark"
                 return 0
             fi
         done
         sleep 0.2
     done
+    _e2e_deadline_disarm "$dpid" "$dmark"
 
     # Taken ONCE, before the dump, and reused. The dump issues three more probes,
     # so summarising again afterwards reports a different set of numbers under the
@@ -523,14 +555,14 @@ find_leader() {
     # fixture's own diagnostics rather than describing the wait that failed.
     summary="$(probe_summary "$mark")"
 
-    echo "no live node answered as leader within ${budget}s, waiting for ${what}."
+    echo "no live node answered as leader within ${budget}, waiting for ${what}."
     echo "  ${summary}"
     echo "  What each was asked and said:"
     for index in "${!scheduler_ports[@]}"; do
         [[ -n "${scheduler_ports[$index]}" ]] || { echo "  slot ${index}: stopped by this fixture"; continue; }
         echo "  127.0.0.1:${scheduler_ports[$index]}: $(cluster "127.0.0.1:${scheduler_ports[$index]}" --cluster-status)"
     done
-    fail "no live node answered as leader in ${budget}s, waiting for ${what} (${summary})"
+    fail "no live node answered as leader in ${budget}, waiting for ${what} (${summary})"
 }
 
 # The endpoint a refusal tells a client to ask instead, or empty when it names
@@ -616,8 +648,12 @@ wait_for_formation() {
     local mark; mark="$(probe_mark)"
     local started="$SECONDS"
 
-    local deadline=$(( SECONDS + FormationSeconds ))
-    while [[ "$SECONDS" -lt "$deadline" ]]; do
+    local armed dpid dmark
+    _e2e_deadline_arm "$FormationSeconds"
+    armed="$_e2e_deadline_armed"
+    dpid="${armed%% *}"
+    dmark="${armed#* }"
+    while ! _e2e_deadline_passed "$dmark"; do
         led=""
         named=""
         followers=0
@@ -673,10 +709,12 @@ wait_for_formation() {
 
         if [[ -n "$led" && "$followers" -eq $(( live - 1 )) && "$named" == "$led" ]]; then
             leader_endpoint="$led"
+            _e2e_deadline_disarm "$dpid" "$dmark"
             return 0
         fi
         sleep 0.2
     done
+    _e2e_deadline_disarm "$dpid" "$dmark"
 
     # What the declines named, as its own sentence, because it is the evidence that
     # separates the remaining possibilities and it is cheap to state.
@@ -774,12 +812,17 @@ echo "cluster E2E: exactly one node answers, and keeps answering"
 redirect_from() {
     local endpoint="$1" answer=""
     local mark; mark="$(probe_mark)"
-    local deadline=$(( SECONDS + RedirectSeconds ))
-    while [[ "$SECONDS" -lt "$deadline" ]]; do
+    local armed dpid dmark
+    _e2e_deadline_arm "$RedirectSeconds"
+    armed="$_e2e_deadline_armed"
+    dpid="${armed%% *}"
+    dmark="${armed#* }"
+    while ! _e2e_deadline_passed "$dmark"; do
         answer="$(cluster "$endpoint" --cluster-status)"
         case "$answer" in
             *"ask --scheduler="*)
                 named_endpoint "$answer"
+                _e2e_deadline_disarm "$dpid" "$dmark"
                 return 0
                 ;;
             *"known settings:"*)
@@ -788,6 +831,7 @@ redirect_from() {
         esac
         sleep 0.2
     done
+    _e2e_deadline_disarm "$dpid" "$dmark"
     fail "a follower at ${endpoint} never named where to ask within ${RedirectSeconds}s: ${answer} ($(probe_summary "$mark"))"
 }
 
@@ -862,7 +906,7 @@ echo "cluster E2E: a follower redirects to an endpoint that answers"
 # @param 3 what to report when it is accepted and never becomes visible
 commit_setting() {
     local key="$1" value="$2" what="$3"
-    local answer settled=0 mark deadline
+    local answer settled=0 mark armed dpid dmark
 
     ask_leader "--cluster-set=${key}=${value}" "accepted" "the leader refused a legitimate setting (${key})"
 
@@ -870,12 +914,15 @@ commit_setting() {
     # is accepted. Bounded rather than unbounded, so a cluster that never replicates
     # fails saying so instead of timing out the suite.
     mark="$(probe_mark)"
-    deadline=$(( SECONDS + ReplicationSeconds ))
+    _e2e_deadline_arm "$ReplicationSeconds"
+    armed="$_e2e_deadline_armed"
+    dpid="${armed%% *}"
+    dmark="${armed#* }"
     # The nested `find_leader` calls below -- one direct, one reached through
     # `ask_leader` -- each carry `FormationSeconds`, which is twice this loop's whole
     # budget. Capped here so the number in the source is the number enforced.
-    enclosing_deadline="$deadline"
-    while [[ "$SECONDS" -lt "$deadline" ]]; do
+    enclosing_mark="$dmark"
+    while ! _e2e_deadline_passed "$dmark"; do
         answer="$(cluster "$leader_endpoint" --cluster-status)"
         if [[ "$answer" == *"$value"* ]]; then
             settled=1
@@ -892,7 +939,8 @@ commit_setting() {
         fi
         sleep 0.2
     done
-    enclosing_deadline=""
+    enclosing_mark=""
+    _e2e_deadline_disarm "$dpid" "$dmark"
 
     [[ "$settled" -eq 1 ]] ||
         fail "${what}: ${key}=${value} was accepted and never became visible within ${ReplicationSeconds}s ($(probe_summary "$mark"))"
@@ -988,8 +1036,11 @@ ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[3]}" "accepted" \
 # to see, because n4 winning here is rare.
 joined=0
 join_mark="$(probe_mark)"
-join_deadline=$(( SECONDS + JoinSeconds ))
-while [[ "$SECONDS" -lt "$join_deadline" ]]; do
+_e2e_deadline_arm "$JoinSeconds"
+join_armed="$_e2e_deadline_armed"
+join_dpid="${join_armed%% *}"
+join_dmark="${join_armed#* }"
+while ! _e2e_deadline_passed "$join_dmark"; do
     answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
     named="$(named_endpoint "$answer")"
     if [[ "$answer" == *"known settings:"* ]]; then
@@ -1004,6 +1055,7 @@ while [[ "$SECONDS" -lt "$join_deadline" ]]; do
     fi
     sleep 0.2
 done
+_e2e_deadline_disarm "$join_dpid" "$join_dmark"
 [[ "$joined" -eq 1 ]] ||
     fail "the admitted node never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary "$join_mark"))"
 echo "cluster E2E: an admitted node is replicated to, which is being counted, and it names ${leader_endpoint}"
@@ -1026,14 +1078,18 @@ echo "cluster E2E: an admitted node is replicated to, which is being counted, an
 # needed is the one that redirects. #435 is that surface; until it exists this line
 # is what an operator has too.
 adopted=0
-adopted_deadline=$(( SECONDS + JoinSeconds ))
-while [[ "$SECONDS" -lt "$adopted_deadline" ]]; do
+_e2e_deadline_arm "$JoinSeconds"
+adopted_armed="$_e2e_deadline_armed"
+adopted_dpid="${adopted_armed%% *}"
+adopted_dmark="${adopted_armed#* }"
+while ! _e2e_deadline_passed "$adopted_dmark"; do
     if grep -q "consensus: this node counts [0-9]* member(s)" "${workdir}/n4.log" 2>/dev/null; then
         adopted=1
         break
     fi
     sleep 0.2
 done
+_e2e_deadline_disarm "$adopted_dpid" "$adopted_dmark"
 if [[ "$adopted" -ne 1 ]]; then
     echo "n4 never adopted a configuration. What it last said about its own quorum:"
     grep -E "consensus: this node counts" "${workdir}/n4.log" 2>/dev/null || echo "  (nothing -- it never reported one at all)"
@@ -1154,17 +1210,22 @@ echo "cluster E2E: the three-node cluster is stopped; starting a one-member one"
 # @param 4 what is being waited for, for the failure message
 await_answer() {
     local endpoint="$1" wanted="$2" seconds="$3" what="$4"
-    local answer="" deadline
+    local answer="" armed dpid dmark
     local mark; mark="$(probe_mark)"
-    deadline=$(( SECONDS + seconds ))
-    while [[ "$SECONDS" -lt "$deadline" ]]; do
+    _e2e_deadline_arm "$seconds"
+    armed="$_e2e_deadline_armed"
+    dpid="${armed%% *}"
+    dmark="${armed#* }"
+    while ! _e2e_deadline_passed "$dmark"; do
         answer="$(cluster "$endpoint" --cluster-status)"
         if [[ "$answer" == *"$wanted"* ]]; then
             printf '%s\n' "$answer"
+            _e2e_deadline_disarm "$dpid" "$dmark"
             return 0
         fi
         sleep 0.2
     done
+    _e2e_deadline_disarm "$dpid" "$dmark"
     fail "${what}: ${endpoint} never answered with '${wanted}' within ${seconds}s. Last answer: ${answer} ($(probe_summary "$mark"))"
 }
 
@@ -1308,8 +1369,11 @@ ask_leader "--cluster-admit=m2=127.0.0.1:${raft_ports[$two_index]}" "accepted" \
 # outcomes and hang out the whole budget on the other.
 joined=0
 join_mark="$(probe_mark)"
-join_deadline=$(( SECONDS + JoinSeconds ))
-while [[ "$SECONDS" -lt "$join_deadline" ]]; do
+_e2e_deadline_arm "$JoinSeconds"
+join_armed="$_e2e_deadline_armed"
+join_dpid="${join_armed%% *}"
+join_dmark="${join_armed#* }"
+while ! _e2e_deadline_passed "$join_dmark"; do
     answer="$(cluster "127.0.0.1:${scheduler_ports[$two_index]}" --cluster-status)"
     named="$(named_endpoint "$answer")"
     if [[ "$answer" == *"known settings:"* ]]; then
@@ -1324,6 +1388,7 @@ while [[ "$SECONDS" -lt "$join_deadline" ]]; do
     fi
     sleep 0.2
 done
+_e2e_deadline_disarm "$join_dpid" "$join_dmark"
 [[ "$joined" -eq 1 ]] ||
     fail "the second member never learned who leads within ${JoinSeconds}s, so it was never replicated to: ${answer} ($(probe_summary "$join_mark"))"
 echo "cluster E2E: the second member is replicated to, and names ${leader_endpoint}"
