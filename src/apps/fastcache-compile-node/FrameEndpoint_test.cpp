@@ -2519,11 +2519,17 @@ TEST_CASE("A connection this node closes at SHUTDOWN is not filed as a peer depa
 TEST_CASE("A request pipelined while a watched answer runs is still served", "[node][frame][peerwatch]")
 {
     // **The clause that stops the fix being a worse bug than the one it closes**, and
-    // it is red twice over. A readable edge is EOF *or* pending data:
-    // `EpollSocket::WaitReadable` probes with `recv(MSG_PEEK)` and reports readiness
-    // for `got >= 0`, and IOCP's zero-byte `WSARecv` cannot separate the two either.
-    // So this fails against a watcher that reads the bytes and drops them, AND against
-    // one that calls any readable edge a disconnect and discards a good object.
+    // it is red twice over: this fails against a watcher that reads the bytes and drops
+    // them, AND against one that calls any readable edge a disconnect and discards a
+    // good object.
+    //
+    // It used to say the two were indistinguishable -- that `WaitReadable` reported
+    // readiness for `got >= 0` and IOCP could not separate them. #677 made that false
+    // and #711 corrected it here and at the three sites in `FrameEndpoint.{hpp,cpp}`
+    // that said the same thing. `WaitReadable` now answers `0` for EOF and `>0` for
+    // data on every transport, so what this case pins is no longer *that the watcher
+    // disambiguates* but *that it reaches the right verdict* -- which is the assertion
+    // that survives #1090 removing the probe `Read` the old wording justified.
     Fleet fleet;
     HoldableResponder responder;
     responder.UseReactor(fleet.io.Reactor());

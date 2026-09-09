@@ -868,13 +868,29 @@ namespace
     /// `IFrameResponder::PeerWatchCounter` for what double-arming that slot costs
     /// (a silently leaked coroutine frame, on both epoll and IOCP).
     ///
-    /// **A readable edge is not a disconnect**, and this is the entire reason the
-    /// `Read` below exists. `EpollSocket::WaitReadable` probes with `recv(MSG_PEEK)`
-    /// and reports readiness for `got >= 0` -- which is EOF (0) and pending data (>0)
-    /// reported identically; IOCP's zero-byte `WSARecv` cannot separate them either.
-    /// Calling a readable edge "gone" would make a worker discard a perfectly good
-    /// object every time a client pipelined a request, which is a worse bug than the
-    /// one this closes.
+    /// **A readable edge is not a disconnect.** Calling one "gone" would make a worker
+    /// discard a perfectly good object every time a client pipelined a request, which
+    /// is a worse bug than the one this closes.
+    ///
+    /// **The `Read` below is no longer what draws that distinction, and this comment
+    /// used to say it was** (#711). It claimed `EpollSocket::WaitReadable` reported
+    /// readiness for `got >= 0` -- EOF and pending data indistinguishable -- and that
+    /// IOCP's zero-byte `WSARecv` could not separate them either. #677 made both false:
+    /// `WaitReadable`'s contract is now `0` for EOF and `>0` for data, consuming
+    /// nothing, and every transport in this tree honours it. `EpollSocket` and
+    /// `KqueueSocket` return the count their `MSG_PEEK` measured rather than a flat 1;
+    /// `IocpSocket`'s completion still carries `bytes == 0` for every case, so its
+    /// `Dispatch` does the peek itself under `readPeekOnly`; `InMemorySocket` answers
+    /// `0` only when its inbound pipe is drained AND write-closed; `TlsSocket`
+    /// delegates or reports buffered plaintext.
+    ///
+    /// So the probe `Read`, `PeerWatch::pulled` and the `PrimeWith` that undoes the
+    /// consumption are a mechanism whose justification has gone. **That is
+    /// [#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090), and it is
+    /// deliberately not done here**: #711 is a comment correction, and deleting a
+    /// mechanism inside one is a change wearing a review's authority. Until then the
+    /// `Read` is redundant rather than wrong -- it reaches the same verdict one syscall
+    /// later, and the EOF path runs through it to no effect.
     ///
     /// @param state The server state, shared for the same LIFETIME reason the socket
     ///        is: this watcher can still be parked when the connection's frame has
