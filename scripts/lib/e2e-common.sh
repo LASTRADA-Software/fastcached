@@ -757,6 +757,37 @@ stop_and_require_exit() {
 # so raise this number in the same commit -- the two files are a pair.
 _e2e_http_read_bound=5
 
+# The second read that tells a CLOSED peer from a HOLDING one where the exit status
+# cannot (bash 3.2). Paid only on that interpreter and on a genuine close, never on the
+# common held path under bash 4+, which arm 1 answers for free.
+#
+# The ordering the probe needs is `fast-return << marker-delay < probe-bound`, and the
+# two margins are NOT alike, so both are stated rather than the comfortable one:
+#
+#   * BELOW the marker: a closed peer returns in microseconds against a 1 s marker, a
+#     factor of about a thousand. Losing this needs the marker to fire inside a read
+#     that came back at once, and it fails to "the peer is holding" -- a false PASS,
+#     the silent direction. Nothing plausible closes a thousandfold gap.
+#   * ABOVE the marker: the marker must appear before this bound expires, which is 1 s
+#     against 4 s -- a factor of four, and the tight side. It is lost only if a
+#     `sleep 1` plus one file creation is delayed past 4 s. This host was measured at
+#     load 31 with three lanes gating and that did not happen, but load is not bounded
+#     by anything here. When it IS lost, a HOLDING peer reads as closed: a false RED,
+#     the loud direction, and the same symptom #1048 had -- now needing a three-second
+#     scheduling stall rather than a 1.3 s clock step.
+#
+# So the failure mode was chosen rather than inherited: the tight margin fails the way
+# somebody notices, and the wide margin guards the way nobody would.
+#
+# The marker sits at 1 s because it is the balance point. Shorter crowds the
+# thousandfold side for no gain on the tight one; longer buys margin above and spends
+# it below, where a fast close is only microseconds away.
+#
+# None of these margins has to absorb a clock step, and that is the design rather than
+# luck: neither side of the comparison reads the wall clock. `read -t` and `sleep` both
+# count down relative intervals, so a `CLOCK_REALTIME` step moves neither.
+_e2e_http_probe_bound=4
+
 # Did the bound end that read, or did the peer?
 #
 # The verdict, split out as a pure function over a READING, for the reason
@@ -767,14 +798,37 @@ _e2e_http_read_bound=5
 # it is a property no Linux or Windows run can exercise, and the guard against it
 # coming back is a CI leg that already went red once.
 #
-# Driven directly, both answers are one line each on any platform: `5 5` is a read
-# that consumed its whole bound and `0 5` is a peer that closed at once. That is
-# the whole rule, and it needs no listener, no port and no five-second wait.
+# Driven directly, every answer is one line on any platform, and it needs no listener,
+# no port and no five-second wait.
 #
-# @param 1 how long the read that ended the loop took, in whole seconds
-# @param 2 the bound that read was given
+# **It no longer reads the elapsed TIME, and that is #1048.** The old rule was
+# `elapsed >= bound`, timed with `SECONDS` -- which is `CLOCK_REALTIME`, and this host
+# steps it. Measured against `CLOCK_MONOTONIC`: a time-sync step of about -1.28 s,
+# roughly 1 read in 14; and on this predicate's own case, 7 of 45 reads reported a
+# `SECONDS` elapsed of 4 while the monotonic clock measured 5.01-5.06 s. Those reads
+# had consumed their whole 5 s bound and carried status 142 to say so -- they only
+# LOOKED short -- but `4 >= 5` was false, so a server that had held perfectly was
+# reported as having CLOSED. 9 failures in 60 probes against one settled node, every
+# body zero bytes, matching `fleet-dashboard-e2e`'s own 3-in-24. The reading was never
+# a duration; `_http_drain_fd3` carries the mechanism.
+#
+# The two readings it takes instead are the ones that are not a race against a margin:
+#
+# @param 1 the exit status of the read that ended the loop. Above 128 is a timeout and
+#          cannot be anything else -- measured disjoint from EOF's 1 on bash 5.2.21,
+#          including the reads a stepped clock had made LOOK short. bash 3.2 answers 1
+#          for both, which is why there is a second parameter at all.
+# @param 2 whether the follow-up probe read BLOCKED: 1 it did, 0 it came back at once,
+#          `-` no probe was taken (the peer had spoken, so nothing was ambiguous).
+#          Judged against a background `sleep`, never a clock. EOF is sticky, so a
+#          closed peer answers in microseconds and a holding one consumes its bound.
 # @return 0 when OUR bound ended the read, 1 when the PEER did
-_e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
+_e2e_read_ended_at_bound() {
+    if [ "$1" -gt 128 ]; then
+        return 0
+    fi
+    [ "$2" != "-" ] && [ "$2" -ne 0 ]
+}
 
 # Read one whole response off fd 3 and close it.
 #
@@ -796,66 +850,83 @@ _e2e_read_hit_bound() { [ "$1" -ge "$2" ]; }
 # copies this file replaced learnt that; the other six never did -- which is the
 # whole argument for there being one copy now rather than one per helper.
 #
-# ## Why the elapsed time and not `read`'s exit status
+# ## What ended the read, and why NOT the elapsed time
 #
-# "The peer closed" and "our own bound expired" are different facts, and the
-# obvious way to tell them apart is that `read -t` returns **above 128** on a
-# timeout and `1` on EOF. **That is bash 4.0+.** bash 3.2 -- which macOS ships, and
-# which `FASTCACHED_BASH` resolves to on every non-Windows platform -- returns a
-# plain `1` for both, so the discrimination silently collapses on the one platform
-# it was written to protect, in the direction that reports a WEDGED server as one
-# that answered nothing. This file's header already records the same shape for
-# `BASHPID`: correct on bash 4, silently inert on 3.2.
+# "The peer closed" and "our own bound expired" are different facts, and this file
+# used to tell them apart by TIMING the read against `SECONDS`: one that consumed its
+# whole bound was the bound's, anything shorter was the peer's. That is #1048.
 #
-# So the status is not asked. The read that ENDED the loop is timed instead, and a
-# read that consumed the whole bound is one the bound ended. That is true on every
-# bash. *Inferred, not measured*: no 3.2 was available to test against -- this host
-# is 5.3.9, where a timeout is 142. Removing the dependency is what makes that
-# acceptable; testing it here would have proved nothing about macOS.
+# The argument it rested on was stated here at length, and its algebra is correct:
+# `floor(a + BOUND) - floor(a)` really is exactly `BOUND`, and 200k simulated
+# placements really did confirm it. **What it never states is the premise it needs:
+# that the clock does not move.** On a host whose wall clock steps, the algebra is
+# still true and the conclusion is still false, because `a` and `a + BOUND` are no
+# longer readings of the same timeline.
 #
-# `SECONDS` is whole seconds sampled off a boundary this process does not choose,
-# so the reading carries a one-second ambiguity -- the same work reads `floor(T)`
-# or `floor(T)+1` depending on where the shell started. **That ambiguity is real
-# and it is argued rather than ignored, because it lands entirely on one side.**
+# `SECONDS` is `CLOCK_REALTIME`. Measured against `CLOCK_MONOTONIC` on a WSL2 host: a
+# host time-sync step of about **-1.28 s**, roughly 1 read in 14. Measured directly on
+# this predicate's own case, 7 of 45 reads reported a `SECONDS` elapsed of 4 while the
+# monotonic clock measured 5.01-5.06 s. The reads consumed their whole bound. They
+# only looked short.
 #
-# In the TIMEOUT direction there is none: `floor(a + BOUND) - floor(a)` is exactly
-# `BOUND` for any `a`, since adding a whole number preserves the fractional part,
-# and `read -t` cannot return BEFORE its bound. So a timed-out read measures
-# `BOUND` or more, never less, and is never mistaken for a peer that closed.
+# So a 5 s bound "measured" 3.7 s, `4 >= 5` was false, and a server that had held
+# perfectly was reported as having CLOSED -- 9 failures in 60 probes against one
+# settled node, every one with a ZERO-byte body, so the server had said nothing at
+# all. The reads all carried status 142, a genuine full-bound timeout, which is the
+# confirmation: nothing returned early, the clock moved underneath the measurement.
 #
-# In the EOF direction the band bites: a peer closing at 4.7s of a 5s bound reads
-# 4 or 5, so it can be called the bound's. That direction FAILS CLOSED -- the
-# probe answers `$E2eSilenceInconclusive` and REFUSES rather than reporting a
-# verdict it did not establish, which is the whole point of the third status. The
-# alternative error, calling a wedged server one that answered nothing, is the
-# silent one and cannot happen here.
+# A wider tolerance is not the fix. The step size is a property of the host's time
+# sync, not of this code, and nothing bounds it.
 #
-# A peer that closes within a second of the bound is pathological anyway: this
-# probe faces a server that either answers at once or holds forever. Measured
-# over 200k simulated placements -- `T=5.0` gives delta 5 always, `T=5.003` gives
-# {5,6}, `T=4.7` gives {4,5}, `T=0.6` gives {0,1}. The last matches #678's thirty
-# runs of ~600ms reading 0 fourteen times and 1 sixteen times.
+# ## The two readings that replace it, and what each depends on
 #
-# Sub-second precision is available (`TIMEFORMAT='%3R'` with `time`, bash 2.0+)
-# and is NOT used: it returns a locale-formatted decimal, and `0,255` fed to
-# `$(( 10#... ))` is a wrong small number rather than an error, because bash
-# arithmetic reads `,` as the comma operator. Integer `SECONDS` has no such path.
+# **Arm 1, the exit status.** A timeout is above 128; EOF is 1. Measured on bash
+# 5.2.21: EOF carried 1 in 5 of 5, a timeout carried 142 in 40 of 40, including every
+# read a stepped clock had made look short. **Depends on no clock at all**, which is
+# why it is first.
 #
-# It times the LAST read rather than the loop, because a server that dribbles a
-# line every two seconds would otherwise accumulate past the bound and be called
-# a timeout.
+# **Arm 2, a follow-up probe**, because arm 1 is unavailable where this has done its
+# damage: bash 3.2 answers a plain `1` for both, macOS runs `/bin/bash`, and macOS is
+# where #1048 and #1058 each ejected a pull request from the merge queue within an
+# hour. Arm 2 is the load-bearing path, not a fallback.
 #
-# The read's own status is LOCAL, deliberately. It is loop control and nothing
-# else: an earlier draft exported it and had to carry a written prohibition against
-# the one use anybody would put it to (telling a timeout from an EOF, which is the
-# very thing it cannot do here). Scoping it makes the prohibition unnecessary
-# rather than merely documented -- there is no variable left to misread.
+# EOF is STICKY -- a closed peer leaves the fd readable forever -- so a second read
+# returns at once where a holding peer consumes its whole bound. That is the signal;
+# the difficulty is reading it on an interpreter with no monotonic clock.
 #
-# @return echoes the body, and sets `_http_drain_elapsed` to how long the read that
-#         ended the loop took. That elapsed time is the only output; the verdict is
-#         `_e2e_read_hit_bound`'s.
+# **It is NOT read from `SECONDS`.** Doing that would put the verdict back on the
+# clock that caused this ticket, in the arm that runs where the ticket hurt. Instead a
+# background `sleep 1` creates a marker file: `sleep` counts down a RELATIVE interval,
+# so a wall-clock step cannot move it. If the marker exists when the read returns, the
+# read blocked for about a second or more and the peer is holding; if not, the read
+# came back at once and the peer had closed.
+#
+# The separation is a closed peer's microseconds against a held peer's whole
+# `_e2e_http_probe_bound`, with the one-second marker between them, and neither side
+# of that comparison consults the wall clock.
+#
+# No version test. The arms are selected by what was OBSERVED -- a status above 128,
+# or its absence -- so 3.2 falls to arm 2 by construction rather than by this file
+# asserting a version number about the interpreter running it. After #1048 that
+# distinction is the point: the old rule failed because it asserted a property of the
+# environment instead of reading one.
+#
+# What is NOT established: bash 3.2's own behaviour. There was no 3.2 to measure on,
+# and the claim that it answers 1 for both is this file's own and remains untested.
+# Arm 2 is built not to care either way, which is why it consults no status.
+#
+# It probes the LAST read rather than the loop, because a server that dribbles a line
+# every two seconds would otherwise accumulate past the bound and be called a timeout.
+#
+# `_http_drain_elapsed` is still set, and it is an OBSERVATION rather than a verdict.
+# It is a `SECONDS` difference, so on a stepping host it is not a duration; do not
+# reintroduce it into any decision.
+#
+# @return echoes the body, and sets `_http_drain_ended` to `bound` when our own
+#         deadline expired or `peer` when the server closed or spoke.
 _http_drain_fd3() {
     local line="" body="" before=0 status=0
+    _http_drain_ended="peer"
     while :; do
         # `|| status=$?` rather than a bare read: a command whose failure
         # is TESTED is exempt from `set -e`, and a bare one is not. This file is
@@ -875,6 +946,104 @@ _http_drain_fd3() {
         body+="${line}"$'\n'
     done
     if [ -n "$line" ]; then body+="$line"; fi
+
+    # WHICH ended the read, and never from the elapsed time -- see the block above.
+    #
+    # Arm 1: a status above 128 is a timeout and nothing else. Measured on bash 5.2.21:
+    # EOF carries 1 (5 of 5), a timeout carries 142 (40 of 40) -- including the six the
+    # stepped clock had made look short, which is what showed they were never short.
+    # Disjoint sets, and no clock is consulted. A bash that never reports it simply
+    # never takes this arm: no version test, because the arm is selected by what was
+    # observed rather than by a number asserted about the interpreter.
+    #
+    # Arm 2, and it is the LOAD-BEARING one: bash 3.2 answers a plain 1 for both, macOS
+    # runs `/bin/bash`, and macOS is where #1048 and #1058 each ejected a pull request
+    # within an hour. EOF is STICKY -- a closed peer leaves the fd ready forever -- so a
+    # second read returns at once where a holding peer consumes its whole bound.
+    local probeBlocked="-" marker="" sleeper=""
+    if [ "$status" -le 128 ] && [ -z "$body" ]; then
+        # The marker is made by `sleep`, which counts down a RELATIVE interval and is
+        # therefore immune to the wall clock stepping. Reading `SECONDS` here instead
+        # would put the drain's verdict back on the clock that caused #1048. Both
+        # primitives are measured-immune rather than documented-immune: 20 x `sleep 0.2`
+        # took 4.03 s monotonic in a run whose realtime read 2.76 s, and `read -t 5`
+        # measured 5010 ms monotonic in all of 20 reads while realtime was short in 3.
+        #
+        # `mktemp`, not a fixed name or a `$$` suffix. ctest runs this suite in parallel
+        # and one fixture drives dozens of probes, so a reused path can find a STALE
+        # marker -- which reads as "the peer is holding", a false PASS and the silent
+        # direction. The C++ side has `src/tests/ScratchPath.hpp` for this and the
+        # argument does not change for a shell fixture.
+        marker="$(mktemp "${_e2e_workdir}/.silence-probe.XXXXXX")"
+        rm -f "$marker"
+        # `>/dev/null 2>&1` IS LOAD BEARING, and it is not the redirection that looks
+        # it. `_http_drain_fd3` echoes the body, so every caller runs it inside `$( )`,
+        # and a command substitution ends when the last WRITER closes the pipe rather
+        # than when the command exits. This background job inherits that pipe.
+        #
+        # Killing the subshell does not necessarily close it: `( sleep 1; ... )` forks a
+        # subshell which forks `sleep`, so `kill "$sleeper"` reaps the SUBSHELL and can
+        # orphan the `sleep`, which goes on holding the inherited fd until it ends.
+        # Measured in isolation, with the arm and the kill separated by 150 ms of work:
+        # three calls inside `$( )` cost 3240 ms without this redirect and 560 ms with
+        # it -- one marker interval each.
+        #
+        # NOT REPRODUCED HERE, and that is stated rather than glossed: this arm kills
+        # the sleeper in the same breath as reading the marker, so the orphan window is
+        # narrow, and five probes measured 590 ms against 570 ms for a peer that closes
+        # at once and 1750 ms against 1720 ms for one that closes after 200 ms. The
+        # redirect is kept on cost rather than on evidence of harm -- it is free, the
+        # window demonstrably exists, and on bash 3.2 every probe reaches this arm,
+        # which is the platform this cannot be measured on and the one both #1048 and
+        # #1058 ejected a pull request from.
+        # AND THE SIGNAL THAT RETIRES IT MUST BE UNCATCHABLE, which is a second
+        # defect in the same three lines and a worse one. A subshell forked here
+        # inherits this shell's traps, and a fixture's EXIT trap is its cleanup -- so
+        # a timer killed with a catchable signal runs `trap 'exit 1' TERM`, reaches
+        # the EXIT trap and `rm -rf`s the run's workdir out from under the run.
+        #
+        # The `trap -` below covers a subshell that has STARTED; it is not the guard.
+        # The disarm follows the arm within microseconds whenever the read returns at
+        # once, so the subshell is usually signalled before it has run a single
+        # command, and `trap -` has not executed yet. `kill -KILL` is what closes it.
+        #
+        # Measured on the sibling timer #1066 adds, which has the identical shape and
+        # is where this was found: interleaved and order-alternated at one load,
+        # 12 pass / 0 fail with the uncatchable signal against 7 pass / 5 fail
+        # without it -- and `trap -` alone was indistinguishable from no fix at all.
+        # This arm is unreachable on bash 4+ whenever the status is decisive, so the
+        # platform where it would fire on every probe is the one it cannot be
+        # measured on.
+        # `3>&-` CLOSES THE CALLER'S SOCKET, and this function always has one open:
+        # `http_get` and `http_response_to_silence` both `exec 3<>/dev/tcp/...` before
+        # calling it. A forked timer inherits that descriptor, and the `sleep` orphaned
+        # by the KILL below then holds the peer's socket for the rest of its interval,
+        # after the fixture believes it has closed it.
+        #
+        # Measured against a real listener, the timer's child attributed by ancestry
+        # rather than by a global `pgrep`: without `3>&-` it holds 1 socket fd and its
+        # fd 3 reads `socket:[...]`; with it, 0 and none.
+        ( trap - EXIT TERM INT HUP; sleep 1; : > "$marker" ) >/dev/null 2>&1 3>&- &
+        sleeper=$!
+        read -r -t "$_e2e_http_probe_bound" _ <&3 || true
+        if [ -e "$marker" ]; then probeBlocked=1; else probeBlocked=0; fi
+        # Reaped here on the ordinary path, and what is reaped is the SUBSHELL: its
+        # `sleep` child can outlive the signal and end on its own, which is why the
+        # redirect above is the part that matters and this `kill` is not.
+        #
+        # An ABANDONED one needs no ledger and is not a new site for #845: it is a
+        # `sleep 1`, so it is gone within a second whatever happens to this shell,
+        # which a daemon-shaped background job would not be.
+        kill -KILL "$sleeper" 2>/dev/null
+        wait "$sleeper" 2>/dev/null
+        rm -f "$marker"
+    fi
+    if _e2e_read_ended_at_bound "$status" "$probeBlocked"; then
+        _http_drain_ended="bound"
+    else
+        _http_drain_ended="peer"
+    fi
+
     exec 3<&-
     printf '%s' "$body"
 }
@@ -927,10 +1096,10 @@ http_response_to_silence() {
     local host="$1" port="$2"
     exec 3<>"/dev/tcp/${host}/${port}" || return "$E2eSilenceRefused"
     _http_drain_fd3
-    # Elapsed, never `read`'s status -- see `_http_drain_fd3`. A read that consumed
-    # the whole bound is one OUR bound ended, and that is not an answer about the
-    # server; anything shorter is the peer having closed, which is.
-    ! _e2e_read_hit_bound "$_http_drain_elapsed" "$_e2e_http_read_bound"
+    # What ENDED the read, never how long it took. `_http_drain_ended` is `bound` when
+    # our own deadline expired -- which is not an answer about the server -- and `peer`
+    # when the server closed or spoke, which is.
+    [ "$_http_drain_ended" = "peer" ]
 }
 
 # ---------------------------------------------------------------------------

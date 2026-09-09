@@ -1517,24 +1517,37 @@ ran=$(( ran + 1 ))
 
 # --- the drain's verdict, against staged readings ---------------------------
 #
-# `_e2e_read_hit_bound` decides whether OUR bound or the PEER ended a read, from
-# the CLOCK. `read -t`'s exit status cannot carry that: a timeout is above 128 on
-# bash 4.0+ and a plain `1` -- byte-identical to EOF -- on the 3.2 that macOS ships.
-# The status-based version therefore failed on macOS ALONE and passed everywhere
-# else, which is why the decision is driven DIRECTLY here rather than through a
-# staged listener: on this platform the real path cannot exhibit the difference.
-# `.agent/rules/testing.md`, on splitting the decision out as a pure function over
-# a record so a verdict needing a rare machine to reproduce needs one line here.
+# `_e2e_read_ended_at_bound` decides whether OUR bound or the PEER ended a read. It
+# is driven DIRECTLY here rather than through a staged listener because half of it
+# cannot be exhibited on this platform at all: bash 3.2, which macOS ships as
+# `/bin/bash`, answers a plain `1` for both a timeout and EOF, so the status arm is
+# unreachable there and the probe arm is unreachable on bash 4+.
+# `.agent/rules/testing.md`, on splitting the decision out as a pure function over a
+# record so a verdict needing a rare machine to reproduce needs one line here.
 #
-# The listener-backed arm of the same property is `http-silence-inconclusive`,
-# which spends the whole five-second bound. These cost nothing and cover the
-# branch on every platform, which that case cannot.
+# **These rows no longer carry an elapsed time, and that is #1048.** The predicate
+# used to read `elapsed >= bound`, timed with `SECONDS` -- which is `CLOCK_REALTIME`,
+# and the host steps it. Measured against `CLOCK_MONOTONIC`, 7 of 45 reads reported a
+# `SECONDS` elapsed of 4 while the monotonic clock measured 5.01-5.06 s: full-bound
+# timeouts carrying status 142, which only LOOKED short. `4 >= 5` was false, so a
+# server that held perfectly was reported as having closed. 9 failures in 60 probes
+# against one settled node.
+#
+# The two staged readings are the read's exit status and whether the follow-up probe
+# BLOCKED -- 1 it did, 0 it came back at once, `-` no probe was taken because the peer
+# had already spoken. Neither is a clock reading, which is the whole repair.
+#
+# The listener-backed arm of the same property is `http-silence-inconclusive`, which
+# spends the whole bound. These cost nothing and cover both branches on every
+# platform, which that case cannot.
 echo "== the drain's verdict, against staged readings"
 read_bound_rows=(
-    "hit-bound-exact|5|5|0|a read that consumed its whole bound is the bound's"
-    "hit-bound-over|6|5|0|a read that overran its bound is still the bound's"
-    "hit-bound-eof|0|5|1|a peer that closed at once is the peer's"
-    "hit-bound-early|4|5|1|a peer that closed inside the bound is the peer's"
+    "ended-timeout-status|142|-|0|a status above 128 is a timeout, so the bound's"
+    "ended-timeout-status-shortread|142|-|0|a read a stepped clock made LOOK short still carries 142, and is still the bound's"
+    "ended-eof-status|1|0|1|EOF status with an instant follow-up probe is the peer's"
+    "ended-32-held|1|1|0|bash 3.2 cannot say, and a probe that BLOCKED is the bound's"
+    "ended-32-closed|1|0|1|bash 3.2 cannot say, and an instant probe is the peer's"
+    "ended-spoke|0|-|1|a peer that spoke needs no probe and is the peer's"
 )
 # Two empty lists agree perfectly: a table that loses its rows reports every
 # reading clean, exactly like a scan that found no readings.
@@ -1546,12 +1559,12 @@ fi
 
 for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
     old="$IFS"
-    IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+    IFS='|' read -r rname rstatus rprobe rwant rwhat <<< "$row"
     IFS="$old"
-    ( . "$library"; _e2e_read_hit_bound "$relapsed" "$rbound" ) && rgot=0 || rgot=$?
+    ( . "$library"; _e2e_read_ended_at_bound "$rstatus" "$rprobe" ) && rgot=0 || rgot=$?
     ran=$(( ran + 1 ))
     if [ "$rgot" -ne "$rwant" ]; then
-        echo "FAIL ${rname}: ${rwhat} -- elapsed ${relapsed}s against a ${rbound}s bound returned ${rgot}, wanted ${rwant}" >&2
+        echo "FAIL ${rname}: ${rwhat} -- status ${rstatus} with probe delta ${rprobe} returned ${rgot}, wanted ${rwant}" >&2
         note_failure "${rname}"
     fi
 done
@@ -1562,7 +1575,7 @@ done
 read_bound_answers="$(
     for row in ${read_bound_rows[@]+"${read_bound_rows[@]}"}; do
         old="$IFS"
-        IFS='|' read -r rname relapsed rbound rwant rwhat <<< "$row"
+        IFS='|' read -r rname rstatus rprobe rwant rwhat <<< "$row"
         IFS="$old"
         printf '%s\n' "$rwant"
     done | sort -u | grep -c .
