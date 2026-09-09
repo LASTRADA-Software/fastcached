@@ -2444,10 +2444,66 @@ _timeout_invocations() {
         | grep -v '^[0-9][0-9]*: *#' || true
 }
 
-# The canary. A scan that has never been seen to fire is a scan reporting PASS over
-# a set in which nothing could fail -- `.agent/rules/build-and-toolchain.md` on
-# `script-check-canary`. Both directions, because a pattern that matches everything
-# would pass the positive half alone.
+# Both directions of one scan's canary, against fixtures the caller staged.
+#
+# A scan that has never been seen to fire is a scan reporting PASS over a set in which
+# nothing could fail -- `.agent/rules/build-and-toolchain.md` on `script-check-canary`.
+# The negative half is not optional: a pattern that matched EVERYTHING would pass the
+# positive half alone, and the two halves fail in opposite directions.
+#
+# One driver rather than three copies (#642). The three canaries here differed only in
+# an extractor, a fixture, a count and two nouns -- which is the copy-pasted-block-that-
+# differs-only-in-constants shape AGENT.md calls a defect outright. It had already grown
+# from the two the ticket counted to three, which is the argument for lifting it now:
+# each copy is a place the next scan's canary can be written slightly weaker, and the
+# guard nobody re-reads is the one that matters.
+#
+# The fixtures stay with their scans. They are the part that is genuinely per-scan, and
+# hoisting them would put the staged text a long way from the extractor it is staged for.
+#
+# FOUR canaries go through it: timeout, grep-q, helper-redefinition and seconds-scan. Two
+# do not, and both are decisions rather than omissions -- a canary left out silently is
+# the next weak copy, which is the whole argument above:
+#
+#   * `bash32-canary` asks SEVEN questions, not two. Beyond catch/not-catch it drives the
+#     declared-region machinery and the outside-scripts walk, so its shape is not this
+#     one and forcing it through would mean parameterising five more behaviours.
+#   * `grep-q-scan-canary` keeps a THIRD half of its own for the `pipefail` predicate,
+#     which decides whether a file is EXAMINED at all. That is a different question from
+#     "does the extractor fire", and it sits beside the driver call rather than inside it.
+#
+# @param 1 case name, as `note_failure` records it
+# @param 2 extractor function to drive, by name
+# @param 3 file staging what MUST be caught
+# @param 4 file staging what must NOT be caught
+# @param 5 how many hits $3 is expected to yield
+# @param 6 plural noun for what $3 stages -- "invocations", "pipelines", "copies"
+# @param 7 why a hit on $4 is wrong, as the tail of "the scan fired on ..."
+_scan_canary() {
+    local name extractor mustCatch mustNotCatch want noun spuriousWhy caught spurious
+    name="$1"; extractor="$2"; mustCatch="$3"; mustNotCatch="$4"
+    want="$5"; noun="$6"; spuriousWhy="$7"
+
+    # `grep -c` reads all of its input, so this is not the `producer | grep -q` SIGPIPE
+    # hazard the scan below exists to find: no early exit, nothing to lose under pipefail.
+    ran=$(( ran + 1 ))
+    caught="$( "$extractor" "$mustCatch" | grep -c . || true )"
+    if [ "$caught" -ne "$want" ]; then
+        echo "FAIL ${name}: the scan caught ${caught} of ${want} staged ${noun}," >&2
+        echo "     so it cannot be trusted to have found none in the real scripts" >&2
+        "$extractor" "$mustCatch" | sed 's/^/     | /' >&2
+        note_failure "$name"
+    fi
+
+    ran=$(( ran + 1 ))
+    spurious="$( "$extractor" "$mustNotCatch" || true )"
+    if [ -n "$spurious" ]; then
+        echo "FAIL ${name}: the scan fired on ${spuriousWhy}" >&2
+        printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
+        note_failure "$name"
+    fi
+}
+
 canary_dir="$(mktemp -d)"
 cat > "${canary_dir}/must-catch.sh" <<'CANARY'
 timeout 5 foo
@@ -2466,21 +2522,9 @@ cases=("wait-timeout-silent|1|logged NOTHING")
 # timeout 5 foo
 TargetTimeoutSeconds=900
 CANARY
-ran=$(( ran + 1 ))
-caught="$(_timeout_invocations "${canary_dir}/must-catch.sh" | grep -c . || true)"
-if [ "$caught" -ne 7 ]; then
-    echo "FAIL timeout-scan-canary: the scan caught ${caught} of 7 staged invocations," >&2
-    echo "     so it cannot be trusted to have found none in the real scripts" >&2
-    _timeout_invocations "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    note_failure "timeout-scan-canary"
-fi
-ran=$(( ran + 1 ))
-spurious="$(_timeout_invocations "${canary_dir}/must-not-catch.sh" || true)"
-if [ -n "$spurious" ]; then
-    echo "FAIL timeout-scan-canary: the scan fired on text that runs nothing" >&2
-    printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
-    note_failure "timeout-scan-canary"
-fi
+_scan_canary "timeout-scan-canary" _timeout_invocations \
+    "${canary_dir}/must-catch.sh" "${canary_dir}/must-not-catch.sh" \
+    7 "invocations" "text that runs nothing"
 rm -rf "$canary_dir"
 
 # Is this script exempt from a scan, per that scan's allowlist?
@@ -2618,21 +2662,10 @@ hits="$(printf '%s\n' "$text" | grep -n -F -- "$token" || true)"
 out="$(producer)"; case "$out" in *"$want"*) : ;; esac
 grep -q -- "$wantMsg" <<< "$out"
 CANARY
-ran=$(( ran + 1 ))
-grepq_caught="$(_pipe_into_grep_q "${grepq_canary_dir}/must-catch.sh" | grep -c . || true)"
-if [ "$grepq_caught" -ne 6 ]; then
-    echo "FAIL grep-q-scan-canary: the scan caught ${grepq_caught} of 6 staged pipelines," >&2
-    echo "     so it cannot be trusted to have found none in the real scripts" >&2
-    _pipe_into_grep_q "${grepq_canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    note_failure "grep-q-scan-canary"
-fi
-ran=$(( ran + 1 ))
-grepq_spurious="$(_pipe_into_grep_q "${grepq_canary_dir}/must-not-catch.sh" || true)"
-if [ -n "$grepq_spurious" ]; then
-    echo "FAIL grep-q-scan-canary: the scan fired on a shape that is not the defect" >&2
-    printf '%s\n' "$grepq_spurious" | sed 's/^/     | /' >&2
-    note_failure "grep-q-scan-canary"
-fi
+_scan_canary "grep-q-scan-canary" _pipe_into_grep_q \
+    "${grepq_canary_dir}/must-catch.sh" "${grepq_canary_dir}/must-not-catch.sh" \
+    6 "pipelines" "a shape that is not the defect"
+
 # The pipefail predicate needs its own canary, because it is what decides whether a
 # file is EXAMINED at all: read wrong in the quiet direction it exempts everything
 # and the scan reports clean over nothing, which is the failure its neighbours'
@@ -2784,21 +2817,9 @@ dash_get() { http_get 127.0.0.1 "$1" "$2"; }
 probe_hostname() { hostname -I 2>/dev/null; }
 # fail() { }
 CANARY
-ran=$(( ran + 1 ))
-caught="$(_helper_redefinitions "${canary_dir}/must-catch.sh" | grep -c . || true)"
-if [ "$caught" -ne 2 ]; then
-    echo "FAIL helper-scan-canary: the scan caught ${caught} of 2 staged copies," >&2
-    echo "     so it cannot be trusted to have found none in the real scripts" >&2
-    _helper_redefinitions "${canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    note_failure "helper-scan-canary"
-fi
-ran=$(( ran + 1 ))
-spurious="$(_helper_redefinitions "${canary_dir}/must-not-catch.sh")"
-if [ -n "$spurious" ]; then
-    echo "FAIL helper-scan-canary: the scan fired on a script that defines no copy" >&2
-    printf '%s\n' "$spurious" | sed 's/^/     | /' >&2
-    note_failure "helper-scan-canary"
-fi
+_scan_canary "helper-scan-canary" _helper_redefinitions \
+    "${canary_dir}/must-catch.sh" "${canary_dir}/must-not-catch.sh" \
+    2 "copies" "a script that defines no copy"
 rm -rf "$canary_dir"
 
 # The same `_scan_exempt` the timeout scan above uses. Each row names why, and the
@@ -3170,7 +3191,7 @@ rm -rf "$canary_dir"
 # The allowlist, in the `_scan_exempt` shape the two scans above use. Each row
 # names WHY, and a row that is a deferred defect names the ISSUE so an exclusion
 # cannot rot into folklore. Neither of these two is a defect.
-bash32_allowed="tidy-sweep.sh:not a bash 3.2 script and does not claim to be. It declares a bash 4.4 floor in its own header (wait -n is 4.3; expanding an empty array under set -u stops erroring at 4.4), and its 'tidy-sweep-selftest' registration carries SKIP_RETURN_CODE 77 so a stock macOS runner reports SKIPPED rather than red. A declared exception with an enforcement mechanism, not an omission."
+bash32_allowed="tidy-sweep.sh:not a bash 3.2 script and does not claim to be. It declares a bash 4.4 floor in its own header (wait -n is 4.3; expanding an empty array under set -u stops erroring at 4.4). Its 'tidy-sweep-selftest' registration runs it through FASTCACHED_BASH44 -- a version-CHECKED interpreter rather than the /bin/bash pin every other registration uses -- and keeps SKIP_RETURN_CODE 77 for a host where no candidate clears the floor. Until #598 that registration used the 3.2 pin and therefore reported SKIPPED on macOS in perpetuity; this sentence used to cite that skip as the enforcement mechanism, which stopped being the arrangement when the interpreter moved. A declared exception with an enforcement mechanism, not an omission."
 
 # DERIVED, by walking the tree rather than by listing files or naming
 # directories. `find` because a glob cannot recurse portably and this must work in
@@ -3507,22 +3528,9 @@ cat > "${seconds_canary_dir}/must-not-catch.sh" <<'CANARY'
 elapsed=$(( SECONDS - started ))
 stall=$(( SECONDS - grewAt ))
 CANARY
-ran=$(( ran + 1 ))
-seconds_caught="$(_seconds_unlisted "${seconds_canary_dir}/must-catch.sh" | grep -c . || true)"
-if [ "${seconds_caught:-0}" -ne 3 ]; then
-    echo "FAIL seconds-scan-canary: the scan caught ${seconds_caught} of 3 staged bounds," >&2
-    echo "     so it cannot be trusted to have found none in the real scripts" >&2
-    _seconds_unlisted "${seconds_canary_dir}/must-catch.sh" | sed 's/^/     | /' >&2
-    note_failure "seconds-scan-canary"
-fi
-ran=$(( ran + 1 ))
-seconds_spurious="$(_seconds_unlisted "${seconds_canary_dir}/must-not-catch.sh" || true)"
-if [ -n "$seconds_spurious" ]; then
-    echo "FAIL seconds-scan-canary: the scan fired on a listed reading or on a comment" >&2
-    printf '%s
-' "$seconds_spurious" | sed 's/^/     | /' >&2
-    note_failure "seconds-scan-canary"
-fi
+_scan_canary "seconds-scan-canary" _seconds_unlisted \
+    "${seconds_canary_dir}/must-catch.sh" "${seconds_canary_dir}/must-not-catch.sh" \
+    3 "bounds" "a listed reading or on a comment"
 rm -rf "$seconds_canary_dir"
 
 ran=$(( ran + 1 ))
