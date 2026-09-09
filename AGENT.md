@@ -1011,8 +1011,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   once and never again makes #673's pipelined case pass vacuously), retired by RAII AND
   explicitly before the reply write. Retiring is not disconnecting — the cancel arrives
   as an ERROR and `ArmDisconnect` reads any error as a departure, so what silences it
-  must be the RETIREMENT, never the code. Synchronous on epoll/kqueue, **asynchronous on
-  IOCP** where the kernel owns the op's one `OVERLAPPED` (#884). `InMemorySocket` never
+  must be the RETIREMENT, never the code. **Synchronous on every transport that parks a
+  read**, IOCP included since #884 — which it is not for free: the kernel owns a
+  retracted op's `OVERLAPPED` until a LATER turn, so the retired operation node is stood
+  down and the next read gets a fresh one, rather than the waiter being left for the
+  aborted completion to resolve. Left asynchronous it was worse than a leak — the reused
+  `OVERLAPPED` had its `Internal` field zeroed by the next `Read`, and since the reactor
+  reads the error FROM that field the abort dispatched as success-with-zero-bytes: a
+  spurious EOF on a healthy socket with its data unread. `InMemorySocket` never
   parks a `WaitReadable`, so twelve blocking cases were green throughout —
   `Testing::ParkingReadableSocket` parks and COUNTS orphaned watches instead of aborting.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through

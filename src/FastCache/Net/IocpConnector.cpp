@@ -7,6 +7,7 @@
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ConnectFlow.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
+    #include <FastCache/Net/IocpStatus.hpp>
     #include <FastCache/Net/KeepAlive.hpp>
 
     #include <winsock2.h>
@@ -89,28 +90,22 @@ namespace
     /// The completion is the SINGLE writer of the outcome, which is why the
     /// deadline below cancels the operation rather than settling the op itself.
     /// That removes the two-writer race the readiness path has to guard against.
-    void OnConnectComplete(IocpCompletion* base, DWORD /*bytes*/, DWORD err)
+    void OnConnectComplete(IocpCompletion* base, DWORD /*bytes*/, IocpStatus status)
     {
         auto* const op = reinterpret_cast<ConnectOp*>(base);
         if (op->settled)
             return;
         op->settled = true;
 
-        // `overlapped.Internal` is an NTSTATUS and the reactor hands it over
-        // as-is, so 0xC0000236 (connection refused) would fall through every
-        // WSAE* row and land on SystemError -- useless to a connector whose whole
-        // job is to tell refused from unreachable. `WSAGetOverlappedResult` is
-        // the documented conversion.
-        if (err != 0)
-        {
-            DWORD transferred = 0;
-            DWORD flags = 0;
-            if (WSAGetOverlappedResult(
-                    op->socket, reinterpret_cast<LPWSAOVERLAPPED>(&op->completion), &transferred, FALSE, &flags)
-                == FALSE)
-                err = static_cast<DWORD>(WSAGetLastError());
-        }
-        op->error = err;
+        // The NTSTATUS the reactor read is not a WSA code: 0xC0000236 (connection
+        // refused) matches no `WSAE*` row and lands on `SystemError`, which is useless
+        // to a connector whose whole job is to tell refused from unreachable. This
+        // function used to carry that observation and its own private conversion --
+        // correct, and invisible to every other consumer of `IocpCompletion::dispatch`,
+        // one of which is `IocpSocket` and had the same defect for as long. The
+        // conversion now lives in one place and the `dispatch` signature no longer
+        // offers a `DWORD` to forget to convert.
+        op->error = Detail::WsaErrorOf(op->socket, op->completion, status);
 
         if (auto waiter = std::exchange(op->waiter, {}); waiter)
             op->reactor->Submit(waiter);

@@ -32,9 +32,14 @@ namespace FastCache::Detail
 /// `updateInterest` and every field access must already have happened. `EpollSocket::Close`
 /// records the ASan report that established this.
 ///
-/// `IocpSocket` deliberately does NOT use it: the kernel owns that op's `OVERLAPPED`,
-/// so its retirement retracts rather than completes, and sharing a body between the two
-/// shapes would hide exactly the difference #884 is about.
+/// `IocpSocket` deliberately does NOT use it, and the reason is no longer the one that
+/// used to stand here. That reason was *its retirement retracts rather than completes* --
+/// true until #884, which made every transport that parks a read retire it synchronously,
+/// IocpSocket included. What differs now is what retirement additionally OWES on that
+/// platform: the kernel keeps writing into the retracted operation's `OVERLAPPED`, so the
+/// whole operation node is stood down and the next read gets a fresh one. Its `Impl` has
+/// the matching shape and not this one -- a `shared_ptr` read node, no `readBuffer`, no
+/// `UpdateInterest()` -- so there is no body to share even before the semantics differ.
 ///
 /// @tparam Impl The socket's `Impl`, which must expose `readOp` and `UpdateInterest()`.
 /// @param impl The socket's implementation block.

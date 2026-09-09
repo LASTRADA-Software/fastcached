@@ -6,6 +6,7 @@
     #include <FastCache/Async/IocpReactor.hpp>
     #include <FastCache/Async/ReactorTeardown.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
+    #include <FastCache/Net/IocpStatus.hpp>
     #include <FastCache/Net/NetError.hpp>
     #include <FastCache/Net/ReadSlot.hpp>
     #include <FastCache/Net/SocketAddress.hpp>
@@ -136,6 +137,28 @@ struct IocpSocket::Impl
         /// say whether it matters.
         std::shared_ptr<Impl> inFlight {};
 
+        /// A strong reference to this node itself, taken with `inFlight` and released
+        /// by `Dispatch`.
+        ///
+        /// **Read ops only, and that asymmetry is the whole of #884.** A read op can be
+        /// RETRACTED while the kernel still owns its `OVERLAPPED`: `CancelRead` retires
+        /// the waiter and the caller may issue the next read in the same turn, so the
+        /// node the kernel is still writing into has to outlive its place in
+        /// `Impl::readOp`. `inFlight` cannot do that job -- it keeps the enclosing
+        /// `Impl` alive, not this node -- so without this the next `Read` would either
+        /// reuse the retracted node's `OVERLAPPED` or free it under the kernel.
+        ///
+        /// A write op has no such moment: nothing retracts a write short of `Close()`,
+        /// which sets `_closed` and makes every arm site refuse before it reaches the
+        /// `OVERLAPPED`. So `writeOp` stays a plain member and this stays empty for it.
+        /// See `CancelRead` for the full argument and for what would change it.
+        ///
+        /// Deliberately a self-cycle while an operation is outstanding, broken by
+        /// `Dispatch`, on exactly the terms `inFlight` above states: a completion that
+        /// can never be dequeued leaks this node rather than freeing it under the
+        /// kernel's feet.
+        std::shared_ptr<Op> self {};
+
         /// Whether this read op is a `WaitReadable` probe rather than a real read.
         ///
         /// **The completion cannot tell.** A zero-byte `WSARecv` fires on readability
@@ -146,10 +169,56 @@ struct IocpSocket::Impl
         bool readPeekOnly { false };
     };
 
-    Op readOp;
+    /// The read node the NEXT read will use, replaced rather than reused whenever the
+    /// kernel still owns the current one's `OVERLAPPED`. See `Op::self` and #884.
+    std::shared_ptr<Op> readOp { MakeReadOp() };
     Op writeOp;
 
-    static void Dispatch(IocpCompletion* base, DWORD bytes, DWORD err)
+    /// A fresh read node, wired to the shared dispatcher.
+    /// @return The new node.
+    [[nodiscard]] static std::shared_ptr<Op> MakeReadOp()
+    {
+        auto op = std::make_shared<Op>();
+        op->completion.dispatch = &Dispatch;
+        op->isWrite = false;
+        return op;
+    }
+
+    /// Claim the read slot for a new operation, replacing the node when the current one
+    /// is still in the kernel's hands.
+    ///
+    /// The order is load-bearing. `ClaimReadSlot` is asked FIRST and of the CURRENT
+    /// node, because #663's question -- is a read already parked here -- is about the
+    /// node a waiter is registered on, and replacing first would ask it of a fresh node
+    /// and always pass. Only then does an in-flight node get stood down, which is
+    /// #884's question: has the kernel finished with this `OVERLAPPED`.
+    ///
+    /// @return The node the caller should arm.
+    [[nodiscard]] Op& ArmRead()
+    {
+        Detail::ClaimReadSlot(readOp->awaitable); // repopulated by the suspend callback
+        if (readOp->inFlight)
+            readOp = MakeReadOp();
+
+        // **An ordinary read allocates nothing, and that rests on a fact in another
+        // function.** `Dispatch` moves `inFlight` and `self` out at its TOP, before it
+        // resumes the waiter -- so a coroutine that arms its next read inline from the
+        // resume finds this node free and REUSES it. A fresh node is taken only when an
+        // operation is genuinely still outstanding, which after #884 means a
+        // `CancelRead` that retired a parked read. Move either `std::move` in `Dispatch`
+        // below its `Complete` and this silently becomes an allocation per read, with
+        // every test still green.
+
+        // Taken HERE rather than beside `inFlight` at the two arm sites, for the reason
+        // `ClaimReadSlot` itself exists: a guard folded into the operation is
+        // self-enforcing, and one written alongside it is a line the third arm site
+        // forgets. Released by `Dispatch`, or by the arm site when the submit fails
+        // outright and no completion will ever arrive.
+        readOp->self = readOp;
+        return *readOp;
+    }
+
+    static void Dispatch(IocpCompletion* base, DWORD bytes, IocpStatus status)
     {
         auto* op = reinterpret_cast<Op*>(base);
 
@@ -157,6 +226,11 @@ struct IocpSocket::Impl
         // -- and the OVERLAPPED the kernel just wrote into -- is still alive even
         // if the owning IocpSocket was destroyed while this was in flight.
         auto const keepAlive = std::move(op->inFlight);
+
+        // Released with `inFlight` and for the same reason: this node may already have
+        // been replaced in `Impl::readOp` by a read armed after a `CancelRead`, and the
+        // kernel was still writing into it until the completion this call is handling.
+        auto const selfKeepAlive = std::move(op->self);
 
         auto* awaitable = op->awaitable;
         op->awaitable = nullptr;
@@ -172,6 +246,14 @@ struct IocpSocket::Impl
 
         if (!awaitable)
             return;
+
+        // The NTSTATUS the reactor read becomes a WSA code here, where the socket is in
+        // reach. Below the early return above deliberately: a node stood down by
+        // `CancelRead` has already answered its waiter, so asking Winsock about it would
+        // be a syscall whose result nobody reads. `keepAlive->native` is
+        // `INVALID_SOCKET` exactly when `Close()` got there first, which `WsaErrorOf`
+        // reads as the abort it is.
+        auto const err = Detail::WsaErrorOf(keepAlive ? keepAlive->native : INVALID_SOCKET, op->completion, status);
         if (err != 0)
         {
             awaitable->Complete(std::unexpected(MakeWsaError(static_cast<int>(err), op->isWrite ? "WSASend" : "WSARecv")));
@@ -198,9 +280,9 @@ struct IocpSocket::Impl
         reactor { r },
         native { s }
     {
-        readOp.completion.dispatch = &Dispatch;
+        // `readOp` is wired by `MakeReadOp`, since every replacement needs the same
+        // wiring and a constructor cannot reach the ones made later.
         writeOp.completion.dispatch = &Dispatch;
-        readOp.isWrite = false;
         writeOp.isWrite = true;
     }
 };
@@ -259,7 +341,13 @@ IocpSocket::~IocpSocket()
         // resuming it would be a second use-after-free, in the caller rather
         // than here. Clearing it is safe only because the assertion above holds:
         // a completion cannot be dequeued while this destructor runs.
-        _impl->readOp.awaitable = nullptr;
+        //
+        // Only the CURRENT read node can carry a waiter. A node stood down by
+        // `CancelRead` had its awaitable detached there, and nothing re-registers one
+        // on a node that is no longer `readOp` -- so clearing this one clears all of
+        // them, and the retired nodes stay alive on their own `Op::self` until their
+        // completions arrive.
+        _impl->readOp->awaitable = nullptr;
         _impl->writeOp.awaitable = nullptr;
     }
 
@@ -291,24 +379,40 @@ void IocpSocket::CancelRead() noexcept
 {
     if (_closed || !_impl || _impl->native == InvalidSocketValue)
         return;
-    if (_impl->readOp.awaitable == nullptr)
+
+    auto& op = *_impl->readOp;
+
+    // Detached BEFORE anything else can run, because `Complete` below resumes the
+    // waiter INLINE and that coroutine is entitled to issue the next read straight
+    // away. It then reaches `ArmRead`, which must see an empty slot (or #663's tripwire
+    // fires on a read nobody armed) and an `inFlight` node (so it takes a fresh one
+    // rather than the `OVERLAPPED` the kernel is still holding).
+    auto* const awaitable = std::exchange(op.awaitable, nullptr);
+    if (awaitable == nullptr)
         return;
 
-    // **The awaitable cannot be completed here, and that is a property of the
-    // platform rather than a choice.** The kernel owns `&readOp.completion` and WRITES
-    // to it -- `Internal` and `InternalHigh` are updated at completion -- which is the
-    // same fact `Op::inFlight` exists for and the reason `Close()` above retracts
-    // nothing either. Detaching the awaitable and completing it inline, the way
-    // `EpollSocket::CancelRead` does, would free the coroutine and leave the next
-    // `Read` reusing an `OVERLAPPED` the kernel still holds.
+    // Retract first, so the kernel is told before control leaves this function. The
+    // completion still arrives, on a later turn, and `Dispatch` finds no awaitable and
+    // releases the node -- which is why nothing here waits for it.
+    static_cast<void>(::CancelIoEx(reinterpret_cast<HANDLE>(_impl->native), reinterpret_cast<LPOVERLAPPED>(&op.completion)));
+
+    // **The retirement is synchronous, which is the contract `ISocket::CancelRead`
+    // states and what #884 was.** The error is constructed here rather than read off
+    // the aborted completion, because that completion has not happened yet: this is the
+    // same answer `EpollSocket::CancelRead` and `KqueueSocket::CancelRead` produce
+    // inline, so a caller cannot tell the platforms apart. `systemCode` names the
+    // Win32 spelling of what was actually done to the operation.
     //
-    // So this retracts the operation instead. The completion is still dequeued, with
-    // `ERROR_OPERATION_ABORTED`, and `Impl::Dispatch` completes the awaitable and
-    // releases the slot then -- on a LATER reactor turn. `ISocket::CancelRead` states
-    // that consequence, and the window it leaves is
-    // [#884](https://github.com/LASTRADA-Software/fastcached/issues/884).
-    static_cast<void>(
-        ::CancelIoEx(reinterpret_cast<HANDLE>(_impl->native), reinterpret_cast<LPOVERLAPPED>(&_impl->readOp.completion)));
+    // The node is deliberately NOT reused afterwards. It stays in flight, holding
+    // itself alive through `Op::self`, until its completion is dequeued; the next read
+    // gets a new one. That is the whole of the fix -- the previous implementation left
+    // this awaitable in place and let the next `Read` overwrite both it and the
+    // `OVERLAPPED` the kernel was still writing into.
+    awaitable->Complete(std::unexpected(NetError {
+        .code = NetErrorCode::Cancelled,
+        .systemCode = static_cast<int>(ERROR_OPERATION_ABORTED),
+        .context = "CancelRead",
+    }));
 }
 
 namespace
@@ -333,8 +437,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
-    auto& op = _impl->readOp;
-    Detail::ClaimReadSlot(op.awaitable); // repopulated by the suspend callback below
+    auto& op = _impl->ArmRead();
     op.readPeekOnly = false;
     op.completion.overlapped = OVERLAPPED {};
 
@@ -354,6 +457,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
         return a;
     }
     op.inFlight.reset(); // failed synchronously, so no completion will arrive
+    op.self.reset();     // ... so `Dispatch` will not be the one to release this
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
@@ -368,8 +472,7 @@ IoAwaitable IocpSocket::WaitReadable()
     // is readable (data, EOF, or error) and carries `bytes == 0` in every one of
     // those cases, so `Dispatch` peeks to tell them apart -- see `Op::readPeekOnly`.
     // The caller is expected to issue a real Read next.
-    auto& op = _impl->readOp;
-    Detail::ClaimReadSlot(op.awaitable);
+    auto& op = _impl->ArmRead();
     op.readPeekOnly = true;
     op.completion.overlapped = OVERLAPPED {};
 
@@ -389,6 +492,7 @@ IoAwaitable IocpSocket::WaitReadable()
         return a;
     }
     op.inFlight.reset(); // failed synchronously, so no completion will arrive
+    op.self.reset();     // ... so `Dispatch` will not be the one to release this
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
@@ -524,7 +628,7 @@ struct IocpListener::Impl
 
     AcceptOp current;
 
-    static void Dispatch(IocpCompletion* base, DWORD /*bytes*/, DWORD err)
+    static void Dispatch(IocpCompletion* base, DWORD /*bytes*/, IocpStatus status)
     {
         auto* op = reinterpret_cast<AcceptOp*>(base);
 
@@ -533,6 +637,11 @@ struct IocpListener::Impl
         // still alive even if the owning IocpListener was destroyed while this
         // accept was outstanding.
         auto const keepAlive = std::move(op->inFlight);
+
+        // `AcceptEx`'s result is asked of the LISTENING socket, not of the half-born
+        // accepted one: the operation was issued on the listener, and `acceptSock` has
+        // no completed operation to report on.
+        auto const err = Detail::WsaErrorOf(keepAlive ? keepAlive->listenSock : INVALID_SOCKET, op->completion, status);
 
         auto* awaitable = op->awaitable;
         op->awaitable = nullptr;

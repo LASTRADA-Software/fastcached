@@ -885,11 +885,16 @@ namespace
     ///
     /// **It is ALSO called explicitly at each exit, and that is not belt-and-braces for
     /// its own sake.** A destructor runs as the coroutine frame unwinds, which is after
-    /// the reply has been written; retiring before the write gives IOCP -- where
-    /// cancellation is asynchronous (`ISocket::CancelRead`, #884) -- a whole write round
-    /// trip in which to dequeue the aborted completion. Forgetting one of those explicit
-    /// calls therefore costs promptness on one platform rather than correctness, which
-    /// is the property that makes the pair worth having.
+    /// the reply has been written, so without the explicit call the watch stays armed
+    /// across the whole write. Retiring first frees the read slot before it.
+    ///
+    /// That reason is a REPLACEMENT rather than the original, and the original is worth
+    /// knowing about: this used to say the explicit calls bought IOCP -- where
+    /// cancellation was asynchronous -- a write round trip in which to dequeue the
+    /// aborted completion, so forgetting one cost promptness on one platform rather
+    /// than correctness. #884 made retirement synchronous everywhere, which retired the
+    /// reason and not the practice. The rule outlives its dead reason; the reason above
+    /// holds on every platform and is what the pair is worth having for now.
     class ScopedDisconnectWatch
     {
       public:

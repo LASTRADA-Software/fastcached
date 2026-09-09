@@ -1536,16 +1536,24 @@ Every rule below has already been a bug.
       survives in the other.
   - **Retirement is RAII and also explicit, and the pair is deliberate.** A destructor
     covers the four exits that exist and the ones added later; the explicit calls put
-    the cancel BEFORE the reply write, which on IOCP -- where cancellation is
-    asynchronous -- gives the aborted completion a write round trip in which to
-    arrive. Forgetting an explicit call therefore costs promptness on one platform
-    rather than correctness.
-  - **Synchronous on epoll and kqueue, asynchronous on IOCP, and a caller must not
-    assume otherwise.** The kernel owns the read op's single `OVERLAPPED` there, so
-    `CancelIoEx` is all that is available and the reactor completes the awaitable when
-    the aborted completion is dequeued. A `Read` in the same reactor turn still reuses
-    it: narrower than not cancelling at all, not closed, and
-    [#884](https://github.com/LASTRADA-Software/fastcached/issues/884).
+    the cancel BEFORE the reply write, so the read slot is free across it rather than
+    only once the frame unwinds. That reason REPLACED an earlier one -- that the
+    explicit calls bought IOCP, where cancellation was asynchronous, a write round trip
+    in which to dequeue the aborted completion -- which #884 made false. The practice
+    outlived its reason; check which you are relying on before removing a call.
+  - **Synchronous on every transport that parks a read, IOCP included, and a caller may
+    arm the next read in the same turn.** That is not free on IOCP and the cost is the
+    interesting part: the kernel owns a retracted operation's `OVERLAPPED` until its
+    completion is dequeued, a LATER turn, so `IocpSocket` retires the waiter inline and
+    stands the whole operation NODE down -- `Op::self` keeps it alive for the kernel --
+    while the next read gets a fresh one.
+    [#884](https://github.com/LASTRADA-Software/fastcached/issues/884) was leaving the
+    waiter in place instead, and it was worse than the leak it looks like: the next
+    `Read` zeroes `OVERLAPPED::Internal`, `IocpReactor` reads the operation's error out
+    of exactly that field, so the abort dispatched as `err == 0, bytes == 0` -- a
+    SPURIOUS EOF on a healthy socket whose data was still unread and whose own
+    completion was then dropped. Anything that retracts an operation the kernel is
+    still writing into owes the same treatment.
   - **The in-memory transport cannot stage any of this**, which is why twelve blocking
     cases were green while a coroutine leaked per connection: `InMemorySocket::WaitReadable`
     answers inline, so nothing is ever parked. `Testing::ParkingReadableSocket` parks
@@ -1946,15 +1954,6 @@ consequence rather than a precaution.
 
 ## Open work
 
-- **[#884](https://github.com/LASTRADA-Software/fastcached/issues/884)** —
-  `ISocket::CancelRead` cannot retire an IOCP read synchronously: the kernel owns the
-  read op's single `OVERLAPPED`, so the override can only `CancelIoEx` and the reactor
-  completes the awaitable when the aborted completion is dequeued. A `Read` issued in
-  the SAME reactor turn therefore still reuses that `OVERLAPPED`. Narrower than #710's
-  unconditional per-pass reuse and not closed; closing it needs a per-operation
-  completion in `IocpSocket`'s I/O core, on a platform nobody in this run can compile.
-  The ticket carries the mechanism and the acceptance, and the residual is stated on
-  `CancelRead` itself rather than only here.
 - **[#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090)** —
   `WatchPeer`'s 512-byte probe `Read`, `PeerWatch::pulled` and the `ByteReader`
   priming that undoes the consumption exist to tell a readable edge from EOF.

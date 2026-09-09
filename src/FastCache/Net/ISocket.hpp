@@ -309,14 +309,18 @@ class ISocket
     /// and completed it exactly this way, and they do it to `RunBlockingRead`'s own
     /// trampoline on every close that finds one parked.
     ///
-    /// **Retirement is not synchronous on every platform and a caller must not assume it
-    /// is.** Epoll and kqueue detach and complete inline, so the slot is free when this
-    /// returns. IOCP cannot: the kernel owns the read op's single `OVERLAPPED`, so the
-    /// override there retracts the operation with `CancelIoEx` and the reactor completes
-    /// the awaitable when the aborted completion is dequeued. A caller that arms another
-    /// read in the SAME reactor turn is therefore still double-arming on Windows --
-    /// narrower than not cancelling at all, and not closed
-    /// ([#884](https://github.com/LASTRADA-Software/fastcached/issues/884)).
+    /// **Retirement is SYNCHRONOUS on every transport that parks a read: when this
+    /// returns, the waiter has been resumed and the read slot is free.** A caller may
+    /// arm the next read in the same reactor turn.
+    ///
+    /// That is a promise IOCP had to be made to keep rather than one it kept for free,
+    /// and the shape of what it costs is worth knowing before writing the next
+    /// transport. The kernel owns a retracted operation's `OVERLAPPED` until its
+    /// completion is dequeued, which is a LATER turn, so `IocpSocket` cannot simply
+    /// complete the waiter and let the next `Read` reuse the block -- it retires the
+    /// waiter here and stands the whole operation node down, giving the next read a
+    /// fresh one. Anything that retracts an operation the kernel is still writing into
+    /// owes the same.
     ///
     /// **The default does nothing, and that is for FAKES** -- a scripted double whose
     /// reads resolve inline has no frame to free, and making this pure virtual would
