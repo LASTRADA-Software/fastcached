@@ -4925,3 +4925,54 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 300
 )
+
+# The cluster key must live in a container that zeroes its storage (#324).
+#
+# Registered because fixing the eight holders is not fixing the defect: a ninth is one
+# declaration away and looks exactly like the eight did. It earned this row on its first
+# real run -- a careful hand census of this same tree found SIX holders, and the scan then
+# named two more in `FleetHarness.hpp` that the census had walked straight past.
+#
+# In the DEFAULT set rather than `smoke`, because it needs no daemon, socket or compiler,
+# and a check that runs on one leg is a check that is not consulted.
+#
+# It reads NAMES, and what that cannot see is written on the script rather than implied
+# here: a credential under a name its table does not carry is invisible to it. The
+# compensating rule is that every row must still MATCH something -- a term that has quietly
+# stopped matching is a guard that has quietly stopped guarding, and reads identically to a
+# clean tree (#492). That arm is not decoration: the table's first draft carried a
+# `clusterKey` row, the check refused the real tree over it, and the row was wrong -- this
+# tree names no such variable, only `clusterKeyFile`, which is a PATH and not the secret.
+add_test(
+    NAME "credential-containers"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh"
+)
+set_tests_properties("credential-containers" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+
+# Six cases, both directions, and the ones with teeth are the negatives.
+#
+# Case 1 asserts the PASSING direction, which is the arm nobody writes: #1031 was a guard
+# that refused every tree and stood for two days, because a guard nobody has watched ACCEPT
+# is not known to work.
+#
+# Cases 3 and 4 are the two silent failures -- a vocabulary term that has stopped matching,
+# and an empty population, both of which a naive check reports as clean.
+#
+# Case 6 pins the two FALSE POSITIVES this check produced on its first run against the real
+# tree: `std::string` matched as a RETURN type on a line whose parameter was a span, and
+# `std::string` matched inside `std::string_view`. Both are one mistake -- a pattern is
+# broader than its author reads it as -- and both point at REFUTING a correct declaration,
+# which is the direction that gets acted on because a finding looks like work.
+add_test(
+    NAME "credential-containers-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh" --self-test
+)
+set_tests_properties("credential-containers-selftest" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)

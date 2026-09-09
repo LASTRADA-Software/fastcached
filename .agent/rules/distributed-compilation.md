@@ -846,6 +846,63 @@ Consequences that are each load-bearing:
   serial rather than replacing it, which is what keeps that component pure — no key,
   no wall clock, no crypto in the thing whose whole job is a deterministic unit
   test. See `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282).
+- **A credential lives in `SecureByteBuffer`, and the wipe is an ALLOCATOR rather than a
+  destructor.** The cluster key was a plain `std::vector<std::byte>` in every one of its
+  holders, freed without being touched — the key that MACs both discovery proofs and every
+  lease grant, left in freed memory for whatever allocated next (#324). The wipe rides on
+  `deallocate` so that every release goes through one door and no holder has a line it can
+  forget — the `Refuse`/`ClaimReadSlot` argument again, a guard folded INTO the operation
+  being self-enforcing where one called alongside it needs a scan. It is what makes the
+  COPIES safe without anyone thinking about them, and there are several: the validator
+  takes the key **by value** and `SchedulerService` builds its own from a span, so one
+  secret lives in several buffers with independent lifetimes. It also covers a vector that
+  GROWS, whose old block is freed long before the object dies and which a destructor-based
+  design cannot see — **no holder here grows one today**, so that half is cover for a
+  future change nobody would connect to the secret, and saying so matters because the
+  tempting version of this rule cites a growing holder and this tree has none. The first
+  draft of this bullet did exactly that.
+  - `std::memset` is not a wipe. Measured, one function, both spellings inlined into one
+    `main` under LTO with hidden visibility and `-fno-semantic-interposition`: gcc 14.2 and
+    clang 22.1 **delete the `memset` entirely** and both keep the `explicit_bzero`. The
+    platform table is in `SecureBytes.cpp`; macOS and the BSDs take the volatile-pointer
+    fallback deliberately, because their `explicit_bzero`'s availability varies with the
+    deployment target and a wrong guess is a build break on a host this lane cannot test.
+  - **Container-agnostic is not the same as SUFFICIENT, and where it falls short is ONE
+    platform.** The allocator instantiates for `std::basic_string` too and is not enough
+    there: short-string optimisation keeps a short secret INSIDE the object, where no
+    allocator is ever called. Measured, sweeping length 0–40 against an arena that counts
+    allocations:
+
+    <!-- table-total: none -->
+    | standard library | `sizeof` | inline capacity | first allocating length |
+    |---|--:|--:|--:|
+    | libstdc++ 14 | 32 | 15 | 16 |
+    | MSVC STL 19.51 | 32 | 15 | 16 |
+    | libc++ 22 | 24 | **22** | **23** |
+
+    **libc++ is the sole outlier**, so the claim is not *this varies per platform* — it is
+    that a **16-to-22-character** secret is on the heap on Linux and Windows and lives
+    **inline on macOS**. The consequence is operational rather than theoretical: **the
+    platform to write the failing test against is macOS**, and a string fix validated on
+    Linux and Windows looks complete while being absent exactly where it is not. (CI pins
+    MSVC toolset 14.44 and 14.51 was measured; the inline capacity is an ABI property of
+    that `std::string`, so they are expected identical — inferred, not read.) Every
+    `--requirepass` and scheduler token is far inside all three — `hunter2` is 7 characters
+    and allocates **0** times — so a string fix built on this seam alone is correct for
+    long secrets, silently absent for short ones, and green under any test written with a
+    realistic value. Secret STRINGS need this allocator **and** an inline wipe, which is
+    #1125 — and the inline wipe has its own trap: a destructor-based one misses the
+    INLINE-TO-HEAP transition, where the contents are copied out and the inline buffer is
+    left holding the secret in the object's own storage, invisible to any test that
+    constructs at final size.
+  - The holders are found by NAME (`scripts/check-credential-containers.sh`), and the
+    limits of that are on the script rather than implied: a credential under a name its
+    table does not carry is invisible to it, `clusterKeyFile` is a PATH and not a row, and
+    a bare `key` cannot be one because this is a cache and `key` is what it stores. Each
+    row must still MATCH something — a term that has quietly stopped matching is a guard
+    that has quietly stopped guarding and reads exactly like a clean tree. It earned its
+    place on its first real run, finding two holders in `src/tests/FleetHarness.hpp` that a
+    careful hand census had just missed.
 - **One seam signs with the pre-shared key, and the domain label is a required
   parameter rather than a string each caller remembers.**
   `Cluster/ClusterSigning.hpp` carries `SigningDomain` and a `SigningDomainTable` row
@@ -2662,6 +2719,19 @@ only thing that would catch an encoding that drops a field on the way.
   listed have since been implemented rather than deferred (`ISocket::CancelRead`,
   `ISocket::ShutdownWrite`, and #663's read-slot rule), which is why it is one entry and
   not four.
+- **[#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)** — the same
+  defect #324 fixed for the cluster key is still live for the file-backed STRING
+  credentials (`--requirepass`, the two token files), and the seam #324 built does not
+  finish it. `SecureAllocator` instantiates for `std::basic_string` perfectly well, and
+  short-string optimisation means it is never CALLED for a short value — measured on
+  libstdc++ 14, a 7-character secret allocates **0** times. So a string fix built on the
+  allocator alone is correct for long secrets, absent for short ones, and green under any
+  test written with a realistic password. It also reaches further than a container swap:
+  `Config::requirePass` and `NodeConfig::token` are fields of the two central config
+  structs, which are copied, compared by `UnreloadableChanges`, and held as TWO live
+  snapshots by `ConfigReloader` — so a rotated secret survives in the previous snapshot
+  for as long as anything holds it. That reach is why it is a separate ticket rather than
+  the second half of #324.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was

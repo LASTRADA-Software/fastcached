@@ -178,4 +178,4 @@ CheckOptions:
   - key:             readability-identifier-naming.FunctionCase
     value:           CamelCase
   - key:             readability-identifier-naming.FunctionIgnoredRegexp
-    value:           '^(main|begin|end|push_back|pop_back|data|str|get|size|length|resize|empty|clear|value|c_str|capacity|to_string|string_view|assign|at|reserve|substr|sv|await_ready|await_suspend|await_resume|initial_suspend|final_suspend|unhandled_exception|return_value|return_void|yield_value|get_return_object|get_return_object_on_allocation_failure|address|operator_new|operator_delete|from_promise)$'
+    value:           '^(main|begin|end|push_back|pop_back|data|str|get|size|length|resize|empty|clear|value|c_str|capacity|to_string|string_view|assign|at|reserve|substr|sv|await_ready|await_suspend|await_resume|initial_suspend|final_suspend|unhandled_exception|return_value|return_void|yield_value|get_return_object|get_return_object_on_allocation_failure|address|operator_new|operator_delete|from_promise|allocate|deallocate)$'

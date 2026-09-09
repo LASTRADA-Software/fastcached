@@ -7,6 +7,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 
@@ -114,9 +115,9 @@ enum class LeasePolicy : std::uint8_t
 /// grant names, and a key that differs per run would make a failure look like a
 /// flake. Its bytes are otherwise arbitrary.
 /// @return The key.
-[[nodiscard]] std::vector<std::byte> TestClusterKey()
+[[nodiscard]] SecureByteBuffer TestClusterKey()
 {
-    return std::vector<std::byte>(32, std::byte { 0x5A });
+    return SecureByteBuffer(32, std::byte { 0x5A });
 }
 
 /// The endpoint the worker under test advertises, and the one grants must name.

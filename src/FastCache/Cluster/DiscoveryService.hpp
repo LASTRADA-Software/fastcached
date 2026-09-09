@@ -6,6 +6,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/IDatagramSocket.hpp>
 
 #include <chrono>
@@ -41,7 +42,7 @@ struct DiscoveryConfig
     ///
     /// Never sent, and nothing derived from it is either. It only ever appears
     /// inside an HMAC over a nonce this node chose or was given.
-    std::vector<std::byte> presharedKey;
+    SecureByteBuffer presharedKey;
 
     /// How often this node announces itself.
     std::chrono::seconds beaconInterval { 15 };

@@ -16,7 +16,10 @@ src/FastCache/
                 `port` / `host:port` / `[v6]:port`), IRandomSource (the randomness seam,
                 beside Clock and for the same reason), Logger, BufferPool,
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
-                StringHash, Owner, Utf8 (one strict RFC 3629 decoder -- overlongs,
+                StringHash, Owner, SecureBytes (the one zeroing primitive, and
+                `SecureByteBuffer` -- the allocator every credential lives behind, so
+                the wipe happens at each RELEASE and not only at the holder's death),
+                Utf8 (one strict RFC 3629 decoder -- overlongs,
                 surrogates and anything above U+10FFFF refused, so what it accepts
                 a strict parser on the far end accepts too), Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
