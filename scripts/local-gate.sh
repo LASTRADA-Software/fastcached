@@ -489,6 +489,72 @@ skip_report() {
     fi
 }
 
+# Every verdict word ctest prints for a test, and whether the gate's failure
+# EXCERPT shows it.
+#
+# A table because two readers need this vocabulary and they must not be able to
+# disagree: this excerpt, and #1159's reconcile against the registered total. Two
+# hand-kept lists that drift apart is how one instrument starts describing a
+# different run from the other.
+#
+# **The list is hand-kept, and saying so is the honest answer rather than a
+# missing feature.** #1158 asks that it be derived from something; it cannot be.
+# ctest enumerates its own verdict words nowhere reachable at runtime -- not in
+# `--help`, not in any file the gate can read -- so a derivation would mean
+# restating them somewhere else and calling the copy a source. What actually
+# closes the omission is not a longer list but the reconcile, which compares a SUM
+# against a total and therefore has no list to be incomplete (#1159).
+#
+# `Exception` is #1158: a segfault is `***Exception`, never `***Failed`, so a leg
+# failed by a crash printed a correct verdict and named no test. Measured on a
+# real `Linux-gcc-release` log: `grep -c '***Failed'` returned 0 while ctest
+# reported 1 test failed.
+#
+# `Not Run` is here because it was shown EMISSIBLE rather than assumed: Catch2's
+# `catch_discover_tests` writes a `<TARGET>_NOT_BUILT-<hash>` sentinel whenever a
+# test target was not built, and `FASTCACHED_BUILD_TESTCLIENT` and
+# `FASTCACHED_BUILD_BENCHMARKS` default OFF, so a partial build produces it
+# (#1159's measurement). #1158 asked for it to be covered or shown impossible; it
+# is covered, because it is not impossible.
+#
+# `Passed` and `Skipped` are deliberately OUT of the excerpt. Passed would print
+# thousands of lines. Skipped is reported by `skip_report` with its own names and
+# its own three outcomes, so repeating it here would put the same fact in two
+# places with two formats and one of them would go stale.
+gate_ctest_states=(
+    "Passed|no"
+    "Failed|yes"
+    "Skipped|no"
+    "Timeout|yes"
+    "Exception|yes"
+    "Not Run|yes"
+)
+
+# The alternation the failure excerpt greps for, built from the table above so a
+# new state is a row rather than an edit here.
+gate_excerpt_pattern() {
+    local row pattern=""
+    for row in "${gate_ctest_states[@]}"; do
+        [[ "${row#*|}" == "yes" ]] || continue
+        pattern="${pattern}\\*\\*\\*${row%%|*}|"
+    done
+    # The totals line is not a per-test state and is not in the table; it is here
+    # because a reader needs the count beside the names.
+    echo "${pattern}tests passed"
+}
+
+# The lines the gate shows a reader when a leg's tests fail.
+#
+# `grep -m 30` rather than `grep | head -30`: a pipe into `head` kills the
+# producer with SIGPIPE once it has enough, and this script sets `pipefail`, so
+# the pipeline reports the producer's death. The bound is the same and there is
+# no second process to misreport.
+#
+# Reads a ctest run's output on stdin.
+failure_excerpt() {
+    grep -E -m 30 "$(gate_excerpt_pattern)" || true
+}
+
 if [[ -n "$classify_log" ]]; then
     if [[ "$classify_log" == "-" ]]; then
         _classify_outcome="$(gate_outcome)"
@@ -1846,6 +1912,60 @@ $gate_passed_marker"
         "==   334 - a second skipped case (Skipped)" \
         "$(skip_report gate-clang-debug <<< "$_skips" | tail -1)"
 
+    # -----------------------------------------------------------------------
+    # #1158: the failure excerpt names the test on a leg failed by a CRASH.
+    #
+    # A segfault is `***Exception`, never `***Failed`, so the old two-token
+    # alternation printed a correct verdict and named nothing. Measured on a real
+    # `Linux-gcc-release` log: `grep -c '***Failed'` returned 0 while ctest
+    # reported 1 test failed.
+    _crash="$(printf '954/3491 Test #907: Site 3: a registration presents the secret in force NOW ***Exception: SegFault  0.16 sec\n955/3491 Test #908: something ordinary ... Passed    0.01 sec\n99%% tests passed, 1 tests failed out of 3491\n')"
+
+    expect "a leg failed by a crash names the crashed test" \
+        "954/3491 Test #907: Site 3: a registration presents the secret in force NOW ***Exception: SegFault  0.16 sec
+99% tests passed, 1 tests failed out of 3491" \
+        "$(failure_excerpt <<< "$_crash")"
+
+    # ... and the control that gives the case above its meaning: a `Passed` line
+    # is in that input and must NOT be excerpted, or the excerpt is thousands of
+    # lines and names nothing usefully.
+    expect "an ordinary passing test is not excerpted" "0" \
+        "$(failure_excerpt <<< "$_crash" | grep -c 'something ordinary' || true)"
+
+    # `Not Run`, which #1158 asked to be covered or shown impossible. It is
+    # emissible: `catch_discover_tests` writes a `_NOT_BUILT` sentinel for a target
+    # that was not built, and two of this project's test targets default OFF.
+    _notrun="$(printf '1/4 Test #1: CowTreeTests_NOT_BUILT-b12d07c ***Not Run   0.00 sec\n25%% tests passed, 3 tests failed out of 4\n')"
+    expect "an unbuilt-target sentinel is named too" \
+        "1/4 Test #1: CowTreeTests_NOT_BUILT-b12d07c ***Not Run   0.00 sec
+25% tests passed, 3 tests failed out of 4" \
+        "$(failure_excerpt <<< "$_notrun")"
+
+    # The two states the excerpt always covered, so this change is shown to add
+    # rather than to replace.
+    for _old in Failed Timeout; do
+        expect "the excerpt still names a ***${_old} test" \
+            "7/9 Test #7: an older shape ***${_old}  1.00 sec" \
+            "$(failure_excerpt <<< "7/9 Test #7: an older shape ***${_old}  1.00 sec")"
+    done
+
+    # The pattern is BUILT from the table, so a row is the unit of change. Asserted
+    # against the whole string rather than by searching it: a check that only looks
+    # for the tokens it expects cannot notice one that should not be there.
+    expect "the excerpt pattern is derived from the state table" \
+        '\*\*\*Failed|\*\*\*Timeout|\*\*\*Exception|\*\*\*Not Run|tests passed' \
+        "$(gate_excerpt_pattern)"
+
+    # Every row parses, and the two columns are the only two spellings. A row that
+    # stopped parsing would silently drop its state from the excerpt.
+    for _row in "${gate_ctest_states[@]}"; do
+        case "${_row#*|}" in
+            yes|no) ;;
+            *) echo "SELF-TEST FAILED: unknown excerpt column in '$_row'" >&2
+               self_test_failures=$((self_test_failures + 1)) ;;
+        esac
+    done
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -2066,7 +2186,7 @@ run_preset() {
 
     echo "== $preset: test (--parallel $jobs)"
     if ! ctest --preset "$preset" --parallel "$jobs" > "$log" 2>&1; then
-        grep -E '\*\*\*Failed|\*\*\*Timeout|tests passed' "$log" | head -30
+        failure_excerpt < "$log"
         # A failing leg's skips matter as much as a passing one's -- more, since a
         # skip is one of the ways a case stops reporting on the thing that broke.
         skip_report "$preset" "$build_dir" < "$log"
