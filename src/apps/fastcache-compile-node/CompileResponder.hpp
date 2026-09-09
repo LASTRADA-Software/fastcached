@@ -213,14 +213,34 @@ class CompileResponder final: public IFrameResponder
     /// hops home, and its write fails. Short TUs would keep succeeding, so a smoke
     /// test passes.
     ///
-    /// `Wire::DefaultCompileLeaseTimeout` rather than a number of this surface's own,
-    /// and it is the same argument #249 made for the two ends of the client's side:
-    /// past it the scheduler has reclaimed the lease and may have re-granted the key,
-    /// so an object produced after it is one nobody can use. Serving longer than the
-    /// grant lives is doing work the fleet has already given away.
+    /// **`MaxCompileLeaseLifetime`, and it is deliberately the CEILING rather than the
+    /// default.** The rule it serves is unchanged and is #249's: past the grant's own
+    /// expiry the scheduler has reclaimed the lease and may have re-granted the key, so
+    /// an object produced after it is one nobody can use, and serving longer than the
+    /// grant lives is doing work the fleet has already given away. What changed is that
+    /// the grant's expiry is no longer a constant this build knows -- since #522 it
+    /// comes from a replicated setting, so a fleet that has told itself its translation
+    /// units are long mints grants this surface must be prepared to serve out.
+    ///
+    /// **This window cannot be the grant's, because of WHEN it is asked.** The endpoint
+    /// arms it at the point it decides to serve, which is before the payload is read --
+    /// and the grant is inside the payload. So at this moment no authenticated bound
+    /// exists, and the only value that cannot cut a legal job short is the largest one
+    /// a cluster is allowed to agree on. `Validate` is what makes that safe: the
+    /// ceiling is a constant this build knows, never a number a peer can name.
+    ///
+    /// **The cost is stated rather than absorbed.** A peer that has already passed
+    /// `RefusePeer` -- a fleet member, not a stranger -- may now hold a compile socket
+    /// for the ceiling rather than the old default while it uploads. That is bounded by
+    /// the connection cap and by the in-flight byte budget, neither of which this
+    /// widens, and it is the second reason `MaxCompileLeaseLifetime` is an hour rather
+    /// than a rounder, more generous number.
+    ///
+    /// The per-job bound is the grant's own `expiresAt` and tightens as soon as one is
+    /// verified; `WorkerProtocol` owns that, and owns saying WHICH of the two ran out.
     [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
     {
-        return CompileCacheWire::DefaultCompileLeaseTimeout;
+        return CompileCacheWire::MaxCompileLeaseLifetime;
     }
 
     /// @copydoc IFrameResponder::MaxRequestBytes

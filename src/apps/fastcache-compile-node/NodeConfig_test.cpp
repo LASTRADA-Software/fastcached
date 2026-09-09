@@ -4657,3 +4657,48 @@ TEST_CASE("The worker parses --seed-config, and no file may carry it", "[node][c
     CHECK(row->yamlKey.empty());
     CHECK(row->reloadable == Reloadable::No);
 }
+
+TEST_CASE("No node flag can override how long a compile may take", "[node][config][lease]")
+{
+    // **The acceptance clause of #522 that is an ABSENCE, so it is a scan and the scan
+    // needs a control.** #243 originally asked for a node-side flag letting a site with
+    // long translation units raise the worker's per-request bound. That is the wrong
+    // lever and putting it back would be worse than never having had it: a worker
+    // serving past the grant produces an object for a key the scheduler has already
+    // reclaimed and may have re-granted, so the fleet does the work twice and one of the
+    // two results is thrown away -- with every counter normal. The lever is the
+    // replicated `lease-lifetime`, and there is deliberately no local one.
+    //
+    // Asked of the option TABLE rather than of the source text, because the table is
+    // what parsing and `--help` are both driven by: a flag that is not a row cannot be
+    // typed, cannot come from a configuration file, and cannot ride into a service
+    // registration. A grep over `NodeConfig.cpp` would answer about prose.
+    auto const rows = NodeOptions();
+
+    // **The positive control, and it is not decoration.** A scan that reports an absence
+    // is worth nothing until it has been seen to find a presence: an empty span, a
+    // renamed accessor or a predicate that never matches all read as "no override
+    // exists", which is the one answer this case must not be able to give for the wrong
+    // reason. So it first finds rows it must find.
+    REQUIRE_FALSE(rows.empty());
+    auto const names = [&rows](std::string_view needle) {
+        return std::ranges::any_of(rows, [needle](auto const& row) { return row.primary == needle; });
+    };
+    REQUIRE(names("--slots"));       // a real row, and the one the rulebook names as
+    REQUIRE(names("--listen-node")); // per-machine rather than replicated
+    // And that the predicate below can say yes about something, using a row that exists
+    // and legitimately mentions a timeout-shaped word.
+    REQUIRE(std::ranges::any_of(rows, [](auto const& row) { return row.primary.contains("--"); }));
+
+    // Now the absence. Any row whose flag names a compile or lease duration would be a
+    // local override of a fleet-wide agreement.
+    for (auto const& row: rows)
+    {
+        INFO("row: " << row.primary);
+        CHECK_FALSE(row.primary.contains("lease-timeout"));
+        CHECK_FALSE(row.primary.contains("lease-lifetime"));
+        CHECK_FALSE(row.primary.contains("compile-timeout"));
+        CHECK_FALSE(row.primary.contains("request-timeout"));
+        CHECK_FALSE(row.primary.contains("job-timeout"));
+    }
+}

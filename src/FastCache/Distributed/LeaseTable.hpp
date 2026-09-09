@@ -23,6 +23,25 @@ struct Lease
     std::string token;    ///< Presented by the client to the worker.
     std::string workerId; ///< The worker the job was assigned to.
     std::string key;      ///< The object key being compiled.
+
+    /// How long this grant lives, as it was granted -- never as the table is
+    /// configured NOW.
+    ///
+    /// On the lease rather than read back off the table, and that is the whole of
+    /// #522's second decision made structural. The lifetime is a replicated setting a
+    /// cluster may change while work is in flight, and a table that judged its live
+    /// entries against the current value would move the bound of a grant already
+    /// minted -- a client and a worker would then be holding a token whose expiry the
+    /// scheduler no longer agrees with, which is the disagreement this ticket exists
+    /// to make impossible. Carried here, an in-flight lease keeps what it was granted
+    /// under because there is nowhere else for its bound to come from.
+    ///
+    /// It is also the ONE value the signed grant's `expiresAt` is derived from. The
+    /// scheduler used to compute that separately, from its own wall clock plus the
+    /// table's timeout, a moment after the table had stamped `issuedAt` from a
+    /// different clock -- two derivations of one fact, which the caching principle in
+    /// AGENT.md names as the thing a wider return value prevents.
+    std::chrono::milliseconds lifetime { 0 };
 };
 
 /// One outstanding lease, as a diagnostic rather than as an authorization.
@@ -107,13 +126,20 @@ class LeaseTable
     /// library. The reasoning for the value is there too, stated once.
     static constexpr std::chrono::milliseconds DefaultLeaseTimeout = CompileCacheWire::DefaultCompileLeaseTimeout;
 
-    /// How long a lease this table issues stays live.
+    /// How long a lease this table issues stays live **when the caller names nothing**.
     ///
-    /// Exposed so a signed grant's expiry can be derived from it rather than
-    /// written beside it. The two would otherwise be a pair of literals that have
-    /// to agree forever, and the way they fail to is silent: a token outliving its
-    /// lease is a capability nothing has any record of, and one dying first is a
-    /// worker refusing work the scheduler is still suppressing the key for.
+    /// The fallback, since #522, and no longer the answer for every lease: a caller
+    /// with a cluster passes the lifetime its cluster agreed on, and each entry keeps
+    /// what it was granted under. What this still answers for is the deployment with
+    /// no replicated state to read -- one machine, no `--listen-raft`, nothing to
+    /// agree with -- which must go on working with no configuration at all.
+    ///
+    /// **A signed grant's expiry is no longer derived from this**, and that is the
+    /// change rather than an omission. It comes from `Lease::lifetime`, so the token
+    /// and the entry that authorises it carry one number instead of two computed a
+    /// moment apart; the hazard the old wording described -- a token outliving its
+    /// lease, or dying first -- is now absent by construction rather than avoided by
+    /// both sides reading one getter.
     /// @return The lifetime this table was constructed with.
     [[nodiscard]] std::chrono::milliseconds Timeout() const noexcept
     {
@@ -197,10 +223,25 @@ class LeaseTable
     };
 
     /// Take a lease on `key` for `workerId`, unless one is already outstanding.
+    ///
     /// @param key The object key about to be compiled.
     /// @param workerId The worker the job will go to.
+    /// @param lifetime How long this grant lives. Defaulted to what the table was
+    ///        constructed with, which is the single-node deployment: no cluster, no
+    ///        replicated setting, and nothing to resolve. A caller that HAS a cluster
+    ///        passes what it agreed on, and the value is stamped onto the lease rather
+    ///        than kept here -- see `Lease::lifetime` for why a live entry must not be
+    ///        judged against a number that can change underneath it.
     /// @return The lease when granted; nullopt when another client holds one.
-    [[nodiscard]] std::optional<Lease> Acquire(std::string_view key, std::string_view workerId);
+    [[nodiscard]] std::optional<Lease> Acquire(std::string_view key,
+                                               std::string_view workerId,
+                                               std::chrono::milliseconds lifetime);
+
+    /// @copydoc Acquire
+    [[nodiscard]] std::optional<Lease> Acquire(std::string_view key, std::string_view workerId)
+    {
+        return Acquire(key, workerId, _leaseTimeout);
+    }
 
     /// Look up a lease by its token, without consuming it.
     ///

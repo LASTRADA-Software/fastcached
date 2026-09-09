@@ -11,6 +11,7 @@
 #include <array>
 #include <chrono>
 #include <expected>
+#include <format>
 #include <ranges>
 #include <string>
 #include <utility>
@@ -129,14 +130,15 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
                                     WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
-                                    IMetricsSink& metrics)
+                                    IMetricsSink& metrics,
+                                    std::chrono::seconds slack)
 {
     // `clock` by VALUE: a `WallClockRef` IS the borrow, so copying it into the closure
     // carries the guard rather than re-binding a reference. This capture was `&clock`,
     // and it is the retention a member scan cannot see -- the validator outlives this
     // call and nothing anywhere declares a wall-clock member for it (#1032).
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), clock, &lease, &metrics](
-               std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), clock, &lease, &metrics, slack](
+               std::string_view token, std::string_view fingerprint) -> LeaseDecision {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
         // that later, with `UnknownFingerprint`. So the two comparisons compose rather
@@ -165,13 +167,19 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // so a caller learns nothing about a grant it did not already hold. `detail`
         // is left empty for the same reason -- there is no authenticated fact to name.
         if (!cluster.has_value())
-            return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Unregistered, .detail = {} };
+            return LeaseDecision { .refusal =
+                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Unregistered,
+                                                                   .detail = {} },
+                                   .remaining = std::nullopt };
 
-        // ONE slack, passed to BOTH, rather than each site taking the same default. The
-        // shared predicate makes them agree on the COMPARISON; only passing one value
-        // makes them agree on the WINDOW, and it is the window a future caller with a
-        // non-default slack would split.
-        constexpr auto slack = Distributed::LeaseTokenClockSkewSlack;
+        // ONE slack, passed to BOTH -- and now to the THIRD site, the budget this
+        // returns. The shared predicate makes them agree on the COMPARISON; passing one
+        // value is what makes them agree on the WINDOW, and it is the window a caller
+        // with a non-default slack would split. That caller is no longer hypothetical:
+        // it is a parameter, defaulted to the production value, so the window can be
+        // narrowed to something a test can outrun. Without it nothing could ever observe
+        // a job outliving its grant -- a verifying grant has at least `slack` of budget
+        // by construction, so the refusal below would be unreachable and untested.
 
         auto verified = Distributed::VerifyLeaseToken(
             key,
@@ -203,9 +211,12 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // move inside this function, that retry becomes a permanent `Replayed` and
             // distribution stops with this counter blaming an attacker.
             if (!lease.spent.Spend(token, verified->expiresAt, now, slack))
-                return Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Replayed,
-                                                   .detail = "this lease has already been spent at this worker; a "
-                                                             "grant authorizes exactly one compile" };
+                return LeaseDecision {
+                    .refusal = Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::Replayed,
+                                                           .detail = "this lease has already been spent at this worker; a "
+                                                                     "grant authorizes exactly one compile" },
+                    .remaining = std::nullopt
+                };
 
             // **The second learning channel, and it works when the first does not.**
             // A grant naming a later term than this worker knows is adopted -- and it
@@ -231,7 +242,30 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
             // whichever copy is edited next is the one that stops agreeing.
             if (lease.notice.Observe(lease.term.Learn(verified->epoch)))
                 metrics.Increment(IMetricsSink::Counter::WorkerSchedulerTermRegressions);
-            return std::nullopt;
+            // The bound travels out. It is the ONLY authenticated statement anybody has
+            // about when the fleet stops wanting this answer, and until #522 it stopped
+            // here: the surface below went on to spend minutes compiling against a
+            // constant, so a cluster that had agreed on a different lifetime was obeyed
+            // by the scheduler and the client and ignored by the machine doing the work.
+            //
+            // Derived HERE, from the `now` this validator already read, so the caller
+            // needs no clock of its own.
+            //
+            // **With the skew slack, and dropping it would reintroduce the exact defect
+            // the slack exists to prevent.** The obvious reading -- a budget should be
+            // the grant's own expiry, since the slack is about a boundary -- is wrong
+            // here, and a case in this file already says so: a worker whose clock is
+            // minutes fast computes a NEGATIVE remaining for every job it was
+            // legitimately granted, and would refuse them all, on exactly the machines
+            // nobody is watching. Moving that refusal from before the compile to after
+            // it makes it worse rather than better, since the work is done first.
+            //
+            // So this is the same window the verifier accepted on, and the cost is
+            // stated rather than hidden: a compile is abandoned `slack` past the point
+            // the scheduler reclaimed the key, not at it.
+            return LeaseDecision { .refusal = std::nullopt,
+                                   .remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       (verified->expiresAt + slack) - now) };
         }
 
         // The CLAIMS are dropped deliberately -- what a worker needs from a grant is
@@ -240,14 +274,19 @@ LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
         // re-deriving a decision it is not the one making. The refusal travels whole,
         // diagnostic included: that string was formatted for this caller and used to
         // be allocated and dropped.
-        return std::move(verified.error());
+        return LeaseDecision { .refusal = std::move(verified.error()), .remaining = std::nullopt };
     };
 }
 
 LeaseValidator UncheckedLeaseValidator()
 {
     return [](std::string_view, std::string_view) {
-        return std::optional<Distributed::LeaseRefusal> {};
+        // No refusal AND no bound, which are two separate facts rather than one
+        // permissive answer. This worker holds no key, so it has authenticated nothing
+        // and can state no bound -- and a caller that read a disengaged `remaining` as
+        // "no time left" would refuse every compile on the single-machine install this
+        // validator exists for. `LeaseDecision::remaining` carries that distinction.
+        return LeaseDecision { .refusal = std::nullopt, .remaining = std::nullopt };
     };
 }
 
@@ -366,7 +405,8 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     // NOT `UnknownLease`. That is the SCHEDULER's code, meaning "a lease I issued
     // and have since forgotten", and a worker answering with it sent an operator to
     // the scheduler to look for a fault that is local.
-    if (auto const refusal = _validator(token, fingerprint); refusal.has_value())
+    auto const decision = _validator(token, fingerprint);
+    if (auto const& refusal = decision.refusal; refusal.has_value())
     {
         // The detail travels. It is empty for anything that failed the MAC -- a
         // caller that could not authenticate a token has established no fact about
@@ -456,6 +496,41 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
     auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt);
     _metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted);
     _metrics.Increment(IMetricsSink::Counter::WorkerCompileMillisTotal, static_cast<std::uint64_t>(elapsed.count()));
+
+    // **The job outlived its grant, so the object goes nowhere and the refusal says
+    // WHICH bound ran out.** The compiler is not killed -- it has already finished, and
+    // killing one mid-flight would not even unblock this thread, since the
+    // grandchildren hold the pipe write ends (#239). What is declined is SERVING the
+    // result: past the grant's expiry the scheduler has reclaimed the lease and may
+    // have re-granted the key, so this object is work the fleet has already given away.
+    //
+    // **Which bound is the whole point of saying it.** This surface now has two, and
+    // they are opposite diagnoses fixed by different people -- the same split
+    // `TransportFailure` draws between `Expired` and `Silent` on the client, and it is
+    // stated in the same words because an operator reading both ends must not have to
+    // translate. Running out of GRANT means the cluster's `lease-lifetime` is shorter
+    // than this site's slowest translation unit, and one number fixes it. Running out
+    // of the endpoint's window instead means the compile exceeded the largest lease a
+    // cluster may agree on at all, which no setting fixes. Reported as one number they
+    // would send whoever read it to change the thing that was not the problem, which is
+    // exactly what #245 records about reporting silence as an expiry.
+    //
+    // Compared against `remaining` rather than a fresh clock reading: both sides are
+    // then steady-clock durations, so a wall clock stepping during a long compile
+    // cannot decide this. Disengaged means this worker authenticated nothing and has no
+    // bound to enforce, which is the keyless single-machine install and not a job that
+    // has run out of time.
+    if (decision.remaining.has_value() && elapsed > *decision.remaining)
+    {
+        auto const& row = Distributed::DescribeLeaseRefusal(Distributed::LeaseRefusalReason::Expired);
+        return Refuse(_metrics,
+                      SurfaceRefusal { .code = row.code, .counter = row.workerCounter },
+                      std::format("this compile took {} ms and its grant allowed {} ms; the lease expired while it "
+                                  "ran, so the object is not served. Raise the cluster's lease-lifetime setting if "
+                                  "this site's translation units are longer than the fleet was told",
+                                  elapsed.count(),
+                                  decision.remaining->count()));
+    }
 
     // The object goes back in an envelope chosen from what the CLIENT said it
     // accepts -- carried in its own request, so no negotiation round trip. `Envelope`,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -367,18 +369,57 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
         return lease.token;
     }
 
-    // The expiry is derived from the lease table's own lifetime rather than written
-    // beside it. A token that outlived its lease would be a capability with no record
-    // anywhere; one that died first would have a worker refusing work whose key this
-    // scheduler is still suppressing.
+    // The expiry comes from the LEASE, not from the table. A token that outlived its
+    // lease would be a capability with no record anywhere; one that died first would
+    // have a worker refusing work whose key this scheduler is still suppressing.
+    //
+    // It used to read `_leases.Timeout()` here, which was one derivation of the fact
+    // and `Acquire`'s `issuedAt` stamp was another -- correct only while the lifetime
+    // was a constant. It is a replicated setting since #522, so the two could be
+    // separated by an operator changing it between the two statements. The lease
+    // carries what it was granted under and every end reads that.
     return MintLeaseToken(_signingKey,
                           LeaseClaims { .serial = lease.token,
                                         .endpoint = std::string { endpoint },
                                         .fingerprint = std::string { fingerprint },
                                         .key = lease.key,
-                                        .expiresAt = _wallClock.Now() + _leases.Timeout(),
+                                        .expiresAt = _wallClock.Now() + lease.lifetime,
                                         .clusterId = _clusterId,
                                         .epoch = _epoch.load(std::memory_order_acquire) });
+}
+
+std::chrono::milliseconds SchedulerService::AgreedLeaseLifetime() const
+{
+    // No cluster is not a missing answer: it is the one-machine deployment, which has
+    // no replicated state for anybody to set and must go on working with none.
+    if (_admin == nullptr)
+        return _leases.Timeout();
+
+    auto const configured = _admin->ClusterState().SettingOf(Cluster::LeaseLifetimeSetting);
+    if (!configured.has_value())
+        return _leases.Timeout();
+
+    // The SAME predicate `Validate` refuses with, so the two cannot disagree about
+    // what a value means -- see `Cluster::ParseLeaseLifetime`.
+    auto const parsed = Cluster::ParseLeaseLifetime(*configured);
+    if (parsed.has_value())
+        return *parsed;
+
+    // Not fatal, and deliberately not a refusal to schedule. `Validate` runs on the
+    // leader before the append, so no build in this tree can put an unreadable value
+    // here; what can is a NEWER build with wider bounds, mid rolling upgrade -- and a
+    // node that refused every lease on meeting one would take the fleet down for an
+    // upgrade rather than for a fault. Serving under the default is the outcome that
+    // degrades; saying so once is what keeps it from being silent.
+    if (!_warnedLeaseLifetime.exchange(true, std::memory_order_relaxed))
+        _logger.Logf(LogLevel::Warn,
+                     "this cluster's {} is {}, which this build cannot read ({}); granting leases of {} ms until it "
+                     "is set to something this build understands",
+                     Cluster::LeaseLifetimeSetting,
+                     *configured,
+                     parsed.error(),
+                     _leases.Timeout().count());
+    return _leases.Timeout();
 }
 
 void SchedulerService::SetRole(SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
@@ -759,7 +800,7 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
         // three.
         return Refuse(WireCodeFor(picked.error()));
 
-    auto const lease = _leases.Acquire(request.key, picked->id);
+    auto const lease = _leases.Acquire(request.key, picked->id, AgreedLeaseLifetime());
     if (!lease.has_value())
         // Still reachable, and the reason it must stay: `IsInFlight` above is
         // advisory, so two callers can both pass it and race here. `Acquire` is the
@@ -789,8 +830,14 @@ SchedulerReply SchedulerService::Lease(CallerContext const& caller, Wire::LeaseR
     // preprocessed payload it is about to send -- without a negotiation round trip,
     // and without guessing at something the worker cannot decode after the whole
     // payload has already crossed the network.
-    return SchedulerReply::Success(Wire::EncodeLeaseGrant(
-        Wire::LeaseGrant { .endpoint = picked->endpoint, .leaseToken = token, .workerCodecs = picked->codecs }));
+    return SchedulerReply::Success(
+        Wire::EncodeLeaseGrant(Wire::LeaseGrant { .endpoint = picked->endpoint,
+                                                  .leaseToken = token,
+                                                  .workerCodecs = picked->codecs,
+                                                  // From the LEASE, like the token's own expiry, so the client's
+                                                  // bound and the grant's cannot be two readings of one setting
+                                                  // taken a moment apart.
+                                                  .lifetime = lease->lifetime }));
 }
 
 SchedulerReply SchedulerService::Release(CallerContext const& caller, std::string_view leaseToken, std::string_view key)

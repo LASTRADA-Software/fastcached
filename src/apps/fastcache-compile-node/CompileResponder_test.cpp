@@ -1302,8 +1302,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     // Measured on a clean tree, three consecutive runs: 8.82 s, exit 0. The five in
     // `HeaderTimeout` is what the arithmetic is BUILT from; it is not a window this
     // case ever waits on, since the whole point is that the compile's own window is
-    // `DefaultCompileLeaseTimeout` -- ten minutes -- as the two `REQUIRE`s below
-    // assert.
+    // `MaxCompileLeaseLifetime` -- an hour -- as the two `REQUIRE`s below assert.
     //
     // So a sub-7.5 s termination here is the process being killed from outside: an OOM
     // kill on a loaded host, another lane's `pkill`, or a stale binary from a tree that
@@ -1313,10 +1312,17 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     MergedWorker worker { fix, io };
     MergedResponder merged { nullptr, nullptr, &worker.responder };
 
-    // The SIZE, asserted rather than waited out: ten minutes of held compile would be a
+    // The SIZE, asserted rather than waited out: an hour of held compile would be a
     // suite nobody runs. Paired with the mechanism above, the two cover both.
-    REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile))
-            == Wire::DefaultCompileLeaseTimeout);
+    //
+    // The CEILING rather than the default, since #522: the lease lifetime is a
+    // replicated setting, so a fleet may grant longer than the default and this window
+    // is armed before any grant can be read. `RequestTimeout` carries the argument.
+    // Asserted against the named constant rather than a literal, so a build that
+    // silently went back to bounding a compile by the DEFAULT fails here -- which is
+    // the regression that would abandon exactly the long translation units this ticket
+    // is about, while short ones kept succeeding.
+    REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile)) == Wire::MaxCompileLeaseLifetime);
     REQUIRE(worker.responder.RequestTimeout(static_cast<std::uint8_t>(Wire::Op::Compile)) > FrameServer::HeaderTimeout);
 
     auto const port = FreePort();

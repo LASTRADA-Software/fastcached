@@ -175,7 +175,7 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     REQUIRE_FALSE(state.lease.term.Known().has_value());
 
     // And the foreign fleet is refused anyway -- on the identity, not the term.
-    auto const foreign = (*validator)(ForeignGrantUnder(CurrentTerm), "gcc-13");
+    auto const foreign = (*validator)(ForeignGrantUnder(CurrentTerm), "gcc-13").refusal;
     REQUIRE(foreign.has_value());
     CHECK(Testing::Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
 
@@ -191,7 +191,7 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
 
     // The control, and it is what stops this passing against a validator that refuses
     // everything: this node's OWN fleet is served, first grant and all.
-    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").refusal.has_value());
 }
 
 TEST_CASE("The production factory wires the spend and the term through", "[node][lease][epoch][replay]")
@@ -231,7 +231,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // would pass against a validator that refuses everything; without the others,
     // against one that accepts everything and enforces nothing.
     auto const first = GrantUnder(CurrentTerm, "l1");
-    CHECK_FALSE((*validator)(first, "gcc-13").has_value());
+    CHECK_FALSE((*validator)(first, "gcc-13").refusal.has_value());
     CHECK(state.lease.term.Known() == std::optional<std::uint64_t> { CurrentTerm });
     CHECK(state.lease.spent.Size() == 1);
     CHECK(said.empty());
@@ -240,7 +240,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // row. This is the check that used to not exist at all: the grant authenticated,
     // named this worker and this toolchain, and had not expired, so it was served
     // every time it arrived.
-    auto const replay = (*validator)(first, "gcc-13");
+    auto const replay = (*validator)(first, "gcc-13").refusal;
     REQUIRE(replay.has_value());
     CHECK(Testing::Unwrap(replay).reason == Distributed::LeaseRefusalReason::Replayed);
 
@@ -257,7 +257,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     // exists for: before it, this grant was refused and every honest grant after it
     // was too, until the process restarted. The fleet keeps working.
     auto const afterReset = GrantUnder(DeposedTerm, "l1-again");
-    CHECK_FALSE((*validator)(afterReset, "gcc-13").has_value());
+    CHECK_FALSE((*validator)(afterReset, "gcc-13").refusal.has_value());
     CHECK(state.lease.term.Known() == std::optional<std::uint64_t> { DeposedTerm });
     CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 
@@ -274,7 +274,7 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
 
     // Once per reset, not once per grant: the fleet is now steady at the lower term and
     // every compile learns it again.
-    CHECK_FALSE((*validator)(GrantUnder(DeposedTerm, "l2"), "gcc-13").has_value());
+    CHECK_FALSE((*validator)(GrantUnder(DeposedTerm, "l2"), "gcc-13").refusal.has_value());
     CHECK(said.size() == 1);
     CHECK(state.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 1);
 }
@@ -299,8 +299,8 @@ TEST_CASE("A node with no cluster key builds a validator that learns and spends 
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
 
-    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
-    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").has_value());
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").refusal.has_value());
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").refusal.has_value());
     CHECK_FALSE(state.lease.term.Known().has_value());
     CHECK(state.lease.spent.Size() == 0);
 }

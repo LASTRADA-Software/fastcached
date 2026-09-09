@@ -114,7 +114,12 @@ using WireVersion = std::uint8_t;
 /// so a worker learns which fleet it serves from the one exchange it has with the
 /// scheduler it was configured to reach
 /// ([#401](https://github.com/LASTRADA-Software/fastcached/issues/401)).
-inline constexpr WireVersion CurrentVersion = 5;
+///
+/// **6 put the lease's lifetime on the LEASE grant.** The lifetime became a
+/// replicated setting, so the number a client must bound its wait by is no longer a
+/// constant both ends compile in -- it has to travel
+/// ([#522](https://github.com/LASTRADA-Software/fastcached/issues/522)).
+inline constexpr WireVersion CurrentVersion = 6;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -167,7 +172,17 @@ inline constexpr WireVersion CurrentVersion = 5;
 /// spends its length on: a wrong answer that looks like a right one. Refusing the
 /// older REGISTER outright is `UnsupportedVersion`, which names the range and
 /// arrives before the worker believes it has joined anything.
-inline constexpr WireVersion MinSupportedVersion = 5;
+///
+/// **And again for version 6, which is version 4's case exactly.** The LEASE reply
+/// gained a field, and `SplitFields` is exact about arity -- so a version-5 launcher
+/// meeting a version-6 grant does not misread it, it fails to decode it at all, which
+/// is the better half of this. The reason the range still cannot stay open is the
+/// other direction: a version-6 launcher against a version-5 scheduler decodes
+/// nothing either, and the alternative -- accepting a three-field grant and falling
+/// back to the constant -- is precisely the silent wrong answer #522 exists to
+/// remove, reintroduced as a compatibility shim. A client that cannot learn the
+/// fleet's lifetime must not guess it.
+inline constexpr WireVersion MinSupportedVersion = 6;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -953,6 +968,41 @@ inline constexpr std::size_t MaxControlPayload = 64 * 1024;
 /// on `DefaultDispatchTotal`.
 inline constexpr std::chrono::milliseconds DefaultCompileLeaseTimeout { 600'000 };
 
+/// The largest lease lifetime a cluster may agree on.
+///
+/// The value above is a DEFAULT since #522: a site whose translation units are long
+/// says so by setting `lease-lifetime` in replicated state, and every end then reads
+/// the number out of the grant rather than out of a constant. This is how far that
+/// number may go, and it exists because two separate things stop being free as it
+/// grows.
+///
+/// **The expiry is still load-bearing for replay, which is the binding reason.**
+/// #614's spend-once is what carries replay protection now, and `SpentLeases` prunes
+/// with the verifier's own predicate, so retention and acceptance stay one window at
+/// any value here -- that part is a memory cost and a self-limiting one, since a set
+/// holding `(lifetime + slack) x spend rate` entries shrinks as the translation units
+/// get longer, which is the deployment that raises this. But `SpentLeases` states
+/// three residuals its spend does NOT close, and this constant bounds two of them: a
+/// worker restart empties the set, so a token captured beforehand is spendable once
+/// afterwards for whatever is left of its `expiresAt`, and a clock stepping backwards
+/// is bounded by "the same window". A worker restart is an ORDINARY fleet event --
+/// a rolling upgrade is a fleet of them -- so this number is the post-restart replay
+/// window, and raising it raises exactly the thing the expiry was chosen to bound.
+///
+/// **It is also the endpoint's answer window for a compile**, which is the second
+/// reason and was not obvious. `CompileResponder::RequestTimeout` is armed before the
+/// payload is read and therefore before any grant can be verified, so the only value
+/// available at that moment which cannot cut a legal job short is this ceiling. A
+/// served member may hold a compile socket this long while uploading; the per-job
+/// bound tightens to the grant as soon as one is authenticated.
+///
+/// One hour. Six times the default, which covers "our translation units are long" with
+/// room -- a site whose SINGLE translation unit exceeds an hour has a build problem no
+/// lease lifetime fixes -- and small enough that both costs above stay bounded by
+/// something an operator can reason about. A rounder, more generous number would buy
+/// nothing and widen both.
+inline constexpr std::chrono::milliseconds MaxCompileLeaseLifetime { 3'600'000 };
+
 /// How often a worker writes `Status::Progress` while a dispatched compile runs.
 ///
 /// **One number, for `DefaultCompileLeaseTimeout`'s reason**: the worker's cadence
@@ -995,6 +1045,18 @@ static_assert(DefaultCompileIdleTimeout >= 3 * DefaultProgressInterval,
               "a client must tolerate at least two missed pulses; below that, jitter reads as a dead worker");
 static_assert(DefaultCompileIdleTimeout < DefaultCompileLeaseTimeout,
               "an idle bound at or above the total budget bounds nothing that the total did not already bound");
+
+// **This assertion covers the DEFAULT and nothing else, now that the lifetime is a
+// replicated setting.** A cluster may agree on a lifetime at or below the idle bound,
+// which puts a healthy worker's own reactor jitter above the total and reads as a fleet
+// that has stopped working -- the same failure the assertion above exists to prevent,
+// reachable at run time instead of at build time. So the relation is asked again where
+// the setting is validated (`Cluster::ValidateLeaseLifetime`), on the LEADER, before the
+// append: an operator gets an error rather than an entry replicated cluster-wide. The
+// value is REFUSED there and never clamped -- a clamp would answer `accepted` for a
+// number the cluster did not adopt, which is the ticket's own complaint one layer along.
+static_assert(DefaultCompileLeaseTimeout <= MaxCompileLeaseLifetime,
+              "the default lease lifetime must itself be a value a cluster is allowed to agree on");
 
 /// Every opcode this build understands.
 ///
@@ -3279,6 +3341,24 @@ struct LeaseGrant
     /// a few bytes in a reply that is being sent anyway, and keeps the exchange free
     /// of a negotiation round trip.
     CodecList workerCodecs;
+
+    /// How long this grant lives, so the client can bound its own wait by it.
+    ///
+    /// **In the CLEAR, beside the token rather than read out of it**, and that is a
+    /// deliberate refusal to add an unauthenticated claims reader. The expiry is also
+    /// inside the MACed claims, where the WORKER reads it after verifying -- but the
+    /// client holds no key and cannot verify anything, so giving it a way to read
+    /// claims without checking them would put exactly the primitive the MAC-first rule
+    /// forbids into a header three binaries include. What the client needs is not a
+    /// claim about the token; it is its own budget, from the scheduler that is already
+    /// telling it which worker to dial.
+    ///
+    /// Without it the client's total came from a compile-time constant (#522). A fleet
+    /// that had agreed on a longer lifetime was then obeyed by the scheduler and the
+    /// worker and ignored by the client, which gave up mid-compile on a job everybody
+    /// else still considered live -- the same failure in the third of three places, and
+    /// the one the operator sees.
+    std::chrono::milliseconds lifetime { 0 };
 };
 
 /// Frame the payload of a successful LEASE reply.
@@ -3287,7 +3367,11 @@ struct LeaseGrant
 [[nodiscard]] inline std::vector<std::byte> EncodeLeaseGrant(LeaseGrant const& grant)
 {
     auto const codecs = EncodeCodecList(grant.workerCodecs);
-    return WireFields::Encode({ AsBytes(grant.endpoint), AsBytes(grant.leaseToken), std::span<std::byte const> { codecs } });
+    auto const lifetime = EncodeU32Field(static_cast<std::uint32_t>(grant.lifetime.count()));
+    return WireFields::Encode({ AsBytes(grant.endpoint),
+                                AsBytes(grant.leaseToken),
+                                std::span<std::byte const> { codecs },
+                                std::span<std::byte const> { lifetime } });
 }
 
 /// The fields of a LEASE grant, as views.
@@ -3296,6 +3380,7 @@ struct LeaseGrantView
     std::span<std::byte const> endpoint;
     std::span<std::byte const> leaseToken;
     CodecList workerCodecs;
+    std::chrono::milliseconds lifetime { 0 };
 };
 
 /// Split a LEASE reply payload.
@@ -3303,12 +3388,19 @@ struct LeaseGrantView
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<LeaseGrantView> DecodeLeaseGrant(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, 3);
+    auto const fields = SplitFields(payload, 4);
     if (!fields.has_value())
+        return std::nullopt;
+    // Strict about the width, like every other numeric field here: a lifetime of
+    // another length is a sender speaking a shape this build does not know, and
+    // reading four bytes of it would invent a budget.
+    auto const lifetime = DecodeU32Field((*fields)[3]);
+    if (!lifetime.has_value())
         return std::nullopt;
     return LeaseGrantView { .endpoint = (*fields)[0],
                             .leaseToken = (*fields)[1],
-                            .workerCodecs = DecodeCodecList((*fields)[2]) };
+                            .workerCodecs = DecodeCodecList((*fields)[2]),
+                            .lifetime = std::chrono::milliseconds { *lifetime } };
 }
 
 /// What a worker answers a COMPILE with.

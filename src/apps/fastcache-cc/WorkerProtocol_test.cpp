@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
@@ -65,6 +66,16 @@ class StubRunner final: public IProcessRunner
   public:
     std::string object { "OBJECT" }; ///< What the fake compiler writes.
 
+    /// How long the fake compiler pretends to take.
+    ///
+    /// Zero for every case but the one about a job outliving its grant, which needs a
+    /// compile that measurably outlasts a budget. A real sleep rather than an injected
+    /// clock because the duration being compared is `steady_clock` measured around this
+    /// runner -- so the only honest way to make it large is to actually take that long.
+    /// Kept in milliseconds, and small: the budget it has to beat is narrowed to zero by
+    /// the case, so this exists to be non-zero rather than to be long.
+    std::chrono::milliseconds takes { 0 };
+
     CompileRun RunCaptureCombined(std::span<std::string const> argv) override
     {
         return RunCaptureSplit(argv);
@@ -72,6 +83,8 @@ class StubRunner final: public IProcessRunner
     CompileRun RunCaptureSplit(std::span<std::string const> argv) override
     {
         Test::WriteStubObject(argv, object);
+        if (takes > std::chrono::milliseconds::zero())
+            std::this_thread::sleep_for(takes);
         return CompileRun { .exitCode = 0, .out = {}, .err = {} };
     }
 };
@@ -184,7 +197,8 @@ constexpr std::uint64_t GrantTerm = 4;
 /// @return The validator.
 [[nodiscard]] LeaseValidator MakeLeaseValidator(LeasePolicy policy,
                                                 Distributed::WorkerLeaseState& lease,
-                                                IMetricsSink& metrics)
+                                                IMetricsSink& metrics,
+                                                std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack)
 {
     if (policy == LeasePolicy::Unchecked)
         return UncheckedLeaseValidator();
@@ -192,7 +206,7 @@ constexpr std::uint64_t GrantTerm = 4;
     // REGISTER reply said, so a validator built for a test has to be told the same way
     // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
     lease.fleet.Pin(std::string { ThisCluster });
-    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
+    return SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics, slack);
 }
 
 struct Fixture
@@ -217,9 +231,15 @@ struct Fixture
     ///        passes `AvailableCodecs()`, and a case can narrow it to assert what a
     ///        worker without a codec answers.
     /// @param policy Which production lease policy to build; see `LeasePolicy`.
-    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(), LeasePolicy policy = LeasePolicy::Unchecked):
+    /// @param slack How far this worker's clock may trail the scheduler's. Production
+    ///        everywhere but the one case that has to observe a job outliving its
+    ///        grant: a verifying grant carries at least `slack` of budget by
+    ///        construction, so at the production value that refusal is unreachable.
+    explicit Fixture(Wire::CodecList codecs = AvailableCodecs(),
+                     LeasePolicy policy = LeasePolicy::Unchecked,
+                     std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack):
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() },
-        worker { jobs, MakeLeaseValidator(policy, lease, metrics), std::move(codecs), metrics }
+        worker { jobs, MakeLeaseValidator(policy, lease, metrics, slack), std::move(codecs), metrics }
     {
     }
     Fixture(Fixture const&) = delete;
@@ -2140,7 +2160,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         auto const validator =
             SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
 
-        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13");
+        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::Unregistered);
         // Not ClusterMismatch: the two call for opposite operator actions, and a worker
@@ -2156,7 +2176,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         auto const validator =
             SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
 
-        CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").has_value());
+        CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
 
     SECTION("registered into a fleet that names none still compiles, and only for grants naming none")
@@ -2170,11 +2190,98 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         auto const validator =
             SignedLeaseValidator(TestClusterKey(), std::string { ThisWorker }, LeaseClock, lease, metrics);
 
-        CHECK_FALSE(validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").has_value());
+        CHECK_FALSE(
+            validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").refusal.has_value());
 
         auto const foreign =
-            validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 7, "18"), "gcc-13");
+            validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, 7, "18"), "gcc-13").refusal;
         REQUIRE(foreign.has_value());
         CHECK(Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
+    }
+}
+
+TEST_CASE("A compile that outlived its grant is refused as EXPIRED and its object is not served", "[worker-protocol][lease]")
+{
+    // **The worker has two bounds now and must say which one ran out.** Since #522 the
+    // endpoint's answer window is `MaxCompileLeaseLifetime` -- the widest a cluster may
+    // agree on, because that window is armed before the payload and therefore before any
+    // grant can be read -- while the bound that actually applies to a job is the grant's
+    // own. An operator meeting a truncated compile has to be able to tell *the fleet's
+    // lease-lifetime is shorter than our slowest translation unit*, which one setting
+    // fixes, from *this compile exceeded the largest lease anyone may agree on*, which
+    // no setting fixes. Reported as one thing they would go and change the wrong one --
+    // the failure `TransportFailure` records for `Expired` against `Silent` on the
+    // client, arriving on the worker.
+    //
+    // **The skew slack is what makes this hard to observe, and narrowing it is the
+    // only honest way in.** A grant that verifies carries at least `slack` of budget by
+    // construction -- the budget is measured against the same acceptance window the
+    // verifier used, deliberately, because a worker whose clock runs fast would
+    // otherwise refuse every job it was legitimately granted. At the production five
+    // minutes this refusal is unreachable in any test that does not actually compile for
+    // five minutes, so the case narrows the slack to zero and makes the compile take
+    // measurably longer than the nothing that then remains.
+    //
+    // The slack is a real parameter rather than a seam cut for this case: the code it
+    // reaches already argued that a caller with a non-default value must not be able to
+    // split the window, and this is that caller.
+    Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying, std::chrono::seconds { 0 } };
+    fix.lease.fleet.Pin(std::string { ThisCluster });
+    fix.runner.takes = std::chrono::milliseconds { 20 };
+
+    // Expiring exactly now: inside the (zeroed) acceptance window, so it verifies, and
+    // with no budget left at all, so any compile at all outlives it.
+    auto const answer = fix.worker.Answer(CompileFrame(
+        "gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker, "gcc-13", std::chrono::seconds { 0 })));
+    REQUIRE(answer.has_value());
+
+    CHECK(Decode(Unwrap(answer)).status == Wire::Status::Error);
+    // WHICH refusal, not merely that one happened. `LeaseExpired` is the code that
+    // names the lease; anything else sends an operator somewhere unrelated.
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseExpired);
+
+    // The compile RAN -- this is not the pre-flight refusal one line up the file, which
+    // never starts a job. That distinction is the case: the worker did the work, then
+    // declined to serve a result the fleet had already reclaimed.
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsCompleted) == 1);
+}
+
+TEST_CASE("A compile inside its grant is served, and one from a keyless worker is too", "[worker-protocol][lease]")
+{
+    // **The control, and it carries two distinct claims the case above cannot.**
+    //
+    // Without the first, a build that refused EVERY compile would pass the expiry case
+    // perfectly -- which is the shape this repository keeps rediscovering: an assertion
+    // that the broken state also satisfies.
+    SECTION("a grant with time left still serves its object")
+    {
+        // The SAME narrowed slack and the SAME slow compile as the case above, so the
+        // only thing that differs is how much budget the grant carried. A control that
+        // also relaxed the slack back to production would pass against a build that
+        // refuses on the slack rather than on the budget.
+        Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Verifying, std::chrono::seconds { 0 } };
+        fix.lease.fleet.Pin(std::string { ThisCluster });
+        fix.runner.takes = std::chrono::milliseconds { 20 };
+
+        auto const answer = fix.worker.Answer(CompileFrame(
+            "gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 })));
+        REQUIRE(answer.has_value());
+        CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
+        CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired) == 0);
+    }
+
+    SECTION("a worker with no cluster key has no bound to enforce, and does not invent one")
+    {
+        // The single-machine install. `UncheckedLeaseValidator` authenticates nothing,
+        // so it reports NO remaining budget -- and a caller reading that disengaged
+        // optional as *no time left* rather than *no bound* would refuse every compile
+        // on every keyless node. Two states, one of which is not zero.
+        Fixture fix { { Wire::IdentityCodec }, LeasePolicy::Unchecked };
+
+        auto const answer =
+            fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, "no-lease-needed"));
+        REQUIRE(answer.has_value());
+        CHECK(Decode(Unwrap(answer)).status == Wire::Status::Ok);
     }
 }

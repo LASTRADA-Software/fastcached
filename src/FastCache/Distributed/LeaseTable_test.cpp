@@ -362,3 +362,83 @@ TEST_CASE("A clock that moves backwards does not expire live leases", "[distribu
     fix.clock.Advance(std::chrono::milliseconds { -2000 });
     CHECK(fix.leases.Find(Unwrap(lease).token).has_value());
 }
+
+TEST_CASE("A lease keeps the bound it was granted under when a later one is shorter", "[distributed][lease]")
+{
+    // **#522's second decision, made structural rather than asserted in prose.** The
+    // lifetime is a replicated setting a cluster may change while work is in flight. A
+    // table that judged live entries against the CURRENT value would move the bound of a
+    // grant already minted -- and the client and the worker are both holding a token
+    // whose expiry came from the old one, so the three ends would disagree about when
+    // the job is over. That is the disagreement this ticket exists to make impossible.
+    Fixture fix;
+
+    using namespace std::chrono_literals;
+    auto const generous = fix.leases.Acquire("objkey-long", "w1", 10'000ms);
+    REQUIRE(generous.has_value());
+    CHECK(Unwrap(generous).lifetime == 10'000ms);
+
+    // The cluster shortens the setting. Every lease taken from here on is short.
+    auto const brief = fix.leases.Acquire("objkey-short", "w1", 200ms);
+    REQUIRE(brief.has_value());
+
+    // Past the NEW bound and well inside the OLD one.
+    fix.clock.Advance(1'000ms);
+
+    // The one that matters: the in-flight generous lease is still live, judged against
+    // what it was granted under. Read through `Find`, which is the call a worker's
+    // authorization goes through, rather than through a getter no production path uses.
+    CHECK(fix.leases.Find(Unwrap(generous).token).has_value());
+    CHECK(fix.leases.IsInFlight("objkey-long"));
+
+    // The control, and it is what makes the assertion above mean something: a table that
+    // simply never expired anything would pass every line up to here. The short lease
+    // taken under the NEW value is gone at the same instant, from the same table, under
+    // the same clock -- so what is being observed is the per-entry bound and not a
+    // liveness check that stopped working.
+    CHECK_FALSE(fix.leases.Find(Unwrap(brief).token).has_value());
+    CHECK_FALSE(fix.leases.IsInFlight("objkey-short"));
+}
+
+TEST_CASE("A lease granted under a longer bound is not expired early by a shorter default", "[distributed][lease]")
+{
+    // The mirror, because the failure has two directions and only one of them is
+    // reachable from the case above. A table holding `_leaseTimeout` and consulting it
+    // per entry expires a GENEROUS in-flight lease the moment the setting drops; one
+    // that ignores the granted value altogether keeps a BRIEF lease alive far too long,
+    // suppressing a key nobody is building. Both are one-line implementations away.
+    using namespace std::chrono_literals;
+    Fixture fix; // constructed with a 1000ms default
+
+    auto const brief = fix.leases.Acquire("objkey-brief", "w1", 100ms);
+    REQUIRE(brief.has_value());
+
+    fix.clock.Advance(500ms); // past the grant, inside the table's own default
+
+    CHECK_FALSE(fix.leases.Find(Unwrap(brief).token).has_value());
+
+    // And the key is free again, which is the operator-visible half: a lease that
+    // outlives its grant suppresses duplicate work for a job nobody is doing.
+    auto const regranted = fix.leases.Acquire("objkey-brief", "w2", 100ms);
+    CHECK(regranted.has_value());
+}
+
+TEST_CASE("A caller that names no lifetime gets the table's own, which is the one-machine install", "[distributed][lease]")
+{
+    // The deployment with no replicated state to read: one node, no consensus, nothing
+    // to agree with. It must keep working with no configuration at all, so the
+    // convenience overload is asserted rather than assumed -- and asserted through the
+    // OBSERVABLE bound rather than through `Timeout()`, which would pass against an
+    // overload that recorded the default and judged against something else.
+    using namespace std::chrono_literals;
+    Fixture fix; // 1000ms
+
+    auto const lease = fix.leases.Acquire("objkey-default", "w1");
+    REQUIRE(lease.has_value());
+    CHECK(Unwrap(lease).lifetime == fix.leases.Timeout());
+
+    fix.clock.Advance(900ms);
+    CHECK(fix.leases.Find(Unwrap(lease).token).has_value());
+    fix.clock.Advance(200ms);
+    CHECK_FALSE(fix.leases.Find(Unwrap(lease).token).has_value());
+}
