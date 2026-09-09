@@ -555,6 +555,105 @@ failure_excerpt() {
     grep -E -m 30 "$(gate_excerpt_pattern)" || true
 }
 
+# Does every test ctest ran land in a state this gate knows about?
+#
+# The excerpt above matches MARKERS IT ENUMERATES, and so does every other reader
+# here. An enumeration only covers the states its author was thinking about --
+# `***Exception` was missed for exactly that reason (#1158) -- so a longer list is
+# not the fix, because the next state is missed by the same mechanism.
+#
+# A SUM against the registered total has no list to be incomplete. It fires on ANY
+# state outside whatever the summer knows, including one a future ctest or Catch2
+# adds. That is the `*)`-arm argument answered rather than restated: you cannot
+# enumerate your way out, so compare against a total instead (#1159).
+#
+# ## Its honest limit, stated here because a reader will otherwise infer more
+#
+# **This says THAT something is unaccounted for. It never says WHAT.** A run
+# holding a crash and a run holding an unbuilt-target sentinel produce the same
+# alarm with the same wording. It does not replace the excerpt: that names the
+# failing test, this only guarantees that an unlisted state cannot pass silently.
+# Its silence is not a claim about which states occurred.
+#
+# ## Where the total comes from
+#
+# The DENOMINATOR of ctest's own `<n>/<N> Test #<id>:` prefix, which the same run
+# prints on every result line. Not a figure from CMake, not a count of
+# registrations, not the summary's `out of N` alone -- the requirement is that the
+# total cannot drift out of step with what actually ran, and a number emitted by
+# the run beside each result cannot.
+#
+# ## Why it counts with `grep` rather than walking lines
+#
+# Seven passes over the log instead of a bash loop doing six regex tests on each
+# of ~7000 lines. The states are made mutually exclusive by anchoring each verdict
+# to the trailing `N.NN sec` through `[^0-9*]*`, which cannot span the `***` of a
+# following marker -- so a test whose NAME ends in a verdict word is not counted
+# twice. That exclusivity is not assumed: when the per-state counts do not sum to
+# the number of result lines, this says so rather than reporting a total it cannot
+# stand behind.
+#
+# @param 1 Label to report against, normally the preset.
+# Reads a ctest run's output on stdin. Echoes `ok`, or a multi-line report.
+states_reconcile() {
+    local label="$1" text row word marker count
+    local accounted=0 lines=0 total=0 detail=""
+    text="$(cat)"
+
+    local resultLine='^ *[0-9]+/[0-9]+ Test +#[0-9]+:'
+    lines=$(grep -cE "$resultLine" <<< "$text" || true)
+    if [[ "$lines" -eq 0 ]]; then
+        # No result lines at all is not a reconcile failure: it is a run this
+        # cannot read, which `skip_report` reports in its own words. Saying
+        # "0 of 0 accounted" here would be a second, vaguer voice for one fact.
+        echo "ok"
+        return 0
+    fi
+
+    total=$(grep -oE "$resultLine" <<< "$text" | head -1 | sed 's|.*/||; s| .*||')
+
+    # A total this cannot read is its own outcome, and making it one is what gives
+    # the guard above something to protect. `[[ 0 -eq "" ]]` is TRUE in bash --
+    # an empty operand evaluates to 0 -- so an unreadable total silently compared
+    # equal to an empty count and answered `ok`. That is this instrument reporting
+    # a clean reconcile about a run it could not read, which is the exact species
+    # it was written to catch, one level up.
+    #
+    # Found by mutation rather than by review: deleting the no-result-lines guard
+    # changed no verdict, so the case asserting it was passing under both readings.
+    if ! [[ "$total" =~ ^[1-9][0-9]*$ ]]; then
+        echo "== ${label}: cannot read the registered total from this output, so the"
+        echo "==   states cannot be reconciled against anything. This is not a clean"
+        echo "==   reconcile and must not be read as one."
+        return 0
+    fi
+
+    for row in "${gate_ctest_states[@]}"; do
+        word="${row%%|*}"
+        if [[ "$word" == "Passed" ]]; then
+            marker="$word"
+        else
+            marker="\\*\\*\\*$word"
+        fi
+        count=$(grep -cE "${marker}[^0-9*]*[0-9]+\\.[0-9]+ sec *$" <<< "$text" || true)
+        accounted=$((accounted + count))
+        detail="${detail}
+==     ${word}: ${count}"
+    done
+
+    if [[ "$accounted" -eq "$total" ]]; then
+        echo "ok"
+        return 0
+    fi
+
+    echo "== ${label}: the per-test states do not account for every test ctest ran."
+    echo "==   accounted ${accounted}, registered ${total}, result lines seen ${lines}${detail}"
+    echo "==   This says THAT something is unaccounted for and never WHAT: a state no"
+    echo "==   reader here enumerates, or a run that stopped early, produce the same"
+    echo "==   alarm. Read the full log; do not add a state to make this quiet until"
+    echo "==   you know which one it is."
+}
+
 if [[ -n "$classify_log" ]]; then
     if [[ "$classify_log" == "-" ]]; then
         _classify_outcome="$(gate_outcome)"
@@ -1966,6 +2065,59 @@ $gate_passed_marker"
         esac
     done
 
+    # -----------------------------------------------------------------------
+    # #1159: the reconcile against the registered total.
+    #
+    # The direction that decides whether this is worth having: it must be SILENT
+    # on ordinary input. A reconcile that fires on a healthy run is worse than
+    # none, because it is re-run until quiet and then believed when it matters.
+    _healthy="$(printf '1/3 Test #1: alpha ...   Passed    0.01 sec\n2/3 Test #2: beta ....   Passed    0.02 sec\n3/3 Test #3: gamma ...   Passed    0.03 sec\n100%% tests passed, 0 tests failed out of 3\n')"
+    expect "an ordinary passing run reconciles silently" "ok" \
+        "$(states_reconcile leg <<< "$_healthy")"
+
+    # A run whose states this gate knows, MIXED, still reconciles -- so the check
+    # is not simply answering ok to everything with the word Passed in it.
+    _mixed_states="$(printf '1/4 Test #1: alpha ...   Passed    0.01 sec\n2/4 Test #2: beta ....   ***Failed  0.02 sec\n3/4 Test #3: gamma ...   ***Skipped 0.03 sec\n4/4 Test #4: delta ...   ***Exception: SegFault  0.04 sec\n75%% tests passed, 1 tests failed out of 4\n')"
+    expect "a run mixing four known states reconciles" "ok" \
+        "$(states_reconcile leg <<< "$_mixed_states")"
+
+    # THE TICKET: a state nobody enumerated. The excerpt cannot see it -- that is
+    # the point -- and the sum does, without having been told what it is.
+    _unlisted="$(printf '1/3 Test #1: alpha ...   Passed    0.01 sec\n2/3 Test #2: beta ....   ***Bananas 0.02 sec\n3/3 Test #3: gamma ...   Passed    0.03 sec\n66%% tests passed, 1 tests failed out of 3\n')"
+    expect "a state nobody enumerated is caught by the SUM" \
+        "==   accounted 2, registered 3, result lines seen 3" \
+        "$(states_reconcile leg <<< "$_unlisted" | sed -n '2p')"
+
+    # And the excerpt is blind to that same input, which is why both exist. If
+    # this ever starts matching, the two instruments have stopped being
+    # independent and the sum is no longer the backstop.
+    expect "... and the excerpt does NOT see it, which is why the sum exists" "0" \
+        "$(failure_excerpt <<< "$_unlisted" | grep -c 'Bananas' || true)"
+
+    # A run that stopped early: every line is a known state, and the total still
+    # does not add up. A checker keyed only on unknown MARKERS would pass this.
+    _truncated="$(printf '1/9 Test #1: alpha ...   Passed    0.01 sec\n2/9 Test #2: beta ....   Passed    0.02 sec\n')"
+    expect "a run that stopped early does not reconcile either" \
+        "==   accounted 2, registered 9, result lines seen 2" \
+        "$(states_reconcile leg <<< "$_truncated" | sed -n '2p')"
+
+    # Output with no result lines is NOT a reconcile failure -- `skip_report`
+    # already reports an unreadable run in its own words, and a second vaguer
+    # voice for one fact is how a reader learns to ignore both.
+    expect "output with no result lines is left to skip_report" "ok" \
+        "$(states_reconcile leg <<< "a truncated log with no per-test lines")"
+
+    # The mutual exclusivity the counting relies on, driven rather than assumed: a
+    # test whose NAME ends in a verdict word must be counted ONCE. Double-counting
+    # would make accounted 2 against a registered 1, so `ok` is the assertion.
+    expect "a test whose name ends in a verdict word is counted once" "ok" \
+        "$(states_reconcile leg <<< "1/1 Test #1: a case named Passed ...   ***Failed  0.01 sec")"
+
+    # It says THAT, never WHAT -- asserted, because the sentence is the whole
+    # reason nobody should read its silence as a claim about which states ran.
+    expect "the report refuses to name the state" "yes" \
+        "$([[ "$(states_reconcile leg <<< "$_unlisted")" == *"never WHAT"* ]] && echo yes || echo no)"
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -2190,8 +2342,23 @@ run_preset() {
         # A failing leg's skips matter as much as a passing one's -- more, since a
         # skip is one of the ways a case stops reporting on the thing that broke.
         skip_report "$preset" "$build_dir" < "$log"
+        # Printed but not made into a second verdict: this leg is already red, and
+        # a reconcile alarm here is EVIDENCE about why the excerpt may name less
+        # than the whole story rather than an additional finding.
+        _reconcile="$(states_reconcile "$preset" < "$log")"
+        [[ "$_reconcile" == "ok" ]] || printf '%s\n' "$_reconcile"
         fail "$preset tests (full log: $log)"
     fi
+
+    # #1159, and on the GREEN path is where it earns its place: a leg that ctest
+    # reports as passing while some test landed in a state no reader here
+    # enumerates would otherwise go by silently, which is the whole species.
+    _reconcile="$(states_reconcile "$preset" < "$log")"
+    if [[ "$_reconcile" != "ok" ]]; then
+        printf '%s\n' "$_reconcile"
+        fail "$preset tests: the per-test states do not account for every test that ran"
+    fi
+
     grep -E 'tests passed' "$log" | head -1
     # #1130: the totals line above is the one #1128 makes untrustworthy, so the
     # skipped NAMES go in the log beside it, before the log this read is deleted.
