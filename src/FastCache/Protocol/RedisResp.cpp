@@ -920,11 +920,23 @@ namespace
     ///
     /// **It is ALSO called explicitly at each exit, and that is not belt-and-braces for
     /// its own sake.** A destructor runs as the coroutine frame unwinds, which is after
-    /// the reply has been written; retiring before the write gives IOCP -- where
-    /// cancellation is asynchronous (`ISocket::CancelRead`, #884) -- a whole write round
-    /// trip in which to dequeue the aborted completion. Forgetting one of those explicit
-    /// calls therefore costs promptness on one platform rather than correctness, which
-    /// is the property that makes the pair worth having.
+    /// the reply has been written, so without the explicit call the watch stays armed
+    /// across the whole write. Retiring first frees the read slot before it.
+    ///
+    /// That reason is a REPLACEMENT rather than the original, and the original is worth
+    /// knowing about: this used to say the explicit calls bought IOCP -- where
+    /// cancellation was asynchronous -- a write round trip in which to dequeue the
+    /// aborted completion, so forgetting one cost promptness on one platform rather
+    /// than correctness.
+    ///
+    /// #884 retired that reason **for this watch specifically**, and the qualifier is the
+    /// point. What it made synchronous everywhere is freeing the read SLOT. Resolving the
+    /// WAITER inline is a narrower promise: it holds for a parked `WaitReadable`, which is
+    /// what this watch parks, and NOT for a real `Read` on IOCP, which settles later
+    /// (`ISocket::CancelRead`). So *retirement is synchronous everywhere* -- the sentence
+    /// that stood here -- is false as a general claim and true only of the one shape this
+    /// class uses. The rule outlives its dead reason; the reason above holds on every
+    /// platform and for every shape, which is why it is the one stated first.
     class ScopedDisconnectWatch
     {
       public:

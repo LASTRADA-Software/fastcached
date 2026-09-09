@@ -32,9 +32,19 @@ namespace FastCache::Detail
 /// `updateInterest` and every field access must already have happened. `EpollSocket::Close`
 /// records the ASan report that established this.
 ///
-/// `IocpSocket` deliberately does NOT use it: the kernel owns that op's `OVERLAPPED`,
-/// so its retirement retracts rather than completes, and sharing a body between the two
-/// shapes would hide exactly the difference #884 is about.
+/// `IocpSocket` deliberately does NOT use it, and the reason is no longer the one that
+/// used to stand here. That reason was *its retirement retracts rather than completes*,
+/// and #884 split it in two rather than refuting it. What that ticket made uniform is
+/// the SLOT: every transport that parks a read frees it before `CancelRead` returns,
+/// `IocpSocket` included, so no caller can meet an occupied slot. What it did NOT make
+/// uniform is the WAITER: a real `Read` on IOCP settles LATER rather than inline,
+/// because the kernel keeps writing into the retracted operation's `OVERLAPPED`, so the
+/// whole operation node is stood down and the next read gets a fresh one.
+///
+/// Both halves matter here, and collapsing them into *"retirement is synchronous now"*
+/// is the sentence this comment used to carry. Its `Impl` has the matching shape and not
+/// this one -- a `shared_ptr` read node, no `readBuffer`, no `UpdateInterest()` -- so
+/// there is no body to share even before the semantics differ.
 ///
 /// @tparam Impl The socket's `Impl`, which must expose `readOp` and `UpdateInterest()`.
 /// @param impl The socket's implementation block.
