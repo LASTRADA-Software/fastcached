@@ -480,11 +480,39 @@ TEST_CASE("A lookup some Task owns is left alone by the reactor", "[net][resolve
         FastCache::ThreadedAddressResolver resolver { inner };
 
         auto lookup = ResolveOwned(&resolver, &reactor, FrameSentinel { &counters }, &counters);
+
+        // HELD across the drain, and that is the whole repair (#1149).
+        //
+        // `Stop()` settles the jobs still QUEUED on the calling thread, which is
+        // ordered. A job a worker has already dequeued is settled on the WORKER
+        // thread, at an instant nothing here orders -- and `Settle` ends in
+        // `reactor->Submit(...)`. So the hand-back can land while this thread is
+        // still inside `Drain()`, which DEQUEUES AND RESUMES it. The submission is
+        // then gone, and the assertion below reads 0.
+        //
+        // It races INTO the drain rather than arriving after it, so no bound on
+        // this thread can order it: the worker is free to settle from the instant
+        // it dequeues, which is before `Drain()` is even entered. Lengthening a
+        // wait cannot un-consume a submission, and the sibling case above cannot
+        // show this because it never drains at all. Holding the resolver is what
+        // turns the race into an ordering.
+        inner.Hold();
         reactor.Submit(lookup.Native());
         reactor.Drain();
-        REQUIRE(counters.parked == 1);
+        inner.Release();
 
+        // NO assertion inside the held window, deliberately. A `REQUIRE` firing
+        // while the gate is held unwinds straight past `Release()`, and
+        // `ThreadedAddressResolver`'s destructor then joins a worker parked inside
+        // `Resolve` forever -- a suite timeout naming nothing, which this file's own
+        // `ScriptedResolver` comment says the project has already paid for once.
+        // Removing the window is better than guarding it.
         resolver.Stop();
+
+        // `parked` is incremented at the top of the coroutine body, BEFORE the
+        // `co_await`, so it reads 1 under either ordering and is evidence that the
+        // body ran rather than evidence about the hand-back.
+        REQUIRE(counters.parked == 1);
         REQUIRE(reactor.PendingSubmissions() == 1);
         CHECK(counters.destroyed == 0);
     }
