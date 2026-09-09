@@ -1744,6 +1744,54 @@ Two rules fall out of the same fixture:
   build `gate-clang-debug` before gating anything that ADDS a file: it is the only leg that
   tidies, and otherwise you learn it twice from a 25-minute gate.
 
+## A background helper runs the fixture's cleanup until you have watched it not
+
+Anything forked into the background in these scripts **inherits the shell's traps**, and
+in a fixture the EXIT trap *is* the run's cleanup. So a helper signalled with a catchable
+signal runs `rm -rf "$scratch"` on its way out — deleting the workdir of the run that is
+still using it. Nothing in the resulting failure names a trap, a timer or a cleanup:
+`node-ready-waits-for-marker` failed about a third of the time with
+
+```
+selftest FAILED: cannot arm a 15s deadline: '/tmp/tmp.XXXX' is not a directory
+```
+
+which is the *second* wait's arm refusing because the *first* wait's timer had already
+deleted the directory. The trap's own `FUNCNAME` stack identified the site, with a
+`BASHPID` that was not `$$`; no probe did.
+
+**`trap - EXIT TERM INT HUP` as the subshell's first statement is the fix everyone
+reaches for, and it is not sufficient.** It covers a subshell that has STARTED, and the
+window that actually fires is the one BEFORE that: the disarm follows the arm by
+microseconds on a wait that returns at once, so the helper is usually signalled before it
+runs a single command, and an inherited `trap 'exit 1' TERM` takes it straight to the
+inherited EXIT trap. Measured, interleaved and order-alternated so the arms share their
+load — a sequential before/after on a host that goes idle produces exactly the false
+"fixed" this investigation nearly shipped:
+
+<!-- table-total: none -->
+
+| arrangement | pass / fail |
+|---|---|
+| unfixed, load 47 | 9 / 3 |
+| `trap -` inside the subshell, load 47 | **10 / 2** |
+| unfixed, load 43 | 7 / 5 |
+| uncatchable signal (`kill -KILL`), load 43 | **12 / 0** |
+| uncatchable signal, load 36, N=25 | **25 / 0** |
+
+`trap -` alone is indistinguishable from no fix. So **both** guards belong in the code,
+each stating WHICH WINDOW it closes, or somebody deletes the one that looks redundant —
+they are `_e2e_deadline_arm`'s `trap -` and `_e2e_deadline_disarm`'s `kill -KILL`. The
+`trap -` is not useless; it is insufficient, and those are different claims.
+
+**Two standalone probes reproduced none of it**, the first because the subshell's output
+went to `/dev/null`, which is where its evidence went — a fake more permissive than the
+thing it stands for, twice, on one question. A real fixture found it in one run. And the
+inheritance is **version-dependent**: measured on bash 5.2.21, a background subshell does
+not run the parent's EXIT trap at all and the shape does not reproduce, so the platform
+that shows this is macOS's bash 3.2 — the one no development host here can measure. A
+green Linux run is not evidence about it.
+
 ## Open work
 
 - **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
