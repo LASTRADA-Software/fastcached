@@ -21,6 +21,7 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -36,13 +37,24 @@ using namespace FastCache;
 namespace
 {
 
-/// Accept exactly one connection on `listener` and return whether it succeeded.
+/// Accept exactly one connection on `listener` and hand the SOCKET back.
 /// A free function (not a capturing lambda) so it is a safe coroutine body.
+///
+/// **The socket rather than a `bool`, and that is the accept-but-silent case's whole
+/// subject.** A coroutine answering `r.has_value()` destroys `r` on its way out, which
+/// CLOSES the connection the instant it is accepted -- so the peer was accept-then-go,
+/// the probe returned on EOF rather than on its own recv timeout, and the case's bound
+/// was asserted against nothing. `CHECK_FALSE` and `elapsed < 10s` both hold under
+/// that, which is why it stayed invisible: an accept-but-silent peer and a peer that
+/// hung up were the same observation.
 /// @param listener The bound listener to accept on.
-[[nodiscard]] Task<bool> AcceptOne(IListener* listener)
+/// @return The accepted socket, or nullptr when the accept did not land.
+[[nodiscard]] Task<std::unique_ptr<ISocket>> AcceptOne(IListener* listener)
 {
     auto r = co_await listener->Accept();
-    co_return r.has_value();
+    if (!r.has_value())
+        co_return nullptr;
+    co_return std::move(*r);
 }
 
 /// A listener on a loopback port this run was GIVEN, plus the port it got.
@@ -202,6 +214,101 @@ class HeldUnlistenedPort
     std::uint16_t _port { 0 };
 };
 
+/// How long a rendezvous in this file may take, and how often it re-asks.
+///
+/// A BOUND rather than a duration to spend. The three cases below each slept a flat
+/// 100 ms to let a server thread reach its accept loop, and under load the sleep
+/// elapsed first: the probe then connected to a listener nobody was accepting on and
+/// the case reported the server unhealthy
+/// ([#1141](https://github.com/LASTRADA-Software/fastcached/issues/1141)). Raising the
+/// constant buys a slower suite and the same failure on a slower host, which is the
+/// response #354 exists to refuse -- the rendezvous wants to be a CONDITION.
+///
+/// The bound is generous because it is only ever paid when something is actually
+/// wrong; the ordinary cost is one poll interval.
+constexpr std::chrono::milliseconds RendezvousBound { 10'000 };
+
+/// How often a rendezvous re-asks its condition.
+constexpr std::chrono::milliseconds RendezvousPoll { 10 };
+
+/// What a bounded rendezvous observed, so a timeout can say what it measured.
+struct Rendezvous
+{
+    bool ready { false };                   ///< Whether the condition held before the bound.
+    std::chrono::milliseconds waited { 0 }; ///< Measured, never assumed from the poll count.
+};
+
+/// Wait until `ready()` answers true, or the bound expires.
+///
+/// The elapsed time is MEASURED off `steady_clock` rather than derived from the number
+/// of polls: `n * RendezvousPoll` is what the loop asked for, and a sleep costs what the
+/// host's timer granularity says. It is also deliberately not the wall clock -- WSL2
+/// steps `CLOCK_REALTIME` both ways, so a duration read from it is not a duration
+/// ([#1058](https://github.com/LASTRADA-Software/fastcached/issues/1058)).
+/// The bound is checked BETWEEN attempts, so the worst case is the bound plus one
+/// predicate call -- measured at **12035 ms** against a 10 s bound for the case whose
+/// predicate is an `HttpHealthProbe` against a silent peer, which spends its own ~3 s
+/// timeout before answering. That is why the elapsed is REPORTED rather than the bound:
+/// a reader who saw only "timed out after 10000 ms" would be reading a number nobody
+/// observed, which is the defect `wait_until` in `scripts/lib/e2e-common.sh` was fixed
+/// for. Interrupting a predicate mid-call is not worth the machinery here -- nothing in
+/// this file waits on anything whose own timeout is unbounded.
+/// @param ready The condition to wait for; called until it answers true.
+/// @return Whether it held, and how long this actually took.
+template <typename Predicate>
+[[nodiscard]] Rendezvous WaitUntilReady(Predicate ready)
+{
+    auto const start = std::chrono::steady_clock::now();
+    auto const deadline = start + RendezvousBound;
+    for (;;)
+    {
+        auto const held = ready();
+        auto const now = std::chrono::steady_clock::now();
+        auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        if (held)
+            return Rendezvous { .ready = true, .waited = waited };
+        if (now >= deadline)
+            return Rendezvous { .ready = false, .waited = waited };
+        std::this_thread::sleep_for(RendezvousPoll);
+    }
+}
+
+/// Whether a TCP connect to a loopback port SUCCEEDS, sending nothing.
+///
+/// The discrimination a timed-out rendezvous owes its reader, and it is the whole
+/// reason this is a raw connect rather than another `HttpHealthProbe`: a slow host and
+/// a wedged server want different people. The listener these cases bind is listening
+/// before any thread starts, so the kernel queues a connection in its backlog whether
+/// or not anything is accepting -- which means a connect that SUCCEEDS says the
+/// listener is alive and its accept loop never ran, and a connect that is REFUSED says
+/// the listener itself is gone. Neither is inferable from the probe's `false`.
+/// @param port The loopback port to reach for.
+/// @return True when the connect completed.
+[[nodiscard]] bool LoopbackConnectSucceeds(std::uint16_t port)
+{
+    Detail::EnsureNetworkInitialised();
+#if defined(_WIN32)
+    auto const opened = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (opened == INVALID_SOCKET)
+        return false;
+#else
+    int const opened = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (opened < 0)
+        return false;
+#endif
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    auto const connected = ::connect(opened, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) == 0;
+#if defined(_WIN32)
+    std::ignore = ::closesocket(opened);
+#else
+    std::ignore = ::close(opened);
+#endif
+    return connected;
+}
+
 } // namespace
 
 TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise", "[net][health]")
@@ -221,13 +328,39 @@ TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise"
     SteadyClock clock;
     AdminHttpServer server { *listener, metrics, [] { return MetricsSnapshot {}; }, logger, clock };
 
-    std::jthread serverThread { [&server] { FastCache::SyncRun(server.Run()); } };
+    std::atomic<bool> threadRan { false };
+    std::jthread serverThread { [&server, &threadRan] {
+        threadRan.store(true, std::memory_order_release);
+        FastCache::SyncRun(server.Run());
+    } };
 
-    // Give the accept loop a moment to park on Accept().
-    std::this_thread::sleep_for(std::chrono::milliseconds { 100 });
+    // The rendezvous IS the positive assertion, and that is deliberate: waiting until
+    // the server answers 200 and waiting until it is up are the same question, so
+    // spelling them separately would only add a second reading of one fact. What a
+    // duration could not do is fail INFORMATIVELY, which is the whole of #1141.
+    auto const live = WaitUntilReady([Port] { return HttpHealthProbe("127.0.0.1", Port, "/healthz"); });
+    if (!live.ready)
+    {
+        auto const reachable = LoopbackConnectSucceeds(Port);
+        // Stopped BEFORE the `FAIL`, and after the diagnosis has been taken: `FAIL`
+        // aborts the case by THROWING, so the `server.Shutdown()` at the end of this
+        // body is unwound past, and `~jthread` then joins an accept loop nothing has
+        // asked to stop -- `AdminHttpServer::Run` leaves only on the shutdown flag, and
+        // the lambda takes no stop token for `request_stop` to reach. The case would
+        // HANG on the one path this diagnosis exists to serve.
+        server.Shutdown();
+        FAIL("the admin server never answered /healthz, measured over "
+             << live.waited.count() << " ms. A TCP connect to its port "
+             << (reachable ? "SUCCEEDS, so the listener is bound and nothing accepted -- the server thread is "
+                             "wedged or was never scheduled"
+                           : "is REFUSED, so the listener itself is gone -- not a scheduling problem")
+             << ", and the server thread " << (threadRan.load(std::memory_order_acquire) ? "did" : "did NOT")
+             << " begin running.");
+    }
 
-    CHECK(HttpHealthProbe("127.0.0.1", Port, "/healthz"));
-    // A path that 404s is not "200", so the probe must report unhealthy.
+    // A path that 404s is not "200", so the probe must report unhealthy. This is the
+    // half that makes the case a discrimination rather than a liveness check: a probe
+    // that answered true for everything would pass the line above.
     CHECK_FALSE(HttpHealthProbe("127.0.0.1", Port, "/nope"));
 
     server.Shutdown();
@@ -261,10 +394,10 @@ TEST_CASE("HttpHealthProbe rejects a non-200 response whose body contains \" 200
     auto& listener = bound.listener;
     listener->SetTimeouts(std::chrono::milliseconds { 100 }, std::chrono::seconds { 5 });
 
-    auto const respond500 = [](IListener* l) -> Task<void> {
+    auto const respond500 = [](IListener* l) -> Task<bool> {
         auto accepted = co_await l->Accept();
         if (!accepted.has_value())
-            co_return;
+            co_return false;
         std::array<char, 256> req {};
         (void) co_await (*accepted)->Read(std::span<std::byte> { reinterpret_cast<std::byte*>(req.data()), req.size() });
         constexpr std::string_view Reply { "HTTP/1.1 500 Internal Server Error\r\n"
@@ -275,14 +408,37 @@ TEST_CASE("HttpHealthProbe rejects a non-200 response whose body contains \" 200
         (void) co_await (*accepted)->Write(
             std::span<std::byte const> { reinterpret_cast<std::byte const*>(Reply.data()), Reply.size() });
         (*accepted)->Close();
+        co_return true;
     };
-    std::jthread acceptor { [&listener, &respond500](std::stop_token const& stop) {
+    // `answered` is what stops this case passing vacuously. The assertion below is a
+    // `CHECK_FALSE`, and an unanswered probe is `false` too -- so with no acceptor at
+    // all, or an acceptor that never got scheduled, the case reported the rule holding
+    // over a peer that had said nothing (#1141, the same file's #354 shape).
+    std::atomic<bool> reachedAccept { false };
+    std::atomic<bool> answered { false };
+    std::jthread acceptor { [&listener, &respond500, &reachedAccept, &answered](std::stop_token const& stop) {
         while (!stop.stop_requested())
-            FastCache::SyncRun(respond500(listener.get()));
+        {
+            reachedAccept.store(true, std::memory_order_release);
+            if (FastCache::SyncRun(respond500(listener.get())))
+                answered.store(true, std::memory_order_release);
+        }
     } };
 
-    std::this_thread::sleep_for(std::chrono::milliseconds { 100 });
+    auto const parked = WaitUntilReady([&reachedAccept] { return reachedAccept.load(std::memory_order_acquire); });
+    INFO("waited " << parked.waited.count() << " ms for the responder thread to reach Accept()");
+    REQUIRE(parked.ready);
+
     CHECK_FALSE(HttpHealthProbe("127.0.0.1", Port, "/healthz"));
+
+    // It answered, so the `false` above is a REFUSAL of a 500 rather than the silence
+    // of a peer that was never there. What this still cannot separate is a 500 the
+    // probe read from a 500 written after the probe gave up; the responder writes
+    // immediately on accept, so the two are not distinguishable from outside without a
+    // status the probe does not return.
+    auto const served = WaitUntilReady([&answered] { return answered.load(std::memory_order_acquire); });
+    INFO("waited " << served.waited.count() << " ms for the responder to report writing its 500");
+    CHECK(served.ready);
 
     acceptor.request_stop();
     listener->Close();
@@ -301,21 +457,59 @@ TEST_CASE("HttpHealthProbe times out (not hangs) against an accept-but-silent pe
     auto& listener = bound.listener;
     listener->SetTimeouts(std::chrono::milliseconds { 100 }, std::chrono::seconds { 5 });
 
-    std::jthread acceptor { [&listener](std::stop_token const& stop) {
-        // Accept and then sit on the connection (never write) until asked to stop.
-        auto accepted = FastCache::SyncRun(AcceptOne(listener.get()));
-        static_cast<void>(accepted);
+    // Both flags earn their place. `reachedAccept` replaces a 100 ms sleep with the
+    // condition it was approximating, and `accepted` is what stops the case passing
+    // vacuously: the assertion is a `CHECK_FALSE`, so with NO acceptor at all the probe
+    // still answers false and the case still passed -- an accept-but-silent peer and no
+    // peer were the same observation (#1141).
+    std::atomic<bool> reachedAccept { false };
+    std::atomic<bool> accepted { false };
+    std::jthread acceptor { [&listener, &reachedAccept, &accepted](std::stop_token const& stop) {
+        // Accept and then SIT on the connection (never write, never close) until asked
+        // to stop. Holding `taken` is what makes the peer silent rather than gone --
+        // see `AcceptOne` for what dropping it costs.
+        //
+        // The accept RETRIES rather than being attempted once. `SetTimeouts` arms a
+        // 100 ms accept poll, so a single attempt hands the probe a 100 ms window to
+        // connect in and reports "never accepted" on any host that misses it -- a red
+        // for a slow machine, which is the response #354 exists to refuse. Each failed
+        // pass costs one poll interval, so the loop does not spin.
+        std::unique_ptr<ISocket> taken;
+        reachedAccept.store(true, std::memory_order_release);
         while (!stop.stop_requested())
+        {
+            if (taken == nullptr)
+            {
+                taken = FastCache::SyncRun(AcceptOne(listener.get()));
+                if (taken != nullptr)
+                    accepted.store(true, std::memory_order_release);
+                continue;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds { 50 });
+        }
     } };
 
-    std::this_thread::sleep_for(std::chrono::milliseconds { 100 });
+    auto const parked = WaitUntilReady([&reachedAccept] { return reachedAccept.load(std::memory_order_acquire); });
+    INFO("waited " << parked.waited.count() << " ms for the silent acceptor to reach Accept()");
+    REQUIRE(parked.ready);
 
     auto const start = std::chrono::steady_clock::now();
     CHECK_FALSE(HttpHealthProbe("127.0.0.1", Port, "/healthz"));
     auto const elapsed = std::chrono::steady_clock::now() - start;
     // It must return on the bounded probe timeout (~3s), not hang indefinitely.
     CHECK(elapsed < std::chrono::seconds { 10 });
+    // And the FLOOR is what discriminates; the ceiling above never could. A peer that
+    // accepted and hung up answers `false` in well under a millisecond and satisfies
+    // the ceiling -- measured on this tree at **0.5 ms**, against **3.0 s** once the
+    // acceptor holds the connection open. A `steady_clock` interval only ever GROWS on
+    // a slow host, so a floor cannot be flaked by one; it sits well under the probe's
+    // own ~3 s so that constant is not pinned from out here.
+    CHECK(elapsed >= std::chrono::seconds { 1 });
+
+    // And it timed out against a peer that had ACCEPTED it, which is the case's subject.
+    auto const took = WaitUntilReady([&accepted] { return accepted.load(std::memory_order_acquire); });
+    INFO("waited " << took.waited.count() << " ms for the acceptor to report taking the connection");
+    CHECK(took.ready);
 
     acceptor.request_stop();
     listener->Close();
