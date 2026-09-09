@@ -1469,7 +1469,7 @@ jobs:
       # modern libc++ has it. llvm is keg-only, so we point the compiler at its
       # explicit path and add its libc++ to the linker search + rpath.
       - name: "Install build tools"
-        run: brew install ninja llvm openssl@3
+        run: brew install ninja llvm openssl@3 bash
 
       # The clang-release preset pins CMAKE_C/CXX_COMPILER to bare clang/clang++
       # (= AppleClang on PATH); override on the command line, which takes
