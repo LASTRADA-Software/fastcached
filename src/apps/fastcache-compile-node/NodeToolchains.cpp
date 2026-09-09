@@ -363,6 +363,12 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
     }();
 
     std::vector<ToolchainEntry> entries;
+
+    // Candidates that were found and could not be spawned. See
+    // `DiscoveredToolchains::unaskable`: this cannot be recovered downstream, because
+    // what survives says nothing about what left.
+    std::size_t unaskable = 0;
+
     if (source == ToolchainSource::MachineSearched)
     {
         for (auto const& candidate: discovery->Discover())
@@ -374,6 +380,12 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
             // that fails everything sent to it.
             if (!CanSpawn(runner, candidate.compiler))
             {
+                // COUNTED as well as dropped, and #1060 is the whole of why. Dropping
+                // is right -- a compiler that cannot be run must not be registered --
+                // but until now dropping was all that survived, so a machine whose
+                // every compiler was mid-upgrade became indistinguishable from a
+                // machine that has none, and the node exited on both.
+                ++unaskable;
                 logger.Logf(
                     LogLevel::Warn, "ignoring {} found by {}: it cannot be executed", candidate.compiler, candidate.layout);
                 continue;
@@ -407,7 +419,7 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
             entries.push_back(*std::move(split));
         }
 
-    return DiscoveredToolchains { .entries = std::move(entries), .source = source };
+    return DiscoveredToolchains { .entries = std::move(entries), .source = source, .unaskable = unaskable };
 }
 
 SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
@@ -419,6 +431,18 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
                                    SurveyVoice voice)
 {
     auto const& entries = discovered.entries;
+
+    // **The departures, counted by KIND, because the survivors cannot answer the
+    // question** (#1060). An empty survey has two opposite causes -- every candidate
+    // was asked and refused, or no candidate could be asked at all -- and
+    // `toolchains.empty()` sees neither, since by then the reason each one left is
+    // gone. One is a configuration error that stays until somebody acts; the other
+    // may be over by the next heartbeat.
+    //
+    // Seeded from discovery, which has already dropped every candidate it could not
+    // spawn and is the only place that number exists.
+    std::size_t departedUnaskable = discovered.unaskable;
+    std::size_t departedDecided = 0;
 
     // Computed CONCURRENTLY, and the cost is why. A cold fingerprint is a full walk
     // of the include tree -- about two seconds over 288 MB on an ordinary Xcode
@@ -461,6 +485,18 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
         // to the same operator, and the two were already two spellings of one fact.
         if (!identity.Usable())
         {
+            // Which KIND of departure this was, taken from the defect rather than
+            // decided here. `UnrunProbe` is the probe that never ran, and its own
+            // documentation already argues this case one layer down -- "transient by
+            // nature, which is exactly why it must be reported rather than absorbed:
+            // the cheap remedy is to probe again, and nothing can choose that remedy
+            // if the failure is indistinguishable from success". Every other defect
+            // is an answer: the compiler ran and what came back does not identify it.
+            if (identity.defect == Cc::IdentityDefect::UnrunProbe)
+                ++departedUnaskable;
+            else
+                ++departedDecided;
+
             auto const& explanation = Cc::ExplainDefect(identity.defect);
             logger.Logf(LogLevel::Error, "refusing {}: {}. {}", entry.compiler, explanation.reason, explanation.remedy);
             continue;
@@ -520,6 +556,33 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
     // out, so a layout added to the table necessarily appears in it.
     if (toolchains.empty())
     {
+        // **Asked of the departures, never of the count** (#1060). Nothing survived,
+        // and the two machines that produces are opposites: one where at least one
+        // candidate RAN and was refused, which is a configuration error and stays one
+        // until an operator acts; and one where every candidate that left could not be
+        // ASKED, which may be over by the next heartbeat.
+        //
+        // The condition is deliberately "no decided departure AND at least one
+        // transient one" rather than "any transient departure". A machine with one
+        // unspawnable compiler and one that answered with a banner nothing can
+        // identify has a real defect an operator must fix, so it stays fatal -- the
+        // transient half does not excuse the decided half. And both counters at zero
+        // means nothing was ever a candidate, which is the ordinary "no compiler
+        // installed" case and is refused below exactly as before.
+        if (departedDecided == 0 && departedUnaskable != 0)
+        {
+            // It must NOT say "found no compiler on this machine": that sentence is
+            // false here -- compilers were found, and none could be run. A confident
+            // wrong signal is worse than a vague right one, and this one sends an
+            // operator to install something that is already installed.
+            logger.Logf(LogLevel::Warn,
+                        "no toolchain to serve YET: {} compiler(s) were found and none could be asked what they are, "
+                        "for the reason given above each. This is not a configuration error and this node is not "
+                        "exiting -- it will ask again on a later heartbeat and serves nothing until one answers",
+                        departedUnaskable);
+            return SurveyResult { .outcome = SurveyOutcome::NoneCouldBeAsked, .served = {} };
+        }
+
         switch (discovered.source)
         {
             case ToolchainSource::MachineSearched:

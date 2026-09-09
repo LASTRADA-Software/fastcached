@@ -110,6 +110,20 @@ struct DiscoveredToolchains
 {
     std::vector<ToolchainEntry> entries; ///< What to fingerprint, in table order.
     ToolchainSource source;              ///< How the set was chosen.
+
+    /// Candidates that were FOUND and could not be spawned, so nothing was learned
+    /// about them.
+    ///
+    /// Carried rather than recomputed, because it cannot be recomputed: the entries
+    /// that survive discovery say nothing about the ones that did not, and by the
+    /// time the survey asks whether it serves anything, why each candidate left is
+    /// gone. That is the collapse #1060 is about, and this is the half of it that
+    /// happens before `FingerprintToolchains` is even called.
+    ///
+    /// A COUNT and not a list: the only question asked of it is whether every
+    /// departure was transient, and each one has already been logged by name where
+    /// it happened.
+    std::size_t unaskable { 0 };
 };
 
 /// One toolchain this worker serves, once its identity is known.
@@ -296,9 +310,33 @@ enum class SurveyOutcome : std::uint8_t
 {
     /// The walk finished and this node serves what `served` holds.
     Served,
-    /// The walk finished and nothing survived it. A startup refusal; see
-    /// `FingerprintToolchains`.
+    /// The walk finished and nothing survived it, and at least one candidate was
+    /// ASKED and refused. A startup refusal; see `FingerprintToolchains`.
     NothingToServe,
+    /// The walk finished, nothing survived it, and every candidate that left did so
+    /// because it could not be ASKED at all.
+    ///
+    /// **Not a refusal, and the distinction is the whole of
+    /// [#1060](https://github.com/LASTRADA-Software/fastcached/issues/1060).** These
+    /// are opposite machines: one is misconfigured and stays misconfigured until an
+    /// operator acts, the other may be fine one beat later -- a compiler mid-upgrade,
+    /// a fork that failed under momentary memory pressure, a filesystem not mounted
+    /// yet. `toolchains.empty()` cannot tell them apart, because by the time it is
+    /// asked the reason each candidate left is gone.
+    ///
+    /// So it is the DEPARTURES that are counted, never the survivors, and the two
+    /// transient departures are the ones the tree already names: a candidate
+    /// `CanSpawn` refused, and one whose identity came back `Cc::IdentityDefect::
+    /// UnrunProbe`, whose own documentation says it is *"transient by nature, which
+    /// is exactly why it must be reported rather than absorbed"*. This is that
+    /// sentence one layer up.
+    ///
+    /// A caller keeps the node RUNNING on this and asks again -- which is what the
+    /// periodic re-survey in `main` already does when a machine loses its last
+    /// compiler while serving, for the reason written there: a routine upgrade must
+    /// not be able to remove a machine from the fleet permanently. Only the FIRST
+    /// survey lacked that, and only because it could not see the difference.
+    NoneCouldBeAsked,
     /// The node was asked to stop mid-walk. `served` is meaningless.
     Cancelled,
 };

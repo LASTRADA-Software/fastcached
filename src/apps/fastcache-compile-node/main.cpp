@@ -1274,6 +1274,26 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 surveyFoundNothing = true;
                 DaemonControls::Instance().RequestStop();
                 return;
+            case Node::SurveyOutcome::NoneCouldBeAsked:
+                // **Not fatal, and `surveyFoundNothing` stays false** (#1060). Every
+                // candidate that left did so because it could not be asked -- a
+                // compiler mid-upgrade, a fork that failed under momentary pressure --
+                // and this node is not misconfigured, so exiting `2` would tell a
+                // supervisor a configuration error it does not have and take a
+                // recoverable machine out of the fleet for good.
+                //
+                // Falls THROUGH to the heartbeat loop rather than returning, which is
+                // the whole remedy: `registrars` stays empty so nothing is announced,
+                // the compile port serves nothing, and the periodic sweep below
+                // surveys the machine again. That loop already treats a machine that
+                // loses its last compiler this way, for the reason written there --
+                // a routine upgrade must not be able to remove a machine from the
+                // fleet permanently. Only the FIRST survey lacked it, and only
+                // because it could not tell the two empty surveys apart.
+                //
+                // `FingerprintToolchains` has already said so at Warn, naming the
+                // count, so nothing is logged twice here.
+                break;
             case Node::SurveyOutcome::Cancelled:
                 // Already stopping, and `surveyFoundNothing` stays false: this node
                 // was not misconfigured, it was interrupted, and exiting non-zero
