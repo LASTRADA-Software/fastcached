@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -136,7 +137,7 @@ class AsyncQueue final
     /// Asserts that no consumer is parked. See the lifetime section.
     ~AsyncQueue()
     {
-        assert(!_waiter && "AsyncQueue destroyed with a consumer still parked on it");
+        assert(!_waiter.resume && "AsyncQueue destroyed with a consumer still parked on it");
     }
 
     /// Offer an item, from any thread.
@@ -148,7 +149,7 @@ class AsyncQueue final
     /// @return Whether it was accepted, and what it displaced.
     AsyncQueuePush Push(T value)
     {
-        std::coroutine_handle<> waiter {};
+        ParkedWork waiter {};
         AsyncQueuePush outcome {};
         {
             std::scoped_lock const guard { _mutex };
@@ -181,7 +182,7 @@ class AsyncQueue final
         // it, and `Submit` performs a syscall on the platform reactors. A
         // producer holding a lock of its own across that would serialise its own
         // hot path behind it.
-        if (waiter)
+        if (waiter.resume)
             _reactor.Submit(waiter);
         return outcome;
     }
@@ -194,14 +195,14 @@ class AsyncQueue final
     /// the reason an outbox is a queue rather than a poll.
     void Close() noexcept
     {
-        std::coroutine_handle<> waiter {};
+        ParkedWork waiter {};
         {
             std::scoped_lock const guard { _mutex };
             _closed.store(true, std::memory_order_release);
             _items.clear();
             waiter = std::exchange(_waiter, {});
         }
-        if (waiter)
+        if (waiter.resume)
             _reactor.Submit(waiter);
     }
 
@@ -227,7 +228,7 @@ class AsyncQueue final
     [[nodiscard]] bool HasWaiter() const noexcept
     {
         std::scoped_lock const guard { _mutex };
-        return static_cast<bool>(_waiter);
+        return static_cast<bool>(_waiter.resume);
     }
 
     /// @return Cumulative items displaced by overflow across this queue's life.
@@ -265,13 +266,14 @@ class AsyncQueue final
         /// woken it has already happened.
         /// @param handle The suspended consumer.
         /// @return true to stay suspended; false when an item arrived first.
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) noexcept
+        template <typename Promise>
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) noexcept
         {
             std::scoped_lock const guard { _queue->_mutex };
             if (!_queue->_items.empty() || _queue->_closed.load(std::memory_order_relaxed))
                 return false;
-            assert(!_queue->_waiter && "AsyncQueue supports one consumer; a second is a programmer error");
-            _queue->_waiter = handle;
+            assert(!_queue->_waiter.resume && "AsyncQueue supports one consumer; a second is a programmer error");
+            _queue->_waiter = Detail::ParkedWorkFor(handle);
             return true;
         }
 
@@ -312,7 +314,7 @@ class AsyncQueue final
     mutable std::mutex _mutex;
 
     std::deque<T> _items;
-    std::coroutine_handle<> _waiter {};
+    ParkedWork _waiter {};
 
     /// Stored under `_mutex` with release and read outside it with acquire, so a
     /// loop condition can ask without taking the lock. The pairing means a reader

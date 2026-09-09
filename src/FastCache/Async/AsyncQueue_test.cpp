@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <optional>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <tests/FrameSentinel.hpp>
 #include <tests/Unwrap.hpp>
 
 namespace
@@ -250,4 +252,113 @@ TEST_CASE("A producer on another thread reaches a consumer on the reactor", "[as
     reactor.Drain();
     CHECK(ended);
     CHECK_FALSE(queue.HasWaiter());
+}
+
+// ---------------------------------------------------------------------------
+// #1041: what the queue owes a chain it hands to the reactor and nobody dequeues.
+//
+// `Push` and `Close` both `Submit(waiter)` a BORROWED handle carrying no ownership,
+// so a reactor destroyed before the post is dequeued frees nothing. That is correct
+// for a consumer some `Task` owns and a leak for a detached one, and the two are
+// indistinguishable at the call site today because the handle is erased in
+// `await_suspend` before the queue ever sees it.
+//
+// Counted with a frame sentinel rather than left to LeakSanitizer, for the reason
+// `ParkedWork_test.cpp` gives: a leak only a sanitizer reports is a red once in N
+// runs and reads as a flake.
+namespace
+{
+
+using FastCache::Testing::FrameCounters;
+using FastCache::Testing::FrameSentinel;
+
+/// A chain owned by NOBODY, parked on an empty queue.
+FastCache::DetachedTask ConsumeDetached(Queue* queue, FrameSentinel sentinel, FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    auto item = co_await queue->Pop();
+    (void) item;
+    co_return;
+}
+
+/// The same shape, owned by the `Task` the caller holds. The control.
+FastCache::Task<void> ConsumeOwned(Queue* queue, FrameSentinel sentinel, FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    auto item = co_await queue->Pop();
+    (void) item;
+    co_return;
+}
+
+} // namespace
+
+TEST_CASE("A detached consumer submitted by Push and never dequeued is freed at teardown", "[async][queue][parkedwork]")
+{
+    FrameCounters counters;
+    {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        Queue queue { reactor, FastCache::AsyncQueueOptions {} };
+
+        ConsumeDetached(&queue, FrameSentinel { &counters }, &counters);
+        REQUIRE(counters.parked == 1);
+        REQUIRE(queue.HasWaiter());
+
+        // AsyncQueue.hpp `Push`: exchanges the waiter out and submits it.
+        auto const pushed = queue.Push(7);
+        REQUIRE(pushed.accepted);
+        REQUIRE_FALSE(queue.HasWaiter());
+        // The reactor is destroyed WITHOUT draining, so the post is never dequeued.
+    }
+    CHECK(counters.destroyed == 1);
+}
+
+TEST_CASE("A detached consumer submitted by Close and never dequeued is freed at teardown", "[async][queue][parkedwork]")
+{
+    FrameCounters counters;
+    {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        Queue queue { reactor, FastCache::AsyncQueueOptions {} };
+
+        ConsumeDetached(&queue, FrameSentinel { &counters }, &counters);
+        REQUIRE(counters.parked == 1);
+
+        // AsyncQueue.hpp `Close`: the other site, and the stop path rather than the
+        // hot one -- a queue closed while its consumer is parked is the ordinary way
+        // a peer sender ends.
+        queue.Close();
+        REQUIRE_FALSE(queue.HasWaiter());
+    }
+    CHECK(counters.destroyed == 1);
+}
+
+TEST_CASE("A consumer some Task owns is left alone by the reactor", "[async][queue][parkedwork]")
+{
+    // The control, and it is mandatory rather than decoration: freeing everything at
+    // teardown is as wrong as freeing nothing. This frame is owned by the `Task`
+    // below, so a reactor that freed what it merely borrows would double free here --
+    // and this case is what would catch it.
+    FrameCounters counters;
+    {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        Queue queue { reactor, FastCache::AsyncQueueOptions {} };
+
+        auto consumer = ConsumeOwned(&queue, FrameSentinel { &counters }, &counters);
+        reactor.Submit(consumer.Native());
+        reactor.Drain();
+        REQUIRE(counters.parked == 1);
+        REQUIRE(queue.HasWaiter());
+
+        auto const pushed = queue.Push(7);
+        REQUIRE(pushed.accepted);
+        // Reactor destroyed with the post undrained, exactly as above -- but this
+        // frame has an owner, so it must survive until `consumer` goes out of scope.
+        CHECK(counters.destroyed == 0);
+    }
+    // Freed exactly once, by the Task that owns it.
+    CHECK(counters.destroyed == 1);
 }

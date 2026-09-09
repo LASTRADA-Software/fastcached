@@ -36,7 +36,7 @@ struct ReadinessDialOp
 {
     Traits::Reactor* reactor { nullptr };
     Traits::Handler handler {};
-    std::coroutine_handle<> waiter {};
+    ParkedWork waiter {};
     std::expected<void, NetError> outcome {};
     bool settled { false };
 };
@@ -59,11 +59,21 @@ struct DialPark
         return op->settled;
     }
 
-    [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const noexcept
+    /// Templated on the promise for `ResumeOn`'s reason: `SettleDial` posts this
+    /// chain to a reactor that may be destroyed before it runs it, and only the
+    /// parking coroutine's own promise type knows whether anything else can free
+    /// it ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+    /// By the time `SettleDial` sees it the handle is erased, so this is the last
+    /// place the question can be asked.
+    /// @tparam Promise The suspending coroutine's promise type.
+    /// @param handle The suspended dial.
+    /// @return true to stay suspended; false when the dial settled first.
+    template <typename Promise>
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const noexcept
     {
         if (op->settled)
             return false;
-        op->waiter = handle;
+        op->waiter = ParkedWorkFor(handle);
         return true;
     }
 
@@ -106,7 +116,7 @@ void SettleDial(ReadinessDialOp<Traits>& op, std::expected<void, NetError> outco
     // that is not there.
     op.reactor->Detach(&op.handler);
 
-    if (auto waiter = std::exchange(op.waiter, {}); waiter)
+    if (auto waiter = std::exchange(op.waiter, ParkedWork {}); waiter.resume)
         op.reactor->Submit(waiter);
 }
 

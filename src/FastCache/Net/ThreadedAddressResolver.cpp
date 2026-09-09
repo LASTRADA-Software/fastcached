@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <atomic>
@@ -28,7 +29,7 @@ namespace
     {
         std::mutex mutex;
         ResolveResult result { std::vector<ResolvedEndpoint> {} };
-        std::coroutine_handle<> waiter {};
+        ParkedWork waiter {};
         bool done { false };
     };
 
@@ -40,15 +41,21 @@ namespace
     /// caller's continuation on a resolver thread.
     void Settle(ResolveSlot& slot, IReactor* reactor, ResolveResult result)
     {
-        std::coroutine_handle<> waiter {};
+        // A `Detail::Parked` rather than a bare `ParkedWork`, so the branch that
+        // hands nothing on FREES an unowned chain instead of dropping it. That is
+        // `ParkedWork`'s contract -- resumed or freed, never neither -- and the
+        // no-reactor arm is the only place here that can decline to hand it on.
+        // Nothing changes for a BORROWED handle: `abandon` is empty, so the guard
+        // destroys nothing and the caller's owner still frees it.
+        Detail::Parked waiter;
         {
             std::scoped_lock const guard { slot.mutex };
             slot.result = std::move(result);
             slot.done = true;
-            waiter = std::exchange(slot.waiter, {});
+            waiter = Detail::Parked { std::exchange(slot.waiter, ParkedWork {}) };
         }
-        if (waiter && reactor != nullptr)
-            reactor->Submit(waiter);
+        if (waiter.Handle() && reactor != nullptr)
+            reactor->Submit(waiter.Take());
     }
 
     /// Suspends until a slot is filled.
@@ -67,12 +74,23 @@ namespace
             return slot->done;
         }
 
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<> handle) const noexcept
+        /// Templated on the promise for `ResumeOn`'s reason: the hand-back below
+        /// posts this chain to a reactor that may be destroyed before it runs it,
+        /// and only the parking coroutine's own promise type knows whether
+        /// anything else can free it
+        /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
+        /// By the time `Settle` sees it the handle is erased, so this is the last
+        /// place the question is answerable at all.
+        /// @tparam Promise The suspending coroutine's promise type.
+        /// @param handle The suspended lookup.
+        /// @return true to stay suspended; false when the answer arrived first.
+        template <typename Promise>
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const noexcept
         {
             std::scoped_lock const guard { slot->mutex };
             if (slot->done)
                 return false;
-            slot->waiter = handle;
+            slot->waiter = Detail::ParkedWorkFor(handle);
             return true;
         }
 

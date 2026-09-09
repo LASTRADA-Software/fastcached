@@ -19,6 +19,7 @@
 #include <tuple>
 #include <vector>
 
+#include <tests/FrameSentinel.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
@@ -390,4 +391,103 @@ TEST_CASE("A lookup failure names what could not be resolved", "[net][resolve]")
     CHECK(FastCache::Testing::Unwrap(out).error().code == FastCache::NetErrorCode::AddressNotAvail);
     CHECK(FastCache::Testing::Unwrap(out).error().context.contains("nowhere.example.com"));
     CHECK(FastCache::Testing::Unwrap(out).error().context.contains("6674"));
+}
+
+// ---------------------------------------------------------------------------
+// #1041: what the hand-back owes a chain nobody dequeues.
+//
+// `Settle` hands the waiter over with `reactor->Submit(waiter)` -- a BORROWED
+// handle, erased in `SlotPark::await_suspend` long before the resolver sees it,
+// so a reactor destroyed before that post is dequeued frees nothing. Correct for
+// a lookup some `Task` owns, a leak for a detached one, and indistinguishable at
+// the call site today.
+//
+// `Stop()` is what makes this ORDERED rather than raced: it joins the workers AND
+// settles whatever is still queued rather than dropping it, so the hand-back has
+// provably happened by the time it returns -- by either route, through the one
+// `Settle`. `PendingSubmissions()` is the positive control, because a case whose
+// finding is that a frame was NOT freed has to show first that the site it is
+// about was reached at all.
+namespace
+{
+
+using FastCache::Testing::FrameCounters;
+using FastCache::Testing::FrameSentinel;
+
+/// A chain owned by NOBODY, parked on a lookup a worker thread will settle.
+FastCache::DetachedTask ResolveDetached(FastCache::IAsyncAddressResolver* resolver,
+                                        FastCache::IReactor* reactor,
+                                        FrameSentinel sentinel,
+                                        FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    auto result = co_await resolver->Resolve("cache.example.com", 6674, reactor);
+    (void) result;
+    counters->completed.fetch_add(1, std::memory_order_acq_rel);
+    co_return;
+}
+
+/// The same shape, owned by the `Task` the caller holds. The control.
+FastCache::Task<void> ResolveOwned(FastCache::IAsyncAddressResolver* resolver,
+                                   FastCache::IReactor* reactor,
+                                   FrameSentinel sentinel,
+                                   FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    auto result = co_await resolver->Resolve("cache.example.com", 6674, reactor);
+    (void) result;
+    counters->completed.fetch_add(1, std::memory_order_acq_rel);
+    co_return;
+}
+
+} // namespace
+
+TEST_CASE("A detached lookup handed back and never dequeued is freed at teardown", "[net][resolve][parkedwork]")
+{
+    FrameCounters counters;
+    {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        ScriptedResolver inner;
+        FastCache::ThreadedAddressResolver resolver { inner };
+
+        ResolveDetached(&resolver, &reactor, FrameSentinel { &counters }, &counters);
+        REQUIRE(counters.parked == 1);
+
+        // A name rather than a literal, or the fast path answers inline and no
+        // worker -- and so no hand-back -- ever happens.
+        resolver.Stop();
+
+        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(counters.completed == 0);
+        // The reactor is destroyed WITHOUT draining, so the post is never dequeued.
+    }
+    CHECK(counters.destroyed == 1);
+}
+
+TEST_CASE("A lookup some Task owns is left alone by the reactor", "[net][resolve][parkedwork]")
+{
+    // The control, and it is mandatory rather than decoration: freeing everything
+    // at teardown is as wrong as freeing nothing, and this is the case a reactor
+    // that freed what it merely borrows would double free in.
+    FrameCounters counters;
+    {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        ScriptedResolver inner;
+        FastCache::ThreadedAddressResolver resolver { inner };
+
+        auto lookup = ResolveOwned(&resolver, &reactor, FrameSentinel { &counters }, &counters);
+        reactor.Submit(lookup.Native());
+        reactor.Drain();
+        REQUIRE(counters.parked == 1);
+
+        resolver.Stop();
+        REQUIRE(reactor.PendingSubmissions() == 1);
+        CHECK(counters.destroyed == 0);
+    }
+    // Freed exactly once, by the Task that owns it.
+    CHECK(counters.destroyed == 1);
 }

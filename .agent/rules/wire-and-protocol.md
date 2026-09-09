@@ -1289,6 +1289,35 @@ Every rule below has already been a bug.
     requirement is new; it is written where the reactor is declared.
   - Epoll was MEASURED, end to end and under LSan. IOCP and kqueue share the shape and
     were code-read; the Windows leg builds and runs the same cases against `IocpReactor`.
+- **A derived interface that re-declares ONE overload HIDES every other overload of that
+  name from its base**, and here it hid the one that carries ownership. `IReactor`
+  re-declared `Submit(std::coroutine_handle<>)` and never re-declared
+  `IExecutor::Submit(ParkedWork)`, so through an `IReactor&` -- which is what every
+  parking site in this tree holds -- only the BORROWING overload existed. The seven
+  `Submit(handle)` sites of
+  [#1041](https://github.com/LASTRADA-Software/fastcached/issues/1041) did not neglect to
+  hand ownership over: **they could not**, and the call each of them wrote bound to the
+  overload that drops what it is given. `Schedule` declares both, which is precisely why
+  `SleepUntil` could hand ownership over and nothing that submits could -- one interface,
+  two verbs, opposite outcomes, and nothing at either call site says which you got.
+  - **Silent in both directions, and it is name lookup working rather than failing.**
+    Lookup stops at the first scope that has the name, so the derived declaration is
+    legal, every call still compiles, and the one selected is the wrong one. Adding an
+    overload to a BASE therefore reaches no caller holding the derived type, and nothing
+    warns -- which is why the hole survived #1025, the change that created the overload.
+  - **The detection is the compiler, once the overload is reachable.** Convert the call
+    sites to pass the owning type and build: every site that had been binding to the
+    hidden overload fails `no viable conversion`, and **the set of those errors IS the
+    reach of the defect**. That is a measurement rather than a census, so unlike a grep
+    it cannot be narrower than its author reads it -- the census that opened this ticket
+    said seven, and the compiler is what confirmed seven rather than agreeing with it.
+    Re-declare the overload (or `using Base::Name;`) and they compile again, which is the
+    ACCEPTING direction and the one a guard nobody has watched accept does not have.
+  - **Restoring the overload re-binds nothing that already compiled.** A caller passing a
+    `coroutine_handle<>` still selects the handle overload, so the repair cannot silently
+    change an existing call -- worth stating, because the fear that it might is exactly
+    what argues for leaving the hole open.
+
 - **A watchdog may not write to a socket a coroutine owns, and the reason is
   OWNERSHIP rather than interleaving.** `FrameServer::CloseOverdue` closes connections
   past their deadline, so a peer got a bare TCP close it cannot tell from a crash, a

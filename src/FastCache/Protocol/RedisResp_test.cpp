@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include <tests/FrameSentinel.hpp>
 #include <tests/SocketDecorator.hpp>
 
 namespace
@@ -3697,4 +3698,186 @@ TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immed
     // non-blocking XREAD rather than wedging.
     REQUIRE_FALSE(h.reply.empty());
     REQUIRE(h.reply.ends_with("*1\r\n$-1\r\n")); // EXEC: [ nil ]
+}
+
+// ---------------------------------------------------------------------------
+// #1041: this file holds TWO of the seven `Submit(handle)` sites, and they are
+// the two ways a RESP session is woken by something other than its own socket.
+//
+// `Subscriber::WakeLatch::WakeOnce` and the blocking read's latch both hand the
+// parked handle over with `reactor->Submit(toWake)` -- BORROWED, erased at the
+// await site, carrying no ownership -- so a reactor destroyed before that post is
+// dequeued frees nothing. Correct for a session some `Task` owns, a leak for a
+// detached one.
+//
+// Two cases rather than one, because they are two lines with two wake paths: a
+// publish and an append. `PendingSubmissions()` is the positive control in both --
+// a case whose finding is that a frame was NOT freed has to show first that the
+// site it is about was reached at all.
+//
+// **The reactor is declared LAST in every case below, so it is destroyed FIRST.**
+// That is the opposite of `BlockingHarness`'s order and it is deliberate: those
+// cases destroy the launcher `Task` before the harness, while here the REACTOR is
+// what frees the chain, and a chain freed after the socket and the registries it
+// points into would be reading freed memory the moment #1041 is fixed.
+namespace
+{
+
+using FastCache::Testing::FrameCounters;
+using FastCache::Testing::FrameSentinel;
+
+/// A session owned by NOBODY, parked on something only another connection wakes.
+FastCache::DetachedTask ServeDetached(FastCache::RedisRespHandler* handler,
+                                      FastCache::ISocket* socket,
+                                      FastCache::CacheEngine* engine,
+                                      FastCache::SessionContext session,
+                                      FrameSentinel sentinel,
+                                      FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    co_await handler->Run(socket, engine, /*primer*/ {}, session);
+    counters->completed.fetch_add(1, std::memory_order_acq_rel);
+    co_return;
+}
+
+/// The same shape, owned by the `Task` the caller holds. The control.
+FastCache::Task<void> ServeOwned(FastCache::RedisRespHandler* handler,
+                                 FastCache::ISocket* socket,
+                                 FastCache::CacheEngine* engine,
+                                 FastCache::SessionContext session,
+                                 FrameSentinel sentinel,
+                                 FrameCounters* counters)
+{
+    (void) sentinel;
+    counters->parked.fetch_add(1, std::memory_order_acq_rel);
+    co_await handler->Run(socket, engine, /*primer*/ {}, session);
+    counters->completed.fetch_add(1, std::memory_order_acq_rel);
+    co_return;
+}
+
+/// The XADD plus blocking XREAD that both stream arrangements below start from.
+constexpr std::string_view SeedThenBlock = "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n";
+
+} // namespace
+
+TEST_CASE("A detached subscriber woken by a publish and never dequeued is freed at teardown",
+          "[protocol][resp][pubsub][parkedwork]")
+{
+    FrameCounters counters;
+    {
+        FastCache::InMemoryLruStorage storage;
+        FastCache::ManualClock clock;
+        FastCache::CacheEngine engine { storage, clock };
+        FastCache::PubSubRegistry pubsub;
+        auto pair = FastCache::InMemorySocketPair::Create();
+        FastCache::RedisRespHandler handler;
+        // `InMemorySocket::WaitReadable` answers INLINE, so on the plain pair the
+        // subscriber's readable arm never parks and the push arm never has a handle
+        // to hand back -- the same blind spot that kept #710 invisible across twelve
+        // blocking cases.
+        FastCache::Testing::ParkingReadableSocket watched { *pair.server };
+        FastCache::TestReactor reactor { clock };
+
+        FastCache::SessionContext session;
+        session.pubsub = &pubsub;
+        session.reactor = &reactor;
+
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+
+        ServeDetached(&handler, &watched, &engine, session, FrameSentinel { &counters }, &counters);
+        REQUIRE(counters.parked == 1);
+        REQUIRE(watched.IsWatchParked());
+
+        // The wake path under test: Publish -> Deliver -> WakeOnce -> Submit.
+        REQUIRE(pubsub.Publish("ch", "hello") == 1);
+        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(counters.completed == 0);
+        // The reactor is destroyed WITHOUT draining, so the post is never dequeued.
+    }
+    CHECK(counters.destroyed == 1);
+}
+
+TEST_CASE("A detached blocking read woken by an append and never dequeued is freed at teardown",
+          "[protocol][resp][stream][parkedwork]")
+{
+    FrameCounters counters;
+    {
+        FastCache::InMemoryLruStorage storage;
+        FastCache::ManualClock clock;
+        FastCache::CacheEngine engine { storage, clock };
+        auto pair = FastCache::InMemorySocketPair::Create();
+        FastCache::StreamWaiterRegistry waiters;
+        FastCache::RedisRespHandler handler;
+        FastCache::TestReactor reactor { clock };
+
+        FastCache::SessionContext session;
+        session.streamWaiters = &waiters;
+        session.reactor = &reactor;
+
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
+
+        ServeDetached(&handler, pair.server.get(), &engine, session, FrameSentinel { &counters }, &counters);
+        REQUIRE(counters.parked == 1);
+
+        auto const added = engine.StreamAdd("s",
+                                            FastCache::StreamCodec::StreamId { .ms = 2, .seq = 0 },
+                                            false,
+                                            std::vector<std::pair<std::string, std::string>> { { "g", "w" } },
+                                            std::nullopt,
+                                            false);
+        REQUIRE(added.has_value());
+
+        // The second wake path: NotifyAppended -> WakeOnce -> Submit. A different
+        // line from the pub/sub one, which is why this is its own case.
+        waiters.NotifyAppended("s");
+        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(counters.completed == 0);
+    }
+    CHECK(counters.destroyed == 1);
+}
+
+TEST_CASE("A RESP session some Task owns is left alone by the reactor", "[protocol][resp][stream][parkedwork]")
+{
+    // The control, and it is mandatory rather than decoration: freeing everything
+    // at teardown is as wrong as freeing nothing, and this is the case a reactor
+    // that freed what it merely borrows would double free in.
+    FrameCounters counters;
+    {
+        FastCache::InMemoryLruStorage storage;
+        FastCache::ManualClock clock;
+        FastCache::CacheEngine engine { storage, clock };
+        auto pair = FastCache::InMemorySocketPair::Create();
+        FastCache::StreamWaiterRegistry waiters;
+        FastCache::RedisRespHandler handler;
+        FastCache::TestReactor reactor { clock };
+
+        FastCache::SessionContext session;
+        session.streamWaiters = &waiters;
+        session.reactor = &reactor;
+
+        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
+
+        auto served = ServeOwned(&handler, pair.server.get(), &engine, session, FrameSentinel { &counters }, &counters);
+        reactor.Submit(served.Native());
+        reactor.Run();
+        REQUIRE(counters.parked == 1);
+
+        auto const added = engine.StreamAdd("s",
+                                            FastCache::StreamCodec::StreamId { .ms = 2, .seq = 0 },
+                                            false,
+                                            std::vector<std::pair<std::string, std::string>> { { "g", "w" } },
+                                            std::nullopt,
+                                            false);
+        REQUIRE(added.has_value());
+        waiters.NotifyAppended("s");
+        REQUIRE(reactor.PendingSubmissions() == 1);
+        // Reactor destroyed with the post undrained, exactly as above -- but this
+        // frame has an owner, so it must survive until `served` goes out of scope.
+        CHECK(counters.destroyed == 0);
+    }
+    // Freed exactly once, by the Task that owns it.
+    CHECK(counters.destroyed == 1);
 }
