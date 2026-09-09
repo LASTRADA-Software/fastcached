@@ -504,6 +504,7 @@ is where they are explained one by one.
 | `fastcached_dispatch_worker_registrations_malformed_total` | A peer named its toolchain, endpoint or version in bytes that are not UTF-8 and was refused. |
 | `fastcached_dispatch_worker_endpoint_mismatch_total` | A worker was admitted while advertising an endpoint whose host is not the address it connected from. |
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. |
+| `fastcached_dispatch_workers_withdrawn_total` | A machine re-surveyed, found it no longer serves a toolchain, and retired that registration itself. |
 | `fastcached_dispatch_frames_refused_unsupported_version_total` | A peer built against another release of the wire. |
 | `fastcached_dispatch_frames_refused_unknown_opcode_total` | A frame naming a verb no build has. |
 | `fastcached_dispatch_frames_refused_not_permitted_total` | A verb that exists and is served on a different port. |

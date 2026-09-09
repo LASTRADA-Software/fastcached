@@ -1141,6 +1141,10 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
 
     auto registrars = registrarsFor(toolchains);
 
+    // Registrations this node has stopped serving and has not yet retired. Drained by
+    // the next `AnnounceOnce`; see `HeartbeatRound::withdrawals`.
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+
     // What this node will TRY to serve, which since #365 is the only honest number
     // available at the ready line: the served map is empty until the heartbeat
     // thread's first round finishes walking the include trees, and printing its size
@@ -1182,6 +1186,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
 
     Node::HeartbeatRound const round { .cfg = cfg,
                                        .registrars = registrars,
+                                       .withdrawals = withdrawals,
                                        .capacity = compileCapacity,
                                        .loadSampler = *loadSampler,
                                        .cacheTier = cacheTier.get(),
@@ -1268,7 +1273,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // never announces a fingerprint it is not yet ready to serve. One way
                 // into the serving state rather than two.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
-                registrars = registrarsFor(toolchains);
+                Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
                 break;
             case Node::SurveyOutcome::NothingToServe:
                 surveyFoundNothing = true;
@@ -1398,13 +1403,20 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // path this exists to close; the other order would leave that window
                 // open for a whole heartbeat.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
-                registrars = registrarsFor(toolchains);
+                Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
 
                 // A worker that ends up serving nothing keeps running and keeps
                 // saying nothing, rather than exiting: the compiler may come back
                 // with the next package, and a routine upgrade must not be able to
-                // remove a machine from the fleet permanently. Its entries expire
-                // from the registry on their own.
+                // remove a machine from the fleet permanently.
+                //
+                // Its entries used to reach the registry's timeout on their own, and
+                // since #573 the line above RETIRES them instead. That does not weaken
+                // the rule this paragraph is about: a withdrawal is no more permanent
+                // than an expiry, because the next survey that finds a compiler
+                // registers again. What it removes is the 90 seconds in between, during
+                // which the scheduler would go on picking a worker that has already
+                // stopped serving the fingerprint and would refuse every job it sent.
                 if (toolchains.empty())
                     logger.Logf(LogLevel::Warn,
                                 "this machine now has no usable toolchain; serving nothing until one returns");

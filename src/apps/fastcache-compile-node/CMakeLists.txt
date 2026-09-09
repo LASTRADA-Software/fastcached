@@ -98,6 +98,7 @@ if(FASTCACHED_BUILD_TESTS)
         DiscoveryTier.cpp
         DiscoveryTier_test.cpp
         ExchangeLog_test.cpp
+        NodeAnnounce_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
         SchedulerTier.cpp

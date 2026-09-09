@@ -304,6 +304,32 @@ class SchedulerService
                                            NodeLoad const& load,
                                            std::span<FleetBucket const> history = {});
 
+    /// Retire one registration at the worker's own request.
+    ///
+    /// `Register`'s missing counterpart. Without it a worker that re-surveyed and
+    /// dropped a toolchain could only stop heartbeating that entry and wait out
+    /// `WorkerRegistry::DefaultHeartbeatTimeout` -- and `ReapExpiredWorkers()` runs
+    /// BEFORE `Pick`, so an entry inside its window survives the reap and is handed
+    /// out, granting a lease to a worker certain to refuse it with
+    /// `UnknownFingerprint`
+    /// ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)).
+    ///
+    /// **Gated exactly as `Heartbeat` is, with no `GateScope` relaxation, and that is
+    /// a decision rather than an omission.** `Release` is exempted because it settles
+    /// an obligation in a per-node `LeaseTable` nobody else holds, so gating it on
+    /// leadership would pin a key on the one machine able to free it. A registry is
+    /// this scheduler's own SCHEDULING state, and a demoted node's registry is not the
+    /// one handing out leases -- so withdrawing there achieves nothing, and following
+    /// `NotLeader` to the node that is dispatching is the only thing that helps the
+    /// worker.
+    ///
+    /// @param caller Who is asking.
+    /// @param workerId The id handed back by `Register`; a capability only that worker
+    ///                 holds, which is why this verb names it rather than the
+    ///                 `(fingerprint, endpoint)` it stands for -- see `Op::Withdraw`.
+    /// @return `Ok`, including when the id is unknown, or a refusal from the gate.
+    [[nodiscard]] SchedulerReply Withdraw(CallerContext const& caller, std::string_view workerId);
+
     /// Pick a worker and authorize one job on it.
     ///
     /// The grant's token is a **credential**, not merely bookkeeping: it carries a

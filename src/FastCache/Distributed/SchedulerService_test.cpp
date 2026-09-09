@@ -223,6 +223,13 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
         CHECK(service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Heartbeat(Insider, "whoever", NodeLoad {}).error == Wire::ErrorCode::NotLeader);
         CHECK(service.Lease(Insider, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NotLeader);
+        // `Withdraw` is gated, and the section below is why that needed deciding
+        // rather than assuming: `Release` is exempt because it settles an obligation
+        // in a table only this node holds. A registry is this scheduler's SCHEDULING
+        // state, and a demoted node's registry is not the one handing out leases -- so
+        // withdrawing there achieves nothing, and following the redirect to the node
+        // that IS dispatching is the only thing that helps the worker (#573).
+        CHECK(service.Withdraw(Insider, "whoever").error == Wire::ErrorCode::NotLeader);
     }
 
     SECTION("and does not gate the one verb that settles rather than decides")
@@ -458,6 +465,160 @@ TEST_CASE("A worker that stops heartbeating leaves the fleet", "[distributed][sc
 
     CHECK(fleet.service.Workers().LiveWorkers().empty());
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
+}
+
+namespace
+{
+/// The id the registry assigned one of a machine's entries.
+/// @param fleet The service to ask.
+/// @param fingerprint Which of the machine's toolchains.
+/// @return The id, or empty when nothing serves that fingerprint.
+[[nodiscard]] std::string IdOf(Leading const& fleet, std::string_view fingerprint)
+{
+    for (auto const& worker: fleet.service.Workers().LiveWorkers())
+        if (worker.fingerprint == fingerprint)
+            return worker.id;
+    return {};
+}
+
+/// The id of the entry a lease was actually granted against.
+///
+/// Not `IdOf`: two entries can share a fingerprint, `Pick` chooses between them, and
+/// `LiveWorkers()` is sorted by id rather than by who was picked -- so asking by
+/// fingerprint names an arbitrary one of the pair and frees nothing about half the
+/// time. `inFlight` is what the registry itself moved when the lease was taken, so it
+/// names the holder rather than guessing at it. Found by the case below failing for
+/// exactly that reason, which is the fixture reporting its own defect rather than the
+/// subject's.
+/// @param fleet The service to ask.
+/// @return The id, or empty when nothing is running.
+[[nodiscard]] std::string IdHoldingWork(Leading const& fleet)
+{
+    for (auto const& worker: fleet.service.Workers().LiveWorkers())
+        if (worker.inFlight != 0)
+            return worker.id;
+    return {};
+}
+} // namespace
+
+TEST_CASE("A worker withdrawing one toolchain leaves its others registered", "[distributed][scheduler]")
+{
+    // #573. A node that re-surveys and drops a toolchain could only stop heartbeating
+    // that entry and wait out `DefaultHeartbeatTimeout`, and `ReapExpiredWorkers()`
+    // runs BEFORE `Pick` -- so for 90 s an entry inside its window survives the reap
+    // and is handed out, granting a lease to a worker certain to refuse it.
+    //
+    // **The sibling is the control and is the half that matters.** One machine serving
+    // two toolchains is two entries keyed `(fingerprint, endpoint)`, so a withdrawal
+    // that dropped the ENDPOINT would take the whole machine out of the fleet on a
+    // routine upgrade -- and would pass a case asserting only that the withdrawn
+    // fingerprint stopped being served.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Register(Insider, OneSlot("clang-20", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+    auto const dropped = IdOf(fleet, "gcc-14");
+    REQUIRE_FALSE(dropped.empty());
+
+    CHECK(fleet.service.Withdraw(Insider, dropped).status == Wire::Status::Ok);
+
+    // Both halves asked of the REGISTRY, which spends nothing. The first draft asked
+    // them with leases and the control moved under the neutering -- not because the
+    // endpoint had been dropped, but because the subject's lease was then granted and
+    // took the machine's only slot, so the sibling honestly had no capacity. A control
+    // that the subject's own side effect can starve is not a control, and it fails in
+    // the direction that looks like the finding it exists to rule out.
+    CHECK(IdOf(fleet, "gcc-14").empty());
+    CHECK_FALSE(IdOf(fleet, "clang-20").empty());
+
+    // And dispatch follows the registry, which is the consequence an operator sees.
+    // The sibling is asked FIRST and against an idle machine, for the reason above:
+    // asked afterwards, a build that wrongly granted the gcc-14 lease would have taken
+    // the slot and this would fail for capacity rather than for registration.
+    CHECK(fleet.service.Lease(Insider, Ask("clang-20", "key-2")).status == Wire::Status::Ok);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).error == Wire::ErrorCode::NoWorker);
+
+    // Its own counter, never summed with the expiry beside it: an expiry is a machine
+    // that stopped answering and a withdrawal is one that said so, and adding them
+    // makes every routine toolchain upgrade read as a heartbeat failure.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersWithdrawn) == 1);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersExpired) == 0);
+}
+
+TEST_CASE("Withdrawing frees the leases held against that registration", "[distributed][scheduler]")
+{
+    // *A worker being dropped is an event, or nothing releases what was held against
+    // it.* Reached deliberately here rather than by timeout, and owing the same
+    // follow-up.
+    //
+    // A SECOND worker for the same fingerprint is what makes this assert anything: it
+    // gives the freed key somewhere to go, so the reply distinguishes. With the
+    // release, the key is free and the surviving machine takes it; without it, the key
+    // is still in flight and the same request is refused `AlreadyInFlight` -- and a
+    // case with only one worker would read `NoWorker` either way.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100")).status == Wire::Status::Ok);
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
+
+    auto const holder = IdHoldingWork(fleet);
+    REQUIRE_FALSE(holder.empty());
+    CHECK(fleet.service.Withdraw(Insider, holder).status == Wire::Status::Ok);
+
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReclaimed) == 1);
+    CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
+}
+
+TEST_CASE("Withdrawing an id the scheduler does not know succeeds", "[distributed][scheduler]")
+{
+    // The deliberate divergence from `Heartbeat`, asserted as a PAIR because the
+    // contrast is the whole decision: that verb refuses `UnknownLease` in order to
+    // provoke re-registration, which is the opposite of what a withdrawal wants. The
+    // end state a withdrawal asks for is already true, so it is idempotent -- and a
+    // node that lost the race to its own expiry must not log a refusal for having
+    // succeeded.
+    Leading fleet;
+
+    CHECK(fleet.service.Withdraw(Insider, "worker-that-never-was").status == Wire::Status::Ok);
+    CHECK(fleet.service.Heartbeat(Insider, "worker-that-never-was", NodeLoad {}).error == Wire::ErrorCode::UnknownLease);
+
+    // Nothing was retired, so nothing is counted: the counter measures withdrawals
+    // that changed something, which is what makes it the #573 before/after figure
+    // rather than a tally of requests.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchWorkersWithdrawn) == 0);
+}
+
+TEST_CASE("A withdrawal closes the dispatch window the heartbeat timeout leaves open", "[distributed][scheduler]")
+{
+    // The before/after #573 asks for, as a number rather than an argument, and on a
+    // `ManualClock` rather than wall time -- which is the only kind of clock a verdict
+    // can rest on here.
+    SECTION("without one, dispatch continues until the timeout")
+    {
+        Leading fleet;
+        REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+        // The window. `ReapExpiredWorkers()` runs before `Pick`, so an entry one tick
+        // inside its timeout survives the reap and is still handed out -- a lease
+        // granted to a worker that has stopped serving this fingerprint.
+        fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout - 1s);
+        CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
+
+        fleet.clock.Advance(2s);
+        CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
+    }
+
+    SECTION("with one, it closes at once and the clock never moves")
+    {
+        Leading fleet;
+        REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+        auto const dropped = IdOf(fleet, "gcc-14");
+        REQUIRE_FALSE(dropped.empty());
+        REQUIRE(fleet.service.Withdraw(Insider, dropped).status == Wire::Status::Ok);
+
+        CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).error == Wire::ErrorCode::NoWorker);
+    }
 }
 
 TEST_CASE("Refusals an operator sizes a fleet from are counted; client defects are not", "[distributed][scheduler][metrics]")

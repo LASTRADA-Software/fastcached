@@ -399,8 +399,14 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
     std::vector<Cc::WorkerRegistrar> registrars;
     registrars.emplace_back(notice, "gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
 
+    // Empty here: this case is about which credential a round PRESENTS, and a
+    // withdrawal presents the same one through the same seam. Covered on its own in
+    // `NodeAnnounce_test.cpp` rather than folded in as a second subject.
+    std::vector<Cc::WorkerRegistrar> withdrawals;
+
     HeartbeatRound const round { .cfg = cfg,
                                  .registrars = registrars,
+                                 .withdrawals = withdrawals,
                                  .capacity = capacity,
                                  .loadSampler = loadSampler,
                                  .cacheTier = nullptr,

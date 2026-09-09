@@ -62,6 +62,15 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
                                    "fastcache-compile-node --serve-scheduler and point clients at it" },
+        // `DispatchNotPermitted` and never `UnknownOpcode`, even though this verb is
+        // newer than most clients: *unimplemented is not served elsewhere*. A worker
+        // told `UnknownOpcode` here would conclude this daemon is too OLD to know the
+        // verb, when the truth is that this endpoint is a cache and the scheduler is
+        // somewhere else -- and it would then step over a refusal it should follow.
+        Wire::RefusedVerb { .op = Wire::Op::Withdraw,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
+                                   "fastcache-compile-node --serve-scheduler and point clients at it" },
         Wire::RefusedVerb { .op = Wire::Op::Lease,
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache and no longer schedules; run the fleet's scheduler with "
@@ -819,6 +828,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // in sync for whatever the client pipelined behind it.
             case Wire::Op::Register:
             case Wire::Op::Heartbeat:
+            case Wire::Op::Withdraw:
             case Wire::Op::Lease:
             case Wire::Op::Compile:
             case Wire::Op::Release:

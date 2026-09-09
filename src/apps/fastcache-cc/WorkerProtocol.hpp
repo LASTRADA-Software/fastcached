@@ -339,6 +339,31 @@ class WorkerRegistrar
                                                                  CompileCacheWire::LoadFields const& load = {},
                                                                  Credential const& credential = {});
 
+    /// Retire this registration, because the node no longer serves its toolchain.
+    ///
+    /// `Register`'s counterpart, and the whole of
+    /// [#573](https://github.com/LASTRADA-Software/fastcached/issues/573) on this
+    /// side. Without it a node that re-surveyed could only stop heartbeating and let
+    /// the entry age out, during which the scheduler goes on picking it and granting
+    /// leases this worker will refuse.
+    ///
+    /// **Best-effort by contract.** Every refusal is survivable -- an old scheduler
+    /// answers `UnknownOpcode`, a demoted one `NotLeader`, an unreachable one
+    /// nothing -- and in every case the pre-existing heartbeat expiry closes the
+    /// window exactly as it did before. So a caller LOGS this and carries on; it must
+    /// never abort a round or a shutdown, which is the mistake #283 and #340 record
+    /// under a different verb.
+    ///
+    /// The id is not cleared on any path, unlike `Heartbeat`'s `UnknownLease` arm:
+    /// this registrar is being discarded by its owner either way, and clearing would
+    /// only lose the diagnostic.
+    /// @param scheduler Connected transport; not owned.
+    /// @param credential Credential to present.
+    /// @return Nothing when the scheduler accepted -- which includes it answering
+    ///         `Ok` for an id it does not know, since that is the same end state --
+    ///         otherwise the refusal, to be logged rather than acted on.
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(ISocket& scheduler, Credential const& credential = {});
+
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept
     {

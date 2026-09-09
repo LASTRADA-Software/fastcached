@@ -373,6 +373,25 @@ class WorkerRegistry
     ///         ordinary case.
     [[nodiscard]] std::vector<std::string> ExpireStale();
 
+    /// Drop one registration because the worker says it no longer serves it.
+    ///
+    /// The same event as `ExpireStale` reached deliberately instead of by timeout,
+    /// and the caller owes it the same follow-up: releasing what was held against
+    /// that id. The registry does not do that here either, for the reason stated
+    /// above -- the lease table is its sibling rather than its dependency.
+    ///
+    /// **Erases by id and touches no sibling entry.** A machine serving several
+    /// toolchains is several entries keyed `(fingerprint, endpoint)` with an id each,
+    /// so withdrawing one leaves the rest registered; anything that dropped the
+    /// endpoint would take a node's whole fleet presence away on a routine
+    /// re-survey ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)).
+    ///
+    /// @param workerId The id issued at registration.
+    /// @return Whether an entry was erased. False means the id is unknown -- already
+    ///         expired, or from a scheduler that has restarted -- which is the state
+    ///         the caller wanted and is not an error.
+    [[nodiscard]] bool Remove(std::string_view workerId);
+
     /// Every live worker, for `/metrics` and diagnostics.
     /// @return A snapshot; expired workers are excluded.
     [[nodiscard]] std::vector<WorkerInfo> LiveWorkers() const;

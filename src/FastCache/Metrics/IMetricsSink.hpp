@@ -130,6 +130,19 @@ class IMetricsSink
         /// registration count is a fleet whose heartbeats are not arriving rather
         /// than one that is growing.
         DispatchWorkersExpired,
+        /// Registrations a worker retired deliberately, by `Op::Withdraw`.
+        ///
+        /// Kept apart from `DispatchWorkersExpired` because the two say opposite
+        /// things about a fleet's health: an expiry is a machine that stopped
+        /// answering, which is an incident, while a withdrawal is a machine that
+        /// re-surveyed and said so, which is the system working. Summing them would
+        /// make every routine toolchain upgrade look like a heartbeat failure --
+        /// exactly the reading `DispatchWorkersExpired`'s own note exists to protect.
+        ///
+        /// It is also the before/after measurement for
+        /// [#573](https://github.com/LASTRADA-Software/fastcached/issues/573): a
+        /// withdrawal that lands is a 90-second dispatch window that did not happen.
+        DispatchWorkersWithdrawn,
         /// Leases freed because the worker holding them was dropped.
         ///
         /// Distinct from `DispatchLeasesReleased`, which is a client reporting its

@@ -259,6 +259,35 @@ enum class Op : std::uint8_t
     /// Numbered after the cluster verbs rather than beside `Lease`, because the
     /// byte is the contract and the ones already spoken cannot move.
     Release = 0x0C,
+
+    /// Worker tells the scheduler it has stopped serving one registration.
+    ///
+    /// The counterpart `Register` never had: a worker could announce a toolchain and
+    /// could not retract one, so a node that re-surveyed and dropped a fingerprint
+    /// simply stopped heartbeating that entry and let it age out at
+    /// `DefaultHeartbeatTimeout`. For those 90 seconds the scheduler went on picking
+    /// it -- `ReapExpiredWorkers` runs BEFORE `Pick`, so an entry inside its window
+    /// survives the reap and is handed out, and the client is granted a lease to a
+    /// worker certain to refuse it
+    /// ([#573](https://github.com/LASTRADA-Software/fastcached/issues/573)).
+    ///
+    /// **It names the `workerId` and nothing else, and that is a security decision
+    /// rather than a shape one.** A withdrawal naming `(fingerprint, endpoint)` would
+    /// be an unauthenticated eviction primitive: `SchedulerService::Gate` asks
+    /// membership, and membership deliberately admits every laptop and CI runner
+    /// through `--fleet-member`, so any admitted client could evict any worker from
+    /// the fleet. The id is a capability this scheduler minted at `Register` and only
+    /// that worker holds -- exactly the model `Heartbeat` already uses, which is the
+    /// argument for it: it introduces no new trust question rather than merely
+    /// resembling one.
+    ///
+    /// **Best-effort, and never load-bearing.** Every way of not delivering it --
+    /// an old scheduler answering `UnknownOpcode`, a redirect, an unreachable
+    /// scheduler -- leaves the pre-existing expiry to close the window exactly as
+    /// before. That is what keeps this a latency optimisation rather than a
+    /// correctness dependency, and it is why a worker must step over the refusal
+    /// rather than treat it as fatal (#283, #340).
+    Withdraw = 0x0D,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1027,6 +1056,21 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::Release,
                    .name = "release",
                    .fieldCount = 2, // leaseToken, key
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
+    // `Ok | Error` and no third status, which is what keeps `MinSupportedVersion`
+    // where it is. Step-over is a REQUEST-side property -- a request carries an op
+    // byte a server can refuse by name -- so an old scheduler meeting this answers
+    // `UnknownOpcode` and the worker carries on. `Status::Progress` had to move
+    // `MinSupportedVersion` for the mirror reason: a REPLY carries a status byte and
+    // no kind, so an old client cannot step over one it does not know. A distinct
+    // "withdrew nothing" status here would invert that and cost a version bump,
+    // which is why an unknown id answers `Ok` instead.
+    OpDescriptor { .code = Op::Withdraw,
+                   .name = "withdraw",
+                   .fieldCount = 1, // workerId
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -2965,6 +3009,35 @@ struct HeartbeatView
     if (!load.has_value())
         return std::nullopt;
     return HeartbeatView { .workerId = (*fields)[0], .inFlight = *inFlight, .load = *load };
+}
+
+/// Frame a WITHDRAW request.
+///
+/// One field, and the id rather than the entry it names: see `Op::Withdraw` for why
+/// that is a security decision and not a shape one.
+/// @param workerId The id the scheduler issued at registration.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeWithdraw(std::string_view workerId, WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::Withdraw, { AsBytes(workerId) });
+}
+
+/// A worker retiring one of its registrations.
+struct WithdrawView
+{
+    std::span<std::byte const> workerId;
+};
+
+/// Split a WITHDRAW payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<WithdrawView> DecodeWithdrawPayload(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::Withdraw));
+    if (!fields.has_value())
+        return std::nullopt;
+    return WithdrawView { .workerId = (*fields)[0] };
 }
 
 /// Frame a LEASE request.

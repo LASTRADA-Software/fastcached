@@ -83,6 +83,12 @@ inline constexpr std::array ExchangeLogTable {
                               "deliberately, since a reader who turns on Debug wants the traffic, not the "
                               "pulse. What an operator wants from a heartbeat is ABSENCE, which no line can "
                               "carry and the registry's liveness view can" },
+    VerbLogRow { .code = CompileCacheWire::Op::Withdraw,
+                 .level = LogLevel::Info,
+                 .rationale = "beside `Register` rather than beside `Heartbeat`, because it is the same event in "
+                              "the other direction and just as rare: a machine leaving a toolchain behind. An "
+                              "operator reading why the fleet stopped distributing one fingerprint wants this "
+                              "line, and there is at most one per re-survey rather than one per interval" },
     VerbLogRow { .code = CompileCacheWire::Op::Lease,
                  .level = LogLevel::Info,
                  .rationale = "the scheduling decision itself -- the verb whose silence prompted this table" },

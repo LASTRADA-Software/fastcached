@@ -77,6 +77,32 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // first is what lets the whole round move together.
     std::optional<std::string> leader;
 
+    // **Withdrawals first, and the ordering mirrors the adding direction's.** Adding
+    // runs the compile port before the registration -- `ReplaceToolchains` then
+    // `registrarsFor` -- so a worker never announces a fingerprint it is not yet ready
+    // to serve. Dropping wants the mirror, and gets it from the same two lines: the
+    // compile port has ALREADY stopped serving these fingerprints by the time a
+    // registrar reaches this list, so the scheduler is told last, when the claim is
+    // certainly true. That the ordering was deliberate in one direction and merely
+    // incidental in the other is how #573 came to exist at all.
+    //
+    // Cleared unconditionally afterwards: see `HeartbeatRound::withdrawals` for why a
+    // failure is not retried.
+    for (auto& retiring: round.withdrawals)
+    {
+        if (auto const retired = retiring.Withdraw(client, round.credential.Current()); !retired.has_value())
+            // Logged and not acted on. Every refusal here -- an `UnknownOpcode` from a
+            // scheduler too old to know the verb, a `NotLeader`, an unreachable host --
+            // leaves the pre-existing expiry closing the window exactly as before, so
+            // this must never redirect the round, abort it, or count against it.
+            round.logger.Logf(LogLevel::Info,
+                              "scheduler {} did not retire {}: {}; its registration will expire instead",
+                              endpoint,
+                              retiring.Fingerprint(),
+                              retired.error().reason);
+    }
+    round.withdrawals.clear();
+
     for (auto& registrar: round.registrars)
     {
         if (!registrar.WorkerId().empty())
