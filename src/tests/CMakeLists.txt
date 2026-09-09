@@ -4212,6 +4212,34 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
 # of guarded constructors reads identically to complete coverage (#492), so it is
 # deny-by-default with one stated exception, and it refuses when it finds no
 # `WallClockRef` anywhere -- two empty lists agree perfectly.
+#
+# **What it costs, so a slow run is diagnosed rather than guessed at.** The scan is
+# FORK-BOUND, not read-bound: three processes per file -- one `awk` to strip block
+# comments and two `grep`s -- each in a command substitution, over every `src/*.hpp`
+# and `src/*.cpp` that `git ls-files` reports. So its cost tracks the FILE COUNT and
+# the host's fork cost, and barely at all the size of what changed.
+#
+# Measured 2026-09-09, and the conditions are half the figure:
+#
+#   687 files, Git Bash on a 32-core Windows host, tree on a local NTFS disk
+#     ~56-60 s per run, about 87 ms per file
+#     run-to-run spread ~4 s on an idle box, two runs of one unchanged tree
+#     four concurrent copies: 59 s each, i.e. no measurable contention at 32 cores
+#
+# Against the 120 s budget below that is roughly 2x headroom HERE. It is NOT 2x on a
+# hosted two-core Windows runner, where this has been observed timing out having
+# printed its start line and read all 687 sources -- a slow walk rather than a wedge.
+# That side is unmeasured and is what
+# [#1143](https://github.com/LASTRADA-Software/fastcached/issues/1143) tracks; treat
+# this figure as the Linux/Git-Bash row of a table with a Windows row nobody has
+# filled in, never as "the scan takes a minute".
+#
+# Two consequences worth having before touching the number. Raising the budget makes
+# a slow host pass and says nothing about why it was slow, which is the response
+# #354 refuses. And adding a couple of files cannot explain a timeout: at 87 ms each
+# they are an order of magnitude below the run-to-run spread, so a branch that
+# reddens this is almost certainly meeting the budget rather than causing it -- check
+# the file-set delta against that spread before attributing it to a change.
 add_test(
     NAME "wall-clock-borrow"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" "${CMAKE_SOURCE_DIR}"
