@@ -30,7 +30,7 @@ class CacheEngine
 {
   public:
     /// Construct over an IStorage and IClock; both must outlive the engine.
-    /// An optional `IWallClock&` injects wall-time access for the
+    /// An optional `WallClockRef` injects wall-time access for the
     /// EXPIREAT/PEXPIREAT family and the memcached absolute-exptime
     /// translation. Production callers omit the third argument (defaults
     /// to `DefaultSystemWallClock()`); tests pass a ManualWallClock so
@@ -46,11 +46,12 @@ class CacheEngine
     /// reason.
     /// @param storage   Backing storage.
     /// @param clock     Monotonic clock for TTL/timeout semantics.
-    /// @param wallClock Wall clock for absolute-UNIX-time translations.
+    /// @param wallClock Wall clock for absolute-UNIX-time translations. Borrowed through
+    ///                  `WallClockRef`, so a temporary is refused rather than dangling.
     /// @param metrics   Where this layer's counters go; null to count nothing.
     CacheEngine(IStorage& storage,
                 IClock& clock,
-                IWallClock& wallClock = DefaultSystemWallClock(),
+                WallClockRef wallClock = DefaultSystemWallClock(),
                 IMetricsSink* metrics = nullptr) noexcept;
 
     // -- memcached-flavoured operations -------------------------------------
@@ -586,9 +587,16 @@ class CacheEngine
         return _clock;
     }
 
-    [[nodiscard]] IWallClock& WallClock() noexcept
+    /// The borrowed wall clock.
+    ///
+    /// `const&` rather than the mutable reference this returned before #1032. The member
+    /// was `IWallClock&` and nothing ever mutated through it -- `RedisResp.cpp` is the one
+    /// caller and it asks `Now()`, which is `const` -- so the mutability was reach nobody
+    /// used, and stating that is the decision rather than an oversight.
+    /// @return The clock this engine translates absolute timestamps against.
+    [[nodiscard]] IWallClock const& WallClock() const noexcept
     {
-        return _wallClock;
+        return _wallClock.Get();
     }
 
     /// Where this layer's counters go, or null when nothing is counting.
@@ -625,7 +633,7 @@ class CacheEngine
 
     IStorage& _storage;
     IClock& _clock;
-    IWallClock& _wallClock;
+    WallClockRef _wallClock;
     IMetricsSink* _metrics { nullptr };
 };
 

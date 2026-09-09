@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include <tests/FleetHistoryFakes.hpp>
@@ -101,6 +102,33 @@ AdminHttpServer::SnapshotProvider WorkerShapedSnapshot()
 /// @param busy Compiles running right now.
 /// @param slots Compiles this node advertises.
 /// @return A provider answering with exactly those.
+// `FleetSampler` is the FORWARDER, and this is the row the guard exists for.
+//
+// It stores no wall clock at all: it hands the reference to `_fleet`, `_node` and
+// `_received`, which do. So a deleted `FleetHistory(IWallClock const&&)` overload
+// would leave this call site free to pass a temporary -- measured, gcc and clang
+// alike -- because inside a forwarding constructor the parameter is a named lvalue.
+// That is #1028 exactly, and it is why the guard is a `WallClockRef` PARAMETER
+// carried by value rather than a deleted overload on whatever happens to store it.
+//
+// Both directions, or the refusal and "this type cannot be built at all" look the same.
+static_assert(std::is_constructible_v<FleetSampler,
+                                      std::nullopt_t,
+                                      AtomicMetricsSink&,
+                                      AdminHttpServer::SnapshotProvider,
+                                      SystemWallClock&,
+                                      HistoryPaths,
+                                      NullLogger&>,
+              "a named clock must still reach the sampler through the forwarder");
+static_assert(!std::is_constructible_v<FleetSampler,
+                                       std::nullopt_t,
+                                       AtomicMetricsSink&,
+                                       AdminHttpServer::SnapshotProvider,
+                                       SystemWallClock,
+                                       HistoryPaths,
+                                       NullLogger&>,
+              "a temporary must be refused AT the forwarder: this is the case #1028 shipped");
+
 [[nodiscard]] AdminHttpServer::SnapshotProvider NodeFacts(std::size_t busy = 0, std::size_t slots = 8)
 {
     return [busy, slots] {

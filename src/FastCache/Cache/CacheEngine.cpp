@@ -27,7 +27,7 @@ namespace
 
 } // namespace
 
-CacheEngine::CacheEngine(IStorage& storage, IClock& clock, IWallClock& wallClock, IMetricsSink* metrics) noexcept:
+CacheEngine::CacheEngine(IStorage& storage, IClock& clock, WallClockRef wallClock, IMetricsSink* metrics) noexcept:
     _storage { storage },
     _clock { clock },
     _wallClock { wallClock },

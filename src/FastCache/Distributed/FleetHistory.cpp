@@ -615,8 +615,8 @@ std::optional<FleetRange> FleetRangeFromKey(std::string_view key) noexcept
     return std::nullopt;
 }
 
-FleetHistory::FleetHistory(IWallClock const& wall):
-    _wall { &wall }
+FleetHistory::FleetHistory(WallClockRef wall):
+    _wall { wall }
 {
     // Sized from the table rather than from three named constants, so a ring added
     // there is allocated here without this constructor being edited.
@@ -626,7 +626,7 @@ FleetHistory::FleetHistory(IWallClock const& wall):
 
 std::int64_t FleetHistory::NowMillis() const noexcept
 {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(_wall->Now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(_wall.Now().time_since_epoch()).count();
 }
 
 void FleetHistory::Record(EnumTable<FleetMetric, std::uint64_t> const& values)
@@ -894,8 +894,8 @@ bool FleetHistory::Load(std::filesystem::path const& path)
     return true;
 }
 
-FleetNodeHistories::FleetNodeHistories(IWallClock const& wall):
-    _wall { &wall }
+FleetNodeHistories::FleetNodeHistories(WallClockRef wall):
+    _wall { wall }
 {
 }
 
@@ -913,7 +913,7 @@ std::size_t FleetNodeHistories::AcceptHistory(std::string_view endpoint, std::sp
         if (found == _nodes.end())
             found = _nodes
                         .emplace(std::string { endpoint },
-                                 Entry { .history = std::make_unique<FleetHistory>(*_wall), .highWater = -1 })
+                                 Entry { .history = std::make_unique<FleetHistory>(_wall), .highWater = -1 })
                         .first;
         entry = &found->second;
     }
@@ -1078,7 +1078,7 @@ bool FleetNodeHistories::Load(std::filesystem::path const& path)
             || !reader.Take(nestedSize, nested))
             return false;
 
-        auto history = std::make_unique<FleetHistory>(*_wall);
+        auto history = std::make_unique<FleetHistory>(_wall);
         if (!history->ReadBody(nested))
             return false;
         restored.emplace(std::string { endpoint },

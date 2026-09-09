@@ -229,7 +229,7 @@ class SchedulerService
     ///        means a node with no `--cluster-id`, which is the one-machine
     ///        deployment: a verifier that names none expects none.
     SchedulerService(IClock& clock,
-                     IWallClock const& wallClock,
+                     WallClockRef wallClock,
                      IMetricsSink& metrics,
                      ILogger& logger,
                      std::span<std::byte const> signingKey,
@@ -578,7 +578,7 @@ class SchedulerService
                                              std::string_view endpoint,
                                              std::string_view fingerprint);
 
-    IWallClock const& _wallClock;
+    WallClockRef _wallClock;
     IMetricsSink& _metrics;
     /// Where the endpoint-mismatch observation goes (#242).
     ///

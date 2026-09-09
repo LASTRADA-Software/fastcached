@@ -246,7 +246,7 @@ namespace
 } // namespace
 
 SchedulerService::SchedulerService(IClock& clock,
-                                   IWallClock const& wallClock,
+                                   WallClockRef wallClock,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
                                    std::span<std::byte const> signingKey,

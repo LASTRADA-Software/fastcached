@@ -127,11 +127,15 @@ namespace
 
 LeaseValidator SignedLeaseValidator(std::vector<std::byte> signingKey,
                                     std::string advertisedEndpoint,
-                                    IWallClock const& clock,
+                                    WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics)
 {
-    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), &clock, &lease, &metrics](
+    // `clock` by VALUE: a `WallClockRef` IS the borrow, so copying it into the closure
+    // carries the guard rather than re-binding a reference. This capture was `&clock`,
+    // and it is the retention a member scan cannot see -- the validator outlives this
+    // call and nothing anywhere declares a wall-clock member for it (#1032).
+    return [key = std::move(signingKey), endpoint = std::move(advertisedEndpoint), clock, &lease, &metrics](
                std::string_view token, std::string_view fingerprint) -> std::optional<Distributed::LeaseRefusal> {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers

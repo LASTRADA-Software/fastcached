@@ -4103,3 +4103,41 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# A retained wall clock is a `WallClockRef`, never a raw `IWallClock` pointer or
+# reference member (#1032). The TYPE is the guard -- `WallClockRef` refuses to be built
+# from an rvalue, and the `static_assert` pairs in `Core/WallClockRef_test.cpp` and
+# `AdminEndpoint_test.cpp` are what pin that, including the FORWARDER case a deleted
+# rvalue overload on the storing type would have passed.
+#
+# This scan covers the one thing the type cannot: a new class declaring a raw
+# `IWallClock const* _wall` and never reaching for `WallClockRef` at all. An opt-in set
+# of guarded constructors reads identically to complete coverage (#492), so it is
+# deny-by-default with one stated exception, and it refuses when it finds no
+# `WallClockRef` anywhere -- two empty lists agree perfectly.
+add_test(
+    NAME "wall-clock-borrow"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("wall-clock-borrow" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Eight cases -- four properties in BOTH file-set modes, because a synthetic tree is not
+# a git repository and a self-test that only ever built one would exercise the walk path
+# while CI exercises git. Each case asserts the mode it ran in.
+#
+# Both directions are shown red by neutering, and the first attempt failed that: the
+# comment case passed with comment handling REMOVED, because the match is anchored at the
+# start of a line and a `//` comment can never reach it. What the stripping is actually
+# for is a declaration quoted inside a `/* ... */`, which does sit at the start of its
+# own line. The fixture is that now, and removing the handling reddens exactly it.
+add_test(
+    NAME "wall-clock-borrow-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" --self-test
+)
+set_tests_properties("wall-clock-borrow-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 180
+)

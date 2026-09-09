@@ -242,7 +242,7 @@ class FleetHistory
     static constexpr std::chrono::seconds SampleInterval = FleetSampleInterval;
 
     /// @param wall Where a bucket's timestamp comes from; injected so a test can place one.
-    explicit FleetHistory(IWallClock const& wall);
+    explicit FleetHistory(WallClockRef wall);
 
     /// Record one reading, folding it into whichever bucket its instant belongs to.
     ///
@@ -371,7 +371,7 @@ class FleetHistory
 
     [[nodiscard]] std::int64_t NowMillis() const noexcept;
 
-    IWallClock const* _wall;
+    WallClockRef _wall;
     mutable std::mutex _mutex;
 
     /// One ring per `FleetRingTable` row, in enumerator order.
@@ -427,7 +427,7 @@ class FleetNodeHistories final: public IFleetHistorySink
 {
   public:
     /// @param wall Where a bucket's timestamp comes from; injected so a test can place one.
-    explicit FleetNodeHistories(IWallClock const& wall);
+    explicit FleetNodeHistories(WallClockRef wall);
 
     /// Take what a node handed over.
     ///
@@ -485,7 +485,7 @@ class FleetNodeHistories final: public IFleetHistorySink
     [[nodiscard]] bool Save(std::filesystem::path const& path) const;
 
   private:
-    IWallClock const* _wall;
+    WallClockRef _wall;
     mutable std::mutex _mutex;
 
     /// One entry per machine: its series, and how far it has reported.
