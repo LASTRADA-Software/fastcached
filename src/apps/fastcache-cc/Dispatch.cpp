@@ -40,6 +40,11 @@ namespace
     }
 
     /// Build a `DispatchResult` that carries only a reason.
+    ///
+    /// **Not for `DispatchStatus::Declined`** -- that one goes through `DeclinedBy`,
+    /// which derives its cause from the outcome that caused it. A decline built here
+    /// would carry the seed cause and report a fleet-shaped refusal as "not
+    /// dispatchable", which is a confident wrong answer rather than a gap (#618).
     [[nodiscard]] DispatchResult Refused(DispatchStatus status, std::string detail)
     {
         return DispatchResult { .status = status,
@@ -49,6 +54,33 @@ namespace
                                 .stderrText = {},
                                 .detail = std::move(detail),
                                 .workerEndpoint = {} };
+    }
+
+    /// Build a declined `DispatchResult`, classified by what the peer answered.
+    ///
+    /// Taking the OUTCOME rather than a cause is what makes the classification
+    /// impossible to forget: there is no argument here to pass a bare
+    /// `DeclineCause` to, and no call site with a line it could omit. That is the
+    /// same shape `SurfaceRefusal::Refuse` uses one layer down, and the reason is
+    /// this file's own: `Declined` was one sentence for every way a fleet says no,
+    /// and an operator reading a wall of them could not tell "my fleet has no
+    /// compiler for this" from "my fleet is busy" (#618).
+    ///
+    /// An outcome that carries no refusal CODE -- anything but `Rejected` -- is
+    /// `Unrecognised` rather than a guess. There is nothing to classify, and naming
+    /// the likeliest cause would be exactly the confident wrong signal this change
+    /// exists to remove.
+    ///
+    /// @param outcome What the peer answered.
+    /// @param detail The verbose sentence; variable text is welcome here, because it
+    ///        reaches the `Note` and never the tally.
+    /// @return The declined result, with its cause already decided.
+    [[nodiscard]] DispatchResult DeclinedBy(CacheOutcome const& outcome, std::string detail)
+    {
+        auto result = Refused(DispatchStatus::Declined, std::move(detail));
+        result.decline =
+            outcome.kind == CacheOutcomeKind::Rejected ? DeclineCauseFor(outcome.code) : DeclineCause::Unrecognised;
+        return result;
     }
 
     /// Encode the argument list as one length-prefixed field per argument.
@@ -165,8 +197,8 @@ namespace
             // fingerprint it does not have, an argument it will not accept. Distinct
             // from the compiler running and rejecting the code, which arrives as a
             // successful exchange carrying a non-zero exit code.
-            return Refused(DispatchStatus::Declined,
-                           std::format("{} refused the job: {}", job.endpoint, DescribeOutcome(compileOutcome)));
+            return DeclinedBy(compileOutcome,
+                              std::format("{} refused the job: {}", job.endpoint, DescribeOutcome(compileOutcome)));
 
         auto const result = Wire::DecodeCompileResult(compileOutcome.value);
         if (!result.has_value())
@@ -378,7 +410,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
         // NoWorker, NoCapacity, AlreadyInFlight, DispatchNotPermitted -- every one
         // of them ordinary, and every one answered by compiling locally. The
         // scheduler's own words travel so the caller can say which it was.
-        return Refused(DispatchStatus::Declined, DescribeOutcome(leaseOutcome));
+        return DeclinedBy(leaseOutcome, DescribeOutcome(leaseOutcome));
 
     auto const grant = Wire::DecodeLeaseGrant(leaseOutcome.value);
     if (!grant.has_value())

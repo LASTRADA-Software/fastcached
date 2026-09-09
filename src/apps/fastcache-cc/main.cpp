@@ -2188,7 +2188,7 @@ void RecordManifest(Config const& cfg,
                                       cfg.credential);
     // What the fleet's own answer means on the statistics axis, decided once and in
     // `Stats`, which is where it can be asserted -- `main.cpp` is in no test target.
-    auto const fleetAnswer = Cc::RecordingFor(outcome.status);
+    auto const fleetAnswer = Cc::RecordingFor(outcome.status, outcome.decline);
 
     if (outcome.status == Cc::DispatchStatus::Mismatched)
     {

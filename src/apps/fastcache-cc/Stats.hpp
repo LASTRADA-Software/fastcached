@@ -136,8 +136,12 @@ struct DispatchRecording
 /// for a fleet that was merely busy.
 ///
 /// @param status What `Dispatch` returned.
+/// @param cause Which kind of decline, when `status` is `Declined`; ignored
+///        otherwise. Required rather than defaulted, because a default would let a
+///        new call site record a decline whose cause nobody chose -- and the whole
+///        of #618 is that one sentence stood in for every way a fleet says no.
 /// @return The state to record and the reason to tally it under.
-[[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status) noexcept;
+[[nodiscard]] DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept;
 
 /// One recorded invocation.
 struct Record

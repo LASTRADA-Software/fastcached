@@ -235,9 +235,12 @@ namespace
 
     constexpr EnumTable<DispatchStatus, DispatchRecordingRow> DispatchRecordingTable { {
         DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Compiled, .outcome = DispatchOutcome::Dispatched },
-        DispatchRecordingRow { .reason = "the fleet declined this compile",
-                               .status = DispatchStatus::Declined,
-                               .outcome = DispatchOutcome::Declined },
+        // No reason of its own: a decline's reason comes from `DeclineReasonTable`
+        // below, keyed on the CAUSE. This row used to read "the fleet declined this
+        // compile" for every way a fleet can say no, so an operator saw one bucket
+        // covering "nothing serves your compiler", "the fleet is busy" and "a worker
+        // refused the job" -- three remedies that are not adjacent (#618).
+        DispatchRecordingRow { .reason = {}, .status = DispatchStatus::Declined, .outcome = DispatchOutcome::Declined },
         DispatchRecordingRow { .reason = "the fleet could not be reached",
                                .status = DispatchStatus::Unavailable,
                                .outcome = DispatchOutcome::Unreachable },
@@ -250,6 +253,43 @@ namespace
     } };
     static_assert(RowsInEnumeratorOrder(DispatchRecordingTable, &DispatchRecordingRow::status),
                   "DispatchRecordingTable must hold exactly one row per DispatchStatus, in enumerator order");
+
+    /// What an operator reads for one kind of decline, and what to do about it.
+    struct DeclineReasonRow
+    {
+        std::string_view reason; ///< The FIXED tally reason.
+        DeclineCause cause {};   ///< Which cause this row describes.
+    };
+
+    /// One row per `DeclineCause`, in enumerator order.
+    ///
+    /// Every reason is a FIXED string under `RecordFallback`'s rule, and here that is
+    /// structural rather than remembered: the text is chosen by the CAUSE, so there
+    /// is nowhere for an endpoint or an elapsed-seconds count to enter. The peer's
+    /// own words -- which carry both, and which `DescribeOutcome` appends verbatim --
+    /// stay on the verbose `Note` where they already correctly live.
+    ///
+    /// Each sentence names what an operator would DO, because that is the axis the
+    /// rows are cut on. Two causes an operator answers identically would be one row;
+    /// what may never share one is `NoToolchain`, `NoCapacity` and `Withdrawn`, which
+    /// this repository's metrics rules already refuse to sum -- a misconfigured
+    /// fleet, a fleet that is too small, and a fleet that is unavailable.
+    constexpr EnumTable<DeclineCause, DeclineReasonRow> DeclineReasonTable { {
+        DeclineReasonRow { .reason = "no worker serves this toolchain", .cause = DeclineCause::NoToolchain },
+        DeclineReasonRow { .reason = "the fleet was full of its own work", .cause = DeclineCause::NoCapacity },
+        DeclineReasonRow { .reason = "matching workers had withdrawn their slots", .cause = DeclineCause::Withdrawn },
+        DeclineReasonRow { .reason = "another client was already building this key",
+                           .cause = DeclineCause::AlreadyBuilding },
+        DeclineReasonRow { .reason = "the fleet refused this client", .cause = DeclineCause::NotPermitted },
+        DeclineReasonRow { .reason = "the worker refused the job", .cause = DeclineCause::WorkerRefused },
+        DeclineReasonRow { .reason = "the fleet named no leader to ask", .cause = DeclineCause::NoLeader },
+        DeclineReasonRow { .reason = "this launcher and the fleet disagree about the wire",
+                           .cause = DeclineCause::ProtocolMismatch },
+        DeclineReasonRow { .reason = "the fleet refused with a reason this launcher does not know",
+                           .cause = DeclineCause::Unrecognised },
+    } };
+    static_assert(RowsInEnumeratorOrder(DeclineReasonTable, &DeclineReasonRow::cause),
+                  "DeclineReasonTable must hold exactly one row per DeclineCause, in enumerator order");
 
     /// Widest label the distribution section can print.
     ///
@@ -702,7 +742,7 @@ std::string_view ToStringView(Outcome outcome) noexcept
     return "UNAVAILABLE";
 }
 
-DispatchRecording RecordingFor(DispatchStatus status) noexcept
+DispatchRecording RecordingFor(DispatchStatus status, DeclineCause cause) noexcept
 {
     // `Last` is an ordinary enumerator as far as the language is concerned, so a
     // caller can name it and every in-range promise here is prose. Answering
@@ -713,7 +753,17 @@ DispatchRecording RecordingFor(DispatchStatus status) noexcept
     if (static_cast<std::size_t>(status) >= EnumeratorCount<DispatchStatus>)
         return DispatchRecording { .reason = {}, .outcome = DispatchOutcome::Unknown };
     auto const& row = DispatchRecordingTable[static_cast<std::size_t>(status)];
-    return DispatchRecording { .reason = row.reason, .outcome = row.outcome };
+    if (status != DispatchStatus::Declined)
+        return DispatchRecording { .reason = row.reason, .outcome = row.outcome };
+
+    // A decline's reason is chosen by its CAUSE. Asked the same question the status
+    // arm above answers, and for the same reason: an unnameable cause says nothing
+    // this build can report on rather than indexing past the table.
+    if (static_cast<std::size_t>(cause) >= EnumeratorCount<DeclineCause>)
+        return DispatchRecording { .reason = DeclineReasonTable[static_cast<std::size_t>(DeclineCause::Unrecognised)].reason,
+                                   .outcome = row.outcome };
+    return DispatchRecording { .reason = DeclineReasonTable[static_cast<std::size_t>(cause)].reason,
+                               .outcome = row.outcome };
 }
 
 std::string_view ToStringView(DispatchOutcome outcome) noexcept

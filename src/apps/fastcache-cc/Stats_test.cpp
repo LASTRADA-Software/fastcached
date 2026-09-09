@@ -9,15 +9,22 @@
 
 #include "Stats.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
@@ -160,19 +167,92 @@ TEST_CASE("RecordingFor names what an operator reads for each dispatch status")
     // while an operator is sent to look at the network for a fleet that was merely
     // busy. Only a test tells those apart -- which is why the table had to leave
     // `main.cpp`, a file in no test target.
-    CHECK(RecordingFor(DispatchStatus::Compiled).outcome == DispatchOutcome::Dispatched);
-    CHECK(RecordingFor(DispatchStatus::Compiled).reason.empty());
+    // The cause is ignored for every status but `Declined`, so these name one and it
+    // must not show through.
+    constexpr auto Any = DeclineCause::NoToolchain;
 
-    CHECK(RecordingFor(DispatchStatus::Declined).outcome == DispatchOutcome::Declined);
-    CHECK(RecordingFor(DispatchStatus::Declined).reason == "the fleet declined this compile");
+    CHECK(RecordingFor(DispatchStatus::Compiled, Any).outcome == DispatchOutcome::Dispatched);
+    CHECK(RecordingFor(DispatchStatus::Compiled, Any).reason.empty());
 
-    CHECK(RecordingFor(DispatchStatus::Unavailable).outcome == DispatchOutcome::Unreachable);
-    CHECK(RecordingFor(DispatchStatus::Unavailable).reason == "the fleet could not be reached");
+    CHECK(RecordingFor(DispatchStatus::Declined, Any).outcome == DispatchOutcome::Declined);
+
+    CHECK(RecordingFor(DispatchStatus::Unavailable, Any).outcome == DispatchOutcome::Unreachable);
+    CHECK(RecordingFor(DispatchStatus::Unavailable, Any).reason == "the fleet could not be reached");
 
     // A state and no reason: the cache axis already carries #280's sentence, and one
     // report must not print it under two headings.
-    CHECK(RecordingFor(DispatchStatus::Mismatched).outcome == DispatchOutcome::Mismatched);
-    CHECK(RecordingFor(DispatchStatus::Mismatched).reason.empty());
+    CHECK(RecordingFor(DispatchStatus::Mismatched, Any).outcome == DispatchOutcome::Mismatched);
+    CHECK(RecordingFor(DispatchStatus::Mismatched, Any).reason.empty());
+}
+
+TEST_CASE("Every kind of decline is tallied under a reason of its own")
+{
+    // The acceptance #618 turns on, and the ARRANGEMENT is the case. Every one of
+    // these is `DispatchStatus::Declined` with `DispatchOutcome::Declined`, so a
+    // section per cause asserting either of those passes on the build this ticket is
+    // about -- the one where all of them read "the fleet declined this compile".
+    // What distinguishes them is the tally reason, so every reason is collected and
+    // compared against every other rather than checked one at a time.
+    //
+    // They are the tally KEY (`Stats.cpp`'s `dispatchReasons` map), so two causes
+    // sharing a string would silently merge into one row in `--show-stats` -- which
+    // is the defect, one layer along, and is invisible to any assertion that only
+    // looks at one cause.
+    std::vector<std::string_view> reasons;
+    for (auto const idx: std::views::iota(std::size_t { 0 }, FastCache::EnumeratorCount<DeclineCause>))
+    {
+        auto const cause = static_cast<DeclineCause>(idx);
+        auto const recording = RecordingFor(DispatchStatus::Declined, cause);
+
+        // Every cause stays a decline: the second field says WHICH, never whether.
+        CHECK(recording.outcome == DispatchOutcome::Declined);
+        // And every one has words. An empty reason is a cause that prints no line
+        // under "why distribution did not help", which is the silence the ticket is.
+        CHECK_FALSE(recording.reason.empty());
+        reasons.push_back(recording.reason);
+    }
+
+    REQUIRE(reasons.size() == FastCache::EnumeratorCount<DeclineCause>);
+
+    // The discrimination itself. Each assertion above holds for a build that answers
+    // one sentence for all of them; only this one rejects it.
+    auto distinct = reasons;
+    std::ranges::sort(distinct);
+    auto const duplicates = std::ranges::unique(distinct);
+    distinct.erase(duplicates.begin(), duplicates.end());
+    CHECK(distinct.size() == reasons.size());
+
+    // And the three the ticket names arrive differently from each other, spelled out
+    // rather than left to the set comparison -- these are the three remedies an
+    // operator actually chooses between, and a future edit that merged any pair
+    // would still satisfy a count.
+    auto const noWorker = RecordingFor(DispatchStatus::Declined, DeclineCause::NoToolchain).reason;
+    auto const noCapacity = RecordingFor(DispatchStatus::Declined, DeclineCause::NoCapacity).reason;
+    auto const refused = RecordingFor(DispatchStatus::Declined, DeclineCause::WorkerRefused).reason;
+    CHECK(noWorker != noCapacity);
+    CHECK(noCapacity != refused);
+    CHECK(noWorker != refused);
+
+    // Duplicate suppression is not a fault and must not read as one: it is the
+    // system working, and tallied beside "no machine serves your compiler" it looks
+    // like a fleet in trouble.
+    CHECK(RecordingFor(DispatchStatus::Declined, DeclineCause::AlreadyBuilding).reason != noWorker);
+}
+
+TEST_CASE("A refusal code this launcher does not know is not reported as one it does")
+{
+    // `Unrecognised` is reachable only from a peer NEWER than this launcher, because
+    // `DeclineCausesAreTotal` requires a row for every code this build's own wire
+    // header knows. So the guard is that an unknown byte does not land on a real
+    // cause -- reported as, say, `NoCapacity`, it would send an operator to buy
+    // machines because a newer fleet said something this build cannot read.
+    constexpr auto FromTheFuture = static_cast<FastCache::CompileCacheWire::ErrorCode>(0xFE);
+    CHECK(DeclineCauseFor(FromTheFuture) == DeclineCause::Unrecognised);
+
+    // And a code it DOES know is classified, or the guard above would pass on a
+    // build that answered `Unrecognised` for everything.
+    CHECK(DeclineCauseFor(FastCache::CompileCacheWire::ErrorCode::NoWorker) == DeclineCause::NoToolchain);
+    CHECK(DeclineCauseFor(FastCache::CompileCacheWire::ErrorCode::NoCapacity) == DeclineCause::NoCapacity);
 }
 
 TEST_CASE("ToStringView names every dispatch token")
@@ -301,8 +381,16 @@ TEST_CASE("Naming the enumerator count does not read past either table")
     // -- an unnameable state is the same situation as a token from a later build,
     // reached from the other side -- and the token round-trips to it.
     CHECK(ToStringView(DispatchOutcome::Last) == "UNKNOWN");
-    CHECK(RecordingFor(DispatchStatus::Last).outcome == DispatchOutcome::Unknown);
-    CHECK(RecordingFor(DispatchStatus::Last).reason.empty());
+    CHECK(RecordingFor(DispatchStatus::Last, DeclineCause::NoToolchain).outcome == DispatchOutcome::Unknown);
+    CHECK(RecordingFor(DispatchStatus::Last, DeclineCause::NoToolchain).reason.empty());
+
+    // The same promise on the CAUSE, which is a second unnameable value reached the
+    // same way. It stays a decline -- the status is nameable and says so -- and its
+    // reason is the one that claims least, rather than whichever row `Last` would
+    // have indexed past the table into.
+    auto const unnameable = RecordingFor(DispatchStatus::Declined, DeclineCause::Last);
+    CHECK(unnameable.outcome == DispatchOutcome::Declined);
+    CHECK(unnameable.reason == RecordingFor(DispatchStatus::Declined, DeclineCause::Unrecognised).reason);
 }
 
 TEST_CASE("A dispatch reason is never ranked beside a cache reason")
@@ -315,7 +403,7 @@ TEST_CASE("A dispatch reason is never ranked beside a cache reason")
     auto record = MakeRecord(Outcome::Unavailable, "main", "a.cpp", 5);
     record.detail = "connect failed";
     record.dispatch = DispatchOutcome::Declined;
-    record.dispatchDetail = "the fleet declined this compile";
+    record.dispatchDetail = "no worker serves this toolchain";
     AppendRecord(record);
 
     auto const report = FormatReport("");
@@ -324,7 +412,7 @@ TEST_CASE("A dispatch reason is never ranked beside a cache reason")
     REQUIRE(cacheHeading != std::string::npos);
     REQUIRE(fleetHeading != std::string::npos);
     CHECK(report.find("connect failed") < fleetHeading);
-    CHECK(report.find("the fleet declined this compile") > fleetHeading);
+    CHECK(report.find("no worker serves this toolchain") > fleetHeading);
 }
 
 TEST_CASE("A crossed reply is ranked once, not once per axis")
@@ -397,11 +485,11 @@ TEST_CASE("A discarded result is still counted as having asked the fleet")
 TEST_CASE("FormatHtmlReport carries the distribution panel only when there is a fleet")
 {
     ScopedStateDir const scoped;
-    AppendDispatchRecords(1, DispatchOutcome::Declined, "the fleet declined this compile");
+    AppendDispatchRecords(1, DispatchOutcome::Declined, "no worker serves this toolchain");
     auto const withFleet = FormatHtmlReport("");
     CHECK(withFleet.contains(">distribution<"));
     CHECK(withFleet.contains("asked of the fleet"));
-    CHECK(withFleet.contains("the fleet declined this compile"));
+    CHECK(withFleet.contains("no worker serves this toolchain"));
 
     REQUIRE(ResetLog());
     AppendDispatchRecords(1, DispatchOutcome::NotConfigured);
