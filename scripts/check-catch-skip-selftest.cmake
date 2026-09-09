@@ -219,6 +219,58 @@ else()
     endforeach()
 endif()
 
+# 9. A comment ending in a backslash must not SWALLOW the registration below it (#1053).
+#
+# The reader used to split lines with a CMake list, and no list can carry a line ending
+# in a backslash: `one\\;two` expands to ONE element, because a `;` preceded by any
+# backslash is read as escaped. The merged element begins with the EARLIER line, so this
+# `#` comment swallows the registration under it, `^[ \t]*#` skips the lot, and the
+# violation is reported NOWHERE. A false GREEN, which is the direction nobody investigates.
+#
+# A Windows path is how a backslash reaches the end of a line in a CMakeLists without
+# anybody thinking about CMake syntax, which is the point.
+#
+# Asserting the LINE, not merely that the check objected: against the old reader this
+# one-file tree objects anyway, via the matched-nothing guard -- `No catch_discover_tests
+# registration was found anywhere`. In a real tree other files supply registrations, so
+# that guard stays quiet and the swallowed violation is simply never reported. An
+# assertion on `objected` alone would therefore pass under the bug for the wrong reason.
+fastcached_make_tree("swallowed-registration" "src/thing/CMakeLists.txt"
+    "# the toolchain lives under C:\\\ncatch_discover_tests(thing-tests)\n" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "swallowed-registration: a bare registration under a comment ending in a backslash was not reported at all -- the two lines merged and the `#` test skipped both, which is a false GREEN")
+else()
+    string(FIND "${output}" "CMakeLists.txt:2:" position)
+    if(position EQUAL -1)
+        list(APPEND failures "swallowed-registration: the check objected, but not about the registration on line 2 -- so this case is observing some other refusal and would pass with the reader broken")
+    endif()
+endif()
+
+# 10. And a backslash EARLIER in the file must not move where a violation is reported.
+#
+# Distinct from case 9 rather than a variation of it: there the registration vanishes,
+# here it is found and MISFILED. The assertion is the exact `file:line`, because under
+# the bug the file is still named -- one line early -- so asserting on the filename
+# passes under the defect and certifies nothing.
+#
+# The DOUBLING half of the same fault is not asserted here, and that is deliberate:
+# this check reports `file:line` and a numeric code and never echoes line text, so a
+# doubled backslash has no observable consequence in its output. Inventing an
+# assertion for it would be a fixture testing the fixture. It is pinned where it IS
+# observable, in `check-succeed-not-skip-selftest.cmake`, which echoes the message.
+fastcached_make_tree("shifted-line-number" "src/thing/CMakeLists.txt"
+    "# the toolchain lives under C:\\\nadd_executable(thing-tests a.cpp)\n\ncatch_discover_tests(thing-tests)\n" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "shifted-line-number: the bare registration on line 4 was not reported at all")
+else()
+    string(FIND "${output}" "CMakeLists.txt:4:" position)
+    if(position EQUAL -1)
+        list(APPEND failures "shifted-line-number: the violation is on line 4 and was reported elsewhere -- a line ending in a backslash merged with the next and shifted every line number below it")
+    endif()
+endif()
+
 if(failures)
     list(LENGTH failures failureCount)
     message("")
@@ -233,4 +285,4 @@ if(failures)
     message(FATAL_ERROR "catch skip selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "catch skip selftest: 8 synthetic tree(s), every verdict as expected")
+message(STATUS "catch skip selftest: 10 synthetic tree(s), every verdict as expected")

@@ -91,19 +91,46 @@ set(catchSkipCode 4)
 # either, because 4 is not 0. The count is the only thing that moves.
 #
 # Brackets are REPLACED rather than escaped because nothing here matches on them, and a
-# space preserves every column and every line number. Escaping is kept for `;` and `\`
-# because this check reports `file:line` and its lines must survive verbatim -- that
-# difference is not incidental, and #495 records why this idiom exists in two
-# incompatible families that must not be merged into one.
-function(fastcached_read_lines path outVar)
+# space preserves every column and every line number.
+#
+# Escaping `;` and `\` used to be kept here on the grounds that this check reports
+# `file:line` and its lines must survive verbatim. They did not survive verbatim, and a
+# line ending in a backslash did not survive at all: no CMake list can carry one.
+# Measured on CMake 3.28.3, `one\\;two` -- an ESCAPED backslash followed by a separator --
+# expands to ONE element, because a `;` preceded by any backslash is read as escaped
+# whether or not that backslash was itself escaped. The merged element begins with the
+# EARLIER line, so a `#` comment swallowed the real line below it and every `file:line`
+# after it drifted, which is a false GREEN.
+#
+# So the lines are WALKED and no list is built. Live exposure was ZERO when this was
+# repaired -- no file in this check's corpus of 12 CMakeLists ends a line with a
+# backslash -- which makes it a latent hazard closed rather than an observed failure
+# fixed. The hazard is one file away: `dist-compile-e2e.sh` has 152 such lines.
+#
+# #495 records why this idiom exists in two copies; consolidating them is that ticket
+# and not this one.
+macro(fastcached_take_line contentVar lineVar doneVar)
+    string(FIND "${${contentVar}}" "\n" _ftl_newline)
+    if(_ftl_newline EQUAL -1)
+        set(${lineVar} "${${contentVar}}")
+        set(${contentVar} "")
+        set(${doneVar} TRUE)
+    else()
+        string(SUBSTRING "${${contentVar}}" 0 ${_ftl_newline} ${lineVar})
+        math(EXPR _ftl_after "${_ftl_newline} + 1")
+        string(SUBSTRING "${${contentVar}}" ${_ftl_after} -1 ${contentVar})
+        set(${doneVar} FALSE)
+    endif()
+    string(REGEX REPLACE "\r$" "" ${lineVar} "${${lineVar}}")
+endmacro()
+
+# The file, read once, ready to be walked a line at a time.
+function(fastcached_read_content path outVar)
     file(READ "${path}" content)
-    string(REPLACE "\\" "\\\\" content "${content}")
-    string(REPLACE ";" "\\;" content "${content}")
     string(REPLACE "[" " " content "${content}")
     string(REPLACE "]" " " content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
-    string(REPLACE "\n" ";" lines "${content}")
-    set(${outVar} "${lines}" PARENT_SCOPE)
+    set(${outVar} "${content}" PARENT_SCOPE)
 endfunction()
 
 # Which CMakeLists this REPOSITORY owns, asked of git rather than inferred from
@@ -190,10 +217,12 @@ set(registrations "")
 set(violations "")
 
 foreach(relative IN LISTS listFiles)
-    fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${relative}" lines)
+    fastcached_read_content("${FASTCACHED_SOURCE_DIR}/${relative}" rest)
 
     set(lineNumber 0)
-    foreach(line IN LISTS lines)
+    set(atEnd FALSE)
+    while(NOT atEnd)
+        fastcached_take_line(rest line atEnd)
         math(EXPR lineNumber "${lineNumber} + 1")
 
         # Prose, not a call. This file's own header names the function it checks.
@@ -210,15 +239,21 @@ foreach(relative IN LISTS listFiles)
         # the call is read to its closing parenthesis rather than one line being
         # tested. A registration split across lines is legal CMake and must not read
         # as a violation.
-        set(callText "${line}")
+        #
+        # Walked from THIS line onward: `rest` already holds everything after it, so
+        # prepending the current line gives the same sequence the old list index did,
+        # without indexing and without a second copy of the parenthesis counting.
+        set(callText "")
         set(depth 0)
-        set(scanNumber 0)
-        foreach(inner IN LISTS lines)
-            math(EXPR scanNumber "${scanNumber} + 1")
-            if(scanNumber LESS lineNumber)
-                continue()
-            endif()
-            if(NOT scanNumber EQUAL lineNumber)
+        set(onFirst TRUE)
+        set(scanContent "${line}\n${rest}")
+        set(scanDone FALSE)
+        while(NOT scanDone)
+            fastcached_take_line(scanContent inner scanDone)
+            if(onFirst)
+                set(callText "${inner}")
+                set(onFirst FALSE)
+            else()
                 set(callText "${callText} ${inner}")
             endif()
             string(REGEX MATCHALL "\\(" opens "${inner}")
@@ -229,7 +264,7 @@ foreach(relative IN LISTS listFiles)
             if(depth LESS_EQUAL 0)
                 break()
             endif()
-        endforeach()
+        endwhile()
 
         if(NOT callText MATCHES "SKIP_RETURN_CODE[ \t]+([0-9]+)")
             list(APPEND violations "${relative}:${lineNumber}: sets no SKIP_RETURN_CODE, so every Catch2 skip scores as a FAILURE")
@@ -237,7 +272,7 @@ foreach(relative IN LISTS listFiles)
             list(APPEND violations
                  "${relative}:${lineNumber}: SKIP_RETURN_CODE ${CMAKE_MATCH_1}, but Catch2 exits ${catchSkipCode} on SKIP -- the property is present and does nothing")
         endif()
-    endforeach()
+    endwhile()
 endforeach()
 
 # A scan that found NO registration is not a clean tree -- this project has several

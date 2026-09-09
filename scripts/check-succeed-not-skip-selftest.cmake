@@ -361,6 +361,49 @@ else()
     endforeach()
 endif()
 
+# 14. A line ending in a backslash must not swallow the line below it (#1053).
+#
+# The reader used to escape `\` and `;` and split on newlines, and no CMake list can
+# carry a line ending in a backslash: `one\;two` expands to ONE element, because a `;`
+# preceded by any backslash is read as escaped. The `#define` continuation below would
+# merge with the line under it, shifting every line number after it by one.
+#
+# The assertion is the exact `file:line`, NOT the filename: under the bug this file is
+# still reported, one line early, so a filename assertion passes under the defect and
+# certifies nothing. The violation sits BELOW the backslash for the same reason.
+set(mergeSite "#define TWO_LINES(x) \\\n    do { (void) (x)${SEMI} } while (false)\n\nTEST_CASE(\"ran\")\n{\n    SUCCEED(\"no loopback available, skipping\")${SEMI}\n}\n")
+fastcached_make_tree("trailing-backslash" "src/thing/Thing_test.cpp" "${mergeSite}" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "trailing-backslash: the check missed a SUCCEED that sits below a line ending in a backslash -- the merged element begins with the earlier line, so the violation is hidden entirely")
+else()
+    fastcached_expect_text("${output}" "Thing_test.cpp:6:"
+        "trailing-backslash: the violation is on line 6 and was reported elsewhere -- a line ending in a backslash merged with the next and shifted every line number below it")
+endif()
+
+# 15. A backslash INSIDE a line must be reported as one backslash, not two (#1053).
+#
+# The old reader escaped backslashes to survive list splitting and never unescaped
+# them, so every quoted message carrying one was echoed doubled. A separate fault from
+# the merge above and asserted separately: one fix must not be assumed to cover both.
+set(doubledSite "TEST_CASE(\"ran\")\n{\n    SUCCEED(\"no path C:\\dev available, skipping\")${SEMI}\n}\n")
+fastcached_make_tree("interior-backslash" "src/thing/Thing_test.cpp" "${doubledSite}" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "interior-backslash: the check did not object to a SUCCEED whose message says it is skipping")
+else()
+    # NOT through `fastcached_expect_text`: it is a MACRO, so its argument is
+    # substituted textually and re-parsed, and a backslash in the needle is then read
+    # as an escape -- CMake refuses the selftest with `Invalid character escape`. A
+    # quoted variable reference inside `string(FIND)` is expanded without that second
+    # parse, which is the only spelling that can assert on a backslash at all.
+    set(singleBackslash "C:\\dev")
+    string(FIND "${output}" "${singleBackslash}" backslashPosition)
+    if(backslashPosition EQUAL -1)
+        list(APPEND failures "interior-backslash: the message was echoed with a doubled backslash -- the reader escaped it for the split and never put it back")
+    endif()
+endif()
+
 if(failures)
     list(LENGTH failures failureCount)
     message("")
@@ -375,4 +418,4 @@ if(failures)
     message(FATAL_ERROR "succeed-not-skip selftest: ${failureCount} verdict(s) wrong")
 endif()
 
-message(STATUS "succeed-not-skip selftest: 13 synthetic tree(s), every verdict as expected")
+message(STATUS "succeed-not-skip selftest: 15 synthetic tree(s), every verdict as expected")
