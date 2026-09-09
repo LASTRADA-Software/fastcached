@@ -2240,6 +2240,35 @@ jobs:
               || { echo "::error::$path not marked %config"; exit 1; }
           done
 
+      # The other direction. The two steps above assert that a config file the
+      # package SHIPS is preserved across an upgrade; this one asserts that a
+      # config file it USED to ship is taken off disk. Deleting the asset row
+      # does not do that -- a package manager will not silently delete something
+      # it has classified as an operator's to edit -- so the conffiles list
+      # carries a `remove-on-upgrade` entry per retired path (#291, #383).
+      #
+      # A real upgrade of the real packages, in throwaway roots: a synthesised
+      # predecessor ships each retired path as an ordinary conffile/%config, and
+      # the built package is installed over it. `dpkg --unpack` suffices because
+      # dpkg retires the conffile during unpack, before any maintainer script
+      # runs, which is what lets this skip dependency resolution and scriptlets
+      # and stay clear of the live-install steps below.
+      #
+      # BOTH package managers and BOTH operator states. rpm needs no retirement
+      # mechanism of its own -- it already removes a dropped %config(noreplace)
+      # file and keeps an edited one as .rpmsave -- and that is a claim about
+      # somebody else's tool that this repository relies on and does not control,
+      # so it is checked rather than trusted. Pristine and edited are different
+      # code paths in both tools, and the pristine arm asserts there is NO
+      # preserved sibling, or it is quietly the edited arm over again.
+      - name: "Retired config files are removed on upgrade"
+        working-directory: out/build/gcc-release
+        run: |
+          set -euo pipefail
+          check="$GITHUB_WORKSPACE/scripts/check-obsolete-conffiles.sh"
+          bash "$check" --deb "$(ls fastcached_*.deb)"  "$GITHUB_WORKSPACE"
+          bash "$check" --rpm "$(ls fastcached-*.rpm)" "$GITHUB_WORKSPACE"
+
       # Install for real and drive traffic through it. The GitHub runner has a
       # live systemd, so this exercises the actual unit — the service account,
       # the hardening, journald capture and the SIGHUP path all included.
