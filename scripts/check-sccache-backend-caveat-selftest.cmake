@@ -79,6 +79,60 @@ set(FastCachedSelftestBudgetSeconds 180)
 # relationship being refused rather than the value.
 set(FastCachedSelftestCrampedBudgetSeconds 15)
 
+# The narration threshold and budget the QUIET case runs with, and the reason they
+# are its own pair rather than the shared ones above (#1142).
+#
+# The quiet case asserts that the check narrates NOTHING. Narration starts once a run
+# has already taken `FASTCACHED_SCAN_NARRATE_AFTER` seconds, so with the shipped
+# default of 10 that assertion was a bet on this host completing the synthesised scan --
+# 26 files, `FastCachedSelftestCorpusFiles` of filler plus the README and the snippet --
+# in under ten seconds. Idle it takes about one; under `ctest --parallel 32` with another
+# build on the box it crosses ten, the check narrates TRUTHFULLY, and the case reads a
+# correct narration as a failure. Measured: 0 failures in 10 standalone runs at
+# 1.05-1.38 s, against 1 in 3 at the gate's own parallelism where the passing runs took
+# 15.56 s and 19.84 s. WSL2 over DrvFs, 32 CPUs.
+#
+# So the threshold is set far enough above the observed cost that it stops being a
+# margin and becomes a different claim: that no host this project runs on is three
+# thousand times slower than this one. A margin gets outrun -- which is what ten
+# seconds was -- and a claim of that shape does not.
+#
+# THE CEILING IS DERIVED, NOT FREE. `check-sccache-backend-caveat.cmake` refuses any
+# budget below twice the narration threshold, so these two move TOGETHER and the budget
+# is what bounds the threshold. Raising the threshold alone would trip the very rule
+# that `a budget too close to the narration threshold is refused before scanning`
+# exists to enforce, and that case would go red instead of this one.
+#
+# So the ceiling on this threshold is HALF THIS BUDGET, and the way to raise one is to
+# raise both. Reach for that invariant rather than for a bigger number on its own: the
+# check's own refusal says "lower the narration threshold or raise the budget, and keep
+# them moving together", which is the instruction it gives whoever trips it.
+#
+# They are a separate pair rather than a raise of `FastCachedSelftestBudgetSeconds`
+# because that constant is shared by three other cases whose behaviour has no reason to
+# move with this one.
+#
+# #608 is the same species in a different fixture and offers two remedies: stop depending
+# on the threshold, or keep a margin large enough to be real AND still discriminate. THIS
+# TOOK THE SECOND. The first is not available here -- freezing the clock is another case's
+# subject and turns the outcome into `Cost NOT MEASURED`, which would destroy the headroom
+# assertion this case also makes.
+#
+# And #608's weakening clause deliberately does NOT apply. There the threshold is DERIVED
+# from the bound (`recent = bound / 4`), so raising the bound raises the quantity under
+# test and the case asserts less. Here the threshold is a PRECONDITION of the quietness
+# assertion rather than its subject, so raising it softens neither thing asserted -- it
+# only makes "this run did not cross the threshold" reliably true instead of accidentally
+# true. Same species, opposite consequence; do not transfer that clause here by analogy.
+#
+# IF THIS PROVES INSUFFICIENT, DO NOT RAISE IT AGAIN. Reduce the case to its load-immune
+# half -- that headroom is reported at all -- and stop asserting quietness live. Climbing a
+# constant twice is how a fixture ends up with a number nobody can justify and everybody
+# trusts, and a case that tests less but never lies is worth more than one that tests more
+# and flakes.
+set(FastCachedSelftestQuietNarrateAfterSeconds 3600)
+set(FastCachedSelftestQuietBudgetSeconds 7200)
+
 # ---------------------------------------------------------------------------
 # The synthesised tree.
 #
@@ -176,7 +230,7 @@ endfunction()
 # checkpoint, so it would stay silent even had narration become unconditional.
 set(FastCachedSccacheSelftestCases
     "narrates once a run is slow|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|still scanning --  && file(s) after  &&  ms/file, so the whole scan needs |narrated nothing"
-    "quiet at defaults, and reports headroom against the budget|-|-DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|walked  &&  ms/file. That is the ' && % of the ${FastCachedSelftestBudgetSeconds}s budget|still scanning && No budget was given"
+    "quiet below the narration threshold, and reports headroom against the budget|-|-DFASTCACHED_SCAN_NARRATE_AFTER=${FastCachedSelftestQuietNarrateAfterSeconds} -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestQuietBudgetSeconds}|walked  &&  ms/file. That is the ' && % of the ${FastCachedSelftestQuietBudgetSeconds}s budget|still scanning && No budget was given"
     "reports no headroom when given no budget|-|-DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery}|walked  &&  ms/file. That is the ' && No budget was given|% of the"
     "a frozen clock is its own outcome, never speed|1700000000|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|Cost NOT MEASURED && SOURCE_DATE_EPOCH is set| ms/file && still scanning"
     "a checkpoint wider than the corpus reports that it explained nothing|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|narrated nothing|still scanning"
@@ -234,7 +288,20 @@ foreach(row IN LISTS FastCachedSccacheSelftestCases)
                 set(present FALSE)
             endif()
             if(NOT present STREQUAL "${mustAppear}")
-                list(APPEND failures "  ${caseName}\n      ${complaint}: ${needle}")
+                # What this HOST took, beside the needle that did not match.
+                #
+                # Every timing-dependent case here can be failed by a slow enough box, and a
+                # bare pattern mismatch on such a case is a mystery red -- which is what
+                # teaches people to re-run a hygiene check rather than read it (#1142). The
+                # run reports its own elapsed seconds, so quoting them turns "a string was
+                # missing" into "this host took Ns", which a reader can act on without
+                # reproducing anything. Best-effort by construction: a run that printed no
+                # cost line contributes nothing here rather than failing a second time.
+                set(observed "")
+                if(output MATCHES "in ([0-9]+)s and read")
+                    set(observed "\n      this host took ${CMAKE_MATCH_1}s for the scan")
+                endif()
+                list(APPEND failures "  ${caseName}\n      ${complaint}: ${needle}${observed}")
             endif()
         endforeach()
     endforeach()
