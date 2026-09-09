@@ -96,6 +96,24 @@ enum class LayoutFilesystem : std::uint8_t
     PosixRooted, ///< The root starts at `/` and means it -- not a drive-relative path.
 };
 
+/// How a layout's `binPaths` is read.
+///
+/// A COLUMN rather than a rule in the walk, because the two readings are a property
+/// of the layout and not of the code that iterates it: MSYS2 genuinely serves
+/// compilers out of `ucrt64`, `mingw64` AND `clang64` at once, while a Visual Studio
+/// install holds one directory per HOST architecture and this machine can run
+/// exactly one of them. A blanket "first bindir that yields a compiler wins" would be
+/// wrong for the first, and searching all of them wrong for the second.
+enum class BinPathSelection : std::uint8_t
+{
+    /// Every entry is searched. The default, and what every non-Windows row wants.
+    All,
+    /// The entries are indexed by `HostArchitecture` and exactly one is searched --
+    /// the machine's own. The span must therefore hold one entry per enumerator, in
+    /// enumerator order, which `HostArchitectureBinPaths` is what builds.
+    ByHostArchitecture,
+};
+
 struct ToolchainLayout
 {
     /// What this layout is called, in the startup log.
@@ -129,6 +147,8 @@ struct ToolchainLayout
     /// Directories beneath the root (or beneath `versionRoot/<version>`) holding
     /// the binaries.
     std::span<std::string_view const> binPaths;
+    /// How `binPaths` is read.
+    BinPathSelection binPathSelection { BinPathSelection::All };
     /// The compiler names sought there, without an executable suffix.
     std::span<std::string_view const> binaries;
     /// How those names are matched.

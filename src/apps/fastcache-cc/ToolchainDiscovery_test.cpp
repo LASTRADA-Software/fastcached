@@ -3,6 +3,7 @@
 #include "ToolchainHostTestUtils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators_all.hpp>
 
 #include <algorithm>
 #include <span>
@@ -154,14 +155,28 @@ TEST_CASE("A version suffix is a version, not any suffix", "[toolchain-discovery
 TEST_CASE("A Visual Studio install is found through vswhere", "[toolchain-discovery]")
 {
     constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    // **The MACHINE's architecture is stated, never re-derived from this build.**
+    // This block used to re-spell the table's own build-architecture conditional,
+    // which made the case a
+    // tautology: it asserted that the table chose whatever the COMPILER chose, so it
+    // was green under any build and could not fail for the reason it exists (#146).
+    // Driven from a scripted host, all three arms run on one runner -- including the
+    // arm64 arm, which no build of this project has ever executed.
+    auto const [architecture, nativeBin, otherBin] = GENERATE(table<HostArchitecture, std::string_view, std::string_view>(
+        { { HostArchitecture::Arm64, "bin/Hostarm64/arm64", "bin/Hostx64/x64" },
+          { HostArchitecture::X64, "bin/Hostx64/x64", "bin/Hostarm64/arm64" },
+          { HostArchitecture::X86, "bin/Hostx86/x86", "bin/Hostx64/x64" } }));
+    CAPTURE(nativeBin);
+
     ScriptedToolchainHost host;
+    host.WithNativeArchitecture(architecture);
     host.SetEnvironment("ProgramFiles(x86)", "C:/Program Files (x86)");
     host.AddExecutable("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe");
+    // All three host bindirs are present, so the case measures which one is CHOSEN
+    // rather than which one happens to exist.
     for (auto const& version: { "14.44.35207", "14.51.36231" })
-    {
-        host.AddExecutable(std::string { vs } + "/VC/Tools/MSVC/" + version + "/bin/Hostx64/x64/cl.exe");
-        host.AddExecutable(std::string { vs } + "/VC/Tools/MSVC/" + version + "/bin/Hostarm64/arm64/cl.exe");
-    }
+        for (auto const& bin: { "bin/Hostx64/x64", "bin/Hostarm64/arm64", "bin/Hostx86/x86" })
+            host.AddExecutable(std::string { vs } + "/VC/Tools/MSVC/" + version + "/" + bin + "/cl.exe");
     host.AddFile(std::string { vs } + "/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt", "14.51.36231\r\n");
 
     ScriptedRunner runner;
@@ -169,14 +184,6 @@ TEST_CASE("A Visual Studio install is found through vswhere", "[toolchain-discov
 
     auto const candidates = DiscoverToolchainCandidates(host, runner);
     auto const paths = PathsOf(candidates);
-
-#if defined(_M_ARM64) || defined(__aarch64__)
-    constexpr std::string_view nativeBin = "bin/Hostarm64/arm64";
-    constexpr std::string_view otherBin = "bin/Hostx64/x64";
-#else
-    constexpr std::string_view nativeBin = "bin/Hostx64/x64";
-    constexpr std::string_view otherBin = "bin/Hostarm64/arm64";
-#endif
 
     // Both installed toolsets, because a client pinned to the older one needs a
     // worker matching it -- and the HINTED one first, so the toolchain a plain `cl`
@@ -206,26 +213,32 @@ TEST_CASE("The clang-cl Visual Studio bundles is found too", "[toolchain-discove
     // builds using it were cached and could never be dispatched, with nothing
     // reporting why.
     constexpr std::string_view vs = "C:/Program Files/Microsoft Visual Studio/18/Community";
+    // Stated rather than re-derived, for the reason the MSVC case above gives. This
+    // row carried the SAME build-architecture `#if`: the row added to stop discovery
+    // walking past Visual Studio's own bundled clang-cl was itself picking its
+    // directory from a fact about the compiler that built it.
+    auto const [architecture, nativeBin, otherBin] = GENERATE(table<HostArchitecture, std::string_view, std::string_view>(
+        { { HostArchitecture::Arm64, "VC/Tools/Llvm/ARM64/bin", "VC/Tools/Llvm/x64/bin" },
+          { HostArchitecture::X64, "VC/Tools/Llvm/x64/bin", "VC/Tools/Llvm/ARM64/bin" },
+          { HostArchitecture::X86, "VC/Tools/Llvm/bin", "VC/Tools/Llvm/ARM64/bin" } }));
+    CAPTURE(nativeBin);
+
     ScriptedToolchainHost host;
+    host.WithNativeArchitecture(architecture);
     host.SetEnvironment("ProgramFiles(x86)", "C:/Program Files (x86)");
     host.AddExecutable("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe");
-    for (auto const& architecture: { "x64", "ARM64" })
+    // The 32-bit host's copy sits at `VC/Tools/Llvm/bin`, matching the layout Visual
+    // Studio used before it grew per-architecture directories -- so all three are
+    // staged and the case measures the choice.
+    for (auto const& bin: { "VC/Tools/Llvm/x64/bin", "VC/Tools/Llvm/ARM64/bin", "VC/Tools/Llvm/bin" })
         for (auto const& binary: { "clang-cl.exe", "clang.exe", "clang++.exe" })
-            host.AddExecutable(std::string { vs } + "/VC/Tools/Llvm/" + architecture + "/bin/" + binary);
+            host.AddExecutable(std::string { vs } + "/" + bin + "/" + binary);
 
     ScriptedRunner runner;
     runner.Answer("vswhere", std::string { vs } + "\r\n");
 
     auto const candidates = DiscoverToolchainCandidates(host, runner);
     auto const paths = PathsOf(candidates);
-
-#if defined(_M_ARM64) || defined(__aarch64__)
-    constexpr std::string_view nativeBin = "VC/Tools/Llvm/ARM64/bin";
-    constexpr std::string_view otherBin = "VC/Tools/Llvm/x64/bin";
-#else
-    constexpr std::string_view nativeBin = "VC/Tools/Llvm/x64/bin";
-    constexpr std::string_view otherBin = "VC/Tools/Llvm/ARM64/bin";
-#endif
 
     // Not `CHECK(!empty)` afterwards: an empty result would make the layout loop
     // below pass vacuously, which is the shape this whole case exists to catch.

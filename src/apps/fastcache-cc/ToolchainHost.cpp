@@ -8,8 +8,26 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <system_error>
 #include <utility>
+
+#if defined(_WIN32)
+    // `<windows.h>` ALONE, and the single header is the fix rather than a tidy-up.
+    // This block was `<processthreadsapi.h>` beside it, written in that order --
+    // and clang-format sorts an include block alphabetically, so it put
+    // `processthreadsapi.h` FIRST and deleted the blank line separating them.
+    // `winnt.h` then arrives without the architecture `windows.h` sets up and stops
+    // the build with `#error "No Target Architecture"`. Invisible on Linux, where
+    // neither header exists and the block is preprocessed away, so the formatter
+    // broke a platform it could not compile for. `windows.h` declares
+    // `IsWow64Process2` and `GetNativeSystemInfo` on its own with
+    // `_WIN32_WINNT=0x0A00`, which this build sets, so nothing is lost by dropping
+    // the second include -- and with one header there is no order left to sort.
+    #include <windows.h>
+#else
+    #include <sys/utsname.h>
+#endif
 
 namespace FastCache::Cc
 {
@@ -112,6 +130,63 @@ namespace
             return true;
 #else
             return false;
+#endif
+        }
+
+        /// Ask the OS, never the preprocessor -- this is the one host fact where
+        /// build time and run time genuinely disagree.
+        ///
+        /// **`GetSystemInfo` is the wrong call and it is the one to reach for
+        /// first.** Under WOW64 it reports the EMULATED architecture, so an x64
+        /// process on an ARM64 host is told `x64` -- which reproduces #146 exactly
+        /// while looking like a fix, and passes any test written against a scripted
+        /// host. `GetNativeSystemInfo` is the documented way to see past the
+        /// emulation, and `IsWow64Process2` reports it as a machine type directly.
+        ///
+        /// On POSIX `uname -m` is the machine, since nothing here emulates a
+        /// different one behind the kernel's back.
+        [[nodiscard]] HostArchitecture NativeArchitecture() const noexcept override
+        {
+#if defined(_WIN32)
+            // `nativeMachine` is filled in whether or not this process is under
+            // WOW64, which is what makes one call sufficient for both cases.
+            USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+            USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+            if (::IsWow64Process2(::GetCurrentProcess(), &processMachine, &nativeMachine) != 0)
+                switch (nativeMachine)
+                {
+                    case IMAGE_FILE_MACHINE_ARM64:
+                        return HostArchitecture::Arm64;
+                    case IMAGE_FILE_MACHINE_AMD64:
+                        return HostArchitecture::X64;
+                    case IMAGE_FILE_MACHINE_I386:
+                        return HostArchitecture::X86;
+                    default:
+                        break;
+                }
+
+            // The fallback is still a NATIVE reading rather than the emulated one.
+            SYSTEM_INFO info {};
+            ::GetNativeSystemInfo(&info);
+            switch (info.wProcessorArchitecture)
+            {
+                case PROCESSOR_ARCHITECTURE_ARM64:
+                    return HostArchitecture::Arm64;
+                case PROCESSOR_ARCHITECTURE_AMD64:
+                    return HostArchitecture::X64;
+                default:
+                    return HostArchitecture::X86;
+            }
+#else
+            utsname info {};
+            if (::uname(&info) != 0)
+                return HostArchitecture::X86;
+            auto const machine = std::string_view { static_cast<char const*>(info.machine) };
+            if (machine == "aarch64" || machine == "arm64")
+                return HostArchitecture::Arm64;
+            if (machine == "x86_64" || machine == "amd64")
+                return HostArchitecture::X64;
+            return HostArchitecture::X86;
 #endif
         }
 
