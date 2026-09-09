@@ -1697,13 +1697,17 @@ TEST_CASE("A header that could not be read leaves the walk incomplete and uncach
 
     UnreadableFile const held { locked };
 
-    // REQUIRED rather than skipped past, and `SKIP` is deliberately not used here at
-    // all: Catch2 exits 4 when every case was skipped and ALSO exits with the number
-    // of failed assertions, so wiring `SKIP_RETURN_CODE 4` into `catch_discover_tests`
-    // would report any case with exactly four failed assertions as skipped -- and the
-    // pre-fix run of this very case produced exactly four. Both supported platforms
-    // can deny a read, so a host where this does not hold is a case that cannot do its
-    // job, and saying so beats passing without asserting anything.
+    // REQUIRED rather than skipped past. Both supported platforms can deny a read, so
+    // a host where this does not hold is a case that cannot do its job, and saying so
+    // beats passing without asserting anything.
+    //
+    // **This comment used to carry #1128 as a local reason to avoid `SKIP` entirely**:
+    // Catch2 exits with its failed-assertion count, so `SKIP_RETURN_CODE 4` reported
+    // any case with exactly four failures as skipped -- and the pre-fix run of this
+    // very case produced exactly four. The hazard was real, correctly diagnosed, and
+    // written down where only this file could see it while all five binaries carried
+    // it. It is fixed at the mechanism now (ctest keys on the OUTPUT), so `SKIP` is
+    // safe here; the argument above stands on its own merits rather than on that.
     REQUIRE(held.Held());
 
     std::vector<std::string> const roots { includeDir.string() };

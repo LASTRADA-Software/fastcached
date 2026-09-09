@@ -1519,6 +1519,23 @@ what differs between compilers, standard libraries, hosts and tool versions.
     prints a real `CMake Error` from a nested `cmake -P`, which leaves the pattern
     as the only thing that can fail it. Fixing a wrong *reason* without
     re-deriving what it justified is how a guard survives as decoration.
+- **A guard's REMEDY TEXT is part of the guard. Nothing tests it, and it is the only
+  part of a check most people ever read.** `check-catch-skip-return-code` went on
+  telling the reader to *"Add to the registration: `PROPERTIES SKIP_RETURN_CODE 4`"*
+  after the same commit made that property the thing it REFUSES — so following the
+  instrument's own advice reintroduced #1128, hit the identical refusal, and read as
+  the CHECK being broken, which is the reading that gets a guard deleted. It survives
+  every test a check normally gets: the verdict logic was correct throughout and ten
+  synthetic trees drove it in both directions, because a self-test asserts THAT the
+  check objected and never what it advised. The window is a change of MECHANISM rather
+  than of verdict — nobody forgets the message when a check starts refusing something
+  new; it rots when the check refuses the same SHAPE for the opposite reason. Read it
+  as somebody who has never seen it: not *is this accurate* but **if I did exactly what
+  this says, where do I end up.** And state what the rule does NOT cover in the refusal
+  itself — the script-driven `SKIP_RETURN_CODE 77` registrations are unaffected, a
+  shell script choosing its own exit code where a Catch2 binary spends its status on
+  the failed-assertion count — or the next reader over-applies it and deletes a
+  property that is load-bearing elsewhere.
 - Never silence clang-tidy with `NOLINT` — fix the source.
 - A return type is not part of a function's mangled name on Linux, so two
   functions differing only in return type silently collide.
@@ -2083,17 +2100,39 @@ and what they may assume.
   GIT. **The mode under test was not the mode in use**, which is a guard passing
   because it is testing something else. So the mode is part of the OUTPUT and asserted
   on both sides, or the cheap-to-construct path silently becomes the only one tested.
-- A Catch2 `SKIP(...)` exits **4**, so every `catch_discover_tests` registration
-  carries `PROPERTIES SKIP_RETURN_CODE 4` — without it ctest scores a skip as a
-  FAILURE, and the binary prints `1 skipped` while ctest prints `***Failed` for the
-  same run (#499). A false RED: all seven skip sites are environment-conditional, so
-  they fire on a constrained runner and report a regression that is not there, and
-  whoever meets it deletes the SKIP rather than suspecting the registration. The value
-  is part of the rule — `77` is the script-driven convention and does nothing here.
-  The mechanism was already applied eleven times one directory away, so the guard is a
-  check (`catch-skip-return-code`, shown failing by `catch-skip-selftest`), because a
-  sixth test binary reopens it by omission. And the list is written at BUILD time, so
-  a reconfigure alone leaves a stale one that reads exactly like a current one.
+- A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means or it scores
+  a skip as a FAILURE — the binary prints `1 skipped` while ctest prints `***Failed` for
+  the same run (#499). A false RED: essentially every skip site is
+  environment-conditional, so they fire on a constrained runner and report a regression
+  that is not there, and whoever meets it deletes the SKIP rather than suspecting the
+  registration. (This said "all seven"; the tree held 39 at #1128's merge base, and the
+  figure moved by one mid-ticket — the rule file states the pattern, and the argument
+  never rested on the count.)
+  **And the mechanism that fixes that RED is itself broken, which is #1128.** Catch2's
+  exit code **is** its failed-assertion count clamped at 255, so `SKIP_RETURN_CODE 4`
+  scores a case failing exactly four assertions as *skipped* — and a case that skips one
+  `SECTION` and fails four in another. Genuinely failing tests, silent, inside
+  `100% tests passed`, in all five binaries. **The repair for one state collapse was the
+  site of the next, inside the mechanism chosen to prevent state collapse.** It is still
+  what the tree carries, because **all three alternative channels were measured and every
+  one is worse**: the exit status is fully occupied (every value in 1..255 is a reachable
+  assertion count); the OUTPUT is a substring search over text the SUBJECT controls, so a
+  case that only fails but mentions the summary text is scored skipped, and anchoring it
+  is impossible because `^` is `cmd.exe`'s escape character while a literal newline
+  **arrives EMPTY** through cmd — which makes an empty pattern that matches every line,
+  so the remedy degrades into every failing test scoring as skipped, silently, at exit
+  zero; and `FAIL_REGULAR_EXPRESSION` does **not** outrank `SKIP_RETURN_CODE`, so the two
+  cannot be composed. A `catch_discover_tests` property value is a **wire format with
+  three parsers in it** — a literal `|` killed every Windows leg at the DISCOVERY step
+  before anything linked (#1146) — and **no Linux gate can reproduce any of that.** The
+  fix is a change of MECHANISM, open as #1152; `catch-skip-exit-collision` asserts the
+  premises so the record cannot rot into a false rule, and `src/tests/CatchSkipCanary.cpp`
+  carries the shapes a replacement must survive. **Adding shapes cannot make a pattern
+  safe**: every shape is one you thought of, and the channel is shared with an author who
+  thinks of others. Not `WILL_FAIL` anywhere either — a skipped test carrying it is not
+  scored a failure, so such a canary is green under the very defect it guards. And the
+  list is written at BUILD time, so a reconfigure alone leaves a stale one that reads
+  exactly like a current one.
 - The converse, and the direction nobody investigates: `SUCCEED` is right when a case
   RAN and had nothing to assert, and wrong when the case could not run — where it stands
   in for a skip it reports a PASS for a property nothing established (#685). Twenty-one

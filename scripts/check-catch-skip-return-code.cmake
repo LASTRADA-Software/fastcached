@@ -2,6 +2,27 @@
 #
 # Every `catch_discover_tests` registration tells ctest that exit 4 means SKIPPED.
 #
+# ## What this check enforces is KNOWN BROKEN, and enforcing it is still right (#1128)
+#
+# `SKIP_RETURN_CODE 4` closed #499's false RED and opened a false GREEN: Catch2's exit
+# code IS its failed-assertion count, so a case failing exactly four assertions is
+# scored *skipped*, and so is a case that skips one `SECTION` and fails four assertions
+# in another. Measured through real ctest on today's tree; both sit inside
+# `100% tests passed`, in all five binaries.
+#
+# It is enforced anyway because **every alternative was measured and is worse.** Three
+# channels, all closed: the exit status is fully occupied (every value in 1..255 is a
+# reachable assertion count), the OUTPUT is shared with text the subject controls and
+# cannot be anchored through the Windows command line that carries the property, and
+# `FAIL_REGULAR_EXPRESSION` does not outrank `SKIP_RETURN_CODE` so the two cannot be
+# composed. The full argument, with the measurements, is at the top-level CMakeLists
+# and in `.agent/rules/testing.md`; the fix is a change of MECHANISM and is tracked as
+# open work there.
+#
+# So this check keeps the tree consistent with the least-bad option rather than with a
+# correct one. Do not read its green as the property being sound.
+# `catch-skip-exit-collision` is the reader that will say when a premise moves.
+#
 # A Catch2 case that calls `SKIP(...)` exits **4**. `SKIP_RETURN_CODE` is the only
 # thing that tells ctest an exit code means *skipped* rather than *failed*, and none
 # of the five Catch2 registrations set it -- so the binary printed `1 skipped` and

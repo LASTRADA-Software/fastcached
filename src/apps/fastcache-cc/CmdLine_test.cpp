@@ -1500,8 +1500,11 @@ TEST_CASE("CompilerWorkingDirectory keeps the symlinked spelling a driver report
         // unconditional; only this way of demonstrating it is not -- so this is SKIPPED
         // and not a pass. `SUCCEED` here would report green for the one property the
         // change exists to establish, on every host that cannot make a link.
-        // `catch_discover_tests` carries `SKIP_RETURN_CODE 4`, so ctest scores it as a
-        // skip rather than as a failure.
+        // `catch_discover_tests` carries `SKIP_RETURN_CODE 4`, so ctest scores it as
+        // a skip rather than as a failure. That mechanism is known broken in the other
+        // direction -- Catch2 exits with its failed-assertion count, so four failures
+        // also read as a skip (#1128, fix tracked as #1152) -- but it is what makes
+        // SKIP usable here at all.
         std::filesystem::remove_all(base);
         SKIP("symlinks unavailable on this host");
     }
