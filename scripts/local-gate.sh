@@ -845,6 +845,44 @@ configure_reason() {
     echo "$reasons"
 }
 
+# Whether the formatter should be run at all, and over how many files.
+#
+# A pure function of the list so `--self-test` drives the same code the run uses;
+# the alternative is a guard tested nowhere, which is the shape this file exists to
+# refuse.
+#
+# It exists because an EMPTY list is not a formatted tree. `git ls-files | xargs
+# clang-format -i` hands the formatter no operands, GNU xargs runs it anyway, and
+# clang-format reads stdin and answers `error: cannot use -i when reading from
+# stdin` -- so the gate reported `GATE FAILED: clang-format` for a tree whose
+# formatting it had never examined. Measured on GNU findutils 4.9.0: empty input
+# with no `-r` RUNS the command with no arguments, and the real pipeline exits
+# **123**, which is xargs's "the utility exited non-zero" and neither 0 nor 1.
+#
+# The observed cause was a linked worktree whose `.git` file held an ABSOLUTE
+# `gitdir:`: the other git could not resolve it and listed nothing, where the same
+# tree listed 395 files once the pointer was relative (#1064).
+#
+# NOT `xargs -r`. That fixes the symptom in the wrong direction -- an empty list
+# would become a silent PASS, the gate announcing it had formatted a tree it never
+# read. The guard is on the LIST, so both xargs dialects refuse identically and the
+# verdict does not depend on which platform the developer is standing on.
+#
+# @param 1 The newline-separated list, as `git ls-files` prints it.
+# @return `refuse <n>` when there is nothing to format, `format <n>` otherwise.
+format_plan() {
+    local list="$1"
+    local count=0
+    if [[ -n "$list" ]]; then
+        count="$(printf '%s\n' "$list" | wc -l | tr -d ' ')"
+    fi
+    if [[ "$count" -eq 0 ]]; then
+        echo "refuse ${count}"
+    else
+        echo "format ${count}"
+    fi
+}
+
 if [[ "$self_test" -eq 1 ]]; then
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
@@ -1390,6 +1428,15 @@ $gate_passed_marker"
     # those vacuous while every one of them passed. The `leg_summary` checks are
     # deliberately NOT among them -- they pass their pairs explicitly, which is what
     # lets them state what the renderer does independently of what the gate runs.
+    # An empty file list is a REFUSAL, not a formatting failure (#1064). Both
+    # directions, because a guard that only checks the populated case passes under
+    # the bug: the count is what separates "formatted 683 files" from "formatted
+    # none of them", and the old run printed the same sentence either way.
+    expect "an empty list refuses instead of reaching the formatter" "refuse 0" "$(format_plan "")"
+    expect "a single file is offered to the formatter" "format 1" "$(format_plan "a.cpp")"
+    expect "every file in the list is counted" "format 3" \
+        "$(format_plan "$(printf 'a.cpp\nb.hpp\nc.h')")"
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -1454,9 +1501,28 @@ if [[ "$format" -eq 1 ]]; then
     formatter="clang-format-${tools_version}"
     command -v "$formatter" >/dev/null 2>&1 \
         || fail "$formatter not found; install it or pass --no-format"
-    git ls-files '*.h' '*.hpp' '*.cpp' | xargs "$formatter" -i --style=file \
+    # Captured and counted BEFORE the formatter is asked anything, so the two ways
+    # of having no files to format are told apart and neither is reported as a
+    # formatting failure. `set -uo pipefail` carries no `-e`, so an errored
+    # `git ls-files` and an empty-but-successful one used to land on the identical
+    # `fail "clang-format"` -- a sentence that reads as mundane and actionable, so
+    # the response is to run the formatter by hand, which succeeds, which then reads
+    # as the gate being flaky (#1064).
+    format_list="$(git ls-files '*.h' '*.hpp' '*.cpp')" \
+        || fail "git ls-files failed in $(pwd), so no source was offered to $formatter and this tree's formatting is UNEXAMINED"
+
+    format_verdict="$(format_plan "$format_list")"
+    format_count="${format_verdict#* }"
+    if [[ "${format_verdict%% *}" == "refuse" ]]; then
+        fail "git ls-files matched no C++ source in $(pwd), so $formatter was never run and this tree's formatting is UNEXAMINED -- this is NOT a formatting failure. A linked worktree whose .git file holds an absolute 'gitdir:' is how this happens: the other git cannot resolve it and lists nothing, where the same tree lists hundreds of files once the pointer is relative (#1064)"
+    fi
+
+    printf '%s\n' "$format_list" | xargs "$formatter" -i --style=file \
         || fail "clang-format"
-    echo "== formatted with $formatter"
+
+    # The COUNT, not just the tool: zero and 683 must not render the same sentence,
+    # which is the whole defect one line up.
+    echo "== formatted ${format_count} file(s) with $formatter"
 fi
 
 # @param 1 The preset to build and test.
