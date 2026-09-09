@@ -80,6 +80,34 @@ FastPathCeilingMs=2000
 # written out, a ceiling of 10000ms was caught by nothing.
 FastPathDefectFloorMs=$(( FastPathCeilingMs * 3 / 2 ))
 
+# What `run_bounded` costs per call when nothing is wrong, which is what makes the
+# `SLOW:` reading a NUMBER rather than an adjective.
+#
+# A CONSTANT and not a literal inside the message: the paragraph at the ceiling
+# case says the baseline must live in one place, and the version of that message
+# spelled `4-5ms` in the `echo` anyway -- restating it in exactly the way the
+# comment beside it forbade, and drifting the moment the helper changed.
+#
+# A QUANTITY UNDER CONDITIONS, and both halves travel:
+#
+#   * pre-#1077, 32-core Linux, lightly loaded: 284-303ms for twenty commands
+#     against 200ms requested, so about 4-5ms per call.
+#   * #1077 arms the deadline INSIDE the poll loop, which is one extra fork per
+#     call. Measured as a PAIRED step and not as two independent readings, the
+#     two trees alternated within each pair so load drift cannot masquerade as
+#     the difference: +2ms per call, 7 of 8 pairs positive, N=8, load ~26.
+#
+# The figure below is DERIVED from that step rather than re-measured on an idle
+# host, which is said out loud because it is the weaker of the two claims and a
+# reader has no way to recover the difference afterwards.
+#
+# It is also the ceiling case's own comment coming true on a real change instead
+# of as an argument: that paragraph says a change adding one fork per call
+# "arrives here as a breach and reads exactly like a slow host", and #1077 then
+# added exactly that fork. A STEP in this figure is the helper; a proportional
+# rise across the whole run is the host.
+FastPathBaselineMsPerCall="6-7"
+
 # Is a timer reading the `<seconds>.<three digits>` shape `%3R` produces?
 #
 # PURE, and lifted out of `fast_path_ms` for the reason this file's header gives
@@ -95,6 +123,56 @@ _is_duration_reading() {
         [0-9]*.[0-9][0-9][0-9]) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Where `fast_path_ms`'s pause meter writes, one line per pause REQUESTED.
+#
+# A FUNCTION rather than a variable, and the reason is the bug it replaces:
+# `fast_path_ms` is itself called as `fast_ms="$(fast_path_ms)"`, so it runs in a
+# subshell and every variable it sets dies with it. A `_fast_path_ledger=...`
+# assignment inside it left the reader looking at an empty name, and
+# `fast_path_asked_ms` then reported a pause total of ZERO -- caught only because
+# the positive control below refuses zero BY NAME rather than reading it as a very
+# fast bound. Derived from `scratch` at both ends instead, so there is no value
+# left to lose across the boundary.
+fast_path_ledger() { printf '%s' "${scratch}/fast-path-pauses"; }
+
+# How much pause `run_bounded` ASKED FOR during the last `fast_path_ms`, in whole
+# milliseconds.
+#
+# **This is the verdict the two cases below assert on, and the elapsed time is
+# only evidence beside it.** What the helper REQUESTED is a decision: no host, no
+# scheduler and no time sync can move it, where every wall-clock reading in this
+# file can be stepped (#1058). It is also strictly more than a timing proxy can
+# see, since it counts the ticks as well as their length -- a `run_bounded` that
+# polled five times per call instead of once is invisible to a ceiling the ramp
+# still fits under, and shows up here as five times the pause.
+#
+# `LC_ALL=C` on the awk for the separator reason `fast_path_ms` gives above: a
+# `de_DE` awk reads `0.01` as `0` and the total comes back plausible and short.
+#
+# A malformed line is REFUSED rather than skipped, because awk would otherwise
+# read it as zero and the total would be short by an unknown amount -- the one
+# wrong answer a caller has no way to detect.
+#
+# @return the total in whole milliseconds; `0` when nothing was recorded, which
+#         the caller must read as a LOST ledger rather than as a fast bound.
+fast_path_asked_ms() {
+    local total ledger
+    ledger="$(fast_path_ledger)"
+    if [ ! -e "$ledger" ]; then
+        printf '0'
+        return 0
+    fi
+    total="$(LC_ALL=C awk '
+        !/^[0-9]+(\.[0-9]+)?$/ { bad = $0; exit 1 }
+        { sum += $1 }
+        END { if (bad == "") printf "%d", (sum * 1000) + 0.5 }
+    ' "$ledger")" || {
+        echo "the pause ledger holds a line that is not a pause, so its total would be short by an unknown amount" >&2
+        return 1
+    }
+    printf '%s' "$total"
 }
 
 # Run `FastPathCommands` commands that finish immediately through `run_bounded`,
@@ -126,7 +204,86 @@ _is_duration_reading() {
 # @return The elapsed time of the `FastPathCommands` calls, in whole milliseconds.
 fast_path_ms() {
     local elapsed
+    # Truncated HERE rather than at the two call sites, so the pause total and the
+    # elapsed reading cover the same twenty commands by construction rather than
+    # by both cases remembering to say so.
+    local ledger
+    ledger="$(fast_path_ledger)"
+    if ! : > "$ledger"; then
+        echo "cannot open the pause ledger at ${ledger}" >&2
+        return 1
+    fi
+    # The pause meter runs INSIDE the substitution below; its EXPLANATION lives
+    # out here, and that placement is load-bearing rather than tidiness.
+    #
+    # **bash 3.2's command-substitution scanner does not skip comments.** An
+    # apostrophe in a comment inside `$( )` therefore opens a single-quoted string
+    # as far as that scanner is concerned, and it swallows the closing paren. This
+    # block sat inside the substitution and carried five of them -- `lane's`,
+    # `run_bounded`'s, `measurement's`, `timer's`, `file's` -- an odd count, so the
+    # scan ended mid-quote and the parser reported `syntax error near unexpected
+    # token '('` **135 lines further down**, at the first real paren in the file,
+    # which is why the reported line was a valid line that master parses fine.
+    #
+    # macOS ships 3.2, so this was `e2e-helpers-selftest` dying at PARSE in 0.02s
+    # on `macOS-clang-release` while every other platform ran it green. Measured
+    # on a real bash 3.2.39 rather than reasoned: the two constructs that look
+    # more suspicious both parse there -- a function definition inside `$( )`, and
+    # a multi-line single-quoted `awk` program -- and only the comment apostrophe
+    # fails. Keeping the body comment-free is what makes that unrepeatable: there
+    # is nowhere for an apostrophe to hide.
+    #
+    # The file's `bash 3.2` scan cannot catch this and is not at fault: it checks
+    # TOKENS (`mapfile`, `declare -A`, `local -n`), and this is a composition of
+    # individually legal ones. That gap is #880.
+    #
+    # `run_bounded` calls `sleep` by bare name, so a function of that name takes
+    # precedence -- and a function defined in there is confined to that subshell,
+    # so no other case in this file runs against a shadowed `sleep`. `command
+    # sleep` delegates to the real one, so the timing the expression is measuring
+    # is unchanged: the meter records the REQUEST and changes nothing about the
+    # pause.
+    #
+    # In THIS file and not in `lib/e2e-common.sh`, which would be the tidier home.
+    # That library is another lane's subject right now (#1048, #1066), and a check
+    # does not reach into a file it does not own to install the instrument it
+    # needs. It is also the more honest coupling: the property under test is
+    # `run_bounded`'s pacing, so the meter belongs to the test.
+    #
+    # It fails CLOSED if `run_bounded` ever stops spelling its pause `sleep` -- a
+    # `command sleep`, a `/bin/sleep`, a background timer -- because the ledger
+    # then reads zero and the positive control in the case below refuses BY NAME
+    # rather than reporting a very fast bound.
+    #
+    # It records ONLY the pauses this measurement's own flow performs. A pause the
+    # poll loop waits on is spent by `run_bounded`; a background timer's `sleep` is
+    # a marker running CONCURRENTLY and is not time the helper spends between
+    # polls, so counting it would be counting the wrong quantity.
+    #
+    # Not hypothetical: #1066, landed as #1077, gives `run_bounded` a real deadline
+    # as a backgrounded `( ...; sleep "$seconds"; ... ) &`, so on the merged tree
+    # twenty calls of `run_bounded 5 true` added 20 x 5 s and the meter read
+    # **100200 ms** instead of 200. The healthy case then reported `BUG:` on a good
+    # tree. Neither branch is wrong alone; the combination is, which is the one
+    # tree nothing builds.
+    #
+    # `BASH_SUBSHELL` and deliberately NOT `BASHPID`: the pid is bash 4.0+ and is
+    # silently inert on the 3.2 macOS ships -- this file's own header records
+    # `fail` losing a guard exactly that way -- where `BASH_SUBSHELL` is bash 3.0+
+    # and answers on every platform this runs on. Confirmed on the 3.2 built to
+    # diagnose this: `BASHPID` is unset there and `BASH_SUBSHELL` reads 0. A
+    # backgrounded subshell is one level deeper; the poll loop is not.
+    #
+    # It fails CLOSED if the poll pause ever moves into a subshell too: the ledger
+    # reads zero and the positive control below refuses it by name.
     elapsed="$( export LC_ALL=C; TIMEFORMAT='%3R'
+        _fast_path_level=$BASH_SUBSHELL
+        sleep() {
+            if [ "$BASH_SUBSHELL" -eq "$_fast_path_level" ]; then
+                printf '%s\n' "$1" >> "$ledger"
+            fi
+            command sleep "$@"
+        }
         { time { for _ in $(seq 1 "$FastPathCommands"); do run_bounded 5 true >/dev/null 2>&1; done; }; } 2>&1 )"
     # REFUSED unless the reading has the shape `%3R` produces. Measured, and this
     # is the fail-OPEN direction rather than a tidiness check:
@@ -826,10 +983,101 @@ run_case() {
         # that as a `SECONDS` delta of 2 or 3 depending on phase, and `-gt 2`
         # fires on the 3 alone, so it caught a REAL regression about half the
         # time. This one fires on it every time.
-        fast_ms="$(fast_path_ms)"
-        echo "${FastPathCommands} immediate commands ran in ${fast_ms}ms (measured, ceiling ${FastPathCeilingMs}ms)"
-        if [ "$fast_ms" -gt "$FastPathCeilingMs" ]; then
+        # THE VERDICT IS THE PAUSE ASKED FOR; THE ELAPSED TIME IS EVIDENCE (#1058).
+        #
+        # Everything above this line is true and none of it was enough, because
+        # every figure in it is a WALL-CLOCK reading and a wall clock can be
+        # STEPPED. Measured on a contended WSL2 host: twenty `sleep 0.2` calls,
+        # no `run_bounded` and no subshell, timed by bash's `time`, by
+        # `date +%s.%N` and by `/proc/uptime` at once --
+        #
+        #     run   time %3R   realtime   monotonic
+        #     6     4.020      4.021      4.020
+        #     7     2.761      2.763      4.030
+        #     8     4.023      4.026      4.030
+        #
+        # -- the two CLOCK_REALTIME readers agreeing with each other and losing
+        # 1.27s against CLOCK_MONOTONIC, which cannot be stepped. The sleeps were
+        # real; the reading was not a duration. That is #678 coming back through
+        # the other door: #678 was this verdict ruined by `SECONDS`'s one-second
+        # quantisation and was fixed by keeping the clock and raising the
+        # resolution, which is why the paragraphs above talk about resolution.
+        # Resolution was never the whole defect.
+        #
+        # So the assertion is on what `run_bounded` ASKED FOR -- the sum of its
+        # own pauses, recorded where it sleeps and read back exactly. That number
+        # is a DECISION rather than a measurement, so no host and no clock can
+        # move it, and it answers the question this case actually asks: does the
+        # bound sleep through a command that has already finished. It is also
+        # STRICTLY MORE than the timing proxy could see, since it counts the
+        # ticks as well as their length -- a `run_bounded` that polled five times
+        # per call instead of once fails here and was invisible to a ceiling that
+        # the ramp still fitted under.
+        #
+        # The elapsed time keeps being measured and printed, and can no longer
+        # FAIL anything. `.agent/rules/testing.md` requires a bounded wait to say
+        # which kind of failure it met; a slow host and a helper that did not
+        # bite are fixed by different people, and now the two are separate lines.
+        # A reading this host cannot produce is REPORTED, not fatal -- and that is
+        # the other half of demoting the clock. `fast_path_ms` refuses a malformed
+        # reading and returns non-zero, which under `set -e` used to end the case:
+        # exactly how `/.044` took this case red once in 30 runs. A refusal is
+        # right while the reading is the VERDICT and wrong once it is only
+        # evidence, so the status is taken here instead of ending the run.
+        if fast_ms="$(fast_path_ms)"; then reading=1; else reading=0; fast_ms=""; fi
+        asked_ms="$(fast_path_asked_ms)"
+        if [ "$reading" -eq 1 ]; then
+            echo "${FastPathCommands} immediate commands asked for ${asked_ms}ms of pause; the wall clock read ${fast_ms}ms (ceiling ${FastPathCeilingMs}ms)"
+        else
+            echo "${FastPathCommands} immediate commands asked for ${asked_ms}ms of pause; the wall clock produced no usable reading, and is not the verdict (ceiling ${FastPathCeilingMs}ms)"
+        fi
+        # A census returning zero needs a positive control. Without this the whole
+        # case passes vacuously the day the record stops being written: the
+        # ceiling comparison would read `0 -gt 2000` and be delighted, which is
+        # precisely the regression a reviewer replacing `_e2e_bounded_pause` with
+        # a bare `sleep` would introduce.
+        #
+        # It reads zero as LOST rather than as a very fast bound, and the one host
+        # property that would make that wrong is bash reaping the background child
+        # before the very next builtin runs, which would cost a call zero polls.
+        # Measured, 40 runs of this case: **800 of 800 calls polled exactly once**,
+        # every total 200 ms, none lower. Stated rather than assumed, because it is
+        # a property of the shell's SIGCHLD timing and not of anything here -- and
+        # a host that did reap that fast would report this as a defect when the
+        # fast path had in fact become perfect.
+        if [ "$asked_ms" -le 0 ]; then
+            echo "BUG: run_bounded recorded no pause at all over ${FastPathCommands} commands,"
+            echo "BUG: so the ledger was lost and this case asserted nothing"
+        elif [ "$asked_ms" -gt "$FastPathCeilingMs" ]; then
             echo "BUG: the bound is sleeping through commands that have already finished"
+        elif [ "$reading" -eq 1 ] && [ "$fast_ms" -gt "$FastPathCeilingMs" ]; then
+            # THE FOURTH READING. Three causes can put the measured cost over the
+            # ceiling while the pause asked for stays normal, and they are fixed
+            # by three different people:
+            #
+            #   * the host was slow, or its clock stepped forward (#1058);
+            #   * `run_bounded` got MORE EXPENSIVE PER CALL -- twenty of them land
+            #     inside this measurement, so a change that adds one fork per call
+            #     arrives here as a breach and reads exactly like a slow host.
+            #
+            # Neither can be told from the other in ONE reading, so this does not
+            # guess. It prints the per-call overhead, which is the quantity that
+            # actually separates them, and names both causes -- the rule this
+            # repository already states for a lower Raft term: report what is
+            # OBSERVED, name both causes, and say that the RATE separates them. A
+            # confident wrong signal is worse than a vague right one.
+            #
+            # The baseline is `FastPathBaselineMsPerCall`, which carries the
+            # measurement and the conditions it was taken under. NAMED here and
+            # not restated: the version of this that wrote the number out in the
+            # message below drifted the day #1077 added a fork per call, while
+            # the paragraph forbidding exactly that sat four lines above it.
+            overhead_ms=$(( fast_ms - asked_ms ))
+            echo "SLOW: run_bounded asked for ${asked_ms}ms of pause, well inside the ${FastPathCeilingMs}ms"
+            echo "SLOW: ceiling, and the wall clock still read ${fast_ms}ms -- ${overhead_ms}ms of overhead"
+            echo "SLOW: over ${FastPathCommands} commands, $(( overhead_ms / FastPathCommands ))ms per call against a ${FastPathBaselineMsPerCall}ms baseline."
+            echo "SLOW: That is the host, its clock, or a run_bounded that got more expensive per"
+            echo "SLOW: call -- one reading cannot say which, and the rate does. Reported, not failed."
         fi
         ;;
 
@@ -859,11 +1107,30 @@ run_case() {
     # An ORDINARY ROW rather than a second bespoke block: it asserts a threshold
     # and prints nothing anyone needs on the passing path, so `expect` covers it.
     bounded-fast-path-bites)
+        # Against the pause ASKED FOR, for the reason the case above gives at
+        # length. This is the half that was actually going red: the staged defect
+        # measured 2966ms, 2904ms and 2879ms against a 3000ms floor on a
+        # contended host, and a defect cannot come in SHORT by being slow. Twenty
+        # `sleep 0.2` calls were requested and performed every time -- counted --
+        # and the clock lost the difference.
+        #
+        # The floor now bounds an exact quantity, which makes it a stronger guard
+        # than it was rather than a relaxed one: the worry recorded at
+        # `FastPathCommands` is that halving the count would halve the separation
+        # with nothing going red, and halving it now takes the requested total
+        # from 4000ms to 2000ms, straight through this floor.
         _e2e_bounded_pauses=()
-        fast_ms="$(fast_path_ms)"
-        echo "the staged flat-pause defect measured ${fast_ms}ms over ${FastPathCommands} commands (ceiling ${FastPathCeilingMs}ms, floor ${FastPathDefectFloorMs}ms)"
-        if [ "$fast_ms" -le "$FastPathDefectFloorMs" ]; then
-            echo "BUG: the staged defect came in under ${FastPathDefectFloorMs}ms, so the ceiling"
+        # Reported and not fatal, for the reason the case above gives.
+        if fast_ms="$(fast_path_ms)"; then reading=1; else reading=0; fast_ms=""; fi
+        asked_ms="$(fast_path_asked_ms)"
+        if [ "$reading" -eq 1 ]; then
+            clock="the wall clock read ${fast_ms}ms"
+        else
+            clock="the wall clock produced no usable reading"
+        fi
+        echo "the staged flat-pause defect asked for ${asked_ms}ms of pause over ${FastPathCommands} commands; ${clock} (ceiling ${FastPathCeilingMs}ms, floor ${FastPathDefectFloorMs}ms)"
+        if [ "$asked_ms" -le "$FastPathDefectFloorMs" ]; then
+            echo "BUG: the staged defect asked for under ${FastPathDefectFloorMs}ms of pause, so the ceiling"
             echo "BUG: no longer separates a healthy run from a broken one"
         fi
         ;;
@@ -876,9 +1143,20 @@ run_case() {
     # `0,243` evaluates to 243 through bash's comma operator, and a separatorless
     # `4` becomes 4ms for four seconds of sleeping. Both would report a healthy
     # bound over a broken one, which is this check's one intolerable outcome, so
-    # the arm that stops them is asserted rather than assumed. `%3R` produces none
-    # of them today; a `TIMEFORMAT` edit is what produces them tomorrow, and it
-    # would look like nothing had happened.
+    # the arm that stops them is asserted rather than assumed.
+    #
+    # **"`%3R` produces none of them today" stood here and is FALSE** -- it was
+    # written expecting a `TIMEFORMAT` edit to be what broke the shape tomorrow.
+    # `%3R` produced `/.044` on an ordinary run of this check (#1058): the wall
+    # clock stepped backwards far enough that the interval ended before it began,
+    # and bash renders a negative second by decrementing the digit character, so
+    # `'0' - 1` is `/`. The guard caught it and refused BY NAME, which is the only
+    # reason the run said something true rather than reporting 44 ms for a third
+    # of a second of work.
+    #
+    # So this is no longer a predicate kept against a hypothetical future edit. It
+    # has been watched firing on real output, and what produces the malformed
+    # reading is the host, not the format string.
     duration-reading-shape)
         # A TALLY and not a fixed sentence, so the summary line is a second
         # signal rather than a marker that prints whatever the arms did: a
@@ -1741,7 +2019,7 @@ cases=(
     "bounded-124-is-not-a-timeout|0|a command exiting 124: rc=124 outcome=finished|a ceiling expiring:    rc=124 outcome=exceeded"
     "bounded-kills-the-child|0|the bound exited 124|!BUG:"
     "duration-reading-shape|0|accepted 3 readings and refused 7|!BUG:"
-    "bounded-fast-path-bites|0|the staged flat-pause defect measured|!BUG:"
+    "bounded-fast-path-bites|0|the staged flat-pause defect asked for|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
     "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
@@ -1950,13 +2228,23 @@ echo "== run_bounded does not sleep away the fast path"
 out="$( bash "${BASH_SOURCE[0]}" --case bounded-fast-path 2>&1 )"
 status=$?
 ran=$(( ran + 1 ))
-expect "bounded-fast-path|0| immediate commands ran in |!BUG:" "$out" "$status" \
+expect "bounded-fast-path|0| immediate commands asked for |!BUG:" "$out" "$status" \
     || note_failure "bounded-fast-path"
 # UNCONDITIONALLY, pass included. A bound that prints its figure only when it
 # breaks cannot show its margin eroding until the day it fails -- the same shape
 # as a counter this project exports and nobody scrapes. The number is the
 # evidence; `PASSED` on its own is not.
-sed -n 's/^[0-9][0-9]* immediate/   &/p' <<< "$out"
+#
+# **AND THE `SLOW:` LINES, which this filter silently dropped.** `SLOW:` is not a
+# failure -- that is the whole point of it, the host being slow is not the
+# helper's fault -- so it never reaches `expect`'s failure dump either, and a
+# filter anchored on the measurement line alone made the one report that
+# distinguishes *the host was slow* from *the helper did not bite* invisible on
+# every run that produced it. Measured: 30 runs of the after-rate for #1058
+# produced a 2631 ms healthy reading against the 2000 ms ceiling -- a `SLOW:`
+# report, emitted by the case and shown to nobody. A separation nothing prints is
+# the paragraph above happening to the line below it.
+sed -n -e 's/^[0-9][0-9]* immediate/   &/p' -e 's/^SLOW:/   &/p' <<< "$out"
 
 # --- no fixture spells `timeout` again -------------------------------------
 #
