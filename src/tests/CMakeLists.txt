@@ -4295,3 +4295,45 @@ set_tests_properties("node-reloadable-docs-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# ---------------------------------------------------------------------------
+# A script that guards one prerequisite and then uses a second unguarded one reports a
+# missing tool as a failed read (#1038, #1052).
+#
+# The audit that closed #1038 was run BY HAND, and a hand audit is exact about what it
+# looked at and silent about what it did not -- so it cannot see the thirteenth script.
+#
+# The population is INVOCATIONS, never guards: a set derived from what the tree guards
+# cannot contain a tool guarded nowhere, which is exactly the pre-bug state, and at
+# `ed295468` such a set holds no `jq` at all. Optional tools are a short seed unioned
+# with what the tree is seen to guard; the one PREREQUISITE row is typed because a
+# missing row there is a false positive noticed on the first run, where a missing seed
+# row is a silent false negative.
+add_test(
+    NAME "unguarded-prerequisites"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-unguarded-prerequisites.sh"
+)
+set_tests_properties("unguarded-prerequisites" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 300
+)
+
+# Five cases, both directions, and two of them are the ones with teeth.
+#
+# The POSITIVE CONTROL runs against `check-pr-closing-keywords.sh` at `ed295468` and must
+# name the unguarded `jq`. If that commit is unreachable the self-test REFUSES rather
+# than skipping: it is the only case proving this check can fail at all, so a shallow
+# clone must not read as green.
+#
+# The HEREDOC PAIR is two fixtures differing only by the wrapper -- the same invocation
+# inside a quoted heredoc must not be flagged and bare must be. A build that stopped
+# skipping heredocs reddens the first; one that skipped too much greens the second, so
+# neither can pass vacuously.
+add_test(
+    NAME "unguarded-prerequisites-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-unguarded-prerequisites.sh" --self-test
+)
+set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 300
+)
