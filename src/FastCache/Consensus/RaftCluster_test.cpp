@@ -147,11 +147,15 @@ TEST_CASE("A minority partition cannot elect or commit", "[consensus][raft][clus
     // The property that makes a quorum a quorum -- and it is about *committing*,
     // not about who calls themselves leader.
     //
-    // An isolated node that was already leader keeps reporting itself leader:
-    // nothing here deposes it. A leader does now track whether a majority still
-    // answers it -- that is what lets it refuse a challenger's pre-vote -- but
-    // ACTING on that answer by stepping down is a separate mechanism, as is a
-    // leader lease. An isolated *follower* keeps standing for election and keeps
+    // An isolated node that was already leader keeps reporting itself leader for
+    // a while, and then stops: since issue #437 its own `Tick` relinquishes
+    // leadership once a majority has stopped answering it, so the role this case
+    // reads is a snapshot rather than a fixture -- which is exactly why the
+    // assertions below are about commitment and never about who calls themselves
+    // leader. (This comment used to say that acting on that answer was "a
+    // separate mechanism"; it stopped being one at #437 and nobody corrected the
+    // claim, which is what issue #1061 cost.) A leader lease is still a separate
+    // mechanism. An isolated *follower* keeps standing for election and keeps
     // losing. Either way the guarantee is the same and it is the one asserted
     // here: nothing the minority does can be committed.
     RaftClusterHarness cluster { { "n1", "n2", "n3" } };
@@ -655,6 +659,64 @@ TEST_CASE("A healthy cluster never changes term", "[consensus][raft][cluster][pr
     // carry a raised term while the leader's stayed put.
     for (auto const& id: { "n1", "n2", "n3" })
         CHECK(cluster.At(id).driver->Node().CurrentTerm() == term);
+
+    RequireNoViolations(cluster);
+}
+
+TEST_CASE("A cluster of one that admits a second member keeps leading", "[consensus][raft][cluster][membership]")
+{
+    // The arrangement that has no recovery, and the reason it is the discriminator
+    // rather than the four-member one. Growing from one member to two doubles the
+    // quorum at the instant the configuration is adopted, and the member it adds
+    // has by construction never answered -- so a leader deposed for that silence
+    // needs a vote from a node holding no configuration, which grants none. There
+    // is no second candidate and no later term: both machines stay up, healthy and
+    // leaderless.
+    //
+    // At three members and above somebody else can campaign, so the same defect
+    // presents as an election storm that eventually settles -- which is why a case
+    // asserting only that a leader exists eventually passes under it.
+    RaftClusterHarness cluster { { "n1" } };
+    REQUIRE(SettleOnLeader(cluster));
+    REQUIRE(Unwrap(cluster.Leader()) == "n1");
+
+    cluster.Join("n2");
+    cluster.Run(30);
+    REQUIRE_FALSE(cluster.At("n2").driver->Node().HasCluster());
+
+    auto const term = Unwrap(cluster.TermOfLeader());
+    REQUIRE(cluster.ProposeMembershipOnLeader({ "n1", "n2" }).has_value());
+
+    // The admitted member's first answer does not arrive inside one heartbeat, and
+    // the case says nothing without that. The harness delivers in one to three
+    // steps, so a proposal answered by the very next step reaches the leader before
+    // its own heartbeat falls due and the defect is stepped straight over -- this
+    // case passed against it, measured, before the delay was added. What produces
+    // it in the field is ordinary: a leader's durability write and a joiner's first
+    // reply both happen before any contact can be recorded, and on a sanitizer
+    // build they are not reliably done inside 50 ms.
+    //
+    // Four steps, not more: the answer must still land inside the window a member
+    // admitted at this instant is owed, so a partition long enough to outlast that
+    // window would take the leader down under the fix as well and assert nothing.
+    cluster.Partition({ "n1" });
+    cluster.Run(4);
+    cluster.Heal();
+    cluster.Run(120);
+
+    // Named, and in the same term: "somebody leads" is what the four-member
+    // arrangement answers under the defect too, after four terms of churn. What
+    // distinguishes this is that the node which proposed the change is still the
+    // one leading, and that admitting a member cost no election at all.
+    CHECK(cluster.Leader() == std::optional<NodeId> { "n1" });
+    CHECK(cluster.TermOfLeader() == std::optional<Term> { term });
+
+    // And the member it admitted was actually replicated to, which is what makes
+    // the assertion above a property of the cluster rather than of one node's
+    // opinion of itself.
+    CHECK(cluster.At("n2").driver->Node().HasCluster());
+    CHECK(cluster.At("n2").driver->Node().ActiveMembers().size() == 2);
+    CHECK(cluster.At("n2").driver->Node().KnownLeader() == std::optional<NodeId> { "n1" });
 
     RequireNoViolations(cluster);
 }

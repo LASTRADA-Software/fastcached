@@ -694,6 +694,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A leader and a follower stamp the same link half a round trip apart, so a shared
   window never bought a shared answer. A non-leader decides a pre-vote from its own
   `_knownLeader` and election deadline, never from a timestamp.
+- CheckQuorum DEPOSES a leader here — the rulebook said for months that nothing did,
+  and #1061 is what that cost. It measures SILENCE, and a member admitted a moment
+  ago has not been silent, it has not been ASKED: adopting the configuration grows
+  the quorum before the new member can have answered, so the leader deposes itself
+  at its next heartbeat. `RaftNode` counts THAT peer, by id, for one
+  `electionTimeoutMin` — never by seeding `_followerContact`, whose absence means
+  something else and which pre-vote reads too. At two members the arithmetic cannot
+  be satisfied and nothing recovers, because the member just admitted holds no
+  configuration and so grants no votes; at three and above somebody else campaigns,
+  so it presents as an election storm that settles and every *a leader exists
+  eventually* test passes under it. `undecided` in a node log is
+  `SchedulerRole::Undecided`, not a Raft role.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.

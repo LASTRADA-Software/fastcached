@@ -323,6 +323,21 @@ class RaftNode
     [[nodiscard]] RaftOutput Receive(RaftMessage const& message, TimePoint now);
 
   private:
+    /// A member this leader has admitted, and when its configuration adopted it.
+    ///
+    /// A pair rather than two fields, so the id and the instant cannot be set
+    /// apart: an instant with no id excuses whichever peer is silent, which is a
+    /// different and wrong rule — a leader would then go on counting a member that
+    /// died before the admission.
+    struct AdmittedMember
+    {
+        /// Who was admitted.
+        NodeId id;
+
+        /// When the configuration counting it was adopted.
+        TimePoint at;
+    };
+
     /// Private, so `Create` is the only way in and its validation cannot be
     /// bypassed by omission.
     /// @param config A configuration that has already passed `Validate()`.
@@ -587,6 +602,48 @@ class RaftNode
     /// which is why `BecomeLeader` clears it and fills it from the votes that
     /// were actually cast rather than from the peer list.
     std::unordered_map<NodeId, TimePoint> _followerContact;
+
+    /// The member this leader admitted, and the instant its configuration adopted
+    /// it.
+    ///
+    /// CheckQuorum measures SILENCE, and silence is only measurable against
+    /// something that would otherwise have been said. Adopting a configuration
+    /// grows the quorum the moment the entry is appended, which is the rule that
+    /// makes the change committable at all — so the member it adds is counted
+    /// before anything has been asked of it, and `_followerContact`'s absence means
+    /// *not yet asked* for that one member rather than *went quiet*. Read as
+    /// silence, a healthy leader is deposed by its own next heartbeat for a lack of
+    /// contact that could not have existed.
+    ///
+    /// Kept OUT of `_followerContact` deliberately: seeding that map would be a
+    /// record of a response nobody sent, and every reader of it — CheckQuorum here,
+    /// and pre-vote through `HasLiveLeader` — would be reading a claim that is
+    /// false. Its own comment says so, and `BecomeLeader` fills it from the votes
+    /// actually cast for exactly that reason.
+    ///
+    /// One entry rather than a map, because `ProposeMembership` admits exactly one
+    /// member at a time and refuses a second until the first has committed.
+    ///
+    /// It is NOT cleared when the member finally answers, and does not need to be:
+    /// the grace it grants is one `electionTimeoutMin` from the ADMISSION, while
+    /// the contact record that answer writes runs one from an instant that is
+    /// never EARLIER — the response is handled after the proposal that provoked it
+    /// — so from the first answer onwards `_followerContact` closes no sooner than
+    /// this does, and is read first, and this one can no longer decide anything. A
+    /// clear on the answer path would be a second rule to keep in step for no
+    /// change in behaviour.
+    ///
+    /// "Never earlier" rather than "strictly later" on purpose: the two instants
+    /// are whatever a caller passed, and a clock coarse enough to report the same
+    /// one twice makes them EQUAL. The conclusion holds under equality and would
+    /// not need to be revisited; a claim of strictness would be false there, and
+    /// this is exactly the kind of reason that gets carried one clause too far.
+    ///
+    /// Only a leader reads it, and `BecomeLeader` clears it — so the one moment it
+    /// could be read again after this node stops leading is the moment it is
+    /// discarded, and there is no separate clear on the step-down paths to keep in
+    /// step with those.
+    std::optional<AdmittedMember> _admitted;
 
     /// Voters that granted this node their vote in the current term, itself
     /// included. A set rather than a counter because a retransmitted response
