@@ -1297,3 +1297,146 @@ TEST_CASE("NarrationLevel: quieting a survey must not quieten what it found", "[
     CHECK(NarrationLevel(SurveyVoice::Routine) < NarrationLevel(SurveyVoice::Announce));
     CHECK(NarrationLevel(SurveyVoice::Routine) >= FastCache::LogLevel::Debug);
 }
+
+TEST_CASE("NodeToolchains: an empty survey says WHICH of the two empties it is", "[node][toolchains]")
+{
+    // **#1060.** `toolchains.empty()` answered one question for two opposite machines:
+    // one whose every compiler RAN and was refused -- a configuration error, correctly
+    // fatal -- and one whose every compiler could not be ASKED, which may be over by
+    // the next heartbeat. Both exited the daemon with `ExitUsage`, and the searched
+    // machine was told "found no compiler on this machine" while holding compilers it
+    // could not spawn.
+    //
+    // The assertion is what DISTINGUISHES them, and it has to be: both refuse, both
+    // serve nothing, both log an error, and a case asserting any of that passes under
+    // the bug. This is the argument "Cancelled must not read as NothingToServe" makes
+    // three cases up, for a third state.
+    NodeConfig const cfg = Startable();
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+
+    SECTION("every candidate could not be asked, so the node is not misconfigured")
+    {
+        FixedDiscovery discovery { { Candidate("/opt/a/g++"), Candidate("/opt/b/clang++") } };
+        SpawnScript runner;
+        runner.Unspawnable("/opt/a/g++").Unspawnable("/opt/b/clang++");
+        CapturingLogger logger;
+
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        auto const surveyed =
+            FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {});
+
+        CHECK(surveyed.outcome == SurveyOutcome::NoneCouldBeAsked);
+        CHECK(surveyed.served.empty());
+
+        // The sentence that was false: compilers WERE found, and telling this operator
+        // to install one sends them to fix something that is not broken.
+        CHECK_FALSE(Logged(logger, "found no compiler on this machine"));
+        // And it is not the startup refusal, whose presence is what makes the node exit.
+        CHECK_FALSE(Logged(logger, "no toolchain to serve: "));
+    }
+
+    SECTION("every candidate ran and was refused, which stays fatal")
+    {
+        // `Speechless` spawns and says nothing, which is a driver this build cannot
+        // identify -- an ANSWER, and a configuration error that will still be there
+        // next beat.
+        FixedDiscovery discovery { { Candidate("/opt/a/g++"), Candidate("/opt/b/clang++") } };
+        SpawnScript runner;
+        runner.Speechless("/opt/a/g++").Speechless("/opt/b/clang++");
+        CapturingLogger logger;
+
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        auto const surveyed =
+            FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {});
+
+        CHECK(surveyed.outcome == SurveyOutcome::NothingToServe);
+        CHECK(surveyed.served.empty());
+        CHECK(Logged(logger, "no toolchain to serve"));
+    }
+
+    SECTION("a probe that never ran is the OTHER transient route, one layer down")
+    {
+        // `Unprobeable` spawns for the banner and fails the include probe, which is
+        // `Cc::IdentityDefect::UnrunProbe` -- documented as transient by nature, and
+        // the reason the classification reads the DEFECT rather than counting drops
+        // at one site. `CanSpawn` is happy here, so this cannot reach the discovery
+        // counter at all.
+        FixedDiscovery discovery { { Candidate("/opt/a/g++") } };
+        SpawnScript runner;
+        runner.Unprobeable("/opt/a/g++");
+        CapturingLogger logger;
+
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        REQUIRE_FALSE(Unwrap(discovered).entries.empty()); // it DID spawn; the drop is later
+        auto const surveyed =
+            FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {});
+
+        CHECK(surveyed.outcome == SurveyOutcome::NoneCouldBeAsked);
+    }
+
+    SECTION("one transient and one decided departure stays fatal")
+    {
+        // The transient half does not excuse the decided half: this machine has a real
+        // defect an operator must fix, so retrying forever would hide it.
+        FixedDiscovery discovery { { Candidate("/opt/a/g++"), Candidate("/opt/b/clang++") } };
+        SpawnScript runner;
+        runner.Unspawnable("/opt/a/g++").Speechless("/opt/b/clang++");
+        CapturingLogger logger;
+
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        auto const surveyed =
+            FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {});
+
+        CHECK(surveyed.outcome == SurveyOutcome::NothingToServe);
+    }
+
+    SECTION("a mixed machine is unchanged: it serves what it has")
+    {
+        FixedDiscovery discovery { { Candidate("/opt/a/g++"), Candidate("/opt/b/clang++") } };
+        SpawnScript runner;
+        runner.Unspawnable("/opt/b/clang++");
+        CapturingLogger logger;
+
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        auto const surveyed =
+            FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {});
+
+        CHECK(surveyed.outcome == SurveyOutcome::Served);
+        CHECK(surveyed.served.size() == 1);
+    }
+}
+
+TEST_CASE("NodeToolchains: the two empty surveys do not report the same outcome", "[node][toolchains]")
+{
+    // The discrimination stated as its own property, because the sections above could
+    // all be satisfied by a build that answered `NoneCouldBeAsked` for BOTH -- each
+    // asserts one arm, and neither can see the collapse the ticket is about. Here the
+    // two runs differ in nothing but what the compilers DO, and the outcomes are
+    // compared to each other rather than to a constant.
+    NodeConfig const cfg = Startable();
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+
+    auto surveyWith = [&](auto&& program) {
+        FixedDiscovery discovery { { Candidate("/opt/a/g++") } };
+        SpawnScript runner;
+        program(runner);
+        CapturingLogger logger;
+        auto const discovered = DiscoverToolchainEntries(cfg, &discovery, runner, logger);
+        REQUIRE(discovered.has_value());
+        return FingerprintToolchains(Unwrap(discovered), runner, host, TestClock(), logger, std::stop_token {}).outcome;
+    };
+
+    auto const unaskable = surveyWith([](SpawnScript& r) { r.Unspawnable("/opt/a/g++"); });
+    auto const refused = surveyWith([](SpawnScript& r) { r.Speechless("/opt/a/g++"); });
+
+    CHECK(unaskable != refused);
+    CHECK(unaskable == SurveyOutcome::NoneCouldBeAsked);
+    CHECK(refused == SurveyOutcome::NothingToServe);
+}
