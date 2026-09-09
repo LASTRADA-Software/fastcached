@@ -22,10 +22,14 @@ bool LeaseTable::IsLive(Entry const& entry, TimePoint now) const noexcept
     // backwards in a test must not read as an enormous age and expire everything.
     if (now < entry.issuedAt)
         return true;
-    return std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.issuedAt) <= _leaseTimeout;
+    // The entry's OWN bound, never `_leaseTimeout`. The lifetime is a replicated
+    // setting since #522, so reading the table's current value here would re-judge a
+    // grant already minted the moment an operator changed it -- expiring live leases
+    // whose tokens the fleet still considers good, or extending ones it does not.
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - entry.issuedAt) <= entry.lease.lifetime;
 }
 
-std::optional<Lease> LeaseTable::Acquire(std::string_view key, std::string_view workerId)
+std::optional<Lease> LeaseTable::Acquire(std::string_view key, std::string_view workerId, std::chrono::milliseconds lifetime)
 {
     std::scoped_lock const guard { _mutex };
     auto const now = _clock.Now();
@@ -45,7 +49,9 @@ std::optional<Lease> LeaseTable::Acquire(std::string_view key, std::string_view 
         _tokenByKey.erase(existing);
     }
 
-    Lease lease { .token = std::format("l{}", _nextToken++), .workerId = std::string { workerId }, .key = keyStr };
+    Lease lease {
+        .token = std::format("l{}", _nextToken++), .workerId = std::string { workerId }, .key = keyStr, .lifetime = lifetime
+    };
     _tokenByKey.emplace(keyStr, lease.token);
     _byToken.emplace(lease.token, Entry { .lease = lease, .issuedAt = now });
     return lease;

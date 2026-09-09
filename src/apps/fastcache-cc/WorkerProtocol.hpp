@@ -11,6 +11,7 @@
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -22,6 +23,60 @@
 
 namespace FastCache::Cc
 {
+
+/// What a validator answers: whether the job may run, and until when.
+///
+/// **Two things, because the second one had nowhere to go and the caller needed it.**
+/// The validator derives the grant's expiry -- it has to, since that is what decides
+/// acceptance -- and used to return none of it, so the surface that goes on to spend
+/// minutes compiling had no idea when the fleet stops wanting the answer. That is the
+/// shape AGENT.md's caching principle names: a wider return value is the stronger fix,
+/// not merely the cheaper one, because the alternative is a caller re-deriving what
+/// this already computed, and two derivations of one fact can disagree.
+///
+/// **A struct rather than `std::expected<LeaseGrant, LeaseRefusal>`, and the reason is
+/// a hazard rather than a preference.** This project's default for a fallible answer is
+/// `std::expected`, and here it would INVERT `has_value()` at every existing call site
+/// and in every test that inspects a validator's answer -- `if (result.has_value())`
+/// goes on compiling and starts meaning the opposite. A plain aggregate has no
+/// `has_value()`, so every site that must be re-read fails to build instead. The
+/// deviation is stated because it is a deviation.
+struct LeaseDecision
+{
+    /// Why the job may not run, or nothing when it may.
+    std::optional<Distributed::LeaseRefusal> refusal;
+
+    /// How long this job may still usefully run, measured when the grant was checked.
+    ///
+    /// **A duration rather than the `expiresAt` instant it is derived from**, which is
+    /// this repository's standing rule and not a preference: a raw `TimePoint` on a
+    /// report invites the consumer to subtract `now()` from it, which is right in
+    /// production and silently wrong under every manual clock, because the two clocks
+    /// agree about nothing. `WorkerInfo`'s heartbeat age is a duration for that reason
+    /// and this is the same shape. Handed a duration, the caller compares it against the
+    /// elapsed time it already measures with a steady clock -- so the comparison is
+    /// monotone and a wall clock stepping mid-compile cannot move it.
+    ///
+    /// **Measured against the same acceptance window the verifier used, slack included.**
+    /// The tempting alternative -- the grant's bare expiry, on the reasoning that slack
+    /// is for boundaries and this is a budget -- reintroduces the defect the slack
+    /// exists to prevent: a worker whose clock runs minutes fast would compute a
+    /// negative budget for every job it was legitimately granted and refuse them all,
+    /// having already done the work. So the cost is the other way round and is stated:
+    /// a job is abandoned `slack` past the point the scheduler reclaimed its key rather
+    /// than at it.
+    ///
+    /// **Disengaged is a state and not a missing value**: a worker with no cluster key
+    /// checks nothing (`UncheckedLeaseValidator`), so there is no authenticated bound for
+    /// it to report, and an engaged zero would mean *no time left* rather than *no bound*
+    /// -- which would refuse every compile on the single-machine install. That is the same
+    /// rule the toolchain evidence follows: evidence a caller may not have is a disengaged
+    /// optional, never an empty field.
+    ///
+    /// Populated only after the MAC verified, so what it is derived from is a fact the
+    /// scheduler signed rather than something the client wrote.
+    std::optional<std::chrono::milliseconds> remaining;
+};
 
 /// Decide whether a lease token authorizes a job.
 ///
@@ -56,9 +111,8 @@ namespace FastCache::Cc
 ///
 /// @param leaseToken The token the client presented.
 /// @param fingerprint The toolchain the client says it compiled against.
-/// @return Nothing when the job may run, or why it may not.
-using LeaseValidator =
-    std::function<std::optional<Distributed::LeaseRefusal>(std::string_view leaseToken, std::string_view fingerprint)>;
+/// @return Whether the job may run, and the bound it runs under.
+using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, std::string_view fingerprint)>;
 
 /// The validator a worker holding the cluster's key builds.
 ///
@@ -120,7 +174,8 @@ using LeaseValidator =
                                                   std::string advertisedEndpoint,
                                                   WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
-                                                  IMetricsSink& metrics);
+                                                  IMetricsSink& metrics,
+                                                  std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack);
 
 /// The validator a worker with no cluster key builds: it refuses nothing.
 ///

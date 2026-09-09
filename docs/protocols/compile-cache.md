@@ -189,7 +189,7 @@ over anything.
 ```
 REGISTER   [fingerprint][endpoint][slots][codecs][capacity] -> [workerId]
 HEARTBEAT  [workerId][inFlight][load]                       -> Ok
-LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs]
+LEASE      [fingerprint][objectKey][codecs]                 -> [endpoint][leaseToken][workerCodecs][leaseLifetime]
 COMPILE    [leaseToken][fingerprint][args][source][codecs][sourceName]
                                               -> [exitCode][object][stdout][stderr][correlation]
 RELEASE    [leaseToken][objectKey]                          -> Ok
@@ -291,7 +291,25 @@ A `RELEASE` the scheduler cannot match is refused
 `unknown-lease` rather than accepted quietly. That is the diagnostic for a job
 that outlived its lease, which means the fleet's lease timeout is shorter than its
 slowest translation unit — and there is nowhere else that fact could be observed.
-The client does nothing about it either way: it has its object already.
+The client does nothing about it either way; whether it has an object depends on the
+worker, which declines to serve one produced past the grant's own expiry
+(`lease-expired`), because by then the scheduler has reclaimed the key and may have
+re-granted it. Either way the invocation falls back to a local compile, and the
+remedy is the same: raise `lease-lifetime`.
+
+**How long a lease lives travels on the grant**, as `leaseLifetime`, in the clear
+beside the token. It is a replicated cluster setting (`lease-lifetime`) rather than a
+constant each end compiles in, so the number has to reach the client somehow — and
+the client holds no cluster key, so reading it out of the token's authenticated
+claims is not open to it. Handing it a way to read claims *without* checking them
+would put exactly the primitive the MAC-first rule forbids into a header every binary
+includes; what the client needs is not a claim about the token but its own budget,
+from the scheduler that is already telling it which worker to dial.
+
+The worker reads the same number from inside the MAC, where it belongs, because the
+worker *can* verify. Both ends therefore bound the same job by the same value, and
+the scheduler reclaims the key at it. A grant already minted keeps the bound it was
+issued under, whatever the setting does afterwards.
 
 ### Bulk fields carry a codec envelope
 

@@ -1642,3 +1642,142 @@ TEST_CASE("A caller context outlives the storage its peer id came from", "[distr
     REQUIRE(caller.has_value());
     CHECK(caller->peerId == LongPeer);
 }
+
+namespace
+{
+
+/// A cluster whose replicated state a case writes directly.
+///
+/// The scheduler reaches replicated state through `IClusterAdmin`, so this is the seam
+/// production uses and not one cut for the test. It proposes nothing -- every case here
+/// is about what a scheduler READS from an already-agreed state, and a fake that also
+/// implemented consensus would be asserting somebody else's code.
+class StubCluster final: public IClusterAdmin
+{
+  public:
+    Cluster::ClusterState state;
+
+    [[nodiscard]] Cluster::ClusterState ClusterState() const override
+    {
+        return state;
+    }
+
+    [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
+    {
+        return {};
+    }
+
+    /// Put a setting into replicated state, as an accepted `--cluster-set` would.
+    /// @param name The key.
+    /// @param value Its value.
+    void Set(std::string_view name, std::string_view value)
+    {
+        state.settings.push_back(Cluster::Setting { .name = std::string { name }, .value = std::string { value } });
+    }
+};
+
+/// How long the grant in `reply` says it lives.
+/// @param reply What `Lease` answered.
+/// @return The lifetime the client would bound its wait by.
+[[nodiscard]] std::chrono::milliseconds LifetimeOf(SchedulerReply const& reply)
+{
+    auto const grant = Wire::DecodeLeaseGrant(reply.payload);
+    REQUIRE(grant.has_value());
+    return Unwrap(grant).lifetime;
+}
+
+} // namespace
+
+TEST_CASE("A lease is granted for as long as the CLUSTER agreed, not for as long as this build was compiled with",
+          "[distributed][scheduler][lease]")
+{
+    // **The three-ends case, and it is the whole of #522.** The ticket's premise was
+    // that the replicated lease timeout is the lever a site raises to say its
+    // translation units are long. It was the right lever and it was not connected to
+    // anything: the scheduler, the worker and the client each read one compile-time
+    // constant, and `ClusterState::SettingOf` had no production caller in the tree at
+    // all. Raising the setting moved nothing.
+    //
+    // What is asserted here is the number leaving the scheduler -- on the LEASE reply,
+    // which is what the CLIENT bounds its wait by. A case asserting only the table's
+    // internal bookkeeping would pass against a scheduler that agreed with itself and
+    // told nobody.
+    Leading fleet;
+    StubCluster cluster;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
+
+    SECTION("with no cluster at all, the built-in default: the one-machine install")
+    {
+        // Deliberately never calls `AdministerWith`. A node with no consensus has no
+        // replicated state to read and must keep working with no configuration, so
+        // this is the arm that would break every single-machine deployment.
+        auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(granted.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(granted) == Wire::DefaultCompileLeaseTimeout);
+    }
+
+    SECTION("a cluster that has agreed nothing gets the default too")
+    {
+        fleet.service.AdministerWith(cluster);
+        auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(granted.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(granted) == Wire::DefaultCompileLeaseTimeout);
+    }
+
+    SECTION("a cluster that has agreed a longer lifetime gets that one")
+    {
+        // The case the ticket is about: a site says its translation units are long, in
+        // the one place every member reads.
+        cluster.Set(Cluster::LeaseLifetimeSetting, "2400000");
+        fleet.service.AdministerWith(cluster);
+
+        auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(granted.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(granted) == std::chrono::milliseconds { 2'400'000 });
+        // Distinct from the default, stated rather than left implied: a build that
+        // ignored the setting entirely would answer the default, and 2'400'000 is only
+        // meaningful as an assertion because it is not that.
+        CHECK(LifetimeOf(granted) != Wire::DefaultCompileLeaseTimeout);
+    }
+
+    SECTION("a cluster that has agreed a SHORTER lifetime gets that one, because the lever is symmetric")
+    {
+        // The other direction, and it is not decoration: a build that only ever widened
+        // -- taking the max of the setting and the default, say -- passes every
+        // assertion above. A fleet of small translation units may legitimately want a
+        // shorter lease, and nothing in this ticket argues otherwise.
+        cluster.Set(Cluster::LeaseLifetimeSetting, "120000");
+        fleet.service.AdministerWith(cluster);
+
+        auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(granted.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(granted) == std::chrono::milliseconds { 120'000 });
+    }
+
+    SECTION("a value this build cannot read serves under the default and says so once")
+    {
+        // Unreachable from any build in this tree -- `Validate` refuses such a value on
+        // the leader before the append -- and reachable from a NEWER one with wider
+        // bounds, mid rolling upgrade. Refusing to schedule would take a fleet down for
+        // an upgrade rather than for a fault, so it degrades; saying nothing is what
+        // makes a degradation permanent.
+        cluster.Set(Cluster::LeaseLifetimeSetting, "as-long-as-it-takes");
+        fleet.service.AdministerWith(cluster);
+
+        auto const first = fleet.service.Lease(Insider, Ask("gcc-14", "key-1"));
+        REQUIRE(first.status == Wire::Status::Ok);
+        CHECK(LifetimeOf(first) == Wire::DefaultCompileLeaseTimeout);
+
+        auto const said = fleet.logger.Snapshot();
+        auto const mentions = std::ranges::count_if(
+            said, [](auto const& record) { return record.message.contains(Cluster::LeaseLifetimeSetting); });
+        CHECK(mentions == 1);
+        // ONCE, not once per compile: a line per dispatched job buries itself on the
+        // first parallel build, which is the same fact `_warnedUnsigned` records.
+        (void) fleet.service.Lease(Insider, Ask("gcc-14", "key-2"));
+        CHECK(
+            std::ranges::count_if(fleet.logger.Snapshot(),
+                                  [](auto const& record) { return record.message.contains(Cluster::LeaseLifetimeSetting); })
+            == 1);
+    }
+}

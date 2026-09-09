@@ -784,8 +784,9 @@ class FrameServer
     ///
     /// **Derived from the verb's own window, and it shipped once as a flat constant
     /// that was wrong by a factor of 120.** `SweepInterval * 4` resolves to five
-    /// seconds; `CompileResponder::RequestTimeout` is `DefaultCompileLeaseTimeout`,
-    /// which is six hundred. A translation unit that has just outrun a ten-minute
+    /// seconds; `CompileResponder::RequestTimeout` was `DefaultCompileLeaseTimeout` at
+    /// the time, which is six hundred -- and is `MaxCompileLeaseLifetime` since #522,
+    /// which is wider again. A translation unit that has just outrun a ten-minute
     /// grant does not return inside five seconds, so the deferral expired, the socket
     /// was closed, and the connection found nothing owed when `Answer` finally came
     /// back -- delivering the explanation reliably on the cache surface, where the
@@ -798,8 +799,11 @@ class FrameServer
     /// that makes this failure.
     ///
     /// So the rule is: **a responder gets at most twice its own budget before the
-    /// socket goes.** Ten seconds on the cache, twenty minutes on a compile; both
-    /// bounded, both proportional to what the surface itself said its work costs, and
+    /// socket goes.** Ten seconds on the cache, and twice `MaxCompileLeaseLifetime` on
+    /// a compile -- two hours since #522 widened that ceiling, where it was twenty
+    /// minutes before. Stated as the RULE rather than as a figure, because the figure
+    /// moves with a constant this file does not own: both bounded, both proportional to
+    /// what the surface itself said its work costs, and
     /// neither able to drift from `RequestTimeout` because it is the same number. No
     /// flag and no new virtual -- the value comes from a question the endpoint
     /// already asks at the point it arms the answer window.

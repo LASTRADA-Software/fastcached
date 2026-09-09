@@ -5,6 +5,7 @@
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -91,7 +92,59 @@ struct SettingSpec
 {
     std::string_view name;    ///< The key as an operator writes it.
     std::string_view summary; ///< What it does, for `--help` and diagnostics.
+
+    /// Refuse a value this setting may not take, or null when any text will do.
+    ///
+    /// A COLUMN rather than an arm of `Validate`'s switch, because the switch is
+    /// per-verb and this is per-setting: a second constrained setting would otherwise
+    /// grow a second `if` inside `SetSetting`'s arm, and adding a setting stops being
+    /// adding a row. Null is the honest spelling for `upstream` and `fleet-open`,
+    /// whose values this build does not constrain, rather than a function that
+    /// accepts everything -- one says *nothing to check*, the other says *checked and
+    /// fine*, and only the first is true.
+    ///
+    /// Runs on the LEADER before the append, so an operator gets an error rather than
+    /// an entry replicated to every node. It REFUSES and never repairs: a clamped
+    /// value would be answered `accepted` while the cluster adopted a different
+    /// number, which is a setting that did not do what it said -- the failure this
+    /// whole table exists to prevent.
+    ///
+    /// @param value The value as the operator typed it.
+    /// @return Why it may not be set, or nullopt when it may.
+    std::optional<std::string> (*refuse)(std::string_view value) = nullptr;
 };
+
+/// The key naming how long a lease -- and therefore a dispatched compile -- may live.
+///
+/// One named constant rather than a literal at each site, for the reason the wire
+/// error codes are one: this string is spelled by the table row that declares it, by
+/// the scheduler that reads it back, and by the documentation, and three surfaces
+/// spelling it separately is exactly how they drift apart.
+inline constexpr std::string_view LeaseLifetimeSetting = "lease-lifetime";
+
+/// Read a `lease-lifetime` value, or say why it is not one.
+///
+/// **The one predicate both the validator and every reader ask**, rather than one
+/// constant they each compare against. Two sites that spell the comparison separately
+/// can agree about the bounds and still disagree about what parses -- which is the
+/// argument the spend-once retention window is built on, one layer along: it is the
+/// comparison that is easy to get wrong twice, not the number.
+///
+/// Declared here and defined in the translation unit, so this header does not have to
+/// include the wire constants it bounds against; `SettingTable` only needs an address.
+///
+/// @param value Milliseconds, as the operator typed them.
+/// @return The lifetime, or a sentence naming why it may not be set.
+[[nodiscard]] std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::string_view value);
+
+/// Refuse a `lease-lifetime` this cluster may not agree on.
+///
+/// The `SettingSpec::refuse` adapter over `ParseLeaseLifetime`. Separate only because
+/// the column answers *may this be set* and a reader wants the value.
+///
+/// @param value Milliseconds, as the operator typed them.
+/// @return Why it may not be set, or nullopt when it may.
+[[nodiscard]] std::optional<std::string> RefuseLeaseLifetime(std::string_view value);
 
 /// Every replicated setting, in one place.
 ///
@@ -100,9 +153,13 @@ struct SettingSpec
 /// can differ per machine because the machines differ. `--slots` is the counter-
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
-inline constexpr std::array<SettingSpec, 2> SettingTable {
+inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = "upstream", .summary = "host:port of the shared fastcached every member reads through to" },
     SettingSpec { .name = "fleet-open", .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+    SettingSpec { .name = LeaseLifetimeSetting,
+                  .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
+                             "compile, and the object coming back -- not how long a compiler may run",
+                  .refuse = &RefuseLeaseLifetime },
 };
 
 /// Whether `name` is a setting this cluster replicates.

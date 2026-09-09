@@ -433,7 +433,9 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                                               .own = available,
                                               .credential = credential,
                                               .request = request,
-                                              .budget = budgets.compile,
+                                              // The GRANT's bound, not this process's.
+                                              // `UnderGrantedLease` carries the argument.
+                                              .budget = UnderGrantedLease(budgets.compile, grant->lifetime),
                                               .maxObjectBytes = budgets.maxDecompressedBytes });
 
     // --- and hand the lease back, however that went -------------------------

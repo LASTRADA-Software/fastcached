@@ -4,11 +4,17 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <format>
 #include <ranges>
 #include <span>
+#include <system_error>
 #include <utility>
 
 namespace FastCache::Cluster
@@ -253,6 +259,68 @@ void Apply(ClusterState& state, Command const& command)
     }
 }
 
+std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::string_view value)
+{
+    namespace Wire = CompileCacheWire;
+
+    // Parsed whole, so trailing text is a refusal rather than something `from_chars`
+    // silently stops at: "600000ms" and "600 000" are both things an operator types,
+    // and adopting the prefix of either would set a number they did not write.
+    //
+    // The bounds are spelled into the call rather than hoisted into an `end` local
+    // because `bugprone-suspicious-stringview-data-usage` refuses the hoisted form, and
+    // `WarningsAsErrors` makes that a build failure rather than a comment. The check
+    // looks for `size()` in the same call as `data()`; an `end` computed one line above
+    // is a bound it cannot see. There is no defect in either spelling -- `from_chars`
+    // takes two pointers and reads no terminator -- so this is the analyser's rule being
+    // obeyed, not a hazard being avoided.
+    std::uint64_t millis = 0;
+    auto const parsed = std::from_chars(value.data(), value.data() + value.size(), millis);
+    if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size())
+        return std::unexpected(
+            std::format("{} is milliseconds, as digits: {}", LeaseLifetimeSetting, value.empty() ? "(empty)" : value));
+
+    auto const asked = std::chrono::milliseconds { millis };
+
+    // The relation `CompileCacheWire`'s static_assert can no longer cover, asked here
+    // because here is where a value first exists. An idle bound at or above the total
+    // means a healthy worker's own reactor jitter outlives the job, so the fleet reads
+    // as stopped -- and the client would give up on silence before the lease it is
+    // waiting on could possibly expire, which makes the total bound nothing.
+    if (asked <= Wire::DefaultCompileIdleTimeout)
+        return std::unexpected(
+            std::format("{} must exceed the {} ms a client tolerates in silence, or a healthy worker's own "
+                        "jitter reads as a dead one; asked for {} ms",
+                        LeaseLifetimeSetting,
+                        Wire::DefaultCompileIdleTimeout.count(),
+                        asked.count()));
+
+    // REFUSED, never clamped: see `SettingSpec::refuse`. The ceiling's own reasons are
+    // on `MaxCompileLeaseLifetime` and are about replay and about how long a member may
+    // hold a compile socket, neither of which an operator can be expected to derive.
+    if (asked > Wire::MaxCompileLeaseLifetime)
+        return std::unexpected(
+            std::format("{} may be at most {} ms, since it bounds the window a captured grant is replayable in "
+                        "across a worker restart; asked for {} ms",
+                        LeaseLifetimeSetting,
+                        Wire::MaxCompileLeaseLifetime.count(),
+                        asked.count()));
+
+    return asked;
+}
+
+std::optional<std::string> RefuseLeaseLifetime(std::string_view value)
+{
+    // A thin adapter, so the table column and every reader ask ONE function. The two
+    // could otherwise agree about the bounds and disagree about the parse -- which is
+    // the shape the acceptance/retention rule refuses for the same reason: it is the
+    // comparison, not the constant, that is easy to get wrong twice.
+    auto parsed = ParseLeaseLifetime(value);
+    if (parsed.has_value())
+        return std::nullopt;
+    return std::move(parsed).error();
+}
+
 namespace
 {
     /// What `AddMember` records; all three become a `ClusterMember`.
@@ -343,9 +411,21 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             // would otherwise be replicated to every node, snapshotted, carried across
             // restarts and do nothing -- with the only symptom being that the thing
             // the operator configured did not happen.
-            if (FindSetting(command.key) == nullptr)
-                return std::unexpected(InvalidConfiguration("no such cluster setting: " + command.key));
-            return {};
+            {
+                auto const* const spec = FindSetting(command.key);
+                if (spec == nullptr)
+                    return std::unexpected(InvalidConfiguration("no such cluster setting: " + command.key));
+
+                // The VALUE, once the key is settled. Same argument one level down: a value
+                // this build cannot act on would otherwise be replicated, snapshotted and
+                // carried across restarts while the thing the operator configured did not
+                // happen. A row with no `refuse` says this build constrains nothing here,
+                // which is a claim rather than an omission -- see `SettingSpec::refuse`.
+                if (spec->refuse != nullptr)
+                    if (auto reason = spec->refuse(command.value); reason.has_value())
+                        return std::unexpected(InvalidConfiguration(*std::move(reason)));
+                return {};
+            }
 
         // The count rather than a verb; falls out to the refusal below.
         case CommandKind::Last:
