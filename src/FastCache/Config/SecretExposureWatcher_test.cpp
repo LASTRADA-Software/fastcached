@@ -15,6 +15,8 @@
 
 #if !defined(_WIN32)
     #include <sys/stat.h>
+
+    #include <unistd.h>
 #endif
 
 using FastCache::Config;
@@ -238,9 +240,42 @@ TEST_CASE("SecretExposureWatcher: a reload reports a transition into exposure, o
         // for a file that now needs `chmod o-r`. Two exposures, two remedies; the one
         // already said no longer describes the file.
         //
-        // Not owned by root, so 0640 is `OwnersOwnGroup` rather than the delegated
-        // arrangement the packages ship.
+        // **Not owned by root, and under #870 that stopped being an assumption.** The
+        // sequence this section needs is TWO DIFFERENT exposure kinds, and only a
+        // non-administrative owner produces the first of them: owned by root, 0640 is
+        // the delegation the packages ship (`0640 root:_fastcached`) and reports
+        // nothing at all, leaving `AnyLocalAccount` as the only kind a mode change can
+        // still reach -- so there is no second kind to change TO, and the property
+        // this case exists for is not arrangeable at all.
+        //
+        // Hence a SKIP rather than the both-modes assertion the `FileTrust` case takes:
+        // there the root run has a real and BETTER expectation to assert, and here it
+        // has none. Skipping is honest about a case that cannot run; a `SUCCEED` would
+        // report a pass for a property nothing established, which `succeed-not-skip`
+        // exists to catch.
+        //
+        // Chowning the file to a non-administrative uid WOULD preserve the coverage
+        // under real root. It is deliberately not done: it could not be demonstrated
+        // from here -- an unprivileged user namespace maps only uid 0, so the chown
+        // fails, and `newuidmap` is absent -- and a fix nobody has watched fail is not
+        // a verified one.
+        if (::geteuid() == 0)
+            SKIP("running as root, so the 0640 file this fixture creates is the ADMINISTRATOR "
+                 "DELEGATION rather than an exposure, and no second exposure KIND remains for "
+                 "it to change into");
+
         auto const path = write("widens.yaml", "requirepass: hunter2\n", groupReadableMode);
+
+        // The control, for the reason its twin in `FileTrust_test.cpp` earns: the SKIP
+        // above is decided from the CALLER's euid while the verdict below is decided by
+        // the FILE's owner, and nothing else ties those two facts together. Without it
+        // a fixture that guessed its own mode wrong asserts the wrong expectation in
+        // silence, which is the failure #870 is about.
+        struct ::stat info {};
+
+        REQUIRE(::stat(path.c_str(), &info) == 0);
+        REQUIRE((info.st_uid == 0) == (::geteuid() == 0));
+
         Watched watched { path, "hunter2" };
         REQUIRE(watched.said.size() == 1);
         CHECK(watched.said.front().contains("chmod g-r"));
