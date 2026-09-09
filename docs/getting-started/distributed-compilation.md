@@ -517,6 +517,7 @@ start it with `--admin-listen` and these count the outcomes.
 | `fastcached_dispatch_workers_expired_total` | A machine stopped heartbeating and was dropped. Rising beside a rising registration count is a fleet whose heartbeats are not arriving, not one that is growing. |
 | `fastcached_dispatch_leases_reclaimed_total` | A machine went away mid-job, or restarted, and the keys it was building were freed. Work nobody will report done — a build that lost part of its distribution, which is a different thing to fix from a fleet that is merely full. |
 | `fastcached_dispatch_leases_unauthorized_total` | A client handed back a lease token this cluster never signed. Never sum it with the `unknown-lease` refusals beside it: those name a lease this scheduler *did* issue and has since forgotten, while a rise here is a forged release — or, far more likely, a launcher predating signed leases, in which case it tracks a rollout and stops when the rollout finishes. |
+| `fastcached_dispatch_leases_released_late_total` | A client reported a job whose lease had **already expired**: a real compile outran the lease timeout. Read it as a fraction of `released_total` — a steady fraction means the lease bound is shorter than this site's slowest translation unit. **Not** a count of leases that expired: a client that never reports back at all reaches this nowhere, and is `reclaimed` or nothing. |
 
 The first three refusals are different operator problems and are deliberately
 counted apart: summing them hides a misconfiguration behind a busy fleet, and
