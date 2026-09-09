@@ -2121,22 +2121,81 @@ done
 # waited -- which is exactly the gap the defect lives in. Replacing the clock
 # with `elapsed=$(( elapsed + 1 ))` leaves all forty other checks green.
 #
-# A four-second bound, required to have taken at least three seconds of wall
-# clock. Under an iteration count it is four polls of 0.2s and comes back in
-# under a second. The slack is one second because `SECONDS` truncates at both
-# ends; the gap being measured is three seconds wide, so no truncation reaches
-# across it.
+# A four-second bound, required to have taken at least three seconds -- and the
+# three seconds are counted MONOTONICALLY, which is the whole of this change.
+#
+# `SECONDS` is `CLOCK_REALTIME`, which a VM guest's host time sync steps. Measured
+# on this host: backwards by ~2.03 s, periodically, so ~12% of any 4 s window
+# contains one (#1108). This floor's slack measured 1.10-1.41 s over ten runs of
+# this very case, so EVERY step observed exceeds EVERY slack observed -- the floor
+# is crossed whenever a step lands in the window, and the case then prints
+# `the loop is counting iterations rather than reading a clock`: a confidently
+# worded FALSE cause, naming the subject as broken when the meter moved.
+#
+# The reason this row used to carry -- "load pushes a wait AWAY from the
+# threshold" -- is true of load and silent about the step, which is
+# load-INDEPENDENT (#1108 refutes load across a twentyfold excursion). A reason
+# that argues the wrong variable is worse than none, because it reads as
+# considered. The old "1s slack for truncation" argument was sound about
+# truncation and was never about a step.
+#
+# The remedy is a co-timer, not a wider margin: a background `sleep` counts down
+# on `CLOCK_MONOTONIC` and cannot be stepped, so arming N seconds before the
+# child and asking afterwards whether it fired answers "did at least N seconds
+# pass" with no clock read at all. #354 refuses a bigger margin, and no margin
+# can outrun a step whose magnitude is not a constant.
+#
+# NOT `_e2e_deadline_arm`, though it is the same mechanism. Two reasons, and the
+# second is load bearing:
+#
+#   * the library is not sourced at this file's top level -- every case runs it
+#     in a subshell, and the one `. lib/e2e-common.sh` further down is staged
+#     heredoc content -- so the function is out of scope and `_e2e_workdir` unset;
+#   * this measurement exists precisely to time the library from OUTSIDE, the one
+#     reading it cannot take about itself. Borrowing the library's own timer would
+#     make the meter part of the subject.
+#
+# `/proc/uptime` is not the answer either: it occurs in this tree only inside
+# comments, and macOS -- where this file runs, on bash 3.2 -- does not have it.
+_outer_floor_armed=""
+_outer_floor_arm() {
+    local seconds="$1" marker=""
+    marker="$(mktemp "${TMPDIR:-/tmp}/e2e-floor.XXXXXX" 2>/dev/null)" || marker=""
+    [ -n "$marker" ] || { echo "FAIL: cannot arm a ${seconds}s monotonic floor" >&2; exit 2; }
+    rm -f "$marker"
+    # `trap -` here and an UNCATCHABLE signal in the disarm, for the reason
+    # `_e2e_deadline_arm` records at length: a forked subshell inherits this
+    # shell's traps, so a timer killed by a catchable signal runs the fixture's
+    # own cleanup.
+    ( trap - EXIT TERM INT HUP; sleep "$seconds"; : > "$marker" ) >/dev/null 2>&1 3>&- &
+    _outer_floor_armed="$! $marker"
+}
+_outer_floor_reached() { [ -e "$1" ]; }
+_outer_floor_disarm() {
+    kill -KILL "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+    if [ -e "$2" ]; then rm -f "$2"; fi
+}
+
 echo "== the bound is a duration, not an iteration count"
+_outer_floor_arm 3
+clock_armed="$_outer_floor_armed"
+clock_pid="${clock_armed%% *}"
+clock_mark="${clock_armed#* }"
 clock_started="$SECONDS"
 out="$( bash "${BASH_SOURCE[0]}" --case wait-clock-bound 2>&1 )"
 status=$?
 clock_took=$(( SECONDS - clock_started ))
+clock_floor=0
+_outer_floor_reached "$clock_mark" && clock_floor=1
+_outer_floor_disarm "$clock_pid" "$clock_mark"
 ran=$(( ran + 1 ))
 if [ "$status" != "1" ]; then
     echo "FAIL wait-clock-bound: exited ${status}, expected 1" >&2
     note_failure "wait-clock-bound"
-elif [ "$clock_took" -lt 3 ]; then
-    echo "FAIL wait-clock-bound: a 4s bound came back after ${clock_took}s of wall clock;" >&2
+elif [ "$clock_floor" -ne 1 ]; then
+    echo "FAIL wait-clock-bound: a 4s bound came back before 3s of MONOTONIC time had" >&2
+    echo "     passed (realtime read ${clock_took}s, a diagnostic and not the verdict);" >&2
     echo "     the loop is counting iterations rather than reading a clock" >&2
     printf '%s\n' "$out" | sed 's/^/     | /' >&2
     note_failure "wait-clock-bound"
@@ -2145,11 +2204,25 @@ else
     # correctly and still report the budget, which is the half with teeth --
     # a timeout message stating a duration nobody measured is a fixture lying
     # to the person diagnosing it.
+    #
+    # That figure is the library's own `SECONDS` delta, so it is steppable too,
+    # and comparing it against 3 used to be a SECOND false-red path in this one
+    # case -- the fix for the outer timing alone would have left the ticket's
+    # symptom live. It is no longer a verdict on the subject: the co-timer above
+    # has already established that three seconds really passed, so a child
+    # reporting less than three has a realtime reading that DISAGREES with
+    # monotonic time. That is an observation about the clock, not a defect in the
+    # wait, and it is reported as its own outcome rather than as the nearest
+    # neighbour -- which here would be a red naming the wrong subject.
     reported="$(printf '%s\n' "$out" | sed -n 's/^waited \([0-9][0-9]*\)s (measured.*/\1/p')"
-    if [ -z "$reported" ] || [ "$reported" -lt 3 ]; then
-        echo "FAIL wait-clock-bound: it waited ${clock_took}s and reported '${reported:-nothing}'" >&2
+    if [ -z "$reported" ]; then
+        echo "FAIL wait-clock-bound: it waited ${clock_took}s and reported nothing" >&2
         printf '%s\n' "$out" | sed 's/^/     | /' >&2
         note_failure "wait-clock-bound"
+    elif [ "$reported" -lt 3 ]; then
+        echo "INCONCLUSIVE wait-clock-bound: 3s of monotonic time passed and the wait" >&2
+        echo "     reported ${reported}s, read from CLOCK_REALTIME. The meter stepped" >&2
+        echo "     (#1108); this says nothing about the bound, so it is not a failure." >&2
     fi
 fi
 
@@ -2161,22 +2234,47 @@ fi
 # politely -- or that never escalates to KILL -- takes 30 s and passes every
 # assertion inside the case. The lower bound is there so a helper that returned
 # 124 immediately, without running the command at all, cannot pass either.
+# BOTH bounds are monotonic, and the floor is why. Its slack was argued as a
+# "3-4x margin" -- which is the CEILING's margin; the row was silent about the
+# floor of 1, the direction nobody re-reads. Re-measured on this host through the
+# shell that actually steps: this case runs 3.08-3.33 s, so the floor's slack is
+# 2.08-2.33 s against a step observed as large as 2.09 s. Those overlap, so the
+# floor is defeatable too -- rarely, needing a large step to meet a fast run, and
+# rare is not safe. The earlier 3.875 s reading was taken under Git Bash, which
+# does not step; measuring a margin through the one shell without the defect is
+# what made this look comfortable.
 echo "== run_bounded's ceiling is wall clock, and it escalates"
+_outer_floor_arm 1
+bfloor_armed="$_outer_floor_armed"
+bfloor_pid="${bfloor_armed%% *}"
+bfloor_mark="${bfloor_armed#* }"
+_outer_floor_arm 10
+bceil_armed="$_outer_floor_armed"
+bceil_pid="${bceil_armed%% *}"
+bceil_mark="${bceil_armed#* }"
 bounded_started="$SECONDS"
 out="$( bash "${BASH_SOURCE[0]}" --case bounded-outlasts-a-trapped-term 2>&1 )"
 status=$?
 bounded_took=$(( SECONDS - bounded_started ))
+bounded_floor=0
+bounded_over=0
+_outer_floor_reached "$bfloor_mark" && bounded_floor=1
+_outer_floor_reached "$bceil_mark" && bounded_over=1
+_outer_floor_disarm "$bfloor_pid" "$bfloor_mark"
+_outer_floor_disarm "$bceil_pid" "$bceil_mark"
 ran=$(( ran + 1 ))
 if [ "$status" != "0" ]; then
     echo "FAIL bounded-clock: exited ${status}, expected 0" >&2
     printf '%s\n' "$out" | sed 's/^/     | /' >&2
     note_failure "bounded-clock"
-elif [ "$bounded_took" -lt 1 ]; then
-    echo "FAIL bounded-clock: a 1s bound over a 30s child returned in ${bounded_took}s;" >&2
+elif [ "$bounded_floor" -ne 1 ]; then
+    echo "FAIL bounded-clock: a 1s bound over a 30s child returned before 1s of" >&2
+    echo "     MONOTONIC time had passed (realtime read ${bounded_took}s);" >&2
     echo "     the command cannot have been run" >&2
     note_failure "bounded-clock"
-elif [ "$bounded_took" -gt 10 ]; then
-    echo "FAIL bounded-clock: a 1s bound over a TERM-ignoring child took ${bounded_took}s;" >&2
+elif [ "$bounded_over" -eq 1 ]; then
+    echo "FAIL bounded-clock: a 1s bound over a TERM-ignoring child took more than" >&2
+    echo "     10s of MONOTONIC time (realtime read ${bounded_took}s);" >&2
     echo "     the bound is waiting for a child that will not die, which is an" >&2
     echo "     unbounded wait inside the thing that exists to bound one" >&2
     note_failure "bounded-clock"
@@ -2202,19 +2300,29 @@ fi
 # was taken: BEFORE this change the `SECONDS`-delta-over-a-whole-process idiom
 # appeared exactly three times in this file. Two of them are still here.
 #
-#   * `wait-clock-bound`             LOWER bound. Safe by construction -- load
-#                                    pushes a wait AWAY from the threshold, and
-#                                    truncation can only make a 4s wait read
-#                                    smaller, which is the direction the check
-#                                    already tolerates with a 1s slack. KEPT.
+#   * `wait-clock-bound`             LOWER bound. Was argued "safe by
+#                                    construction -- load pushes a wait AWAY from
+#                                    the threshold". That is true of LOAD and
+#                                    silent about a clock STEP, which #1108
+#                                    measured as load-INDEPENDENT: slack
+#                                    1.10-1.41s against a step of 1.98-2.09s, so
+#                                    every step exceeds every slack. CONVERTED to
+#                                    a monotonic co-timer; the realtime delta is
+#                                    printed and compared against nothing.
 #   * `bounded-outlasts-a-trapped-term`
-#                                    UPPER bound. A 1s bound plus the 2s
-#                                    `_e2e_bounded_grace` before KILL, measured
-#                                    2.5-3.1s on the host below, against a 10s
-#                                    ceiling -- so a 3-4x margin, and it absorbs
-#                                    both the truncation and the load. KEPT.
-#                                    Note what the margin is made of: raising
-#                                    `_e2e_bounded_grace` is what eats it.
+#                                    Argued as an UPPER bound with a 3-4x margin,
+#                                    which is the ceiling's margin -- the row was
+#                                    silent about its floor of 1. Re-measured
+#                                    through the shell that steps: 3.08-3.33s, so
+#                                    the floor's slack is 2.08-2.33s against a
+#                                    step reaching 2.09s. Those OVERLAP. The
+#                                    earlier 2.5-3.1s was Git Bash, which does not
+#                                    step. CONVERTED, both bounds.
+#
+# The general finding, which outlives both rows: a margin cannot justify a
+# realtime bound here, because the step's magnitude is not a constant and #354
+# refuses widening one anyway. Neither row was wrong about the variable it
+# named; each was silent about the only one that reaches it.
 #   * `bounded-fast-path`            UPPER bound with no margin to spare. The
 #                                    only one that had to move, and it is now
 #                                    timed inside its own case -- so a reader
@@ -3230,8 +3338,7 @@ echo "== no bound is decided from SECONDS"
 # so the rest of this file, its own two timings above included, stays scanned.
 
 # One row per exemption, `basename:reason`, matched per row by `_scan_exempt`.
-seconds_exempt="cluster-e2e.sh:a fixture, and outside #1066, which converted the library. Its deadlines are the same idiom and are known remaining sites rather than sound ones; the survey above says so in the same words.
-tsan-canary-rate.sh:computes a delta and echoes it. It reports the figure and compares it against nothing, so there is no bound to be wrong.
+seconds_exempt="tsan-canary-rate.sh:computes a delta and echoes it. It reports the figure and compares it against nothing, so there is no bound to be wrong.
 node-socket-activation-e2e.sh:a READY_SECONDS budget handed to wait_until, which is a NAME matched by the word rather than a clock read of its own."
 
 # Every `SECONDS` read that is not a bound decided INSIDE the loop it bounds, with
@@ -3241,9 +3348,12 @@ node-socket-activation-e2e.sh:a READY_SECONDS budget handed to wait_until, which
 #     subtract into a variable that is printed;
 #   * this file's own timings of a whole process from OUTSIDE, which is the one
 #     measurement the library cannot make about itself and is what `wait-clock-bound`
-#     and `bounded-outlasts-a-trapped-term` exist to take. The survey above argues
-#     each: a lower bound that load pushes AWAY from its threshold, and an upper one
-#     with a 3-4x margin.
+#     and `bounded-outlasts-a-trapped-term` exist to take. Their VERDICTS are now
+#     monotonic co-timers, so what is left of them here is the realtime figure they
+#     PRINT beside it -- the first kind, arrived at from the second.
+#
+# `cluster-e2e.sh` has no file-level exemption any more: its eight waits are armed
+# co-timers, so the only reads left in it are the two below, which feed prose.
 #
 seconds_reported=(
     'local started="$SECONDS" grewAt="$SECONDS"|wait_until: the two origins for the durations it REPORTS'
@@ -3251,12 +3361,14 @@ seconds_reported=(
     'elapsed=$(( SECONDS - started ))|the elapsed a verdict PRINTS, so it is measured rather than assumed'
     'stall=$(( SECONDS - grewAt ))|how long since the log grew, a reported reading'
     'local started="$SECONDS" elapsed=0 armed dpid dmark|stop_and_require_exit: the origin for the duration it reports'
+    'local started="$SECONDS"|cluster-e2e.sh: the origin for firstNamedAt, which feeds diagnostic prose only'
+    'firstNamedAt=$(( SECONDS - started ))|cluster-e2e.sh: how long until a leader was first named, printed in the formation diagnosis'
     'before=$SECONDS|_http_drain_fd3: the observation #1048 left with no reader'
     '_http_drain_elapsed=$(( SECONDS - before ))|_http_drain_fd3: that same observation, marked not to be read'
-    'clock_started="$SECONDS"|check-e2e-helpers.sh: times wait-clock-bound from OUTSIDE the process under test'
-    'clock_took=$(( SECONDS - clock_started ))|check-e2e-helpers.sh: the same, and a LOWER bound, which load pushes away from its threshold'
-    'bounded_started="$SECONDS"|check-e2e-helpers.sh: times bounded-outlasts-a-trapped-term from OUTSIDE'
-    'bounded_took=$(( SECONDS - bounded_started ))|check-e2e-helpers.sh: the same, an upper bound with a 3-4x margin'
+    'clock_started="$SECONDS"|check-e2e-helpers.sh: the realtime origin wait-clock-bound PRINTS; its verdict is the monotonic co-timer'
+    'clock_took=$(( SECONDS - clock_started ))|check-e2e-helpers.sh: that same realtime delta, printed as a diagnostic and compared against nothing'
+    'bounded_started="$SECONDS"|check-e2e-helpers.sh: the realtime origin bounded-clock PRINTS; both its bounds are monotonic co-timers'
+    'bounded_took=$(( SECONDS - bounded_started ))|check-e2e-helpers.sh: that same realtime delta, printed as a diagnostic and compared against nothing'
 )
 ran=$(( ran + 1 ))
 if [ "${#seconds_reported[@]}" -lt 1 ]; then
