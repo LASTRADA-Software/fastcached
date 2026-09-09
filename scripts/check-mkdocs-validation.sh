@@ -18,8 +18,15 @@
 # that job able to fail at all.
 set -euo pipefail
 
+# `--root <tree>` points the check at a tree other than this checkout.
+#
+# It was spelled `--self-test` until #596, and it never ran a single case: there is no
+# harness here, no staged fixture and no verdict table, only a root override. A flag named
+# for a self-test that executes nothing is the same defect as an unregistered one, arriving
+# from the other side -- the name asserts coverage and nothing behind it can fail. Nothing
+# called it under either spelling, so the rename costs no call site.
 root="$(cd "$(dirname "$0")/.." && pwd)"
-[ "${1:-}" != "--self-test" ] || root="${2:?--self-test needs a tree}"
+[ "${1:-}" != "--root" ] || root="${2:?--root needs a tree}"
 
 python3 - "$root" <<'PY'
 import sys, os

@@ -1157,6 +1157,57 @@ set_tests_properties("mkdocs-validation" PROPERTIES
     TIMEOUT 60
 )
 
+# A script offering `--self-test` must be REGISTERED to run it (#596).
+#
+# An unrun self-test is the most expensive green there is: the cases exist, they are
+# written carefully, they are cited in review, and nothing says no target invokes them.
+# `scripts/ci-apt-update.sh` grew twelve cases covering the decision that had just broken
+# CI, no `add_test` named it, and the allowlist shipped with the runner's real layout
+# untested -- taking every Linux job down at `Install build tools` (#1160).
+#
+# The rule is stricter than #596's literal wording, which asks only that the script
+# "appear in an add_test COMMAND". The tree held the counterexample: at the time of
+# writing `check-mkdocs-validation.sh` appeared in the table, in its plain mode, and its
+# self-test had still never run. So the registration must PASS the flag.
+add_test(
+    NAME "selftest-registered"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered.cmake"
+)
+set_tests_properties("selftest-registered" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be seen to refuse AND to accept -- eight synthetic trees, one
+# verdict each.
+#
+# Both directions, because #596 asks for both and because they are different edits: a
+# self-test ADDED without a registration, and a registration REMOVED from one that had
+# it. The accepting direction is not decoration either (#1031): a guard that fails closed
+# and unconditionally reads as "my branch is bad" rather than "the gate is broken", and
+# can stand for days.
+#
+# Every case here has been shown to FAIL under a mutation of the check, one case per
+# mutation, which is the only evidence that any of them constrains anything. That is not
+# a formality: case 5 originally staged a PROSE mention of the flag, which matches no
+# dispatch shape whether comments are skipped or not, so deleting the comment skip left
+# it green -- a duplicate of case 6 wearing case 5's name. Reading it could not show
+# that; only neutering the check did.
+add_test(
+    NAME "selftest-registered-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_CHECK=${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered.cmake"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered-selftest.cmake"
+)
+set_tests_properties("selftest-registered-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "script-modes"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
