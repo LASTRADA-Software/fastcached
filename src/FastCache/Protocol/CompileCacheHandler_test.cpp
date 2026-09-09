@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/ForeignGenerationValue.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -554,17 +555,11 @@ TEST_CASE("A foreign value generation and a malformed value are refused by DIFFE
     // servers. Nothing here should be read as making this a newer-peer-only answer.
     CcFixture fix;
 
-    // A value a launcher of the NEXT generation would have written: encoded through
-    // the real encoder, so the framing is honest, then stamped one generation on. What
-    // separates it from the junk arm is the LAYOUT, not the leading byte.
-    CompileValue produced;
-    produced.objectBlob = { std::byte { 0x01 } };
-    produced.textRegions.push_back({ .grammar = Grammar::ShowIncludes, .bytes = "Note: including file: /src/inc/a.hpp\n" });
-    auto foreign = EncodeCompileValue(produced);
-    REQUIRE_FALSE(foreign.empty());
-    REQUIRE(static_cast<std::uint8_t>(foreign.front()) == CompileValueVersion);
-    constexpr auto NextGeneration = static_cast<std::uint8_t>(CompileValueVersion + 1);
-    foreign.front() = std::byte { NextGeneration };
+    // A value a launcher of another generation would have written: encoded through the
+    // real encoder, so the framing is honest, then restamped. What separates it from the
+    // junk arm is the LAYOUT, not the leading byte. Which byte carries the generation is
+    // known in `src/tests/ForeignGenerationValue.hpp` and nowhere else (#649).
+    auto const foreign = Testing::ForeignGenerationValue();
 
     // Both refusals and then a FETCH, on one connection: each refusal declares its own
     // length, so a client that reads only headers stays in sync across both of them.
@@ -584,7 +579,7 @@ TEST_CASE("A foreign value generation and a malformed value are refused by DIFFE
 
     // The message is the whole of the operator's diagnostic, so it names BOTH
     // generations rather than restating the code in words.
-    CHECK(foreignError.message == ForeignGenerationMessage(NextGeneration));
+    CHECK(foreignError.message == ForeignGenerationMessage(Testing::ForeignGeneration));
 
     // The companion: bytes that are not a compile value at all keep `MalformedValue`,
     // whose meaning this ticket deliberately leaves alone.

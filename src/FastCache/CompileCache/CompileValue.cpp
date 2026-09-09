@@ -88,26 +88,14 @@ namespace
         return Refuse(ProtocolErrorCode::UnsupportedFeature, ForeignGenerationMessage(generation));
     }
 
-    /// Where the generation sits in an encoded value: its leading byte.
-    ///
-    /// The named form of a position `DecodeCompileValue` also reads, through its
-    /// `ByteCursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
-    /// together -- a field added ahead of the generation changes both. It exists so
-    /// that `CanonicalStoredValue`, which needs the number for a refusal that names
-    /// it, asks a question with a name rather than writing `front()` a hundred lines
-    /// from the code that guarantees the answer.
-    ///
-    /// @param bytes An encoded value, possibly empty.
-    /// @return The declared generation, or none when there is no leading byte to
-    ///         declare one -- which is not the same as declaring generation zero.
-    [[nodiscard]] std::optional<std::uint8_t> DeclaredGeneration(std::span<std::byte const> bytes) noexcept
-    {
-        if (bytes.empty())
-            return std::nullopt;
-        return static_cast<std::uint8_t>(bytes.front());
-    }
-
 } // namespace
+
+std::optional<std::uint8_t> DeclaredGeneration(std::span<std::byte const> bytes) noexcept
+{
+    if (bytes.size() <= CompileValueGenerationOffset)
+        return std::nullopt;
+    return static_cast<std::uint8_t>(bytes[CompileValueGenerationOffset]);
+}
 
 bool IsForeignGeneration(ProtocolError const& error) noexcept
 {
