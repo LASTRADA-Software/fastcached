@@ -1654,6 +1654,61 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A test may not decide anything from the architecture it was COMPILED for.
+#
+# `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the
+# BUILD, while the implementation picks its answer from the same fact -- so both
+# flip together and the case is green under every build, unable to fail for the
+# reason it exists. That is #146: the MSVC bindir chosen by the architecture the
+# binary was compiled for rather than the machine it runs on, with a test pointed
+# straight at it that could not have caught it.
+#
+# Scoped to architecture macros and NOT to `_WIN32`, and the distinction is the
+# whole reason this check can exist: a Windows build runs on Windows, so an
+# operating-system condition is a fact and a per-platform literal is sound, while
+# an x64 build runs on ARM64 Windows routinely, so an architecture condition is a
+# PROXY. Measured when this landed: 35 of 215 test files carry a platform or
+# architecture directive and 33 are the legitimate shape, so a scan over platform
+# directives generally would refuse 33 correct files -- and a guard that refuses
+# correct code gets disabled, taking the real finding with it. The script's header
+# carries the full reasoning; do not widen it.
+#
+# Default set rather than "smoke": it reads source files, needs no daemon, socket
+# or compiler, and has no skip path.
+#
+# **50 ms, and the figure carries its conditions** because they differ by 168x.
+# Measured on one machine, one afternoon, same check and same 215 files: 0.050 s
+# on ext4, 8.4 s idle on a DrvFs checkout under WSL, 11.9 s there at load average
+# 27, and one outright TIMEOUT at 60 s while a full gate ran alongside it. The
+# cost is the filesystem's per-file open, not this check -- a whole-file filter
+# before the line read, the optimisation that took `worker-refusals-counted` from
+# 2.9 s to 208 ms, was tried here and moved nothing (8.385 s against 8.420 s),
+# because there is no line-matching cost to remove. So a slow local run is the
+# checkout, and anyone meeting one should not optimise a 50 ms check or raise this
+# timeout to silence it.
+#
+# **No `SKIP_RETURN_CODE` here, and its absence is load-bearing.** It reads as a
+# redundant observation until #1128: a status this registration does not claim is
+# a status CTest is free to reinterpret. Catch2's exit code IS its failed-assertion
+# count, so a case failing exactly four assertions exits 4, collides with the
+# `SKIP_RETURN_CODE 4` the Catch2 registrations must carry, and ctest reports
+# `100% tests passed` over a red binary. This check exits 1 on a refusal, claims
+# no skip code, and has no skip path to want one -- so its refusal cannot be
+# silently rescored into a skip. Verified through the real harness rather than
+# read off the idiom: with a violation planted, ctest scores it **Failed**.
+add_test(
+    NAME "architecture-conditioned-tests"
+    COMMAND ${CMAKE_COMMAND}
+        "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}/src"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-architecture-conditioned-tests.cmake"
+)
+set_tests_properties("architecture-conditioned-tests" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Byte-order qualifier hygiene. Fails when a source file writes `::htonl(...)`
 # or any of its siblings.
 #
