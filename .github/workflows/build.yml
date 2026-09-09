@@ -1464,6 +1464,28 @@ jobs:
           max-size: 256M
           save: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
 
+      # Can the bash we ship to actually PARSE our scripts? (#1100)
+      #
+      # BEFORE configure and build, and that placement is the whole value: a script
+      # legal token-by-token can still be unparseable by macOS's 2007 /bin/bash, and
+      # until now the only instrument that said so was the full `ctest` run four
+      # minutes into this required context -- reporting the wrong line when it did
+      # (#1096: the cause was 135 lines above, on a line identical to master's).
+      #
+      # `/bin/bash` EXPLICITLY, not the `bash` on PATH. This step is the only place in
+      # the project where a real 3.2 exists, and running it under Homebrew's bash 5
+      # would parse the very constructs it exists to catch and report success -- the
+      # mode under test not being the mode in use. The script asserts its own
+      # interpreter and REFUSES on 4.0 or newer, so a misrouted run is loud rather than
+      # green, but naming the interpreter here means it does not have to rely on that.
+      #
+      # It runs before `brew install`, so nothing it depends on can be installed by
+      # this job -- `bash -n` and `git ls-files` are all it needs, and both are on the
+      # image. Milliseconds per file, no side effects: `bash -n` reads and parses
+      # without executing.
+      - name: "Parse every script under the bash macOS ships"
+        run: /bin/bash scripts/check-bash32-parse.sh
+
       # Apple's bundled AppleClang 15 ships a libc++ without std::jthread
       # (libc++ only implemented it in LLVM 18). Use Homebrew's LLVM, whose
       # modern libc++ has it. llvm is keg-only, so we point the compiler at its

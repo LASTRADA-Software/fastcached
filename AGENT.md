@@ -2475,6 +2475,17 @@ Line endings are LF everywhere, enforced by `.gitattributes` (`* text=auto eol=l
 rather than by each developer's `core.autocrlf`. A CRLF `*.sh` does not misbehave —
 it fails to start at all.
 
+Dependency sources are shared across build trees per machine, so a fresh worktree does
+not re-clone Catch2, yaml-cpp, zstd and lz4 — which matters here because the work
+happens in throwaway worktrees, making that a per-BRANCH cost rather than a
+per-machine one. `CPM_SOURCE_CACHE` defaults to `%LOCALAPPDATA%\fastcached\cpm` or
+`~/.cache/fastcached/cpm`; anything that already set it wins, including the environment
+variable CI uses to point it inside the workspace for its own cache action. Override
+with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found simply
+fetches into the build tree as before. Measured (native NTFS, Git Bash, Windows 11,
+cold build tree): **45 s and 118 MB fetched without it, 24 s and 1.1 MB with** — and
+over DrvFs, where #545 found it, the same fetch is slow enough to read as a hang.
+
 CMake presets live in `CMakePresets.json`. Common entry points:
 
 ```sh

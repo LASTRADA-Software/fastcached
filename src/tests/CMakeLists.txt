@@ -1226,6 +1226,32 @@ set_tests_properties("apt-update-wrapped" PROPERTIES
 # Both directions, plus the two ways this scan could lie: a commented mention, and
 # a tree that calls NEITHER -- which must refuse rather than report clean over a
 # check that had stopped meaning anything.
+# The macOS parse gate's own logic, watched refusing AND accepting (#1100).
+#
+# The GATE itself is a step of the macOS job and is deliberately not registered here: it
+# parses with the interpreter it is RUN under, so on any host whose bash is 4.0 or newer
+# it refuses by name rather than reporting a green it cannot justify. Registering it in
+# the default set would make it red on every platform but one.
+#
+# The SELF-TEST runs anywhere, because it drives the checker's decisions rather than the
+# 3.2 parser: the accepting arm, an unparseable script named and refused, the message
+# qualifying its reported line as the point of FAILURE rather than of cause, the version
+# gate refusing a modern bash, and an empty walk refused instead of reported clean.
+#
+# It also stages #1096's REAL construct -- an apostrophe inside a comment within `$( )` --
+# and asserts it is ACCEPTED here, which is not a weaker case than it sounds: that
+# construct parses on bash 4+, and that is exactly why the gate must run on 3.2 and why a
+# green from a modern bash is worth nothing. The red on that file is observed on the
+# macOS runner, which is the only real 3.2 in this project's world.
+add_test(
+    NAME "bash32-parse-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-bash32-parse.sh" --self-test
+)
+set_tests_properties("bash32-parse-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 add_test(
     NAME "apt-update-wrapped-selftest"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh" --self-test

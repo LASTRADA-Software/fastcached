@@ -227,6 +227,35 @@ CiScopeTable=(
 
 # Every other event this workflow can dispatch a sweep from -- a `push` to
 # master, a tag push, and any trigger added to `on:` later. `BASE` is not read.
+#
+# ## A release tag KEEPS the full sweep, and that is a decision (#571)
+#
+# It used to be an accident of an expression: the condition covered tags because it
+# covered pushes, and a version tag is almost always placed on a commit master's own
+# push has already swept -- so the release run re-analyses a tree with a known-clean
+# result, at about 22.5 minutes. Recorded here rather than left implied, because the
+# next reader arrives at this row wondering exactly that.
+#
+# MEASURED first, since #571 asks the question the other way round: does `origin/master`
+# resolve on a tag checkout, and what would the diff hold? Neither is reachable --
+# a tag push is `GITHUB_EVENT_NAME=push`, it matches this row, and this row's base is
+# `none`, so `BASE` is never consulted on that path at all:
+#
+#     CiScopeFor push          ->  all   (base empty)
+#     CiScopeFor pull_request  ->  diff  origin/master
+#     CiScopeFor merge_group   ->  diff  origin/master
+#
+# So the tempting narrowing is not merely unnecessary, it is unsound, and in the
+# direction that fails QUIET. A tag sits ON master, so a diff against `origin/master`
+# from a tag checkout is EMPTY -- the sweep would print `no source changed`, exit 0 and
+# analyse NOTHING, on the one commit that is about to become an artefact. That is the
+# opposite failure to paying 22.5 minutes, and much worse: a release is the last gate
+# before something ships, which is precisely where a full sweep is most defensible and
+# where analysing nothing is least detectable.
+#
+# The cost is also not merge latency. A tag run blocks no pull request and nobody waits
+# on it, so this is runner-minutes -- the same distinction the workflow's own header
+# draws about master pushes, and the two quantities get quoted for each other.
 CiScopeDefaultRow="*  all  none"
 
 # The mapping, as a pure function of the three things it depends on.
