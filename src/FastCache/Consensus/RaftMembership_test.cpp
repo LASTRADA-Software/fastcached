@@ -495,3 +495,69 @@ TEST_CASE("An admitted member that answers keeps the leader that admitted it", "
 
     CHECK(node.CurrentRole() == Role::Leader);
 }
+
+TEST_CASE("A leader elected by a bare quorum survives admitting a fourth member", "[consensus][raft][membership]")
+{
+    // The shape #1077 hit in the wild, and it is the one that says whether the
+    // grace merely makes the defect rarer or closes it.
+    //
+    // A three-member leader is elected by a BARE quorum -- itself and one peer --
+    // so `BecomeLeader` seeds contact from the votes actually cast and the third
+    // member has none. That is not a degraded cluster; it is what every election
+    // in an odd-sized cluster looks like until the first heartbeat comes back.
+    // Admitting a fourth then takes the quorum from two to three while the
+    // evidence stays at two, so the leader deposes itself -- and the member it was
+    // admitting is stranded in no cluster at all, because the configuration entry
+    // dies with the leadership that appended it.
+    //
+    // What the grace restores is exactly the tolerance the cluster had BEFORE the
+    // admission: one live peer was enough for a quorum of two, and one live peer
+    // plus the member just admitted is enough for a quorum of three. Admission
+    // stops costing fault tolerance it was never meant to cost.
+    LeaderFixture fix;
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+    REQUIRE(fix.node.ActiveMembers().size() == 3);
+
+    REQUIRE(fix.node.ProposeMembership({ "n1", "n2", "n3", "n4" }, At(200)).has_value());
+    REQUIRE(fix.node.ActiveMembers().size() == 4);
+
+    // The next heartbeat. n2's contact was stamped when it voted and is still
+    // inside the window; n3 never answered this leadership at all, and n4 cannot
+    // have. Under the defect that is two against a quorum of three.
+    (void) fix.node.Tick(At(250));
+
+    CHECK(fix.node.CurrentRole() == Role::Leader);
+    CHECK(fix.node.KnownLeader() == std::optional<NodeId> { "n1" });
+}
+
+TEST_CASE("The retry after a lost leadership is not itself a second step-down", "[consensus][raft][membership]")
+{
+    // Why the fleet did not simply recover. `--cluster-admit` commits the member's
+    // RECORD first, so every node holds it, and the reconciler on whichever node
+    // leads next re-proposes the quorum change. Under the defect that retry is the
+    // very thing that deposes the next leader -- so the cluster has a repair loop
+    // whose every iteration re-triggers the fault, which is an election storm
+    // rather than a recovery, and #1077 spent its whole 60 s budget inside one.
+    //
+    // Modelled here as the retry alone: a fresh leader of the next term, elected
+    // by a bare quorum exactly as the last one was, proposing the same change.
+    // Whether it survives is whether the loop converges.
+    LeaderFixture fix;
+    REQUIRE(fix.node.ProposeMembership({ "n1", "n2", "n3", "n4" }, At(200)).has_value());
+
+    // It survives its own heartbeat, so the entry it appended has time to reach a
+    // quorum -- which is the whole of what the admitted member is waiting for.
+    (void) fix.node.Tick(At(250));
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    // And the peers acknowledge it, so the change commits and the member is in.
+    auto const last = fix.node.Log().LastIndex();
+    for (auto const* const peer: { "n2", "n3" })
+        (void) fix.node.Receive(
+            AppendEntriesResponse {
+                .term = Term { .value = 1 }, .result = AppendResult::Accepted, .matchIndex = last, .followerId = peer },
+            At(260));
+
+    CHECK(fix.node.CommitIndex() == last);
+    CHECK(fix.node.CurrentRole() == Role::Leader);
+}
