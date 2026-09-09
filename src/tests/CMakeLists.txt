@@ -4218,3 +4218,37 @@ set_tests_properties("macos-package-e2e-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# What the node's option table says RELOADS, against what the shipped artefacts claim
+# (#1026). `OptionSpec::reloadable` decides it and nothing derived either artefact from
+# the table; it had already drifted, hand-corrected from four to five to seven in one
+# branch, and #403, #293, #404 and #405 each added a row.
+#
+# Labelled `docs-subject` as well as `hygiene`: its subject IS prose, and prose drifts
+# by being edited, which is the whole reason that label exists (#687).
+#
+# Both directions. A new row the docs omit costs a reader a stale page; a doc naming a
+# setting as reloadable that the table denies costs an OPERATOR, who edits the shipped
+# file, sends SIGHUP, sees no error and believes a setting is in force that is not.
+add_test(
+    NAME "node-reloadable-docs"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("node-reloadable-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 120
+)
+
+# Eleven synthetic trees, including the three ways this check could pass while
+# guarding nothing: no reloadable row at all, no artefact declaring the subject, and an
+# artefact that declares one and states nothing. The subject marker earned its place
+# immediately -- scanning for the table header alone matched the DAEMON's reload matrix,
+# which carries the identical header for a different binary and a different set.
+add_test(
+    NAME "node-reloadable-docs-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" --self-test
+)
+set_tests_properties("node-reloadable-docs-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 180
+)
