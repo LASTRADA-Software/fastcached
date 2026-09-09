@@ -95,23 +95,52 @@ set(vocabulary
 
 # Read and split by hand rather than with `file(STRINGS)`, which returns a LIST: a line
 # containing a semicolon becomes two elements and every line number after it drifts.
-# Backslashes are escaped first, or a line ending in one merges with the next.
+# Lines are WALKED, never assembled into a CMake list, and that is the whole point.
 #
-# `[` and `]` are CMake list structure too, and a single unbalanced one -- in a comment,
-# where nobody is thinking about CMake syntax -- merges every following line into one
-# element. C++ is full of them, so they are REPLACED with a space, which preserves every
-# column and every line number. That difference between escaping `;`/`\` and replacing
-# brackets is not incidental; see `check-catch-skip-return-code.cmake`, where #495
-# records what it cost to learn.
-function(fastcached_read_lines path outVar)
+# A list cannot carry a line ending in a backslash. Measured on CMake 3.28.3: the value
+# `one\\;two` -- an ESCAPED backslash followed by a separator -- expands to ONE element,
+# because a `;` preceded by any backslash is read as escaped whether or not that
+# backslash was itself escaped. So no ordering of escapes can place a separator after
+# such a line. The reader here used to escape `\` and `;` and split on newlines, and its
+# own comment claimed that escaping stopped a line ending in a backslash merging with
+# the next -- which is the one case it does not stop.
+#
+# A merged element begins with whatever the EARLIER line began with, so a `//` swallows
+# the real code below it and every line number after it drifts. That is a false GREEN,
+# which is the direction nobody investigates.
+#
+# Live exposure was ZERO when this was repaired: no file in this check's corpus of 229
+# test sources ends a line with a backslash. So this closes a latent hazard rather than
+# fixing an observed failure -- and it is one file away, since `dist-compile-e2e.sh` has
+# 152 such lines and `local-gate.sh` 101. A check reading `scripts/*.sh` through the old
+# idiom would have met it on its first file.
+#
+# `[` and `]` are still replaced with a space. With no list they can no longer merge
+# anything, so this is now purely about what the check SEES -- and changing that is a
+# different decision from repairing the reader, taken separately or not at all.
+# Consolidating the copies of this idiom is #495, not this ticket.
+macro(fastcached_take_line contentVar lineVar doneVar)
+    string(FIND "${${contentVar}}" "\n" _ftl_newline)
+    if(_ftl_newline EQUAL -1)
+        set(${lineVar} "${${contentVar}}")
+        set(${contentVar} "")
+        set(${doneVar} TRUE)
+    else()
+        string(SUBSTRING "${${contentVar}}" 0 ${_ftl_newline} ${lineVar})
+        math(EXPR _ftl_after "${_ftl_newline} + 1")
+        string(SUBSTRING "${${contentVar}}" ${_ftl_after} -1 ${contentVar})
+        set(${doneVar} FALSE)
+    endif()
+    string(REGEX REPLACE "\r$" "" ${lineVar} "${${lineVar}}")
+endmacro()
+
+# The file, read once, ready to be walked a line at a time.
+function(fastcached_read_content path outVar)
     file(READ "${path}" content)
-    string(REPLACE "\\" "\\\\" content "${content}")
-    string(REPLACE ";" "\\;" content "${content}")
     string(REPLACE "[" " " content "${content}")
     string(REPLACE "]" " " content "${content}")
     string(REPLACE "\r\n" "\n" content "${content}")
-    string(REPLACE "\n" ";" lines "${content}")
-    set(${outVar} "${lines}" PARENT_SCOPE)
+    set(${outVar} "${content}" PARENT_SCOPE)
 endfunction()
 
 # Which test files this REPOSITORY owns, asked of git rather than inferred from
@@ -205,12 +234,13 @@ foreach(relative IN LISTS testFiles)
         continue()
     endif()
 
-    fastcached_read_lines("${FASTCACHED_SOURCE_DIR}/${relative}" lines)
-    list(LENGTH lines lineCount)
+    fastcached_read_content("${FASTCACHED_SOURCE_DIR}/${relative}" rest)
 
     set(lineNumber 0)
     set(inBlockComment FALSE)
-    foreach(rawLine IN LISTS lines)
+    set(atEnd FALSE)
+    while(NOT atEnd)
+        fastcached_take_line(rest rawLine atEnd)
         math(EXPR lineNumber "${lineNumber} + 1")
 
         # Prose, not a call. This rule is written out in `.agent/rules/testing.md` and
@@ -296,10 +326,12 @@ foreach(relative IN LISTS testFiles)
 
         # `lineNumber` is 1-based, so it is already the 0-based index of the NEXT line.
         if(reason STREQUAL "")
-            set(scanIndex "${lineNumber}")
-            while(scanIndex LESS lineCount)
-                list(GET lines "${scanIndex}" following)
-                math(EXPR scanIndex "${scanIndex} + 1")
+            # `rest` is already everything after this line, so the lookahead walks a
+            # copy of it rather than indexing. Same lines, same order, no list.
+            set(ahead "${rest}")
+            set(aheadDone FALSE)
+            while(NOT aheadDone)
+                fastcached_take_line(ahead following aheadDone)
                 string(STRIP "${following}" following)
                 if(following STREQUAL "" OR following MATCHES "^(//|\\*|/\\*)")
                     continue()
@@ -315,7 +347,7 @@ foreach(relative IN LISTS testFiles)
             list(APPEND violations
                  "${where}: ${reason} -- a case that could not RUN is SKIPPED, not passed. Use SKIP")
         endif()
-    endforeach()
+    endwhile()
 endforeach()
 
 # A scan that found NO `SUCCEED` at all is not a clean tree. This project has a dozen
