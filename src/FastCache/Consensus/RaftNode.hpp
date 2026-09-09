@@ -621,8 +621,20 @@ class RaftNode
     /// false. Its own comment says so, and `BecomeLeader` fills it from the votes
     /// actually cast for exactly that reason.
     ///
-    /// One entry rather than a map, because `ProposeMembership` admits exactly one
-    /// member at a time and refuses a second until the first has committed.
+    /// One entry rather than a map, and that is a DECISION resting on the
+    /// one-at-a-time rule rather than on a single optional being convenient:
+    /// `Membership::Classify` refuses any change but one addition or one removal,
+    /// and `HasUncommittedConfiguration` refuses a second change until the first
+    /// has committed. So at most one member can be awaiting its first answer.
+    ///
+    /// A second `ProposeMembership` therefore OVERWRITES this, and the member the
+    /// first one admitted loses whatever grace it had left. That is correct rather
+    /// than merely tolerable, and the reason is what the second proposal had to get
+    /// past: the first change COMMITTED, so that member has been replicated to and
+    /// given a full commit round to answer in. If it still has no contact record it
+    /// is genuinely silent, which is the state this grace exists to be distinguished
+    /// FROM. Whoever batches membership changes one day breaks that argument and not
+    /// merely this field, so the two move together.
     ///
     /// It is NOT cleared when the member finally answers, and does not need to be:
     /// the grace it grants is one `electionTimeoutMin` from the ADMISSION, while
@@ -638,6 +650,14 @@ class RaftNode
     /// one twice makes them EQUAL. The conclusion holds under equality and would
     /// not need to be revisited; a claim of strictness would be false there, and
     /// this is exactly the kind of reason that gets carried one clause too far.
+    ///
+    /// The window is closed by TIME and by nothing else, and that is safe here
+    /// because `TimePoint` is `steady_clock` (`Core/Clock.hpp`): every path that
+    /// hands this node a `now` -- the driver's loop through `IReactor::Clock()`, and
+    /// `ConsensusTier`'s own `steady_clock::now()` -- is monotonic, so the window
+    /// cannot be reopened by a clock that steps backwards. The wall clock is a
+    /// SEPARATE seam returning a different type (`IWallClock`, `system_clock`), so
+    /// this is enforced by the type system rather than by remembering it.
     ///
     /// Only a leader reads it, and `BecomeLeader` clears it — so the one moment it
     /// could be read again after this node stops leading is the moment it is
