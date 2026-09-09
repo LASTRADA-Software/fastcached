@@ -10,6 +10,8 @@
 #   systemctl restart fastcache-compile-node   apply any change
 #   systemctl reload fastcache-compile-node    apply a reloadable one, in place
 #
+# reloadable-for: fastcache-compile-node
+#
 # SEVEN settings are reloadable and the rest are read once at startup. A reload
 # re-reads this file the way the start read it, so a change to anything else is
 # refused BY NAME rather than half-applied -- you are told which key needs the

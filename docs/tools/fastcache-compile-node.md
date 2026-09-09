@@ -1505,6 +1505,8 @@ wins" stays a question of which pass ran second. If the file will not parse, or
 changes a setting that cannot change at runtime, **nothing is applied** and the
 refusal names every offending setting. You saved once; you get one answer.
 
+<!-- reloadable-for: fastcache-compile-node -->
+
 | Reloadable | Requires a restart |
 |---|---|
 | `log_level`, `allow_compile_arg`, `requirepass`, `fleet_member`, `fleet_open`, `toolchain`, `no_toolchain_discovery` | `advertise`, `slots`, `node_class`, `reserve_cores`, and every listen, cache, cluster and TLS setting |
