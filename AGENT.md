@@ -2355,6 +2355,22 @@ quickly.
   point, since a reader can arrive at either call site having never seen the helper at all. The remedy is on
   the SENDING end because only it can be: **say what was MEASURED and what was INFERRED, separately, every
   time.** The receiver cannot recover the distinction at any price; the sender states it for free.
+  **And that never-restate sentence does NOT reach a measurement's CONDITIONS — pin those, do not point
+  at them.** The test is whether the two copies are supposed to stay EQUAL. A live figure (a rate, a
+  count, a required-context set) has two copies meant to agree, so they drift while both claim to be
+  current: one copy, everyone points at it. A measurement's conditions are the state of the world at one
+  INSTANT and must NOT track their source, so they are restated deliberately and marked as of the
+  measurement. Measured 2026-09-09 (#1151): a registration comment recorded a hosted scan at **2.11 s**
+  under `four cores at CTEST_PARALLEL_LEVEL: 4`, and the tidy that suggests itself is to delete the
+  numbers and point at `build.yml`. Do that and the day somebody sets four to eight, the 2.11 s figure
+  silently claims it was measured at eight — a false condition welded to a real measurement by an
+  unrelated edit, with no signal, and worse than the stale constant it replaces, which at least
+  misstates only itself. **The corrected comment LOOKS like the defect**: it restates a number from a
+  file it cites, exactly the shape the sentence above catches, so it must say why it is pinned or the
+  next cleanup reverses it. Two people applied the never-restate rule correctly here and got the wrong
+  answer — and the original error, `two-core` against a workflow saying four, was not drift at all but a
+  value wrong when typed against a file its author had not opened, which no link and no guard catches.
+  Only reading the source you cite does.
 - **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs
   ~2.09 ms on Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart.
   A design that looks free on the platform you develop on can be the dominant cost
