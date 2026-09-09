@@ -3285,12 +3285,89 @@ struct BlockingHarness
         reply = co_await DrainResponse(pair.client.get());
     }
 
-    /// Launcher coroutine: runs the handler to completion and captures the reply.
-    /// @param session Session context.
-    /// @return The launcher task.
-    FastCache::Task<void> RunHandler(FastCache::SessionContext session)
+    /// A launched handler whose destructor RETIRES the parked reads before the
+    /// coroutine frames holding their awaitables are freed.
+    ///
+    /// The cases used to hold the launcher as a bare `Task<void>` local declared AFTER
+    /// the harness, so at scope exit the task died FIRST: its frames went, leaving
+    /// `InMemorySocket::_pendingRead` pointing into freed storage, and the socket's own
+    /// destruction then COMPLETED that pointer. ASan reported `heap-use-after-free` in
+    /// `IoAwaitable::Complete` — in `Net/`, in production code, naming neither the case
+    /// nor the assertion that actually failed
+    /// ([#888](https://github.com/LASTRADA-Software/fastcached/issues/888)).
+    ///
+    /// **It is only reachable when a case FAILS**, which is what makes it worse than a
+    /// latent test bug: a green suite says nothing about it, and the developer who meets
+    /// it is handed a memory-safety violation in a file they were not editing. The #710
+    /// lane traced it, took it for a finding of the ticket it was working, and
+    /// established otherwise only by following the destruction order.
+    ///
+    /// The retirement rides on the object every case must already create, rather than
+    /// on a call every case must remember — the shape `.agent/rules/wire-and-protocol.md`
+    /// argues for, since a guard called ALONGSIDE an operation needs a scan and this one
+    /// cannot be omitted at all. Member order is deliberately not the mechanism: a
+    /// destructor BODY runs before every member destructor, so the sockets are closed
+    /// while `_task` is still whole whatever order the members are in.
+    ///
+    /// **`Close()`, never `CancelRead()`.** A cancel leaves the socket usable, so the
+    /// handler it resumes can park AGAIN on the very next read — and the drain in
+    /// `RunHandlerOn` reads the CLIENT end, so the dangling pointer would simply move to
+    /// the other end of the pair. `Close()` clears the progress callback, which is what
+    /// makes the retirement final (`InMemoryTransport.cpp`).
+    class Launcher
     {
-        return RunHandlerOn(pair.server.get(), session);
+      public:
+        /// @param harness The harness owning the pair both ends of which must be retired.
+        /// @param served  What the handler was launched on — the pair's server end, or a
+        ///                decorator over it, which forwards `Close`.
+        /// @param task    The launched coroutine.
+        Launcher(BlockingHarness& harness, FastCache::ISocket& served, FastCache::Task<void> task) noexcept:
+            _harness { &harness },
+            _served { &served },
+            _task { std::move(task) }
+        {
+        }
+
+        Launcher(Launcher const&) = delete;
+        Launcher(Launcher&&) = delete;
+        Launcher& operator=(Launcher const&) = delete;
+        Launcher& operator=(Launcher&&) = delete;
+
+        ~Launcher()
+        {
+            _served->Close();
+            _harness->pair.server->Close();
+            _harness->pair.client->Close();
+        }
+
+        /// @return The coroutine handle, for `TestReactor::Submit`.
+        [[nodiscard]] auto Native() const noexcept
+        {
+            return _task.Native();
+        }
+
+      private:
+        BlockingHarness* _harness;
+        FastCache::ISocket* _served;
+        FastCache::Task<void> _task;
+    };
+
+    /// Launch the handler on the pair's server end.
+    /// @param session Session context.
+    /// @return The launcher; keep it alive for as long as the reactor may resume it.
+    [[nodiscard]] Launcher Launch(FastCache::SessionContext session)
+    {
+        return Launcher { *this, *pair.server, RunHandlerOn(pair.server.get(), session) };
+    }
+
+    /// Launch the handler on a decorator interposed over the pair's server end.
+    /// @param served  The decorator; must outlive the returned launcher, which is what
+    ///                declaring it before the launcher in the case gives you.
+    /// @param session Session context.
+    /// @return The launcher.
+    [[nodiscard]] Launcher LaunchOn(FastCache::ISocket& served, FastCache::SessionContext session)
+    {
+        return Launcher { *this, served, RunHandlerOn(&served, session) };
     }
 };
 
@@ -3314,7 +3391,7 @@ TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp
 
     // Launch the handler on the reactor; it processes the XADD, then parks on
     // the blocking XREAD (no entry after 1-0 yet).
-    auto launcher = h.RunHandler(session);
+    auto launcher = h.Launch(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     // Parked and NOT abandoned: the peer is still able to send, so the disconnect
@@ -3350,7 +3427,7 @@ TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[prot
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
 
-    auto launcher = h.RunHandler(session);
+    auto launcher = h.Launch(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned); // parked, waiting on the 50ms deadline.
@@ -3388,7 +3465,7 @@ TEST_CASE("RESP: XREAD BLOCK 0 is abandoned when the peer closes gracefully", "[
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
     h.pair.client->ShutdownWrite(); // the peer has finished sending, and is gone.
 
-    auto launcher = h.RunHandler(session);
+    auto launcher = h.Launch(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
 
@@ -3421,7 +3498,7 @@ TEST_CASE("RESP: a blocking read retires its readability watch instead of leavin
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
 
-    auto launcher = h.RunHandlerOn(&watched, session);
+    auto launcher = h.LaunchOn(watched, session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned);
@@ -3480,7 +3557,7 @@ TEST_CASE("RESP: a blocking read that loops does not arm a second readability wa
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
-    auto launcher = h.RunHandlerOn(&watched, session);
+    auto launcher = h.LaunchOn(watched, session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned);
@@ -3544,7 +3621,7 @@ TEST_CASE("RESP: a readability watch that resolved IS re-armed on the next pass"
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
-    auto launcher = h.RunHandlerOn(&watched, session);
+    auto launcher = h.LaunchOn(watched, session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE(watched.WatchesArmed() == 1);
@@ -3599,7 +3676,7 @@ TEST_CASE("RESP: a parked readability watch still reports a peer that went away"
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
-    auto launcher = h.RunHandlerOn(&watched, session);
+    auto launcher = h.LaunchOn(watched, session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned);
@@ -3637,7 +3714,7 @@ TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "
                                            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
                                            "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
-    auto launcher = h.RunHandler(session);
+    auto launcher = h.Launch(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
     REQUIRE_FALSE(h.handlerReturned);
@@ -3689,7 +3766,7 @@ TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immed
                     "*1\r\n$4\r\nEXEC\r\n")));
     h.pair.client->ShutdownWrite();
 
-    auto launcher = h.RunHandler(session);
+    auto launcher = h.Launch(session);
     h.reactor.Submit(launcher.Native());
     h.reactor.Run();
 
