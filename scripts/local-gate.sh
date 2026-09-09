@@ -396,6 +396,99 @@ gate_outcome_status() {
     echo "${row%%|*}"
 }
 
+# The tests a leg did not run, BY NAME, read out of that leg's own ctest output.
+#
+# `100% tests passed, 0 tests failed out of 3543` was the only thing a gate log
+# said about tests, and under #1128 it is precisely the line that cannot be
+# trusted: a Catch2 case failing exactly four assertions exits 4, every
+# registration reads exit 4 as a skip, so ctest scores it `Skipped` and still
+# prints that. The correct reading is therefore *check the skipped list* -- and
+# the gate carried no skip data at all, so that instruction could not be carried
+# out by anybody, and a lane believing it had checked had not (#1130).
+#
+# **A COUNT is refused as the fix, and that was measured rather than argued.** A
+# branch adding a skip guarded on `geteuid() == 0` leaves the tally unchanged on
+# an unprivileged gate: the skip never fires, the case runs normally, and a
+# reader checking the number sees the familiar figure and concludes correctly FOR
+# THE WRONG REASON. One more skip is not my skip, and an unchanged count is not
+# an unchanged set. So this reports names.
+#
+# ## Why it reads ctest's OUTPUT and not `Testing/Temporary/LastTestsDisabled.log`
+#
+# That file holds the names, is written at no extra cost, and is the obvious
+# source. It is also a stale verdict waiting to happen: ctest writes it only when
+# something did not run, and does NOT remove or empty it when nothing did.
+# Measured, one build directory, consecutive runs:
+#
+#   a run skipping one test    LastTestsDisabled.log written        17:51:15
+#   a run skipping nothing     untouched -- still 17:51:15, still naming that test
+#
+# So a reader trusting the file after a clean run is handed the PREVIOUS run's
+# skips, with nothing in the file to say so. The leg's own ctest output cannot go
+# stale that way, because it is produced by the run it describes. It is also
+# richer: the file merges every reason under a name that says `Disabled`, while
+# ctest labels each entry `(Skipped)`, `(Disabled)` or `(Not Run)`.
+#
+# ## Three outcomes, not two
+#
+# "nothing skipped" is a conclusion drawn from the ABSENCE of a block, so
+# something that must be PRESENT is asserted first: a ctest run that finished
+# always prints its totals line. Text carrying none is reported UNKNOWN rather
+# than as nothing-skipped. That is the state this project keeps collapsing -- the
+# file was not there and nothing was skipped are not the same fact, and only one
+# of them is about the tree.
+#
+# Entries are matched by SHAPE rather than by reading the block to end of input,
+# because ctest prints `The following tests FAILED:` AFTER this block and a
+# range-to-EOF would report those failures as skips -- which would be #1128's own
+# defect rebuilt inside its remedy.
+#
+# The pointer is SUPPLEMENTARY and the names are the record: an inlined list is
+# read months later, on another machine, after the build tree is gone, which is
+# most of when a gate log is read at all. It cannot go stale either, because it
+# is written by the run it describes -- the staleness hazard belongs to the
+# POINTER here, which is why the one offered below names `LastTest.log`, refreshed
+# every run, and never `LastTestsDisabled.log`, which is not. A pointer alone
+# would have cost the whole ticket: the log would still carry no skip data, and
+# the reader would still need a tree that may not exist.
+#
+# @param 1 Label to report against, normally the preset.
+# @param 2 Optional build directory, named in the pointer line when given.
+# Reads a ctest run's output on stdin.
+skip_report() {
+    local label="$1" build_dir="${2:-}" text entries count line
+    text="$(cat)"
+
+    # Herestrings rather than pipes throughout: `producer | grep -q` is a false
+    # negative under `pipefail`, which this script sets.
+    if ! grep -q 'tests passed' <<< "$text"; then
+        echo "== ${label}: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
+        echo "==   it cannot support 'nothing was skipped'. Whether the run finished is"
+        echo "==   the question to answer first."
+        return 0
+    fi
+
+    entries="$(awk '
+        /^The following tests did not run:/ { inblock = 1; next }
+        inblock && /^[ \t]*[0-9]+ - / { sub(/^[ \t]*/, ""); print; next }
+        inblock { inblock = 0 }
+    ' <<< "$text")"
+
+    if [[ -z "$entries" ]]; then
+        echo "== ${label}: no tests skipped"
+        return 0
+    fi
+
+    count="$(grep -c . <<< "$entries")"
+    echo "== ${label}: ${count} test(s) did not run, by name --"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && echo "==   ${line}"
+    done <<< "$entries"
+    if [[ -n "$build_dir" ]]; then
+        echo "==   each one's own output is in ${build_dir}/Testing/Temporary/LastTest.log"
+    fi
+}
+
 if [[ -n "$classify_log" ]]; then
     if [[ "$classify_log" == "-" ]]; then
         _classify_outcome="$(gate_outcome)"
@@ -1675,6 +1768,84 @@ $gate_passed_marker"
     expect "every file in the list is counted" "format 3" \
         "$(format_plan "$(printf 'a.cpp\nb.hpp\nc.h')")"
 
+    # -----------------------------------------------------------------------
+    # #1130: the skipped NAMES a leg reports, driven as a pure function over
+    # staged ctest output. No gate is run and no ctest is invoked -- `skip_report`
+    # reads text and writes text, so every outcome is exercised in milliseconds.
+    # The same split `gate_outcome` took, for the same reason.
+    #
+    # Tabs, because that is what ctest indents these entries with, and the
+    # stripping is part of what is under test.
+    _skips="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - rulebook-open-work-state (Skipped)\n\t334 - a second skipped case (Skipped)\n')"
+    _clean="$(printf '100%% tests passed, 0 tests failed out of 10\n\nTotal Test time (real) =  91.02 sec\n')"
+
+    expect "a leg that skipped tests reports them BY NAME, not as a count" \
+        "== gate-clang-debug: 2 test(s) did not run, by name --
+==   82 - rulebook-open-work-state (Skipped)
+==   334 - a second skipped case (Skipped)" \
+        "$(skip_report gate-clang-debug <<< "$_skips")"
+
+    # The direction a guard nobody has watched accept never proves. Silence here
+    # would be indistinguishable from the reporter not running at all, so the
+    # clean case makes a POSITIVE statement.
+    expect "a leg that skipped nothing says so, rather than saying nothing" \
+        "== gate-clang-debug: no tests skipped" \
+        "$(skip_report gate-clang-debug <<< "$_clean")"
+
+    # The state this project keeps collapsing. Output with no ctest totals line is
+    # not a run that skipped nothing -- it is a run whose skip data is UNKNOWN,
+    # which is the shape a killed or interrupted leg leaves. Concluding "nothing
+    # skipped" from the absence of a block, without first asserting that something
+    # which must be present IS, is how the file-was-not-there state disappears.
+    _unknown_head="== gate-clang-debug: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
+    expect "output with no totals line is UNKNOWN, never nothing-skipped" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "a truncated log that stops mid-run" | head -1)"
+    expect "empty output is UNKNOWN too -- the shape a killed leg leaves" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "" | head -1)"
+
+    # ctest prints `The following tests FAILED:` AFTER the did-not-run block, so a
+    # reader that took the block to end of input would report those failures as
+    # skips -- #1128's defect rebuilt inside its own remedy. Both spacings, since
+    # a blank line between the blocks is what would make the naive version look
+    # correct.
+    for _gap in '\n' ''; do
+        _mixed="$(printf '99%% tests passed, 1 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - a skipped one (Skipped)\n%bThe following tests FAILED:\n\t100 - a failed one (Failed)\n' "$_gap")"
+        expect "a FAILED block after the skips is not read as a skip (gap='${_gap}')" \
+            "== gate-clang-debug: 1 test(s) did not run, by name --
+==   82 - a skipped one (Skipped)" \
+            "$(skip_report gate-clang-debug <<< "$_mixed")"
+    done
+
+    # THE TICKET'S OWN ARGUMENT, encoded rather than described: two runs with the
+    # SAME COUNT and different SETS. A tally reports "1" for both and cannot tell
+    # them apart, which is how a branch adding a root-conditional skip -- one that
+    # never fires on an unprivileged gate -- leaves the number unchanged and a
+    # reader concludes correctly for the wrong reason. The names differ, so the
+    # report differs. One more skip is not my skip.
+    _skip_a="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - the skip that was always there (Skipped)\n')"
+    _skip_b="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 91 - a skip this branch introduced (Skipped)\n')"
+    expect "two runs skipping the SAME NUMBER of tests report differently" \
+        "different" \
+        "$([[ "$(skip_report leg <<< "$_skip_a")" == "$(skip_report leg <<< "$_skip_b")" ]] && echo same || echo different)"
+    # And the control that makes the line above mean something: a report compared
+    # with itself is the same, so the check is not simply always saying different.
+    expect "... while a run compared with itself reports identically" \
+        "same" \
+        "$([[ "$(skip_report leg <<< "$_skip_a")" == "$(skip_report leg <<< "$_skip_a")" ]] && echo same || echo different)"
+
+    # The pointer is supplementary and appears only when there is a directory to
+    # name. It points at `LastTest.log`, which every run rewrites -- never at
+    # `LastTestsDisabled.log`, which ctest leaves untouched when nothing skipped,
+    # so after a clean run it still names the PREVIOUS run's skips.
+    expect "the pointer names LastTest.log when a build directory is given" \
+        "==   each one's own output is in out/build/gate-clang-debug/Testing/Temporary/LastTest.log" \
+        "$(skip_report gate-clang-debug out/build/gate-clang-debug <<< "$_skips" | tail -1)"
+    expect "and no pointer line is invented when there is no directory" \
+        "==   334 - a second skipped case (Skipped)" \
+        "$(skip_report gate-clang-debug <<< "$_skips" | tail -1)"
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -1896,9 +2067,15 @@ run_preset() {
     echo "== $preset: test (--parallel $jobs)"
     if ! ctest --preset "$preset" --parallel "$jobs" > "$log" 2>&1; then
         grep -E '\*\*\*Failed|\*\*\*Timeout|tests passed' "$log" | head -30
+        # A failing leg's skips matter as much as a passing one's -- more, since a
+        # skip is one of the ways a case stops reporting on the thing that broke.
+        skip_report "$preset" "$build_dir" < "$log"
         fail "$preset tests (full log: $log)"
     fi
     grep -E 'tests passed' "$log" | head -1
+    # #1130: the totals line above is the one #1128 makes untrustworthy, so the
+    # skipped NAMES go in the log beside it, before the log this read is deleted.
+    skip_report "$preset" "$build_dir" < "$log"
     rm -f "$log"
 }
 
