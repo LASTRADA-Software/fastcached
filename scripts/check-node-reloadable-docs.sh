@@ -197,17 +197,47 @@ subject_of() {
 # @return The paths, one per line, relative to the source directory.
 files_carrying() {
     local root="$1" marker="$2" tracked f
+    local -a existing
+    existing=()
     tracked="$(git -C "$root" ls-files 2>/dev/null)" || return 0
     [[ -n "$tracked" ]] || return 0
-    printf '%s\n' "$tracked" | while IFS= read -r f; do
+
+    # The eligibility pass is BUILTINS ONLY -- `[[ -f ]]` and `case` fork nothing -- so
+    # the whole tracked set is filtered without spending a process on it. A herestring
+    # rather than a pipe, because a `while` on the right of a pipe runs in a subshell
+    # and the array would not survive it.
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         [[ -f "${root}/${f}" ]] || continue
         case "$f" in
             scripts/check-node-reloadable-docs.sh) continue ;;
         esac
-        if grep -F -- "$marker" "${root}/${f}" >/dev/null 2>&1; then
-            echo "$f"
-        fi
-    done
+        existing+=("$f")
+    done <<< "$tracked"
+
+    # Guarded before expanding: `"${arr[@]}"` on an empty array is an error under
+    # `set -u` on bash 3.2, and it would surface as this helper failing rather than as
+    # the tree carrying nothing (#793).
+    [[ ${#existing[@]} -gt 0 ]] || return 0
+
+    # ONE `grep -l` across the set instead of one `grep` per file. This used to spend a
+    # process on every tracked file -- about a thousand of them -- for a question a
+    # single grep answers, which is what put its sibling scan over a CI budget on a host
+    # where a fork is tens of milliseconds.
+    #
+    # `xargs -0` rather than passing the list directly: a thousand paths is tens of
+    # kilobytes of command line, and Git Bash's limit is far lower than Linux's, so the
+    # one platform this is being made fast for is the one that would refuse the argv.
+    # NUL-delimited, so a path with a space survives; `-0` has precedent in
+    # `check-tidy-sweep-database.sh`.
+    #
+    # `-l` alone and never `-lq`: those two flags contradict each other -- one lists
+    # files, the other stops at the first match -- and the shell picks one rather than
+    # refusing, which is how a scan reports files as lacking a marker they contain.
+    #
+    # `|| true` because `grep` exits 1 when a chunk has no match, and `pipefail` is on:
+    # without it, "nothing in this chunk" would read as the helper failing.
+    ( cd "$root" && printf '%s\0' "${existing[@]}" | xargs -0 grep -l -F -- "$marker" 2>/dev/null ) || true
 }
 
 # @param 1 The source directory.

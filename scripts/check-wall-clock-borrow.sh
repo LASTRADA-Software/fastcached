@@ -173,9 +173,38 @@ echo "wall-clock-borrow: reading $(echo "$files" | wc -l | tr -d " ") source(s),
 # start of its own line and matches perfectly. The first version of this script stripped
 # only `//`, and its self-test case passed with the stripping REMOVED: a fixture that
 # could not fail, found by neutering rather than by reading.
-strip_comments()
+# ONE awk over the whole file set, rather than three processes per file.
+#
+# It used to spend an `awk` to strip comments and then two `grep`s over the stripped
+# text, PER FILE -- THREE processes per source for a scan whose actual work is one pass
+# over the tree. The file count and what it costs are recorded once, at this check's
+# registration in `src/tests/CMakeLists.txt`, rather than restated here where a second
+# copy would drift. That is what put a 120 s budget out of reach on a hosted Windows
+# runner, where a fork costs tens of milliseconds rather than the tenths of a
+# millisecond it costs on the Linux legs. The per-line work below is the same
+# algorithm, character for character; what is gone is the process per file.
+#
+# `FILENAME` and `FNR` replace `grep -n` exactly: `strip_comments` printed one line per
+# input line, so the number grep reported was always the source line number.
+#
+# **`FNR == 1` resets the block-comment state per file, and it is load-bearing.** The
+# old shape got this for free by running a fresh `awk` per file. Without it a file
+# ending inside an unterminated `/*` would blank the start of the next one, and the
+# scan would go quiet exactly where it should refuse.
+#
+# **The program lives in a FUNCTION rather than inside a `$( ... )`, and that is not
+# style.** bash 3.2's command-substitution scanner does not skip comments, so one
+# apostrophe inside the program would swallow the closing paren and surface as a parse
+# error somewhere else entirely -- see #1100, which cost a macOS-only red and a
+# bisection to find. macOS ships bash 3.2.
+#
+# `[[:space:]]` inside an awk program is used by `check-e2e-helpers.sh`, which is in the
+# default set and runs on the same macOS leg, so the spelling is established here rather
+# than assumed portable.
+scan_sources()
 {
-    awk '
+    awk -v exempt="$exempt" '
+    FNR == 1 { inBlock = 0 }
     {
         line = $0
         out = ""
@@ -194,24 +223,36 @@ strip_comments()
             out = out line
             line = ""
         }
-        print out
-    }' "$1"
+        if (FILENAME != exempt && out ~ /^[[:space:]]*IWallClock[[:space:]]*(const[[:space:]]*)?[*&][[:space:]]*_[A-Za-z]/)
+            printf "R %s:%d:%s\n", FILENAME, FNR, out
+        if (out ~ /^[[:space:]]*WallClockRef[[:space:]]+_[A-Za-z]/)
+            guarded = guarded + 1
+    }
+    END { printf "G %d\n", guarded + 0 }
+    ' "$@"
 }
 
-raw_members=""
-guarded=0
-for f in $files; do
-    text="$(strip_comments "$f")"
-    hits="$(echo "$text" | grep -nE "^[[:space:]]*IWallClock[[:space:]]*(const[[:space:]]*)?[*&][[:space:]]*_[A-Za-z]" || true)"
-    if [ -n "$hits" ] && [ "$f" != "$exempt" ]; then
-        while IFS= read -r line; do
-            [ -n "$line" ] && raw_members="${raw_members}${f}:${line}
-"
-        done <<< "$hits"
-    fi
-    n="$(echo "$text" | grep -cE "^[[:space:]]*WallClockRef[[:space:]]+_[A-Za-z]" || true)"
-    guarded=$((guarded + n))
-done
+# The list is walked into an ARRAY rather than left to word-splitting, so a path with a
+# space reaches awk whole. The refusal above has already established it is non-empty,
+# which matters under `set -u`: expanding an empty array is an error on bash 3.2 and
+# would read as the scan failing rather than as the tree being empty (#793).
+fileList=()
+while IFS= read -r listed; do
+    [ -n "$listed" ] && fileList+=("$listed")
+done <<< "$files"
+
+scan="$(scan_sources "${fileList[@]}")"
+
+# Two `sed`s over ONE captured string, not per file. `grep -q` is deliberately not used
+# anywhere here: under `pipefail` it reports the producer's SIGPIPE status and answers
+# "absent" precisely when the thing is present.
+raw_members="$(printf '%s\n' "$scan" | sed -n 's/^R //p')"
+guarded="$(printf '%s\n' "$scan" | sed -n 's/^G //p')"
+
+# A missing count is the scan having failed to run, which must not read as a tree with
+# no guarded member -- that refusal says something specific and this would borrow its
+# words.
+[ -n "$guarded" ] || refuse "the scan produced no count; it did not run to completion, which is not the same as finding nothing"
 
 # Two empty lists agree perfectly: a scan finding no guarded member at all has stopped
 # matching, and would then pass over a tree with the guard entirely removed.
