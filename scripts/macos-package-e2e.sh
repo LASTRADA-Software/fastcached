@@ -61,12 +61,14 @@ set -euo pipefail
 pkg=""
 port="6674"
 scope="daemon"
+selftest=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pkg)   pkg="$2";   shift 2 ;;
         --port)  port="$2";  shift 2 ;;
         --scope) scope="$2"; shift 2 ;;
+        --self-test) selftest="1"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -75,6 +77,195 @@ case "$scope" in
     agent|daemon) ;;
     *) echo "--scope must be 'agent' or 'daemon', got '$scope'" >&2; exit 2 ;;
 esac
+
+# The daemon's OWN reason for exiting, which this fixture used to throw away.
+#
+# `launchctl print` says `last exit code = 2` and `launchctl list` says the same 2,
+# and neither says WHICH refusal fired: `ExitUsage` is ONE name for every refusal
+# this program has -- a flag missing, an endpoint that will not bind, a toolchain
+# survey that found nothing (#1060) -- so the exit code cannot discriminate and was
+# never meant to. The sentence naming which one goes to the job's stderr, which
+# `BuildLaunchdPlist` points at `<logdir>/<label>.err.log`, and nothing here read it.
+#
+# Measured: `Package (macOS .pkg)` failed 2 of 30 completed runs across the last 40
+# `build.yml` runs -- `adaaf35c` and `bbc53c2f`, about 100 minutes apart, on branches
+# touching neither `packaging/` nor `Platform/` nor the node -- with an identical
+# `runs = 3` / `last exit code = 2` signature and the reason sitting on the runner's
+# disk, discarded (#1055).
+#
+# The PATH is read from the plist launchd was actually given, never recomputed here.
+# `DefaultLogDirectory` builds it under `FC_MACOS_PREFIX`, which is a BUILD setting,
+# so a fixture recomputing the rule would agree with itself rather than with the
+# installation under test -- and a plist naming no such key is a finding about the
+# plist rather than a missing log.
+#
+# @param 1 The plist launchd was given.
+# @return Prints the path; exits non-zero when the plist cannot be read, and prints
+#         nothing when it names no such key. The CALLER separates those, because
+#         they are different findings.
+stderr_log_path_from_plist() {
+    local plist="$1"
+    [[ -r "$plist" ]] || return 1
+    awk '
+        index($0, "<key>StandardErrorPath</key>") { want = 1; next }
+        want { sub(/^[^>]*>/, ""); sub(/<.*$/, ""); print; exit }
+    ' "$plist"
+}
+
+# Print what the job wrote to stderr, or say precisely why there is nothing.
+#
+# SIX outcomes, and collapsing any of them into "no output" is the defect this
+# exists to close: no plist, a plist naming no `StandardErrorPath`, a log that is
+# ABSENT (the job never got far enough to write one, or launchd did not honour the
+# key), one that exists and cannot be READ, one that is present and EMPTY (it
+# started and refused without saying anything), and one with content. Those are
+# different bugs in different files, and the first four all render as silence.
+#
+# Failure path only, and everything is `|| true`: a diagnostic on an already-failed
+# case must explain the verdict and never change it.
+#
+# A system-scope log is root-owned, so the reader is a SEAM rather than a hard-coded
+# `sudo` -- `${PRIVILEGED_READ-sudo}`, with the `-` and not `:-` so an explicitly
+# EMPTY value is honoured rather than falling back to `sudo`. That is what lets the
+# self-test drive this same function over a synthesised tree as an ordinary user.
+#
+# @param 1 What to call this job in the output.
+# @param 2 The plist launchd was given.
+dump_daemon_stderr() {
+    local what="$1" plist="$2"
+    local path="" text="" lines=""
+
+    echo "--- ${what}: what the job itself said (#1055) ---" >&2
+
+    if [[ ! -r "$plist" ]]; then
+        echo "    no readable plist at ${plist}, so launchd was never told where stderr goes" >&2
+        return 0
+    fi
+
+    path="$(stderr_log_path_from_plist "$plist" || true)"
+    if [[ -z "$path" ]]; then
+        echo "    ${plist} names no StandardErrorPath, so the job's stderr went nowhere readable" >&2
+        return 0
+    fi
+
+    if ! ${PRIVILEGED_READ-sudo} test -e "$path" 2>/dev/null; then
+        echo "    ${path} does not exist: the job never got far enough to write one," >&2
+        echo "    or launchd did not honour StandardErrorPath" >&2
+        return 0
+    fi
+
+    if ! text="$(${PRIVILEGED_READ-sudo} cat "$path" 2>/dev/null)"; then
+        echo "    ${path} exists and could not be read" >&2
+        return 0
+    fi
+
+    if [[ -z "$text" ]]; then
+        echo "    ${path} is EMPTY: the job started and exited without writing a reason" >&2
+        return 0
+    fi
+
+    lines="$(printf '%s\n' "$text" | wc -l | tr -d ' ')"
+    if [[ "$lines" -gt 80 ]]; then
+        echo "    ${path}, last 80 of ${lines} line(s) -- earlier lines not shown:" >&2
+    else
+        echo "    ${path}, ${lines} line(s):" >&2
+    fi
+    printf '%s\n' "$text" | tail -80 | sed 's/^/    /' >&2 || true
+    return 0
+}
+
+# The self-test, driven against a SYNTHESISED tree.
+#
+# It has to be synthesised: the dump runs on a path that fired on 2 of 30 runs, so a
+# green CI run says nothing about it, and waiting for it to fire is waiting for the
+# bug to happen again. Same shape as `node-scratch-isolation-e2e-selftest`, which
+# drives its verdicts against a synthesised readings record for the same reason.
+#
+# Placed BEFORE the macOS guard and before the `trap cleanup EXIT` that runs
+# `fastcached-uninstall`: this must run on any platform and must never touch an
+# installation.
+if [[ -n "$selftest" ]]; then
+    selftest_root="$(mktemp -d)"
+    trap 'rm -rf "$selftest_root"' EXIT
+    PRIVILEGED_READ=""
+    selftest_ran=0
+    selftest_failed=0
+
+    # @param 1 case name, 2 phrase the output must carry, 3 plist path
+    selftest_expect() {
+        local name="$1" needle="$2" plist="$3" out=""
+        selftest_ran=$((selftest_ran + 1))
+        out="$(dump_daemon_stderr "worker" "$plist" 2>&1)" || true
+        case "$out" in
+            *"$needle"*) ;;
+            *)
+                echo "FAIL selftest/${name}: the output does not say '${needle}'" >&2
+                printf '%s\n' "$out" | sed 's/^/     | /' >&2
+                selftest_failed=$((selftest_failed + 1))
+                ;;
+        esac
+    }
+
+    # @param 1 destination plist, 2 the StandardErrorPath to name, or empty for none
+    selftest_plist() {
+        local at="$1" names="$2"
+        mkdir -p "$(dirname "$at")"
+        {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<plist version="1.0"><dict>'
+            echo '    <key>Label</key>'
+            echo '    <string>software.lastrada.fastcachecompilenode</string>'
+            if [[ -n "$names" ]]; then
+                echo '    <key>StandardErrorPath</key>'
+                echo "    <string>${names}</string>"
+            fi
+            echo '</dict></plist>'
+        } > "$at"
+    }
+
+    # 1. No plist at all.
+    selftest_expect "no-plist" "no readable plist at" "${selftest_root}/absent.plist"
+
+    # 2. A plist naming no StandardErrorPath. Distinct from a missing log: the job
+    #    may have run perfectly and had nowhere to say so.
+    selftest_plist "${selftest_root}/nokey.plist" ""
+    selftest_expect "plist-without-the-key" "names no StandardErrorPath" "${selftest_root}/nokey.plist"
+
+    # 3. The key is there and the log is not.
+    selftest_plist "${selftest_root}/missing.plist" "${selftest_root}/logs/missing.err.log"
+    selftest_expect "log-absent" "does not exist" "${selftest_root}/missing.plist"
+
+    # 4. Present and EMPTY -- not the same finding as absent, and the one a naive
+    #    `cat` renders identically to it.
+    mkdir -p "${selftest_root}/logs"
+    : > "${selftest_root}/logs/empty.err.log"
+    selftest_plist "${selftest_root}/empty.plist" "${selftest_root}/logs/empty.err.log"
+    selftest_expect "log-present-but-empty" "is EMPTY" "${selftest_root}/empty.plist"
+
+    # 5. Content, and the content must REACH the output -- which is the whole point.
+    #    The phrase is #1060's, because telling that refusal apart from any other
+    #    `ExitUsage` is what this dump exists to make possible.
+    printf '%s\n' "fastcache-compile-node: found no compiler on this machine" > "${selftest_root}/logs/real.err.log"
+    selftest_plist "${selftest_root}/real.plist" "${selftest_root}/logs/real.err.log"
+    selftest_expect "log-with-content" "found no compiler on this machine" "${selftest_root}/real.plist"
+
+    # 6. A truncated dump must SAY it is truncated, or it reads as the whole file --
+    #    the same collapse one level up. Both halves: that it says so, and that what
+    #    it keeps is the END, which is where a refusal sentence sits.
+    : > "${selftest_root}/logs/long.err.log"
+    selftest_line=1
+    while [[ "$selftest_line" -le 200 ]]; do
+        echo "line ${selftest_line}" >> "${selftest_root}/logs/long.err.log"
+        selftest_line=$((selftest_line + 1))
+    done
+    selftest_plist "${selftest_root}/long.plist" "${selftest_root}/logs/long.err.log"
+    selftest_expect "truncation-is-stated" "last 80 of 200 line(s)" "${selftest_root}/long.plist"
+    selftest_expect "truncation-keeps-the-end" "line 200" "${selftest_root}/long.plist"
+
+    echo "macos-package-e2e selftest: ${selftest_ran} case(s) ran, ${selftest_failed} failed"
+    [[ "$selftest_failed" -eq 0 ]] || exit 1
+    exit 0
+fi
 
 readonly SKIP=77
 
@@ -126,6 +317,18 @@ dump_install_logs() {
         tail -40 /var/log/fastcached-install.log >&2
     fi
     sudo grep -i fastcached /var/log/install.log 2>/dev/null | tail -20 >&2 || true
+
+    # And what the JOBS said, which is the half `launchctl` cannot report: it gives
+    # an exit CODE, and `ExitUsage` is one code for every refusal the worker has.
+    # Hooked here rather than at the one call site that noticed, so every failure
+    # path gets it -- `fail` runs this hook, and the install-service block is only
+    # the route the observed failure took (#1055).
+    dump_daemon_stderr "worker" "/Library/LaunchDaemons/${NODE_LABEL}.plist" || true
+    if [[ "$scope" == "daemon" ]]; then
+        dump_daemon_stderr "daemon" "/Library/LaunchDaemons/${LABEL}.plist" || true
+    else
+        dump_daemon_stderr "daemon (agent scope)" "${HOME}/Library/LaunchAgents/${LABEL}.plist" || true
+    fi
     return 0
 }
 e2e_on_fail dump_install_logs

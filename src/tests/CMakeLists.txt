@@ -4141,3 +4141,26 @@ set_tests_properties("wall-clock-borrow-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# The macOS package fixture's failure-path diagnostic, driven against a SYNTHESISED
+# log tree (#1055).
+#
+# The fixture itself needs root and a real .pkg, so ctest does not run it -- but its
+# diagnostic is a pure function of a plist and a log file, and that part runs
+# anywhere. It has to be tested this way: the dump fires only when the fixture has
+# already failed, which was 2 of 30 completed runs, so a green CI run says nothing
+# about it and waiting for it to fire is waiting for the bug to happen again.
+#
+# Seven cases over the states a naive `cat` renders identically -- no plist, no
+# `StandardErrorPath` key, log absent, log present and EMPTY, log with content, and
+# a truncated dump that must say so and must keep the END. Shown red by neutering:
+# the naive implementation fails five of the seven, and dropping either single
+# distinction fails exactly its own case.
+add_test(
+    NAME "macos-package-e2e-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/macos-package-e2e.sh" --self-test
+)
+set_tests_properties("macos-package-e2e-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
