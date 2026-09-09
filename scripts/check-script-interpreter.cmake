@@ -80,6 +80,20 @@ endif()
 # `${FASTCACHED_BASH}` and not an expansion of a variable this script never sets.
 set(expectedToken "\${FASTCACHED_BASH}")
 
+# Scripts NOT bound by the bash-3.2 rule, and the ONE other token each may use.
+#
+# One row per exemption, `script|token|reason`, matched per row. A bare allowlist of
+# script names would be a hole: it would let `tidy-sweep.sh` be run as a literal
+# `/bin/bash`, or as a bare `bash` resolved from PATH at run time, which is the whole
+# defect this check exists to refuse. The TOKEN is part of the row, so an exemption
+# permits exactly one substitution and not "anything goes for this file".
+#
+# An exemption outlives the shape it was granted for, so it is deleted with the shape
+# rather than reworded.
+set(interpreterExemptions
+    "tidy-sweep.sh|\${FASTCACHED_BASH44}|declares a bash-4.4 floor and exits 77 below one, so the 3.2 pin asserts a rule it is not bound by and reports SKIPPED on macOS in perpetuity (#598). FASTCACHED_BASH44 is version-CHECKED rather than merely found, because a stock macOS find_program returns /bin/bash 3.2 quite happily."
+)
+
 # Read and split by hand rather than with `file(STRINGS)`, for the reason
 # `check-script-check-signals.cmake` records at length: a `;` makes one line two
 # elements and an unbalanced `[` in a COMMENT merges every line after it, and
@@ -103,6 +117,9 @@ endif()
 
 set(violations "")
 set(siteCount 0)
+# Exempt sites are counted and NAMED, so the summary cannot claim a pin it does not have.
+set(exemptCount 0)
+set(exemptSites "")
 
 # EVERY violation goes through here, and that is a seam rather than care.
 #
@@ -112,12 +129,34 @@ set(siteCount 0)
 # -- and it was then written AGAIN, here, within the hour, by the same author who
 # had just filed it. Twice is not carelessness twice, it is a missing seam.
 #
-# The argument is prose and carries no backslash, so the macro is CMP0219-safe at
-# every call site; the escaping happens inside, on the way into the list.
-macro(fastcached_add_violation text)
+# The argument is prose and carries no backslash, so this is CMP0219-safe at every call
+# site; the escaping happens inside, on the way into the list.
+#
+# A FUNCTION and not a macro, and that is a fix rather than a preference. A macro
+# substitutes its arguments TEXTUALLY, so `${text}` re-expands the argument's own
+# content -- and every message here interpolates `${expectedToken}`, whose value is the
+# literal string `${FASTCACHED_BASH}`. This script deliberately never sets that variable
+# (see the `\${` note above), so the second expansion resolved it to nothing and the
+# violation read:
+#
+#     runs a shell script as `bash` rather than ``
+#
+# The one message whose whole job is to name the token a maintainer must use could not
+# name it. Measured on this tree before the change. A function binds `text` as a real
+# variable, so `${text}` dereferences once and the token survives.
+# `"${violations}"` QUOTED on the way in. Unquoted, the accumulated list expands into
+# separate arguments and the `\` escapes stored by earlier calls are consumed, so
+# re-joining re-splits every element that contains a `;` -- the #796 miscount this seam
+# exists to prevent, reintroduced by the very conversion that fixed the message. Measured
+# against a tree with two bad registrations, one of whose lines carries a `;`: 3 findings
+# unquoted becomes 4. The escape and the expansion have to agree, and only one of them was
+# being thought about.
+function(fastcached_add_violation text)
     string(REPLACE ";" "\\;" _escapedViolation "${text}")
-    list(APPEND violations "${_escapedViolation}")
-endmacro()
+    set(_grown "${violations}")
+    list(APPEND _grown "${_escapedViolation}")
+    set(violations "${_grown}" PARENT_SCOPE)
+endfunction()
 set(lineNumber 0)
 set(sawDefinition FALSE)
 
@@ -156,6 +195,34 @@ foreach(line IN LISTS lines)
 
     set(token "${CMAKE_MATCH_1}")
 
+    # Is the script on this line exempt, and if so which single token may it use?
+    #
+    # Matched on the basename as it appears in the quoted path, so a row cannot be
+    # satisfied by a different file whose name merely contains it.
+    set(_exemptToken "")
+    set(_exemptScript "")
+    set(_exemptReason "")
+    foreach(exemption IN LISTS interpreterExemptions)
+        string(FIND "${exemption}" "|" _bar1)
+        string(SUBSTRING "${exemption}" 0 ${_bar1} _rowScript)
+        math(EXPR _afterBar1 "${_bar1} + 1")
+        string(SUBSTRING "${exemption}" ${_afterBar1} -1 _rowRest)
+        string(FIND "${_rowRest}" "|" _bar2)
+        string(SUBSTRING "${_rowRest}" 0 ${_bar2} _rowToken)
+        math(EXPR _afterBar2 "${_bar2} + 1")
+        string(SUBSTRING "${_rowRest}" ${_afterBar2} -1 _rowReason)
+        # The script name is a literal, not a pattern. Unescaped, `tidy-sweep.sh`'s dots
+        # are wildcards -- harmless against today's tree and the same mistake as a `pkill
+        # -f` pattern read as a literal, in a third instrument.
+        string(REPLACE "." "\\." _rowScriptRegex "${_rowScript}")
+        if(line MATCHES "\"[^\"]*scripts/${_rowScriptRegex}\"")
+            set(_exemptToken "${_rowToken}")
+            set(_exemptScript "${_rowScript}")
+            set(_exemptReason "${_rowReason}")
+            break()
+        endif()
+    endforeach()
+
     # `COMMAND "x.sh"` matches the pattern with `COMMAND` as the token, and
     # reporting that as the interpreter names the wrong half of a real defect --
     # #791's lesson. There is no interpreter there at all, and that is what the
@@ -164,6 +231,18 @@ foreach(line IN LISTS lines)
         string(STRIP "${line}" shownLine)
         fastcached_add_violation(
              "src/tests/CMakeLists.txt:${lineNumber} runs a shell script with NO interpreter token before it, so the kernel picks one from the shebang and this check cannot pin it. Line: ${shownLine}")
+    elseif(NOT token STREQUAL "${expectedToken}" AND NOT _exemptToken STREQUAL "")
+        # An exempt script, run through the one token its row permits. Counted as a site
+        # so the census below still sees it -- an exemption removes the OBJECTION, never
+        # the file, or the "found no registrations at all" floor could be walked past by
+        # exempting everything.
+        math(EXPR exemptCount "${exemptCount} + 1")
+        list(APPEND exemptSites "${_exemptScript} -> ${_exemptToken}")
+        if(NOT token STREQUAL "${_exemptToken}")
+            string(STRIP "${line}" shownLine)
+            fastcached_add_violation(
+                 "src/tests/CMakeLists.txt:${lineNumber} runs `${_exemptScript}` as `${token}`. That script is exempt from the `${expectedToken}` pin, but the exemption names ONE permitted token, `${_exemptToken}`, and this is not it. An exemption that admitted any token would readmit exactly what this check refuses: a literal path that breaks on another platform, or a bare `bash` resolved from PATH by ctest at run time. The row's stated reason is: ${_exemptReason} Line: ${shownLine}")
+        endif()
     elseif(NOT token STREQUAL "${expectedToken}")
         string(STRIP "${line}" shownLine)
         fastcached_add_violation(
@@ -199,6 +278,17 @@ if(violations)
         "script interpreter: ${violationCount} finding(s) across ${siteCount} script-driven registration(s)")
 endif()
 
-message(STATUS
-    "script interpreter: all ${siteCount} script-driven registration(s) run through "
-    "\${FASTCACHED_BASH}")
+# The exempt sites are named, not folded into the total. "all N run through
+# ${FASTCACHED_BASH}" stopped being true the moment an exemption existed, and a summary
+# that overstates its own coverage is what this check is about one level up -- a reader
+# would take the pin as universal and it is not.
+math(EXPR pinnedCount "${siteCount} - ${exemptCount}")
+if(exemptCount GREATER 0)
+    message(STATUS
+        "script interpreter: ${pinnedCount} of ${siteCount} script-driven registration(s) run "
+        "through \${FASTCACHED_BASH}; ${exemptCount} exempt by a named row: ${exemptSites}")
+else()
+    message(STATUS
+        "script interpreter: all ${siteCount} script-driven registration(s) run through "
+        "\${FASTCACHED_BASH}")
+endif()

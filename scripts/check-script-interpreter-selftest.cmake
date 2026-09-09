@@ -198,6 +198,87 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# A finding whose LINE contains a semicolon is ONE finding.
+#
+# Every other want-fail case here asserts "one finding" over a line with no `;`, so none
+# of them can see the #796 miscount -- and it came back: converting the accumulator from
+# a macro to a function (to fix a message that could not name its own token) expanded the
+# stored list unquoted, which consumed the escapes the same function had just added, and
+# one finding was counted as two. Measured: 3 findings where 2 were staged.
+#
+# The check already escapes on the way in; what this pins is that the escape and the
+# EXPANSION agree, which is the half that was not being thought about.
+# TWO defects, and the first carries the `;`. One is not enough and that is the whole
+# subtlety: the corruption damages elements ALREADY in the list when a later one is
+# appended, so a single finding is stored and read back intact under the bug. The first
+# version of this case staged one defect, asserted "one finding", and passed with the
+# mutation installed -- a regression test that could not reproduce its regression, found
+# by neutering rather than by reading it.
+#
+# So this case does not go through `fastcached_case`, whose count assertion is hard-wired
+# to one. It asserts TWO.
+fastcached_stage("semicolon" tree)
+fastcached_inject("${tree}" "${oneSite}"
+                  "COMMAND bash \"\${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh\" \; tail" stagedA)
+fastcached_inject("${tree}" "COMMAND \${FASTCACHED_BASH} \"\${CMAKE_SOURCE_DIR}/scripts/flake-rate.sh\""
+                  "COMMAND bash \"\${CMAKE_SOURCE_DIR}/scripts/flake-rate.sh\"" stagedB)
+math(EXPR caseCount "${caseCount} + 1")
+if(NOT stagedA OR NOT stagedB)
+    fastcached_selftest_failed("semicolon"
+        "an injection changed nothing (A=${stagedA} B=${stagedB}), so the case stages fewer than the two defects it needs")
+else()
+    fastcached_run("${tree}" _semiObjected _semiOutput)
+    if(NOT _semiObjected)
+        fastcached_selftest_failed("semicolon" "expected a refusal and the check passed")
+    elseif(NOT _semiOutput MATCHES "2 finding.s. across")
+        fastcached_selftest_failed("semicolon"
+            "two defects were staged, one of them on a line carrying a `;`, and the check did not report exactly two findings -- the accumulator is re-splitting stored elements (#796)")
+        message("${_semiOutput}")
+    else()
+        message(STATUS "  ok    (want-fail, TWO findings) a `;` in one finding does not split another")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# The EXEMPTION, both directions (#598).
+#
+# An exemption is a hole unless it is narrow, and "narrow" here means it permits exactly
+# ONE substitute token for exactly one script. The control above already covers the
+# accepting direction -- the real file carries the exempt site and must pass -- so what
+# is left is the direction that would make it a hole: the exempt script run as something
+# the row does not name. Without this case an exemption keyed on the FILE alone passes
+# every test in this file while readmitting a literal `/bin/bash` or a PATH-resolved
+# `bash`, which is the whole of what this check refuses.
+fastcached_stage("exempt-wrong-token" tree)
+fastcached_inject("${tree}"
+    "COMMAND \${FASTCACHED_BASH44} \"\${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh\""
+    "COMMAND /bin/bash \"\${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh\"" staged)
+if(NOT staged)
+    fastcached_selftest_failed("exempt-wrong-token"
+        "the injection changed nothing -- the exempt registration is not spelled as this case expects, so it stages no defect")
+else()
+    fastcached_case("an exempt script run as a token its row does not name is refused" "${tree}"
+                    "exemption names ONE permitted token")
+endif()
+
+# And the exemption must not leak to a script it does not name. A row keyed loosely --
+# on a substring, say -- would exempt every neighbour whose path contains the name.
+#
+# Injected at `oneSite`, which is registered exactly once, because the harness asserts a
+# single finding. The first version of this case rewrote `run-check.sh` and produced many
+# -- a correct refusal that failed the case for arithmetic rather than for behaviour.
+fastcached_stage("exempt-does-not-leak" tree)
+fastcached_inject("${tree}" "${oneSite}"
+    "COMMAND \${FASTCACHED_BASH44} \"\${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh\"" staged)
+if(NOT staged)
+    fastcached_selftest_failed("exempt-does-not-leak"
+        "the injection changed nothing, so the case stages no defect")
+else()
+    fastcached_case("a NON-exempt script may not use the exempt token either" "${tree}"
+                    "rather than")
+endif()
+
+# ---------------------------------------------------------------------------
 if(failureCount GREATER 0)
     message("")
     message(FATAL_ERROR

@@ -215,12 +215,24 @@ set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
 # The interpreter every script-driven test runs under (#379).
 #
 # `/bin/bash` and never a bare `bash`, because a bare one resolves through PATH.
-# On GitHub's macOS image Homebrew's bash 5.x sits ahead of Apple's 2007
-# `/bin/bash`, so every script test there ran under bash 5 -- and
 # `.agent/rules/build-and-toolchain.md` requires these scripts to work on bash
 # **3.2**, which is what `/bin/bash` on macOS is. The rule had no executor: it was
 # enforced by careful reading, and a `mapfile` had already taken
 # `merge-queue-contexts` red on `macOS-clang-release` once before anyone noticed.
+#
+# This paragraph used to open by stating that Homebrew's bash 5.x sits ahead of Apple's
+# 2007 `/bin/bash` on GitHub's image, so every script test there ran under bash 5. That
+# is **measured false** and was already known to be, in this same tree:
+# `check-script-interpreter.cmake` records both spellings registered side by side and run
+# on `macOS-clang-release` (PR #806, 2026-09-05), where `COMMAND bash` and
+# `COMMAND /bin/bash` BOTH resolved to `/bin/bash` 3.2.57. Two files in one repository
+# asserting opposite things about one fact is how the wrong one survives -- #560's lesson,
+# and the reason the claim is corrected here rather than left for a reader to reconcile.
+#
+# What the pin below buys is therefore not a repair. CMake does not resolve a bare command
+# name at configure time, so `CTestTestfile.cmake` keeps the literal `bash` and the
+# interpreter is chosen from PATH at RUN time; naming `/bin/bash` removes a live
+# dependency on PATH ordering rather than fixing a present defect.
 #
 # Windows has no `/bin/bash`, so it keeps the PATH lookup -- Git for Windows'
 # bash is the only one there and nothing is being selected between. The rule is
@@ -233,6 +245,124 @@ if(WIN32)
     set(FASTCACHED_BASH bash)
 else()
     set(FASTCACHED_BASH /bin/bash)
+endif()
+
+# The PowerShell interpreter, resolved once, for the same reason `FASTCACHED_BASH` is.
+#
+# A bare `pwsh` in a COMMAND is left unresolved in `CTestTestfile.cmake` and picked from
+# PATH at RUN time, so which interpreter a `.ps1` test gets is a property of the image.
+# Eight sites spelled it bare. `check-script-interpreter.cmake` reads `.sh` only, so
+# nothing would ever report the drift.
+#
+# `powershell` (Windows PowerShell 5.1) is deliberately NOT on this list, and the reason
+# is a mistake worth recording. It WAS, on the evidence that
+# `node-scratch-isolation-e2e.ps1 -SelfTest` passes 23 of 23 cases under both pwsh 7.6.5
+# and 5.1 -- measured, and true. But this variable gates TWO scripts, and the second was
+# never asked. Measured:
+#
+#     pwsh        dist-compile-e2e.ps1 -SelfTest  ->  exit 0, PASSED
+#     powershell  dist-compile-e2e.ps1 -SelfTest  ->  exit 1, MethodNotFound
+#
+# `[System.Security.Cryptography.SHA256]::HashData` is .NET 5+, so 5.1 cannot run it. A
+# host with no pwsh -- an ordinary developer Windows box, where the hosted images all
+# ship one -- would resolve `powershell` and take that test RED for a reason unrelated to
+# the change under test. That is the exact criterion the block below states ("an
+# interpreter that could not run it would turn this skip into a failure, which is worse
+# than the `if(WIN32)` it replaces"), failed by carrying one script's measurement over to
+# another. Err NARROW: a 5.1-only host now SKIPS both, which is honest, where the wider
+# list failed one of them.
+find_program(FASTCACHED_PWSH NAMES pwsh pwsh-preview)
+
+# Register a test that could NOT be run here, as a SKIP.
+#
+# Absent is not skipped. A registration omitted because a host lacks a prerequisite
+# vanishes from the run with nothing saying it was ever expected, and no count carries
+# the difference. This puts the row in every run and makes it say which of the two it is.
+#
+# The `SKIP: ` sentinel and the `SKIP_REGULAR_EXPRESSION` that reads it are spelled HERE,
+# once, and that is the point rather than tidiness: written per site they drift apart by
+# OMISSION, and the omission is silent in the worst direction. `cmake -E echo` exits 0, so
+# a site that loses the property reports **Passed** for a property nothing established --
+# #685's SUCCEED-standing-in-for-a-skip defect, reachable by forgetting one line.
+function(fastcached_register_skipped_test name reason)
+    add_test(NAME "${name}" COMMAND ${CMAKE_COMMAND} -E echo "SKIP: ${reason}")
+    set_tests_properties("${name}" PROPERTIES
+        LABELS "hygiene"
+        SKIP_REGULAR_EXPRESSION "SKIP: "
+        TIMEOUT 60
+    )
+endfunction()
+
+# The interpreter for the one script that is NOT bound by the bash-3.2 rule (#598).
+#
+# The pin above exists to enforce that rule. `tidy-sweep.sh` is exempt from it by
+# construction: it declares a bash-4.4 floor and exits 77 below one, so running it
+# through the 3.2 pin asserts a rule it is not bound by and reports SKIPPED on macOS in
+# perpetuity -- new coverage that is Linux-only with nothing saying so.
+#
+# #598 proposed adding `bash` to the macOS `brew install` line, on the reasoning that
+# "Homebrew's bin precedes /bin, so the newer bash is what `COMMAND bash` resolves to".
+# That was true when it was filed on 2026-09-02 and stopped being true on 2026-09-05,
+# when c414428a (#809) pinned every registration to `/bin/bash` precisely so macOS runs
+# the 2007 interpreter. Brew installs to `/opt/homebrew/bin` and cannot touch a
+# SIP-protected `/bin/bash`, so the one-word fix would have left the leg SKIPPED while
+# looking like it worked -- which is the failure #598's own acceptance clause warns
+# about. The brew line is still needed, so that a 4.4 exists to be found at all.
+#
+# VERSION-CHECKED and not merely found, and searched by CANDIDATE rather than by PATH.
+#
+# Both halves are load-bearing on macOS specifically, and the second is easy to get
+# wrong because a claim in this tree said otherwise. `check-script-interpreter.cmake`
+# carries the measurement that settles it -- both spellings registered side by side and
+# run on `macOS-clang-release` (PR #806, 2026-09-05):
+#
+#     COMMAND bash       -> /bin/bash  3.2.57(1)-release
+#     COMMAND /bin/bash  -> /bin/bash  3.2.57(1)-release
+#
+# Homebrew's `bin` is NOT ahead of `/bin` on that image. So `find_program(NAMES bash)`
+# there returns Apple's 3.2 even after `brew install bash` puts a 5.x on disk, and a
+# PATH-order search would report "no 4.4 available" on a runner that has one. The
+# candidates are therefore named, most-specific first, and each is ASKED its version --
+# registering an unchecked find would put the interpreter question back where it started
+# behind a variable named as though it had been answered.
+set(FASTCACHED_BASH44 "")
+set(FASTCACHED_BASH44_VERSION "")
+find_program(FASTCACHED_BASH44_ON_PATH NAMES bash)
+set(_bashCandidates
+    /opt/homebrew/bin/bash          # Homebrew, Apple Silicon
+    /usr/local/bin/bash             # Homebrew, Intel
+    "${FASTCACHED_BASH44_ON_PATH}"  # whatever PATH offers
+    /bin/bash)                      # the system interpreter, last
+# On a stock macOS the third and fourth are the SAME binary -- PATH's `bash` IS
+# `/bin/bash` there, which is the measurement this whole block rests on -- so without
+# this the 3.2 interpreter is spawned and version-probed twice, on exactly the host
+# where the answer is "no candidate qualifies" and all four are tried.
+list(REMOVE_DUPLICATES _bashCandidates)
+foreach(_bashCandidate IN LISTS _bashCandidates)
+    if(NOT _bashCandidate OR NOT EXISTS "${_bashCandidate}")
+        continue()
+    endif()
+    execute_process(
+        COMMAND "${_bashCandidate}" -c "printf '%s.%s' \"\${BASH_VERSINFO[0]}\" \"\${BASH_VERSINFO[1]}\""
+        OUTPUT_VARIABLE _candidateVersion
+        ERROR_QUIET
+        # ENCODING NONE: `execute_process` defaults to AUTO and decodes the child through
+        # the console code page.
+        ENCODING NONE
+    )
+    if(_candidateVersion AND NOT _candidateVersion VERSION_LESS "4.4")
+        set(FASTCACHED_BASH44 "${_bashCandidate}")
+        set(FASTCACHED_BASH44_VERSION "${_candidateVersion}")
+        break()
+    endif()
+endforeach()
+
+if(FASTCACHED_BASH44)
+    message(STATUS "[bash44] ${FASTCACHED_BASH44} is ${FASTCACHED_BASH44_VERSION}")
+else()
+    message(STATUS
+        "[bash44] no bash >= 4.4 among the candidates, so tidy-sweep's self-test will "
+        "report SKIPPED on this host")
 endif()
 
 # The canary: a check that must be seen to fail. See scripts/script-check-canary.cmake
@@ -1155,6 +1285,58 @@ set_tests_properties("mkdocs-validation" PROPERTIES
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "
     TIMEOUT 60
+)
+
+# A script offering `--self-test` must be REGISTERED to run it (#596).
+#
+# An unrun self-test is the most expensive green there is: the cases exist, they are
+# written carefully, they are cited in review, and nothing says no target invokes them.
+# `scripts/ci-apt-update.sh` grew twelve cases covering the decision that had just broken
+# CI, no `add_test` named it, and the allowlist shipped with the runner's real layout
+# untested -- taking every Linux job down at `Install build tools` (#1160).
+#
+# The rule is stricter than #596's literal wording, which asks only that the script
+# "appear in an add_test COMMAND". The tree held the counterexample: at the time of
+# writing `check-mkdocs-validation.sh` appeared in the table, in its plain mode, and its
+# self-test had still never run. So the registration must PASS the flag.
+add_test(
+    NAME "selftest-registered"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered.cmake"
+)
+set_tests_properties("selftest-registered" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And that check must be seen to refuse AND to accept -- eight synthetic trees, one
+# verdict each.
+#
+# Both directions, because #596 asks for both and because they are different edits: a
+# self-test ADDED without a registration, and a registration REMOVED from one that had
+# it. The accepting direction is not decoration either (#1031): a guard that fails closed
+# and unconditionally reads as "my branch is bad" rather than "the gate is broken", and
+# can stand for days.
+#
+# Every case here has been shown to FAIL under a mutation of the check, one case per
+# mutation, which is the only evidence that any of them constrains anything. That is not
+# a formality: case 5 originally staged a PROSE mention of the flag, which matches no
+# dispatch shape whether comments are skipped or not, so deleting the comment skip left
+# it green -- a duplicate of case 6 wearing case 5's name. Reading it could not show
+# that; only neutering the check did.
+add_test(
+    NAME "selftest-registered-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_CHECK=${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered.cmake"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-selftest-registered-selftest.cmake"
+)
+set_tests_properties("selftest-registered-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
 )
 
 add_test(
@@ -2833,15 +3015,30 @@ endif()
 # `if(NOT WIN32)` still applies for the reason its neighbours carry it: the
 # script is POSIX, and what it checks is platform-independent.
 if(NOT WIN32)
-    add_test(
-        NAME "tidy-sweep-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
-    )
-    set_tests_properties("tidy-sweep-selftest" PROPERTIES
-        LABELS "hygiene"
-        SKIP_RETURN_CODE 77
-        TIMEOUT 60
-    )
+    if(FASTCACHED_BASH44)
+        # `${FASTCACHED_BASH44}` and not `${FASTCACHED_BASH}` -- see the derivation above
+        # and the exemption row in `check-script-interpreter.cmake`, which names this
+        # script and only this script.
+        #
+        # `SKIP_RETURN_CODE 77` STAYS. The interpreter is known to clear the floor here,
+        # so this arm should not skip -- but the script exits 77 for its own reasons too,
+        # and a registration that scores those a FAILURE is #499 exactly.
+        add_test(
+            NAME "tidy-sweep-selftest"
+            COMMAND ${FASTCACHED_BASH44} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
+        )
+        set_tests_properties("tidy-sweep-selftest" PROPERTIES
+            LABELS "hygiene"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 60
+        )
+    else()
+        # No interpreter clears the floor. Registered anyway, and SKIPPED -- absent is not
+        # skipped, and dropping the row is what makes a permanent gap indistinguishable
+        # from a platform that was never meant to run it.
+        fastcached_register_skipped_test("tidy-sweep-selftest"
+            "no bash >= 4.4 on this host, so tidy-sweep.sh's scope computation was not exercised")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -3483,15 +3680,36 @@ endif()
 # own startup costs 0.2-0.5s. The decision is now a pure function over a readings
 # record and the cases are rows -- 17 of them, both sides of every bound, in about
 # a third of a second. See `.agent/rules/testing.md`.
-if(WIN32)
+# Gated on an INTERPRETER, not on the platform (#837).
+#
+# `if(WIN32)` was narrower than the thing it guarded. The end-to-end fixture needs
+# Windows -- it drives real processes and a real scratch-directory claim -- but its
+# decision table does not: `Invoke-SelfTest` is a pure function over synthesised
+# readings, which is exactly why it was split out of the fixture in the first place
+# (53 s + RUN_SERIAL became 0.3 s). The registration never followed the split, so a
+# classifier that had already been wrong in production could only be exercised on one
+# platform. GitHub's `ubuntu-*` images carry `pwsh`, so the coverage costs ~1.2 s.
+#
+# An interpreter that could not run it would turn this skip into a FAILURE, which is worse
+# than the `if(WIN32)` it replaces -- so `FASTCACHED_PWSH` names pwsh only. This script
+# itself passes 23 of 23 under Windows PowerShell 5.1 as well, measured; its sibling
+# `dist-compile-e2e.ps1` does not, and they share the gate. See the derivation beside
+# `find_program(FASTCACHED_PWSH ...)`.
+if(FASTCACHED_PWSH)
     add_test(
         NAME "node-scratch-isolation-e2e-selftest"
-        COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/node-scratch-isolation-e2e.ps1" -SelfTest
     )
     set_tests_properties("node-scratch-isolation-e2e-selftest" PROPERTIES
         LABELS "hygiene"
         TIMEOUT 120
     )
+else()
+    # Registered and SKIPPED rather than omitted -- absent is not skipped, and
+    # `if(WIN32)` left every non-Windows runner in the absent state for as long as it
+    # stood. See `fastcached_register_skipped_test`, which owns the sentinel.
+    fastcached_register_skipped_test("node-scratch-isolation-e2e-selftest"
+        "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the wait classifier's decision table was not exercised on this host")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -3672,12 +3890,24 @@ else()
     # round trips to find out, the last of them on a control that compared two
     # objects with different NAMES and so reported a reproducible driver as
     # non-reproducible.
-    if(WIN32)
+    # Gated on an INTERPRETER, not on the platform -- the same fix #837 makes to
+    # `node-scratch-isolation-e2e-selftest`, applied to the sibling that block cites as
+    # prior art. This one is the same shape exactly: a `-SelfTest` mode its own comment
+    # calls a pure decision over synthetic COFF input, gated `if(WIN32)`, so it could only
+    # ever run on one platform. Converting one of the two and reporting the constraint
+    # enforced is this file's own #379 lesson -- six call sites named, thirty in the tree.
+    if(FASTCACHED_PWSH)
         add_test(
             NAME "dist-compile-e2e-selftest"
-            COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1" -SelfTest
+            COMMAND "${FASTCACHED_PWSH}" -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1" -SelfTest
         )
-        set_tests_properties("dist-compile-e2e-selftest" PROPERTIES TIMEOUT 120)
+        set_tests_properties("dist-compile-e2e-selftest" PROPERTIES
+            LABELS "hygiene"
+            TIMEOUT 120
+        )
+    else()
+        fastcached_register_skipped_test("dist-compile-e2e-selftest"
+            "no PowerShell 7 interpreter found (pwsh, pwsh-preview), so the object-comparison decision table was not exercised on this host")
     endif()
 endif()
 
