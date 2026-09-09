@@ -56,18 +56,19 @@ if [ -d /run/systemd/system ]; then
     fi
 fi
 
-# A `compile-node.env` left over from before #291 is INERT now: the unit
-# no longer reads it, so an operator who edits it gets silence. Silence is
-# the failure this whole change is about, arriving from the other side, so
-# say it once -- here, at the upgrade that stops reading it, on exactly the
-# machines that have one. Whether rpm removes a %config(noreplace) file that a
-# newer version stops shipping is #383's question and deliberately not answered
-# here; this is the message, not the scrub, and it is correct either way -- if
-# rpm did remove it, the test below simply does not fire.
-if [ -f "/@FASTCACHED_SYSCONF_DIR@/compile-node.env" ]; then
-    echo "fastcache-compile-node: /@FASTCACHED_SYSCONF_DIR@/compile-node.env is no longer read." >&2
-    echo "  Its settings now live in /@FASTCACHED_SYSCONF_DIR@/fastcache-compile-node.yaml." >&2
-    echo "  The old file is left in place; nothing reads it and it can be removed." >&2
-fi
+# The `compile-node.env` warning that stood here is gone with #383, and it was
+# not merely redundant -- it was WRONG, in the one direction its own comment
+# ruled out. It reasoned that the message "is correct either way -- if rpm did
+# remove it, the test below simply does not fire". rpm does remove it, and the
+# test fired anyway: %post of the new package runs while the retired
+# %config(noreplace) file is STILL on disk, and rpm removes it (or saves it as
+# `<path>.rpmsave` when the operator had edited it) afterwards, in the same
+# transaction. So this printed "The old file is left in place" seconds before
+# rpm took it away, and pointed an operator at a path whose contents had moved.
+#
+# Measured by instrumenting a %post rather than reading interleaved output.
+# That ordering is the opposite of dpkg's, which retires the conffile at unpack
+# and so reaches its postinst with the file already gone -- which is why one of
+# these two messages was false and the other merely dead.
 
 exit 0

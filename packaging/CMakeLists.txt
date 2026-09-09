@@ -51,6 +51,12 @@ set(FASTCACHED_TMPFILES_DIR       "usr/lib/tmpfiles.d")
 # config lookup, so the file this directory installs and the path the daemon
 # probes for are one value.
 
+# Defined on every path, so the export below reads a value this configure set
+# rather than one no branch wrote. Only the Linux branch fills it in: a .pkg and
+# an MSI have no conffile mechanism to retire a file through, which is the same
+# reason they ship a `.default` copy instead of the live config.
+set(FASTCACHED_PLATFORM_OBSOLETE_CONFIG "")
+
 # The service assets only make sense in the root-rooted package layout: their
 # destinations (usr/lib/systemd, etc/) are written assuming the payload lands
 # at /. A conventional prefixed install would scatter them to
@@ -94,7 +100,43 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
         # (#291): two mechanisms that can disagree about one setting are worse
         # than either alone, and nobody had written down which won. Removing the
         # row is what stops new packages shipping it; a copy already on disk is
-        # dpkg's and rpm's to deal with, which is #383.
+        # named in FASTCACHED_PLATFORM_OBSOLETE_CONFIG just below (#383).
+    )
+
+    # Config files this package USED to ship and no longer does. Dropping the
+    # asset row above stops new packages carrying the file; it does not remove
+    # the copy an older package already put on disk, because a package manager
+    # will not silently delete something it has classified as an operator's to
+    # edit. So a dropped config file is TWO edits -- delete the asset row, add
+    # the path here -- and the second is the one that is easy to forget, which
+    # is why this table sits against the first.
+    #
+    # DEB only, and that asymmetry is measured rather than assumed (#383):
+    #
+    #   dpkg  leaves the file in place forever, edited or not. The
+    #         `remove-on-upgrade` conffiles flag is what removes it, saving an
+    #         operator-modified copy as `<path>.dpkg-old`.
+    #   rpm   already does exactly that on its own for a %config(noreplace)
+    #         file a newer version stops shipping -- removed when pristine,
+    #         kept as `<path>.rpmsave` when edited. There is no rpm counterpart
+    #         to add, and adding one would be a second mechanism for a
+    #         behaviour rpm already has.
+    #
+    # Both were measured on both operator states, each against a control file
+    # that IS still shipped, so "the package manager preserved it" is
+    # distinguishable from "the probe never performed an upgrade".
+    # `ctest -R obsolete-conffiles` is what keeps that true.
+    #
+    # The flag needs dpkg >= 1.20.6. Below that -- Debian 10, Ubuntu 20.04 --
+    # dpkg parses the flag as part of the pathname, the upgrade still succeeds,
+    # and the file simply stays, which is today's behaviour rather than a new
+    # failure. Such a host self-repairs on the first upgrade after its dpkg
+    # crosses the floor. That is why this is a conffiles flag and not an
+    # `rm_conffile` call out of maintainer scripts: there is no `preinst` in
+    # this tree, rm_conffile needs one plus matching postinst and postrm arms,
+    # and a preinst that fails is a package that will not install.
+    set(FASTCACHED_PLATFORM_OBSOLETE_CONFIG
+        "/${FASTCACHED_SYSCONF_DIR}/compile-node.env"
     )
 elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
     # The generated scripts are referenced from the build tree; see below.
@@ -162,6 +204,11 @@ if(FASTCACHED_PACKAGE_ROOT_PREFIX)
     # %config(noreplace) filelist.
     set(FASTCACHED_PACKAGE_CONFIG_FILES "${_config_files}"
         CACHE INTERNAL "Package-manager config files (never replaced on upgrade)")
+
+    # Consumed by Packaging.cmake for the DEB conffiles list only; see the
+    # table's own comment for why rpm needs no counterpart.
+    set(FASTCACHED_PACKAGE_OBSOLETE_CONFIG_FILES "${FASTCACHED_PLATFORM_OBSOLETE_CONFIG}"
+        CACHE INTERNAL "Config files older packages shipped and this one removes on upgrade")
 endif()
 
 if(FASTCACHED_PACKAGE_ROOT_PREFIX AND UNIX AND NOT APPLE)
@@ -248,14 +295,18 @@ elseif(FASTCACHED_PACKAGE_ROOT_PREFIX AND APPLE)
     set(FASTCACHED_SCRIPTLET_DIR ""
         CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
 else()
-    # Both exports must be written on EVERY configure, not only when the branch
-    # above runs. They are CACHE INTERNAL, so a value left over from an earlier
-    # configure survives a reconfigure that turns the branch off — and cpack
-    # would then emit conffiles/%config entries for a payload no longer
+    # EVERY export below must be written on EVERY configure, not only when the
+    # branch above runs. They are CACHE INTERNAL, so a value left over from an
+    # earlier configure survives a reconfigure that turns the branch off — and
+    # cpack would then emit conffiles/%config entries for a payload no longer
     # installed, failing rpmbuild with "File not found" and shipping a DEB whose
-    # conffiles list names an absent path.
+    # conffiles list names an absent path. Stated as "every" rather than a
+    # count, because the count was "both" until #383 added a third and a number
+    # in a comment does not move when the list does.
     set(FASTCACHED_PACKAGE_CONFIG_FILES ""
         CACHE INTERNAL "Package-manager config files (never replaced on upgrade)")
+    set(FASTCACHED_PACKAGE_OBSOLETE_CONFIG_FILES ""
+        CACHE INTERNAL "Config files older packages shipped and this one removes on upgrade")
     set(FASTCACHED_SCRIPTLET_DIR ""
         CACHE INTERNAL "Directory holding the configured DEB/RPM maintainer scripts")
 endif()

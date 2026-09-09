@@ -2321,6 +2321,60 @@ endif()
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# A config file this package used to ship is retired from operators' disks.
+#
+# Deleting the asset row stops NEW packages carrying the file and does nothing
+# about the copy already installed -- dpkg keeps a conffile forever once a
+# package has claimed one. So retiring a config file is two edits, and the
+# second one has no symptom: the tree looks finished, every test passes, and
+# `compile-node.env` sat in /etc on every upgraded machine for four releases
+# (#291, #383).
+#
+# This is the source half and it runs everywhere, because it reads two CMake
+# files and needs no package manager: a path is never both shipped and retired
+# (dpkg-deb refuses to BUILD such a package, so the mistake otherwise surfaces
+# only in the packaging job, as a message about the archive), the export is
+# written on every configure, and cmake/Packaging.cmake actually emits the flag
+# rather than computing a list nothing reads.
+#
+# The behavioural half is `--deb` and `--rpm`, in the packaging job, where real
+# packages exist to upgrade -- both managers across both operator states. It is
+# not registered here because the default build produces neither package, and a
+# ctest case that could never run is dead configuration rather than coverage.
+#
+# Not "smoke": it starts no daemon, opens no socket and finishes in
+# milliseconds, so it must survive `ctest -LE smoke`. `if(NOT WIN32)` for the
+# reason its neighbours carry it.
+if(NOT WIN32)
+    add_test(
+        NAME "obsolete-conffiles"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("obsolete-conffiles" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    # Each verdict watched refusing, against synthetic trees. Every assertion was
+    # neutered in turn and exactly one case flipped for each -- including the
+    # reads-the-export one, which was NOT exercised until its case stopped also
+    # tripping the emits-the-flag assertion. Both controls are here too: a tree
+    # whose config rows the reader cannot see, and one whose obsolete table was
+    # deleted, since each reads exactly like a clean tree.
+    add_test(
+        NAME "obsolete-conffiles-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh" --self-test
+    )
+    set_tests_properties("obsolete-conffiles-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # A rulebook `## Open work` entry still names OPEN work.
 #
 # `.agent/rules/` exists because every rule in it has already been a bug, so an

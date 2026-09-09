@@ -182,8 +182,26 @@ if(UNIX AND NOT APPLE)
             "${FASTCACHED_SCRIPTLET_DIR}/deb/postrm"
         )
 
-        if(FASTCACHED_PACKAGE_CONFIG_FILES)
-            string(REPLACE ";" "\n" _conffiles "${FASTCACHED_PACKAGE_CONFIG_FILES}")
+        # Live config files first, then the ones older packages shipped and this
+        # one retires. `remove-on-upgrade` is a per-line flag (dpkg >= 1.20.6);
+        # the reasoning, the measurements and the pre-1.20.6 behaviour are on
+        # the table in packaging/CMakeLists.txt, which is where the paths live.
+        #
+        # The flagged file must NOT be in the payload -- dpkg-deb refuses to
+        # build such a package -- which is exactly the state a retired asset row
+        # leaves it in. And an unflagged path that is not in the payload is
+        # IGNORED rather than removed, so listing one without the flag is a
+        # no-op that looks like a fix.
+        set(_conffile_lines "")
+        foreach(_config IN LISTS FASTCACHED_PACKAGE_CONFIG_FILES)
+            list(APPEND _conffile_lines "${_config}")
+        endforeach()
+        foreach(_obsolete IN LISTS FASTCACHED_PACKAGE_OBSOLETE_CONFIG_FILES)
+            list(APPEND _conffile_lines "remove-on-upgrade ${_obsolete}")
+        endforeach()
+
+        if(_conffile_lines)
+            string(REPLACE ";" "\n" _conffiles "${_conffile_lines}")
             file(WRITE "${FASTCACHED_SCRIPTLET_DIR}/deb/conffiles" "${_conffiles}\n")
             list(APPEND CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
                 "${FASTCACHED_SCRIPTLET_DIR}/deb/conffiles")
