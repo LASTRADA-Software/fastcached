@@ -11,6 +11,8 @@
 
 #if !defined(_WIN32)
     #include <sys/stat.h>
+
+    #include <unistd.h>
 #endif
 
 using FastCache::ClassifySecretFile;
@@ -179,14 +181,62 @@ TEST_CASE("FileTrust: the POSIX acquisition reports what the mode bits say", "[p
               == SecretExposure::AnyLocalAccount);
     }
 
-    SECTION("0640 owned by this test's own account is the owner's own group")
+    SECTION("0640 is classified by WHO owns it, which is whoever ran this suite")
     {
-        // Not owned by root -- these run unprivileged -- so the group grant is the
-        // owner's own. The root-owned counterpart cannot be constructed without
-        // privileges, which is why the delegation clause is asserted through
-        // `ClassifySecretFile` above rather than only here.
-        CHECK(FastCache::SecretFileExposure(modeIs("group.yaml", S_IRUSR | S_IWUSR | S_IRGRP))
-              == SecretExposure::OwnersOwnGroup);
+        // The one section in this file whose SUBJECT changes with the runner, and
+        // #870. The fixture creates `0640 <runner>:<group>`, so an unprivileged run
+        // produces the owner's own group and a root run produces the administrator
+        // delegation. BOTH verdicts are correct for the file that actually exists;
+        // what was wrong was asserting one of them unconditionally, which made the
+        // case pass or fail on who typed the command with nothing in the run saying
+        // which.
+        //
+        // Root is not an exotic mode here. The suite runs as root in most CI
+        // containers -- the trust case further down says so in its own comment --
+        // and `SeedConfigFile`'s privileged branch is reachable no other way.
+        //
+        // ASSERTED in both modes rather than skipped in one, because as root this
+        // is the only place the delegation clause meets a REAL root-owned file;
+        // everywhere else it is driven from a synthesised `SecretFileFacts`. So a
+        // root run covers strictly more than an unprivileged one, where a skip
+        // would have made it cover less.
+        //
+        // This section used to say the root-owned counterpart "cannot be
+        // constructed without privileges". That is false on Linux -- an
+        // unprivileged user namespace (`unshare -r`) gives euid 0 and a file that
+        // `stat` reports as `uid=0`, which is the only fact the clause reads, and
+        // it is how #870 was reproduced on an unprivileged host. Reaching for it
+        // HERE is #1127, because it has to degrade to an honest skip wherever the
+        // facility is absent (macOS, hardened kernels) and that is a different
+        // change from making this case root-safe.
+        auto const path = modeIs("group.yaml", S_IRUSR | S_IWUSR | S_IRGRP);
+
+        // The control that makes this root-SAFE rather than merely root-aware.
+        //
+        // The branch below is chosen from the CALLER's euid, while the verdict is
+        // decided by the FILE's owner (`administrativelyOwned` is `st_uid == 0`).
+        // Those are two different facts and nothing else here ties them together,
+        // so without this a fixture that guessed its mode wrong would assert
+        // against the wrong expectation in silence -- which is the failure this
+        // ticket is about, one level up.
+        struct ::stat info {};
+
+        REQUIRE(::stat(path.c_str(), &info) == 0);
+        REQUIRE((info.st_uid == 0) == (::geteuid() == 0));
+
+        if (::geteuid() == 0)
+        {
+            // `0640 root:root`: an administrator delegating read to a service
+            // account, which is what `InlineCredentialRejection` instructs and what
+            // the macOS package ships. Fit, not exposed.
+            CHECK(FastCache::SecretFileExposure(path) == SecretExposure::None);
+        }
+        else
+        {
+            // `0640 <user>:<group>`: the owner's own group, over accounts they do
+            // not answer for.
+            CHECK(FastCache::SecretFileExposure(path) == SecretExposure::OwnersOwnGroup);
+        }
     }
 
     SECTION("a file that is not there is undetermined, not fit")
