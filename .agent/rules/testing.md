@@ -1325,18 +1325,113 @@ them ran the code that runs in production.
 
 ## A SKIP that ctest scores as a failure
 
-A Catch2 case that calls `SKIP(...)` exits **4**, and `SKIP_RETURN_CODE` is the only
-thing that tells ctest an exit code means *skipped* rather than *failed*. None of the
-five `catch_discover_tests` registrations set it, so the binary printed `1 skipped`
-and ctest printed `***Failed` **for the very same run** (#499).
+A Catch2 case that calls `SKIP(...)` exits **4**, and ctest must be told what that
+means or it scores the skip as a *failure*. None of the five `catch_discover_tests`
+registrations told it, so the binary printed `1 skipped` and ctest printed `***Failed`
+**for the very same run** (#499).
 
-- **Measured, not inferred.** One forced skip: `test cases: 1 | 1 skipped` with
-  `BINARY EXIT: 4`, ctest `***Failed`; after `PROPERTIES SKIP_RETURN_CODE 4`,
-  `***Skipped` and `100% tests passed`.
-- **It is a false RED, which is the insidious direction.** All seven `SKIP` sites in
-  this tree are environment-conditional — three on `AvailableCodecs().size() < 2`,
-  four on being able to bind loopback — so they fire on a constrained runner or a
-  build configured without codecs and report a regression that is not there. Nobody
+**The first repair was `SKIP_RETURN_CODE 4`, and it opened #1128.** Catch2's exit code
+IS its failed-assertion count (clamped at 255), so a case failing exactly four
+assertions exits 4 and is scored *skipped* — a genuinely failing test reported inside
+`100% tests passed`, in all five binaries. **The repair for one state collapse was the
+site of the next, and it landed inside the mechanism chosen to prevent state collapse.**
+
+**That is still what the tree carries, and it is a defect we could not close rather
+than a decision.** Every alternative was measured and every one is worse. Three
+channels, all closed — the argument is below, and the fix is a change of MECHANISM,
+tracked as open work at the end of this file. Do not read `catch-skip-return-code`'s
+green as the property being sound; it keeps the tree consistent with the least-bad
+option. `catch-skip-exit-collision` is the reader that will say when a premise moves.
+
+- **Channel one, the exit status, is fully occupied.** Every value in 1..255 is
+  reachable as an assertion count and 0 is success, so there is no free code to move
+  the skip signal to. Moving 4 to 77 relocates the collision to a case failing 77
+  assertions — rarer, therefore quieter, and rarity is the wrong direction for a false
+  GREEN.
+- **Channel two, the output, is shared with the SUBJECT.** `SKIP_REGULAR_EXPRESSION` is
+  a substring search over the case's ENTIRE output — names, `INFO` messages,
+  stringified expressions — none of which this project controls. A case that only
+  **fails**, carrying the literal summary text in a message, is scored SKIPPED.
+  Measured. Closing that needs a line-start anchor and both spellings are unavailable:
+  `^` is `cmd.exe`'s escape character, and the value is passed on a COMMAND LINE by
+  `catch_discover_tests` which cmd parses on Windows (a literal `|` there killed every
+  Windows leg at the DISCOVERY step); and a literal newline **arrives EMPTY** through
+  cmd — measured, the receiving script runs, exits **0**, argument `[]`. An empty
+  `SKIP_REGULAR_EXPRESSION` matches every line, so **the remedy for the hole degrades
+  into every failing test scoring as skipped, silently, at exit zero.** That is the
+  most dangerous shape found in this whole investigation: worse than the defect it was
+  repairing, and invisible to every check and every Linux gate.
+- **Channel three, composing them, does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT
+  outrank `SKIP_RETURN_CODE` — measured; with both set a four-failure case is still
+  `***Skipped`. That was the one repair needing no new mechanism and no new process.
+- **Adding shapes cannot make a pattern safe**, and this is the argument that decides
+  it rather than the constraint table. A decoy carrying the pattern's TAIL refutes a
+  tail-only pattern and certifies a same-line pattern as safe; a decoy carrying a WHOLE
+  summary line then refutes that one. **Every shape you add is one you thought of, and
+  the channel is shared with an author who thinks of others.**
+- **Two facts about the tool, kept because everyone assumes otherwise from other regex
+  flavours.** CMake's `.` **matches a newline**, so `.*` reaches text on a later line;
+  and CMake has **no POSIX character classes at all** — `[[:digit:]]` matches nothing,
+  parsing as a literal character set.
+
+- **The SUMMARY line, never the `SKIPPED:` marker**, and the difference is the whole
+  design. Measured over nine case shapes: a case that skips one `SECTION` and fails
+  another **prints the marker and fails**, so keying on the marker scores it skipped —
+  which is *wider* than #1128, hiding any number of failures in a case that also skips
+  rather than exactly four. Catch2 already gets the verdict right there, printing
+  `test cases: 1 | 1 failed` above the marker; nobody was reading the line where it
+  says so. The marker says a skip happened SOMEWHERE; the summary says what the case
+  WAS.
+- **A `catch_discover_tests` property value is a WIRE FORMAT with three parsers in it**,
+  and the third is `cmd.exe`. The value is not kept inside CMake: it is written into a
+  generated file and passed on a COMMAND LINE, so on Windows it is parsed by CMake, then
+  ninja, then cmd. A literal `|` is a PIPE there whatever it is quoted with, because the
+  quoting is stripped by the layers in between. Measured (#1146): with `\|` in the
+  pattern, **every Windows leg died at the DISCOVERY step, before anything linked** —
+  `'1' is not recognized as an internal or external command`, cmd having tried to run
+  `1 skipped` as a program, plus a dangling `\` argument and a hunt for a source
+  directory called `cases:`. **Escaping is not the remedy**: `\|` is a POSIX escape cmd
+  does not honour, and no spelling survives three parsers — this file's own
+  quoting-collapsed-through-three-parsers rule, arriving in a property value. The
+  character must simply not be there; a wildcard matches it and the surrounding literal
+  text carries the discrimination. `[|]` is no better (still a literal pipe on the
+  command line) and `[^ ]` is worse (`^` is cmd's escape character).
+  **No gate on a Linux host can reproduce this** — there is no cmd.exe in that path —
+  so a green local gate is not weak evidence about it, it is none, which is this
+  project's standing rule for a change whose subject is the build environment. Anything
+  that ever carries a pattern on that command line must be checked against
+  `& | < > ^ ( ) % " !` by a TEXT check, since CI is otherwise the first reader.
+- **Not `WILL_FAIL`, measured.** A canary that must be seen to fail is the obvious
+  reader for "does a four-failure case still fail", and it does not work: under the old
+  mechanism that case is scored **Skipped**, and ctest does not fail a skipped test
+  carrying `WILL_FAIL` — the run reports `100% tests passed`. **The canary would be
+  green under exactly the defect it exists to catch.** `catch-skip-exit-collision` runs the
+  binary and reads its output instead, which is also the only thing in the tree that
+  can see a REPORTER change: a text scan over CMakeLists cannot.
+
+- **Measured, not inferred** — and this is the #499 measurement, kept as the record of
+  how the false RED was established rather than as the current mechanism. One forced
+  skip: `test cases: 1 | 1 skipped` with `BINARY EXIT: 4`, ctest `***Failed`; after
+  `PROPERTIES SKIP_RETURN_CODE 4`, `***Skipped` and `100% tests passed`. **That last
+  reading is exactly what #1128 turned out to mean for a case failing four
+  assertions**, which is why the property is gone.
+- **It is a false RED, which is the insidious direction.** Essentially every `SKIP`
+  site in this tree is environment-conditional — a loopback bind, an IPv6 stack, a
+  symlink, root, an MSVC-family driver, `AvailableCodecs().size() < 2` — so they fire
+  on a constrained runner or a build configured without codecs and report a regression
+  that is not there. **This bullet used to say "all seven … three on codecs, four on
+  loopback"** — the pattern is `git grep -n 'SKIP("' -- 'src/**/*.cpp'`, excluding
+  `CatchSkipCanary.cpp`, and it answered **39 sites across 17 files at #1128's merge
+  base**, three of them still the codec ones and twenty-two loopback. **The figure moved
+  WHILE #1128 was being written**: it was 38/16 when measured and 39/17 after a rebase
+  picked up #870, which had added an honest root skip in the meantime. That is why a
+  bare number cannot live here — not that this one was carelessly kept, but that any
+  number describing this set is stale the next time somebody writes a `SKIP`, and the
+  ARGUMENT has never rested on it. Quote the pattern, or quote the figure with the
+  commit it was taken at. One site is not environment-conditional
+  at all — `ServiceControl_test.cpp` skips because the property is exercised by the
+  platform end-to-end paths, which is the legitimate *covered elsewhere* skip this file
+  distinguishes from a `SUCCEED`. Nobody
   had hit it because those conditions had not arisen on CI, which is **luck rather
   than coverage**: the codec skips depend on how the build is configured and the
   loopback ones on what the runner allows, and neither is a property of the code.
@@ -1376,8 +1471,9 @@ not be arranged reports a pass for a property nothing established (#685).
 
 **`SUCCEED` is right when the case RAN and there was nothing to assert. It is wrong when
 the case could not run.** That is the whole distinction, and `SKIP("reason")` is the
-whole fix — it exits 4, every `catch_discover_tests` registration carries
-`SKIP_RETURN_CODE 4`, and ctest scores it as skipped.
+whole fix — it exits 4, and every `catch_discover_tests` registration carries
+`SKIP_RETURN_CODE 4` so ctest scores it as skipped. That mechanism is known broken in
+the other direction (#1128, above); it is still the least-bad option available.
 
 - **It fires where coverage is already thinnest.** All twenty-one sites converted for
   #685 were environment-conditional: no loopback listener, no IPv6 stack, no symlink
@@ -1650,6 +1746,15 @@ Two rules fall out of the same fixture:
 
 ## Open work
 
+- **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
+  cannot be told about a Catch2 skip through any property `catch_discover_tests`
+  offers, so `SKIP_RETURN_CODE 4` stays and a four-failure case is still scored
+  *skipped*. Three channels measured and closed (above); the fix is a launcher that
+  NORMALISES the exit code, which needs its Windows per-test process cost measured
+  before it is implemented — this host already has a contention-sensitive `hygiene`
+  class, and the mechanism adds ~3500 spawns. `src/tests/CatchSkipCanary.cpp` carries
+  the shapes it must survive; `catch-skip-exit-collision` asserts the premises so this
+  entry cannot rot into a false rule.
 - **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two
   scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
   `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what

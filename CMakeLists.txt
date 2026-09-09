@@ -352,6 +352,50 @@ if(FASTCACHED_BUILD_TESTS)
     enable_testing()
 endif()
 
+# ## Why ctest still learns a Catch2 skip from `SKIP_RETURN_CODE 4`, and why that is
+# ## KNOWN BROKEN (#1128)
+#
+# Every `catch_discover_tests` registration in this tree carries `SKIP_RETURN_CODE 4`,
+# and **that is a defect we could not close rather than a decision.** Read this before
+# concluding it was never noticed, and read `.agent/rules/testing.md` before attempting
+# either of the two obvious repairs, both of which are measured dead ends.
+#
+# **The defect.** Catch2's exit code IS its failed-assertion count, clamped at 255
+# (`catch_session.cpp`). So a case failing exactly four assertions exits 4 and ctest
+# scores it *skipped*. Measured on today's tree, through real ctest:
+#
+#     four failing assertions        ***Skipped     <- a genuinely failing test
+#     skip in one SECTION + 4 fails  ***Skipped     <- and this one too
+#
+# Both report inside `100% tests passed`, in all five Catch2 binaries.
+#
+# **Channel one, the exit status, is fully occupied.** Every status in 1..255 is
+# reachable as an assertion count and 0 is success, so there is no free value to move
+# the skip signal to. Moving 4 to 77 relocates the collision to a case failing 77
+# assertions -- rarer, therefore quieter, and rarity is the wrong direction for a false
+# GREEN.
+#
+# **Channel two, the output, is shared with the subject.** `SKIP_REGULAR_EXPRESSION` is
+# a substring search over the case's ENTIRE output -- names, `INFO` messages,
+# stringified expressions -- none of which this project controls. A case that only
+# FAILS, carrying the literal summary text in a message, is scored SKIPPED. Closing that
+# needs a line-start anchor, and both spellings are unavailable:
+#
+#   * `^` is `cmd.exe`'s escape character, and this value is passed on a COMMAND LINE by
+#     `catch_discover_tests`, which on Windows cmd parses;
+#   * a literal newline arrives EMPTY through cmd -- measured, `rc=0`, argument `[]` --
+#     and an empty `SKIP_REGULAR_EXPRESSION` matches every line, so the remedy degrades
+#     into every failing test scoring as skipped. Silently, at exit zero.
+#
+# **Channel three, composing them, does not exist.** `FAIL_REGULAR_EXPRESSION` does NOT
+# outrank `SKIP_RETURN_CODE` -- measured; with both set, a four-failure case is still
+# `***Skipped`. That was the one repair needing no new mechanism, and it is not there.
+#
+# So the property cannot be expressed by any property ctest offers on this registration,
+# and the fix is a different MECHANISM. That work is tracked, open, and linked from
+# `.agent/rules/testing.md`; `src/tests/CatchSkipCanary.cpp` carries the shapes any
+# replacement must survive, and `catch-skip-exit-collision` asserts the facts this
+# argument rests on so the conclusion cannot rot silently.
 # ----------------------------------------------------------------------------
 # Sibling libraries (no dependency on FastCache).
 

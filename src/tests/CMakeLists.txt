@@ -61,6 +61,19 @@ include(Catch)
 # `catch-skip-return-code` covers the door this comment cannot: a sixth test binary
 # added without the property would reopen the hole by omission, exactly as the fifth
 # did.
+#
+# **And it is KNOWN BROKEN in the other direction.** `SKIP_RETURN_CODE 4` closed that
+# false RED and opened a false GREEN (#1128): Catch2's exit code IS its failed-assertion
+# count, so a case failing exactly four assertions is scored *skipped*, and so is a case
+# that skips one `SECTION` and fails four assertions in another. The repair for one
+# state collapse was the site of the next, inside the mechanism chosen to prevent state
+# collapse.
+#
+# It stays because all three alternative channels were measured and every one is worse.
+# The argument is at the top of the top-level CMakeLists -- one place, pointed at rather
+# than restated, because this comment exists five times over -- and the fix is a change
+# of MECHANISM, tracked as #1152. `catch-skip-exit-collision` below asserts the premises
+# that argument rests on, so it cannot rot into a false rule.
 catch_discover_tests(FastCacheTest PROPERTIES SKIP_RETURN_CODE 4)
 
 # ---------------------------------------------------------------------------
@@ -701,18 +714,26 @@ set_tests_properties("glob-traversals-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# Every `catch_discover_tests` registration tells ctest that exit 4 means SKIPPED.
+# Every `catch_discover_tests` registration tells ctest what a SKIP looks like, and
+# tells it by matching the case's OUTPUT.
 #
-# A Catch2 case that calls `SKIP(...)` exits 4, and without `SKIP_RETURN_CODE` ctest
-# scores that as a FAILURE -- so the binary prints `1 skipped` and ctest prints
-# `***Failed` for the very same run. Measured on a forced skip, not inferred (#499).
+# A Catch2 case that calls `SKIP(...)` exits 4, and a registration that says nothing
+# leaves ctest scoring that as a FAILURE -- so the binary prints `1 skipped` and ctest
+# prints `***Failed` for the very same run. Measured on a forced skip, not inferred
+# (#499). None of the five Catch2 registrations said anything, while script-driven
+# `add_test` registrations below were already setting `SKIP_RETURN_CODE 77` one
+# directory away -- so the mechanism was known and simply never carried to the
+# registrations that discover thousands of cases.
 #
-# None of the five Catch2 registrations set it, while eleven script-driven `add_test`
-# registrations below set `SKIP_RETURN_CODE 77` one directory away. So the mechanism
-# was known and simply never carried to the registrations that discover thousands of
-# cases -- which is why a comment is not the fix and a check is: a SIXTH test binary
-# would reopen it by omission exactly as the fifth did. Same argument as
-# `script-check-signals`, and the set of registrations is READ from the tree.
+# **But NOT by exit code, which is #1128.** `SKIP_RETURN_CODE 4` was the first repair
+# and it scored a case failing exactly four assertions as *skipped*. The script-driven
+# `77` registrations below are unaffected and stay: a shell script chooses its own exit
+# code, and a Catch2 binary does not -- it spends the status on its failed-assertion
+# count. That difference is the whole reason one mechanism suits one and not the other.
+#
+# A comment is not the fix and a check is: a SIXTH test binary would reopen this by
+# omission exactly as the fifth did. Same argument as `script-check-signals`, and the
+# set of registrations is READ from the tree.
 #
 # In the default set with the other hygiene checks: it reads files and compares
 # strings.
@@ -731,13 +752,19 @@ set_tests_properties("catch-skip-return-code" PROPERTIES
 
 # And that check must be SEEN to fail, on each direction it claims.
 #
-# Six synthetic trees, one verdict asserted each: a correct registration passes, a
-# bare one fails and NAMES the file, `SKIP_RETURN_CODE 77` fails (present, reads
-# correctly in a diff, and does nothing, because Catch2 exits 4 and not 77), the
-# property on a continuation line passes, a tree with no registrations reports a
-# broken scan rather than a clean tree, and a registration inside a build tree is
-# ignored -- the first version of the check walked into `_deps/catch2-src` and
-# reported vendored code nobody here can edit.
+# Synthetic trees, one verdict asserted each -- the script prints how many it drove,
+# derived, because a total written beside a list of cases is a second source of truth
+# and this one had already drifted. A correct registration passes; a bare one fails and
+# NAMES the file; `SKIP_RETURN_CODE 4` fails, and so does a registration carrying it
+# ALONGSIDE the regex, since ctest honours it independently and the cautious half-step
+# is a no-op that reads as progress; a registration spelling the pattern out instead of
+# expanding the shared variable fails; the property on a continuation line passes; a
+# tree with no registrations reports a broken scan rather than a clean tree; a
+# registration inside a build tree is ignored -- the first version of the check walked
+# into `_deps/catch2-src` and reported vendored code nobody here can edit; the git mode
+# CI actually takes is exercised in both directions; and a shared pattern that is
+# missing or defined EMPTY fails, since an empty regex matches every line and would
+# score every failing case as skipped while every registration still read correctly.
 #
 # Per case rather than `WILL_FAIL`, because a check that stopped refusing and one
 # that refuses everything are opposite defects a bare inversion reports identically.
@@ -749,6 +776,41 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-selftest.cmake"
 )
 set_tests_properties("catch-skip-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
+# The reader for #1128's NEGATIVE result.
+#
+# `SKIP_RETURN_CODE 4` above is a defect we could not close, not a decision: Catch2's
+# exit code IS its failed-assertion count, so a case failing exactly four assertions is
+# scored *skipped*. Three channels were measured and all three are closed -- the exit
+# status is fully occupied, the output is shared with text the subject controls and
+# cannot be anchored through the Windows command line, and `FAIL_REGULAR_EXPRESSION`
+# does not outrank `SKIP_RETURN_CODE`. The argument is in the top-level CMakeLists and
+# in `.agent/rules/testing.md`.
+#
+# **A record saying something cannot be done instructs the next session not to try**,
+# which this project's rulebook names as the expensive shape. So the conclusion gets a
+# READER: this asserts the FACTS the argument rests on rather than the conclusion, and
+# a red here means a premise has MOVED and the ticket should be reopened.
+#
+# The canary is deliberately NOT registered with `catch_discover_tests`: several of its
+# cases fail on purpose, and it carries the shapes any replacement mechanism must
+# survive -- padded summaries at two widths, a skip in a later SECTION, and a failing
+# case whose own text echoes a summary line.
+add_executable(catch-skip-canary CatchSkipCanary.cpp)
+target_link_libraries(catch-skip-canary PRIVATE Catch2::Catch2WithMain)
+
+add_test(
+    NAME "catch-skip-exit-collision"
+    COMMAND ${CMAKE_COMMAND}
+        "-DCANARY=$<TARGET_FILE:catch-skip-canary>"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-catch-skip-exit-collision.cmake"
+)
+set_tests_properties("catch-skip-exit-collision" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 120

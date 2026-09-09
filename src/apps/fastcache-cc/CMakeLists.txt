@@ -308,14 +308,20 @@ if(FASTCACHED_BUILD_TESTS)
         target_link_libraries(fastcache-cc-tests PRIVATE ws2_32)
     endif()
     include(Catch)
-    # SKIP_RETURN_CODE, because a Catch2 case that SKIPs exits 4 and ctest scores a
-    # non-zero exit as a FAILURE. Without this, "this host has no MSVC driver" and
-    # "the verifier is broken" are the same red line -- skipped and failed collapsed
-    # into one state, which is the reading `.agent/rules/metrics-and-observability.md`
-    # spends a paragraph on and the exact failure #493 is about.
+    # ctest is told a Catch2 case SKIPPED by its SUMMARY LINE. Without any such
+    # property, "this host has no MSVC driver" and "the verifier is broken" are the
+    # same red line -- skipped and failed collapsed into one state, which is the
+    # reading `.agent/rules/metrics-and-observability.md` spends a paragraph on and
+    # the exact failure #493 is about.
     #
     # Measured on this tree: `fastcache-cc-tests '[msvc]'` exits 4 having reported
     # `1 skipped`, and ctest reported it as `(Failed)`.
+    #
+    # And it is BROKEN in the other direction. Catch2 exits with its failed-assertion
+    # count, so `SKIP_RETURN_CODE 4` scores a case failing exactly four assertions as
+    # *skipped* (#1128) -- the same two states collapsed again, silently. It stays
+    # because every alternative measured worse; see the top of the top-level
+    # CMakeLists, and #1152 for the fix.
     catch_discover_tests(fastcache-cc-tests PROPERTIES SKIP_RETURN_CODE 4)
 
     # ---------------------------------------------------------------------

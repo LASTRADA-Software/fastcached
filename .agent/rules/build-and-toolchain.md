@@ -1652,6 +1652,58 @@ rule, rest on that sentence, and it does not reproduce** (#565).
   buy an exit code and still leave nothing asserting that any given check can
   fail.
 
+## A guard's REMEDY TEXT is part of the guard
+
+**Nothing tests it, and it is the only part of a check most people ever read.**
+
+A check's verdict logic gets a self-test, a canary, a neuter-and-watch-it-fail pass. The
+paragraph it prints when it refuses gets none of that — and that paragraph is the entire
+interface for whoever trips it, who is by definition somebody who does not know the rule
+yet and has just been stopped by a tool they did not know existed.
+
+`check-catch-skip-return-code`'s refusal ended (#1128):
+
+```
+That is a false RED on any runner where an environment-conditional skip
+fires -- and it teaches whoever meets it that the SKIP was wrong, rather
+than the registration. Add to the registration:
+
+    catch_discover_tests(<target> PROPERTIES SKIP_RETURN_CODE 4)
+```
+
+after the same commit made `SKIP_RETURN_CODE` the thing the check REFUSES. **The remedy
+instructed the reader to reintroduce the defect the check exists to prevent.** They would
+have applied it, hit the identical refusal, and concluded the check was broken — which is
+the reading that gets a guard deleted. Worse than a silent guard: a guard steering people
+into the defect while sounding authoritative.
+
+- **It survives every test a check normally gets.** The verdict logic was correct
+  throughout; ten synthetic trees drove it in both directions and all ten passed. The
+  self-test asserts THAT the check objected and, at most, that it named the right file —
+  never what it advised. There is no arrangement of tree fixtures that catches this,
+  because the text is right where the code is wrong is not the failure; the code was
+  right and the text was wrong.
+- **The window is a change of MECHANISM, not a change of verdict.** Nobody forgets to
+  update a message when a check starts refusing something new — the message is why they
+  opened the file. It rots when the check goes on refusing the same SHAPE for an
+  opposite reason, so the diff touches the predicate and the paragraph three hundred
+  lines below it still parses as true.
+- **Read the refusal as the person who has never seen it.** Not "is this sentence
+  accurate" but "if I did exactly what this says, where do I end up". Those are
+  different questions and only the second one found this.
+- **Say what the rule does NOT cover, in the refusal itself.** The same message now
+  states that the script-driven `SKIP_RETURN_CODE 77` registrations are unaffected —
+  a shell script chooses its own exit code and a Catch2 binary spends its status on the
+  failed-assertion count. Without that clause the next reader over-applies the refusal
+  and deletes a property that is load-bearing somewhere else, which is the mirror
+  failure and just as expensive.
+
+Same family as [a rulebook entry that has gone false](#a-rulebook-entry-that-has-gone-false-instructs-the-next-person)
+and as a comment naming the wrong guard: text that instructs, is trusted, and is checked
+by nothing. This one is narrower and sharper, because a check's own output carries more
+authority than either — it arrives at the moment of failure, from the tool doing the
+refusing.
+
 ## The Windows Debug leg exists for the RUNTIME, and proves it is live
 
 `build.yml`'s Windows matrix ran `cl-release` and `clangcl-release` only, so the
