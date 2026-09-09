@@ -718,8 +718,9 @@ Every rule below has already been a bug.
   grows before the member it adds has been asked anything, while `_followerContact`
   gains nothing, because nothing could have arrived. Read as silence by the entry
   above, the leader deposes itself at its very next heartbeat, for a lack of
-  contact that could not have existed. `RaftNode` therefore records the member it
-  admitted and when, and counts **that one peer** for one `electionTimeoutMin`.
+  contact that could not have existed. So while a change is UNCOMMITTED, CheckQuorum
+  asks about the **committed** configuration — the set that elected this leader and
+  still answers it ([#1095](https://github.com/LASTRADA-Software/fastcached/issues/1095)).
   - **At two members it is unsatisfiable by construction, and there is no
     recovery.** Growing from one member to two doubles the quorum, and the second
     member is the one that has never answered — so the arithmetic can only fail.
@@ -745,16 +746,35 @@ Every rule below has already been a bug.
     pre-vote reads the same map through `HasLiveLeader` — so the lie would decide a
     second question nobody was thinking about. The two records are kept apart and
     `HasQuorumContact` prefers the real one.
-  - **The id, never just the instant.** "Some member was admitted recently" excuses
-    whichever peer happens to be silent, which is a different rule and a wrong one:
-    a four-member leader that admits `d` while `b` is dead would go on counting
-    `b`. The pair cannot be split, so it is one struct.
-  - **One election timeout, and the size is an argument rather than a margin.** A
-    leader that cannot get an answer inside one is a leader its followers are
-    already timing out on, so being deposed *then* is CheckQuorum working. Anything
-    longer would let `--cluster-admit` naming an address nothing listens on pin
-    leadership on a node that can commit nothing — which is why the case asserting
-    that the grace ENDS is not decoration.
+  - **The first fix was a CONSTANT, and the constant was the next defect (#1095).**
+    It granted the admitted member one `electionTimeoutMin`, argued as the right
+    size rather than a generous one: a leader that cannot get an answer inside one
+    is a leader its followers are already timing out on. **That reasoning was drawn
+    from the wrong quantity.** A joiner's FIRST exchange carries the leader's log
+    append, the joiner's term adoption and a `nextIndex` walk-back over an empty
+    log — two fsyncs and a round of walk-back, none of which a steady-state
+    heartbeat to an established follower carries. So the window for a joiner's
+    first round trip was sized against established followers' silence, and under
+    coverage instrumentation or on a loaded host it is not enough. The committed
+    configuration has no constant, so there is nothing to outrun.
+  - **`--cluster-admit` naming an address nothing listens on now leaves the leader
+    LEADING, and that is the fix rather than an over-correction.** The old argument
+    was that such a leader must give up or it is pinned while able to commit
+    nothing. That holds only where a SUCCESSOR exists. At 1→2 none does: the new
+    configuration's quorum is two, the joiner is dead, and the deposed leader
+    cannot re-elect alone — so deposing converts *a leader that cannot commit* into
+    *no leader that also cannot commit*, which is this defect by another route. The
+    guard that replaces it is the one the new rule can actually fail: a leader
+    still steps down the moment it loses the quorum of the **committed** set.
+  - **One-member-at-a-time is load-bearing for READS, not only for commitment.**
+    CheckQuorum is what everything reading from a leader rests on (`Tick`), so
+    consulting the old configuration has to rule out a second leader. It does,
+    because `ProposeMembership` refuses any change but a single member: any
+    majority of the old and any majority of the new then share one, that shared
+    member would have moved to a higher term to grant a competing vote, and it
+    would have stopped confirming this leader. **A future ticket arguing for
+    two-member deltas that reads only the commitment argument would be wrong for a
+    reason nothing warned it about.**
   - **The harness could not see it as written, and that is the reportable part.**
     `RaftClusterHarness` delivers in one to three steps, so the admitted member's
     first answer beat the leader's own heartbeat and the case stepped straight over

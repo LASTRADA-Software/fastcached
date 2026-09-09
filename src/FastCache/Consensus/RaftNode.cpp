@@ -161,19 +161,107 @@ void RaftNode::NoteFollowerContact(NodeId const& follower, TimePoint now)
     _followerContact[follower] = now;
 }
 
+std::vector<NodeId> RaftNode::QuorumContactMembers() const
+{
+    // Nothing in flight: the latest configuration IS the committed one, and
+    // deriving it again would answer the same question a second way.
+    if (!HasUncommittedConfiguration())
+        return _members;
+
+    // The newest configuration AT OR BELOW the commit index. Downward from the
+    // commit index rather than from the log's end -- above it is precisely the
+    // entry this must not read -- and stopping at the log's own first index, for
+    // the reason `LatestConfigurationIndex` gives: below the compaction boundary
+    // there is nothing to read, and a scan running to 1 anyway would report "no
+    // configuration" for a log that simply no longer holds the entry.
+    //
+    // Derived by scanning rather than tracked forward, matching
+    // `RefreshConfiguration`. Tracking THIS one forward would actually be sound --
+    // a committed entry cannot be truncated away, so unlike `_members` it only
+    // ever moves in one direction -- and it is still not worth a second mechanism
+    // that has to be kept in step at the four places `_commitIndex` moves. The log
+    // carries configuration and cluster state only and is compacted, so the walk
+    // is over a short vector, and it runs only while a change is in flight.
+    auto const ceiling = std::min(_commitIndex, _log.LastIndex());
+    for (auto const value: std::views::iota(_log.FirstIndex().value, ceiling.value + 1) | std::views::reverse)
+    {
+        auto const index = LogIndex { .value = value };
+        auto const* const entry = _log.EntryAt(index);
+        if (entry == nullptr || entry->kind != EntryKind::Configuration)
+            continue;
+
+        // Validated on the way out as well as in, exactly as `RefreshConfiguration`
+        // does: a set carrying a duplicate or an empty id would make the quorum
+        // below count something that cannot answer.
+        if (auto decoded = Membership::Decode(entry->payload);
+            decoded.has_value() && Membership::Validate(*decoded).has_value())
+            return *std::move(decoded);
+
+        // An unreadable committed configuration is not an excuse to widen the
+        // set: fall through to the snapshot and bootstrap chain rather than to
+        // `_members`, which is the uncommitted set this exists to avoid.
+        break;
+    }
+
+    // No committed configuration entry left in the log. What the snapshot
+    // recorded, if there is one, and only otherwise the bootstrap set -- the
+    // same fall-back chain, and the same reason: a compacted log has no entry to
+    // re-derive from, so going straight to the bootstrap set is how a node
+    // forgets a membership change it took part in.
+    return _snapshotMembers.empty() ? _config.members : _snapshotMembers;
+}
+
 bool RaftNode::HasQuorumContact(TimePoint now) const
 {
-    // Itself, but only while it IS a member -- the carve-out `AdvanceCommitIndex`
-    // makes, for the same reason: a leader that has been removed must not count
-    // itself toward a quorum of the set it is no longer in. Erring toward "no
-    // quorum" is also the safe direction here, since it only ever makes this node
-    // readier to let somebody else stand.
-    auto live = IsMember(_config.self) ? std::size_t { 1 } : std::size_t { 0 };
+    // While a configuration change is UNCOMMITTED, this asks about the COMMITTED
+    // configuration (#1095).
+    //
+    // Adopting a configuration grows the quorum the moment the entry is appended
+    // -- §4.3, and the rule that makes the change committable at all -- while
+    // `_followerContact` gains nothing for the member it adds, because nothing has
+    // been asked of it yet. Measured against the NEW set, a healthy leader is
+    // deposed by its own next heartbeat for a silence that could not have existed.
+    // At 1->2 that is unrecoverable: the ex-leader cannot re-elect alone, and the
+    // joiner is still waiting to learn who leads.
+    //
+    // The old set is the right question because the leader was elected by it and
+    // it is what still answers. CheckQuorum is not a commitment decision -- §4.1
+    // requires the new configuration for those, and `AdvanceCommitIndex` goes on
+    // using `_members` for exactly that reason.
+    //
+    // SAFETY, since this is what everything that READS from a leader rests on
+    // (see `Tick`): a competing leader would need a majority of the NEW
+    // configuration, and `ProposeMembership` refuses any change but a single
+    // member precisely so that any majority of the old and any majority of the new
+    // share one. That shared member would have moved to a higher term to grant the
+    // vote and would have stopped confirming this leader -- so recent contact with
+    // a majority of the OLD set still rules out a second leader. The single-member
+    // restriction is load-bearing here and not only at commitment.
+    //
+    // What this deliberately does NOT do is grant the admitted member a grace
+    // period. That was #1061's fix and it is gone: a window closed by a constant
+    // can be outrun by a slow first round trip -- two fsyncs and a `nextIndex`
+    // walk-back, which is what #1095 observed under coverage instrumentation --
+    // and no constant is the right size for a quantity nobody has bounded. This
+    // rule has no constant to outrun.
+    auto const members = QuorumContactMembers();
 
-    // Over the peers rather than over the map, so an entry left by a member that
-    // has since been removed cannot be counted.
-    for (auto const& peer: _peers)
+    // Itself, but only while it IS a member of THAT set -- the carve-out
+    // `AdvanceCommitIndex` makes, for the same reason: a leader that has been
+    // removed must not count itself toward a quorum of the set it is no longer in.
+    // Erring toward "no quorum" is also the safe direction here, since it only ever
+    // makes this node readier to let somebody else stand.
+    // `find` rather than `std::ranges::contains`, matching `IsMember`: one idiom for
+    // one question, and the C++23 algorithm is not on every standard library CI builds.
+    auto live = std::ranges::find(members, _config.self) != members.end() ? std::size_t { 1 } : std::size_t { 0 };
+
+    // Over the member set rather than over the map, so an entry left by a member
+    // that has since been removed cannot be counted.
+    for (auto const& peer: members)
     {
+        if (peer == _config.self)
+            continue;
+
         // `electionTimeoutMin` because that is the soonest any peer could start
         // campaigning, so it is the shortest silence that could mean this leader
         // is about to be challenged. It deliberately no longer matches the other
@@ -182,27 +270,31 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
         // was, since the two sides stamp contact half a round trip apart.
         auto const found = _followerContact.find(peer);
         if (found != _followerContact.end() && now - found->second < _config.electionTimeoutMin)
-        {
-            ++live;
-            continue;
-        }
-
-        // A member admitted moments ago has not gone quiet: adopting the
-        // configuration counted it before this leader had asked it anything, so
-        // there is no silence yet to measure. Owed the same window as everybody
-        // else and not one instant more -- past that, a leader whose quorum answers
-        // nothing must give up, or `--cluster-admit` naming an address nothing
-        // listens on would pin leadership on a node that can commit nothing.
-        //
-        // One election timeout is also the right size rather than a number picked
-        // to be generous: a leader that cannot get an answer inside one is a leader
-        // its followers are already timing out on, and being deposed then is
-        // CheckQuorum working rather than this defect.
-        if (_admitted.has_value() && _admitted->id == peer && now - _admitted->at < _config.electionTimeoutMin)
             ++live;
     }
 
-    return live >= Quorum();
+    // A quorum of the set that was measured, never `Quorum()`, which answers for
+    // `_members`. Reading contact from one configuration and the threshold from
+    // another is a quorum of neither.
+    //
+    // The code this replaces was NOT making that mistake, and saying so matters
+    // because the shape invites the suspicion: it walked `_peers` and compared
+    // against `Quorum()`, two derivations of one set. They were provably in step
+    // -- `_peers` has exactly two writers, the constructor from
+    // `_config.Peers()` (which is `_config.members` minus self, and `_members` is
+    // initialised from `_config.members` beside it) and `AdoptMembers`, which
+    // rewrites both in one function -- so there was no window in which the
+    // threshold described a set the walk did not. Not a defect that was closed
+    // here as a side effect: a hazard that EXISTS and a hazard that has FIRED are
+    // different claims, and the words for them are nearly identical -- this one
+    // had not fired and could not.
+    //
+    // It is still two things that have to be kept in step, and this now needs a
+    // THIRD set that is neither, so all three inputs are taken from one value. The
+    // rulebook's *who a node dials is not who it counts* is about a different pair
+    // -- the driver's dial list against the configuration -- and does not license
+    // a divergence here.
+    return live >= (members.size() / 2) + 1;
 }
 
 bool RaftNode::HasLiveLeader(TimePoint now) const
@@ -544,13 +636,6 @@ void RaftNode::AdoptMembers(std::vector<NodeId> members)
     std::erase_if(_followerContact, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsMember(id); });
     std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsMember(id); });
-
-    // By the same rule, and it is why the record is dropped here rather than only
-    // when it expires: a member admitted and then removed again before it ever
-    // answered would otherwise go on being counted toward a quorum it is not part
-    // of, which is the one direction this must never be wrong in.
-    if (_admitted.has_value() && !IsMember(_admitted->id))
-        _admitted.reset();
 }
 
 void RaftNode::RefreshConfiguration()
@@ -745,13 +830,6 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
         if (voter != _config.self)
             _followerContact[voter] = now;
 
-    // And with it, whatever a previous leadership had admitted and not heard from.
-    // Evidence about a term this node no longer holds cannot excuse a member in
-    // this one -- and a member that has still not answered will not have voted
-    // here either, so the quorum that just elected this node is already a quorum
-    // without it.
-    _admitted.reset();
-
     // A no-op of this leader's own term, and it is the companion to the §5.4.2
     // guard rather than a nicety. That guard refuses to commit an earlier term's
     // entry by replica count, so a leader whose log ends in fully-replicated
@@ -888,11 +966,6 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(st
     if (HasUncommittedConfiguration())
         return std::unexpected { InvalidConfiguration("a membership change is already in flight; wait for it to commit") };
 
-    // Named BEFORE the adoption below makes it an ordinary member, and from the one
-    // query that answers it, so "exactly one was added" and "this one was added"
-    // cannot come to disagree.
-    auto admitted = Membership::AddedMember(_members, members);
-
     switch (Membership::Classify(_members, members))
     {
         case Membership::ChangeShape::Unchanged:
@@ -914,12 +987,6 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(st
     // configuration that waited for commitment could not be used to REACH it:
     // committing this entry needs a quorum of the very set it describes.
     AdoptMembers(std::move(members));
-
-    // After the adoption, because `AdoptMembers` drops a record naming somebody who
-    // is no longer a member and this one names somebody who has just become one.
-    // Absent for a removal, which takes nothing away from the quorum's evidence.
-    if (admitted.has_value())
-        _admitted = AdmittedMember { .id = *std::move(admitted), .at = now };
 
     RecordLogAppend(output, index);
     ReplicateToPeers(output);

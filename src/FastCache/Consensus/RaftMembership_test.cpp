@@ -141,33 +141,6 @@ TEST_CASE("A change is classified by how many members move", "[consensus][raft][
     CHECK(Membership::Classify(three, std::vector<NodeId> { "n3", "n1", "n2" }) == Membership::ChangeShape::Unchanged);
 }
 
-TEST_CASE("The one member a change adds is named, and only when there is one", "[consensus][raft][membership]")
-{
-    // The companion to `Classify`, and its answer decides which peer a leader is
-    // still waiting to hear from for the first time. Every shape but `AddedOne`
-    // answers nothing, deliberately: crediting a peer that was not added would
-    // count a member that had already gone quiet toward the quorum.
-    std::vector<NodeId> const three { "n1", "n2", "n3" };
-
-    CHECK(Membership::AddedMember(three, std::vector<NodeId> { "n1", "n2", "n3", "n4" }) == std::optional<NodeId> { "n4" });
-
-    // Position carries no meaning, so the addition is found wherever it sits.
-    CHECK(Membership::AddedMember(three, std::vector<NodeId> { "n0", "n3", "n1", "n2" }) == std::optional<NodeId> { "n0" });
-
-    CHECK_FALSE(Membership::AddedMember(three, three).has_value());
-    CHECK_FALSE(Membership::AddedMember(three, std::vector<NodeId> { "n1", "n2" }).has_value());
-    CHECK_FALSE(Membership::AddedMember(three, std::vector<NodeId> { "n1", "n2", "n3", "n4", "n5" }).has_value());
-
-    // A swap gains one and loses one, so it names no single addition even though
-    // the arithmetic of "one new id" would find one.
-    CHECK_FALSE(Membership::AddedMember(three, std::vector<NodeId> { "n1", "n2", "n9" }).has_value());
-
-    // Growing from nothing is the shape a cluster of one has when it admits its
-    // second member, which is the case the whole rule is about.
-    CHECK(Membership::AddedMember(std::vector<NodeId> { "n1" }, std::vector<NodeId> { "n1", "n2" })
-          == std::optional<NodeId> { "n2" });
-}
-
 TEST_CASE("A member set that could not operate is refused", "[consensus][raft][membership]")
 {
     CHECK_FALSE(Membership::Validate(std::vector<NodeId> {}).has_value());
@@ -397,6 +370,14 @@ TEST_CASE("A leader is not deposed by the member it has just admitted", "[consen
     // recovery: the member just admitted holds no configuration of its own, so it
     // grants no votes, and the deposed leader needs its vote to reach a quorum of
     // two. Nothing campaigns again, in that term or any other.
+    //
+    // SUBSUMED, and kept deliberately. Since #1095 this is a strictly weaker prefix
+    // of `A leader whose joiner never answers keeps leading`, which drives the same
+    // arrangement far past this instant -- so it is not independent coverage and
+    // should not be counted as such. It is retained because it pins the FIRST
+    // heartbeat, which is the window #1061 actually reported, and because it still
+    // fails on a wholesale regression of the mechanism. An uncommented subset would
+    // read as a separate property to the next person counting cases.
     ScriptedRandomSource random { { 0 } };
     auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
 
@@ -415,22 +396,26 @@ TEST_CASE("A leader is not deposed by the member it has just admitted", "[consen
     CHECK(node.KnownLeader() == std::optional<NodeId> { "n1" });
 }
 
-TEST_CASE("A member that never answers still deposes the leader that admitted it", "[consensus][raft][membership]")
+TEST_CASE("A leader whose joiner never answers keeps leading, because deposing it elects nobody",
+          "[consensus][raft][membership]")
 {
-    // The guard against over-correcting the case above into "a leader that has
-    // changed the configuration is never deposed". What a newly admitted member is
-    // owed is the same window every other member's silence is measured over, and
-    // not one instant more: past it, a leader whose quorum answers nothing must
-    // give up, or `--cluster-admit` naming an address nothing listens on would pin
-    // leadership on a node that can commit nothing.
+    // The DISCRIMINATOR for #1095: red before the fix, green after, and it fails
+    // before for exactly the reason the ticket exists.
     //
-    // Not a control that passes either way, and saying so matters: neutered, this
-    // case goes red at every assertion in it, because a leader deposed at its first
-    // heartbeat is neither leading at 200 nor a plain follower at 350 -- it has
-    // already armed a timer and begun campaigning. What it guards against is the
-    // OVER-correction, and that is the last assertion alone: a grace that never
-    // expired would leave this node leading a cluster of two that has answered
-    // nothing, and only this case would notice.
+    // This case used to assert the opposite -- that the leader is deposed here --
+    // and that assertion was the defect, not a guard against it. The reasoning it
+    // rested on was that a leader which cannot get an answer inside one
+    // `electionTimeoutMin` is one its followers are already timing out on. That
+    // holds for an established follower and NOT for a joiner: its first exchange
+    // carries the leader's log append, the joiner's term adoption and a `nextIndex`
+    // walk-back over an empty log -- two fsyncs and a round trip that no
+    // steady-state heartbeat pays. The window was sized against the wrong quantity.
+    //
+    // And deposing here buys NOTHING, which is the half that settles it. The new
+    // configuration's quorum is two and the joiner is dead, so no successor can be
+    // elected and the ex-leader cannot re-elect alone. Stepping down converts *a
+    // leader that cannot commit* into *no leader that also cannot commit* -- the
+    // same deadlock #1095 reports, reached by a different route.
     ScriptedRandomSource random { { 0 } };
     auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
 
@@ -438,62 +423,79 @@ TEST_CASE("A member that never answers still deposes the leader that admitted it
     REQUIRE(node.CurrentRole() == Role::Leader);
     REQUIRE(node.ProposeMembership({ "n1", "n2" }, At(ElectionMin.count())).has_value());
 
-    // Every heartbeat inside the window, so a fix that granted only the first is
-    // not mistaken for one that grants the window.
-    for (auto const beat: { 50, 100 })
-    {
-        (void) node.Tick(At(ElectionMin.count() + beat));
-        CHECK(node.CurrentRole() == Role::Leader);
-    }
-
+    // Past where the old grace closed -- one `electionTimeoutMin` after the
+    // proposal, so at `2 * ElectionMin`. Derived rather than written out: at this
+    // instant the removed mechanism has certainly expired, so nothing but the
+    // committed configuration can be carrying this leader.
     (void) node.Tick(At((2 * ElectionMin.count()) + 50));
+
+    CHECK(node.CurrentRole() == Role::Leader);
+    CHECK(node.KnownLeader() == std::optional<NodeId> { "n1" });
+
+    // And it is not a one-heartbeat reprieve: the committed configuration is
+    // `{n1}` with a quorum of one, so there is no constant here to outrun. A fix
+    // that merely widened the old window would pass the assertion above and fail
+    // this one.
+    (void) node.Tick(At(10 * ElectionMin.count()));
+
+    CHECK(node.CurrentRole() == Role::Leader);
+}
+
+TEST_CASE("Once the change commits, the NEW configuration governs and a silent member deposes the leader",
+          "[consensus][raft][membership]")
+{
+    // The handover, and the guard against the fix becoming a permanent exemption.
+    //
+    // This replaces a case asserting that an admitted member which ANSWERS keeps
+    // the leader that admitted it. Under the committed-configuration rule that
+    // case had become vacuous: at 1->2 the committed set is `{n1}` with a quorum of
+    // one, so the leader holds whether or not the joiner ever answers, and the
+    // assertion could no longer fail. It asserted what both sides produce.
+    //
+    // What is still worth asserting is what the answer CAUSES. Once the joiner
+    // acknowledges, the configuration entry commits, `HasUncommittedConfiguration`
+    // goes false, and CheckQuorum hands back to the latest member set -- so from
+    // that moment the joiner is an ordinary member whose silence deposes the leader
+    // like anybody else's. A fix that kept consulting the committed configuration
+    // forever would pass every other case in this file and fail this one.
+    ScriptedRandomSource random { { 0 } };
+    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
+
+    (void) node.Tick(At(ElectionMin.count()));
+    REQUIRE(node.CurrentRole() == Role::Leader);
+    REQUIRE(node.ProposeMembership({ "n1", "n2" }, At(ElectionMin.count())).has_value());
+    REQUIRE(node.ActiveMembers().size() == 2);
+
+    // The joiner accepts everything, which is what commits the configuration entry:
+    // a quorum of the new set is two, and that is this node plus n2.
+    constexpr auto AnsweredAfter = std::int64_t { 20 };
+    (void) node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
+                                                .result = AppendResult::Accepted,
+                                                .matchIndex = node.Log().LastIndex(),
+                                                .followerId = "n2" },
+                        At(ElectionMin.count() + AnsweredAfter));
+
+    // Asserted rather than assumed: everything below is about what happens AFTER
+    // the change commits, so a case in which it never committed would be testing a
+    // different rule while still going green.
+    REQUIRE(node.CommitIndex() == node.Log().LastIndex());
+
+    // Still leading immediately after, on the new set: n2's contact is real and
+    // fresh, so a quorum of two is met.
+    (void) node.Tick(At(ElectionMin.count() + 50));
+    CHECK(node.CurrentRole() == Role::Leader);
+
+    // Now n2 says nothing further. One `electionTimeoutMin` after its ONLY answer
+    // its contact goes stale, and the committed configuration is now `{n1, n2}` --
+    // so the quorum is two, this node is one, and it must step down.
+    (void) node.Tick(At(ElectionMin.count() + AnsweredAfter + ElectionMin.count() + 10));
 
     CHECK(node.CurrentRole() == Role::Follower);
     CHECK_FALSE(node.KnownLeader().has_value());
 
-    // The term is untouched, which is what tells this from a step-down: nothing
-    // higher arrived, so nothing is reported as having caused it.
+    // The term is untouched, which is what tells a relinquish from a step-down:
+    // nothing higher arrived, so nothing is reported as having caused it.
     CHECK(node.CurrentTerm() == Term { .value = 1 });
-}
-
-TEST_CASE("An admitted member that answers keeps the leader that admitted it", "[consensus][raft][membership]")
-{
-    // The other direction, and the reason the window above is a grace rather than
-    // a suspension: once the member answers -- with a REJECTION here, which is
-    // what a joiner with an empty log actually sends -- the ordinary contact
-    // record takes over and the leader keeps leading indefinitely.
-    ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
-
-    (void) node.Tick(At(ElectionMin.count()));
-    REQUIRE(node.CurrentRole() == Role::Leader);
-    REQUIRE(node.ProposeMembership({ "n1", "n2" }, At(ElectionMin.count())).has_value());
-
-    // How long after the proposal the admitted member's first answer arrives. It is
-    // named because the assertion below is arithmetic on it: the two windows run
-    // from the proposal and from this answer, so they close exactly this far apart
-    // and that gap is the only place they can be told apart.
-    constexpr auto AnsweredAfter = std::int64_t { 20 };
-
-    (void) node.Receive(AppendEntriesResponse { .term = Term { .value = 1 },
-                                                .result = AppendResult::Rejected,
-                                                .matchIndex = LogIndex::BeforeFirst(),
-                                                .followerId = "n2" },
-                        At(ElectionMin.count() + AnsweredAfter));
-
-    (void) node.Tick(At(ElectionMin.count() + 50));
-    CHECK(node.CurrentRole() == Role::Leader);
-
-    // Inside that gap: past the admission's own window, which closes one election
-    // timeout after the proposal, and inside the contact's, which closes one after
-    // the answer. Derived rather than written out, so it goes on naming the gap if
-    // `ElectionMin` ever moves instead of silently landing outside it. At this
-    // instant only the ordinary contact record can be carrying the leader, so a fix
-    // that granted a permanent exemption and one that hands over to contact are
-    // told apart here and nowhere else.
-    (void) node.Tick(At((2 * ElectionMin.count()) + (AnsweredAfter / 2)));
-
-    CHECK(node.CurrentRole() == Role::Leader);
 }
 
 TEST_CASE("A leader elected by a bare quorum survives admitting a fourth member", "[consensus][raft][membership]")
@@ -528,6 +530,47 @@ TEST_CASE("A leader elected by a bare quorum survives admitting a fourth member"
 
     CHECK(fix.node.CurrentRole() == Role::Leader);
     CHECK(fix.node.KnownLeader() == std::optional<NodeId> { "n1" });
+}
+
+TEST_CASE("A leader that loses the COMMITTED quorum still steps down, mid-change", "[consensus][raft][membership]")
+{
+    // The over-correction guard, and it is deliberately NOT a discriminator: the
+    // old code deposes here too, because its grace for the admitted member has
+    // expired by this instant and the new quorum of three was never met. It passes
+    // before and after, which is exactly what a guard of this kind does.
+    //
+    // Saying so matters, because the tempting description -- "a case the fix can
+    // actually fail" -- is what this file's own rule refuses. What it guards is the
+    // OVER-correction: consulting the committed configuration must not become
+    // "a leader mid-change is never deposed". If `HasQuorumContact` were made
+    // permissive while a change is in flight, every other case here would still
+    // pass and only this one would go red. Shown, not claimed: returning `true`
+    // early while `HasUncommittedConfiguration()` reddens this case alone.
+    //
+    // The arrangement: a three-member leader elected by a BARE quorum holds contact
+    // for n2 only -- `BecomeLeader` seeds from the votes actually cast -- and n3 has
+    // never answered this leadership. It admits n4, and then n2 goes quiet too. The
+    // committed set is still `{n1, n2, n3}`, its quorum is two, and this leader can
+    // now count only itself.
+    LeaderFixture fix;
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    REQUIRE(fix.node.ProposeMembership({ "n1", "n2", "n3", "n4" }, At(200)).has_value());
+    REQUIRE(fix.node.ActiveMembers().size() == 4);
+
+    // Inside n2's contact window, which was stamped when it voted at `ElectionMin`:
+    // the committed quorum of two is met by this node and n2, so it leads.
+    (void) fix.node.Tick(At(250));
+    REQUIRE(fix.node.CurrentRole() == Role::Leader);
+
+    // Past it. n2's vote was stamped at `ElectionMin` and its window closes one
+    // `electionTimeoutMin` later, so from `2 * ElectionMin` this leader holds
+    // contact with nobody but itself -- one against a committed quorum of two.
+    (void) fix.node.Tick(At((2 * ElectionMin.count()) + 50));
+
+    CHECK(fix.node.CurrentRole() == Role::Follower);
+    CHECK_FALSE(fix.node.KnownLeader().has_value());
+    CHECK(fix.node.CurrentTerm() == Term { .value = 1 });
 }
 
 TEST_CASE("The retry after a lost leadership is not itself a second step-down", "[consensus][raft][membership]")
