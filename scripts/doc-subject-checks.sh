@@ -91,6 +91,14 @@ DocSubjectLabel="docs-subject"
 # stated twice is how the resolver came to know two spellings while the message
 # went on claiming one. Adding a third is adding a word here.
 DocSubjectRunners="-P bash"
+
+# The wrappers a registration may put BETWEEN the runner and the check. A
+# wrapped registration spells `bash .../run-check.sh .../check-x.sh`, so the token
+# after the runner is the WRAPPER and the check is one further along -- and a
+# resolver that stops at the first script proves only that the wrapper exists.
+# That is a guard reporting on the wrong subject: `--list` runs nothing, so its
+# "all runnable" would survive the check script itself being deleted.
+DocSubjectWrappers="run-check.sh"
 CMakeListsRelative="src/tests/CMakeLists.txt"
 FailRegexVariable="FASTCACHED_SCRIPT_CHECK_FAILED"
 
@@ -278,11 +286,15 @@ Run() {
         # alternative: a markdown table is dense with `[#780](...)`, and a
         # `file(STRINGS)` reader merges list elements on brackets -- the hazard
         # `.agent/rules/build-and-toolchain.md` records against six readers.
-        local i=0 script="" runner=""
+        local i=0 script="" runner="" wrapper=""
         while [[ $i -lt ${#args[@]} ]]; do
-            for runner in $DocSubjectRunners; do
+            for runner in $DocSubjectRunners $DocSubjectWrappers; do
                 case "${args[$i]}" in
                     "$runner"|*/"$runner")
+                        # A wrapper's own option -- `run-check.sh --self-test` --
+                        # names no check, so it leaves the resolution where it was
+                        # rather than claiming a flag is a script.
+                        case "${args[$((i + 1))]:-}" in -*) continue ;; esac
                         script="${args[$((i + 1))]:-}"
                         [[ -n "$script" ]] || Fatal "'$name' has a ${args[$i]} with no script after it"
                         [[ -f "$script" ]] || Fatal "'$name' names '$script', which does not exist"
@@ -748,6 +760,75 @@ set_tests_properties("epsilon-docs" PROPERTIES
 )'
     Expect "runs none of: -P bash" "the neither-spelling refusal did not name the runner set" \
         "a labelled check running none of the known runners is REFUSED" want-fail "$tree"
+
+    # 10. A registration that runs its check through `run-check.sh` (#1079). The
+    #     token after the runner is then the WRAPPER, and a resolver stopping
+    #     there proves only that the wrapper exists -- so `--list`'s "all runnable"
+    #     would survive the check script being DELETED, which is this file's own
+    #     subject reported against the wrong object.
+    #
+    #     Measured on the real tree, with `check-table-totals.sh` moved aside:
+    #     without the wrapper row `--list` printed
+    #     `runnable: table-totals -> scripts/run-check.sh`, called all 10 runnable
+    #     and exited 0; with it, it refuses and names `check-table-totals.sh`.
+    local wrappedCML='set(FASTCACHED_SCRIPT_CHECK_FAILED "CMake Error|CMake Warning")
+add_test(
+    NAME "zeta-docs"
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/zeta.sh"
+)
+set_tests_properties("zeta-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)'
+
+    #     Both arms run `--list`, which RESOLVES and executes nothing, because the
+    #     property is the resolution and a RUN cannot see it: `out="${args[@]}"`
+    #     executes the whole registered COMMAND, wrapper included, so the check
+    #     runs whichever token the resolver picked. Written first through `Case`,
+    #     both arms stayed GREEN under the neuter below -- the missing-check one
+    #     because the wrapper stub reached `bash zeta.sh` and bash's own "No such
+    #     file or directory" carries the name the needle looked for, and the
+    #     passing one because the check ran either way. Asserted directly rather
+    #     than through `Case` for the reason the INCONCLUSIVE arm below is: the
+    #     helper is not the thing under test here.
+    local wrapOut wrapStatus
+
+    # The accepting direction, which is not decoration: a resolver that refused
+    # every wrapped registration would satisfy the refusing arm and quietly take
+    # every wrapped check out of the set. #1031's rule -- a guard nobody has
+    # watched ACCEPT is not known to work.
+    tree="${scratch}/t-wrapped-pass"
+    StageTree "$tree" "$wrappedCML"
+    WriteCheck "$tree" run-check.sh '#!/bin/bash
+exec bash "$@"'
+    WriteCheck "$tree" zeta.sh '#!/bin/bash
+echo "table totals: 10 table(s), 3 figure(s) asserted"'
+    wrapStatus=0
+    wrapOut="$(bash "$0" --source-dir "$tree" --list 2>&1)" || wrapStatus=$?
+    if [[ "$wrapStatus" -eq 0 && "$wrapOut" == *"zeta-docs  ->  ${tree}/scripts/zeta.sh"* ]]; then
+        echo "  ok    (want-pass) a wrapped registration resolves to the CHECK, not the wrapper" >&2
+    else
+        echo "  FAIL  (want-pass, exit ${wrapStatus}) a wrapped registration must resolve to the check" >&2
+        printf '%s\n' "$wrapOut" | sed 's/^/        /' >&2
+        status=1
+    fi
+
+    # The refusing direction: the wrapper is present and the CHECK is not. Under
+    # a resolver that stops at the wrapper this is the vacuous pass -- run-check.sh
+    # exists, so nothing is refused and `--list` calls it runnable.
+    tree="${scratch}/t-wrapped-missing"
+    StageTree "$tree" "$wrappedCML"
+    WriteCheck "$tree" run-check.sh '#!/bin/bash
+exec bash "$@"'
+    wrapStatus=0
+    wrapOut="$(bash "$0" --source-dir "$tree" --list 2>&1)" || wrapStatus=$?
+    if [[ "$wrapStatus" -ne 0 && "$wrapOut" == *"zeta.sh', which does not exist"* ]]; then
+        echo "  ok    (want-fail) a wrapped check that does not exist is REFUSED BY NAME" >&2
+    else
+        echo "  FAIL  (want-fail, exit ${wrapStatus}) a deleted check behind a wrapper read as runnable" >&2
+        printf '%s\n' "$wrapOut" | sed 's/^/        /' >&2
+        status=1
+    fi
 
     # An INCONCLUSIVE arm is neither a pass nor a failure, and it is REPORTED
     # rather than folded into either. Folded into failure it sends the next reader

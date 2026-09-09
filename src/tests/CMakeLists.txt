@@ -924,9 +924,52 @@ set_tests_properties("version-fallback-warning" PROPERTIES
 #
 # `script-modes` beside it is not the same check -- that one asks whether a
 # shebanged script carries the bit, this one asks whether a CALL SITE depends on it.
+# A hygiene check that was KILLED and one that FOUND A PROBLEM are the same ctest
+# `***Failed`, and the only tell is the absence of output nobody is looking for
+# (#1079). `run-check.sh` is what tells them apart; these three are what keep it
+# honest and keep it applied.
+#
+# The wrapper's own outcomes, driven against STAGED checks rather than waited for:
+# a killed run is produced with `kill -PIPE`/`kill -KILL`, and the case with no
+# terminal marker at all is produced by a staged check killing its own parent. That
+# is deterministic and costs no sleep, which is what #1079 asks for -- stage the
+# kill rather than wait to catch one.
+add_test(
+    NAME "run-check-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" --self-test
+)
+set_tests_properties("run-check-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that every registered check actually goes through it. A check registered
+# directly is valid CMake, correct in itself, and silently collapses the two states
+# again -- so the set is DERIVED from the registrations rather than listed (#492).
+add_test(
+    NAME "run-check-coverage"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-run-check-coverage.sh"
+)
+set_tests_properties("run-check-coverage" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Both directions, including the two shapes that make a coverage scan lie: a
+# registration file naming NO check (which must refuse rather than report every
+# check wrapped) and an unwrapped mention inside a COMMENT, which is not a call site.
+add_test(
+    NAME "run-check-coverage-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-run-check-coverage.sh" --self-test
+)
+set_tests_properties("run-check-coverage-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "workflow-script-invocations"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh"
 )
 set_tests_properties("workflow-script-invocations" PROPERTIES
     LABELS "hygiene"
@@ -939,7 +982,7 @@ set_tests_properties("workflow-script-invocations" PROPERTIES
 # dropping the entry silently.
 add_test(
     NAME "workflow-script-invocations-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-workflow-script-invocations.sh" --self-test
 )
 set_tests_properties("workflow-script-invocations-selftest" PROPERTIES
     LABELS "hygiene"
@@ -981,7 +1024,7 @@ set_tests_properties("flake-rate-selftest" PROPERTIES
 # written by somebody who has never read this.
 add_test(
     NAME "apt-update-wrapped"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh"
 )
 set_tests_properties("apt-update-wrapped" PROPERTIES
     LABELS "hygiene"
@@ -993,7 +1036,7 @@ set_tests_properties("apt-update-wrapped" PROPERTIES
 # check that had stopped meaning anything.
 add_test(
     NAME "apt-update-wrapped-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-apt-update.sh" --self-test
 )
 set_tests_properties("apt-update-wrapped-selftest" PROPERTIES
     LABELS "hygiene"
@@ -1019,7 +1062,7 @@ set_tests_properties("apt-update-wrapped-selftest" PROPERTIES
 # to fail at all. It SKIPs when PyYAML is absent rather than passing quietly.
 add_test(
     NAME "mkdocs-validation"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-mkdocs-validation.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-mkdocs-validation.sh"
 )
 set_tests_properties("mkdocs-validation" PROPERTIES
     LABELS "hygiene"
@@ -1029,7 +1072,7 @@ set_tests_properties("mkdocs-validation" PROPERTIES
 
 add_test(
     NAME "script-modes"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh"
 )
 set_tests_properties("script-modes" PROPERTIES
     LABELS "hygiene"
@@ -1042,7 +1085,7 @@ set_tests_properties("script-modes" PROPERTIES
 # perfectly -- a scan that matched nothing would otherwise report success.
 add_test(
     NAME "script-modes-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-script-modes.sh" --self-test
 )
 set_tests_properties("script-modes-selftest" PROPERTIES
     LABELS "hygiene"
@@ -1128,7 +1171,7 @@ set_tests_properties("net-boundary" PROPERTIES
 if(NOT WIN32)
     add_test(
         NAME "notarize-retry"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-notarize-retry.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-notarize-retry.sh"
     )
     set_tests_properties("notarize-retry" PROPERTIES
         FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
@@ -1172,7 +1215,7 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_SANITIZER_ADDRESS AND FASTCACHED_ENABLE_TLS)
     add_test(
         NAME "tidy-blind-spots"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots.sh"
                 "${CMAKE_BINARY_DIR}"
     )
     set_tests_properties("tidy-blind-spots" PROPERTIES
@@ -1195,7 +1238,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-blind-spots-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots-selftest.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots-selftest.sh"
     )
     set_tests_properties("tidy-blind-spots-selftest" PROPERTIES
         FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
@@ -1506,7 +1549,7 @@ set_tests_properties("pedantic-suppressions-selftest" PROPERTIES
 if(NOT WIN32)
     add_test(
         NAME "e2e-helpers-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-e2e-helpers.sh"
     )
     # It stages several deliberate timeouts of a couple of seconds each, one
     # four-second wait that must really take four seconds -- the check that the
@@ -2087,7 +2130,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "merge-queue-contexts"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh"
     )
     set_tests_properties("merge-queue-contexts" PROPERTIES
         LABELS "hygiene"
@@ -2108,7 +2151,7 @@ if(NOT WIN32)
     # own parser tests the parser it ships with, not the one that runs.
     add_test(
         NAME "merge-queue-contexts-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-merge-queue-contexts.sh" --self-test
     )
     set_tests_properties("merge-queue-contexts-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2137,7 +2180,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "gated-jobs-fail-safe"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh"
     )
     set_tests_properties("gated-jobs-fail-safe" PROPERTIES
         LABELS "hygiene"
@@ -2157,7 +2200,7 @@ if(NOT WIN32)
     # argument for a baseline case rather than only negative ones.
     add_test(
         NAME "gated-jobs-fail-safe-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-gated-jobs.sh" --self-test
     )
     set_tests_properties("gated-jobs-fail-safe-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2190,7 +2233,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "merge-group-report"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh"
     )
     set_tests_properties("merge-group-report" PROPERTIES
         LABELS "hygiene"
@@ -2199,7 +2242,7 @@ if(NOT WIN32)
 
     add_test(
         NAME "merge-group-report-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-merge-group-report.sh" --self-test
     )
     set_tests_properties("merge-group-report-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2294,7 +2337,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "table-totals"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh"
                 "${CMAKE_SOURCE_DIR}"
     )
     set_tests_properties("table-totals" PROPERTIES
@@ -2310,7 +2353,7 @@ if(NOT WIN32)
     # unreadable multiplier and a mode it cannot name.
     add_test(
         NAME "table-totals-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-table-totals.sh" --self-test
     )
     set_tests_properties("table-totals-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2348,7 +2391,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "obsolete-conffiles"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh"
                 "${CMAKE_SOURCE_DIR}"
     )
     set_tests_properties("obsolete-conffiles" PROPERTIES
@@ -2364,7 +2407,7 @@ if(NOT WIN32)
     # deleted, since each reads exactly like a clean tree.
     add_test(
         NAME "obsolete-conffiles-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-obsolete-conffiles.sh" --self-test
     )
     set_tests_properties("obsolete-conffiles-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2426,7 +2469,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "rulebook-open-work"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --extract
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --extract
     )
     set_tests_properties("rulebook-open-work" PROPERTIES
         LABELS "hygiene;docs-subject"
@@ -2448,7 +2491,7 @@ if(NOT WIN32)
     # the quantity that varies is the network and not the tree.
     add_test(
         NAME "rulebook-open-work-state"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --resolve
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --resolve
     )
     set_tests_properties("rulebook-open-work-state" PROPERTIES
         LABELS "hygiene;smoke"
@@ -2458,7 +2501,7 @@ if(NOT WIN32)
 
     add_test(
         NAME "rulebook-open-work-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-open-work.sh" --self-test
     )
     set_tests_properties("rulebook-open-work-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2493,7 +2536,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-sweep-scope"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh"
     )
     set_tests_properties("tidy-sweep-scope" PROPERTIES
         LABELS "hygiene"
@@ -2502,7 +2545,7 @@ if(NOT WIN32)
 
     add_test(
         NAME "tidy-sweep-scope-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-scope.sh" --self-test
     )
     set_tests_properties("tidy-sweep-scope-selftest" PROPERTIES
         LABELS "hygiene"
@@ -2539,7 +2582,7 @@ endif()
 if(NOT WIN32)
     add_test(
         NAME "tidy-sweep-database"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh"
     )
     set_tests_properties("tidy-sweep-database" PROPERTIES
         LABELS "hygiene"
@@ -2567,7 +2610,7 @@ if(NOT WIN32)
     # refuses).
     add_test(
         NAME "tidy-sweep-database-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-sweep-database.sh" --self-test
     )
     set_tests_properties("tidy-sweep-database-selftest" PROPERTIES
         LABELS "hygiene"
@@ -3614,7 +3657,7 @@ endif()
 if(NOT WIN32 AND TARGET fastcached AND TARGET fastcache-cc)
     add_test(
         NAME "compile-cache-daemon-start"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-start.sh"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-start.sh"
             --fastcached "$<TARGET_FILE:fastcached>"
             --launcher "$<TARGET_FILE:fastcache-cc>"
             --compiler "${CMAKE_CXX_COMPILER}"
@@ -3893,7 +3936,7 @@ set_tests_properties("psk-signing-seam-selftest" PROPERTIES
 # `gc --auto`.
 add_test(
     NAME "configure-subprocess-bounds"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh"
 )
 set_tests_properties("configure-subprocess-bounds" PROPERTIES
     LABELS "hygiene"
@@ -3906,7 +3949,7 @@ set_tests_properties("configure-subprocess-bounds" PROPERTIES
 # two empty lists agree perfectly.
 add_test(
     NAME "configure-subprocess-bounds-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-configure-subprocess-bounds.sh" --self-test
 )
 set_tests_properties("configure-subprocess-bounds-selftest" PROPERTIES
     LABELS "hygiene"
@@ -3928,7 +3971,7 @@ set_tests_properties("configure-subprocess-bounds-selftest" PROPERTIES
 # with the whole suite still green.
 add_test(
     NAME "write-slot-guard"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh"
 )
 set_tests_properties("write-slot-guard" PROPERTIES
     LABELS "hygiene"
@@ -3940,7 +3983,7 @@ set_tests_properties("write-slot-guard" PROPERTIES
 # than reporting clean.
 add_test(
     NAME "write-slot-guard-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh" --self-test
 )
 set_tests_properties("write-slot-guard-selftest" PROPERTIES
     LABELS "hygiene"
@@ -3957,7 +4000,7 @@ set_tests_properties("write-slot-guard-selftest" PROPERTIES
 # Raising the limit is not a fix: it moves the cliff and hides that there is one.
 add_test(
     NAME "gh-listing-seam"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh"
 )
 set_tests_properties("gh-listing-seam" PROPERTIES
     LABELS "hygiene"
@@ -3968,7 +4011,7 @@ set_tests_properties("gh-listing-seam" PROPERTIES
 # while guarding nothing: an empty scan, and the seam itself having been deleted.
 add_test(
     NAME "gh-listing-seam-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-gh-listing-seam.sh" --self-test
 )
 set_tests_properties("gh-listing-seam-selftest" PROPERTIES
     LABELS "hygiene"
@@ -3992,7 +4035,7 @@ set_tests_properties("gh-listing-seam-selftest" PROPERTIES
 # #826 and left #866 open, which is the shape a count cannot see.
 add_test(
     NAME "pr-closing-keywords"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-pr-closing-keywords.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-pr-closing-keywords.sh" --self-test
 )
 set_tests_properties("pr-closing-keywords" PROPERTIES
     LABELS "hygiene"
@@ -4013,7 +4056,7 @@ set_tests_properties("pr-closing-keywords" PROPERTIES
 # target (#909), and the symptom is a slow build rather than a failure.
 add_test(
     NAME "cache-flow-continuations"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh"
 )
 set_tests_properties("cache-flow-continuations" PROPERTIES
     LABELS "hygiene"
@@ -4025,7 +4068,7 @@ set_tests_properties("cache-flow-continuations" PROPERTIES
 # renamed away so it matches nothing, and its subject file gone.
 add_test(
     NAME "cache-flow-continuations-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cache-flow-continuations.sh" --self-test
 )
 set_tests_properties("cache-flow-continuations-selftest" PROPERTIES
     LABELS "hygiene"
@@ -4171,7 +4214,7 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
 # `WallClockRef` anywhere -- two empty lists agree perfectly.
 add_test(
     NAME "wall-clock-borrow"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" "${CMAKE_SOURCE_DIR}"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" "${CMAKE_SOURCE_DIR}"
 )
 set_tests_properties("wall-clock-borrow" PROPERTIES
     LABELS "hygiene"
@@ -4189,7 +4232,7 @@ set_tests_properties("wall-clock-borrow" PROPERTIES
 # own line. The fixture is that now, and removing the handling reddens exactly it.
 add_test(
     NAME "wall-clock-borrow-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" --self-test
 )
 set_tests_properties("wall-clock-borrow-selftest" PROPERTIES
     LABELS "hygiene"
@@ -4232,7 +4275,7 @@ set_tests_properties("macos-package-e2e-selftest" PROPERTIES
 # file, sends SIGHUP, sees no error and believes a setting is in force that is not.
 add_test(
     NAME "node-reloadable-docs"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
 )
 set_tests_properties("node-reloadable-docs" PROPERTIES
     LABELS "hygiene;docs-subject"
@@ -4246,7 +4289,7 @@ set_tests_properties("node-reloadable-docs" PROPERTIES
 # which carries the identical header for a different binary and a different set.
 add_test(
     NAME "node-reloadable-docs-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" --self-test
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" --self-test
 )
 set_tests_properties("node-reloadable-docs-selftest" PROPERTIES
     LABELS "hygiene"
