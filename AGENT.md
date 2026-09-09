@@ -698,7 +698,12 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `RaftConfig::members` may legally be **empty** and `--raft-join` is what starts a
   machine that way. Who a node dials is not who it counts.
 - The quorum follows the replicated state, one change at a time, additions before
-  removals — and a member is never counted before every node can dial it.
+  removals — and a member is never counted before every node can dial it. **One at a
+  time is load-bearing for READS as well as for commitment** (#1095): CheckQuorum
+  consults the committed configuration while a change is in flight, and that is only
+  safe because any majority of the old and any majority of the new share a member.
+  Relaxing the single-member restriction on the commitment argument alone breaks a
+  rule nothing would warn you about.
 - Absence from `ClusterState` is not removal: a `--raft-peer` member is in the
   configuration and in no state, so a member named in the bootstrap set is never
   proposed for removal, and a node given no bootstrap set proposes none at all.
@@ -708,6 +713,26 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A leader and a follower stamp the same link half a round trip apart, so a shared
   window never bought a shared answer. A non-leader decides a pre-vote from its own
   `_knownLeader` and election deadline, never from a timestamp.
+- CheckQuorum DEPOSES a leader here — the rulebook said for months that nothing did,
+  and #1061 is what that cost. It measures SILENCE, and a member admitted a moment
+  ago has not been silent, it has not been ASKED: adopting the configuration grows
+  the quorum before the new member can have answered, so the leader deposes itself
+  at its next heartbeat. So while a change is UNCOMMITTED, CheckQuorum asks about the
+  **committed** configuration (#1095) — the set that elected this leader and still
+  answers it — never by seeding `_followerContact`, whose absence means something
+  else and which pre-vote reads too. The first fix was a per-member grace of one
+  `electionTimeoutMin`, and a window closed by a CONSTANT is one a slow first round
+  trip outruns: a joiner's first exchange carries two fsyncs and a `nextIndex`
+  walk-back, which no steady-state heartbeat does. This rule has no constant.
+  It is safe for READS — which is what CheckQuorum here protects — only because a
+  change is restricted to a SINGLE member, so any majority of the old configuration
+  and any majority of the new share one; that restriction is load-bearing for reads
+  as well as for commitment. At two members the arithmetic cannot
+  be satisfied and nothing recovers, because the member just admitted holds no
+  configuration and so grants no votes; at three and above somebody else campaigns,
+  so it presents as an election storm that settles and every *a leader exists
+  eventually* test passes under it. `undecided` in a node log is
+  `SchedulerRole::Undecided`, not a Raft role.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.
