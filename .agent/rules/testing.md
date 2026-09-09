@@ -39,6 +39,122 @@ One corollary, because reorganising a fixture is how its teeth get quietly pulle
 checked.** After that change the defect was reintroduced and the fixture confirmed to
 still fail for its original reason before the change was believed.
 
+## A wall clock is not a duration, because it can be STEPPED
+
+`SECONDS`, `TIMEFORMAT='%3R'` and `date +%s.%N` all read CLOCK_REALTIME, and a VM
+guest's host time sync moves that in both directions. An interval computed from
+two readings of it is therefore not a lower bound, not an upper bound, and can be
+**negative**.
+
+Measured on a contended WSL2 host (`clocksource: tsc`), twenty `sleep 0.2` calls
+with no fixture around them, timed by three clocks at once:
+
+```
+run   time %3R   date +%s.%N   /proc/uptime
+6     4.020      4.021         4.020
+7     2.761      2.763         4.030      <- both realtime readers lose 1.27s
+8     4.023      4.026         4.030
+```
+
+**The variable is the ENVIRONMENT, not the load.** Two step detectors run
+concurrently on one box, over one 240-second window:
+
+```
+WSL2                 samples=502   min=-1466ms   max=552ms   negative=8
+Git Bash (Windows)   samples=429   min= +545ms   max=592ms   negative=0
+```
+
+WSL2 stepped backwards eight times in four minutes, to **-1.466 s** — inside the
+1.27-1.68 s band the three sessions above measured independently. The Git Bash
+side read 545-592 ms against a 500 ms sleep across that same window, and *that* is
+what says the box was near-idle: a measured overhead of 45-92 ms rather than a load
+average nobody wrote down. **So the step does not need a busy host.**
+
+Two consequences, and the second is the one that costs a session:
+
+* **The magnitude is not portable.** These are WSL2 readings, taken through
+  `wsl.exe` — which is how every ctest-driven figure in this ticket and its
+  neighbours was taken. Do not read them as a property of Linux, of macOS or of a
+  CI runner. And Git Bash producing no backward step in **429 samples** is *not
+  observed under these conditions*, never *cannot step*.
+* **A clean run in the other environment is not weak evidence, it is none.** A
+  lane's 120 clean runs under Git Bash said nothing about a WSL2 defect, the
+  precondition being absent by construction. So a clean run cited against a
+  clock-step ticket states which environment produced it, or it is unreadable.
+
+A 965-sample, zero-backward-step reading was once cited here as evidence that an
+idle host does not step. **The lane that took it reports it ran under Git Bash** —
+120 runs, 60 on master and 60 on the branch, across both idle and 48-burner
+contention, in that environment throughout, with the detector running alongside
+them. So it is a **third corroboration of the pairing** rather than a caveat
+against it: zero backward steps in the environment where the precondition is
+absent by construction. It was never a reading about load. Recorded as REPORTED by
+that lane rather than as measured here, which is the distinction the whole section
+turns on.
+
+Load remains a real and subordinate caveat: the readings in this section were
+taken on a contended host, so the RATE here says nothing about the rate on a quiet
+one. What it no longer supports is the inference that a quiet host is a safe one.
+
+Confirmed independently on the same host by a second session with a different
+reader (`date +%s%N` against `/proc/uptime`, run 8: realtime 2828 ms, monotonic
+4110 ms, delta **-1282 ms**, the other thirteen runs inside 8 ms), and by a third
+measuring `read -t 5` on a FIFO nobody writes to. The three numbers agree, and the
+third session's reads all carried status **142** — a genuine full-bound timeout —
+which is the reconciliation: **the reads did not return early, the reading lost a
+second.**
+
+The cost was #1058: a 23% flake in the DEFAULT `ctest` set, `macOS-clang-release`
+red in a merge group, and a pull request ejected from the queue. Three cases in one
+fixture, three shapes, one cause — a staged 4058 ms defect reading 2966 ms and
+failing a 3000 ms floor; a `read -t 5` that consumed its whole bound measuring
+`SECONDS`-elapsed of **4** in 7 of 45 reads; and `%3R` rendering one interval as
+**`/.044`**, which is how bash prints a negative second, `'0' - 1` being `/`.
+
+**A shape guard does not save you, and this is the reading that proves it.** After
+the fix, a *healthy* fast path that had requested 200 ms of pause reported its
+elapsed time as **6 ms** — the clock had stepped back by very nearly the whole
+interval being measured. That reading is **well formed**. It is not negative, not
+absurd, and it passes every predicate that exists to refuse a malformed one;
+`/.044` was the same event overshooting past zero and was caught *only because* it
+came out malformed. A guard on the SHAPE of a reading cannot help here, because
+nothing about the reading is the wrong shape. The reading has to be structurally
+incapable of being a duration — which is what asserting the requested pause
+achieves — or it will be believed.
+
+**The defect is BIDIRECTIONAL, and only one direction had been seen.** Every
+reading above is a backward step, which presents as work that took less time than
+it did: a bound overrunning, a defect coming in short. A **forward** step is the
+mirror — it shortens a bound, so a healthy wait gives up early and presents as a
+premature failure. Observed on a fourth tree: PR #1081, whose change touches none
+of this, went red on `macOS-clang-release` with `FAIL wait-for-log: exited 1,
+expected 0`, from `wait_until` bounding on `SECONDS`. A reader who has only met the
+backward form will diagnose that as a slow runner and raise the budget, which is
+the one remedy that cannot work.
+
+- **Prefer asserting the DECISION over the measurement.** What a bounded helper
+  *asked for* is exact and host-independent; what it *cost* is a reading. Where the
+  property under test is pacing, record the requested pauses and assert on those.
+  It is also strictly stronger than the timing proxy, since it counts the ticks as
+  well as their length.
+- **Where a duration is genuinely needed, take it from something monotonic.**
+  `sleep` is `nanosleep` against CLOCK_MONOTONIC on Linux and macOS and cannot be
+  stepped — measured, it took its full 4.11 s in the run where realtime read
+  2.83 s — so a co-timer is the portable monotonic clock bash 3.2 does not
+  otherwise have. `/proc/uptime` is Linux-only, `EPOCHREALTIME` is bash 5, and
+  `date +%s%N` is GNU-only.
+- **A derivation is only as sound as the premise it does not state.** The algebra
+  `floor(a + BOUND) - floor(a) == BOUND` is correct, was written down, was defended
+  over 200k simulated placements, and was used to conclude that the silent error
+  *"cannot happen here"*. It assumes the clock does not move, and never says so.
+  **A census cannot falsify a premise** — those placements validated the arithmetic
+  *given* the premise and never tested it. Three readers passed over that paragraph;
+  the tell nobody looked at is that a duration cannot come in short.
+- **#678 was the same clock one property earlier** — its one-second QUANTISATION
+  wrecking readings in these same two files — and it was closed by keeping the clock
+  and improving the resolution, which is why the surrounding comments all argue
+  about resolution. Resolution was never the whole defect.
+
 ## A bounded wait must also say WHICH KIND of failure it was
 
 "Every wait is bounded" is the rule above, and it is not enough on its own. A wait

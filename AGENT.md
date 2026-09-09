@@ -708,18 +708,6 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - A leader and a follower stamp the same link half a round trip apart, so a shared
   window never bought a shared answer. A non-leader decides a pre-vote from its own
   `_knownLeader` and election deadline, never from a timestamp.
-- CheckQuorum DEPOSES a leader here — the rulebook said for months that nothing did,
-  and #1061 is what that cost. It measures SILENCE, and a member admitted a moment
-  ago has not been silent, it has not been ASKED: adopting the configuration grows
-  the quorum before the new member can have answered, so the leader deposes itself
-  at its next heartbeat. `RaftNode` counts THAT peer, by id, for one
-  `electionTimeoutMin` — never by seeding `_followerContact`, whose absence means
-  something else and which pre-vote reads too. At two members the arithmetic cannot
-  be satisfied and nothing recovers, because the member just admitted holds no
-  configuration and so grants no votes; at three and above somebody else campaigns,
-  so it presents as an election storm that settles and every *a leader exists
-  eventually* test passes under it. `undecided` in a node log is
-  `SchedulerRole::Undecided`, not a Raft role.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.
@@ -1907,6 +1895,28 @@ and what they may assume.
   the first try by a loop that counted. `scripts/flake-rate.sh` keeps a tally, keeps the
   early stop, and states its N on every line, because a stability claim without one
   invites the inference it cannot support.
+- **A wall clock is not a duration.** `SECONDS`, `TIMEFORMAT='%3R'` and `date` all read
+  CLOCK_REALTIME, which a VM host's time sync steps BOTH ways — measured **under WSL2**
+  on three instruments in three sessions, a 4.03 s interval read 2.76 s, a `read -t 5` that
+  consumed its whole bound measured 4 in 7 of 45 reads, and one interval came back
+  NEGATIVE (`%3R` prints `/.044`, because `'0' - 1` is `/`). That was #1058: 23% in the
+  DEFAULT set and a pull request ejected from the merge queue. Assert what a helper
+  DECIDED — the pause it REQUESTED is exact and host-independent — or time it against
+  something monotonic (`sleep` is CLOCK_MONOTONIC on both platforms). **The variable is
+  the ENVIRONMENT, not the load**, measured as a pair on ONE box in ONE 240 s window: 8
+  backward steps in 502 WSL2 samples, 0 in 429 Git Bash samples, the box near-idle by
+  Git Bash's own 545-592 ms against a 500 ms sleep. So the step does NOT need a busy
+  host, the magnitudes are not portable off WSL2, and a clean run cited against a
+  clock-step ticket names its environment or is unreadable — 120 clean Git Bash runs
+  were not weak evidence about a WSL2 defect, they were none. **A shape guard is
+  not enough**: the same host produced a *well-formed* **6 ms** reading for work that
+  requested 200 ms of pause, which every predicate accepts. And it is **BIDIRECTIONAL** —
+  a forward step SHORTENS a bound, so a healthy wait gives up early and reads as a slow
+  runner (#1081's macOS `wait-for-log` red), which is the direction that gets "fixed" by
+  raising a budget. **A derivation is only as sound as the premise it does not state**:
+  the algebra here was right, defended over 200k simulated placements, and rested on
+  *the clock does not move*, which nobody wrote down and a census cannot falsify. #678
+  fixed this same predicate's RESOLUTION and left the clock.
 - **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found FIVE tests that
   could not fail for the reason they existed — five shapes, all green, three of them acceptance criteria written by
   whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
