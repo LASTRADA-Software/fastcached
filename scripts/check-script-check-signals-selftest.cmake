@@ -384,6 +384,53 @@ file(WRITE "${blind}/src/tests/CMakeLists.txt"
 fastcached_case("a tree the scan reads to the end with no verdict reader in it fires the control"
                 "${blind}" "no compliant verdict reader" no-count)
 
+# ---------------------------------------------------------------------------
+# Pass 2 (#679): the rule this check was written for, and the walk that now answers
+# it in one pass.
+#
+# Neither was covered here before. The cases above drive passes 3, 3b and 5, and
+# pass 2 -- a registration that cannot report failure, which is the whole reason
+# this file exists -- had never been watched refusing anything. A rewrite of an
+# unwatched function is the shape worth staging a case for.
+
+# The rule. ONE registration loses its signal, and the finding must name that one
+# and only that one: a lookup that blurred two registrations together would report a
+# violation against a check that has nothing wrong with it, and nothing in the
+# message would say so.
+set(registrations "${tree}/src/tests/CMakeLists.txt")
+file(READ "${registrations}" before)
+string(REPLACE
+       "set_tests_properties(\"glob-traversals-selftest\" PROPERTIES\n    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"\n"
+       "set_tests_properties(\"glob-traversals-selftest\" PROPERTIES\n" after "${before}")
+file(WRITE "${registrations}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("unsignalled" "the injection changed nothing, so the case stages no defect")
+endif()
+fastcached_case("a registration with no FAIL_REGULAR_EXPRESSION is refused, and named"
+                "${tree}" ".glob-traversals-selftest. runs a .cmake -P. script but has no FAIL_REGULAR_EXPRESSION")
+file(WRITE "${registrations}" "${before}")
+file(READ "${registrations}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("unsignalled" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# And the walk itself losing the shape it reads. The finding has to name the WALK: a
+# check that answers an instrument fault with 71 findings against 71 innocent
+# registrations is an instrument fault wearing the findings' clothes.
+file(READ "${registrations}" before)
+string(REPLACE "set_tests_properties(" "set_test_properties(" after "${before}")
+file(WRITE "${registrations}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("blocks-unreadable" "the injection changed nothing, so the case stages no defect")
+endif()
+fastcached_case("a walk that stops recognising property blocks names ITSELF, not 71 innocent checks"
+                "${tree}" "has stopped recognising the shape" no-count)
+file(WRITE "${registrations}" "${before}")
+file(READ "${registrations}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("blocks-unreadable" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
 # The control AGAIN, over the tree every case above has now written to. The
 # per-case restores each assert their own file; this asserts the WHOLE tree is
 # back where the first control found it, which is the assertion that survives a

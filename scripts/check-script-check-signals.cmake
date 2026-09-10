@@ -195,39 +195,144 @@ set(sawVerdictHalfRead FALSE)
 set(willFailRegistrations "")
 
 # ---------------------------------------------------------------------------
-# Pass 2: each of them must be given the failure signal.
+# Pass 2, first half: what each `set_tests_properties()` block carries, in ONE
+# walk of the file (#679).
+#
+# This used to be a walk PER REGISTRATION -- 71 registrations against a 5,070-line
+# file, where one pass answers the same question. The ticket recorded 30 x 2,126
+# and about 150 ms of a 190 ms run; both halves have grown since, and the figures
+# in this file are the ones measured on the tree that changed it rather than the
+# ones the ticket carried.
+#
+# The rows are `<test name>|<signalled>|<will fail>` and the FIRST block for a name
+# wins, which is what the per-registration walk did by stopping at the one it
+# found. One list of rows rather than parallel lists, for the reason
+# `fastcached_registration_fields` gives one row for a name and a path: two lists
+# appended in step are two lists that can stop being in step.
+#
+# The name is now compared EXACTLY where it used to be a regex over a partially
+# escaped name -- `$`, `{` and `}` escaped, and every other metacharacter left
+# standing, so a name holding a `.` would have matched a block belonging to a
+# different test. That is stricter, not merely different, and it changes nothing
+# here: measured over the 154 `add_test` names in this file, three carry
+# `${...}` (they are registered inside `foreach()` loops) and those were already
+# escaped; none carries any other metacharacter. Both spellings therefore agree on
+# this tree, and the equivalence was demonstrated per registration rather than
+# argued -- see the ticket.
+set(propertyBlocks "")
+set(currentBlock "")
+set(currentSignalled FALSE)
+set(currentWillFail FALSE)
+
+# The row for a test name, or "" when no block was found for it.
+#
+# A scan rather than a variable named after the test, because three of these names
+# ARE the text `${...}`: `set(_seen_${check} ...)` would expand it and record the
+# answer under a name no lookup could ask for.
+#
+# @param wanted The ctest name.
+# @param rowOut Set to the matching `<name>|<signalled>|<will fail>` row, or "".
+function(fastcached_block_row wanted rowOut)
+    set(${rowOut} "" PARENT_SCOPE)
+    foreach(row IN LISTS propertyBlocks)
+        string(FIND "${row}" "|" barAt)
+        if(barAt EQUAL -1)
+            message(FATAL_ERROR "a property-block row carries no separator: ${row}")
+        endif()
+        string(SUBSTRING "${row}" 0 ${barAt} rowName)
+        if(rowName STREQUAL wanted)
+            set(${rowOut} "${row}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
+# Close the block in hand and file what it carried. A macro, so the append lands in
+# this scope; called at the closing `)` and again at end of file, because the
+# per-registration walk recorded a property the moment it saw it and did not need
+# the block to be closed for that.
+macro(fastcached_close_block)
+    if(NOT currentBlock STREQUAL "")
+        list(APPEND propertyBlocks "${currentBlock}|${currentSignalled}|${currentWillFail}")
+        set(currentBlock "")
+    endif()
+endmacro()
+
+foreach(line IN LISTS lines)
+    if(line MATCHES "^[ \t]*#")
+        continue()
+    endif()
+
+    if(line MATCHES "set_tests_properties\\([ \t]*\"([^\"]+)\"")
+        fastcached_close_block()
+        set(candidate "${CMAKE_MATCH_1}")
+        fastcached_block_row("${candidate}" existingRow)
+        if(existingRow STREQUAL "")
+            set(currentBlock "${candidate}")
+            set(currentSignalled FALSE)
+            set(currentWillFail FALSE)
+        endif()
+    elseif(NOT currentBlock STREQUAL "" AND line MATCHES "FAIL_REGULAR_EXPRESSION")
+        set(currentSignalled TRUE)
+    elseif(NOT currentBlock STREQUAL "" AND line MATCHES "WILL_FAIL[ \t]+TRUE")
+        # Recorded rather than acted on here; pass 4 is where it is spent, beside
+        # the resolved path it needs. The scan does not stop at the first property
+        # it recognises, because two of them are wanted.
+        set(currentWillFail TRUE)
+    elseif(NOT currentBlock STREQUAL "" AND line MATCHES "^[ \t]*\\)[ \t]*$")
+        fastcached_close_block()
+    endif()
+endforeach()
+fastcached_close_block()
+
+# A walk that stops recognising blocks is LOUD either way -- every registration then
+# looks unsignalled -- so this control is not about silence, and saying it was would
+# be the tidier claim rather than the true one. It is about ATTRIBUTION. Measured, by
+# renaming `set_tests_properties` throughout a staged copy: without this the check
+# reports 71 findings against 71 checks that have nothing wrong with them, and with
+# it, one finding that names the walk. An instrument fault wearing the findings'
+# clothes is the outcome a file arguing for measurement over memory must not produce.
+#
+# A floor rather than equality: blocks outnumber `cmake -P` registrations, every ctest
+# test here having one. So it can only be crossed by a walk that has lost most of the
+# file, never by one registration legitimately going without a block.
+list(LENGTH propertyBlocks propertyBlockCount)
+if(propertyBlockCount LESS scriptCheckCount)
+    message(FATAL_ERROR
+        "read ${propertyBlockCount} set_tests_properties() block(s) out of ${testsFile} for "
+        "${scriptCheckCount} `cmake -P` registration(s); every one of them has a block, so "
+        "this walk has stopped recognising the shape and the verdicts below are drawn from "
+        "a file it only partly read")
+endif()
+
+# ---------------------------------------------------------------------------
+# Pass 2, second half: each of them must be given the failure signal.
 #
 # The property is matched by NAME rather than by its value, so a check that
 # spells the pattern some other way still counts as having answered the
 # question -- the point is that somebody decided, not that they decided this.
 # `FASTCACHED_SCRIPT_CHECK_FAILED` exists so nobody has to.
+#
+# The finding names the ONE check it belongs to, which is the way a map gets this
+# wrong: a lookup that blurred two registrations together would report a violation
+# against a check that has nothing wrong with it, and nothing about the message
+# would say so.
 foreach(registration IN LISTS scriptRegistrations)
     fastcached_registration_fields("${registration}" check scriptPath)
-    string(REPLACE "$" "\\$" escaped "${check}")
-    string(REPLACE "{" "\\{" escaped "${escaped}")
-    string(REPLACE "}" "\\}" escaped "${escaped}")
+    fastcached_block_row("${check}" blockRow)
 
     set(signalled FALSE)
     set(willFail FALSE)
-    set(inBlock FALSE)
-    foreach(line IN LISTS lines)
-        if(line MATCHES "^[ \t]*#")
-            continue()
+    if(NOT blockRow STREQUAL "")
+        string(REPLACE "|" ";" blockFields "${blockRow}")
+        list(LENGTH blockFields blockFieldCount)
+        if(NOT blockFieldCount EQUAL 3)
+            message(FATAL_ERROR
+                "property-block row split into ${blockFieldCount} field(s) where 3 are wanted: ${blockRow}")
         endif()
-        if(line MATCHES "set_tests_properties\\([ \t]*\"${escaped}\"")
-            set(inBlock TRUE)
-        elseif(inBlock AND line MATCHES "FAIL_REGULAR_EXPRESSION")
-            set(signalled TRUE)
-        elseif(inBlock AND line MATCHES "WILL_FAIL[ \t]+TRUE")
-            # Recorded rather than acted on here; pass 4 is where it is spent,
-            # beside the resolved path it needs. The scan no longer stops at the
-            # first property it recognises, because two of them are wanted now.
-            set(willFail TRUE)
-        elseif(inBlock AND line MATCHES "^[ \t]*\\)[ \t]*$")
-            set(inBlock FALSE)
-            break()
-        endif()
-    endforeach()
+        list(GET blockFields 1 signalled)
+        list(GET blockFields 2 willFail)
+    endif()
 
     if(willFail)
         list(APPEND willFailRegistrations "${registration}")
