@@ -819,6 +819,22 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   and both disagreements are states nothing could describe. One predicate,
   `RunsConsensus`, because #613 was two tiers authoring this one rule.
 
+**Backwards compatibility is not owed yet, and designing around it has already cost
+work.** Until this software is declared production ready, a wire format, an on-disk
+format, a cache-key version, an enumerator order, a CLI flag or a config key may change
+outright. `fastcache-compile-node` has ONE installation, so a format change costs one
+local rebuild rather than a migration. Four tickets were designed against a burden that
+does not exist — #319 weighed a fix against "an `objkey-v*` bump discards every stored
+value", #322 argued fields were "cheap now and expensive later", #308 read an enumerator
+order as immovable rather than as movable-with-a-bump, and #290 owed no migration path
+at all. **Two limits, and they are the whole of it:** it does not license changing a
+format without bumping its VERSION — the version is how a mismatch is *detected*, which
+is why `UnsupportedFormatVersion` and `Corrupt` are different answers
+([`.agent/rules/storage.md`](.agent/rules/storage.md)) — and it EXPIRES at the
+production-ready declaration, so anything written on the strength of it is due a re-read
+then rather than inherited. Removing superseded code outright rather than keeping a
+compatibility shim is the same position from the other side (#332).
+
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 `Protocol/`, `Net/`, `Async/`.

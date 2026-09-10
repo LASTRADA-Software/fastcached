@@ -256,6 +256,24 @@ redis-cli --tls --insecure -a secret ping     # -> PONG
 curl http://127.0.0.1:9259/healthz            # -> 200 OK
 ```
 
+### Formats are not frozen yet
+
+**Until fastcached is declared production ready, backwards compatibility is not a
+constraint on it.** Wire formats, on-disk formats, cache-key versions, enumerator
+orders, CLI flags and config keys may change outright between versions, and an upgrade
+may discard a cache rather than migrate it. That is a deliberate position, not an
+oversight: it buys the freedom to fix a format properly instead of carrying its first
+draft forever, and it is affordable because a discarded compile cache costs a rebuild.
+
+What it does **not** mean is that a format may change silently. Every format carries a
+version, and a mismatch is reported as a mismatch — an old store is
+`UnsupportedFormatVersion` and never `Corrupt`, and a value written under a
+canonicalization generation a build does not implement is refused by name rather than
+read as damage. You will be told; you will not be migrated.
+
+Pin a version if you need two machines to agree, upgrade them together, and expect this
+paragraph to be deleted when the guarantee arrives.
+
 Binding `0.0.0.0` without `--requirepass` exposes the cache to the network —
 pair them. The image's `HEALTHCHECK` calls `fastcached --healthcheck`, a
 self-contained probe needing no `curl` in the image. Full guide, including a
