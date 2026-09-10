@@ -1806,8 +1806,19 @@ what differs between compilers, standard libraries, hosts and tool versions.
   table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
   restating it — a second copy is not a cross-check, it is a second thing to be
   wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
-  test file in `Async`, `Consensus` or `Distributed` carries no tag that
-  expression selects.
+  test file in a scoped location carries no tag that expression selects. Both
+  halves have been wrong once. The tags were: three of them looked complete and
+  excluded six of ten `Async/` files, which is what the check was written for.
+  Then the SCOPE was: it named three directories, and a `std::thread` census over
+  `FastCacheTest`'s own sources finds **nineteen** threaded files with **eleven** in no row and
+  under no tag — every threaded `Net/` test among them, which is `BlockingListener`'s
+  module and so the module the tree's one observed race (#260) came out of, reached
+  only because the node binary is run whole (#316). A row is now a directory OR a
+  FILE, and the file row IS the exemption mechanism — a mostly single-threaded
+  directory is scoped one file at a time, so the check never forces an unrelated tag
+  onto a case. What it still cannot check is whether the table is COMPLETE: the
+  census is a proxy (a helper spawns the thread; a comment names one) so promoting it
+  to a check would refuse correct files and miss incorrect ones.
 - A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
   request unmergeable, not fast: the workflow never triggers, so no check run is
   created and the required context never reports. Master is guarded by a *ruleset*,

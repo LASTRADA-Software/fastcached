@@ -4908,22 +4908,6 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#316](https://github.com/LASTRADA-Software/fastcached/issues/316)** — the TSan
-  gate **does not scan the module the race it knew about actually lived in.** Its
-  scope is three directories (`Async`, `Consensus`, `Distributed`), and the race
-  was in `BlockingListener::Close` — a `Net/` class. It reached the gate at all
-  only because the node binary happens to be run whole.
-  **`.tsan-suppressions` no longer carries it**, and no longer carries anything:
-  #260 fixed the race and deleting its entry was part of closing it, so the
-  original wording here — that the gate carries a suppression naming the very
-  thing that could break — has gone false. The SCOPE argument has not: a
-  regression reached through a `Net/` unit test in `FastCacheTest` is still
-  selected by no tag this gate uses. `Net/` and
-  `Cache/` also spawn threads in `ThreadedAddressResolver_test.cpp`,
-  `HealthProbe_test.cpp`, `EpollSocket_test.cpp`, `ShardedStorage_test.cpp`
-  (`[sharded][concurrency][stress]`, the tree's one explicit concurrency stress
-  case) and `Core/Clock_test.cpp` — none selected by the gate's tags, none in
-  `FastCachedTsanScopeDirs`, so `check-tsan-scope` does not flag them either.
 - **[#317](https://github.com/LASTRADA-Software/fastcached/issues/317)** —
   `scripts/check-tsan-scope.cmake` proves a FILE is in scope, not a test CASE: one
   selected tag anywhere in a file covers it, so a case added to

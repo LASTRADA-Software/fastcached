@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # ThreadSanitizer scope hygiene: fail if a test in a concurrency-bearing
-# directory carries no tag the TSan gate selects on.
+# location carries no tag the TSan gate selects on.
 #
 # `scripts/tsan-gate.sh` runs a SUBSET of the suite, chosen by Catch2 tag
 # expression, because a whole-tree sanitized run costs more than it finds. That
@@ -45,10 +45,23 @@
 #   unselected tag leaves the sanitized scope unnoticed. That is the same shape
 #   as the bug above, one level down, and closing it means parsing each case's
 #   tag string -- issue #317.
-# - **That the scope directories are the right ones.** `Net/` and `Cache/` also
-#   spawn threads, and the one race the gate suppresses (#260) is a `Net/` class:
-#   the gate suppresses a known race in a module it does not scan, and reaches it
-#   only because the node binary is run whole -- issue #316.
+# - **That the scope table is COMPLETE.** It is a stated claim about where the
+#   threads are, checked by nobody. #316 is what that costs: the table named three
+#   directories, and a census of `std::thread`/`std::jthread`/`std::async` across
+#   `FastCacheTest`'s own sources finds nineteen threaded files, ELEVEN of which
+#   were in no scope row and selected by no gate tag. A grep for those spellings
+#   is NOT promoted into a check here, deliberately: it is a proxy -- a file that
+#   reaches threads through a helper spawns none of its own, and a file naming
+#   `std::thread` in a comment spawns none at all -- so a check built on it would
+#   refuse correct files and miss incorrect ones, which is worse than a stated
+#   table somebody has to argue with. Re-run the census when adding a threaded
+#   test; the residue below is what the table currently claims nothing about.
+# - **Anything in a directory a FILE row names.** `Cache/`, `Core/`, `Protocol/`
+#   and `Server/` are in scope one file at a time, because most of what is in them
+#   is single-threaded and a directory row would demand a scope tag on every case
+#   there. So a NEW threaded test file next to `ShardedStorage_test.cpp` joins the
+#   sanitized scope only when somebody adds its row. That is a real hole and it is
+#   narrower than the one it replaces, which was four whole directories.
 #
 # A tag is matched where Catch2 would see one: directly after the opening `"` of
 # the tag string, or after a preceding `]`. Catch2 also accepts space-separated
@@ -72,13 +85,40 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
 endif()
 
 # ---------------------------------------------------------------------------
-# The directories whose tests must be reachable by the gate. One row per
-# directory. This list is the one thing stated here rather than derived: it is
-# the claim "this is where the threads are", and widening it is a deliberate act.
-set(FastCachedTsanScopeDirs
+# The tests that must be reachable by the gate. One row per location, and a row
+# is either a DIRECTORY (every `*_test.cpp` under it, recursively) or a single
+# FILE. This list is the one thing stated here rather than derived: it is the
+# claim "this is where the threads are", and widening it is a deliberate act.
+#
+# **Why a row may be a file.** Until #316 every row was a directory, and that
+# shape is what kept the threaded tests in `Cache/`, `Core/`, `Protocol/` and
+# `Server/` out: those directories are mostly single-threaded, so a directory row
+# would have demanded a gate tag on every case in them -- and a check that forces
+# an unrelated tag onto a case just to satisfy itself is worse than the gap it
+# closes. A file row states the narrower claim the tree actually supports.
+#
+# It is also the exemption mechanism, which is why there is no separate one: a
+# genuinely single-threaded FILE inside a scoped directory is taken out by
+# replacing that directory row with the file rows that belong -- not by an
+# opt-out somebody can spell without saying what they are opting out of.
+#
+# Each row and what it is here for. `Net/` is a directory because every file in
+# it carries `[net]`, because six of its tests spawn threads, and because it is
+# where `BlockingListener` lives -- the class the tree's one observed race (#260)
+# was in, which this gate reached only through the node binary being run whole.
+set(FastCachedTsanScope
+    # Directories: everything here is concurrency-bearing.
     "src/FastCache/Async"
     "src/FastCache/Consensus"
     "src/FastCache/Distributed"
+    "src/FastCache/Net"
+    # Files: one threaded test in a directory that is otherwise not.
+    "src/FastCache/Cache/ExpiryReaper_test.cpp"
+    "src/FastCache/Cache/ShardedStorage_test.cpp"
+    "src/FastCache/Core/Clock_test.cpp"
+    "src/FastCache/Protocol/RedisRespSocket_test.cpp"
+    "src/FastCache/Server/ReactorServerLoop_test.cpp"
+    "src/FastCache/Server/ReadinessAnnouncer_test.cpp"
 )
 
 # The gate whose scope this enforces. Its `TARGETS` table is the source of truth
@@ -202,29 +242,52 @@ set(tagPattern "[\"]\\[(${tagAlternation})\\]|\\]\\[(${tagAlternation})\\]")
 
 set(uncovered "")
 set(scannedCount 0)
+set(scopeDirCount 0)
+set(scopeFileCount 0)
 
-foreach(scopeDir IN LISTS FastCachedTsanScopeDirs)
-    set(absoluteDir "${FASTCACHED_SOURCE_DIR}/${scopeDir}")
-    if(NOT IS_DIRECTORY "${absoluteDir}")
-        # A renamed or removed directory must not silently empty the scope: the
-        # whole point of this file is that "nothing to check" and "everything is
-        # fine" have to look different.
+foreach(scopeRow IN LISTS FastCachedTsanScope)
+    set(absoluteRow "${FASTCACHED_SOURCE_DIR}/${scopeRow}")
+    if(IS_DIRECTORY "${absoluteRow}")
+        math(EXPR scopeDirCount "${scopeDirCount} + 1")
+        # GLOB_RECURSE, for the reason check-net-boundary.cmake states: a file
+        # this does not scan is a hole that reports green. `Async/` is flat today
+        # and a subdirectory added tomorrow must not walk out of the scope
+        # unnoticed.
+        file(GLOB_RECURSE testFiles "${absoluteRow}/*_test.cpp")
+        if(NOT testFiles)
+            message(FATAL_ERROR
+                "check-tsan-scope: ${scopeRow} contains no *_test.cpp files.\n"
+                "That is either a directory that lost its tests or a glob that "
+                "stopped matching; both make the sanitized scope smaller than it "
+                "reads.")
+        endif()
+    elseif(EXISTS "${absoluteRow}")
+        math(EXPR scopeFileCount "${scopeFileCount} + 1")
+        # A file row that has stopped being a test file is a row that stopped
+        # meaning anything: `contents MATCHES` would still run over a renamed
+        # header and report covered or uncovered for a file no test binary holds.
+        if(NOT scopeRow MATCHES "_test\\.cpp$")
+            message(FATAL_ERROR
+                "check-tsan-scope: the scope row ${scopeRow} is not a "
+                "*_test.cpp file.\n"
+                "A file row names one Catch2 test source. If that test moved, "
+                "move the row; if it became a directory's worth of tests, make "
+                "the row a directory. The rule lives in "
+                "${CMAKE_CURRENT_LIST_FILE}.")
+        endif()
+        set(testFiles "${absoluteRow}")
+    else()
+        # A renamed or removed row must not silently shrink the scope: the whole
+        # point of this file is that "nothing to check" and "everything is fine"
+        # have to look different. Reported as ONE refusal covering both row
+        # kinds, because at this point the row names neither -- claiming it was
+        # "the directory" would send a reader looking for a directory that a
+        # deleted test file never was.
         message(FATAL_ERROR
-            "check-tsan-scope: ${scopeDir} does not exist.\n"
-            "If it moved, update FastCachedTsanScopeDirs here and the TARGETS "
+            "check-tsan-scope: the scope row ${scopeRow} names neither a "
+            "directory nor a file that exists.\n"
+            "If it moved, update FastCachedTsanScope here and the TARGETS "
             "table in scripts/tsan-gate.sh together.")
-    endif()
-
-    # GLOB_RECURSE, for the reason check-net-boundary.cmake states: a file this
-    # does not scan is a hole that reports green. `Async/` is flat today and a
-    # subdirectory added tomorrow must not walk out of the scope unnoticed.
-    file(GLOB_RECURSE testFiles "${absoluteDir}/*_test.cpp")
-    if(NOT testFiles)
-        message(FATAL_ERROR
-            "check-tsan-scope: ${scopeDir} contains no *_test.cpp files.\n"
-            "That is either a directory that lost its tests or a glob that "
-            "stopped matching; both make the sanitized scope smaller than it "
-            "reads.")
     endif()
 
     foreach(testFile IN LISTS testFiles)
@@ -241,12 +304,13 @@ if(uncovered)
     list(JOIN uncovered "\n" uncoveredReport)
     string(REPLACE ";" "]\n    [" printableTags "[${FastCachedTsanScopeTags}]")
     message(FATAL_ERROR
-        "These test files sit in a concurrency-bearing directory but carry no "
-        "tag the ThreadSanitizer gate selects on, so they are NOT run under "
+        "These test files are in the ThreadSanitizer scope but carry no tag the "
+        "gate selects on, so they are NOT run under "
         "TSan:\n${uncoveredReport}\n\n"
         "Give each case one of these tags:\n    ${printableTags}\n\n"
         "If a file genuinely does not belong in the sanitized scope, the fix is "
-        "to narrow FastCachedTsanScopeDirs here -- widening the tag list would "
+        "to narrow FastCachedTsanScope here -- replace the directory row with "
+        "the file rows that do belong -- because widening the tag list would "
         "pull the file IN, not let it out. To widen the scope instead, edit the "
         "TARGETS table in scripts/tsan-gate.sh; this check reads its tags from "
         "there and needs no edit of its own.\n"
@@ -254,6 +318,6 @@ if(uncovered)
 endif()
 
 string(REPLACE ";" "],[" renderedTags "[${FastCachedTsanScopeTags}]")
-list(LENGTH FastCachedTsanScopeDirs scopeDirCount)
-message("tsan scope: ${scannedCount} test file(s) across ${scopeDirCount} "
-        "directory/directories are selected by ${renderedTags}")
+message("tsan scope: ${scannedCount} test file(s) from ${scopeDirCount} "
+        "directory row(s) and ${scopeFileCount} file row(s) are selected by "
+        "${renderedTags}")

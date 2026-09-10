@@ -1182,27 +1182,34 @@ jobs:
   # (#260) — which is the argument for this job, and also why the job is not
   # simply "run everything under TSan".
   #
-  # SCOPE, and what it is not. `Async`, `Consensus`, `Distributed` and the node
-  # are where most of the threads are — but not all of them, and the gap has a
-  # sharp edge: `Net/` and `Cache/` spawn threads too, and the one race this job
-  # suppresses (#260) is a `Net/` class. So this gate currently suppresses a known
-  # race in a module it does not scan, reaching it only because the node binary is
-  # run whole — issue #316. This is a first scope, not a complete one, and saying
-  # otherwise is how a job goes green over code nobody sanitized. Those four map
-  # onto five Catch2 tags —
-  # `[async]`, `[consensus]`, `[distributed]`, `[reactor]`, `[task]` — plus one
-  # binary run whole. The tags are not claimed to be confined to those three
-  # directories: three test files elsewhere carry one and are swept in, which is
-  # harmless, because running MORE than the scope is not the failure this guards.
-  # Running LESS is, and the first version of that list ran less — it named three
-  # tags and silently excluded six of ten `Async/` test files while every signal
-  # in the run said clean.
+  # SCOPE, and what it is not. It is `FastCachedTsanScope` in
+  # `scripts/check-tsan-scope.cmake` — four directories (`Async`, `Consensus`,
+  # `Distributed`, `Net`) and six named files in `Cache/`, `Core/`, `Protocol/`
+  # and `Server/` — plus the node binary run whole. Do not restate the list here;
+  # this comment has already gone stale once by holding a second copy of it.
+  #
+  # It has been WRONG in both of its halves, which is why neither is asserted.
+  # The TAGS were: the first version named three and silently excluded six of ten
+  # `Async/` test files while every signal in the run said clean. Then the SCOPE
+  # was: it named three directories, and a `std::thread` census over every
+  # `FastCacheTest` source finds nineteen threaded files, eleven of them in no row and under no
+  # tag — every threaded `Net/` test among them, which is the module
+  # `BlockingListener` lives in and therefore the module the one race this job has
+  # ever found (#260) came out of. It reached the gate only because the node binary
+  # is run whole. That is #316, and it is closed; what is NOT claimed is that the
+  # table is complete, because the census is a proxy and a check built on it would
+  # refuse correct files.
+  #
+  # The tags are not claimed to be confined to the scoped locations either: test
+  # files elsewhere carry one and are swept in, which is harmless, because running
+  # MORE than the scope is not the failure this guards. Running LESS is.
   #
   # So the scope is enforced rather than asserted: `ctest -R tsan-scope-hygiene`
-  # runs in the DEFAULT set and fails when a test file in one of those
-  # directories carries no selected tag. Widening the scope is therefore two
-  # edits that check each other — the `TARGETS` table in `scripts/tsan-gate.sh`
-  # and `FastCachedTsanScopeTags` in `scripts/check-tsan-scope.cmake`.
+  # runs in the DEFAULT set and fails when a scoped test carries no selected tag.
+  # Widening it is two edits that check each other — the `TARGETS` table in
+  # `scripts/tsan-gate.sh` decides what RUNS, and `FastCachedTsanScope` in
+  # `scripts/check-tsan-scope.cmake` decides what is CLAIMED. That check reads the
+  # tags out of the gate rather than keeping a copy, so the tag half needs one edit.
   #
   # WHY A SCRIPT AND NOT `ctest`. Because a clean sanitizer run is not evidence.
   # `cmake/portable/Sanitizers.cmake` records a defect on this repository where

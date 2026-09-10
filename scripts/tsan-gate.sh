@@ -83,25 +83,42 @@
 # TARGETS table below runs zero cases, and every other signal in the run says
 # clean.
 #
-# **The suite is scoped, and `ctest` has no vocabulary for the scope.** The
-# concurrency in this tree is in `Async`, `Consensus`, `Distributed` and the node.
+# **The suite is scoped, and `ctest` has no vocabulary for the scope.**
 # `catch_discover_tests` registers cases by NAME and this project's Catch2 (3.6)
 # predates `ADD_TAGS_AS_LABELS`, so there is no ctest label to select on and the
 # scope has to be a Catch2 tag expression (issue #312). Running the two binaries
 # directly also collapses ~700 sanitized processes into two: measured at 1.2s and
 # 17.6s against several minutes of per-process runtime startup.
 #
-# The tag list is NOT self-evidently the right one, and an earlier version of it
-# was wrong: `[async],[consensus],[distributed]` looks complete and silently
-# excluded six of ten `Async/` test files, because the reactor and coroutine tests
-# are tagged `[reactor]` and `[task]` and carry no `[async]`. It matched 511 cases
-# and they passed. Nothing in the run could have said otherwise.
+# The tag list is NOT self-evidently the right one, and it has been wrong twice.
+#
+# The first version, `[async],[consensus],[distributed]`, looks complete and
+# silently excluded six of ten `Async/` test files, because the reactor and
+# coroutine tests are tagged `[reactor]` and `[task]` and carry no `[async]`. It
+# matched 511 cases and they passed. Nothing in the run could have said otherwise.
+#
+# The second, which those five tags fixed, was wrong about WHERE THE THREADS ARE
+# rather than about how a directory is spelled -- so the check written to enforce
+# the first correction could not see it (#316). `Async`, `Consensus` and
+# `Distributed` are not the only places this tree spawns one: a census of
+# `std::thread`/`std::jthread`/`std::async` over `FastCacheTest`'s own sources
+# names NINETEEN files, and ELEVEN of them were selected by no tag here and sat
+# in no directory `check-tsan-scope.cmake` scanned -- among them every threaded `Net/`
+# test, which is the module `BlockingListener` lives in and therefore the module
+# the one real race this gate has ever seen (#260) came out of. That race reached
+# the gate only because `fastcache-compile-node-tests` is run whole; a regression
+# of it reached through a `Net/` unit test in `FastCacheTest` was selected by
+# nothing. The scope now names those files, and the tags below are what SELECTS
+# them.
 #
 # So the tag list is not trusted here. `scripts/check-tsan-scope.cmake` runs in the
-# default ctest set and fails when a test file in one of those directories carries
-# no tag this expression selects. It reads the expression out of the TARGETS table
-# below rather than restating it, so the two cannot drift apart: a tag removed
-# from that table is a tag that check stops accepting, on its next run.
+# default ctest set and fails when a test in one of the scoped locations carries
+# no tag this expression selects. It reads the expression out of the
+# TARGETS table below rather than restating it, so the two cannot drift apart: a
+# tag removed from that table is a tag that check stops accepting, on its next
+# run. The two halves are independent and both are needed -- this table decides
+# what RUNS, that file decides what is CLAIMED, and a claim with no matching tag
+# is a case nobody sanitizes.
 #
 # **Known-open races need somewhere to live.** `.tsan-suppressions` is that place
 # and every entry names an issue; see the header of that file for why an entry is
@@ -137,8 +154,19 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # `scripts/check-tsan-scope.cmake` PARSES this table -- keep the
 # `"name|tagExpression"` shape, or that check fails by name rather than silently
 # enforcing an empty scope.
+#
+# Which tag reaches which threaded file, so that a tag removed here is removed
+# knowing what stops being sanitized (#316). `[net]` and `[tls]` between them
+# cover all 152 `Net/` cases -- every `Net/` test file carries `[net]`, and three
+# `TlsContext` cases carry only `[tls]` -- which is what lets the scope name that
+# whole directory rather than picking threaded files out of it. The rest are
+# per-file: `[sharded]` for `Cache/ShardedStorage_test.cpp` (the tree's one
+# explicit concurrency stress case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`,
+# `[clock]` for `Core/Clock_test.cpp`, `[pubsub]` for
+# `Protocol/RedisRespSocket_test.cpp`, `[server]` for the two threaded `Server/`
+# files. Measured on this tree: 612 cases selected before, 871 after.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task]"
+    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]"
     "fastcache-compile-node-tests|"
 )
 
