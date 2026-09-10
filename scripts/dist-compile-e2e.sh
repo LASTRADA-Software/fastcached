@@ -714,12 +714,30 @@ if [[ "$mode" == "membership" ]]; then
             --admin-listen="$admin" \
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
             ${@+"$@"}
-        # Registration and the admin surface are waited for separately from the
-        # bind and the readiness `start_node` covers, because a stall in one is a
-        # different fault from a stall in another and a fixture that folds them
-        # cannot say which happened.
+        # Registration is waited for separately from the bind and the readiness
+        # `start_node` covers, because a stall in one is a different fault from a
+        # stall in the other and a fixture that folds them cannot say which
+        # happened.
         wait_for_registration "$started_pid" "$tag" "$started_log"
-        wait_for_port 127.0.0.1 "$admin" "$started_pid" "${tag} admin endpoint" "$started_log"
+
+        # THERE IS NO WAIT FOR THE ADMIN PORT, and the absence is the point (#655).
+        # One stood here and could not fail. `main.cpp` binds the admin surface in
+        # `StartAdminSurfaceOrExplain`, synchronously through `BlockingListener::Bind`
+        # and about four hundred lines BEFORE it logs `compile node ready`; a bind
+        # that fails is `return ExitUsage`, so the marker is unreachable without it.
+        # `start_node` waits for that marker since #634 and `wait_for_registration`
+        # above waits for a heartbeat round, which is later still -- so by here the
+        # port has been listening for two waits.
+        #
+        # Deleting it also improves the failure it appeared to guard: an admin port
+        # this node could not bind is now a DEATH inside `start_node`, reported with
+        # the node's log and its exit status, where the wait would have spent its
+        # budget and then said a healthy-looking process never listened.
+        #
+        # What DOES establish that the surface answers is the first `wait_for_counter`
+        # against it, whose three terminal states begin with `nothing ever answered a
+        # /metrics request`. An unfalsifiable wait is not free: it reads as an
+        # assertion, and gets copied into a fixture where the ordering does not hold.
     }
 
     # --- leg 1: the address is a member, and the compile is served ---------------
@@ -1060,8 +1078,24 @@ wait_for_registration "$worker_pid" "worker" "${workdir}/worker.log"
 # that is simultaneously doing its job -- it runs on its own thread beside the
 # accept loop, and "it constructs" and "it answers while the worker is busy" are
 # different claims.
-wait_for_port 127.0.0.1 "$worker_admin_port" "$worker_pid" "worker admin endpoint" "${workdir}/worker.log"
-
+#
+# THAT IS AN ARGUMENT FOR THE `http_get` BELOW AND NOT FOR A `wait_for_port`, and
+# one stood here carrying it (#655). A port wait establishes a BIND. What
+# establishes "it answers while the worker is busy" is a request that gets a `200`
+# back, which is the next line.
+#
+# The wait could not have failed either. `main.cpp` binds this surface
+# synchronously in `StartAdminSurfaceOrExplain`, about four hundred lines before
+# it logs `compile node ready`, and a bind that fails is `return ExitUsage` -- so
+# the marker `start_node` waits on since #634 is unreachable without it, and the
+# `wait_for_registration` above is a heartbeat round later still. Its deletion
+# also improves the failure it looked like it guarded: an admin port this node
+# could not bind is a DEATH inside `start_node`, with the log and the exit status,
+# rather than a spent budget reporting that a healthy process never listened.
+#
+# Recorded at this length because deleting the wait WITHOUT reading the comment
+# would look like the claim went with it, and the next reader might restore the
+# wait or -- worse -- delete the `http_get` as the apparently redundant one.
 health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" \
     || fail "worker admin endpoint refused a connection on ${worker_admin_port}"
 [[ "$health" == *"200 OK"* ]] \
