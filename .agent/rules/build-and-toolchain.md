@@ -1412,6 +1412,68 @@ log sitting at zero bytes for slightly too long, an output file containing a sin
 backslash, an exit code disagreeing with its own log's last line, a finding
 reappearing that had supposedly been closed.
 
+## A count that OVERSTATES what is wrong is the same defect as one that understates it
+
+Everything above is about an instrument reporting **fewer** things than are wrong, or
+reporting on the wrong subject entirely. The other direction is a defect of exactly the
+same kind and had no entry here until #796:
+
+> **A verdict must be a verdict about something, and an instrument that cannot say how
+> many things are wrong cannot be trusted about WHICH.**
+
+**The tell is an arm reporting a number nobody can explain**, and that is the only
+actionable half. All three instances below were caught that way. None was caught by
+reading the code, and one had already been read twice.
+
+**The two directions are not symmetric in practice.** An under-report is silent and gets
+found late. An over-report is **loud and misattributed**: it sends somebody to a defect
+that is not there, and when they find nothing it discredits the instrument — so the next
+real finding from it is discounted too. In instance 1 the phantom second line was a
+sentence fragment that a reader would reasonably have chased.
+
+Three instances, all in one change (#680, PR #795), and they are three distinct
+mechanisms rather than one bug told three ways:
+
+- **A literal `;` split one finding into two** (#796, instance 1). CMake treats a
+  semicolon inside a list element as an element boundary, so
+  `list(APPEND violations "... in cmake/Packaging.cmake; either the hook is gone or ...")`
+  became two elements and `list(LENGTH)` counted **2** for one defect. This is the exact
+  hazard `check-script-check-signals.cmake`'s own header documents at length for
+  `file(STRINGS)` — *"a line containing a semicolon becomes two elements"* — met one
+  function over, **in the file that documents it**. A rule stated in the file that obeys
+  it is not learned by the file that does not.
+- **An edit that inserted a statement inside another statement's argument list.** A
+  `string(REPLACE ...)` landed between `list(APPEND violations` and its message argument,
+  so CMake parsed `string`, `(`, `REPLACE` as arguments to `list(APPEND)` and the run
+  reported **`10 finding(s)`** with an empty path. The edit script asserted its anchor
+  existed and was unique — which this file already requires — and **a match is necessary
+  and not sufficient**: the insertion POSITION must also be structurally valid.
+- **A missing file reporting three findings for one cause.** With `cmake/Packaging.cmake`
+  absent, the pass appended one violation for the missing file and then **the loop still
+  ran**, so each of two hook variables added another. Three findings, one cause. Found by
+  applying the first instance's lesson deliberately rather than by it biting, which is the
+  direction this clause exists to produce.
+
+**And the CMake argument-passing fact that cost a cycle finding these.** A `macro()`
+substitutes its arguments **textually** and CMake then re-parses them, so a backslash
+escape inside a pattern is consumed **twice**: `"\\("` written at the call site arrives
+at `MATCHES` as a bare `(`, a regex group opener, and fails to compile. A `function()`
+does not, because the argument is a variable. The failure is at **regex-compile** time,
+which reads as *my pattern is wrong* rather than as *my macro ate a backslash*.
+
+The remedy in `check-script-check-signals-selftest.cmake` is that patterns passed to a
+macro carry **no backslash escapes at all** — a literal `(`, `.` or backtick is written as
+`.`, which is laxer than an escape and is the price of a pattern meaning the same thing at
+the call site and inside the macro. Quadrupling the escape is correct, unreadable, and
+will not be maintained.
+
+That is one half of a larger fact about macros, and the other half is
+[#1216](https://github.com/LASTRADA-Software/fastcached/issues/1216): because the
+parameters are TEXT rather than variables, `if(param STREQUAL "x")` inside a macro
+compares the literal string `param` and the branch is **silently dead**. Same cause, two
+symptoms, and neither has a diagnostic — one fails loudly at the wrong layer, the other
+does not fail at all.
+
 ## A claim about a tool is checked against the tool
 
 The section above is about instruments reporting on the wrong tree. This one is about
