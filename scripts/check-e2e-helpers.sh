@@ -2201,6 +2201,13 @@ verdicts=(
     "starved-quiet-at-threshold|worker|20|22|98|yes|-|no|-|10000|!NOTE: the loop asked"
     "starved-named-below-threshold|worker|20|22|98|yes|-|no|-|9999|NOTE: the loop asked for only 9999ms of pauses inside a 20s budget"
     "starved-unknown-claims-nothing|worker|20|22|98|yes|-|no|-|-|!NOTE: the loop asked"
+    # A wait that ended EARLY spent no budget, so the pacing comparison -- which is
+    # against the budget -- claims nothing. Pinned in both directions and one row
+    # apart in `alive` alone: the death row must NOT carry the note while the
+    # no-pid row, which did run to its budget, must. Without the second the
+    # suppression could be unconditional and both rows would still pass.
+    "starved-silent-on-death|worker|10|0|1|no|7|no|-|0|the process DIED|!NOTE: the loop asked"
+    "starved-named-when-nothing-watched|worker|10|11|3|unknown|-|unknown|-|0|NOTE: the loop asked for only 0ms"
 )
 
 echo "== the verdict, against staged records"
