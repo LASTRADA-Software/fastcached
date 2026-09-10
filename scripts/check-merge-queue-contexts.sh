@@ -50,6 +50,82 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # ---------------------------------------------------------------------------
+# The two helpers the FOURTH door needs, defined HERE rather than beside their
+# three siblings further down, because `--self-test` selects its own subject with
+# them and a self-test cannot call a function defined below it. Finding that out
+# cost nothing only because the case refuses when it can stage no defect; a
+# selector that had silently matched nothing would have reported a passing tree.
+#
+# The FOURTH door, and the only one where the context REPORTS and is then taken
+# back: a run cancelled by its own successor at the SAME head SHA (#761, #820).
+#
+# The first three doors are a context that never arrives -- no `merge_group:`
+# trigger, a `branches:` filter, a job whose `if:` excludes the event. This one
+# arrives, gets computed, and is discarded: the required context reads
+# `completed/cancelled`, which is neither pass nor fail, so the pull request is
+# blocked until a later run reports. Measured on `pr-labels.yml`, the 100 most
+# recent runs to 2026-09-10T20:36Z: **14 cancelled**, each superseded by a
+# same-branch run seconds to minutes later, and in three of four inspected by hand
+# the labelling job had already SUCCEEDED before the verdict was thrown away.
+#
+# ## The rule is not "never cancel", and getting that wrong would refuse a
+# ## correct workflow
+#
+# `build.yml` sets `cancel-in-progress: true` and is right to. It triggers on
+# `push` and a bare `pull_request:` (`opened`, `synchronize`, `reopened`), so a
+# superseding run carries a NEW head SHA and the contexts it cancels belong to a
+# commit no ruleset gates on any more.
+#
+# What makes it a defect is a trigger that fires WITHOUT changing the head SHA --
+# `edited`, `labeled`, `unlabeled`. Then both runs answer for one commit, and
+# killing the first destroys that commit's only verdict. So the two halves are
+# read out of the file and ANDed; nothing here names a workflow, and `build.yml`
+# is exempt because the rule does not reach it rather than because a list says so.
+#
+# ## What this does NOT cover
+#
+# A `concurrency:` block on a JOB rather than on the workflow. The refusal is
+# therefore worded as "this workflow", and a job-level setting would pass -- said
+# plainly, because a check silent about a case reads exactly like one that
+# cleared it. No workflow here has one today.
+
+# Which same-SHA re-trigger types this workflow's `on:` block names, if any.
+#
+# Comments are stripped before matching: a COMMENT is not a call site, and both
+# workflows this rule fires on discuss these very words in prose beside the
+# settings it reads.
+SameShaRetriggerTypes() {
+    awk '
+        { line = $0; sub(/[ \t]*#.*$/, "", line) }
+        line ~ /^on:[ \t]*$/         { inOn = 1; next }
+        inOn && line ~ /^[^ \t]/     { inOn = 0 }
+        !inOn                        { next }
+        line ~ /^    types:[ \t]*\[/ {
+            types = line
+            sub(/^[^[]*\[/, "", types)
+            sub(/\].*$/, "", types)
+            n = split(types, value, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[ \t]+|[ \t]+$/, "", value[i])
+                if (value[i] == "edited" || value[i] == "labeled" || value[i] == "unlabeled")
+                    hits = hits (hits == "" ? "" : ", ") value[i]
+            }
+        }
+        END { if (hits == "") exit 1; print hits }
+    ' "$1"
+}
+
+# Does this workflow cancel a run that is already in progress?
+# @return 0 and the line number(s) when it does.
+CancelsRunsInProgress() {
+    awk '
+        { line = $0; sub(/[ \t]*#.*$/, "", line) }
+        line ~ /^[ \t]*cancel-in-progress:[ \t]*true[ \t]*$/ { hits = hits (hits == "" ? "" : ", ") NR }
+        END { if (hits == "") exit 1; print hits }
+    ' "$1"
+}
+
+# ---------------------------------------------------------------------------
 # `--self-test` drives the verdict rules against SYNTHESISED trees, in both
 # directions. A guard nobody has watched refuse is not a guard, and the arm that
 # matters most -- a leg added to a workflow with no row -- had never been seen to
@@ -118,6 +194,54 @@ if [[ "${1:-}" == "--self-test" ]]; then
         >> "$scratch/tree/.github/workflows/build.yml"
     Injected "an extra leg" "$scratch/tree/.github/workflows/build.yml" "$scratch/before" \
         && SelfTestCase "a leg added to a workflow with no verdict row is REFUSED (#408/#629 arriving again)" want-fail
+
+    # The fourth door: a same-SHA re-trigger plus `cancel-in-progress: true`.
+    #
+    # Anchored on the SETTING and not on a workflow name, and the tree is chosen
+    # by the RULE rather than named: whichever workflow already carries a
+    # same-SHA trigger type is the one where flipping the setting stages the
+    # defect. Naming `pr-labels.yml` here would be a scheduled failure the day
+    # that file's triggers change, which is the anchoring mistake the case below
+    # this one records paying for twice.
+    Stage
+    victim=""
+    for candidate in "$scratch"/tree/.github/workflows/*.yml; do
+        SameShaRetriggerTypes "$candidate" >/dev/null || continue
+        CancelsRunsInProgress "$candidate" >/dev/null && continue
+        victim="$candidate"
+        break
+    done
+    if [[ -z "$victim" ]]; then
+        echo "  FAIL  no workflow names a same-SHA re-trigger type without already cancelling; the fourth-door case can stage nothing" >&2
+        selfTestStatus=1
+    else
+        cp "$victim" "$scratch/before"
+        sed -i.bak 's/^  cancel-in-progress: false$/  cancel-in-progress: true/' "$victim"
+        rm -f "$victim.bak"
+        Injected "cancel-in-progress flipped on" "$victim" "$scratch/before" \
+            && SelfTestCase "cancelling a run in progress on a same-SHA trigger is REFUSED (#761/#820)" want-fail
+    fi
+
+    # And the direction that keeps the rule from being "never cancel": a workflow
+    # that cancels but names no same-SHA trigger type must still PASS. Without
+    # this, a check that refused every `cancel-in-progress: true` would satisfy
+    # the case above for the wrong reason and take `build.yml` red.
+    Stage
+    control=""
+    for candidate in "$scratch"/tree/.github/workflows/*.yml; do
+        CancelsRunsInProgress "$candidate" >/dev/null || continue
+        SameShaRetriggerTypes "$candidate" >/dev/null && continue
+        control="$candidate"
+        break
+    done
+    if [[ -z "$control" ]]; then
+        echo "  FAIL  no workflow cancels without a same-SHA trigger, so the rule's exempt direction is untested" >&2
+        selfTestStatus=1
+    else
+        echo "  ok    (control) $(basename "$control") cancels in progress and is correctly NOT refused"
+        selfTestCases=$((selfTestCases + 1))
+        SelfTestCase "a workflow that cancels but has no same-SHA trigger still passes" want-pass
+    fi
 
     # A row naming a context nothing produces any more.
     Stage
@@ -469,6 +593,7 @@ FiltersPullRequestBranches() {
     ' "$1"
 }
 
+
 # ---------------------------------------------------------------------------
 # Every workflow named in the table must listen for the event.
 #
@@ -498,6 +623,19 @@ for workflow in "${workflows[@]}"; do
         Fail "$workflow filters \`pull_request\` by base branch, so every required context it produces would NEVER REPORT on a pull request based on anything else -- which is every layer of a stacked pull request but the bottom one, and it presents as CI that has not started rather than as a failure"
     else
         echo "ok: $workflow does not filter pull_request by base branch"
+    fi
+
+    # Both halves, ANDed. Either alone is ordinary: cancelling is right when the
+    # successor carries a new SHA, and a same-SHA trigger is fine when nothing
+    # kills the run holding the verdict.
+    if retrigger="$(SameShaRetriggerTypes "$workflow")"; then
+        if cancels="$(CancelsRunsInProgress "$workflow")"; then
+            Fail "$workflow triggers on $retrigger -- which fire WITHOUT changing the head SHA -- and sets \`cancel-in-progress: true\` (line $cancels). The superseding run then answers for the same commit as the run it kills, so until it finishes every required context this workflow produces reads \`cancelled\` on that commit: neither pass nor fail, and a blocked pull request. Measured on pr-labels.yml: 14 of the 100 most recent runs, with the work already done in three of four inspected. Set \`cancel-in-progress: false\`. This is NOT an argument against cancelling in general -- build.yml triggers on push and a bare \`pull_request:\`, so its superseding runs carry a new SHA and it is untouched by this rule."
+        else
+            echo "ok: $workflow triggers on $retrigger but does not cancel a run in progress, so a same-SHA verdict survives"
+        fi
+    else
+        echo "ok: $workflow names no same-SHA re-trigger type, so a superseding run carries a new SHA"
     fi
 done
 
