@@ -5500,3 +5500,80 @@ set_tests_properties("banner-probe-identity-selftest" PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 300
 )
+
+# ---------------------------------------------------------------------------
+# A CMake `macro()`'s parameters are TEXT, substituted into the body before it runs,
+# so `if(param STREQUAL "x")` compares the literal string `param` and the branch is
+# dead. A `function()`'s parameters are real variables, so the identical line is
+# correct there -- which is what makes this silent. CMake diagnoses nothing, and
+# moving a body between the two forms changes its meaning with no test going red.
+#
+# `check-corrupt-store-diagnostics-selftest.cmake` had BOTH verdict arms dead this
+# way: every case fell through to a substring check, and the two `want-pass` cases
+# pass an empty substring, so they asserted NOTHING while reporting green.
+#
+# The scan fails CLOSED in three directions rather than reporting a quiet zero: an
+# empty file set is refused, a `macro(` definition it cannot parse is refused BY NAME
+# rather than leaving that body unexamined behind the same all-clear, and a tree in
+# which it recognised no macro at all is refused -- a scan that has stopped
+# recognising its subject otherwise vouches for every macro in the tree without
+# reading one.
+#
+# In the default set with the other hygiene checks: it reads files and compares
+# strings. Measured at 1c985538 on Windows 11 / Git Bash / native NTFS / CMake
+# 4.3.1, minimum of five runs: **318 ms** over 74 files. The TIMEOUT below is not
+# that measurement -- it matches the neighbouring hygiene checks and leaves room for
+# a DrvFs checkout under WSL, where the per-file open, not this check, is the cost.
+#
+# No `SKIP_RETURN_CODE`, and its absence is deliberate: a status a registration does
+# not claim is a status CTest is free to reinterpret (#1128). This check exits 1 on a
+# refusal and has no skip path to want one.
+add_test(
+    NAME "macro-bare-parameters"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-macro-bare-parameters.cmake"
+)
+set_tests_properties("macro-bare-parameters" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# And the check above must be watched REFUSING and ACCEPTING, against 17 synthesised
+# trees -- 8 it must accept, 9 it must refuse, each refusal asserting the phrase the
+# refusal carries rather than the verdict alone. A guard nobody has watched accept is
+# not known to work, which is #1031's lesson and cost two days.
+#
+# Two of those cases are about this file's own subject. A self-test for a scan over
+# CMake source holds violating CMake source as DATA, and a line walk cannot tell code
+# from a multi-line string containing code -- so the check exempts a REGION
+# (`# macro-bare-parameter-scan: data-begin` / `data-end`), never a FILE, the trade
+# `check-e2e-helpers.sh` already settled for the bash-3.2 scan. Regions must BALANCE:
+# an unterminated `data-begin` silences every line below it while the run reports
+# clean, which is this check's own subject one level up.
+#
+# The harness is a `function()` and MUST stay one. As a `macro()` its `want` parameter
+# textually rewrote `${want}` inside the staged case bodies, so `if(${want} STREQUAL
+# "yes")` reached the disk as `if(pass STREQUAL "yes")` -- valid CMake, not a
+# violation, and the accepting verdict each case wanted. Four cases staged a corrupted
+# subject and every one was green. No assertion phrased in the harness's own
+# parameters can see that, because the substitution rewrites the expectation in
+# lockstep with the subject; the file-scope staging assertion counts a literal `${`
+# instead, which names no parameter and so survives. Armed, it reads 0 of 13 where a
+# healthy run reads 11 of 16.
+#
+# In the default set: it writes small files and runs `cmake -P` seventeen times.
+# Measured at 1c985538, same conditions, minimum of three runs: **864 ms**.
+add_test(
+    NAME "macro-bare-parameters-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/macro-bare-parameters-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-macro-bare-parameters-selftest.cmake"
+)
+set_tests_properties("macro-bare-parameters-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
