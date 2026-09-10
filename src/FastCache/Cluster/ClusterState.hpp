@@ -168,8 +168,7 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// machine's size on all of them.
 inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = "upstream", .summary = "host:port of the shared fastcached every member reads through to" },
-    SettingSpec { .name = FleetOpenSetting,
-                  .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+    SettingSpec { .name = FleetOpenSetting, .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
     SettingSpec { .name = LeaseLifetimeSetting,
                   .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
                              "compile, and the object coming back -- not how long a compiler may run",

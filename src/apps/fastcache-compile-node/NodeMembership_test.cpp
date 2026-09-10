@@ -11,7 +11,7 @@ using namespace FastCache;
 /// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
 namespace
 {
-    FastCache::NullLogger membershipLog;
+FastCache::NullLogger membershipLog;
 }
 using namespace FastCache::Node;
 using FastCache::Distributed::Membership;
@@ -175,8 +175,7 @@ TEST_CASE("The cluster's fleet-open row opens a node whose flag did not", "[node
     CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
 }
 
-TEST_CASE("A node with no cluster row keeps its own flag, and an unset row is not a no",
-          "[node][membership]")
+TEST_CASE("A node with no cluster row keeps its own flag, and an unset row is not a no", "[node][membership]")
 {
     // The ACCEPT direction, and the case that fails if the fix over-corrects: a fix
     // that made admission read the row and refuse whenever it is absent would pass
