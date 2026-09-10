@@ -176,7 +176,7 @@ TEST_CASE("A later candidate succeeds after an earlier one fails", "[net][connec
     CHECK(log.allowances.size() == 2);
 }
 
-TEST_CASE("A resolution failure is reported without dialling", "[net][connectflow]")
+TEST_CASE("A resolution failure in the shared connect flow is reported without dialling", "[net][connectflow]")
 {
     FastCache::ManualClock clock;
     ListResolver resolver { 2 };
