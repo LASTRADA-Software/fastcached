@@ -35,12 +35,12 @@ struct NestedRow
 
 constexpr Cc::RefusalClaim ClaimOfFlat(FlatRow const& row) noexcept
 {
-    return Cc::RefusalClaim { row.answer.has_value(), row.rationale };
+    return Cc::RefusalClaim { .counted = row.answer.has_value(), .rationale = row.rationale };
 }
 
 constexpr Cc::RefusalClaim ClaimOfNested(NestedRow const& row) noexcept
 {
-    return Cc::RefusalClaim { row.policy.counter.has_value(), row.policy.rationale };
+    return Cc::RefusalClaim { .counted = row.policy.counter.has_value(), .rationale = row.policy.rationale };
 }
 
 // ---------------------------------------------------------------------------
