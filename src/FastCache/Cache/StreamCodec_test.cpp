@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include <tests/DeclaredCountBlob.hpp>
+
 using namespace FastCache;
 using FastCache::StreamCodec::ConsumerGroup;
 using FastCache::StreamCodec::PendingEntry;
@@ -163,69 +165,27 @@ TEST_CASE("StreamCodec: ParseId accepts ms and ms-seq, rejects junk", "[cache][s
 namespace
 {
 
-/// Assembles a stream blob field by field, so a case can stop at any declared count.
+/// A stream blob up to and including the entries-added counter.
 ///
-/// Built from the codec's own `Magic`/`TypeStream` and its big-endian convention
-/// rather than a hex literal, so it cannot drift from the format it exercises.
-class BlobBuilder
+/// The assembly moved to `tests/DeclaredCountBlob.hpp` (#306). What could NOT move is
+/// this: the magic bytes used to sit in the builder's constructor, which is precisely
+/// why neither of the other two sites could adopt it -- a builder that knows one
+/// format is a builder for one file. So the format is spelled here, as steps, and the
+/// shared class stays ignorant of it.
+///
+/// Still built from the codec's own `Magic`/`TypeStream` rather than a hex literal,
+/// so it cannot drift from the format it exercises.
+[[nodiscard]] FastCache::Testing::DeclaredCountBlob StreamHeader()
 {
-  public:
-    BlobBuilder()
-    {
-        _out.push_back(StreamCodec::Magic);
-        _out.push_back(StreamCodec::TypeStream);
-    }
-
-    BlobBuilder& U32(std::uint32_t v)
-    {
-        for (auto const shift: { 24, 16, 8, 0 })
-            _out.push_back(static_cast<std::byte>((v >> shift) & 0xFFU));
-        return *this;
-    }
-
-    BlobBuilder& U64(std::uint64_t v)
-    {
-        for (auto const shift: { 56, 48, 40, 32, 24, 16, 8, 0 })
-            _out.push_back(static_cast<std::byte>((v >> shift) & 0xFFU));
-        return *this;
-    }
-
-    /// A stream id: two u64s, as `AppendId` writes it.
-    BlobBuilder& Id()
-    {
-        return U64(0).U64(0);
-    }
-
-    /// A length-prefixed empty string, the cheapest a field can be on the wire.
-    BlobBuilder& EmptyField()
-    {
-        return U32(0);
-    }
-
-    /// Everything before the entry count: the two ids and the entries-added counter.
-    BlobBuilder& StreamHeader()
-    {
-        return Id().Id().U64(0);
-    }
-
-    BlobBuilder& Pad(std::size_t n)
-    {
-        _out.insert(_out.end(), n, std::byte { 0 });
-        return *this;
-    }
-
-    [[nodiscard]] std::span<std::byte const> Bytes() const
-    {
-        return _out;
-    }
-
-  private:
-    std::vector<std::byte> _out;
-};
-
-/// The largest count the field can hold -- the shape every instance of this defect
-/// class was reported with.
-constexpr std::uint32_t Impossible = 0xFFFFFFFFU;
+    FastCache::Testing::DeclaredCountBlob out;
+    out.Byte(static_cast<std::uint8_t>(StreamCodec::Magic)).Byte(static_cast<std::uint8_t>(StreamCodec::TypeStream));
+    // Two ids -- each two u64s, as `AppendId` writes one -- then the entries-added
+    // counter. Spelled out rather than given a shared `Id()` step: a stream id is
+    // this format's idea, and the whole point of the move is that the builder holds
+    // no format's ideas.
+    out.U64(0).U64(0).U64(0).U64(0).U64(0);
+    return out;
+}
 
 /// Trailing bytes to leave after a hostile count.
 ///
@@ -267,20 +227,20 @@ TEST_CASE("StreamCodec: every declared count is refused when the blob cannot sup
 
     SECTION("the entry count")
     {
-        auto const blob = BlobBuilder {}.StreamHeader().U32(Impossible).Pad(TrailingBytes);
+        auto const blob = StreamHeader().U32(FastCache::Testing::ImpossibleCount).Pad(TrailingBytes);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
         CHECK(out.entries.capacity() == 0); // refused, not reserved-then-failed
     }
 
     SECTION("an entry's field count")
     {
-        auto const blob = BlobBuilder {}.StreamHeader().U32(1).Id().U32(Impossible);
+        auto const blob = StreamHeader().U32(1).U64(0).U64(0).U32(FastCache::Testing::ImpossibleCount);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
     }
 
     SECTION("the group count")
     {
-        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(Impossible).Pad(TrailingBytes);
+        auto const blob = StreamHeader().U32(0).U32(FastCache::Testing::ImpossibleCount).Pad(TrailingBytes);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
         CHECK(out.groups.capacity() == 0); // refused, not reserved-then-failed
     }
@@ -292,21 +252,22 @@ TEST_CASE("StreamCodec: every declared count is refused when the blob cannot sup
         // counts BOTH of its counts, so without those four bytes the GROUP count is
         // refused first and the consumer-count guard is never consulted -- delete that
         // guard and the case still goes green.
-        auto const blob = BlobBuilder {}
-                              .StreamHeader()
+        auto const blob = StreamHeader()
                               .U32(0)
                               .U32(1)
                               .EmptyField()
-                              .Id()
+                              .U64(0) // a stream id: two u64s
                               .U64(0)
-                              .U32(Impossible)
+                              .U64(0)
+                              .U32(FastCache::Testing::ImpossibleCount)
                               .Pad(StreamCodec::detail::CountBytes);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
     }
 
     SECTION("a group's pending-entry count")
     {
-        auto const blob = BlobBuilder {}.StreamHeader().U32(0).U32(1).EmptyField().Id().U64(0).U32(0).U32(Impossible);
+        auto const blob =
+            StreamHeader().U32(0).U32(1).EmptyField().U64(0).U64(0).U64(0).U32(0).U32(FastCache::Testing::ImpossibleCount);
         CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
     }
 }
@@ -321,13 +282,13 @@ TEST_CASE("StreamCodec: a declared count is bounded by the bytes actually left",
     // One entry is achievable, and those twenty zero bytes really are one: a zero id
     // and a zero field count. The blob then ends before the group count, so the decode
     // still fails -- but on TRUNCATION, further in, not on the claim.
-    auto const oneFits = BlobBuilder {}.StreamHeader().U32(1).Pad(StreamCodec::detail::MinEntryBytes);
+    auto const oneFits = StreamHeader().U32(1).Pad(StreamCodec::detail::MinEntryBytes);
     CHECK_FALSE(StreamCodec::Decode(oneFits.Bytes(), out));
     CHECK(out.entries.size() == 1); // it got past the count and decoded the entry
 
     // Two cannot fit in the same twenty bytes, and that is decided on the count alone
     // -- so nothing is decoded at all.
-    auto const twoDoNot = BlobBuilder {}.StreamHeader().U32(2).Pad(StreamCodec::detail::MinEntryBytes);
+    auto const twoDoNot = StreamHeader().U32(2).Pad(StreamCodec::detail::MinEntryBytes);
     CHECK_FALSE(StreamCodec::Decode(twoDoNot.Bytes(), out));
     CHECK(out.entries.empty());
 }
