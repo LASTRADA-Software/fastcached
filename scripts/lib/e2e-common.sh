@@ -1282,9 +1282,9 @@ _e2e_counter_answered="no"
 #
 #   * IT DID NOT HONOUR `e2e_wait_seconds`. It opened `local seconds=10`, so an
 #     operator raising the fixture's budget -- the documented remedy for a slow
-#     box -- scaled twenty-one waits and not this one. And this is the wait a slow
-#     machine lengthens MOST: it waits for a compile to finish and a counter to
-#     rise, where the others wait for a process to bind.
+#     box -- scaled every wait in the file except this one. And this is the wait a
+#     slow machine lengthens MOST: it waits for a compile to finish and a counter
+#     to rise, where the others wait for a process to bind.
 #   * IT PRODUCED NO SLOW-VERSUS-WEDGED VERDICT, so its timeout could not say
 #     which kind of failure it was -- the distinction `.agent/rules/testing.md`
 #     requires of every wait, because a loaded machine and a wedged process are
