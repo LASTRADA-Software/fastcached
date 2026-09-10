@@ -1506,6 +1506,28 @@ what differs between compilers, standard libraries, hosts and tool versions.
   so the run never happened, two gates in one build directory, a dirty tree, the log on
   `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
   `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
+  BACKGROUND LAUNCH that started nothing and said so in the affirmative — `A && B &&
+  nohup C & echo STARTED` binds the `&` to the WHOLE `&&` list, so the marker is printed
+  by the launcher before anything it describes could have failed, and under `wsl.exe` the
+  detached job dies with the invocation that started it whether or not `setsid` and
+  `nohup` are spelled; the tell was that the log file did not EXIST, never the exit
+  status, and the two mangled-path re-encounters beside it were already two entries on
+  this list, which is what the list is for — and its SHARPEST form, `nohup` inside
+  `wsl.exe -e bash -lc`, where the child dies with the WSL session and the log is never
+  CREATED: not stale, not truncated, **absent**, so there is no artefact to examine or
+  date and absence is exactly what a lane reads as *still running*. `pgrep -f
+  local-gate.sh` cannot settle that — it found three gates, none of them the asking
+  lane's, and every one matched the same pattern; `readlink /proc/<pid>/cwd` per pid is
+  what named them. **Four spellings in one evening from four lanes, and the property that
+  ties them is that NEITHER the wrapper's exit status NOR the presence of a log settles
+  it**: two produce exit 0 with no work done, one produces no artefact at all, and one
+  produces a status about the wrong process — `GATE_EXIT=$?` inside a `wsl.exe` string is
+  the OUTER shell's, reporting `0` over a run that had just printed `TSAN GATE FAILED`,
+  which is a second mechanism reaching the same false verdict as the `setsid` fork below.
+  So the wrapper writes an artefact BEFORE the gate starts, naming the commit it is
+  about, which makes *the wrapper ran* checkable independently of *the gate produced
+  output* — and the verdict itself is read from the tool's own terminal text, never from
+  a status. And a
   DrvFs log redirect that failed while leaving the gate child ALIVE, and the gate's own
   `clang-format -i` REWRITING the commit and then measuring what it had rewritten, and a
   `ctest` total that counts only the TARGET SET it was configured with — `-DFASTCACHED_BUILD_TESTCLIENT`
@@ -1527,7 +1549,21 @@ what differs between compilers, standard libraries, hosts and tool versions.
   swap went to 7G of 7G with no OOM kill logged, and one died mid-build with exit **144**.
   A nonzero exit from a KILLED gate is not a red tree, and 144 turned up twice that day in
   unrelated contexts, so it means *something killed this* and never *the tree is bad*.
-  Serialise the gate across lanes rather than racing it. A dirty-tree guard
+  Serialise the gate across lanes rather than racing it — **with a LOCK, and a
+  poll-for-zero is not one.** *"Wait until no other `local-gate.sh` is running, then
+  start"* reads as mutual exclusion and behaves like it **only while there is a single
+  waiter**, which is the condition it is invariably tested under. With N waiters it fails
+  twice: it STARVES, because it waits for zero rather than for the set running when you
+  arrived, so every later arrival extends your wait — measured on this box, a lane queued
+  at 5:35 was still waiting at 15:57 while one that arrived ten minutes later started and
+  finished first; and it is a THUNDERING HERD, because when the running set drains every
+  waiter's next poll sees zero and they all start at once, which is the concurrent-gate
+  storm the rule exists to prevent, arriving at the moment adoption is complete and
+  looking exactly like nobody following the rule. `flock` on a lock file, never `fcntl`,
+  for the reason the storage and scratch-root rules already give — an `fcntl` lock is per
+  PROCESS, so two gates inside one shell would both take it and succeed. It is not FIFO,
+  so a lane can be unlucky; unlucky-and-bounded is not starving and cannot stampede, and
+  it must not be "improved" into a queue. A dirty-tree guard
   that samples once AT THE START cannot see an instrument that dirties the tree itself —
   sample at both ends, and note that implementing half of a two-clause rule looks exactly
   like compliance. Presence is not usability, and a
@@ -2323,8 +2359,36 @@ and what they may assume.
   (`launcher-e2e-ports-selftest`, REGISTERED-and-skipped where `pwsh` is absent).
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
-- A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
-  `--help ...` printed usage and reported a pass for a case that never ran.
+- A Catch2 case name is an ARGUMENT, and that one fact has three consequences. It may
+  not begin with `-` — CTest passes it as an argument, so `--help ...` printed usage
+  and reported a pass for a case that never ran. A **COMMA** splits the spec, so a name
+  containing one selects NOTHING and the run answers `No tests ran`, which exits
+  **non-zero** — measured, exit 2, two unmatched fragments — so the miss presents as a
+  *deterministic red* rather than an empty result, and a rate loop reads `pass=0 fail=N`
+  for a case that never ran (#636, #895). That is not a reason to rename: 529 of 3503
+  names carry a comma and the sentence-shaped convention is right, so select by TAG, and
+  **anything selecting a subset asserts how many cases RAN**, not only how many failed.
+  Write it as *the name is an argument*, never as *commas are bad*, or the next
+  separator character is a new ticket.
+- A DUPLICATED case name registers two ctest entries that each run BOTH cases, because
+  `catch_discover_tests` registers one entry per name and Catch2 matches every case
+  carrying it. Nothing is skipped — what breaks is ATTRIBUTION, so it reads as harmless:
+  one defect surfaces as two reds naming neither case, and `ctest -R "^<name>$"` cannot
+  select one of the pair (#729). `test-name-hygiene` refuses duplicates, its exemption
+  rows carry a REASON, and a row that has stopped describing a duplicate is refused as
+  STALE — an exemption nobody must keep true would wave through the next one.
+- **A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG.** Catch2
+  unwinds, so the failure skips the stop and `~jthread` joins a loop nobody stopped: the
+  timeout does not name the assertion, a timeout and a wedge look identical, and a green
+  suite says nothing about it. It concentrates in TEARDOWN tests, whose author is
+  thinking about the subject's ordering rather than the harness's. `CHECK` does not
+  unwind and is not this. Fix by stopping BEFORE asserting, or by RAII — where
+  **declaration order is half of it**, the fake outliving the thread that touches it, or
+  the hang becomes a use-after-free. A lambda taking a `std::stop_token` is not exposed
+  at all. **Not soundly mechanizable** — that needs dataflow, and a textual scan is
+  approximate in both directions (both misreadings were observed while triaging it) —
+  so no check is written, deliberately: it would refuse 18 legitimate raw threads on
+  arrival, and a check that fails on arrival gets disabled (#902).
 - A fixture states which PATH it exercised. `check-catch-skip-return-code` derives its
   file set from `git ls-files` and falls back to a directory walk; its selftest had six
   green cases and CI still failed, with no contradiction between them — a synthetic
