@@ -121,6 +121,16 @@ constexpr std::string_view NodePrefix = "fastcache_";
     auto snapshot = FullySpecifiedSnapshot();
     snapshot.host = HostCapacity {};
     snapshot.upstreamConfigured = true;
+    // Consensus is a node-only block too, and it is populated with a member set AND
+    // a leader rather than a default `ConsensusStatus`: two of its five series are
+    // rendered only when there is something to name, so a default-constructed status
+    // would let the page lose exactly those two rows unnoticed -- which is this
+    // check's whole direction.
+    snapshot.consensus = ConsensusStatus { .members = { "n1" },
+                                           .knownLeader = Consensus::NodeId { "n1" },
+                                           .term = Consensus::Term { .value = 1 },
+                                           .commitIndex = Consensus::LogIndex { .value = 1 },
+                                           .role = Consensus::Role::Leader };
     return snapshot;
 }
 

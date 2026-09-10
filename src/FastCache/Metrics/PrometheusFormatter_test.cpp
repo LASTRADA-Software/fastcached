@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
+// For `Consensus::RoleTable`, which the role state-set's expected labels are read
+// from rather than written out here: a list restated in the test is a second thing
+// to keep in step, and it would agree with a renderer that had lost a row.
+#include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
@@ -12,9 +16,30 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
+
+namespace
+{
+/// How many times @p needle appears in @p haystack.
+///
+/// A count and not a `contains`, because the exposition format's rule is that a
+/// series carries its `# HELP` and `# TYPE` exactly once with every sample under
+/// them -- so the failure worth catching is a header emitted per label value, which
+/// `contains` reports as present and a scraper rejects outright.
+/// @param haystack The rendered exposition.
+/// @param needle What to count.
+/// @return The number of non-overlapping occurrences.
+[[nodiscard]] std::size_t Occurrences(std::string_view haystack, std::string_view needle)
+{
+    auto found = std::size_t { 0 };
+    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+        ++found;
+    return found;
+}
+} // namespace
 
 TEST_CASE("RenderPrometheus emits HELP/TYPE/value triples", "[metrics][prometheus]")
 {
@@ -294,4 +319,144 @@ TEST_CASE("Whether a node has a shared cache is named, not inferred from a count
     // never by dropping a counter row.
     CHECK(absent.contains("fastcache_node_cache_upstream_store_failures_total"));
     CHECK(without.contains("fastcache_node_cache_upstream_store_failures_total"));
+}
+
+TEST_CASE("A process with no consensus renders no consensus series", "[metrics][prometheus][consensus]")
+{
+    // #435's absence, and the one this rule is stated for: a process that runs no
+    // consensus has no cluster to describe, so a member count of 0 would be a
+    // reading about a quorum it is not part of. The daemon is always in this state;
+    // so is a compile node started without `--listen-raft`.
+    //
+    // Matched on the SERIES PREFIX rather than one name, because the block is five
+    // series and a check naming one of them would go on passing while the other four
+    // leaked out of a process with nothing to say.
+    AtomicMetricsSink metrics;
+    auto const body = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .uptime = Uptime { 1s } });
+
+    CHECK_FALSE(body.contains("fastcache_node_consensus_"));
+    // The positive control. Without it this case passes over a renderer that emits
+    // nothing at all, which is a different defect wearing the same green.
+    CHECK(body.contains("fastcached_uptime_seconds 1\n"));
+}
+
+TEST_CASE("A node that holds no configuration says so rather than vanishing", "[metrics][prometheus][consensus]")
+{
+    // The state #388 is: a node admitted into `ClusterState` that never adopted the
+    // CONFIGURATION entry. `HasCluster()` is false, so `NextDeadline()` excuses it
+    // from every deadline -- it campaigns in no election, grants no pre-vote, and
+    // logs nothing while doing it. Invisible while the leader lives and fatal the
+    // moment it dies.
+    //
+    // So an empty member set RENDERS. It is a reading, not an absence: the node runs
+    // consensus, and what it counts is nobody. Suppressing it -- the obvious reading
+    // of "absent is not zero" -- would hide exactly the state this ticket exists to
+    // expose, which is why the absence is spelled one level up, by the whole block
+    // being gone.
+    AtomicMetricsSink metrics;
+    auto const body = RenderPrometheus(
+        metrics, MetricsSnapshot { .storage = std::nullopt, .host = std::nullopt, .consensus = ConsensusStatus {} });
+
+    CHECK(body.contains("# TYPE fastcache_node_consensus_members gauge"));
+    CHECK(body.contains("fastcache_node_consensus_members 0\n"));
+    CHECK(body.contains("fastcache_node_consensus_term 0\n"));
+
+    // And no member samples, because there are no members to name -- the tier rule
+    // one axis over. The three unconditional series above are what make this
+    // absence readable rather than indistinguishable from a process with no
+    // consensus at all.
+    CHECK_FALSE(body.contains("fastcache_node_consensus_member{"));
+    CHECK_FALSE(body.contains("# TYPE fastcache_node_consensus_member gauge"));
+
+    // Nor a leader, which a node in this state legitimately does not know.
+    CHECK_FALSE(body.contains("fastcache_node_consensus_leader"));
+
+    // A follower in term 0 that counts nobody is what a joiner looks like, so the
+    // role has to be there too or the reading is half of one.
+    CHECK(body.contains("fastcache_node_consensus_role{role=\"follower\"} 1\n"));
+}
+
+TEST_CASE("A node's consensus block names every member and who leads", "[metrics][prometheus][consensus]")
+{
+    // What `--cluster-status` could never answer: the QUORUM this node operates
+    // under, from this node, whether or not it leads. `ClusterState.members` is the
+    // fleet's member record and a different set, and only a leader answers it -- so
+    // the node whose view matters during a stall is the one that redirects you.
+    AtomicMetricsSink metrics;
+    auto const body =
+        RenderPrometheus(metrics,
+                         MetricsSnapshot { .storage = std::nullopt,
+                                           .host = std::nullopt,
+                                           .consensus = ConsensusStatus { .members = { "n1", "n2", "n3" },
+                                                                          .knownLeader = Consensus::NodeId { "n2" },
+                                                                          .term = Consensus::Term { .value = 4 },
+                                                                          .commitIndex = Consensus::LogIndex { .value = 11 },
+                                                                          .role = Consensus::Role::Follower } });
+
+    CHECK(body.contains("fastcache_node_consensus_members 3\n"));
+    CHECK(body.contains("fastcache_node_consensus_term 4\n"));
+    CHECK(body.contains("fastcache_node_consensus_commit_index 11\n"));
+
+    // The set, not only its size: "which members does this node count" is the
+    // question asked when a cluster will not re-elect, and a count cannot answer it.
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n1\"} 1\n"));
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n2\"} 1\n"));
+    CHECK(body.contains("fastcache_node_consensus_member{member=\"n3\"} 1\n"));
+    // One HELP/TYPE pair for the series, with the three samples under it: repeating
+    // the header per label value is what a scraper rejects, and it is the mistake a
+    // per-sample `Append` loop makes silently -- every value is present and the
+    // exposition is invalid.
+    CHECK(Occurrences(body, "# TYPE fastcache_node_consensus_member gauge") == 1);
+    CHECK(Occurrences(body, "# HELP fastcache_node_consensus_member ") == 1);
+
+    CHECK(body.contains("fastcache_node_consensus_leader{leader=\"n2\"} 1\n"));
+}
+
+TEST_CASE("The consensus role is a state set driven by RoleTable", "[metrics][prometheus][consensus]")
+{
+    // A sample per role with exactly one 1, and the label values come from
+    // `Consensus::RoleTable` rather than a list written out here -- the rule the
+    // tier samples follow against `StorageTierTable` and the counters against
+    // `MetricsCatalog`, so a fifth role reaches the scrape by being a row.
+    //
+    // Driven over EVERY role rather than one, because a renderer that hard-coded
+    // `follower` would pass a single-role case and report every leader as a
+    // follower, which is the wrong answer in the direction an operator acts on.
+    AtomicMetricsSink metrics;
+
+    for (auto const& subject: Consensus::RoleTable)
+    {
+        auto const body =
+            RenderPrometheus(metrics,
+                             MetricsSnapshot { .storage = std::nullopt,
+                                               .host = std::nullopt,
+                                               .consensus = ConsensusStatus { .members = { "n1" }, .role = subject.role } });
+
+        for (auto const& row: Consensus::RoleTable)
+            CHECK(body.contains(std::format(
+                "fastcache_node_consensus_role{{role=\"{}\"}} {}\n", row.name, row.role == subject.role ? 1 : 0)));
+    }
+}
+
+TEST_CASE("A node in an election names no leader rather than an empty one", "[metrics][prometheus][consensus]")
+{
+    // "Nobody leads right now" is a different fact from "somebody else leads", and
+    // it is the one a client cannot act on -- so it must not render as a leader
+    // whose id is the empty string, which a dashboard would draw as a member.
+    //
+    // Absence is the spelling, and it is readable because the three unconditional
+    // series are still there saying consensus is running.
+    AtomicMetricsSink metrics;
+    auto const body =
+        RenderPrometheus(metrics,
+                         MetricsSnapshot { .storage = std::nullopt,
+                                           .host = std::nullopt,
+                                           .consensus = ConsensusStatus { .members = { "n1", "n2" },
+                                                                          .term = Consensus::Term { .value = 9 },
+                                                                          .role = Consensus::Role::Candidate } });
+
+    CHECK_FALSE(body.contains("fastcache_node_consensus_leader"));
+    CHECK(body.contains("fastcache_node_consensus_members 2\n"));
+    CHECK(body.contains("fastcache_node_consensus_role{role=\"candidate\"} 1\n"));
 }

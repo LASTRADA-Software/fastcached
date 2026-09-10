@@ -137,6 +137,15 @@ namespace
     }
 } // namespace
 
+ConsensusStatus ConsensusStatusFrom(Consensus::RaftDriver::Progress const& progress)
+{
+    return ConsensusStatus { .members = progress.members,
+                             .knownLeader = progress.knownLeader,
+                             .term = progress.term,
+                             .commitIndex = progress.commitIndex,
+                             .role = progress.role };
+}
+
 std::string DescribeRole(Distributed::SchedulerRole role, Consensus::Term term, std::string_view leaderEndpoint)
 {
     return std::format("consensus: this node is now {} in term {}{}",
@@ -522,6 +531,29 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
 Cluster::ClusterState ConsensusTier::ClusterState() const
 {
     return _application.State();
+}
+
+std::function<ConsensusStatus()> ConsensusScrapeSource(ConsensusTier const* tier)
+{
+    // Null is the ordinary single-machine deployment, not a degraded one: a node
+    // without `--listen-raft` runs no consensus at all, and an empty function is what
+    // leaves `MetricsSnapshot::consensus` disengaged so the renderer emits no
+    // consensus series whatsoever. A default-constructed `ConsensusStatus` here would
+    // instead report a cluster of nobody, which is a reading rather than an absence.
+    if (tier == nullptr)
+        return {};
+    return [tier] {
+        return tier->Status();
+    };
+}
+
+ConsensusStatus ConsensusTier::Status() const
+{
+    // ONE read of the driver, so the five facts describe one moment. Asking
+    // `_driver->Node()` for them instead would be five reads with no lock at all --
+    // that accessor says so in as many words -- and the moment they disagree is an
+    // election, which is exactly when somebody is looking.
+    return ConsensusStatusFrom(_driver->CurrentProgress());
 }
 
 std::expected<void, ConsensusError> ConsensusTier::ProposeToCluster(Cluster::Command const& command)

@@ -757,3 +757,79 @@ TEST_CASE("A term that moves without the role moving is still reported", "[conse
         CHECK(Unwrap(change.cause).from == "n2");
     }
 }
+
+TEST_CASE("CurrentProgress reports the role and the leader, under the same lock", "[consensus][raft][driver]")
+{
+    // `CurrentProgress` is the ONE read anything outside this driver has of what a
+    // node believes about its own cluster
+    // ([#435](https://github.com/LASTRADA-Software/fastcached/issues/435)), and until
+    // it carried these two it could not answer the question at all: a member set and
+    // a commit index say nothing about whether this node is campaigning or who it
+    // follows.
+    //
+    // The alternative is `Node().CurrentRole()` beside `Node().ActiveMembers()`, and
+    // `Node()` says in as many words that it is not synchronized. That is four reads
+    // of a state machine the timer loop and every peer reader are free to move, and
+    // the moment they disagree is an election -- which is exactly when somebody is
+    // reading this.
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    RecordingMachine machine { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    RaftDriver driver {
+        std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine
+    };
+
+    // A quiet follower knows its members and no leader. Asserted BEFORE anything
+    // moves, because "names no leader" is the state an election is in and a case
+    // that only ever saw a settled cluster could not tell the two apart.
+    auto const quiet = driver.CurrentProgress();
+    CHECK(quiet.role == Role::Follower);
+    CHECK_FALSE(quiet.knownLeader.has_value());
+    CHECK(quiet.term == Term { .value = 0 });
+    CHECK(quiet.members == std::vector<NodeId> { "n1", "n2", "n3" });
+
+    // Campaigning: a role that moved without a leader appearing, which is the
+    // reading that separates a node standing for election from one quietly
+    // following. Both hold the same members and the same commit index.
+    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+
+    auto const campaigning = driver.CurrentProgress();
+    CHECK(campaigning.role == Role::Candidate);
+    CHECK_FALSE(campaigning.knownLeader.has_value());
+    CHECK(campaigning.term == Term { .value = 1 });
+
+    // And elected: the role and the leader move together, and the leader is this
+    // node -- which `role == Leader` also says, so the pairing is what proves the
+    // field is filled from the node rather than defaulted.
+    REQUIRE(
+        driver
+            .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
+                     TimePoint {} + 150ms)
+            .has_value());
+
+    auto const elected = driver.CurrentProgress();
+    CHECK(elected.role == Role::Leader);
+    CHECK(elected.knownLeader == std::optional<NodeId> { "n1" });
+    CHECK(elected.term == Term { .value = 1 });
+
+    // Deposed by a higher term from a peer: a leader this node is NOT, which no
+    // other field here reports.
+    REQUIRE(driver
+                .Receive(AppendEntriesRequest { .term = Term { .value = 2 },
+                                                .leaderId = "n3",
+                                                .prevLogIndex = LogIndex::BeforeFirst(),
+                                                .prevLogTerm = Term::None(),
+                                                .entries = {},
+                                                .leaderCommit = LogIndex::BeforeFirst() },
+                         TimePoint {} + 200ms)
+                .has_value());
+
+    auto const deposed = driver.CurrentProgress();
+    CHECK(deposed.role == Role::Follower);
+    CHECK(deposed.knownLeader == std::optional<NodeId> { "n3" });
+    CHECK(deposed.term == Term { .value = 2 });
+}
