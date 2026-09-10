@@ -259,8 +259,8 @@ stop_bound_seconds=$(( worker_drain_seconds + 5 ))
 # made the old single 15 wrong in the first place.
 daemon_stop_seconds=5
 
-# The pid of the process the last `start_node` started, and the only way it is
-# handed back.
+# The pid of the process the last `start_node` or `start_daemon` started, and the
+# only way it is handed back.
 #
 # A function that PRINTED its pid would have to be called in a command
 # substitution, and the whole spawn would then happen in a subshell: the
@@ -271,7 +271,7 @@ daemon_stop_seconds=5
 # hand the caller an empty pid on the way past.
 started_pid=""
 
-# And the log that node writes, so a caller that wants to dump it on a later
+# And the log that process writes, so a caller that wants to dump it on a later
 # failure need not respell the tag.
 started_log=""
 
@@ -341,6 +341,55 @@ start_node() {
     started_port="$port"
     pids+=("$pid")
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
+}
+
+# Start one `fastcached` daemon, and wait for it to be ACCEPTING.
+#
+# `start_node`'s counterpart, and it exists for the same reason one ticket later
+# (#644). The node recipe reached twelve copies before #451 folded it; the DAEMON
+# recipe was still written out five times, each repeating its own
+# `> "${workdir}/<tag>.log" 2>&1 &`, its own `$!`, its own `pids+=` and its own
+# wait -- and each free to spell the tag one way and the log another. That is the
+# mapping a reader needs when a run fails: the failure names a daemon, the
+# evidence is in a file, and nothing connects the two if the two are typed
+# separately. Here the TAG is both, exactly as `start_node` documents for itself.
+#
+# The five copies had already drifted in the smaller way: the message each wait
+# printed was a phrase of its own (`membership daemon`, `isolation daemon`, `tier
+# upstream`) while the log was named something else, so `cat`ing the right file
+# after a failure meant knowing the mapping. There is now one name.
+#
+# IT WAITS FOR ACCEPTING, NOT FOR THE BIND, and that is the one behavioural change
+# rather than a fold. All five copies used `wait_for_port`, which returns for a
+# socket that is bound with nobody accepting on it -- the connect lands in the
+# backlog and answers the probe. `Core/ReadinessMarker.hpp` puts the daemon's
+# `ready, accepting connections` strictly after the last acceptor arms, and the
+# very next thing every one of these call sites does is point a launcher at that
+# port. #634 is the same hole in the node's half of this file, found only after it
+# had been open for months, and building the weaker recipe here knowing that is
+# how it gets inherited.
+#
+# `--listen` is the invariant, because every daemon here binds one address and
+# that address is what the caller then probes. Everything else is the caller's,
+# including the log level: a default plus an override is the same flag twice, and
+# which wins is then the option table's overwrite order.
+#
+# @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message
+#          about this daemon
+# @param 2 host to bind and probe
+# @param 3 port to bind and probe
+# @param 4.. every flag that differs between the daemons this fixture starts
+start_daemon() {
+    local tag="$1" host="$2" port="$3"
+    shift 3
+    local log="${workdir}/${tag}.log" pid=""
+    "$fastcached" --listen="${host}:${port}" ${@+"$@"} > "$log" 2>&1 &
+    pid=$!
+    started_pid="$pid"
+    started_log="$log"
+    started_port="$port"
+    pids+=("$pid")
+    wait_for_daemon_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 
 # Write a translation unit whose content is unique to the caller.
@@ -592,12 +641,9 @@ if [[ "$mode" == "membership" ]]; then
     # sends the launcher to 127.0.0.1:6674, which on a developer machine is very
     # likely a real node serving real builds.
     mem_cache_port="$(free_port)"
-    "$fastcached" --listen="127.0.0.1:${mem_cache_port}" \
-        --storage-max-value=64M --log-level=info \
-        > "${workdir}/mem-daemon.log" 2>&1 &
-    mem_daemon_pid=$!
-    pids+=("$mem_daemon_pid")
-    wait_for_port 127.0.0.1 "$mem_cache_port" "$mem_daemon_pid" "membership daemon" "${workdir}/mem-daemon.log"
+    start_daemon "mem-daemon" 127.0.0.1 "$mem_cache_port" \
+        --storage-max-value=64M --log-level=info
+    mem_daemon_pid="$started_pid"
     export FASTCACHE_ADDR="127.0.0.1:${mem_cache_port}"
 
     proj="${workdir}/memproj"
@@ -940,12 +986,9 @@ fi
 # arrive on it beside the cache and scheduler verbs.
 cache_port="$(free_port)"
 
-"$fastcached" --listen="127.0.0.1:${cache_port}" \
-    --storage-max-value=64M --log-level=info \
-    > "${workdir}/daemon.log" 2>&1 &
-daemon_pid=$!
-pids+=("$daemon_pid")
-wait_for_port 127.0.0.1 "$cache_port" "$daemon_pid" "daemon" "${workdir}/daemon.log"
+start_daemon "daemon" 127.0.0.1 "$cache_port" \
+    --storage-max-value=64M --log-level=info
+daemon_pid="$started_pid"
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
@@ -1121,11 +1164,8 @@ echo "== case 3: fingerprint isolation"
 # worker, which is exactly what this case must not have.
 iso_cache_port="$(free_port)"
 iso_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${iso_cache_port}" \
-    --log-level=info > "${workdir}/iso-daemon.log" 2>&1 &
-iso_daemon_pid=$!
-pids+=("$iso_daemon_pid")
-wait_for_port 127.0.0.1 "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
+start_daemon "iso-daemon" 127.0.0.1 "$iso_cache_port" --log-level=info
+iso_daemon_pid="$started_pid"
 
 start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
     "$no_local_cache" \
@@ -1219,11 +1259,8 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
 cap_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${cap_cache_port}" \
-    --log-level=info > "${workdir}/cap-daemon.log" 2>&1 &
-cap_daemon_pid=$!
-pids+=("$cap_daemon_pid")
-wait_for_port 127.0.0.1 "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
+start_daemon "cap-daemon" 127.0.0.1 "$cap_cache_port" --log-level=info
+cap_daemon_pid="$started_pid"
 
 # The scheduler node names a toolchain nothing here compiles with, deliberately.
 # Every node is both a peer and a possible scheduler, so it always registers as a
@@ -1376,10 +1413,8 @@ echo "== case 9: a local hit never reaches the shared cache"
 cache_node_port="$(free_port)"
 cache_upstream_port="$(free_port)"
 
-"$fastcached" --listen="127.0.0.1:${cache_upstream_port}" --log-level=info     > "${workdir}/tier-upstream.log" 2>&1 &
-tier_upstream_pid=$!
-pids+=("$tier_upstream_pid")
-wait_for_port 127.0.0.1 "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
+start_daemon "tier-upstream" 127.0.0.1 "$cache_upstream_port" --log-level=info
+tier_upstream_pid="$started_pid"
 
 start_node "tier-node" 127.0.0.1 "$cache_node_port" \
     --cache-memory=64m \

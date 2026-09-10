@@ -858,7 +858,7 @@ run_case() {
         # above do and for their reason: a stand-in that cannot bind otherwise
         # arrives as an unexplained death beside an EMPTY log, on a runner nobody
         # can reach. stdout is closed off, being the staged listener's own chatter.
-        _selftest_node "$p" 1 "$log" >/dev/null 2>>"$log" &
+        _selftest_node "$p" 1 "$log" "$E2eNodeReadyMarker" >/dev/null 2>>"$log" &
         staged=$!
         # THE BIND IS STAGED FIRST, and that is the point rather than setup.
         #
@@ -901,7 +901,7 @@ run_case() {
         log="${scratch}/never.log"
         : > "$log"
         p="$(free_port)"
-        _selftest_node "$p" never "$log" >/dev/null 2>>"$log" &
+        _selftest_node "$p" never "$log" "$E2eNodeReadyMarker" >/dev/null 2>>"$log" &
         staged=$!
         # Staged for the reason the case above gives, and here it is also what
         # makes the budget mean what it says: the 2s below must be spent waiting
@@ -944,6 +944,52 @@ run_case() {
         staged=$!
         wait_for_node_ready 127.0.0.1 "$p" "$staged" "a node that never binds" "$log" 1
         echo "BUG: the wait returned for a node that never bound"
+        ;;
+
+    # --- `wait_for_daemon_ready` ----------------------------------------------
+    #
+    # The daemon's readiness line is `ready, accepting connections`, emitted once
+    # the LAST acceptor has armed. `dist-compile-e2e.sh` started five daemons and
+    # waited on the PORT for each, which is strictly weaker (#644).
+    #
+    # Two cases and the second is the one that discriminates. `waits-for-marker`
+    # alone would pass a `wait_for_daemon_ready` that greps the NODE's marker, or
+    # any other string, because the stand-in eventually logs and the port answers
+    # throughout; `refuses-the-nodes-marker` stages the node's line and requires
+    # the wait to expire on it, which is what pins the two constants apart.
+    daemon-ready-waits-for-marker)
+        log="${scratch}/daemon.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_node "$p" 1 "$log" "$E2eDaemonReadyMarker" >/dev/null 2>>"$log" &
+        staged=$!
+        # The bind is staged first for the reason `node-ready-waits-for-marker`
+        # records at length: it is what puts the helper's own port wait into
+        # #634's condition, and it stops a tight budget being spent on perl.
+        wait_for_port 127.0.0.1 "$p" "$staged" "the staged daemon" "$log" 15
+        wait_for_daemon_ready 127.0.0.1 "$p" "$staged" "the staged daemon" "$log" 15
+        # Through the constant, never the text: an assertion spelling the marker a
+        # second time agrees with itself whatever the helper does.
+        case "$(<"$log")" in
+            *"$E2eDaemonReadyMarker"*) echo "wait_for_daemon_ready returned with the daemon accepting" ;;
+            *) echo "BUG: it returned while the daemon had only bound" ;;
+        esac
+        kill "$staged" 2>/dev/null || true
+        ;;
+
+    # A process logging the NODE's readiness line, which is not this one. Both
+    # waits share `_e2e_wait_ready` now, so the marker is the only thing telling
+    # them apart -- and a shared body that lost the parameter would wait for
+    # whichever constant it hard-coded and pass one of the two cases either way.
+    daemon-ready-refuses-the-nodes-marker)
+        log="${scratch}/wrongmarker.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_node "$p" 1 "$log" "$E2eNodeReadyMarker" >/dev/null 2>>"$log" &
+        staged=$!
+        wait_for_port 127.0.0.1 "$p" "$staged" "a daemon logging the wrong line" "$log" 15
+        wait_for_daemon_ready 127.0.0.1 "$p" "$staged" "a daemon logging the wrong line" "$log" 3
+        echo "BUG: the wait returned for a process that logged the node's marker"
         ;;
 
     # --- `wait_for_counter` --------------------------------------------------
@@ -1980,9 +2026,18 @@ _selftest_metrics() {
 # flags differ between the BSD, GNU and OpenBSD builds and one of those is on
 # every platform CI runs, but never the same one.
 #
+# THE MARKER IS A PARAMETER, because `fastcached` has one of these lines too and
+# it is a different one -- `ready, accepting connections`, from `ReadinessAnnouncer`
+# (#644). Two stand-ins would be two copies of a program whose every subtlety is
+# recorded here and in `_selftest_listener`, and the `exec`/lifetime pair is exactly
+# the kind that gets fixed in one copy. The CALLER passes the library constant, so
+# nothing here spells the node's text a third time -- the line below is what a real
+# node writes, which is staging rather than asserting.
+#
 # @param 1 port
 # @param 2 seconds to wait before logging the marker, or `never`
 # @param 3 the log to write it to
+# @param 4 the marker text to log, e.g. `$E2eNodeReadyMarker`
 _selftest_node() {
     # `exec` for the reason `_selftest_listener` above gives: `$!` must be this
     # perl and not the subshell bash forks for a backgrounded function, or the
@@ -1990,19 +2045,19 @@ _selftest_node() {
     # holding its port for the full 30 seconds below. Only ever called with `&`.
     exec perl -e '
         use strict; use warnings; use IO::Socket::INET;
-        my ($port, $delay, $logfile) = @ARGV;
+        my ($port, $delay, $logfile, $marker) = @ARGV;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
         if ($delay ne "never") {
             sleep $delay;
             open(my $log, ">>", $logfile) or die $!;
-            print $log "compile node ready on 127.0.0.1:$port, advertising ...
+            print $log "$marker on 127.0.0.1:$port, and then whatever else the line carries
 ";
             close $log;
         }
         sleep 30;
-    ' "$1" "$2" "$3"
+    ' "$1" "$2" "$3" "$4"
 }
 
 # ---------------------------------------------------------------------------
@@ -2487,6 +2542,8 @@ socket_cases=(
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"
+    "daemon-ready-waits-for-marker|0|wait_for_daemon_ready returned with the daemon accepting|!BUG:"
+    "daemon-ready-refuses-the-nodes-marker|1|to log: ready, accepting connections|!BUG:"
     "counter-rises|0|wait_for_counter returned and handed back the reading 1|!BUG:"
     "counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
     "counter-absent|1|of a 1s budget|exports no staged_counter_total series at all|!BUG:"

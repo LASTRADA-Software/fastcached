@@ -1003,6 +1003,20 @@ wait_for_registration() {
 # behaviour are different jobs.
 E2eNodeReadyMarker="compile node ready"
 
+# The line `fastcached` logs once every acceptor is armed, and the marker
+# `wait_for_daemon_ready` below waits on.
+#
+# The second row of `Core/ReadinessMarker.hpp`, and the two constants here are that
+# table read from the shell. Both are wire constants in all but name: this build
+# recompiles no fixture, so rewording either breaks its waiters by TIMEOUT -- the
+# slowest and least informative failure there is -- with a green build behind it.
+#
+# `ready, accepting connections` reports ACCEPTING, which is strictly later than the
+# bind (#646). That is why a daemon gets a readiness wait rather than the port wait
+# five call sites used: a bound port with nobody accepting answers a connect probe
+# out of the backlog and then holds the client.
+E2eDaemonReadyMarker="ready, accepting connections"
+
 # Wait until a compile node is SERVING, not merely bound.
 #
 # BOUND IS NOT READY. Since #365 a node binds FIRST and logs this line
@@ -1074,6 +1088,39 @@ E2eNodeReadyMarker="compile node ready"
 # @param 6 optional bound in seconds for BOTH waits together; defaults to
 #          `e2e_wait_seconds`
 wait_for_node_ready() {
+    _e2e_wait_ready "$E2eNodeReadyMarker" wait_for_node_ready ${@+"$@"}
+}
+
+# Wait until a `fastcached` daemon is ACCEPTING, not merely bound.
+#
+# The daemon's half of the rule above, and it is not a weaker version of it: its
+# marker is emitted by `ReadinessAnnouncer` once the LAST acceptor has armed, so
+# between the bind and this line sit every reactor thread and every acceptor the
+# daemon runs. `Core/ReadinessMarker.hpp` states both facts in one table and has
+# no `Bound` enumerator at all, precisely so a fixture cannot claim the weaker one.
+#
+# It exists because `dist-compile-e2e.sh` started five daemons and waited on the
+# PORT for each (#644). A connect that lands in the backlog with nobody accepting
+# answers the probe and then holds the client, and the fixture's very next act is
+# to point a launcher at that port. The window is small on a warm machine, which
+# is exactly the property #634 found had been quietly true of the node for months.
+#
+# Same signature, same shared deadline, same required log as
+# `wait_for_node_ready`; the marker is the only difference, so they are two rows
+# rather than two functions.
+wait_for_daemon_ready() {
+    _e2e_wait_ready "$E2eDaemonReadyMarker" wait_for_daemon_ready ${@+"$@"}
+}
+
+# The body both readiness waits are: bind, then the marker, on ONE deadline.
+#
+# @param 1 the marker to wait for
+# @param 2 the caller's own name, for the refusal below -- a message naming this
+#          function would send a reader to a helper they did not call
+# @param 3.. the caller's arguments, unchanged
+_e2e_wait_ready() {
+    local marker="$1" caller="$2"
+    shift 2
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
     local seconds="${6:-$_e2e_wait_seconds}"
     # A log is REQUIRED, and `-` is refused rather than passed through. It is the
@@ -1081,8 +1128,8 @@ wait_for_node_ready() {
     # already pass it there -- so a call site converted from `wait_for_port`
     # without noticing would reach `grep -q "$marker" -`, which reads the
     # FIXTURE'S OWN STDIN once per poll, never matches, and ends the run as a
-    # readiness timeout for a node that was perfectly healthy.
-    [ "$logfile" != "-" ]         || fail "wait_for_node_ready needs a log to read the marker out of; ${what} was given '-'"
+    # readiness timeout for a process that was perfectly healthy.
+    [ "$logfile" != "-" ]         || fail "${caller} needs a log to read the marker out of; ${what} was given '-'"
     local armed dpid dmark
     _e2e_deadline_arm "$seconds"
     armed="$_e2e_deadline_armed"
@@ -1097,7 +1144,7 @@ wait_for_node_ready() {
     # It now says it by naming the SHARED budget rather than a remainder, because a
     # remainder is exactly the subtraction of two clock readings this function
     # stopped doing. The deadline is retired here, by the leg that armed it.
-    wait_for_log "$E2eNodeReadyMarker" "$pid"         "${what} (readiness, on what is left of a ${seconds}s budget shared with the bind)"         "$logfile" "$seconds" "$armed"
+    wait_for_log "$marker" "$pid"         "${what} (readiness, on what is left of a ${seconds}s budget shared with the bind)"         "$logfile" "$seconds" "$armed"
     _e2e_deadline_disarm "$dpid" "$dmark"
 }
 
