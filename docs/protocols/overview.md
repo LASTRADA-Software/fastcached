@@ -8,7 +8,7 @@ compatible with existing clients, plus one of its own:
 | memcached (text)     | [memcached protocol.txt][mc]               | Full        |
 | memcached (binary)   | [memcached protocol_binary.xml][mcb]       | Full        |
 | memcached (meta)     | [memcached protocol.txt §meta][mc]         | Full        |
-| Redis (RESP2)        | [Redis Serialization Protocol][resp]       | Key-value subset |
+| Redis (RESP2 + RESP3) | [Redis Serialization Protocol][resp]      | Key-value subset, plus sets, streams, pub/sub and transactions |
 | Compile cache (`0xFC`) | [Compile cache](compile-cache.md)        | fastcached's own |
 
 The compile cache is deliberately unlike the other four: they move opaque
@@ -30,21 +30,26 @@ speaks one protocol; mixing on a single connection is not supported.
 Each row is a logical capability area; cells show how complete each
 protocol is in fastcached today.
 
-| Capability area               | memcached text | memcached binary | memcached meta | Redis RESP2 |
+| Capability area               | memcached text | memcached binary | memcached meta | Redis RESP |
 |-------------------------------|:---:|:---:|:---:|:---:|
-| Storage (set/add/replace/append/prepend) | Full | Full | Full | Partial (SET only) |
-| CAS                           | Full | Full | Full | Not applicable |
+| Storage (set/add/replace/append/prepend) | Full | Full | Full | Partial (`SET`/`SETEX`/`PSETEX`/`MSET`) |
+| CAS                           | Full | Full | Full | Via `WATCH` + `MULTI` |
 | Retrieval (get / gets)        | Full | Full | Full | Full |
-| TTL refresh (touch / GAT)     | Full | Full | Full | Not supported |
-| Arithmetic (incr / decr)      | Full | Full | Full | Not supported |
+| TTL refresh (touch / GAT)     | Full | Full | Full | Partial (`EXPIRE` family; no read-and-touch) |
+| TTL query                     | Via `me` | n/a | Via `me` | Full (`TTL` / `PTTL`) |
+| Arithmetic (incr / decr)      | Full | Full | Full | Full (plus `INCRBYFLOAT`) |
 | Deletion                      | Full | Full | Full | Full |
 | Flush                         | Full | Full | n/a  | Full |
 | Stats                         | Sub-commands | Basic | Via `me` | INFO only |
 | Slabs / LRU tuning            | Synthetic stub | n/a | n/a | n/a |
 | `watch` event streaming       | Not supported | n/a | n/a | n/a |
-| Authentication                | n/a | SASL rejected | n/a | AUTH rejected |
+| Authentication                | n/a | SASL rejected | n/a | Full (`AUTH` vs `--requirepass`) |
 | Multiple databases            | n/a | n/a | n/a | Single keyspace |
-| Pub / sub                     | n/a | n/a | n/a | Not supported |
+| Pub / sub                     | n/a | n/a | n/a | Full, plus keyspace notifications |
+| Sets                          | n/a | n/a | n/a | Partial (7 verbs; no set algebra) |
+| Streams                       | n/a | n/a | n/a | Full enough for consumer groups |
+| Transactions                  | n/a | n/a | n/a | Full (`MULTI` / `EXEC` / `WATCH`) |
+| Key enumeration               | Not supported | n/a | n/a | Not supported |
 | Scripting (EVAL)              | n/a | n/a | n/a | Not supported |
 
 Legend: **Full** = full spec coverage · **Partial** = subset · **n/a** =
@@ -67,7 +72,7 @@ every protocol.
 - [Binary opcodes](binary-opcodes.md) — hex table.
 - [Binary status codes](status-codes.md) — every status code
   fastcached emits.
-- [Redis RESP2](redis-resp.md) — supported subset and rationale.
+- [Redis RESP](redis-resp.md) — supported subset and rationale.
 
 ## Compatibility
 

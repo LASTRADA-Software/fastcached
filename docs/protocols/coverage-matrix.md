@@ -11,20 +11,22 @@ column shows how that operation is expressed in a given protocol.
 | stub       | Recognised but returns synthetic output (no real backing) |
 | **no**     | Not implemented; the command is rejected or ignored |
 
-| Operation                                    | memcached text | memcached binary | memcached meta | Redis RESP2 |
+| Operation                                    | memcached text | memcached binary | memcached meta | Redis RESP |
 |----------------------------------------------|----------------|------------------|----------------|-------------|
 | Store value unconditionally                  | [`set`](../commands/memcached/storage/set.md) | `0x01` SET / `0x11` SETQ | [`ms M=S`](../commands/memcached/meta/ms.md) | [`SET`](../commands/redis/string/set.md) |
 | Store only if absent                         | [`add`](../commands/memcached/storage/add.md) | `0x02` ADD / `0x12` ADDQ | [`ms M=E`](../commands/memcached/meta/ms.md) | [`SET NX`](../commands/redis/string/set.md) |
 | Store only if present                        | [`replace`](../commands/memcached/storage/replace.md) | `0x03` REPLACE / `0x13` REPLACEQ | [`ms M=R`](../commands/memcached/meta/ms.md) | [`SET XX`](../commands/redis/string/set.md) |
 | Append to existing value                     | [`append`](../commands/memcached/storage/append.md) | `0x0e` APPEND / `0x19` APPENDQ | [`ms M=A`](../commands/memcached/meta/ms.md) | **no** |
 | Prepend to existing value                    | [`prepend`](../commands/memcached/storage/prepend.md) | `0x0f` PREPEND / `0x1a` PREPENDQ | [`ms M=P`](../commands/memcached/meta/ms.md) | **no** |
-| Compare-and-swap                             | [`cas`](../commands/memcached/storage/cas.md) | via CAS field in header | [`ms C(token)`](../commands/memcached/meta/ms.md) | – |
+| Compare-and-swap                             | [`cas`](../commands/memcached/storage/cas.md) | via CAS field in header | [`ms C(token)`](../commands/memcached/meta/ms.md) | `WATCH` + `MULTI`/`EXEC` |
 | Fetch by key                                 | [`get`](../commands/memcached/retrieval/get.md) | `0x00` GET / `0x09` GETQ / `0x0c` GETK / `0x0d` GETKQ | [`mg v`](../commands/memcached/meta/mg.md) | [`GET`](../commands/redis/string/get.md) |
 | Fetch with CAS                               | [`gets`](../commands/memcached/retrieval/gets.md) | implicit (CAS in header) | [`mg c v`](../commands/memcached/meta/mg.md) | – |
 | Fetch and refresh TTL                        | [`gat`](../commands/memcached/retrieval/gat.md) / [`gats`](../commands/memcached/retrieval/gats.md) | `0x1d` GAT / `0x1e` GATQ / `0x23` GATK / `0x24` GATKQ | [`mg v T(token)`](../commands/memcached/meta/mg.md) | **no** |
-| Refresh TTL without reading value            | [`touch`](../commands/memcached/lifetime/touch.md) | `0x1c` TOUCH | [`mg T(token)`](../commands/memcached/meta/mg.md) | **no** |
-| Increment numeric value                      | [`incr`](../commands/memcached/arithmetic/incr.md) | `0x05` INCREMENT / `0x15` INCREMENTQ | [`ma M=I`](../commands/memcached/meta/ma.md) | **no** |
-| Decrement numeric value                      | [`decr`](../commands/memcached/arithmetic/decr.md) | `0x06` DECREMENT / `0x16` DECREMENTQ | [`ma M=D`](../commands/memcached/meta/ma.md) | **no** |
+| Refresh TTL without reading value            | [`touch`](../commands/memcached/lifetime/touch.md) | `0x1c` TOUCH | [`mg T(token)`](../commands/memcached/meta/mg.md) | `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` |
+| Drop the TTL, keep the value                 | – | – | – | `PERSIST` |
+| Read the remaining TTL                       | – | – | [`me`](../commands/memcached/meta/me.md) (`exp`) | `TTL` / `PTTL` |
+| Increment numeric value                      | [`incr`](../commands/memcached/arithmetic/incr.md) | `0x05` INCREMENT / `0x15` INCREMENTQ | [`ma M=I`](../commands/memcached/meta/ma.md) | `INCR` / `INCRBY` / `INCRBYFLOAT` |
+| Decrement numeric value                      | [`decr`](../commands/memcached/arithmetic/decr.md) | `0x06` DECREMENT / `0x16` DECREMENTQ | [`ma M=D`](../commands/memcached/meta/ma.md) | `DECR` / `DECRBY` |
 | Auto-vivify on miss                          | – | `0x05`/`0x06` with exptime!=0xFFFFFFFF | [`mg N(token)`](../commands/memcached/meta/mg.md) / [`ma N J`](../commands/memcached/meta/ma.md) | – |
 | Delete key                                   | [`delete`](../commands/memcached/deletion/delete.md) | `0x04` DELETE / `0x14` DELETEQ | [`md`](../commands/memcached/meta/md.md) | [`DEL`](../commands/redis/keys/del.md) / [`UNLINK`](../commands/redis/keys/unlink.md) |
 | Mark stale (recache coordination)            | – | – | [`md I`](../commands/memcached/meta/md.md) / [`ms I`](../commands/memcached/meta/ms.md) | – |
@@ -41,10 +43,21 @@ column shows how that operation is expressed in a given protocol.
 | LRU tuning                                   | stub ([`lru`](../commands/memcached/slabs/lru.md)) | – | – | – |
 | LRU crawler control                          | stub ([`lru_crawler`](../commands/memcached/slabs/lru_crawler.md)) | – | – | – |
 | Event watch streaming                        | **no** | – | – | – |
-| Authentication                               | – | SASL rejected | – | [`AUTH`](../commands/redis/connection/auth.md) rejected |
+| Authentication                               | – | SASL rejected | – | [`AUTH`](../commands/redis/connection/auth.md) against `--requirepass` |
 | Echo                                         | – | – | – | [`ECHO`](../commands/redis/connection/echo.md) |
 | Server handshake                             | – | – | – | [`HELLO`](../commands/redis/connection/hello.md) |
-| Command introspection                        | – | – | – | [`COMMAND`](../commands/redis/server/command.md) (empty array) |
+| Command introspection                        | – | – | – | [`COMMAND`](../commands/redis/server/command.md) / `COUNT` / `INFO` |
+| Reset the connection                         | – | – | – | `RESET` |
+| Fetch several keys at once                   | [`get k1 k2`](../commands/memcached/retrieval/get.md) | pipelined `0x09` GETQ | pipelined [`mg`](../commands/memcached/meta/mg.md) | `MGET` |
+| Store several keys at once                   | – | pipelined `0x11` SETQ | pipelined [`ms`](../commands/memcached/meta/ms.md) | `MSET` / `MSETNX` |
+| Set membership                               | – | – | – | `SADD` / `SREM` / `SMEMBERS` / `SCARD` / `SISMEMBER` / `SMISMEMBER` / `SPOP` |
+| Set algebra                                  | – | – | – | **no** |
+| Stream append and read                       | – | – | – | `XADD` / `XRANGE` / `XREAD` / `XLEN` and 11 more |
+| Stream consumer groups                       | – | – | – | `XGROUP` / `XREADGROUP` / `XACK` / `XPENDING` / `XCLAIM` / `XAUTOCLAIM` |
+| Publish / subscribe                          | – | – | – | `PUBLISH` / `SUBSCRIBE` / `PSUBSCRIBE` and the two unsubscribes |
+| Transaction                                  | – | – | – | `MULTI` / `EXEC` / `DISCARD` / `WATCH` / `UNWATCH` |
+| Enumerate the keyspace                       | **no** | **no** | **no** | **no** |
+| Protocol conformance probe                   | – | – | – | `DEBUG PROTOCOL <type>` |
 | Select database                              | – | – | – | [`SELECT`](../commands/redis/connection/select.md) accepted (no-op, single keyspace) |
 | Client connection setup                      | – | – | – | [`CLIENT`](../commands/redis/connection/client.md) stub |
 | Runtime config probe                         | – | – | – | [`CONFIG`](../commands/redis/server/config.md) stub |

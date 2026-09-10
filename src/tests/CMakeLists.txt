@@ -2882,6 +2882,51 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Every RESP verb the server answers is documented, and every verb the docs
+# claim is answered exists.
+#
+# `RedisResp.hpp` has said for a long time that `CommandTable` is the source of
+# truth "if this prose drifts". That is a sentence, not a reader, and the prose
+# drifted: six doc pages said RESP3 was unsupported while a probe returns a
+# RESP3 map, `unsupported.md` named `SADD` and `SMEMBERS` as examples of an
+# absent family that is in fact served, and `COMMAND` was documented as always
+# answering `*0` against a live `:66`. None of it could fail, so none of it did.
+#
+# `docs-subject` as well as `hygiene`: the subject IS documentation, and #687 is
+# what happens when a check about prose is gated on a code change -- prose
+# drifts by being edited, and by the code beneath it moving.
+#
+# `if(NOT WIN32)` for the reason its neighbours above carry it: the script is
+# POSIX and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "resp-command-docs"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-resp-command-docs.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("resp-command-docs" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against synthetic trees. A suite with only a correct case
+    # passes under every bug the check exists to catch -- and the correct case is
+    # not decoration either: a guard nobody has watched ACCEPT is not known to
+    # work, which is #1031. Both ways the reader can fail to LOOK (an unreadable
+    # array literal, a renamed doc heading) are watched REFUSING rather than
+    # passing over two empty lists, and the stated row count is driven in both
+    # directions.
+    add_test(
+        NAME "resp-command-docs-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-resp-command-docs.sh" --self-test
+    )
+    set_tests_properties("resp-command-docs-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # A config file this package used to ship is retired from operators' disks.

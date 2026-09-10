@@ -1,6 +1,6 @@
 # AUTH
 
-**Protocols:** Redis RESP2 · **Status:** Supported (when `--requirepass` is set)
+**Protocols:** Redis RESP2 / RESP3 · **Status:** Supported (when `--requirepass` is set)
 
 fastcached authenticates clients against a single shared secret configured
 with `--requirepass=<secret>` (or the `requirepass` YAML key). When no secret

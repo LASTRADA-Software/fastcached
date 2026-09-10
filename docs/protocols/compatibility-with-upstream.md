@@ -65,15 +65,25 @@ Reference: [Redis 7.x][redis], RESP2 subset only.
 | `ECHO`                                   | Full   |
 | `INFO`                                   | Full   |
 | `HELLO 2`                                | Full   |
-| `HELLO 3` (RESP3)                        | Rejected with `-NOPROTO` |
-| `COMMAND`                                | Full   |
+| `HELLO 3` (RESP3)                        | Full -- upgrades the connection |
+| `COMMAND` / `COUNT` / `INFO`             | Full over fastcached's own table |
+| `COMMAND DOCS`                           | Empty array (no metadata carried) |
 | `FLUSHDB` / `FLUSHALL`                   | Full   |
 | `QUIT`                                   | Full   |
-| `AUTH`                                   | Rejected (no auth backend) |
+| `RESET`                                  | Full   |
+| `AUTH`                                   | Full against `--requirepass`; "no password is set" when unset |
 | `SELECT`                                 | No-op for any index (single keyspace; always `+OK`) |
 | `CLIENT`                                 | Connection-setup stub (`SETNAME`/`SETINFO`/`ID`/`GETNAME`) |
 | `CONFIG`                                 | Stub (`CONFIG GET` reports `0` per param; others reply `+OK`) |
-| Other Redis commands                     | Not supported (see [Unsupported Redis commands](../commands/redis/unsupported.md)) |
+| `TTL` / `PTTL` / `EXPIRE` family / `PERSIST` | Full   |
+| `MGET` / `MSET` / `MSETNX`               | Full   |
+| `INCR` / `DECR` / `INCRBY` / `DECRBY` / `INCRBYFLOAT` | Full |
+| Sets                                     | Partial -- 7 verbs; no set algebra |
+| Streams                                  | Full enough for consumer groups (15 verbs) |
+| Pub / sub                                | Full -- plus keyspace notifications |
+| `MULTI` / `EXEC` / `DISCARD` / `WATCH` / `UNWATCH` | Full |
+| `DEBUG PROTOCOL` / `LOLWUT`              | Full   |
+| Lists, hashes, sorted sets, scripting, `KEYS` / `SCAN` | Not supported (see [Unsupported Redis commands](../commands/redis/unsupported.md)) |
 
 This is a deliberate subset chosen to cover the `sccache` /
 key-value-cache use case. Expanding the Redis surface is tracked as a

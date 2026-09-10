@@ -22,8 +22,8 @@ enum class ProtocolFlavor : std::uint8_t
 {
     Unknown = 0,
     MemcachedText,
-    MemcachedBinary, ///< Not yet implemented; recognised but currently treated like MemcachedText.
-    RedisResp,       ///< Not yet implemented; recognised but currently treated like MemcachedText.
+    MemcachedBinary, ///< The memcached binary protocol; `MemcachedBinaryHandler` serves it.
+    RedisResp,       ///< RESP2 and RESP3; `RedisRespHandler` serves it.
     CompileCache,    ///< fastcached's own compile-cache binary protocol (CompileCacheWire::Magic).
 };
 

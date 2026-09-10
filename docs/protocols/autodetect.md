@@ -2,7 +2,7 @@
 
 When a client connects, fastcached peeks the first byte and routes the
 connection to one of four protocol handlers — memcached binary, the
-compile cache, Redis RESP2, or memcached text. (The meta commands are
+compile cache, Redis RESP, or memcached text. (The meta commands are
 dispatched from inside the text handler, so they need no first-byte rule
 of their own.) The rule set is small and unambiguous; mis-classification
 would mean a closed connection, not a wrong answer.
@@ -13,8 +13,8 @@ would mean a closed connection, not a wrong answer.
 |-------------------|------------------------------------|
 | `0x80`            | memcached binary handler           |
 | `0xFC`            | [compile-cache handler](compile-cache.md) |
-| `*`               | Redis RESP2 handler (array form)   |
-| `+` `-` `:` `$`   | Redis RESP2 handler (inline form)  |
+| `*`               | Redis RESP handler (array form)    |
+| `+` `-` `:` `$`   | Redis RESP handler (inline form)   |
 | anything else     | memcached text handler (line-based) |
 
 `mg`, `ms`, `md`, `ma`, `me`, `mn` are dispatched from inside the

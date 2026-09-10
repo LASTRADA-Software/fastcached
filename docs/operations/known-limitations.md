@@ -25,8 +25,14 @@ place.
   shared secret, redis-style); with no secret configured it replies the
   redis-compatible "no password is set" error. Per-user ACLs beyond the
   single optional `--auth-username` are not supported.
-- **`HELLO 3` (Redis)**: rejected with `-NOPROTO`. RESP3 is not
-  supported.
+- **`COMMAND DOCS` (Redis)**: replies with an empty array. `COMMAND`,
+  `COMMAND COUNT` and `COMMAND INFO` are real introspection over the
+  dispatch table; only the human-readable metadata is absent.
+- **Redis set algebra**: `SINTER`, `SUNION`, `SDIFF`, `SRANDMEMBER`,
+  `SMOVE` and `SSCAN` are not implemented. The rest of the set family is.
+- **Key enumeration**: there is no `KEYS`, `SCAN`, `RANDOMKEY`, `DBSIZE`
+  or `stats cachedump` on any protocol, so a client cannot list the
+  keyspace. Use the `/metrics` endpoint for aggregate counts.
 - **`SELECT db` (Redis)**: accepted as a no-op for any index — the
   reply is always `+OK`, but fastcached is a single flat keyspace, so
   the index is ignored rather than selecting a distinct database.
