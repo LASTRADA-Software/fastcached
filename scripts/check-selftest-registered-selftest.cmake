@@ -291,6 +291,30 @@ ExpectVerdict("case 6d: a quoted flag with no dispatch is REFUSED, not ignored"
     "${bannerDir}" "refuse" "check-usage.sh")
 
 # ---------------------------------------------------------------------------
+# Case 14 -- the walk reads a WHOLE line, however long, and this is the case that would
+# fail if anyone bounded it to a window.
+#
+# #1168 anticipated a window bound and the check deliberately has none; the line is
+# recovered by an exact REVERSE find rather than by looking back a fixed distance. The
+# two halves of the `positional-comparison` shape are put 3,000 characters apart on ONE
+# line, so recognising it requires the whole line and no part of it.
+#
+# The corpus cannot catch this: 38,188 lines across the scanned scripts, longest 950
+# characters, six over 500 and none over 1,000 -- so any window above about 1 KB would
+# have looked perfect today and been a silent cliff for whoever first wrote a longer
+# line. That is what makes a staged 3,000-character line worth more than the real tree.
+string(REPEAT "x" 3000 longPad)
+NewTree("long-line" longLineDir)
+file(WRITE "${longLineDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${longLineDir}/scripts/check-long.sh"
+    "[ \"\${1:-}\" = \"\$mode\" ] && : \"${longPad}\" && mode=\"--self-test\"
+")
+file(WRITE "${longLineDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"long\" COMMAND bash \"scripts/check-long.sh\" --self-test)
+")
+ExpectVerdict("case 14: a dispatch 3,000 characters into a line is still read"
+    "${longLineDir}" "pass" "")
+
+# ---------------------------------------------------------------------------
 # Case 10 -- a `.cmake` self-test offers by its NAME, and a `-P` registration runs it.
 # This whole family was outside the scan until #1220: it globbed `*.sh` and `*.ps1`
 # only, so 23 `*-selftest.cmake` files -- including this check's own -- were never asked
