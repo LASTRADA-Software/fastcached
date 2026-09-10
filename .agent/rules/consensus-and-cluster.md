@@ -197,6 +197,45 @@ Every rule below has already been a bug.
   null on Windows until it called `Detail::EnsureNetworkInitialised`, and no fake
   would ever have shown that.
 
+## A refusal code carries its own permanence, and there are THREE answers
+
+`ConsensusErrorCode::InvalidConfiguration` had two producers that meant opposite
+things. `Cluster::Validate` returns it for a command nothing could ever apply --
+permanent. `RaftNode::ProposeMembership` returned it for *a membership change is
+already in flight; wait for it to commit* and for *the proposed member set is the
+current one*, both of which clear on their own.
+
+`SubjectOf` is a `constexpr` table over that enum and therefore reads as a global
+fact, so it was correct only on the entry-propose path and wrong on the membership
+one. What guarded that was a sentence in its own doc plus `ConsensusTier::ReconcileQuorum`
+declining to consult it -- the weakest kind of guard, and the obvious next tidy-up
+would have wired it in and reported *wait for the change in flight to commit* as
+**can never be recorded as it stands**, at Warn, every reconcile interval.
+
+The fix is that the CODE carries the property (#196):
+`ConfigurationChangeInFlight` and `MembershipUnchanged` are enumerators of their
+own, and `SchedulerService`'s `WireCodeFor` -- an `EnumTable` over the same enum --
+fails the build until each has decided what it says on the wire. Both new wire
+codes are in `UncountedRefusals`: one is what a healthy cluster answers while a
+change it accepted replicates, the other is an idempotent request arriving twice,
+so a rise in either would measure how often somebody retried.
+
+**`RefusalSubject` gained a THIRD value, and that is the part worth remembering.**
+*The proposed member set is the one already in force* is a refusal only in the
+sense that nothing was appended: the caller's goal is TRUE. Folded into `Command`
+it is reported at Warn as a record somebody must go and correct; folded into
+`Moment` it abandons a pass that had nothing left to do. Both are the misleading
+symptom the classification exists to remove, so `Satisfied` is named -- the
+four-states rule arriving in a consensus taxonomy.
+
+It stays a REFUSAL rather than becoming a success, and the reason is not
+squeamishness: a success would have to carry a `Proposal` naming an entry that
+does not exist, and `Cluster::NextQuorumChange` never proposes an unchanged set --
+so the state a success would force every caller to handle is one production does
+not reach. The ticket asked whether it is a refusal at all; that is the answer,
+and it is recorded here because the question will be asked again.
+
+
 ## The replicated cluster configuration
 
 - **A cluster setting that nothing can change at runtime is a log entry pretending to
