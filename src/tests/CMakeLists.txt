@@ -4590,6 +4590,48 @@ set_tests_properties("istreambuf-iterator-selftest" PROPERTIES
 # of guarded constructors reads identically to complete coverage (#492), so it is
 # deny-by-default with one stated exception, and it refuses when it finds no
 # `WallClockRef` anywhere -- two empty lists agree perfectly.
+#
+# **What it costs, so a slow run is diagnosed rather than guessed at.** ONE `awk` pass
+# over the whole file set plus two `sed`s to split the result -- a handful of processes
+# regardless of how many sources there are. Measured 2026-09-09, and the conditions are
+# half the figure: **687 files, ~0.46 s per run, spread ~9 ms over three runs**, Git Bash
+# on a 32-core Windows host, tree on local NTFS. On a hosted Windows runner, **2.11 s and
+# 2.44 s** on the `Windows-cl-debug` and `Windows-cl-release` legs -- four cores at
+# `CTEST_PARALLEL_LEVEL: 4`, the values `build.yml`'s `env:` block carried when these
+# figures were taken. **Those two numbers are PINNED here rather than pointed at**, and
+# the never-restate rule does not reach them: a condition that TRACKED its source would
+# make this measurement claim a parallelism it was never taken under, the day somebody
+# edits that file -- a false condition welded to a real figure, by an unrelated change,
+# with no signal. Citations get linked; measurements get pinned. Treat those as two
+# rows, never as "the scan is fast".
+#
+# **It was not always this shape, and the history is the reason the budget exists.** It
+# used to spend THREE processes per file -- an `awk` to strip block comments and two
+# `grep`s over the stripped text -- so 687 sources cost 2061 processes and ~60 s here.
+# When this change was in flight master still carried that shape, which made master its
+# own control under identical conditions: six hosted readings -- four runs of
+# `Windows-cl-debug`, plus the three Windows legs of one run -- span **97.39 to 114.64 s
+# against this 120 s budget**. It took required contexts red repeatedly, including on a
+# diff that changed nothing but a comment;
+# [#1150](https://github.com/LASTRADA-Software/fastcached/issues/1150) carries that
+# record and it is deliberately not tallied here, a hand-kept count beside a moving fact
+# being a second source of truth.
+#
+# **Read the spread against the margin; that is what a ratio hides.** Those six readings
+# span **17.25 s**, and the slowest left **5.36 s** of headroom. A fluctuation of a size
+# already observed between those very runs is therefore more than three times the margin
+# of the slowest one -- so which leg crosses 120 s is not a property of the leg, and
+# every leg sat within one ordinary fluctuation of the budget. A scan whose cost tracks
+# the FILE COUNT rather than the diff lands back there if the per-file process ever
+# comes back, which is why the shape is written down and not just the number.
+#
+# Two responses are tempting and both are wrong. **Raising the budget** makes a slow
+# host pass and explains nothing, which is what #354 refuses -- and a budget is what
+# separates a slow host from a wedged process. **Attributing a timeout to whatever
+# branch is under it** needs the file-set delta checked first: this scan reads the tree,
+# not the diff, so a change adding a handful of files moves its cost by well under the
+# run-to-run spread. That check is two commands and it settles attribution before
+# anybody reads a diff for a cause that is not in it.
 add_test(
     NAME "wall-clock-borrow"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-borrow.sh" "${CMAKE_SOURCE_DIR}"
@@ -4651,6 +4693,16 @@ set_tests_properties("macos-package-e2e-selftest" PROPERTIES
 # Both directions. A new row the docs omit costs a reader a stale page; a doc naming a
 # setting as reloadable that the table denies costs an OPERATOR, who edits the shipped
 # file, sends SIGHUP, sees no error and believes a setting is in force that is not.
+# Cost: one `grep -l` across the tracked set rather than one `grep` per tracked file.
+# Measured 2026-09-09 on the same host and shell as `wall-clock-borrow` above: ~0.64 s
+# per run, spread ~26 ms over three runs, against the 120 s budget below. On a hosted
+# Windows runner, **1.92 s and 2.08 s** on the `Windows-cl-debug` and
+# `Windows-cl-release` legs, under the conditions stated for its sibling above. It used
+# to spend a process per tracked file -- about a thousand -- and cost ~18 s here and
+# **36.01 to 45.89 s** across those same six hosted readings, rising to 55.70 s in the
+# run where its sibling timed out. On the shared 120 s budget that is 30-38% against its
+# sibling's 81-96%, which is the whole of why one fired and the other did not
+# ([#1150](https://github.com/LASTRADA-Software/fastcached/issues/1150)).
 add_test(
     NAME "node-reloadable-docs"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
