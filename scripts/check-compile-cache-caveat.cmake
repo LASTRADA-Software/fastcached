@@ -179,6 +179,44 @@ if(sccacheStandIn STREQUAL ccacheStandIn OR ccacheStandIn STREQUAL "")
         "cannot tell which launcher was wired: sccache=[${sccacheStandIn}] ccache=[${ccacheStandIn}]")
 endif()
 
+# One path, two spellings. Compare the PATH, never the bytes a generator wrote.
+#
+# Measured on the three Windows legs, which is where this failed and where the Linux
+# run could not have shown it. `build.ninja` writes
+#
+#     LAUNCHER = "C:\Program Files\CMake\bin\cmake.exe"
+#
+# -- QUOTED because the path holds a space, and with BACKSLASH separators -- while
+# `${CMAKE_COMMAND}` is `C:/Program Files/CMake/bin/cmake.exe`. A `STREQUAL` over
+# those is false for one and the same file, and on Linux the two spellings are
+# identical, so a green run there says nothing about it. The strings are recorded
+# rather than described, so nobody simplifies the normalisation away on the platform
+# that does not need it.
+#
+# Three normalisations, each a FACT about the spelling rather than a loosening of the
+# comparison: a matched surrounding pair of double quotes is the generator's escaping
+# and not part of the name; `file(TO_CMAKE_PATH)` is what CMake itself uses to settle
+# separators; and the comparison folds case only on Windows, where the filesystem
+# does. Nothing else is relaxed -- a wrong launcher must still read as wrong, which
+# is the whole of what this rule buys.
+#
+# @param raw The value as the buildsystem spells it.
+# @param outVar Receives the comparable form.
+function(FastCachedNormalisePath raw outVar)
+    set(value "${raw}")
+    string(STRIP "${value}" value)
+    # Only a MATCHED pair: stripping an unmatched quote would silently accept a
+    # truncated value, which is the one way this could go wrong quietly.
+    if(value MATCHES "^\"(.*)\"$")
+        set(value "${CMAKE_MATCH_1}")
+    endif()
+    file(TO_CMAKE_PATH "${value}" value)
+    if(WIN32)
+        string(TOLOWER "${value}" value)
+    endif()
+    set(${outVar} "${value}" PARENT_SCOPE)
+endfunction()
+
 # What a generated buildsystem says about the compiler launcher.
 #
 # `CMAKE_CXX_COMPILER_LAUNCHER` is set by the module as a NORMAL variable, so
@@ -202,7 +240,7 @@ function(FastCachedWiredLaunchers binaryDir launchersVar readableVar)
         file(STRINGS "${binaryDir}/build.ninja" launcherLines REGEX "^ *LAUNCHER *= *.+$")
         foreach(line IN LISTS launcherLines)
             string(REGEX REPLACE "^ *LAUNCHER *= *" "" value "${line}")
-            string(STRIP "${value}" value)
+            FastCachedNormalisePath("${value}" value)
             if(NOT value STREQUAL "")
                 list(APPEND found "${value}")
             endif()
@@ -215,7 +253,8 @@ function(FastCachedWiredLaunchers binaryDir launchersVar readableVar)
                 file(STRINGS "${makeFile}" compileLines REGEX "CXX_COMPILER_LAUNCHER|\$\(CXX_DEFINES\)")
                 foreach(line IN LISTS compileLines)
                     if(line MATCHES "^[ 	]*[^ 	]*(cmake|ctest)[^ 	]*[ 	]+[^ 	]*(c\+\+|clang|gcc|cl)")
-                        list(APPEND found "${CMAKE_MATCH_0}")
+                        FastCachedNormalisePath("${CMAKE_MATCH_0}" makeValue)
+                        list(APPEND found "${makeValue}")
                     endif()
                 endforeach()
             endforeach()
@@ -400,9 +439,9 @@ foreach(row IN LISTS FastCachedCaveatRows)
 
         set(wantedLauncher "")
         if(wired STREQUAL "sccache")
-            set(wantedLauncher "${sccacheStandIn}")
+            FastCachedNormalisePath("${sccacheStandIn}" wantedLauncher)
         elseif(wired STREQUAL "ccache")
-            set(wantedLauncher "${ccacheStandIn}")
+            FastCachedNormalisePath("${ccacheStandIn}" wantedLauncher)
         elseif(NOT wired STREQUAL "none")
             # Refused rather than treated as `none`, which would be a row that
             # configures, asserts and proves nothing -- the same reason the
