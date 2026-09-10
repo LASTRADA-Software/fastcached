@@ -83,7 +83,16 @@ set(FastCachedCaveatElements
 
 # One row per selection outcome, pipe-delimited:
 #
-#   <name>|<expected output>|<forbidden output>|<stand-in launcher>|<severity>|<extra -D args>
+#   <name>|<expected output>|<forbidden output>|<stand-in launcher>|<severity>|<extra -D args>|<wired>
+#
+# <wired> is what the GENERATED BUILDSYSTEM must carry as the compiler launcher:
+# `sccache`, `ccache`, or `none`. It is the column #187 is about. Every other field
+# here asserts what the module PRINTED, and a module that printed
+# `-- [cache] Enabling sccache ...` with the full caveat at the right severity while
+# wiring no launcher at all would satisfy all of them -- the same defect class the
+# rest of this file exists to close, one layer down. The configure line is the
+# module\'s claim about itself; the launcher in the generated buildsystem is the
+# artefact a compile actually runs.
 #
 # <severity> is `warning` when the row must produce a CMake Warning carrying the
 # caveat, and empty when it must produce no warning at all. Both halves are
@@ -128,12 +137,12 @@ else()
 endif()
 
 set(FastCachedCaveatRows
-    "sccache-row|Enabling sccache|${sccacheForbidden}|sccache|${sccacheSeverity}|-DALLOW_SCCACHE_FALLBACK=ON"
-    "sccache-not-auto|Not using sccache|Enabling sccache|sccache||"
-    "sccache-not-preferred|Enabling ccache|Enabling sccache|sccache-and-ccache||"
-    "ccache-is-silent|Enabling ccache|${FastCachedCaveatMarker}|ccache||"
-    "disabled-is-silent|disabled by USE_COMPILER_CACHE=OFF|${FastCachedCaveatMarker}|sccache||-DUSE_COMPILER_CACHE=OFF"
-    "nothing-installed|No compiler-cache launcher found|${FastCachedCaveatMarker}|none||"
+    "sccache-row|Enabling sccache|${sccacheForbidden}|sccache|${sccacheSeverity}|-DALLOW_SCCACHE_FALLBACK=ON|sccache"
+    "sccache-not-auto|Not using sccache|Enabling sccache|sccache|||none"
+    "sccache-not-preferred|Enabling ccache|Enabling sccache|sccache-and-ccache|||ccache"
+    "ccache-is-silent|Enabling ccache|${FastCachedCaveatMarker}|ccache|||ccache"
+    "disabled-is-silent|disabled by USE_COMPILER_CACHE=OFF|${FastCachedCaveatMarker}|sccache||-DUSE_COMPILER_CACHE=OFF|none"
+    "nothing-installed|No compiler-cache launcher found|${FastCachedCaveatMarker}|none|||none"
 )
 
 foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPILER)
@@ -153,9 +162,70 @@ if(NOT EXISTS "${FASTCACHED_CXX_COMPILER}")
 endif()
 
 # Any real program will do: the module records the path and wires it as a
-# launcher, and this script never builds. `cmake` itself is the one program a
-# CMake script can always name.
-set(standInProgram "${CMAKE_COMMAND}")
+# launcher, and this script never builds. `cmake` and `ctest` are the two programs
+# a CMake script can always name, and they sit beside each other in every install.
+#
+# **Two rather than one, and they must DIFFER** (#187). One program for both
+# launchers makes the wiring assertion below a presence check -- it could say a
+# launcher was wired and never which -- so `sccache-not-preferred`, whose entire
+# claim is that ccache won over sccache, would be proved by a status line and by
+# nothing in the buildsystem. Distinct paths make the row's claim readable off the
+# artefact a compile actually runs.
+set(sccacheStandIn "${CMAKE_COMMAND}")
+set(ccacheStandIn "${CMAKE_CTEST_COMMAND}")
+if(sccacheStandIn STREQUAL ccacheStandIn OR ccacheStandIn STREQUAL "")
+    message(FATAL_ERROR
+        "the two stand-in launchers must be different real programs, or the wiring assertion "
+        "cannot tell which launcher was wired: sccache=[${sccacheStandIn}] ccache=[${ccacheStandIn}]")
+endif()
+
+# What a generated buildsystem says about the compiler launcher.
+#
+# `CMAKE_CXX_COMPILER_LAUNCHER` is set by the module as a NORMAL variable, so
+# `CMakeCache.txt` cannot answer this -- measured across eleven build trees, unset
+# in every one, five of them demonstrably running sccache. What carries it is the
+# generated buildsystem, which spells it differently per generator: Ninja emits a
+# per-rule `LAUNCHER = <path>` variable, and the Makefile generators put the
+# program at the head of the compile command in `build.make`.
+#
+# @param binaryDir The configured build tree.
+# @param launchersVar Receives the distinct launcher paths found, as a list.
+# @param readableVar Receives `yes` when this generator's buildsystem could be
+#        read at all, and `no` when it could not -- which is a THIRD state and is
+#        reported as one, never folded into "no launcher was wired".
+function(FastCachedWiredLaunchers binaryDir launchersVar readableVar)
+    set(found "")
+    set(readable "no")
+
+    if(EXISTS "${binaryDir}/build.ninja")
+        set(readable "yes")
+        file(STRINGS "${binaryDir}/build.ninja" launcherLines REGEX "^ *LAUNCHER *= *.+$")
+        foreach(line IN LISTS launcherLines)
+            string(REGEX REPLACE "^ *LAUNCHER *= *" "" value "${line}")
+            string(STRIP "${value}" value)
+            if(NOT value STREQUAL "")
+                list(APPEND found "${value}")
+            endif()
+        endforeach()
+    else()
+        file(GLOB_RECURSE makeFiles "${binaryDir}/CMakeFiles/*/build.make")
+        if(makeFiles)
+            set(readable "yes")
+            foreach(makeFile IN LISTS makeFiles)
+                file(STRINGS "${makeFile}" compileLines REGEX "CXX_COMPILER_LAUNCHER|\$\(CXX_DEFINES\)")
+                foreach(line IN LISTS compileLines)
+                    if(line MATCHES "^[ 	]*[^ 	]*(cmake|ctest)[^ 	]*[ 	]+[^ 	]*(c\+\+|clang|gcc|cl)")
+                        list(APPEND found "${CMAKE_MATCH_0}")
+                    endif()
+                endforeach()
+            endforeach()
+        endif()
+    endif()
+
+    list(REMOVE_DUPLICATES found)
+    set(${launchersVar} "${found}" PARENT_SCOPE)
+    set(${readableVar} "${readable}" PARENT_SCOPE)
+endfunction()
 
 set(commonArguments
     "-DFASTCACHED_MODULE_DIR=${moduleDir}"
@@ -197,6 +267,13 @@ endif()
 
 set(violations "")
 
+# How many rows had their WIRING read, as opposed to merely their output.
+# Asserted after the loop: a reader that stopped matching would leave every row
+# silently unasserted, and a check that asserts nothing reports clean -- which is
+# the shape #187 is about, arriving in #187's own fix.
+set(wiringRowsRead 0)
+set(wiringGenerators "")
+
 foreach(row IN LISTS FastCachedCaveatRows)
     string(REPLACE "|" ";" fields "${row}")
     list(GET fields 0 name)
@@ -205,6 +282,7 @@ foreach(row IN LISTS FastCachedCaveatRows)
     list(GET fields 3 standIn)
     list(GET fields 4 severity)
     list(GET fields 5 extra)
+    list(GET fields 6 wired)
 
     set(extraArguments "")
     if(NOT extra STREQUAL "")
@@ -225,9 +303,9 @@ foreach(row IN LISTS FastCachedCaveatRows)
     string(REPLACE "-and-" ";" standInNames "${standIn}")
     foreach(standInName IN LISTS standInNames)
         if(standInName STREQUAL "sccache")
-            set(sccachePath "${standInProgram}")
+            set(sccachePath "${sccacheStandIn}")
         elseif(standInName STREQUAL "ccache")
-            set(ccachePath "${standInProgram}")
+            set(ccachePath "${ccacheStandIn}")
         elseif(NOT standInName STREQUAL "none")
             message(FATAL_ERROR "row ${name}: unknown stand-in launcher '${standInName}'")
         endif()
@@ -312,7 +390,78 @@ foreach(row IN LISTS FastCachedCaveatRows)
     elseif(NOT warnedAt EQUAL -1)
         list(APPEND violations "${name}: expected no CMake Warning at all\n${output}")
     endif()
+
+    # And what it WIRED (#187). Everything above reads the configure output, which
+    # is the module's claim about itself; this reads the generated buildsystem,
+    # which is the artefact a compile runs through.
+    FastCachedWiredLaunchers("${rowBinaryDir}" rowLaunchers rowReadable)
+    if(rowReadable STREQUAL "yes")
+        math(EXPR wiringRowsRead "${wiringRowsRead} + 1")
+
+        set(wantedLauncher "")
+        if(wired STREQUAL "sccache")
+            set(wantedLauncher "${sccacheStandIn}")
+        elseif(wired STREQUAL "ccache")
+            set(wantedLauncher "${ccacheStandIn}")
+        elseif(NOT wired STREQUAL "none")
+            # Refused rather than treated as `none`, which would be a row that
+            # configures, asserts and proves nothing -- the same reason the
+            # stand-in column refuses an unknown name.
+            message(FATAL_ERROR "row ${name}: unknown wired launcher '${wired}'")
+        endif()
+
+        if(wantedLauncher STREQUAL "")
+            if(NOT rowLaunchers STREQUAL "")
+                list(APPEND violations
+                     "${name}: the buildsystem wires a compiler launcher [${rowLaunchers}] where this row expects none")
+            endif()
+        else()
+            if(rowLaunchers STREQUAL "")
+                list(APPEND violations
+                     "${name}: the module said so but the buildsystem wires NO compiler launcher; the configure line is a claim, the buildsystem is the artefact\n${output}")
+            else()
+                # Every binding, not merely one of them: a module that wired the
+                # right launcher for one target and the wrong one for another would
+                # satisfy a check that stopped at the first match, and a partially
+                # cached build is exactly the state this whole file is about.
+                foreach(oneLauncher IN LISTS rowLaunchers)
+                    if(NOT oneLauncher STREQUAL "${wantedLauncher}")
+                        list(APPEND violations
+                             "${name}: the buildsystem wires [${oneLauncher}] where this row expects the ${wired} stand-in [${wantedLauncher}]")
+                    endif()
+                endforeach()
+            endif()
+        endif()
+    else()
+        # THIRD state, and it is reported rather than folded into "nothing was
+        # wired". A generator whose buildsystem this cannot read leaves the row's
+        # wiring unasserted, and an unasserted rule that renders like a passing one
+        # is what the ticket this closes is about.
+        list(APPEND wiringGenerators "${name}")
+    endif()
 endforeach()
+
+# The wiring rule, summarised -- and asserted, because the ways it can quietly
+# stop applying are the interesting ones.
+if(NOT wiringGenerators STREQUAL "")
+    message("compile-cache caveat: the generated buildsystem could not be read for "
+            "${wiringGenerators}, so what those rows WIRED was not asserted "
+            "(generator: ${FASTCACHED_GENERATOR})")
+endif()
+if(wiringRowsRead EQUAL 0)
+    if(FASTCACHED_GENERATOR MATCHES "Ninja|Makefiles")
+        # A generator this reader claims to handle, and it read nothing: the reader
+        # has stopped matching. A violation rather than a note, because every row's
+        # wiring assertion is then vacuous and the check reports clean.
+        list(APPEND violations
+             "the wiring reader matched no row on a ${FASTCACHED_GENERATOR} tree, so nothing asserted what any row WIRED; that is the defect this rule exists to remove")
+    else()
+        message("compile-cache caveat: no row's wiring was read on this generator "
+                "(${FASTCACHED_GENERATOR}); the output rules above still ran")
+    endif()
+else()
+    message("compile-cache caveat: read the wired launcher for ${wiringRowsRead} row(s)")
+endif()
 
 if(violations)
     list(JOIN violations "\n\n" report)
