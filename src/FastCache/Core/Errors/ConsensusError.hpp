@@ -20,8 +20,18 @@ namespace FastCache
 enum class ConsensusErrorCode : std::uint8_t
 {
     InvalidConfiguration = 0, ///< The cluster configuration is not self-consistent.
-    NotLeader,                ///< Only a leader may accept a proposal; see `knownLeader`.
-    StorageFailure,           ///< Durable state could not be written or read back.
+
+    // The two conditions `RaftNode::ProposeMembership` used to answer
+    // `InvalidConfiguration` for. They are neither invalid nor configuration: the
+    // command is well formed and would be accepted at another instant, and a table
+    // over this enum could therefore say nothing true about that enumerator (#196).
+    // Splitting them is what lets `SubjectOf` be a fact about the CODE rather than
+    // about which producer a caller happened to reach.
+    ConfigurationChangeInFlight, ///< One membership change is already uncommitted; wait for it.
+    MembershipUnchanged,         ///< The proposed member set is the one already in force.
+
+    NotLeader,      ///< Only a leader may accept a proposal; see `knownLeader`.
+    StorageFailure, ///< Durable state could not be written or read back.
 
     // Peer-wire decode failures. Three rather than one because a reader's
     // correct response differs: an unknown message type or an unsupported
@@ -47,10 +57,21 @@ enum class ConsensusErrorCode : std::uint8_t
 /// the cluster everything after it in the list -- including the quorum reconciliation
 /// that follows -- on every pass, forever, with one log line per interval as the
 /// symptom. That is half of the trap #159 records.
+///
+/// **`Satisfied` is a third state and not a shade of the other two** (#196). "The
+/// proposed member set is the one already in force" is a refusal only in the sense
+/// that nothing was appended: the caller's goal is TRUE, which neither *this change
+/// can never work* nor *ask again later* can express. Folded into `Command` it is
+/// reported at Warn as a record somebody must go and correct; folded into `Moment` it
+/// abandons a pass that had nothing left to do anyway. Both are the misleading
+/// symptom this classification exists to remove, so the state is named -- which is
+/// this repository's own rule that skipped, absent, unstarted and failed are four
+/// states and every convenient summary collapses them.
 enum class RefusalSubject : std::uint8_t
 {
-    Command, ///< This change, permanently. Skip it; the rest of the list may be fine.
-    Moment,  ///< This node, or now. The rest of the list would be refused identically.
+    Command,   ///< This change, permanently. Skip it; the rest of the list may be fine.
+    Moment,    ///< This node, or now. The rest of the list would be refused identically.
+    Satisfied, ///< Already true. Nothing was appended because nothing needed to be.
 };
 
 /// What each refusal is about, one row per `ConsensusErrorCode`.
@@ -67,23 +88,30 @@ struct RefusalSubjectRow
 
 /// One row per `ConsensusErrorCode`, in enumerator order.
 ///
-/// Only `InvalidConfiguration` describes a command; everything else describes this
-/// node or this instant. `StorageFailure` is the one worth pausing on and it is a
-/// moment: the write that failed says nothing about the command, and the next
-/// command would fail the same way -- so a caller should stop, not skip.
+/// `InvalidConfiguration` describes a command, `MembershipUnchanged` describes a goal
+/// already met, and everything else describes this node or this instant.
+/// `StorageFailure` is the one worth pausing on and it is a moment: the write that
+/// failed says nothing about the command, and the next command would fail the same
+/// way -- so a caller should stop, not skip.
 ///
-/// **The classification is a property of the code, and one producer disagrees.**
-/// `RaftNode::ProposeMembership` also answers `InvalidConfiguration` for two
-/// conditions that are plainly moments -- a configuration change already in flight,
-/// and a proposed member set equal to the current one -- so this table is right for a
-/// refusal that came back from proposing a `Cluster::Command`, where
-/// `Cluster::Validate` is the only producer, and wrong for one that came back from
-/// proposing a *membership change*. `SubjectOf` says so at its own doc, and
-/// `ConsensusTier::ReconcileQuorum` deliberately does not consult it. Making the code
-/// carry the property properly means splitting the enumerator, which is
-/// https://github.com/LASTRADA-Software/fastcached/issues/196.
+/// **The classification is a property of the CODE, and it is now true of every
+/// producer** (#196). It was not: `RaftNode::ProposeMembership` answered
+/// `InvalidConfiguration` for two conditions that are not permanent, so this table
+/// was right for a refusal from proposing a `Cluster::Command` -- where
+/// `Cluster::Validate` is the sole producer -- and wrong for one from proposing a
+/// membership change. That was guarded by a sentence in `SubjectOf`'s own doc and by
+/// `ConsensusTier::ReconcileQuorum` declining to consult it, which is the weakest
+/// kind of guard: the obvious next tidy-up would have wired it in and reported *wait
+/// for the change in flight to commit* as **can never be recorded as it stands**, at
+/// Warn, every reconcile interval, for a condition that resolves itself in one
+/// commit. Splitting the enumerator is what makes the table say something true
+/// wherever it is consulted -- and it fails the BUILD until each new code has decided
+/// what it says on the wire, because `SchedulerService`'s `WireCodeFor` is an
+/// `EnumTable` over this enum.
 inline constexpr EnumTable<ConsensusErrorCode, RefusalSubjectRow> RefusalSubjects { {
     { .code = ConsensusErrorCode::InvalidConfiguration, .subject = RefusalSubject::Command },
+    { .code = ConsensusErrorCode::ConfigurationChangeInFlight, .subject = RefusalSubject::Moment },
+    { .code = ConsensusErrorCode::MembershipUnchanged, .subject = RefusalSubject::Satisfied },
     { .code = ConsensusErrorCode::NotLeader, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::StorageFailure, .subject = RefusalSubject::Moment },
     { .code = ConsensusErrorCode::MalformedFrame, .subject = RefusalSubject::Moment },
@@ -94,15 +122,15 @@ inline constexpr EnumTable<ConsensusErrorCode, RefusalSubjectRow> RefusalSubject
 static_assert(RowsInEnumeratorOrder(RefusalSubjects, &RefusalSubjectRow::code),
               "RefusalSubjects must hold one row per ConsensusErrorCode, in enumerator order");
 
-/// What @p code is about, for a refusal produced by proposing a `Cluster::Command`.
+/// What @p code is about.
 ///
-/// **Not for a membership-change refusal.** `RaftNode::ProposeMembership` answers
-/// `InvalidConfiguration` for transient conditions as well, so a caller on that path
-/// would read "wait for the change in flight to commit" as permanent and report it
-/// as such every interval -- which is the misleading-symptom failure the split this
-/// table exists for was meant to remove. See `RefusalSubjects`.
+/// **Every path**, which is what #196 bought: a caller no longer has to know which
+/// producer it reached. The sentence that used to stand here -- *not for a
+/// membership-change refusal* -- was a documentation guard around
+/// `InvalidConfiguration` carrying two opposite meanings, and it is gone because the
+/// meanings are now two codes.
 /// @param code The refusal.
-/// @return Whether it describes the command or the moment.
+/// @return Whether it describes the command, the moment, or a goal already met.
 [[nodiscard]] constexpr RefusalSubject SubjectOf(ConsensusErrorCode code) noexcept
 {
     return RefusalSubjects[static_cast<std::size_t>(code)].subject;
@@ -145,6 +173,39 @@ struct ConsensusError
 [[nodiscard]] inline ConsensusError InvalidConfiguration(std::string_view context)
 {
     return ConsensusError { .code = ConsensusErrorCode::InvalidConfiguration,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build a `ConfigurationChangeInFlight` error.
+///
+/// A MOMENT, and the whole reason #196 split it out of `InvalidConfiguration`: it
+/// resolves itself the instant the change in flight commits, so a caller that reads
+/// it as permanent reports a healthy cluster as a broken one once per interval.
+/// @param context Which change is in flight, in terms a log line can carry.
+/// @return The error.
+[[nodiscard]] inline ConsensusError ConfigurationChangeInFlight(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::ConfigurationChangeInFlight,
+                            .context = std::string { context },
+                            .knownLeader = std::nullopt };
+}
+
+/// Build a `MembershipUnchanged` error.
+///
+/// Not a fault in either direction: the proposal was well formed and the set it names
+/// is the set already in force, so nothing was appended because nothing needed to be.
+/// It stays an error rather than becoming a success carrying no index, because a
+/// success would have to invent a `Proposal` naming an entry that does not exist --
+/// and `Cluster::NextQuorumChange` never proposes an unchanged set, so the state a
+/// success would force every caller to handle is one production does not reach. What
+/// it is NOT is a refusal an operator should be shown at Warn; `RefusalSubject`
+/// carries that.
+/// @param context The set, in terms a log line can carry.
+/// @return The error.
+[[nodiscard]] inline ConsensusError MembershipUnchanged(std::string_view context)
+{
+    return ConsensusError { .code = ConsensusErrorCode::MembershipUnchanged,
                             .context = std::string { context },
                             .knownLeader = std::nullopt };
 }

@@ -463,6 +463,32 @@ enum class ErrorCode : std::uint8_t
     /// can act on.
     InvalidClusterChange = 0x16,
 
+    /// One membership change is already uncommitted, so this one must wait.
+    ///
+    /// Emphatically NOT `InvalidClusterChange`, and the split is #196: that code
+    /// says the cluster could never accept what was asked, and this one says it
+    /// could and will, shortly. Raft admits one configuration change at a time --
+    /// a second built on a configuration a truncation can still roll back would
+    /// have its safety argument made against a set that never existed -- so this
+    /// is what a healthy cluster answers while a change it already accepted is
+    /// replicating. Under the wrong code an operator is sent to correct a record
+    /// that is already correct, once per reconcile interval.
+    ///
+    /// Retriable, and the ONE code here that is: everything else in this range is
+    /// a refusal the caller stops asking about.
+    ClusterChangeInFlight = 0x1F,
+
+    /// The change asked for is already in force, so nothing was recorded.
+    ///
+    /// Not a failure at either end. `--cluster-admit` naming a member the cluster
+    /// already has is idempotence rather than a mistake, and a reconciler
+    /// proposing a quorum equal to the current one has nothing to do -- so the
+    /// answer an operator needs is "already", never "invalid". It is a distinct
+    /// code rather than a success because no entry was appended and there is
+    /// therefore no index to name; `ConsensusErrorCode::MembershipUnchanged`
+    /// carries the same argument at the layer that decides it.
+    ClusterChangeNotNeeded = 0x20,
+
     /// This endpoint is already serving as much as it will serve at once.
     ///
     /// Emphatically NOT `NoCapacity`, which is a statement about the FLEET -- every
@@ -1286,6 +1312,12 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::InvalidClusterChange,
                       .name = "invalid-cluster-change",
                       .defaultMessage = "the cluster cannot accept that change" },
+    ErrorDescriptor { .code = ErrorCode::ClusterChangeInFlight,
+                      .name = "cluster-change-in-flight",
+                      .defaultMessage = "another cluster change is still committing; ask again shortly" },
+    ErrorDescriptor { .code = ErrorCode::ClusterChangeNotNeeded,
+                      .name = "cluster-change-not-needed",
+                      .defaultMessage = "the cluster is already in that state" },
     ErrorDescriptor { .code = ErrorCode::EndpointBusy,
                       .name = "endpoint-busy",
                       .defaultMessage = "this endpoint is serving all it will serve at once" },

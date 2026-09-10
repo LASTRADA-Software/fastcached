@@ -733,6 +733,23 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   so it presents as an election storm that settles and every *a leader exists
   eventually* test passes under it. `undecided` in a node log is
   `SchedulerRole::Undecided`, not a Raft role.
+- A refusal code carries its own PERMANENCE, and there are THREE answers.
+  `InvalidConfiguration` had two producers meaning opposite things — `Cluster::Validate`
+  for a command nothing could ever apply, and `ProposeMembership` for *a change is
+  already in flight* and *the proposed set is the current one*, both of which clear on
+  their own — so `SubjectOf`, a `constexpr` table that reads as a global fact, was right
+  on one path and wrong on the other, guarded only by a sentence in its own doc and by
+  `ReconcileQuorum` declining to consult it. Wiring it in was the obvious next tidy-up
+  and would have reported *wait for it to commit* as **can never be recorded as it
+  stands**, at Warn, every interval (#196). Two enumerators now, and `WireCodeFor` — an
+  `EnumTable` over the same enum — fails the BUILD until each says what it means on the
+  wire; both new wire codes are UNCOUNTED, one being what a healthy cluster answers
+  mid-replication and the other an idempotent request arriving twice.
+  **`RefusalSubject` gained `Satisfied`**: *already in force* is `Command` reported at
+  Warn as a record to go and correct, or `Moment` abandoning a pass with nothing left to
+  do — both the misleading symptom the classification exists to remove. It stays a
+  refusal rather than a success because a success must name an entry that does not
+  exist, and `NextQuorumChange` never proposes an unchanged set.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.

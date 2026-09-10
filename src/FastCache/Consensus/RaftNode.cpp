@@ -964,12 +964,13 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(st
     // configuration that a truncation can still roll back would have its safety
     // argument made against a set that never existed.
     if (HasUncommittedConfiguration())
-        return std::unexpected { InvalidConfiguration("a membership change is already in flight; wait for it to commit") };
+        return std::unexpected { ConfigurationChangeInFlight(
+            "a membership change is already in flight; wait for it to commit") };
 
     switch (Membership::Classify(_members, members))
     {
         case Membership::ChangeShape::Unchanged:
-            return std::unexpected { InvalidConfiguration("the proposed member set is the current one") };
+            return std::unexpected { MembershipUnchanged("the proposed member set is the current one") };
         case Membership::ChangeShape::Unsafe:
             return std::unexpected { InvalidConfiguration(
                 "only one member may be added or removed at a time; two majorities that share no member "
