@@ -67,6 +67,13 @@ stage() {
     # PERMISSIVE than the thing it stood for, every case here passed, and CI refused
     # a correct tree by name. A staged workflow that agrees with the derivation
     # rather than with the workflow tests the derivation against itself.
+    #
+    # selftest-offer: the `--self-test` below is ANOTHER script's command line, staged
+    # into a fake workflow for this fixture to read back. This file's own self-test is
+    # the `--self-test` case arm further down, which is registered; requiring a second
+    # registration for a flag spelled inside a `printf` would be a false refusal on a
+    # correct tree, and `check-selftest-registered.cmake` refuses a token it cannot
+    # classify rather than passing over it silently (#1220).
     printf 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --self-test\n      - run: bash scripts/tidy-sweep.sh "--only=$WORKFILE"\n' \
         > "$work/.github/workflows/build.yml"
     printf '%s\n' "$1" > "$work/scripts/tidy-blind-spots.txt"
