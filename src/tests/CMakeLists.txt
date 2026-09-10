@@ -5227,3 +5227,102 @@ set_tests_properties("credential-containers-selftest" PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 300
 )
+
+# ---------------------------------------------------------------------------
+# The lane reaper's own self-test (#877, #591).
+#
+# `scripts/reap-my-gate.sh` exists because `pkill -f "local-gate.sh"` matches every
+# lane's gate on this machine -- each worktree runs the same three script names, so a
+# name match is GUARANTEED to hit somebody else's process, and it did twice in one
+# night. The victim's gate then prints neither `LOCAL GATE PASSED` nor `GATE FAILED:`,
+# so it reads as a crash in their own tree rather than as somebody else's kill.
+#
+# **The self-test IS the deliverable here, not evidence for it.** A reaper is defined
+# by what it SPARES, and sparing is invisible: a reaper that killed everything would
+# pass any test asserting only that the target died. So both directions are driven,
+# and the sparing half is driven LIVE -- real processes, a real process table -- since
+# the three traps the script is built around (`pgrep -f` is a regex whose `.` matches a
+# `-`; `pgrep -f` matches its own argv while `ps | grep '[l]...'` does not; two
+# worktrees here are one token apart) are all properties of real tools that a staged
+# table cannot exhibit. The decision function itself is pure and injectable, so the
+# branches no machine can arrange -- a process whose cwd is unreadable, and one that is
+# the reaper's own ancestor -- are driven over staged facts in the same run.
+#
+# Registered with the FLAG PASSED rather than merely with the script named: a
+# registration in the script's plain mode satisfies every grep for coverage and runs no
+# case at all, which is how twelve cases guarding the apt sweep never executed once
+# (#1160). `selftest-registered` refuses the plain shape for exactly that reason.
+#
+# Judged by its EXIT STATUS, like `local-gate-selftest` and `tsan-gate-selftest` above:
+# a shell script chooses its own exit code, so the `cmake -P` rule -- that a verdict is
+# read from OUTPUT because `message(WARNING)` exits 0 -- does not reach it, and
+# `script-check-signals` scopes itself to `cmake -P` registrations accordingly. The
+# `FAIL_REGULAR_EXPRESSION` is therefore REDUNDANT rather than load-bearing, and is
+# here because the two channels cannot disagree by construction: only `_reap_expect`
+# prints that marker, and only on a mismatch that also increments the counter the exit
+# status is taken from. It cannot fire on a healthy run -- the tally line says `failed`
+# in lower case and carries no colon.
+#
+# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and more sharply:
+# this script attributes a process by its ancestry and its cwd, which is a POSIX
+# process table.
+#
+# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, an otherwise loaded six-lane
+# box: 14 cases, 2.69 s wall, no case skipped. `TIMEOUT 60` is the figure its two
+# neighbours carry rather than a new one, and leaves about 22x.
+if(NOT WIN32)
+    add_test(
+        NAME "reap-my-gate-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/reap-my-gate.sh" --self-test
+    )
+    set_tests_properties("reap-my-gate-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "REAP SELF-TEST FAILED:"
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# The worktree-pointer repair's own self-test (#336).
+#
+# `git worktree add` writes ABSOLUTE pointers in the dialect of whichever git created
+# the worktree, so a tree created from Windows is unreadable to WSL git -- which then
+# resolves the two paths CONCATENATED and reports a repository that exists nowhere.
+# `local-gate.sh` needs git for its formatter list, its header-filter census and its
+# test-registration walk, so in such a worktree every one of those answers NOTHING and
+# the compiler-specific defects the gate exists to catch reach CI instead.
+#
+# What the self-test pins that no argument can: the repair is asserted against REAL
+# git, by staging a linked worktree, rewriting both pointers relative, and MOVING the
+# whole arrangement -- because "both gits read it" is a claim about a tool and is
+# checked against the tool. It also pins the direction that looks like a fix and is
+# not: `git worktree repair` rewrites the pointers absolute in the dialect of whichever
+# git runs it, so it reproduces the defect from one side and creates it on the other.
+#
+# And the case with teeth is the last one, which asserts that a repair leaving the tree
+# STILL UNREADABLE refuses -- having written the files. Writing the pointers is not the
+# property; git reading the result is, and a check that stopped at "the files were
+# written" would report success for a worktree nobody can use.
+#
+# Registered with the flag passed, judged by exit status, `if(NOT WIN32)`: all three
+# for the reasons given on `reap-my-gate-selftest` above.
+#
+# The script's two SKIP arms -- no git, and a git that could not stage a linked
+# worktree -- exit 0 having said so on the tally line. That is a `SUCCEED` where a skip
+# belongs, and it is the script's own shape rather than this registration's; it is
+# noted here so the next reader does not mistake a skipped run for a covered one.
+#
+# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04: 23 cases, 0.06 s wall, neither
+# skip arm taken. `TIMEOUT 60` is its neighbours' figure; the margin is enormous and
+# the alternative is inventing a number nobody can check.
+if(NOT WIN32)
+    add_test(
+        NAME "repair-worktree-pointers-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
+    )
+    set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
