@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "RespClient.hpp"
 
+#include <FastCache/Core/NumericText.hpp>
+
 #include <algorithm>
 #include <charconv>
-#include <cmath>
 #include <format>
 #include <limits>
 #include <optional>
@@ -100,11 +101,13 @@ namespace
         if (text == "nan")
             return std::numeric_limits<double>::quiet_NaN();
 
+        // NOT `std::from_chars`: libc++ has no floating-point overload before macOS
+        // 26.0, so that spelling compiles on libstdc++ and MSVC and fails to BUILD on
+        // a macos-14 runner. `ParseFiniteDouble` is the tree's one answer to that, and
+        // it pins the C locale so a host whose LC_NUMERIC is not `.` still reads the
+        // wire format this project's own `std::format` writes.
         double value = 0.0;
-        auto const* const first = text.data();
-        auto const* const last = text.data() + text.size();
-        auto const [ptr, ec] = std::from_chars(first, last, value);
-        if (ec != std::errc {} || ptr != last)
+        if (!ParseFiniteDouble(text, value))
             return std::nullopt;
         return value;
     }
