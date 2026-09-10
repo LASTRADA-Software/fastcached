@@ -1136,14 +1136,22 @@ TEST_CASE("A compiler this worker cannot classify refuses the JOB, not its argum
     job.fingerprint = "mystery";
     auto const empty = jobs.Run(job);
     REQUIRE_FALSE(empty.has_value());
-    CHECK(empty.error() == JobRefusal::SpawnFailed);
+    CHECK(empty.error() == JobRefusal::CompilerUnclassified);
     CHECK(runner.Argv().empty()); // and nothing was spawned
+
+    // NOT `SpawnFailed`, which is where this was answered until #264. Asserting the
+    // enumerator alone would pass under either, since both refuse the job and neither
+    // spawns anything -- so what is pinned is that it is not the other one. A worker
+    // that cannot RUN its compiler and one that cannot NAME it are two operator
+    // problems with two remedies.
+    CHECK(empty.error() != JobRefusal::SpawnFailed);
 
     // The same answer with arguments present, rather than the argument being blamed.
     job.args = { "-O2" };
     auto const withArgs = jobs.Run(job);
     REQUIRE_FALSE(withArgs.has_value());
-    CHECK(withArgs.error() == JobRefusal::SpawnFailed);
+    CHECK(withArgs.error() == JobRefusal::CompilerUnclassified);
+    CHECK(withArgs.error() != JobRefusal::RejectedArgument);
 }
 
 TEST_CASE("A refusal names the offending argument without echoing arbitrary bytes", "[compile-job]")

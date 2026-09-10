@@ -351,6 +351,19 @@ jobs:
           git ls-files '*.h' '*.hpp' '*.cpp' \
             | xargs clang-format-${{ env.CLANG_TOOLS_VERSION }} --dry-run --Werror --style=file
 
+      # Here rather than only as a ctest, because this is the one job that installs
+      # the pinned clang-format. Registered as a ctest too, where it SKIPS on a host
+      # without that formatter -- and every build leg is such a host, so the ctest
+      # alone would mean the check never actually ran anywhere (#1135).
+      #
+      # `bash <path>`, never a bare path: inside a check that can refuse, a failure to
+      # START is indistinguishable from the rule firing.
+      - name: "Check the windows.h include category"
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: |
+          bash scripts/run-check.sh scripts/check-windows-header-order.sh "$GITHUB_WORKSPACE"
+          bash scripts/run-check.sh scripts/check-windows-header-order.sh --self-test "$GITHUB_WORKSPACE"
+
   # The release job gates on every other job in this workflow, and that list is
   # hand-written. This is what keeps it honest — and it runs on every push and
   # pull request, not only on a tag: the mistake it catches (adding a job and

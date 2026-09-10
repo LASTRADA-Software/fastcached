@@ -329,6 +329,34 @@ TEST_CASE("NodeToolchains: a discovered compiler is not re-parsed as an override
     CHECK(Unwrap(resolved).begin()->first != "/opt/gcc");
 }
 
+TEST_CASE("NodeToolchains: an unclassifiable compiler is named at survey time", "[node][toolchains]")
+{
+    // #264's third acceptance bullet. Such a toolchain refuses every job it is
+    // offered, and until this the only trace was a per-job refusal a client saw and
+    // an operator did not.
+    //
+    // The WARNING and the SILENCE are asserted together, because either alone passes
+    // under a constant answer: a logger that warns about everything satisfies the
+    // first, and one that warns about nothing satisfies the second. Same rule the
+    // scratch-root mapping warnings are held to.
+    NodeConfig const cfg = Startable();
+    SpawnScript runner;
+    ScriptedToolchainHost host;
+    ScopedStateDir const state;
+
+    CapturingLogger unclassifiable;
+    FixedDiscovery weird { { Candidate("/opt/weird/xlc") } };
+    REQUIRE(ResolveToolchains(cfg, &weird, runner, host, TestClock(), unclassifiable).has_value());
+    CHECK(Logged(unclassifiable, "cannot classify /opt/weird/xlc"));
+
+    // The same survey over a compiler this build DOES know says nothing, so the line
+    // above is about the compiler rather than about surveying.
+    CapturingLogger known;
+    FixedDiscovery gnu { { Candidate("/opt/real/g++") } };
+    REQUIRE(ResolveToolchains(cfg, &gnu, runner, host, TestClock(), known).has_value());
+    CHECK_FALSE(Logged(known, "cannot classify"));
+}
+
 TEST_CASE("NodeToolchains: the two halves compose into what the whole survey answers", "[node][toolchains]")
 {
     // The split is by COST, not by policy (#365): node startup runs the cheap half

@@ -1332,10 +1332,12 @@ std::expected<CompileOutcome, JobError> CompileJobRunner::Run(CompileJob const& 
     // at the fleet's *flags* when the answer is this node's `--toolchain`. And a job
     // with an EMPTY argument list has nothing to refuse, so it would sail past the
     // loop and spawn a driver whose command-line dialect this worker does not know.
-    // `SpawnFailed` is the honest existing answer -- "this worker is broken, compile
-    // it elsewhere" -- and it carries the wire code and the counter that say so.
+    // Its OWN reason since #264. `SpawnFailed` was the honest answer while this had
+    // no wire code and no counter of its own -- right for the client, which compiles
+    // elsewhere either way, and wrong for the operator, who was sent to check a path
+    // when the fault is a toolchain this build cannot classify.
     if (family == DriverFamily::None)
-        return std::unexpected(JobError { .reason = JobRefusal::SpawnFailed,
+        return std::unexpected(JobError { .reason = JobRefusal::CompilerUnclassified,
                                           .detail = "this worker's configured compiler matches no known driver "
                                                     "family, so its command line cannot be built safely" });
 

@@ -15,6 +15,12 @@
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
+
+/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+namespace
+{
+FastCache::NullLogger membershipLog;
+}
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
 
@@ -176,7 +182,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         NodeConfig cfg;
         cfg.nodeId = "n1";
         cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
-        NodeMembership membership { cfg };
+        NodeMembership membership { cfg, membershipLog };
 
         auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, logger);
         REQUIRE(tier.has_value());
@@ -187,7 +193,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
     {
         NodeConfig cfg;
         cfg.raftListen = "6680";
-        NodeMembership membership { cfg };
+        NodeMembership membership { cfg, membershipLog };
 
         // Refused, and refused by NAME: a null tier here would mean the gate is still
         // reading the id, and any other refusal would mean it got somewhere this test

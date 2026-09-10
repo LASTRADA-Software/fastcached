@@ -31,6 +31,12 @@
 // passing, and every other case is about narrowing.
 
 using namespace FastCache;
+
+/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+namespace
+{
+FastCache::NullLogger membershipLog;
+}
 using namespace FastCache::Node;
 
 namespace
@@ -121,7 +127,7 @@ TEST_CASE("A member removed from the file is refused after the reload", "[node][
     auto const path = WriteConfig(scratch.Path(), "fleet_member: 10.0.0.8\n");
 
     auto const initial = RunningNode({ std::string { Revoked }, "10.0.0.8" });
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
@@ -155,7 +161,7 @@ TEST_CASE("A member added to the file is admitted after the reload", "[node][mem
     auto const path = WriteConfig(scratch.Path(), std::format("fleet_member: 10.0.0.8\nfleet_member: {}\n", Revoked));
 
     auto const initial = RunningNode({ "10.0.0.8" });
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
@@ -181,7 +187,7 @@ TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reloa
     auto const path = WriteConfig(scratch.Path(), "fleet_open: false\n");
 
     auto const initial = RunningNode({}, /*open=*/true);
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
@@ -214,7 +220,7 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
 
     auto const initial = RunningNode();
     REQUIRE(initial.clusterKeyFile.empty());
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
 
@@ -280,7 +286,7 @@ TEST_CASE("Narrowing is allowed on a keyless node, which is the direction that c
     auto const path = WriteConfig(scratch.Path(), "");
 
     auto const initial = RunningNode({ std::string { Revoked } });
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
@@ -357,7 +363,7 @@ TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][
     auto const path = WriteConfig(scratch.Path(), "");
 
     auto const initial = RunningNode({ std::string { Revoked } });
-    NodeMembership membership { initial };
+    NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;

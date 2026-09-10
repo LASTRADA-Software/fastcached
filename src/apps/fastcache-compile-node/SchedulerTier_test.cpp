@@ -17,6 +17,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 using namespace FastCache;
+
+/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+namespace
+{
+FastCache::NullLogger membershipLog;
+}
 using namespace FastCache::Node;
 
 namespace
@@ -78,7 +84,7 @@ TEST_CASE("A clustered scheduler does not claim leadership before consensus repo
     // input it does not yet have.
     TierFixture fix;
     auto const cfg = ClusteredNode();
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
 
     auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
     REQUIRE(tier.has_value());
@@ -97,7 +103,7 @@ TEST_CASE("Consensus reporting leadership is what makes a clustered scheduler le
     // one seam consensus drives, and the term arrives with it.
     TierFixture fix;
     auto const cfg = ClusteredNode();
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
 
     auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
     REQUIRE(tier.has_value());
@@ -118,7 +124,7 @@ TEST_CASE("A node leading alone still leads from the moment it starts", "[node][
     // coming.
     TierFixture fix;
     auto const cfg = LoneNode();
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
 
     auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
     REQUIRE(tier.has_value());
@@ -146,7 +152,7 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         cfg.scheduler = "127.0.0.1:6675";
         cfg.serveScheduler = true;
         cfg.raftListen = "127.0.0.1:6680";
-        NodeMembership membership { cfg };
+        NodeMembership membership { cfg, membershipLog };
 
         auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
         REQUIRE(tier.has_value());
@@ -162,7 +168,7 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         cfg.scheduler = "127.0.0.1:6675";
         cfg.serveScheduler = true;
         cfg.nodeId = "n1";
-        NodeMembership membership { cfg };
+        NodeMembership membership { cfg, membershipLog };
 
         auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
         REQUIRE(tier.has_value());

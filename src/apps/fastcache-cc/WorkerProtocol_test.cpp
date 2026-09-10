@@ -897,11 +897,24 @@ TEST_CASE("A compile is counted from start to finish", "[worker-protocol][metric
 
     // No refusal was counted anywhere. A job that ran must not also appear as one
     // that did not, which is what a counter incremented on every exit path does.
-    for (auto const counter: { Sink::WorkerJobsRefusedUnknownFingerprint,
-                               Sink::WorkerJobsRefusedRejectedArgument,
-                               Sink::WorkerJobsRefusedScratchUnavailable,
-                               Sink::WorkerJobsRefusedSpawnFailed })
-        CHECK(fix.metrics.Read(counter) == 0);
+    // DERIVED from the catalog rather than written out. It was a list of four, and
+    // #264 added a fifth refusal counter -- a list keeps checking the four it names
+    // and passes, silent about the reason it does not know, which is the guard shape
+    // `RowsInEnumeratorOrder` exists to reject.
+    std::size_t refusalCounters = 0;
+    for (auto const& row: FastCache::CounterTable)
+    {
+        if (!row.prometheusName.starts_with("fastcache_worker_jobs_refused_"))
+            continue;
+        ++refusalCounters;
+        INFO("counter " << row.prometheusName);
+        CHECK(fix.metrics.Read(row.counter) == 0);
+    }
+
+    // A positive control on the derivation: a prefix that matched nothing would make
+    // the loop above vacuous and this case would pass having checked no counter at
+    // all -- the exact way a zero-row scan reads as complete coverage.
+    CHECK(refusalCounters >= 5);
 }
 
 TEST_CASE("A refusal is counted under its own reason", "[worker-protocol][metrics]")

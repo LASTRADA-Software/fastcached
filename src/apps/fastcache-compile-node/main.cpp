@@ -657,7 +657,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Not `const`: consensus republishes the member set into it while the node runs,
     // which is the whole point of membership being a replicated log entry rather than
     // a command-line list.
-    Node::NodeMembership membership { cfg };
+    Node::NodeMembership membership { cfg, logger };
 
     // The lease a client presents is CHECKED here, and membership is not a substitute
     // for it. `WorkerServer` gates the port on the member oracle, so what reaches

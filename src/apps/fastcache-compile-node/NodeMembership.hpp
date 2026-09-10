@@ -3,11 +3,14 @@
 
 #include "NodeConfig.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -102,13 +105,20 @@ class NodeMembership final: public Distributed::IMembershipOracle
 {
   public:
     /// @param cfg The parsed configuration.
-    explicit NodeMembership(NodeConfig const& cfg):
+    /// @param logger Where the keyless-widening refusal is reported, once.
+    NodeMembership(NodeConfig const& cfg, ILogger& logger):
         _open {},
         _listed { cfg.fleetMembers },
         _cluster {},
         // Pointers into this object's own members, which is safe because the type is
         // neither copyable nor movable and the composite is declared after both.
         _admitted { { &_listed, &_cluster } },
+        _logger { logger },
+        // FIXED for this process. `--cluster-key-file` carries `.same` and no
+        // `.reloadable`, so it cannot change under a running node -- which is what
+        // lets the widening guard below read it once rather than re-ask per commit.
+        _keyless { cfg.clusterKeyFile.empty() },
+        _flagOpen { cfg.fleetOpen },
         _isOpen { cfg.fleetOpen }
     {
     }
@@ -147,7 +157,8 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// @param cfg The configuration just adopted.
     void Adopt(NodeConfig const& cfg)
     {
-        _isOpen.store(cfg.fleetOpen, std::memory_order_relaxed);
+        _flagOpen.store(cfg.fleetOpen, std::memory_order_relaxed);
+        SettleOpenness();
         _listed.Publish(cfg.fleetMembers);
     }
 
@@ -173,8 +184,38 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// machine, which is what this seam was for; it simply no longer costs the
     /// operator's own answer to get that.
     ///
+    /// It also reads the cluster's `fleet-open` row, which is why it takes the STATE
+    /// rather than the endpoint list (#1112). That row was accepted, replicated,
+    /// snapshotted and carried across restarts while changing no admission decision,
+    /// because admission read the flag and nothing read the row -- the failure
+    /// `SettingTable`'s own header describes, one step past the typo `FindSetting`
+    /// guards. Two publishers, one per question, would put the openness half on a
+    /// second call somebody can forget; one seam settles both, in `Adopt`'s order.
+    ///
     /// Safe to call from the consensus thread while surfaces classify callers on
     /// theirs.
+    /// @param state The cluster state as of the latest commit.
+    void PublishCluster(Cluster::ClusterState const& state)
+    {
+        // The flag BEFORE the list, exactly as `Adopt` settles them, and for its
+        // reason: each half is individually atomic, so what the order decides is
+        // which stale half a request between them may read.
+        _agreedOpen.store(AgreedOpenness(state), std::memory_order_relaxed);
+        SettleOpenness();
+        Publish(state.Endpoints());
+    }
+
+    /// Record the cluster's member set alone.
+    ///
+    /// The member-set HALF of `PublishCluster`, and deliberately still reachable: it
+    /// is what the member-set cases assert against, and splitting it out keeps those
+    /// cases about routing rather than about settings.
+    ///
+    /// **No production caller may use it, and none can**: the only one is consensus,
+    /// whose observer is handed a `ClusterState` and therefore has no endpoint list to
+    /// pass. That is what stops this being the second publisher somebody forgets the
+    /// openness half on -- the seam's TYPE refuses the mistake rather than a comment
+    /// asking people not to make it.
     /// @param endpoints The cluster's members, as `host:port`.
     void Publish(std::vector<std::string> const& endpoints)
     {
@@ -206,6 +247,122 @@ class NodeMembership final: public Distributed::IMembershipOracle
     }
 
   private:
+    /// What the cluster's `fleet-open` row says.
+    ///
+    /// A named enumeration rather than `-1`/`0`/`1`, because the encoding is the part
+    /// that is easy to get wrong: the comment below explains WHY absence is not
+    /// closed, and this is what stops a reader having to remember it. `std::int8_t`
+    /// so the atomic below is lock-free everywhere this builds.
+    /// Each enumerator names what was OBSERVED, never what it was concluded to mean.
+    /// `NoRow` and `Unreadable` resolve to the same ANSWER -- this node's own flag --
+    /// and are still two enumerators, because they are two different facts about the
+    /// cluster: nobody has set it, against somebody has set it to something this build
+    /// cannot read. Folding them would make the second unreportable, and the second is
+    /// the one that says a NEWER build is writing this row mid rolling upgrade.
+    enum class AgreedOpen : std::int8_t
+    {
+        NoRow,      ///< The state carries no `fleet-open` row at all.
+        Unreadable, ///< A row is present and its value is neither `'1'` nor `'0'`.
+        Closed,     ///< The row says `'0'`: members only.
+        Open,       ///< The row says `'1'`: admit every caller.
+    };
+
+    /// What the cluster's `fleet-open` row says, as a tri-state.
+    ///
+    /// `Absent` is not `Closed`. *Nobody has said* and *somebody said no* are
+    /// different facts, and reading the first as the second would close a node whose
+    /// operator opened it locally, using a default nobody chose -- the admission-layer
+    /// spelling of *absence from `ClusterState` is not removal*. A tri-state rather
+    /// than `std::optional<bool>` because this is written on the consensus thread and
+    /// read on every surface's, and an optional is not lock-free.
+    /// @param state The state to read.
+    /// @return What the row says, or `Absent` when there is none this build can read.
+    [[nodiscard]] static AgreedOpen AgreedOpenness(Cluster::ClusterState const& state)
+    {
+        auto const configured = state.SettingOf(Cluster::FleetOpenSetting);
+        if (!configured.has_value())
+            return AgreedOpen::NoRow;
+
+        // The row's own documented grammar: `'1' to admit every caller, '0' for
+        // members only`. Anything else is a value this build cannot act on, and it
+        // resolves to ABSENCE rather than to either answer -- guessing `open` would
+        // widen admission on a typo, and guessing `closed` would silently override a
+        // local flag. `Validate` refuses such a value on the leader before the append,
+        // so reaching this needs a NEWER build with a wider grammar, mid rolling
+        // upgrade; falling back to the flag is what degrades rather than breaks.
+        if (*configured == "1")
+            return AgreedOpen::Open;
+        if (*configured == "0")
+            return AgreedOpen::Closed;
+        return AgreedOpen::Unreadable;
+    }
+
+    /// Recompute the effective answer from the flag and the cluster's row.
+    void SettleOpenness()
+    {
+        auto const agreed = _agreedOpen.load(std::memory_order_relaxed);
+        auto const flag = _flagOpen.load(std::memory_order_relaxed);
+
+        // Absence resolves to the FLAG, never to closed. See `AgreedOpenness`.
+        if (agreed == AgreedOpen::NoRow)
+        {
+            _isOpen.store(flag, std::memory_order_relaxed);
+            return;
+        }
+
+        // So does a value this build cannot read -- and unlike absence it is worth
+        // saying once, because it means a NEWER build is writing this row while this
+        // one is still running. Same shape as `AgreedLeaseLifetime`'s fallback (#522):
+        // serving under the local answer degrades, refusing every caller would take
+        // the node down for an upgrade rather than for a fault.
+        if (agreed == AgreedOpen::Unreadable)
+        {
+            if (!_warnedUnreadable.exchange(true, std::memory_order_relaxed))
+                _logger.Logf(LogLevel::Warn,
+                             "this cluster's {} is set to something this build cannot read, so this node is using "
+                             "its own --fleet-open setting until it is set to '1' or '0'",
+                             Cluster::FleetOpenSetting);
+            _isOpen.store(flag, std::memory_order_relaxed);
+            return;
+        }
+
+        auto const wanted = agreed == AgreedOpen::Open;
+
+        // **A keyless node refuses to WIDEN, and narrows freely** -- #282 arriving
+        // through a door the reload guard cannot watch. `ValidateNodeReloadable`
+        // already refuses this transition when an OPERATOR acts on this machine,
+        // because a node with no `--cluster-key-file` built an unchecked lease
+        // validator at startup and `MakeWorkerLeaseValidator` has already run. A
+        // replicated row does the same thing with **no action on this node at all**,
+        // so that guard's own reasoning applies with more force while none of its code
+        // runs.
+        //
+        // Asked as a TRANSITION, like the reload rule: a keyless node its operator has
+        // already opened is running happily today and may stay open. Only the widening
+        // is refused, and the node then stays CLOSED while the cluster says open --
+        // a divergence that fails closed and says so, which is the direction this
+        // whole path exists to choose.
+        //
+        // **It cannot move to the leader, and that is not tidiness left undone.** The
+        // leader would have to refuse `--cluster-set fleet-open=1` for the whole
+        // cluster on account of one member, and it cannot know whether any other
+        // member is keyless -- nothing replicates that, and nothing should.
+        if (wanted && !flag && _keyless)
+        {
+            if (!_warnedKeyless.exchange(true, std::memory_order_relaxed))
+                _logger.Logf(LogLevel::Warn,
+                             "this cluster has agreed {}=1, and this node has no --cluster-key-file, so it is "
+                             "STAYING CLOSED: it built a lease check at startup that verifies nothing, which is "
+                             "only safe while no machine but this one is admitted. Give --cluster-key-file and "
+                             "restart to join the open fleet.",
+                             Cluster::FleetOpenSetting);
+            _isOpen.store(false, std::memory_order_relaxed);
+            return;
+        }
+
+        _isOpen.store(wanted, std::memory_order_relaxed);
+    }
+
     Distributed::OpenMembership _open;
 
     /// What `--fleet-member` named. Replaced wholesale by `Adopt` on an accepted
@@ -220,6 +377,30 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// which it borrows.
     Distributed::AnyOfMembership _admitted;
 
+    /// Where the keyless-widening refusal is reported, once.
+    ILogger& _logger;
+
+    /// Whether this node started with no `--cluster-key-file`. Fixed for the process;
+    /// see the constructor.
+    bool _keyless;
+
+    /// Whether this node has already said so once, so a cluster that stays open does
+    /// not fill the log with one line per commit.
+    std::atomic<bool> _warnedKeyless { false };
+
+    /// What `--fleet-open` says on THIS node. Separate from `_isOpen` since #1112,
+    /// which is the whole shape of that ticket: the effective answer is now a
+    /// function of two inputs, and keeping the local one is what lets absence resolve
+    /// to it and what makes the widening guard a TRANSITION rather than a state.
+    std::atomic<bool> _flagOpen;
+
+    /// Whether this node has already reported an unreadable row, so a cluster that
+    /// keeps one does not fill the log with a line per commit.
+    std::atomic<bool> _warnedUnreadable { false };
+
+    /// What the cluster's `fleet-open` row says; see `AgreedOpenness`.
+    std::atomic<AgreedOpen> _agreedOpen { AgreedOpen::NoRow };
+
     /// Whether `--fleet-open` is in force.
     ///
     /// Atomic since #405, because it is no longer fixed at construction: a reload may
@@ -227,6 +408,10 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// ordering is enough -- it guards nothing but itself, and the list beside it
     /// carries its own lock -- and the branch is one predictable test on a path that
     /// already crosses a network.
+    ///
+    /// DERIVED since #1112, by `SettleOpenness`, from `_flagOpen` and `_agreedOpen`.
+    /// Nothing else writes it, so the two inputs cannot reach the surfaces by
+    /// different routes.
     std::atomic<bool> _isOpen;
 };
 

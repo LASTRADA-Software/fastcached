@@ -52,3 +52,11 @@ perf.data*
 # further down is somebody else's and not this rule's to hide.
 /utf8-argv-*.out
 /utf8-argv-*.err
+
+# `check-windows-header-order.sh --self-test` writes a neutered copy of the
+# configuration beside the real one, so that clang-format resolves the same
+# `--style=file` search it would for a real source file, and removes it on a trap.
+# A SIGKILL skips that trap, and the leftover would dirty the tree for whichever
+# lane looks next -- confusingly, since it is named like the file it is not.
+# Anchored to the root: this pattern is only ever created there.
+/.clang-format-neutered.*

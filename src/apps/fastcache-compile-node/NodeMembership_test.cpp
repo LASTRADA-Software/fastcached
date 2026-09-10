@@ -7,6 +7,12 @@
 #include <vector>
 
 using namespace FastCache;
+
+/// `NodeMembership` reports the keyless-widening refusal here; no case asserts on it.
+namespace
+{
+FastCache::NullLogger membershipLog;
+}
 using namespace FastCache::Node;
 using FastCache::Distributed::Membership;
 
@@ -26,7 +32,7 @@ TEST_CASE("A membership commit does not revoke the hosts an operator listed", "[
     cfg.nodeId = "node-a";
     cfg.fleetMembers = { "10.0.0.1:6676" };
 
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
     REQUIRE(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
 
     // Exactly what the observer in `StartConsensusOrExplain` hands over: whatever
@@ -60,7 +66,7 @@ TEST_CASE("An open node stays open across a membership commit", "[node][membersh
     cfg.nodeId = "node-a";
     cfg.fleetOpen = true;
 
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
     REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
 
     membership.Publish({ "10.0.0.7:7000" });
@@ -92,7 +98,7 @@ TEST_CASE("A forgotten host listed by --fleet-member is STILL admitted, and that
     // The dangerous arrangement: named by the operator AND agreed by the cluster.
     cfg.fleetMembers = { "10.0.0.1:6676" };
 
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
     membership.Publish({ "10.0.0.1:6676", "10.0.0.7:7000" });
     REQUIRE(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
 
@@ -129,10 +135,146 @@ TEST_CASE("Under --fleet-open a forget revokes nothing at all", "[node][membersh
     cfg.fleetOpen = true;
     cfg.fleetMembers = { "10.0.0.1:6676" };
 
-    NodeMembership membership { cfg };
+    NodeMembership membership { cfg, membershipLog };
     REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
 
     membership.Publish({});
     CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
     CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
+}
+
+/// A cluster state carrying one `fleet-open` value and no members.
+/// @param value What the row says, exactly as an operator typed it.
+/// @return The state.
+[[nodiscard]] static FastCache::Cluster::ClusterState OpenSetTo(std::string value)
+{
+    FastCache::Cluster::ClusterState state;
+    state.settings.push_back({ .name = std::string { FastCache::Cluster::FleetOpenSetting }, .value = std::move(value) });
+    return state;
+}
+
+TEST_CASE("The cluster's fleet-open row opens a node whose flag did not", "[node][membership]")
+{
+    // #1112's DISCRIMINATOR: red before, green after. `--cluster-set fleet-open=1`
+    // was accepted, replicated, snapshotted and survived restarts while changing no
+    // admission decision, because admission read the flag and nothing read the row.
+    //
+    // What a test asserting the row was ACCEPTED would prove is nothing -- that
+    // passes on the broken build, which is the whole complaint. The decision is the
+    // subject, so the assertion is a stranger being admitted.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+    REQUIRE_FALSE(cfg.fleetOpen);
+
+    NodeMembership membership { cfg, membershipLog };
+    REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+
+    membership.PublishCluster(OpenSetTo("1"));
+
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+}
+
+TEST_CASE("A node with no cluster row keeps its own flag, and an unset row is not a no", "[node][membership]")
+{
+    // The ACCEPT direction, and the case that fails if the fix over-corrects: a fix
+    // that made admission read the row and refuse whenever it is absent would pass
+    // every refusal case in this file and fail here. `Absence from ClusterState is
+    // not removal` is the rule, one layer up from the members it was written for --
+    // *nobody has said* and *somebody said no* are different facts, and reading the
+    // first as the second closes a node its operator opened with a default nobody
+    // chose.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetMembers = { "10.0.0.1:6676" };
+    cfg.fleetOpen = true;
+
+    NodeMembership membership { cfg, membershipLog };
+    REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+
+    // A commit that names members and says nothing about openness.
+    membership.PublishCluster(FastCache::Cluster::ClusterState {});
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+
+    // And the ordinary policy still works on a closed node: the listed host is
+    // admitted and a stranger is not. A fix that read the row and refused everybody
+    // is green on any refusal-only assertion and red on this one.
+    NodeConfig closed;
+    closed.nodeId = "node-b";
+    closed.fleetMembers = { "10.0.0.1:6676" };
+
+    NodeMembership shut { closed, membershipLog };
+    shut.PublishCluster(FastCache::Cluster::ClusterState {});
+    CHECK(shut.Oracle().Classify("10.0.0.1") == Membership::Member);
+    CHECK(shut.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+}
+
+TEST_CASE("The cluster may CLOSE a node its flag opened", "[node][membership]")
+{
+    // Narrowing is always safe and always applies, which is what makes the widening
+    // guard below an asymmetry rather than a refusal to read the row at all.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetOpen = true;
+
+    NodeMembership membership { cfg, membershipLog };
+    REQUIRE(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
+
+    membership.PublishCluster(OpenSetTo("0"));
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+}
+
+TEST_CASE("A keyless node refuses to be WIDENED by the cluster, and still narrows", "[node][membership]")
+{
+    // #282 through a door the reload guard cannot watch. `ValidateNodeReloadable`
+    // refuses this transition when an OPERATOR acts on the machine; a replicated row
+    // does the same with no action on this node at all, so that guard's reasoning
+    // applies with more force while none of its code runs.
+    //
+    // The node stays CLOSED while the cluster says open. That divergence is the
+    // point: it fails closed, and it is reported.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetMembers = { "10.0.0.1:6676" };
+    REQUIRE(cfg.clusterKeyFile.empty());
+    REQUIRE_FALSE(cfg.fleetOpen);
+
+    NodeMembership membership { cfg, membershipLog };
+    membership.PublishCluster(OpenSetTo("1"));
+
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+    CHECK(membership.Oracle().Classify("10.0.0.1") == Membership::Member);
+
+    // Asked as a TRANSITION, so a keyless node its operator already opened is
+    // running happily today and stays open -- refusing that would break the nodes
+    // this guard exists to protect.
+    NodeConfig opened;
+    opened.nodeId = "node-b";
+    opened.fleetOpen = true;
+    REQUIRE(opened.clusterKeyFile.empty());
+
+    NodeMembership already { opened, membershipLog };
+    already.PublishCluster(OpenSetTo("1"));
+    CHECK(already.Oracle().Classify("10.9.9.9") == Membership::Member);
+
+    // And narrowing still reaches a keyless node: only the widening is refused.
+    NodeMembership shut { opened, membershipLog };
+    shut.PublishCluster(OpenSetTo("0"));
+    CHECK(shut.Oracle().Classify("10.9.9.9") == Membership::Outsider);
+}
+
+TEST_CASE("A row value this build cannot read falls back to the flag", "[node][membership]")
+{
+    // `Validate` refuses such a value on the leader before the append, so reaching
+    // this needs a NEWER build with a wider grammar mid rolling upgrade. Guessing
+    // `open` would widen admission on a typo; guessing `closed` would override a
+    // local flag. Absence is the only answer that does neither.
+    NodeConfig cfg;
+    cfg.nodeId = "node-a";
+    cfg.fleetOpen = true;
+    cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+
+    NodeMembership membership { cfg, membershipLog };
+    membership.PublishCluster(OpenSetTo("yes"));
+    CHECK(membership.Oracle().Classify("10.9.9.9") == Membership::Member);
 }

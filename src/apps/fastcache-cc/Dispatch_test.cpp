@@ -650,6 +650,17 @@ TEST_CASE("A decline says WHICH kind, from either end of the fleet", "[dispatch]
     auto const refused = Dispatch(workerRefusing, Request(args));
     REQUIRE(refused.status == DispatchStatus::Declined);
     CHECK(refused.decline == DeclineCause::WorkerRefused);
+
+    // #264's acceptance says the CLIENT's behaviour does not change. That is asserted
+    // as an EQUALITY with the code this split off from, not merely as `WorkerRefused`
+    // -- the point is that a launcher meeting either compiles locally, so grading the
+    // new one differently would change what builds do to deliver a metrics fix.
+    CHECK(DeclineCauseFor(Wire::ErrorCode::WorkerCompilerUnclassified)
+          == DeclineCauseFor(Wire::ErrorCode::WorkerSpawnFailed));
+
+    // And that it is not `Unrecognised`, which is what a missing row looks like and
+    // reads as a peer from the future rather than this build forgetting one.
+    CHECK(DeclineCauseFor(Wire::ErrorCode::WorkerCompilerUnclassified) != DeclineCause::Unrecognised);
     CHECK(refused.decline != noWorker);
 }
 

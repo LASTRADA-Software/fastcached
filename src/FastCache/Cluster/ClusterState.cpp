@@ -131,15 +131,14 @@ std::optional<Command> DecodeCommand(std::span<std::byte const> payload)
     // lacks, and applying it as whichever enumerator it happens to alias would
     // change the cluster's state in a way nobody wrote down.
     //
-    // Bounded by the enum's own count rather than by its last enumerator BY NAME.
-    // The two agree today and stop agreeing the moment a verb is appended: the
-    // name-anchored form then refuses the new verb, on a peer that understands it
-    // perfectly, and says nothing about why.
-    auto const kindRaw = static_cast<std::size_t>(header[1]);
-    if (kindRaw >= EnumeratorCount<CommandKind>)
+    // Through `DecodeWireEnum` rather than an open-coded bound, which is what this
+    // used to be (#197). Why the bound is derived rather than named is documented
+    // once, on that function; restating it here is how the two drift.
+    auto const kind = Consensus::DecodeWireEnum<CommandKind>(static_cast<std::uint8_t>(header[1]));
+    if (!kind.has_value())
         return std::nullopt;
 
-    return Command { .kind = static_cast<CommandKind>(kindRaw),
+    return Command { .kind = *kind,
                      .key = std::string { WireFields::AsStringView((*fields)[1]) },
                      .value = std::string { WireFields::AsStringView((*fields)[2]) },
                      .schedulerEndpoint = std::string { WireFields::AsStringView((*fields)[3]) } };

@@ -21,8 +21,9 @@
 #include <vector>
 
 #if defined(_WIN32)
-    #include <aclapi.h>
     #include <windows.h>
+
+    #include <aclapi.h>
 #elif defined(__APPLE__)
     #include <sys/resource.h>
     #include <sys/stat.h>

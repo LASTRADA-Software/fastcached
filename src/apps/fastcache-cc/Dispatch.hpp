@@ -421,6 +421,13 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnsupportedCodec, .cause = DeclineCause::ProtocolMismatch },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerScratchUnavailable, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerSpawnFailed, .cause = DeclineCause::WorkerRefused },
+    // The SAME cause as the row above, deliberately: #264 split the operator's view
+    // and left the client's alone. A launcher meeting either compiles locally, and a
+    // row that graded this one differently would change what builds do to deliver a
+    // metrics fix. Present rather than absent so it does not arrive `Unrecognised`,
+    // which reads as a code this build has never heard of.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::WorkerCompilerUnclassified,
+                      .cause = DeclineCause::WorkerRefused },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotLeader, .cause = DeclineCause::NoLeader },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotAMember, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Withdrawn, .cause = DeclineCause::Withdrawn },

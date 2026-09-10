@@ -249,6 +249,22 @@ namespace
                 logger.Logf(NarrationLevel(voice), "read the compiler banner for {}", entry.compiler);
                 auto const flavor = Cc::ClassifyCompiler(entry.compiler);
                 auto const& spec = Cc::DriverOf(flavor);
+
+                // Said once, here, rather than once per job (#264). A compiler whose
+                // driver family is `None` has no argument grammar this build can
+                // write, so `CompileJobRunner` refuses every job offered to it --
+                // correctly, and where only a client can see it. The fault is this
+                // node's configuration and the moment to report it is the one where
+                // the configuration is being read.
+                //
+                // `Warn` and not `Error`: the survey goes on, the toolchain is still
+                // registered, and a node serving three compilers of which one is
+                // unclassifiable is a node that works for the other two.
+                if (spec.family == Cc::DriverFamily::None)
+                    logger.Logf(LogLevel::Warn,
+                                "cannot classify {} as any known driver, so every compile dispatched to it will be "
+                                "refused (worker-compiler-unclassified); check this node's --toolchain",
+                                entry.compiler);
                 fingerprints[index].identity =
                     Cc::CachedToolchainFingerprint(runner, host, entry.compiler, banner, spec, announcing);
                 logger.Logf(NarrationLevel(voice), "computed the toolchain fingerprint for {}", entry.compiler);

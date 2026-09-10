@@ -841,7 +841,7 @@ void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
     // The member set reaches the fleet's oracle from here, so admitting a peer and
     // serving it are one decision rather than two facts that can disagree.
     if (_onMembers)
-        _onMembers(state.Endpoints());
+        _onMembers(state);
 
     // And the leader's ADDRESS may have just arrived, which is a different answer
     // from the role this node already knew.
@@ -933,13 +933,19 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
-        [&membership](std::vector<std::string> const& endpoints) {
+        [&membership](Cluster::ClusterState const& state) {
             // The replicated member set joins the fleet's admission policy, so a node
             // the cluster agreed to admit is served by every surface at once. It does
             // not *become* that policy: `--fleet-member` answers a different question
             // -- who may spend this node's CPU, clients included -- and survives every
             // commit (#251).
-            membership.Publish(endpoints);
+            //
+            // The whole STATE, because the `fleet-open` row is an admission decision
+            // too and had no reader at all until #1112. `NodeMembership` resolves it
+            // against this node's own flag rather than the resolution happening here:
+            // the widening guard needs to be inside the oracle, which is the object
+            // every surface bound at construction (#405).
+            membership.PublishCluster(state);
         },
         logger);
 

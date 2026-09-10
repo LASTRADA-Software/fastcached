@@ -5,8 +5,9 @@
     #include <cstdlib>
     #include <initializer_list>
 
-    #include <crtdbg.h>
     #include <windows.h>
+
+    #include <crtdbg.h>
 #endif
 
 namespace FastCache::Testing
