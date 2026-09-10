@@ -1338,7 +1338,8 @@ stop_and_require_exit "${pids[$rival_index]}" "the node started without --raft-j
 #
 # Read off m1's startup line, which is what an operator does: no surface answers "what
 # is your id", and that residual is worth knowing about rather than papering over here.
-m1_id="$(sed -n 's/.*node identity \([0-9a-f]\{32\}\) .*/\1/p' "${workdir}/m1.log" | head -1)"
+m1_ids="$(sed -n 's/.*node identity \([0-9a-f]\{32\}\) .*/\1/p' "${workdir}/m1.log")"
+m1_id="${m1_ids%%$'\n'*}"
 [[ -n "$m1_id" ]] || fail "could not read m1's minted identity out of its log, so the joiner cannot name it"
 
 raft_ports+=("$(free_port)")

@@ -1021,6 +1021,39 @@ determinism rests on.
       shape can tell. The `timeout` scan escapes that by demanding command position;
       there is no equivalent here. Such a line is reworded or the file is exempted with
       a reason. None exists today.
+    - **THE CONSUMER IS NOT THE POINT; LEAVING EARLY IS — and #970 closed a SPELLING
+      while the scan then enumerated ONE consumer.** `head -N` returns after N lines
+      for the identical reason, and so do `grep -m N` and a `sed` script carrying `q`.
+      So the scan was exact about `grep -q` and silent about every other one: *a list
+      is silent about what it does not name* (#492), rebuilt inside the instrument
+      written to replace a list. `check-script-modes.sh` exited **141** under MSYS2
+      bash, deterministically and with no output at all, on
+      `mode=$(printf '%s\n' "$out" | head -1)` under `set -euo pipefail` — an
+      instrument failing, not a verdict — and the `grep -q` scan read the file clean
+      (#1111). The scan covers all four shapes now, over the same file set and with the
+      same two-direction canary (#1181). Two of the four have no site in this tree at
+      all today: `sed`'s `q` and `grep -m` are covered before they arrive, which is
+      the whole difference between a scan and a list.
+      - **32 sites in 14 files**, remediated with the scan. #1181 estimated *~30
+        across 14 scripts*; the figure here is the one the scan and an independent
+        census both produced, on this tree, at the commit that closed it — and it is a
+        count of the SHAPE, not of defects: the hazard bites only where the payload can
+        exceed the pipe buffer AND the pipeline's status is consulted.
+      - The `set -e` half is load-bearing, and a probe missing it EXONERATES the code:
+        without `-e` the pipeline's 141 is not fatal and the script exits 0. #1111
+        records two such reproductions, both of which refuted the right answer.
+      - Size decides whether it bites at all, so a small fixture reports the idiom
+        working. Measured by #1181 on the reporter's box, 200 runs per size,
+        `printf '%s\n' "$big" | head -1` under `set -uo pipefail`: **0 of 200** nonzero
+        at 13,892 bytes, **200 of 200** at 211,893 bytes. The boundary is the 64 KB
+        pipe buffer — while the whole payload fits, the producer's `write()` completes
+        before the consumer leaves. Same shape as the `grep -q` figures above, from a
+        different reporter on a different day.
+      - `head` reading a FILE is not this and must stay unmatched: `head -1 "$path"`
+        has no pipe. A scan that fired on it would refuse correct code, which is how a
+        scan gets ignored.
+      - For a first LINE the remedy is `${text%%$'\n'*}` — pure bash, no pipe, no fork.
+        `head -N <<< "$text"` is the herestring form where N is not one.
   - **An edit script asserts its anchor MATCHED, and a generator that produced
     nothing fails rather than reporting success.** The same family as the two above,
     reached from the authoring side rather than the checking side, and it happened
@@ -2861,6 +2894,26 @@ carriage return, so such a script does not misbehave — it fails to start at al
   exists to prevent. Three are shapes an unwatched guard accepts: the suppression
   **copied** outward rather than moved, a subject that no longer adds `-pedantic`,
   and an MSVC arm that adds nothing.
+  - **The sharpest instance of it is a mode a failing tool tells you to re-run in.**
+    `check-e2e-helpers.sh --case NAME` ended in a literal `exit 0`, so a run printing
+    `BUG: the bound is sleeping through commands that have already finished` and a
+    healthy run were the same status -- and that mode is what the fixture's own
+    failure block advertises, so the advice pointed at the one path whose verdict was
+    hardcoded. A lane followed it, built a harness on the status and reported **6 of 6
+    PASS** including a run that should have failed; nothing errored and the output was
+    well-formed (#1104).
+  - **A status that answers a DIFFERENT question is why such a thing survives.** The
+    `exit 0` sat after the case returned, so the status did mean something -- *did this
+    case run* -- and the five internal consumers read it correctly for exactly that.
+    Nothing internal ever needed it to carry the verdict, which is why no test failed.
+    Ask what a status ANSWERS, not whether it is read.
+  - The fix applies the driver's OWN rule (the absence of `BUG:` from the output) to
+    the same text, rather than adding a marker beside the printing: one rule and two
+    readers, never two mechanisms free to disagree. THREE outcomes -- 0 clean, 3 ran
+    and reported a defect, anything else aborted -- because *aborted* and *found
+    something* are fixed in different places. And the wrapper is the mode the driver
+    itself uses, or the mode under test is not the mode in use (#499's shape); that is
+    pinned by a derived count of the self-invocations rather than a remembered one.
 
 - **Verifying the FACT a check is about is not verifying the CHECK, and that is the
   version that feels like diligence.** The shape is always the same: you doubt an

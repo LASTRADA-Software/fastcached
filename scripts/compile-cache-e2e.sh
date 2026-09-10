@@ -214,7 +214,8 @@ if [[ -n "$testclient" && -x "$testclient" ]]; then
     # The key the launcher actually used, read off its own trace rather than
     # recomputed here: a second implementation of the key would be a second thing
     # to be wrong, and the key is precisely what this case is about.
-    planted_key="$(sed -n 's/^fastcache-cc: MISS key=//p' "${workdir}/miss.log" | head -n 1)"
+    planted_keys="$(sed -n 's/^fastcache-cc: MISS key=//p' "${workdir}/miss.log")"
+    planted_key="${planted_keys%%$'\n'*}"
     [[ -n "$planted_key" ]] || fail "could not read the object key out of the MISS trace"
 
     cat > "${proj}/wrong.cpp" <<'EOF'

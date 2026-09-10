@@ -235,8 +235,11 @@ DebArms() { # DebArms <deb> <repo-root> <paths>
             || refuse "check-obsolete-conffiles [deb]: $deb does not flag '$path' remove-on-upgrade"
     done
 
-    local keeper
-    keeper="$(grep -v '^remove-on-upgrade ' "$control/conffiles" | head -n 1)"
+    # Captured, then the first line taken: `producer | head -n 1` is the SIGPIPE
+    # shape `check-e2e-helpers.sh`'s early-exit scan refuses (#1181).
+    local keeper keepers
+    keepers="$(grep -v '^remove-on-upgrade ' "$control/conffiles" || true)"
+    keeper="${keepers%%$'\n'*}"
     [[ -n "$keeper" ]] || { refuse "check-obsolete-conffiles [deb]: no ordinary conffile to use as a control"; return; }
 
     local pkgname; pkgname="$(awk '/^Package:/ { print $2; exit }' "$control/control")"
@@ -345,7 +348,8 @@ RpmArms() { # RpmArms <rpm> <repo-root> <paths>
     rpmbuild -bb --define "_topdir $work/top" "$spec" > "$work/rpmbuild.log" 2>&1 \
         || { refuse "check-obsolete-conffiles [rpm]: could not build the synthesised predecessor"; \
              tail -20 "$work/rpmbuild.log" >&2; return; }
-    local oldrpm; oldrpm="$(find "$work/top/RPMS" -name '*.rpm' | head -n 1)"
+    local oldrpms; oldrpms="$(find "$work/top/RPMS" -name '*.rpm')"
+    local oldrpm="${oldrpms%%$'\n'*}"
     [[ -n "$oldrpm" ]] || { refuse "check-obsolete-conffiles [rpm]: rpmbuild produced no package"; return; }
 
     local state

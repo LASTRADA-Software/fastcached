@@ -293,7 +293,7 @@ Main() {
     trap '[ -n "$_cache" ] && rm -rf "$_cache"' RETURN
     [ "${1:-}" = "--candidates" ] && showCandidates="yes"
     listing="$(Enumerate)"
-    mode="$(printf '%s\n' "$listing" | head -1)"
+    mode="${listing%%$'\n'*}"
     files="$(printf '%s\n' "$listing" | tail -n +2 | grep . || true)"
     count="$(printf '%s\n' "$files" | grep -c . || true)"
 

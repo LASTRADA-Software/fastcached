@@ -377,7 +377,8 @@ distribution="${workdir}/expanded/Distribution"
 [[ -r "$distribution" ]] || fail "the expanded package has no Distribution file"
 
 for pane in welcome readme license; do
-    element="$(grep -o "<${pane}[^>]*>" "$distribution" | head -1)"
+    elements="$(grep -o "<${pane}[^>]*>" "$distribution" || true)"
+    element="${elements%%$'\n'*}"
     [[ -n "$element" ]] || fail "the Distribution file declares no <${pane}> pane"
 
     paneFile="$(sed -n 's/.*file="\([^"]*\)".*/\1/p' <<<"$element")"
@@ -398,7 +399,8 @@ done
 # --- 2. the shipped binaries must be redistributable -----------------------
 echo "== checking dynamic-library dependencies"
 for tool in fastcached fastcache-cc; do
-    binary="$(find "${workdir}/expanded" -path "*/Payload/opt/fastcached/bin/${tool}" -type f | head -1)"
+    binaries="$(find "${workdir}/expanded" -path "*/Payload/opt/fastcached/bin/${tool}" -type f)"
+    binary="${binaries%%$'\n'*}"
     [[ -n "$binary" ]] || fail "could not locate ${tool} in the expanded payload"
     strays="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
     [[ -z "$strays" ]] || fail "${tool} links libraries outside /usr/lib:"$'\n'"$strays"

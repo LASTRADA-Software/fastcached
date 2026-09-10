@@ -903,8 +903,8 @@ run_case() {
     # THE PRODUCTION SHAPE, and the row that would have caught the defect the
     # rows around it missed.
     #
-    # `cluster-e2e`'s probe runs `answer="$(cluster …)"`, and `cluster` runs
-    # `out="$(run_bounded …)"` inside that -- so `run_bounded` executes TWO
+    # `cluster-e2e`'s probe runs `answer="$(cluster â€¦)"`, and `cluster` runs
+    # `out="$(run_bounded â€¦)"` inside that -- so `run_bounded` executes TWO
     # subshells below the fixture. The first version of the outcome was a shell
     # variable, and the assignment was discarded at the closing paren: every
     # unstartable probe read back as `finished`, and the fixture filed 870 of them
@@ -2461,14 +2461,14 @@ _timeout_invocations() {
 # The fixtures stay with their scans. They are the part that is genuinely per-scan, and
 # hoisting them would put the staged text a long way from the extractor it is staged for.
 #
-# FOUR canaries go through it: timeout, grep-q, helper-redefinition and seconds-scan. Two
-# do not, and both are decisions rather than omissions -- a canary left out silently is
-# the next weak copy, which is the whole argument above:
+# FOUR canaries go through it: timeout, early-exit, helper-redefinition and
+# seconds-scan. Two do not, and both are decisions rather than omissions -- a canary
+# left out silently is the next weak copy, which is the whole argument above:
 #
 #   * `bash32-canary` asks SEVEN questions, not two. Beyond catch/not-catch it drives the
 #     declared-region machinery and the outside-scripts walk, so its shape is not this
 #     one and forcing it through would mean parameterising five more behaviours.
-#   * `grep-q-scan-canary` keeps a THIRD half of its own for the `pipefail` predicate,
+#   * `early-exit-scan-canary` keeps a THIRD half of its own for the `pipefail` predicate,
 #     which decides whether a file is EXAMINED at all. That is a different question from
 #     "does the extractor fire", and it sits beside the driver call rather than inside it.
 #
@@ -2600,7 +2600,7 @@ if [ "$timeout_scanned" -lt 1 ]; then
     note_failure "timeout-scan"
 fi
 
-# --- no script pipes into `grep -q` under pipefail --------------------------
+# --- no script pipes into a consumer that exits EARLY, under pipefail -------
 #
 # `grep -q` exits at its FIRST match. The producer is then writing into a closed
 # pipe, takes SIGPIPE, and under `pipefail` the pipeline reports the PRODUCER's
@@ -2608,15 +2608,34 @@ fi
 # still writing when grep leaves. Output size decides that, which is why it passes
 # on a developer's machine and reddens a runner (#970).
 #
+# THE CONSUMER IS NOT THE POINT; LEAVING EARLY IS. `head -N` returns after N lines
+# for the identical reason, and so do `grep -m N` and a `sed` script carrying `q`.
+# #970 closed a SPELLING and this scan then enumerated ONE consumer, so it was
+# exact about `grep -q` and silent about every other one -- which is the same
+# a-list-is-silent-about-what-it-does-not-name shape the scan exists to replace.
+# `check-script-modes.sh` exited **141** under MSYS2 bash, deterministically and
+# with no output at all, on `mode=$(printf '%s\n' "$out" | head -1)`, and this scan
+# read the file clean (#1111).
+#
+# Measured, 200 runs per size, `printf '%s\n' "$big" | head -1` under
+# `set -uo pipefail` (#1181): **0 of 200** nonzero at 13,892 bytes and **200 of
+# 200** at 211,893 bytes. The boundary is the 64 KB pipe buffer -- while the whole
+# payload fits, the producer's `write()` completes before the consumer leaves and
+# nothing happens. That is the same size dependence the rulebook already records
+# for `grep -q` (wrong 20 of 20 at 101 KB, right 20 of 20 at 1.1 KB), and it is
+# why a small fixture reports the idiom working and a census by eye is not enough.
+#
 # `.agent/rules/build-and-toolchain.md` has carried this rule since the TSan gate's
 # `nm "$b" | grep -q __tsan_init`, and five scripts here carry a comment explaining
 # why they do NOT do it. It came back in ten files anyway -- which is #627's lesson
 # exactly: a rule stated in the files that obey it never reaches the file that does
 # not. So it is a scan.
 #
-# The remedy is a HERESTRING (`grep -q P <<< "$text"`) when the producer is a
-# variable -- no pipe, so no SIGPIPE -- or capture-then-match when it is a command.
-echo "== no script pipes into grep -q under pipefail"
+# The remedy is a HERESTRING (`grep -q P <<< "$text"`, `head -1 <<< "$text"`) when
+# the producer is a variable -- no pipe, so no SIGPIPE -- or capture-then-match when
+# it is a command. For a FIRST LINE specifically, `${text%%$'\n'*}` is pure bash,
+# forks nothing at all and cannot SIGPIPE by construction.
+echo "== no script pipes into an early-exiting consumer under pipefail"
 
 # Does this script actually TURN pipefail ON? Not "mentions pipefail": five files
 # here name it only in a comment saying why they avoid the idiom, and flagging
@@ -2625,11 +2644,34 @@ _enables_pipefail() {
     grep -qE '^[[:space:]]*set[[:space:]]+-[A-Za-z]*o[A-Za-z]*[[:space:]]+pipefail' "$1"
 }
 
-# A pipe into a `grep` carrying `-q`, in any bundling: `-q`, `-qi`, `-qx`, `-qFf`,
-# `-Fq`. The bundled forms are not decoration -- the hand census that opened #970
+# A pipe into a consumer that can leave before its producer is finished writing.
+# Four spellings, one grep each, merged and deduplicated by line number:
+#
+#   `| head`      -- `head -1`, `head -n 1`, `head -c 128`, and a bare `head`
+#   `| grep -*q`  -- any bundling: `-q`, `-qi`, `-qx`, `-qFf`, `-Fq`
+#   `| grep -*m N`-- leaves after N matches
+#   `| sed ... q` -- a `q`/`Q` COMMAND, addressed or not
+#
+# Four greps rather than one ERE: a single alternation over all four would be
+# unreadable and could carry no comment per shape, and the `sed` one needs a
+# different quoting style from the rest. They are `sort`ed and made unique on the
+# LINE NUMBER, because one line may match two of them and would otherwise be
+# reported and counted twice.
+#
+# The bundled grep forms are not decoration -- the hand census that opened #970
 # spelled the pattern `| grep -q` and was blind to the five `grep -Fxq` sites in
 # `check-gated-jobs.sh` and `check-merge-queue-contexts.sh`, which is to say to the
 # two checks that decide which contexts are REQUIRED. This scan found them.
+#
+# `head` reading a FILE is not this defect and is deliberately not matched: there
+# is no pipe, so there is nothing to SIGPIPE, and `check-script-modes.sh`'s own
+# `first=$(head -1 "$root/$path")` is correct as it stands. The `|` is required.
+#
+# The `sed` pattern demands that the `q` be a COMMAND -- preceded by the start of
+# the script, an address, a `;`, a `{` or a `/`, and followed by a quote, a `;`, a
+# `}`, a `)`, whitespace or end of line. `sed 's/q//'` and `sed -n 's/.*q\(.*\)/\1/p'`
+# therefore do not match, which was checked in both directions against the 125
+# `| sed` lines in this tree before the pattern was adopted (all clean).
 #
 # Comment lines are stripped first -- a COMMENT is not a call site, and two checks
 # in this tree have already matched their own headers.
@@ -2638,79 +2680,113 @@ _enables_pipefail() {
 # a `| grep -q` inside a double-quoted STRING runs nothing. The `timeout` scan
 # solves its version of that by demanding command position; there is no equivalent
 # here, because the defect's own shape IS a pipe. Such a line would have to be
-# reworded or the file exempted with a reason. None exists today.
-_pipe_into_grep_q() {
-    grep -nE '\|[[:space:]]*grep[[:space:]]+([^|;&]*[[:space:]])?-[A-Za-z]*q' "$1" \
-        | grep -v '^[0-9][0-9]*: *#' || true
+# reworded or the file exempted with a reason. None exists today. Nor can it read a
+# `sed` script whose own delimiter is `|`, which ends the scan of the argument at
+# the delimiter; none exists today either.
+_pipe_into_early_exit() {
+    {
+        grep -nE '\|[[:space:]]*head([[:space:]]|$)' "$1"
+        grep -nE '\|[[:space:]]*grep[[:space:]]+([^|;&]*[[:space:]])?-[A-Za-z]*q' "$1"
+        grep -nE '\|[[:space:]]*grep[[:space:]]+([^|;&]*[[:space:]])?-[A-Za-z]*m[[:space:]]*[0-9]' "$1"
+        grep -nE "\|[[:space:]]*sed([[:space:]][^|;&]*)?([[:space:]'\";{/])[0-9]*[qQ](['\";})[:space:]]|\$)" "$1"
+    } 2>/dev/null \
+        | grep -v '^[0-9][0-9]*: *#' \
+        | LC_ALL=C sort -t: -k1,1n -u \
+        || true
 }
 
 # The canary, both directions. A scan nobody has watched refuse is a scan
 # reporting PASS over a set in which nothing could fail.
-grepq_canary_dir="$(mktemp -d)"
-cat > "${grepq_canary_dir}/must-catch.sh" <<'CANARY'
+#
+# The must-not-catch half carries the REMEDIES as well as the near misses, so a
+# pattern broadened until it fires on the fix is caught here rather than in a
+# reviewer's head: a herestring, a capture-then-match, `${var%%$'\n'*}`, and a
+# `head` reading a file.
+earlyexit_canary_dir="$(mktemp -d)"
+cat > "${earlyexit_canary_dir}/must-catch.sh" <<'CANARY'
 printf '%s' "$out" | grep -q -- "$want"
 echo "$x" | grep -qi "feature"
 pkgutil --pkgs | grep -q "^${LABEL}\."
 foo | grep -Fq bar
 printf '%s\n' "$t" | grep -qFf "$needles" || return 0
 if ! printf '%s\n' "$legs" | grep -qx -- "$leg"; then :; fi
+mode=$(printf '%s\n' "$out" | head -1)
+first="$(find . -type f | head -n 1)"
+grep -E 'error:|FAILED' "$log" | head -40
+banner="$(producer | head -c 128)"
+producer | head
+one="$(producer | sed -n '1p;q')"
+marker="$(producer | sed '/ready/q')"
+two="$(producer | sed 1q)"
+three="$(producer | sed -e q)"
+hit="$(producer | grep -m 1 "$pattern")"
 CANARY
-cat > "${grepq_canary_dir}/must-not-catch.sh" <<'CANARY'
+cat > "${earlyexit_canary_dir}/must-not-catch.sh" <<'CANARY'
 grep -q "does match" <<< "$answer"
 hits="$(printf '%s\n' "$text" | grep -n -F -- "$token" || true)"
 # printf '%s' "$out" | grep -q -- "$want"
 out="$(producer)"; case "$out" in *"$want"*) : ;; esac
 grep -q -- "$wantMsg" <<< "$out"
+first="$(head -1 "$path")"
+head -40 <<< "$matches"
+mode="${out%%$'\n'*}"
+label="$(producer | header_for "$x")"
+a="$(producer | sed 's/q//')"
+b="$(producer | sed -n 's/.*q\(.*\)/\1/p')"
+c="$(printf '%s\n' "$hits" | sed 's/^/     | /')"
+d="$(producer | tail -1)"
 CANARY
-_scan_canary "grep-q-scan-canary" _pipe_into_grep_q \
-    "${grepq_canary_dir}/must-catch.sh" "${grepq_canary_dir}/must-not-catch.sh" \
-    6 "pipelines" "a shape that is not the defect"
+_scan_canary "early-exit-scan-canary" _pipe_into_early_exit \
+    "${earlyexit_canary_dir}/must-catch.sh" "${earlyexit_canary_dir}/must-not-catch.sh" \
+    16 "pipelines" "a shape that is not the defect"
 
 # The pipefail predicate needs its own canary, because it is what decides whether a
 # file is EXAMINED at all: read wrong in the quiet direction it exempts everything
 # and the scan reports clean over nothing, which is the failure its neighbours'
 # censuses guard against.
-printf 'set -euo pipefail\n' > "${grepq_canary_dir}/on.sh"
-printf 'set -o pipefail\n' > "${grepq_canary_dir}/on2.sh"
-printf '# set -o pipefail is deliberately NOT used here\nset -u\n' > "${grepq_canary_dir}/off.sh"
+printf 'set -euo pipefail\n' > "${earlyexit_canary_dir}/on.sh"
+printf 'set -o pipefail\n' > "${earlyexit_canary_dir}/on2.sh"
+printf '# set -o pipefail is deliberately NOT used here\nset -u\n' > "${earlyexit_canary_dir}/off.sh"
 ran=$(( ran + 1 ))
-if ! _enables_pipefail "${grepq_canary_dir}/on.sh" \
-    || ! _enables_pipefail "${grepq_canary_dir}/on2.sh" \
-    || _enables_pipefail "${grepq_canary_dir}/off.sh"; then
-    echo "FAIL grep-q-scan-canary: the pipefail predicate misreads a staged script," >&2
+if ! _enables_pipefail "${earlyexit_canary_dir}/on.sh" \
+    || ! _enables_pipefail "${earlyexit_canary_dir}/on2.sh" \
+    || _enables_pipefail "${earlyexit_canary_dir}/off.sh"; then
+    echo "FAIL early-exit-scan-canary: the pipefail predicate misreads a staged script," >&2
     echo "     so which files the scan examines is not what it claims" >&2
-    note_failure "grep-q-scan-canary"
+    note_failure "early-exit-scan-canary"
 fi
-rm -rf "$grepq_canary_dir"
+rm -rf "$earlyexit_canary_dir"
 
-grepq_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary pipelines above. They are heredoc text and run nothing; the canary asserting all six are caught is what covers them."
-grepq_scanned=0
+earlyexit_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary pipelines above. They are heredoc text and run nothing; the canary asserting all sixteen are caught is what covers them."
+earlyexit_scanned=0
 while IFS= read -r script; do
     [ -n "$script" ] || continue
     base="${script##*/}"
-    _scan_exempt "$base" "$grepq_allowed" && continue
+    _scan_exempt "$base" "$earlyexit_allowed" && continue
     _enables_pipefail "$script" || continue
-    grepq_scanned=$(( grepq_scanned + 1 ))
+    earlyexit_scanned=$(( earlyexit_scanned + 1 ))
     ran=$(( ran + 1 ))
-    hits="$(_pipe_into_grep_q "$script")"
+    hits="$(_pipe_into_early_exit "$script")"
     if [ -n "$hits" ]; then
-        echo "FAIL grep-q-scan: ${base} sets pipefail and pipes into grep -q." >&2
-        echo "     grep -q exits at its first match, the producer takes SIGPIPE, and pipefail" >&2
-        echo "     reports the PRODUCER's status -- a false negative on the SUCCESS path (#970)." >&2
-        echo "     Use a herestring: grep -q PATTERN <<< \"\$text\"; or capture, then match." >&2
+        echo "FAIL early-exit-scan: ${base} sets pipefail and pipes into a consumer that exits early." >&2
+        echo "     head, grep -q, grep -m and sed's q all leave before the producer is done; the" >&2
+        echo "     producer then takes SIGPIPE and pipefail reports the PRODUCER's status -- a" >&2
+        echo "     false negative on the SUCCESS path (#970, #1111, #1181)." >&2
+        echo "     Use a herestring: grep -q PATTERN <<< \"\$text\"; head -1 <<< \"\$text\"; or" >&2
+        echo "     capture, then match. For a first line, \${text%%\$'\\n'*} forks nothing at all." >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
-        note_failure "grep-q-scan"
+        note_failure "early-exit-scan"
     fi
 done < <( _shell_scripts )
 
 # A census, for the reason its neighbour records: a walk that matched nothing
 # reports clean over zero files and reads exactly like complete coverage.
 ran=$(( ran + 1 ))
-if [ "$grepq_scanned" -lt 1 ]; then
-    echo "FAIL grep-q-scan: no script under scripts/ sets pipefail, which cannot be true." >&2
+if [ "$earlyexit_scanned" -lt 1 ]; then
+    echo "FAIL early-exit-scan: no script under scripts/ sets pipefail, which cannot be true." >&2
     echo "     Either the walk found no files or the pipefail predicate stopped matching;" >&2
     echo "     either way every script 'passed' without being read." >&2
-    note_failure "grep-q-scan"
+    note_failure "early-exit-scan"
 fi
 
 # --- no script keeps its own copy of a shared helper ------------------------
@@ -3629,6 +3705,7 @@ if [ "$failures" -gt 0 ]; then
     # somebody reads first.
     echo "  failed: ${failed_cases}"
     echo "  re-run one alone with: bash ${BASH_SOURCE[0]} --case <name>"
+    echo "  (that mode exits 0 clean, 3 when the case printed BUG:, else the case aborted)"
 
     # And a copy the NEXT run cannot overwrite. ctest keeps one
     # `Testing/Temporary/LastTest.log`, so #678's evidence was destroyed by the
@@ -3648,6 +3725,8 @@ if [ "$failures" -gt 0 ]; then
         echo "note: per-case detail went to stderr. Re-run under"
         echo "      ctest --output-on-failure, or one case alone as"
         echo "      bash ${BASH_SOURCE[0]} --case <name>"
+        echo "      which exits 0 clean, 3 when the case printed BUG:,"
+        echo "      and otherwise with whatever the case aborted on"
     } > "$durable" 2>/dev/null; then
         echo "  a copy the next run will not overwrite: ${durable}"
     fi
