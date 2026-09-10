@@ -129,10 +129,32 @@ reactor (IOCP / epoll / kqueue) multiplexes every connection on its event
 loop, so the number of concurrent clients is bounded by memory, not by a
 worker count. `--threads` runs that many independent single-threaded
 reactors, each pinned to a core, with every connection pinned to one reactor
-for its lifetime. On Windows the persistent backend additionally drains the
-IOCP reactor from several threads so a blocking page-store `fsync` overlaps
-with serving other connections; the disk backend is therefore always wrapped
-in a `ShardedStorage` for thread safety.
+for its lifetime. The disk backend is always wrapped in a
+`ShardedStorage`, whose per-shard mutex serialises access: `main.cpp` wraps
+whenever more than one thread can reach the storage, and the persistent
+backend is one of four conditions that say so — the others being an explicit
+multi-shard layout, `--threads` above one, and the metrics endpoint, whose
+`fc-admin` thread calls `engine.Snapshot()` concurrently with the reactor.
+
+**No completion port is ever drained from several threads**, on Windows or
+anywhere else. `IocpReactor.hpp` says that migrates a coroutine across threads
+and is unsafe, and `RunMultiReactorWindows` runs one thread per reactor
+exactly as the POSIX path does. This paragraph claimed the opposite until
+[#896](https://github.com/LASTRADA-Software/fastcached/issues/896) — it
+described a threading model this project does not implement and a header in
+the same tree calls unsafe, which is worse than a stale sentence twice over:
+it is the document a session reads FIRST and is told to obey, so it licenses
+the defect, and it changes how a reader grades a concurrency bug. A scoped
+review of #884 recorded that taking it as authoritative would have made its
+verdict *"too kind"* — a same-thread ordering question becomes a cross-thread
+data race — and it reached the right answer only by choosing the header over
+this file. The `fsync`-overlap mechanism it described is in no source either.
+#896 argued that from "no `ThreadPoolExecutor` appears in
+`ReactorServerLoop.cpp`", and **that half of the ticket is wrong**: one is
+constructed on all three serving paths. It is `ThreadPoolExecutor { 1 }`
+running the EXPIRY SWEEP, drains no completion port, and overlaps no `fsync`
+with anything — so the conclusion holds and the evidence offered for it did
+not, which is the shape worth catching in a document nobody re-derives.
 
 ## The rulebook
 
