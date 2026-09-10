@@ -133,39 +133,10 @@ set(pedanticFatalityFlags
     "^-Wno-error=|exempts one diagnostic from fatality and leaves it VISIBLE, so a preset without -Werror that sees it is getting exactly what this asks for"
 )
 
-# Split one '|'-separated row into the variables named in ARGN, the last of which
-# takes whatever remains -- so only the final field may contain a '|', which is
-# what lets a reason be written in ordinary prose.
-#
-# Byte-for-byte with the copies in check-sccache-backend-caveat.cmake,
-# check-byte-order-qualifier.cmake, check-node-surface-docs.cmake,
-# check-version-fallback-warning.cmake and check-fastcache-addr-opt-out.cmake.
-# Consolidating the copies is #495; keeping this one identical is what makes it
-# visible to that sweep, and a sixth splitter spelled differently is precisely
-# what such a sweep is silent about.
-#
-# @param row The '|'-separated row.
-# @param ARGN Output variable names, in field order.
-function(fastcached_row_fields row)
-    list(LENGTH ARGN fieldCount)
-    math(EXPR lastField "${fieldCount} - 1")
-    set(rest "${row}")
-    foreach(field RANGE 0 ${lastField})
-        list(GET ARGN ${field} outVar)
-        if(field EQUAL lastField)
-            set(value "${rest}")
-        else()
-            string(FIND "${rest}" "|" separator)
-            if(separator EQUAL -1)
-                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
-            endif()
-            string(SUBSTRING "${rest}" 0 ${separator} value)
-            math(EXPR restStart "${separator} + 1")
-            string(SUBSTRING "${rest}" ${restStart} -1 rest)
-        endif()
-        set(${outVar} "${value}" PARENT_SCOPE)
-    endforeach()
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 set(violations "")
 set(vacuous "")

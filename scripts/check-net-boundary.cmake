@@ -92,25 +92,10 @@ if(NOT IS_DIRECTORY "${sourceRoot}")
     message(FATAL_ERROR "'${sourceRoot}' is not a directory. Is FASTCACHED_SOURCE_DIR the source root?")
 endif()
 
-# Split a "path|reason" table into two parallel lists, so the reason can be
-# printed beside the rule it explains rather than being a comment nobody reads.
-function(fastcached_split_rows rows pathsOut reasonsOut)
-    set(paths "")
-    set(reasons "")
-    foreach(row IN LISTS ${rows})
-        string(FIND "${row}" "|" separator)
-        if(separator EQUAL -1)
-            message(FATAL_ERROR "Malformed row (no '|'): ${row}")
-        endif()
-        string(SUBSTRING "${row}" 0 ${separator} rowPath)
-        math(EXPR reasonStart "${separator} + 1")
-        string(SUBSTRING "${row}" ${reasonStart} -1 rowReason)
-        list(APPEND paths "${rowPath}")
-        list(APPEND reasons "${rowReason}")
-    endforeach()
-    set(${pathsOut} "${paths}" PARENT_SCOPE)
-    set(${reasonsOut} "${reasons}" PARENT_SCOPE)
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 fastcached_split_rows(FastCachedNetStandaloneDirs standaloneDirs standaloneDirReasons)
 

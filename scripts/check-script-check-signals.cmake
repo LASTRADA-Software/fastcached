@@ -164,29 +164,19 @@ endif()
 list(REMOVE_DUPLICATES scriptRegistrations)
 list(LENGTH scriptRegistrations scriptCheckCount)
 
-# Split one `<test name>|<-P value as written>` row.
+# The `"value|reason"` row convention, defined once (#513). Rows here are
+# `<test name>|<-P value as written>` and `<test name>|<signalled>|<will fail>`; the
+# name and the path travel as ONE row because they are one registration -- two lists
+# appended in step are two lists that can stop being in step, and nothing would say
+# so.
 #
-# A plain split rather than the general row splitter three other scripts carry:
-# neither field can hold a `|`, and the field count is asserted rather than
-# assumed. The name and the path travel as ONE row because they are one
-# registration -- two lists appended in step are two lists that can stop being
-# in step, and nothing would say so.
-#
-# @param row The `<name>|<path>` row.
-# @param nameOut Set to the ctest name.
-# @param pathOut Set to the `-P` value exactly as the registration spells it.
-function(fastcached_registration_fields row nameOut pathOut)
-    string(REPLACE "|" ";" fields "${row}")
-    list(LENGTH fields fieldCount)
-    if(NOT fieldCount EQUAL 2)
-        message(FATAL_ERROR
-            "registration row split into ${fieldCount} field(s) where 2 are wanted: ${row}")
-    endif()
-    list(GET fields 0 rowName)
-    list(GET fields 1 rowPath)
-    set(${nameOut} "${rowName}" PARENT_SCOPE)
-    set(${pathOut} "${rowPath}" PARENT_SCOPE)
-endfunction()
+# This file used to carry a splitter of its own, on the stated ground that neither
+# field can hold a `|` and that the count should be asserted rather than assumed.
+# The shared one asserts the count too, and it does not go through
+# `string(REPLACE "|" ";")` and `list(GET)` -- which is what made the private one
+# shift a row's fields around an unbalanced bracket. The reason was true and did not
+# support the copy.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 set(sawMissingSignal FALSE)
 set(sawMissingDeclaration FALSE)
@@ -235,11 +225,7 @@ set(currentWillFail FALSE)
 function(fastcached_block_row wanted rowOut)
     set(${rowOut} "" PARENT_SCOPE)
     foreach(row IN LISTS propertyBlocks)
-        string(FIND "${row}" "|" barAt)
-        if(barAt EQUAL -1)
-            message(FATAL_ERROR "a property-block row carries no separator: ${row}")
-        endif()
-        string(SUBSTRING "${row}" 0 ${barAt} rowName)
+        fastcached_row_fields("${row}" rowName rowRest)
         if(rowName STREQUAL wanted)
             set(${rowOut} "${row}" PARENT_SCOPE)
             return()
@@ -318,20 +304,13 @@ endif()
 # against a check that has nothing wrong with it, and nothing about the message
 # would say so.
 foreach(registration IN LISTS scriptRegistrations)
-    fastcached_registration_fields("${registration}" check scriptPath)
+    fastcached_row_fields("${registration}" check scriptPath)
     fastcached_block_row("${check}" blockRow)
 
     set(signalled FALSE)
     set(willFail FALSE)
     if(NOT blockRow STREQUAL "")
-        string(REPLACE "|" ";" blockFields "${blockRow}")
-        list(LENGTH blockFields blockFieldCount)
-        if(NOT blockFieldCount EQUAL 3)
-            message(FATAL_ERROR
-                "property-block row split into ${blockFieldCount} field(s) where 3 are wanted: ${blockRow}")
-        endif()
-        list(GET blockFields 1 signalled)
-        list(GET blockFields 2 willFail)
+        fastcached_row_fields("${blockRow}" blockName signalled willFail)
     endif()
 
     if(willFail)
@@ -393,7 +372,7 @@ endmacro()
 # one: it would be registered here like every other check and covered by this very
 # pass.
 foreach(registration IN LISTS scriptRegistrations)
-    fastcached_registration_fields("${registration}" check scriptPath)
+    fastcached_row_fields("${registration}" check scriptPath)
 
     # Resolving the `-P` value happens HERE, beside the `EXISTS` it feeds,
     # rather than in pass 1 where nothing consumes it yet. Every registration
@@ -613,7 +592,11 @@ endforeach()
 # already paid once.
 set(verdictSites 0)
 set(verdictExceptions 0)
-file(GLOB checkScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.cmake")
+# RECURSIVE, since #513 gave scripts/ a `lib/` subdirectory. A non-recursive glob
+# would read every file that exists today and none of the ones a subdirectory
+# acquires, which is the shape a list has -- exact about what it knows and silent
+# about what it does not.
+file(GLOB_RECURSE checkScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.cmake")
 
 # A glob that matched nothing would report success having read no file at all,
 # which is the vacuous shape this whole file argues against.

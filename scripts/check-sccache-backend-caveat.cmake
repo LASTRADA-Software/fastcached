@@ -328,38 +328,10 @@ endif()
 
 fastcached_wall_seconds(runStartSeconds)
 
-# Split one '|'-separated row into the variables named in ARGN, the last of which
-# takes whatever remains -- so only the final field may contain a '|', which is
-# what lets a reason be written in ordinary prose.
-#
-# Named `fastcached_row_fields` rather than the `fastcached_split_rows` that
-# check-net-boundary.cmake defines: that one is a different contract (a whole
-# table, two fixed outputs), and two functions answering to one name with
-# different signatures is a trap for whoever consolidates them. Consolidating the
-# five row-splitters across scripts/ is worth doing and is not this change.
-#
-# @param row The '|'-separated row.
-# @param ARGN Output variable names, in field order.
-function(fastcached_row_fields row)
-    list(LENGTH ARGN fieldCount)
-    math(EXPR lastField "${fieldCount} - 1")
-    set(rest "${row}")
-    foreach(field RANGE 0 ${lastField})
-        list(GET ARGN ${field} outVar)
-        if(field EQUAL lastField)
-            set(value "${rest}")
-        else()
-            string(FIND "${rest}" "|" separator)
-            if(separator EQUAL -1)
-                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
-            endif()
-            string(SUBSTRING "${rest}" 0 ${separator} value)
-            math(EXPR restStart "${separator} + 1")
-            string(SUBSTRING "${rest}" ${restStart} -1 rest)
-        endif()
-        set(${outVar} "${value}" PARENT_SCOPE)
-    endforeach()
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 # Split file content into a list of lines, one element per line.
 #

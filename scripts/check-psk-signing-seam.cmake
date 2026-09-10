@@ -100,35 +100,10 @@ if(NOT IS_DIRECTORY "${sourceRoot}")
     message(FATAL_ERROR "'${sourceRoot}' is not a directory. Is FASTCACHED_SOURCE_DIR the source root?")
 endif()
 
-# Split a "path|reason" table into two parallel lists, so the reason can be
-# printed beside the rule it explains rather than being a comment nobody reads.
-#
-# Copied verbatim from the sibling checks rather than varied, and that is the
-# point: consolidating these into a shared module is #495, deliberately not
-# pre-empted here, and #495's validation compares the copies as TEXT. A copy that
-# rewrote an escape or a spelling would be equivalent and non-identical, which is
-# exactly the divergence that consolidation cannot detect. Keep this byte-for-byte
-# with `check-net-boundary.cmake`, and count this file in when #495 lands.
-# @param rows Name of the list variable holding the rows.
-# @param pathsOut Set to the paths.
-# @param reasonsOut Set to the reasons, in the same order.
-function(fastcached_split_rows rows pathsOut reasonsOut)
-    set(paths "")
-    set(reasons "")
-    foreach(row IN LISTS ${rows})
-        string(FIND "${row}" "|" separator)
-        if(separator EQUAL -1)
-            message(FATAL_ERROR "Malformed row (no '|'): ${row}")
-        endif()
-        string(SUBSTRING "${row}" 0 ${separator} rowPath)
-        math(EXPR reasonStart "${separator} + 1")
-        string(SUBSTRING "${row}" ${reasonStart} -1 rowReason)
-        list(APPEND paths "${rowPath}")
-        list(APPEND reasons "${rowReason}")
-    endforeach()
-    set(${pathsOut} "${paths}" PARENT_SCOPE)
-    set(${reasonsOut} "${reasons}" PARENT_SCOPE)
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 # Turn a list of shell globs into one anchored regex, so the tree can be walked
 # ONCE and the results filtered in memory. `file(GLOB_RECURSE var a b c)`

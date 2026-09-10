@@ -170,38 +170,10 @@ set(FastCachedSurfaceCountExemptions
 )
 
 # ---------------------------------------------------------------------------
-# Split one '|'-separated row into the variables named in ARGN, the last of which
-# takes whatever remains -- so only the final field may contain a '|'.
-#
-# Copied verbatim from the sibling checks rather than varied, and that is the
-# point: consolidating these into a shared module is #495, deliberately not
-# pre-empted here, and #495's validation compares the copies as TEXT. A copy that
-# rewrote an escape or a spelling would be equivalent and non-identical, which is
-# exactly the divergence that consolidation cannot detect. Keep this byte-for-byte
-# with `check-sccache-backend-caveat.cmake`, and count this file in when #495 lands.
-#
-# @param row The '|'-separated row.
-# @param ARGN Output variable names, in field order.
-function(fastcached_row_fields row)
-    list(LENGTH ARGN fieldCount)
-    math(EXPR lastField "${fieldCount} - 1")
-    set(rest "${row}")
-    foreach(field RANGE 0 ${lastField})
-        list(GET ARGN ${field} outVar)
-        if(field EQUAL lastField)
-            set(value "${rest}")
-        else()
-            string(FIND "${rest}" "|" separator)
-            if(separator EQUAL -1)
-                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
-            endif()
-            string(SUBSTRING "${rest}" 0 ${separator} value)
-            math(EXPR restStart "${separator} + 1")
-            string(SUBSTRING "${rest}" ${restStart} -1 rest)
-        endif()
-        set(${outVar} "${value}" PARENT_SCOPE)
-    endforeach()
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 # Split file content into a list of lines, one element per line.
 #

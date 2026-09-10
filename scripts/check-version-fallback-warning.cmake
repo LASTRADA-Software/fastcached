@@ -54,44 +54,10 @@ if(NOT COMMAND _fc_cache_rejection_warning)
         "this check now proves nothing.")
 endif()
 
-# Split a '|'-separated row into named fields.
-#
-# The house splitter, copied byte-for-byte rather than re-derived. It never builds
-# a CMake list, so a field containing ';', '\', '[' or ']' is harmless -- the
-# bracket-vulnerable-reader hazard the rulebook records -- and it carries the
-# malformed-row refusal itself, so a caller needs no field-count guard of its own.
-# The LAST field may contain '|', which is what lets a row end in prose.
-#
-# The row LIST is a separate hazard and this cannot help with it: `set(rows "a;b")`
-# splits at the list level before this is ever called. Keep ';' out of row text.
-#
-# Consolidating the copies is
-# [#495](https://github.com/LASTRADA-Software/fastcached/issues/495), deliberately
-# not pre-empted here. Keep this byte-for-byte with its siblings and count this
-# file in when #495 lands.
-#
-# @param row The '|'-separated row.
-# @param ARGN Output variable names, in field order.
-function(fastcached_row_fields row)
-    list(LENGTH ARGN fieldCount)
-    math(EXPR lastField "${fieldCount} - 1")
-    set(rest "${row}")
-    foreach(field RANGE 0 ${lastField})
-        list(GET ARGN ${field} outVar)
-        if(field EQUAL lastField)
-            set(value "${rest}")
-        else()
-            string(FIND "${rest}" "|" separator)
-            if(separator EQUAL -1)
-                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
-            endif()
-            string(SUBSTRING "${rest}" 0 ${separator} value)
-            math(EXPR restStart "${separator} + 1")
-            string(SUBSTRING "${rest}" ${restStart} -1 rest)
-        endif()
-        set(${outVar} "${value}" PARENT_SCOPE)
-    endforeach()
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 
 set(_caveat "sccache replays a hit's /showIncludes stream")
 set(_detail "Rebuild or reinstall whichever is older.")
