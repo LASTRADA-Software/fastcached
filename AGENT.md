@@ -2030,6 +2030,13 @@ what differs between compilers, standard libraries, hosts and tool versions.
   rebased and rebuilt before it merges, never inspected — the #292 worktree was nine
   behind and the rebuild took about two minutes and was clean, which is what this costs
   when it passes, and passing is why skipping it feels free.
+  - **And the diff that VERIFIES such a rebase is three-dot.** `A..B` folds in the
+    commits `B` carries and `A` does not — the ordinary state right after a rebase —
+    so it answers a question nobody asked: measured, `expect=-35` against `delta=10`,
+    a 45-line gap that reads as a dropped hunk and was reported as one, where `A...B`
+    agreed exactly. A wrong NUMBER, not an error, inside the step that exists to
+    verify. The two forms disagreeing is itself the signal that the branch is behind
+    its base — a finding, not a fault (#541).
 - **After a revert, test for the REVERT, never for the defect.** A revert leaves the
   reverted commit in the ancestry forever, so `--is-ancestor <fix>` answers YES for every
   branch including master and discriminates nothing; the only useful question is

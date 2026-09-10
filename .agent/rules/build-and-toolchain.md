@@ -4433,6 +4433,38 @@ inspected; `gh pr update-branch --rebase` is what converges a queue. And where t
 branches are in flight at once, the second one's green is provisional until it has
 been built on the first.
 
+**And the diff that VERIFIES such a rebase landed intact is three-dot.** `A..B` diffs
+the two endpoints, so when `B`'s history carries commits `A` lacks -- which is the
+ordinary state during a rebase, and the state every branch is in once its base has
+moved -- it folds those changes in too and answers a question nobody asked. `A...B`
+diffs `B` against the MERGE BASE, which is the question actually being put: what does
+this branch change relative to where it diverged.
+
+Measured while checking that a rebase had landed intact
+([#541](https://github.com/LASTRADA-Software/fastcached/issues/541)): the two-dot form
+reported `expect=-35` against `delta=10` -- a 45-line discrepancy that reads exactly
+like a dropped hunk, and was reported as one. The three-dot form over the same pair
+agreed with the expectation exactly, and nothing had been dropped.
+
+The distinction is textbook git, and that is not what makes it worth a bullet. **The
+wrong form produces a plausible NUMBER rather than an error**, and a plausible number
+inside a verification step is indistinguishable from a real finding until something
+else contradicts it. That is this section's own failure direction arriving one step
+later: the bullets above are about a merge that was never built, and this is about the
+instrument that checks the merge, confidently wrong in the same way.
+
+**The two forms disagreeing IS the discriminator, and it is not an error.** It says the
+branch is behind its base -- which is precisely the precondition the sequencing rule
+above turns on, arriving for free out of a diff somebody was running anyway. Read it as
+a finding about the branch, never as a fault in the diff.
+
+Checked across every tracked file at #541 rather than left unmentioned, since
+*"checked, none"* and *"did not check"* must not read alike: the three range usages in
+this tree -- `scripts/ci-scope.sh` twice and `scripts/tidy-sweep.sh` once -- are already
+three-dot, and none needed changing. The census was run with a positive control, a
+planted two-dot range, because a grep that finds nothing has said nothing until it has
+been shown finding something.
+
 ## A rulebook entry that has gone false instructs the next person
 
 Every `## Open work` entry in this directory names an issue that is still open, and
