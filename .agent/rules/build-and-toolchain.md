@@ -4880,17 +4880,28 @@ Three rules fall out, each generalising past this change:
   has run without covering anything that option gates. It is a different instrument
   over the CI matrix, not a deeper `tidy-sweep.sh`, which by construction sees one
   configuration and cannot know what the macOS or Windows legs compile.
-- **[#605](https://github.com/LASTRADA-Software/fastcached/issues/605)** —
-  `PreprocessArgv` re-parses the whole compile database once per translation unit,
-  a second and looser lookup rule for a question `PlanUnits` already answers.
-  The cost is the smaller half (14.1 s of CPU a sweep against 141 ms batched, ~0.3%
-  of wall clock); the correctness half is that the plan row splits with
-  `${unit#*$'\t'}`, which strips through the **first** tab, so a third column folds
-  into `$file`, the lookup misses, and the unit is classified from a command that is
-  not its own with nothing reporting. The row shape is fixed before the batching, and
-  a batched pass is accepted only on identical classifications over the real
-  database — a 100× speedup that moves one verdict is a regression, because the
-  verdicts are the entire job.
+- **[#1234](https://github.com/LASTRADA-Software/fastcached/issues/1234)** —
+  `PreprocessArgv` still parses the whole compile database once per translation
+  unit: 14.1 s of CPU a sweep against 141 ms batched, ~0.3% of wall clock. #605
+  closed the CORRECTNESS half and deliberately left this one. The plan now hands
+  over the entry's own `file` string as a third column and the lookup matches it
+  exactly and verbatim, so `PreprocessArgv` consumes what `PlanUnits` produced
+  rather than holding a second, looser rule (`endswith`) for a question `PlanUnits`
+  already answered — where the two disagreed the looser one won silently,
+  classifying a unit from a command that is not its own. The row is split on a
+  FIXED field count that refuses anything else by name, because `${unit#*$'	'}`
+  strips through the **first** tab and folded any third column into `$file`.
+  **Not `IFS=$'	' read`**: a tab is IFS whitespace, so an empty field collapses
+  and shifts every field after it, and the empty-`file` row would read as a short
+  row and pass. What is left is the parse, and its route is blocked on a smaller
+  question — `TidyOne` hands ONE directory to both `clang-tidy -p` and
+  `PreprocessArgv`, so making every unit a single-entry database also changes which
+  database the ANALYSER reads. A batched pass is accepted only on identical
+  classifications over the real database — a 100× speedup that moves one verdict
+  is a regression, because the verdicts are the entire job. The method is settled:
+  compare the two rules as a LOOKUP rather than by compiling every unit, which #605
+  did at 566 of 566 identical, with a control proving the comparison could see a
+  difference.
 - **[#607](https://github.com/LASTRADA-Software/fastcached/issues/607)** — #568 made the
   two CMake sites agree on the lookup that RUNS the interpreter, and `cmake/Coverage.cmake`
   names the four places python is located and which two do not validate. **Nothing reads
