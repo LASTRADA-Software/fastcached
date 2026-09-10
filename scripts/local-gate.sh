@@ -305,6 +305,28 @@ gate_start_marker="== LOCAL GATE STARTED"
 gate_passed_marker="LOCAL GATE PASSED"
 gate_failed_marker="GATE FAILED:"
 
+# ctest's own totals line, which three readers here hinge on: it is what
+# `skip_report` requires before it will conclude anything from a missing block,
+# what terminates the failure excerpt's alternation, and what the green path
+# prints. It sits beside the markers above for their reason -- a string that is
+# both written and read in several places, spelled independently in each, goes on
+# agreeing with itself after the thing it looks for has changed.
+#
+# **ANCHORED, and that is the whole point rather than tidiness.** It was the bare
+# substring `tests passed`, which is the only thing standing between
+# `skip_report`'s `SKIPS UNKNOWN` and its `no tests skipped`. Both gate presets
+# set `outputOnFailure`, so a failing test's own output is interleaved into this
+# same log -- and `scripts/launcher-replay-e2e.sh` prints
+# `control suite: All tests passed (N assertions in M test cases)`, which contains
+# it. A leg KILLED mid-run after any such line would have reported "no tests
+# skipped" for a run that never finished: the reassuring answer, from the guard
+# whose own comment says it exists to stop exactly that.
+#
+# The anchor also keeps those interleaved lines out of the failure excerpt, where
+# they would have burned the `-m 30` budget before ctest's own verdict lines
+# reached it.
+gate_totals_pattern='^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+'
+
 # Outcome, exit status, and what a reader should do about it.
 #
 # A table, so the statuses are DERIVED from one place and the self-test can assert
@@ -394,6 +416,409 @@ gate_outcome_status() {
     local row
     row="$(gate_outcome_row "$1")"
     echo "${row%%|*}"
+}
+
+# The tests a leg did not run, BY NAME, read out of that leg's own ctest output.
+#
+# `100% tests passed, 0 tests failed out of 3543` was the only thing a gate log
+# said about tests, and under #1128 it is precisely the line that cannot be
+# trusted: a Catch2 case failing exactly four assertions exits 4, every
+# registration reads exit 4 as a skip, so ctest scores it `Skipped` and still
+# prints that. The correct reading is therefore *check the skipped list* -- and
+# the gate carried no skip data at all, so that instruction could not be carried
+# out by anybody, and a lane believing it had checked had not (#1130).
+#
+# **A COUNT is refused as the fix, and that was measured rather than argued.** A
+# branch adding a skip guarded on `geteuid() == 0` leaves the tally unchanged on
+# an unprivileged gate: the skip never fires, the case runs normally, and a
+# reader checking the number sees the familiar figure and concludes correctly FOR
+# THE WRONG REASON. One more skip is not my skip, and an unchanged count is not
+# an unchanged set. So this reports names.
+#
+# ## Why it reads ctest's OUTPUT and not `Testing/Temporary/LastTestsDisabled.log`
+#
+# That file holds the names, is written at no extra cost, and is the obvious
+# source. It is also a stale verdict waiting to happen: ctest writes it only when
+# something did not run, and does NOT remove or empty it when nothing did.
+# Measured, one build directory, consecutive runs:
+#
+#   a run skipping one test    LastTestsDisabled.log written        17:51:15
+#   a run skipping nothing     untouched -- still 17:51:15, still naming that test
+#
+# So a reader trusting the file after a clean run is handed the PREVIOUS run's
+# skips, with nothing in the file to say so. The leg's own ctest output cannot go
+# stale that way, because it is produced by the run it describes. It is also
+# richer: the file merges every reason under a name that says `Disabled`, while
+# ctest labels each entry `(Skipped)`, `(Disabled)` or `(Not Run)`.
+#
+# ## Three outcomes, not two
+#
+# "nothing skipped" is a conclusion drawn from the ABSENCE of a block, so
+# something that must be PRESENT is asserted first: a ctest run that finished
+# always prints its totals line. Text carrying none is reported UNKNOWN rather
+# than as nothing-skipped. That is the state this project keeps collapsing -- the
+# file was not there and nothing was skipped are not the same fact, and only one
+# of them is about the tree.
+#
+# Entries are matched by SHAPE rather than by reading the block to end of input,
+# because ctest prints `The following tests FAILED:` AFTER this block and a
+# range-to-EOF would report those failures as skips -- which would be #1128's own
+# defect rebuilt inside its remedy.
+#
+# The pointer is SUPPLEMENTARY and the names are the record: an inlined list is
+# read months later, on another machine, after the build tree is gone, which is
+# most of when a gate log is read at all. It cannot go stale, because it is
+# written by the run it describes. A pointer alone would have cost the whole
+# ticket: the log would still carry no skip data, and the reader would still need
+# a tree that may not exist.
+#
+# **The pointer is good only until the next run in that build directory, and that
+# is accepted rather than solved.** `LastTest.log` is REWRITTEN every run, so a
+# reader returning after any later gate reads a different run's per-test output
+# with nothing saying so -- this repository has already lost evidence that way.
+# It is still the better of the two to name: `LastTestsDisabled.log` is not
+# rewritten at all when nothing was skipped, so it hands back a PREVIOUS run's
+# skips after a clean one, which is worse than being overwritten. Being replaced
+# is not safety; it is a different failure, and the names above are what carries
+# the answer either way.
+#
+# @param 1 Label to report against, normally the preset.
+# @param 2 Optional build directory, named in the pointer line when given.
+# Reads a ctest run's output on stdin.
+skip_report() {
+    local label="$1" build_dir="${2:-}" text entries count line
+    text="$(cat)"
+
+    # Herestrings rather than pipes throughout: `producer | grep -q` is a false
+    # negative under `pipefail`, which this script sets.
+    if ! grep -qE "$gate_totals_pattern" <<< "$text"; then
+        echo "== ${label}: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
+        echo "==   it cannot support 'nothing was skipped'. Whether the run finished is"
+        echo "==   the question to answer first."
+        return 0
+    fi
+
+    entries="$(awk '
+        /^The following tests did not run:/ { inblock = 1; next }
+        inblock && /^[ \t]*[0-9]+ - / { sub(/^[ \t]*/, ""); print; next }
+        inblock { inblock = 0 }
+    ' <<< "$text")"
+
+    if [[ -z "$entries" ]]; then
+        echo "== ${label}: no tests skipped"
+        return 0
+    fi
+
+    count="$(grep -c . <<< "$entries")"
+    echo "== ${label}: ${count} test(s) did not run, by name --"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && echo "==   ${line}"
+    done <<< "$entries"
+    if [[ -n "$build_dir" ]]; then
+        echo "==   each one's own output is in ${build_dir}/Testing/Temporary/LastTest.log"
+    fi
+}
+
+# Every verdict word ctest prints for a test, and whether the gate's failure
+# EXCERPT shows it.
+#
+# A table because two readers need this vocabulary and they must not be able to
+# disagree: this excerpt, and #1159's reconcile against the registered total. Two
+# hand-kept lists that drift apart is how one instrument starts describing a
+# different run from the other.
+#
+# **The list is hand-kept, and this is the argument for that rather than an
+# admission.** #1158 asks that it be derived from something.
+#
+# ctest enumerates its verdict WORDS nowhere the gate can read them, so there is
+# no source to derive this list from as it stands. But there IS a machine-readable
+# route and an earlier version of this comment denied it, which would have been
+# refuted by the first person to run `ctest --help`: **`--output-junit <file>`
+# exists, it is CMake 3.21+, and this project's floor is 3.28**, so it is
+# available on every configuration here.
+#
+# It is declined, on three grounds rather than on ignorance of it. JUnit's
+# per-case vocabulary is NARROWER than the console's -- pass, `<failure>`,
+# `<skipped>` -- so the excerpt would name less, not more, and `***Exception`
+# versus `***Failed` is the distinction #1158 is about. A side file's ABSENCE is
+# ambiguous, where `skip_report` turns on the PRESENCE of a totals line, which is
+# the one property separating "finished and skipped nothing" from "killed". And
+# reading it means an XML parser with attribute unescaping under bash 3.2.
+#
+# What closes the omission is not a longer list and not a different format: it is
+# the reconcile, which compares a SUM against a total and therefore has no list to
+# be incomplete (#1159).
+#
+# `Exception` is #1158: a segfault is `***Exception`, never `***Failed`, so a leg
+# failed by a crash printed a correct verdict and named no test. Measured on a
+# real `Linux-gcc-release` log: `grep -c '***Failed'` returned 0 while ctest
+# reported 1 test failed.
+#
+# `Not Run` is here because it was shown EMISSIBLE rather than assumed: Catch2's
+# `catch_discover_tests` writes a `<TARGET>_NOT_BUILT-<hash>` sentinel whenever a
+# test target was not built, and `FASTCACHED_BUILD_TESTCLIENT` and
+# `FASTCACHED_BUILD_BENCHMARKS` default OFF, so a partial build produces it
+# (#1159's measurement). #1158 asked for it to be covered or shown impossible; it
+# is covered, because it is not impossible.
+#
+# `Passed` and `Skipped` are deliberately OUT of the excerpt. Passed would print
+# thousands of lines. Skipped is reported by `skip_report` with its own names and
+# its own three outcomes, so repeating it here would put the same fact in two
+# places with two formats and one of them would go stale.
+# Columns: the state's NAME, the text ctest actually prints for it, and whether
+# the excerpt shows it.
+#
+# The printed form is a COLUMN and not a rule applied by each reader, which is the
+# correction that makes this table's own claim true. Both readers used to derive
+# the marker themselves -- the excerpt always prefixing `***`, the reconcile
+# prefixing it except for `Passed` -- so the vocabulary was shared and the
+# SPELLING was duplicated. A state whose printed form is not `***<name>`, marked
+# `yes`, would have made the excerpt grep for something that matches nothing, with
+# no way to notice. `Passed` is already that state; it is simply the one that was
+# special-cased rather than tabulated.
+# **ORDER IS LOAD-BEARING.** `states_reconcile` classifies each result line by the
+# FIRST row whose marker matches, so the starred markers must be tried before
+# `Passed`, whose marker is a bare word that also appears inside a test NAME. A
+# case called `a lookup some Passed task owns` that FAILS would otherwise be
+# counted as passed. `Passed` is therefore last, and moving it changes a verdict
+# rather than a listing.
+#
+# The excerpt pattern is unaffected by this order: it takes only the `yes` rows,
+# and `Passed`/`Skipped` are both `no`.
+gate_ctest_states=(
+    "Failed|\\*\\*\\*Failed|yes"
+    "Skipped|\\*\\*\\*Skipped|no"
+    "Timeout|\\*\\*\\*Timeout|yes"
+    "Exception|\\*\\*\\*Exception|yes"
+    "Not Run|\\*\\*\\*Not Run|yes"
+    "Passed|Passed|no"
+)
+
+# One column of a `gate_ctest_states` row, by position, so no caller spells the
+# field separator. 1 = name, 2 = printed marker, 3 = in-excerpt.
+# @param 1 row. @param 2 field number.
+gate_state_field() {
+    local rest="$1"
+    case "$2" in
+        1) echo "${rest%%|*}" ;;
+        2) rest="${rest#*|}"; echo "${rest%%|*}" ;;
+        *) echo "${rest##*|}" ;;
+    esac
+}
+
+# The alternation the failure excerpt greps for, built from the table above so a
+# new state is a row rather than an edit here.
+gate_excerpt_pattern() {
+    local row pattern=""
+    for row in "${gate_ctest_states[@]}"; do
+        [[ "$(gate_state_field "$row" 3)" == "yes" ]] || continue
+        pattern="${pattern}$(gate_state_field "$row" 2)|"
+    done
+    # The totals line is not a per-test state and is not in the table; it is here
+    # because a reader needs the count beside the names.
+    echo "${pattern}${gate_totals_pattern}"
+}
+
+# The lines the gate shows a reader when a leg's tests fail.
+#
+# `grep -m 30` rather than `grep | head -30`: a pipe into `head` kills the
+# producer with SIGPIPE once it has enough, and this script sets `pipefail`, so
+# the pipeline reports the producer's death. The bound is the same and there is
+# no second process to misreport.
+#
+# Reads a ctest run's output on stdin.
+failure_excerpt() {
+    grep -E -m 30 "$(gate_excerpt_pattern)" || true
+}
+
+# Does every test ctest ran land in a state this gate knows about?
+#
+# The excerpt above matches MARKERS IT ENUMERATES, and so does every other reader
+# here. An enumeration only covers the states its author was thinking about --
+# `***Exception` was missed for exactly that reason (#1158) -- so a longer list is
+# not the fix, because the next state is missed by the same mechanism.
+#
+# A SUM against the registered total has no list to be incomplete. It fires on ANY
+# state outside whatever the summer knows, including one a future ctest or Catch2
+# adds. That is the `*)`-arm argument answered rather than restated: you cannot
+# enumerate your way out, so compare against a total instead (#1159).
+#
+# ## Its honest limit, stated here because a reader will otherwise infer more
+#
+# **This says THAT something is unaccounted for. It never says WHAT.** A run
+# holding a crash and a run holding an unbuilt-target sentinel produce the same
+# alarm with the same wording. It does not replace the excerpt: that names the
+# failing test, this only guarantees that an unlisted state cannot pass silently.
+# Its silence is not a claim about which states occurred.
+#
+# ## Where the total comes from
+#
+# The DENOMINATOR of ctest's own `<n>/<N> Test #<id>:` prefix, which the same run
+# prints on every result line. Not a figure from CMake, not a count of
+# registrations, not the summary's `out of N` alone -- the requirement is that the
+# total cannot drift out of step with what actually ran, and a number emitted by
+# the run beside each result cannot.
+#
+# ## Why it counts with `grep`, and the honest comparison
+#
+# EIGHT passes over the log: one for the result lines, one for the total, and one
+# per row of the table.
+#
+# An earlier version of this paragraph said seven, and compared them against a
+# bash loop doing six regex tests on each of ~7000 lines -- which is the worst
+# alternative available and not the one anybody would propose. The real
+# alternative is a single `awk`, and it WINS on speed: measured on a synthetic
+# 7001-line, 592 KB ctest log, 9.0 ms against 71 ms for this. Roughly 8x.
+#
+# The greps stay anyway, and the reason is the table rather than the clock. One
+# awk pass would have to carry the state vocabulary inside its own program text,
+# where `gate_excerpt_pattern` cannot read it -- and one table both readers take
+# from is the whole argument for #1158 and #1159 being one change. The cost of
+# keeping it is about 60 ms per call against a test phase this project measures in
+# minutes, which is under a tenth of a percent of one leg.
+#
+# A comparison against a straw alternative is worse than no comparison, because it
+# reads as though the choice was measured. This one now names the option that
+# actually beats it.
+#
+# The states are made mutually exclusive by anchoring each verdict to the trailing
+# `N.NN sec` through `[^0-9*]*`, which cannot span the `***` of a following marker
+# -- so a test whose NAME ends in a verdict word is not counted twice. That is
+# driven by a self-test case rather than assumed.
+#
+# @param 1 Label to report against, normally the preset.
+# Reads a ctest run's output on stdin. Echoes `ok`, or a multi-line report.
+states_reconcile() {
+    local label="$1" text row rows="" report
+    text="$(cat)"
+
+    # The table, flattened for awk. The vocabulary still lives in exactly one
+    # place; awk is handed it rather than carrying its own copy.
+    #
+    # The backslashes come out HERE rather than inside awk, because `awk -v`
+    # processes escape sequences in the value it is given: handed `\*\*\*Failed`
+    # it prints `escape sequence \* treated as plain *` on stderr before any
+    # program of mine runs, and that warning would land in the gate's log on every
+    # leg. The marker column is regex-escaped for `gate_excerpt_pattern`, which
+    # splices it into an ERE; awk matches it literally with `index()`, which is
+    # what a verdict marker is.
+    #
+    # And the rows are joined with a UNIT SEPARATOR rather than a newline, because
+    # `awk -v` will not take one on every awk. macOS's BSD awk lexes the value as a
+    # string literal and refuses a raw newline inside it -- `awk: newline in string
+    # Failed|***Failed`, once per invocation, on stderr, with the program never
+    # running and `states_reconcile` then reporting on nothing. GNU awk accepts it,
+    # so it is green on Linux and on Git Bash and red only where a BSD awk is, which
+    # is the one platform whose `/bin/bash` this file is already constrained by.
+    # 0x1F cannot appear in a state name or a verdict marker, and it is not an ERE
+    # metacharacter, so `split` treats it literally whichever reading an awk takes.
+    local marker
+    for row in "${gate_ctest_states[@]}"; do
+        marker="$(gate_state_field "$row" 2)"
+        rows="${rows}$(gate_state_field "$row" 1)|${marker//\\/}"$'\037'
+    done
+
+    # ONE pass, and the classification is off the result-line PREFIX plus the
+    # marker -- never off the trailing `N.NN sec`.
+    #
+    # Anchoring on the time was wrong twice, both measured against real ctest. A
+    # `FAIL_REGULAR_EXPRESSION` failure puts the REASON between the verdict and
+    # the time:
+    #
+    #   1/2 Test #1: withdigit ...***Failed  Error regular expression found in
+    #   output. Regex=[error 42]  0.03 sec
+    #
+    # whose digits break `[^0-9*]*`, so a `***Failed` the excerpt named correctly
+    # was counted as zero and the alarm fired on a run with nothing unaccounted.
+    # And a `PASS_REGULAR_EXPRESSION` failure makes ctest WRAP the line, putting
+    # the time on the next one, where no single-line regex can reach it at all.
+    #
+    # It only ever reached the red path because all 71 first-party
+    # `FAIL_REGULAR_EXPRESSION` registrations happen to share the digit-free
+    # `CMake Error|CMake Warning`. That is not reassurance: a red leg is exactly
+    # when this gets read, and a wrong reading there is what teaches people to
+    # ignore it.
+    #
+    # First match wins, so each result line is counted once and the order of the
+    # table is load-bearing -- see the comment on it.
+    report="$(awk -v prefix='^ *[0-9]+/[0-9]+ Test +#[0-9]+:' -v rows="$rows" '
+        BEGIN {
+            n = split(rows, raw, "\037")
+            for (i = 1; i <= n; i++) {
+                if (raw[i] == "") continue
+                p = index(raw[i], "|")
+                k++
+                name[k] = substr(raw[i], 1, p - 1)
+                pat[k]  = substr(raw[i], p + 1)
+            }
+        }
+        $0 ~ prefix {
+            lines++
+            if (total == "") {
+                t = $0
+                sub(/^ *[0-9]+\//, "", t)
+                sub(/[^0-9].*/, "", t)
+                total = t
+            }
+            for (i = 1; i <= k; i++) {
+                if (index($0, pat[i]) > 0) { cnt[i]++; next }
+            }
+            unclassified++
+        }
+        END {
+            printf "%d %d %d", lines + 0, total + 0, unclassified + 0
+            # COUNT first, name second: `Not Run` contains a space, and a
+            # `read -r name count` splits it into `Not` and `Run`, which then
+            # reaches arithmetic as `accounted + Run`. With the count leading, a
+            # plain `read -r count name` takes the whole remainder as the name.
+            for (i = 1; i <= k; i++) printf "\n%d %s", cnt[i] + 0, name[i]
+        }
+    ' <<< "$text")"
+
+    local lines total unclassified accounted=0 detail=""
+    read -r lines total unclassified <<< "${report%%$'\n'*}"
+
+    # No result lines at all is not a reconcile failure: it is a run this cannot
+    # read, which `skip_report` reports in its own words. Saying "0 of 0
+    # accounted" here would be a second, vaguer voice for one fact.
+    if [[ "$lines" -eq 0 ]]; then
+        echo "ok"
+        return 0
+    fi
+
+    local name count
+    while read -r count name; do
+        [[ -z "$name" ]] && continue
+        accounted=$((accounted + count))
+        detail="${detail}
+==     ${name}: ${count}"
+    done <<< "$(printf '%s' "${report#*$'\n'}")"
+
+    # A total this cannot read is its OWN outcome, and it is emitted with its own
+    # status word so the caller cannot collapse it into the other one. `[[ 0 -eq
+    # "" ]]` is TRUE in bash -- an empty operand evaluates to 0 -- so an unreadable
+    # total once compared equal to an empty count and answered `ok`, which is this
+    # instrument reporting a clean reconcile about a run it could not read.
+    if [[ "$total" -eq 0 ]]; then
+        echo "unreadable-total"
+        echo "== ${label}: cannot read the registered total from this output, so the"
+        echo "==   states cannot be reconciled against anything. This is not a clean"
+        echo "==   reconcile and must not be read as one."
+        return 0
+    fi
+
+    if [[ "$accounted" -eq "$total" ]]; then
+        echo "ok"
+        return 0
+    fi
+
+    echo "unaccounted"
+    echo "== ${label}: the per-test states do not account for every test ctest ran."
+    echo "==   accounted ${accounted}, registered ${total}, result lines seen ${lines}, unclassified ${unclassified}${detail}"
+    echo "==   This says THAT something is unaccounted for and never WHAT: a state no"
+    echo "==   reader here enumerates, or a run that stopped early, produce the same"
+    echo "==   alarm. Read the full log; do not add a state to make this quiet until"
+    echo "==   you know which one it is."
 }
 
 if [[ -n "$classify_log" ]]; then
@@ -1675,6 +2100,236 @@ $gate_passed_marker"
     expect "every file in the list is counted" "format 3" \
         "$(format_plan "$(printf 'a.cpp\nb.hpp\nc.h')")"
 
+    # -----------------------------------------------------------------------
+    # #1130: the skipped NAMES a leg reports, driven as a pure function over
+    # staged ctest output. No gate is run and no ctest is invoked -- `skip_report`
+    # reads text and writes text, so every outcome is exercised in milliseconds.
+    # The same split `gate_outcome` took, for the same reason.
+    #
+    # Tabs, because that is what ctest indents these entries with, and the
+    # stripping is part of what is under test.
+    _skips="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - rulebook-open-work-state (Skipped)\n\t334 - a second skipped case (Skipped)\n')"
+    _clean="$(printf '100%% tests passed, 0 tests failed out of 10\n\nTotal Test time (real) =  91.02 sec\n')"
+
+    expect "a leg that skipped tests reports them BY NAME, not as a count" \
+        "== gate-clang-debug: 2 test(s) did not run, by name --
+==   82 - rulebook-open-work-state (Skipped)
+==   334 - a second skipped case (Skipped)" \
+        "$(skip_report gate-clang-debug <<< "$_skips")"
+
+    # The direction a guard nobody has watched accept never proves. Silence here
+    # would be indistinguishable from the reporter not running at all, so the
+    # clean case makes a POSITIVE statement.
+    expect "a leg that skipped nothing says so, rather than saying nothing" \
+        "== gate-clang-debug: no tests skipped" \
+        "$(skip_report gate-clang-debug <<< "$_clean")"
+
+    # The state this project keeps collapsing. Output with no ctest totals line is
+    # not a run that skipped nothing -- it is a run whose skip data is UNKNOWN,
+    # which is the shape a killed or interrupted leg leaves. Concluding "nothing
+    # skipped" from the absence of a block, without first asserting that something
+    # which must be present IS, is how the file-was-not-there state disappears.
+    _unknown_head="== gate-clang-debug: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
+    expect "output with no totals line is UNKNOWN, never nothing-skipped" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "a truncated log that stops mid-run" | head -1)"
+    expect "empty output is UNKNOWN too -- the shape a killed leg leaves" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "" | head -1)"
+
+    # ctest prints `The following tests FAILED:` AFTER the did-not-run block, so a
+    # reader that took the block to end of input would report those failures as
+    # skips -- #1128's defect rebuilt inside its own remedy. Both spacings, since
+    # a blank line between the blocks is what would make the naive version look
+    # correct.
+    for _gap in '\n' ''; do
+        _mixed="$(printf '99%% tests passed, 1 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - a skipped one (Skipped)\n%bThe following tests FAILED:\n\t100 - a failed one (Failed)\n' "$_gap")"
+        expect "a FAILED block after the skips is not read as a skip (gap='${_gap}')" \
+            "== gate-clang-debug: 1 test(s) did not run, by name --
+==   82 - a skipped one (Skipped)" \
+            "$(skip_report gate-clang-debug <<< "$_mixed")"
+    done
+
+    # THE TICKET'S OWN ARGUMENT, encoded rather than described: two runs with the
+    # SAME COUNT and different SETS. A tally reports "1" for both and cannot tell
+    # them apart, which is how a branch adding a root-conditional skip -- one that
+    # never fires on an unprivileged gate -- leaves the number unchanged and a
+    # reader concludes correctly for the wrong reason. The names differ, so the
+    # report differs. One more skip is not my skip.
+    _skip_a="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 82 - the skip that was always there (Skipped)\n')"
+    _skip_b="$(printf '100%% tests passed, 0 tests failed out of 10\n\nThe following tests did not run:\n\t 91 - a skip this branch introduced (Skipped)\n')"
+    expect "two runs skipping the SAME NUMBER of tests report differently" \
+        "different" \
+        "$([[ "$(skip_report leg <<< "$_skip_a")" == "$(skip_report leg <<< "$_skip_b")" ]] && echo same || echo different)"
+    # There WAS a case here comparing a report with itself, offered as the control
+    # that the check is "not simply always saying different". It was vacuous: a
+    # pure text function's output compared with itself can only be equal, so it
+    # asserted bash's `==` and nothing about the gate. Removed rather than
+    # reworded. What actually supplies that discriminating power is the case above
+    # that pins `skip_report`'s exact output byte for byte -- if the reporter
+    # printed a constant, that one fails.
+
+    # The pointer is supplementary and appears only when there is a directory to
+    # name. It points at `LastTest.log`, which every run rewrites -- never at
+    # `LastTestsDisabled.log`, which ctest leaves untouched when nothing skipped,
+    # so after a clean run it still names the PREVIOUS run's skips.
+    expect "the pointer names LastTest.log when a build directory is given" \
+        "==   each one's own output is in out/build/gate-clang-debug/Testing/Temporary/LastTest.log" \
+        "$(skip_report gate-clang-debug out/build/gate-clang-debug <<< "$_skips" | tail -1)"
+    expect "and no pointer line is invented when there is no directory" \
+        "==   334 - a second skipped case (Skipped)" \
+        "$(skip_report gate-clang-debug <<< "$_skips" | tail -1)"
+
+    # -----------------------------------------------------------------------
+    # #1158: the failure excerpt names the test on a leg failed by a CRASH.
+    #
+    # A segfault is `***Exception`, never `***Failed`, so the old two-token
+    # alternation printed a correct verdict and named nothing. Measured on a real
+    # `Linux-gcc-release` log: `grep -c '***Failed'` returned 0 while ctest
+    # reported 1 test failed.
+    _crash="$(printf '954/3491 Test #907: Site 3: a registration presents the secret in force NOW ***Exception: SegFault  0.16 sec\n955/3491 Test #908: something ordinary ... Passed    0.01 sec\n99%% tests passed, 1 tests failed out of 3491\n')"
+
+    expect "a leg failed by a crash names the crashed test" \
+        "954/3491 Test #907: Site 3: a registration presents the secret in force NOW ***Exception: SegFault  0.16 sec
+99% tests passed, 1 tests failed out of 3491" \
+        "$(failure_excerpt <<< "$_crash")"
+
+    # ... and the control that gives the case above its meaning: a `Passed` line
+    # is in that input and must NOT be excerpted, or the excerpt is thousands of
+    # lines and names nothing usefully.
+    expect "an ordinary passing test is not excerpted" "0" \
+        "$(failure_excerpt <<< "$_crash" | grep -c 'something ordinary' || true)"
+
+    # `Not Run`, which #1158 asked to be covered or shown impossible. It is
+    # emissible: `catch_discover_tests` writes a `_NOT_BUILT` sentinel for a target
+    # that was not built, and two of this project's test targets default OFF.
+    _notrun="$(printf '1/4 Test #1: CowTreeTests_NOT_BUILT-b12d07c ***Not Run   0.00 sec\n25%% tests passed, 3 tests failed out of 4\n')"
+    expect "an unbuilt-target sentinel is named too" \
+        "1/4 Test #1: CowTreeTests_NOT_BUILT-b12d07c ***Not Run   0.00 sec
+25% tests passed, 3 tests failed out of 4" \
+        "$(failure_excerpt <<< "$_notrun")"
+
+    # The two states the excerpt always covered, so this change is shown to add
+    # rather than to replace.
+    for _old in Failed Timeout; do
+        expect "the excerpt still names a ***${_old} test" \
+            "7/9 Test #7: an older shape ***${_old}  1.00 sec" \
+            "$(failure_excerpt <<< "7/9 Test #7: an older shape ***${_old}  1.00 sec")"
+    done
+
+    # The pattern is BUILT from the table, so a row is the unit of change. Asserted
+    # against the whole string rather than by searching it: a check that only looks
+    # for the tokens it expects cannot notice one that should not be there.
+    expect "the excerpt pattern is derived from the state table" \
+        '\*\*\*Failed|\*\*\*Timeout|\*\*\*Exception|\*\*\*Not Run|^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' \
+        "$(gate_excerpt_pattern)"
+
+    # Every row parses, and the two columns are the only two spellings. A row that
+    # stopped parsing would silently drop its state from the excerpt.
+    for _row in "${gate_ctest_states[@]}"; do
+        case "$(gate_state_field "$_row" 3)" in
+            yes|no) ;;
+            *) echo "SELF-TEST FAILED: unknown excerpt column in '$_row'" >&2
+               self_test_failures=$((self_test_failures + 1)) ;;
+        esac
+    done
+
+    # -----------------------------------------------------------------------
+    # #1159: the reconcile against the registered total.
+    #
+    # The direction that decides whether this is worth having: it must be SILENT
+    # on ordinary input. A reconcile that fires on a healthy run is worse than
+    # none, because it is re-run until quiet and then believed when it matters.
+    _healthy="$(printf '1/3 Test #1: alpha ...   Passed    0.01 sec\n2/3 Test #2: beta ....   Passed    0.02 sec\n3/3 Test #3: gamma ...   Passed    0.03 sec\n100%% tests passed, 0 tests failed out of 3\n')"
+    expect "an ordinary passing run reconciles silently" "ok" \
+        "$(states_reconcile leg <<< "$_healthy")"
+
+    # A run whose states this gate knows, MIXED, still reconciles -- so the check
+    # is not simply answering ok to everything with the word Passed in it.
+    _mixed_states="$(printf '1/4 Test #1: alpha ...   Passed    0.01 sec\n2/4 Test #2: beta ....   ***Failed  0.02 sec\n3/4 Test #3: gamma ...   ***Skipped 0.03 sec\n4/4 Test #4: delta ...   ***Exception: SegFault  0.04 sec\n75%% tests passed, 1 tests failed out of 4\n')"
+    expect "a run mixing four known states reconciles" "ok" \
+        "$(states_reconcile leg <<< "$_mixed_states")"
+
+    # THE TICKET: a state nobody enumerated. The excerpt cannot see it -- that is
+    # the point -- and the sum does, without having been told what it is.
+    _unlisted="$(printf '1/3 Test #1: alpha ...   Passed    0.01 sec\n2/3 Test #2: beta ....   ***Bananas 0.02 sec\n3/3 Test #3: gamma ...   Passed    0.03 sec\n66%% tests passed, 1 tests failed out of 3\n')"
+    expect "a state nobody enumerated is caught by the SUM" \
+        "==   accounted 2, registered 3, result lines seen 3, unclassified 1" \
+        "$(states_reconcile leg <<< "$_unlisted" | sed -n '3p')"
+
+    # And the excerpt is blind to that same input, which is why both exist. If
+    # this ever starts matching, the two instruments have stopped being
+    # independent and the sum is no longer the backstop.
+    expect "... and the excerpt does NOT see it, which is why the sum exists" "0" \
+        "$(failure_excerpt <<< "$_unlisted" | grep -c 'Bananas' || true)"
+
+    # A run that stopped early: every line is a known state, and the total still
+    # does not add up. A checker keyed only on unknown MARKERS would pass this.
+    _truncated="$(printf '1/9 Test #1: alpha ...   Passed    0.01 sec\n2/9 Test #2: beta ....   Passed    0.02 sec\n')"
+    expect "a run that stopped early does not reconcile either" \
+        "==   accounted 2, registered 9, result lines seen 2, unclassified 0" \
+        "$(states_reconcile leg <<< "$_truncated" | sed -n '3p')"
+
+    # Output with no result lines is NOT a reconcile failure -- `skip_report`
+    # already reports an unreadable run in its own words, and a second vaguer
+    # voice for one fact is how a reader learns to ignore both.
+    expect "output with no result lines is left to skip_report" "ok" \
+        "$(states_reconcile leg <<< "a truncated log with no per-test lines")"
+
+    # The mutual exclusivity the counting relies on, driven rather than assumed: a
+    # test whose NAME ends in a verdict word must be counted ONCE. Double-counting
+    # would make accounted 2 against a registered 1, so `ok` is the assertion.
+    expect "a test whose name ends in a verdict word is counted once" "ok" \
+        "$(states_reconcile leg <<< "1/1 Test #1: a case named Passed ...   ***Failed  0.01 sec")"
+
+    # It says THAT, never WHAT -- asserted, because the sentence is the whole
+    # reason nobody should read its silence as a claim about which states ran.
+    expect "the report refuses to name the state" "yes" \
+        "$([[ "$(states_reconcile leg <<< "$_unlisted")" == *"never WHAT"* ]] && echo yes || echo no)"
+
+    # A `FAIL_REGULAR_EXPRESSION` failure puts the REASON between the verdict and
+    # the time, and a reason with DIGITS in it broke the old trailing-time anchor:
+    # the `***Failed` was counted as zero and the alarm fired on a run with nothing
+    # unaccounted, directly under an excerpt that had named that same test
+    # correctly. Real ctest output, reduced.
+    _reasoned="$(printf '1/2 Test #1: withdigit ...***Failed  Error regular expression found in output. Regex=[error 42]  0.03 sec\n2/2 Test #2: other ...   Passed    0.01 sec\n50%% tests passed, 1 tests failed out of 2\n')"
+    expect "a failure REASON containing digits is still counted" "ok" \
+        "$(states_reconcile leg <<< "$_reasoned")"
+
+    # And a `PASS_REGULAR_EXPRESSION` failure makes ctest WRAP the result line, so
+    # the time lands on the next one where no single-line regex can reach it. The
+    # verdict is still on the prefix line, which is why classification moved there.
+    _wrapped="$(printf '1/2 Test #1: wrapped ...***Failed  Required regular expression not found. Regex=[never]\n  0.02 sec\n2/2 Test #2: other ...   Passed    0.01 sec\n50%% tests passed, 1 tests failed out of 2\n')"
+    expect "a wrapped result line is still counted" "ok" \
+        "$(states_reconcile leg <<< "$_wrapped")"
+
+    # A test whose NAME contains a verdict word, FAILING. First-match-wins over a
+    # table with `Passed` last is what makes this one Failed rather than two
+    # states at once -- reordering the table breaks it.
+    expect "a name containing 'Passed' on a failing test counts once, as Failed" "ok" \
+        "$(states_reconcile leg <<< "$(printf '1/1 Test #1: a lookup some Passed task owns ...***Failed  0.01 sec\n')")"
+
+    # The THIRD outcome, kept distinct from the second by a status word so the
+    # caller cannot collapse them: an unreadable total sends a reader somewhere
+    # else entirely from an unenumerated state.
+    expect "an unreadable registered total is its own status" "unreadable-total" \
+        "$(states_reconcile leg <<< "$(printf '1/0 Test #1: x ...   Passed    0.01 sec\n')" | sed -n '1p')"
+    expect "... and an unaccounted state is the other one" "unaccounted" \
+        "$(states_reconcile leg <<< "$_unlisted" | sed -n '1p')"
+
+    # #1130's guard, anchored. `outputOnFailure` interleaves a failing test's own
+    # output into this log, and `launcher-replay-e2e.sh` prints a line containing
+    # `All tests passed (N assertions in M test cases)`. Unanchored, a leg KILLED
+    # after any such line reported "no tests skipped" -- the reassuring answer for
+    # a run that never finished, from the guard whose comment says it exists to
+    # stop precisely that.
+    expect "a dumped 'All tests passed' line does not satisfy the finished check" \
+        "$_unknown_head" \
+        "$(skip_report gate-clang-debug <<< "control suite: All tests passed (3 assertions in 2 test cases)" | head -1)"
+    expect "... while ctest's real totals line does" \
+        "== gate-clang-debug: no tests skipped" \
+        "$(skip_report gate-clang-debug <<< "100% tests passed, 0 tests failed out of 10")"
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -1892,13 +2547,56 @@ run_preset() {
     #
     # getconf rather than nproc: this gate runs on macOS too.
     local jobs="${FASTCACHE_GATE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+    local _reconcile
 
     echo "== $preset: test (--parallel $jobs)"
     if ! ctest --preset "$preset" --parallel "$jobs" > "$log" 2>&1; then
-        grep -E '\*\*\*Failed|\*\*\*Timeout|tests passed' "$log" | head -30
+        failure_excerpt < "$log"
+        # A failing leg's skips matter as much as a passing one's -- more, since a
+        # skip is one of the ways a case stops reporting on the thing that broke.
+        skip_report "$preset" "$build_dir" < "$log"
+        # Printed but not made into a second verdict: this leg is already red, and
+        # a reconcile alarm here is EVIDENCE about why the excerpt may name less
+        # than the whole story rather than an additional finding.
+        _reconcile="$(states_reconcile "$preset" < "$log")"
+        [[ "$_reconcile" == "ok" ]] || printf '%s\n' "$_reconcile"
         fail "$preset tests (full log: $log)"
     fi
-    grep -E 'tests passed' "$log" | head -1
+
+    grep -E -m 1 "$gate_totals_pattern" "$log"
+    # #1130: the totals line above is the one #1128 makes untrustworthy, so the
+    # skipped NAMES go in the log beside it, before the log this read is deleted.
+    skip_report "$preset" "$build_dir" < "$log"
+
+    # #1159, and on the GREEN path is where it earns its place: a leg that ctest
+    # reports as passing while some test landed in a state no reader here
+    # enumerates would otherwise go by silently, which is the whole species.
+    #
+    # AFTER the totals line and the skipped names, not before. `fail` exits, so
+    # running this first suppressed both on the one run that most needed them --
+    # in the branch whose own ticket is "the gate log carries no skip data".
+    #
+    # The two non-ok outcomes are kept APART here, because collapsing them is the
+    # defect this function exists to prevent, one level up: an unreadable total
+    # and an unenumerated state send a reader to different places, and reporting
+    # the second when the first happened sends them hunting for a state that is
+    # not there. `fail` also names the log, like every other refusal in this
+    # function -- it exits before the `rm` below, so the file survives, and a
+    # message telling somebody to read a log whose `mktemp` name it never prints
+    # is an instruction that cannot be followed.
+    _reconcile="$(states_reconcile "$preset" < "$log")"
+    case "${_reconcile%%$'\n'*}" in
+        ok) ;;
+        unreadable-total)
+            printf '%s\n' "${_reconcile#*$'\n'}"
+            fail "$preset tests: the registered total could not be read, so nothing was reconciled (full log: $log)"
+            ;;
+        *)
+            printf '%s\n' "${_reconcile#*$'\n'}"
+            fail "$preset tests: the per-test states do not account for every test that ran (full log: $log)"
+            ;;
+    esac
+
     rm -f "$log"
 }
 
