@@ -669,13 +669,9 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
     // preprocessed key still serves it.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-hollow" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const sourcePath = root / "src" / "u.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "int main() { return 0; }\n";
-    }
+    scratch.Write("src/u.cpp", "int main() { return 0; }\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = (root / "src").string(),
                                                 .buildTree = (root / "bld").string() };
@@ -795,19 +791,12 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     // validating the moment one of them changes or disappears.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-test" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "header.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint original();\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\nint original();\n");
 
     auto const sourcePath = root / "src" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cl-test-1";
@@ -830,10 +819,7 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     auto const keyBefore = ComputeHeaderStateDigest("mkey", *built);
 
     // Edit the header: validation must fail and the derived object key must move.
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint edited_differently();\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\nint edited_differently();\n");
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
 
     auto const rebuilt = BuildManifest(inputs("objkey-1"), layout);
@@ -843,8 +829,6 @@ TEST_CASE("Build then validate a manifest against real files on disk")
     // Deleting the header must also invalidate rather than silently pass.
     std::filesystem::remove(headerPath);
     CHECK_FALSE(ValidateManifest(*rebuilt, layout, stamp));
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC-style")
@@ -858,19 +842,12 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     // (see issue #49 / issue #51).
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-source-edit" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "header.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint helper();\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\nint helper();\n");
 
     auto const sourcePath = root / "src" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\nint main() { return 0; }\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cl-test-1";
@@ -888,16 +865,11 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
     CHECK(ValidateManifest(*built, layout, stamp));
 
     // Edit the .cpp body itself -- no header touched.
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\nint main() { return 1; }\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\nint main() { return 1; }\n");
 
     // The manifest must no longer validate: the TU itself is part of what a hit
     // reproduces, so its own content has to be covered too.
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("BuildManifest records a relative dependency path instead of dropping it")
@@ -915,19 +887,10 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
     // say so in comments; this was the third consumer and did not.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-relative" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
-    auto const headerPath = root / "src" / "header.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint helper();\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\nint helper();\n");
 
-    auto const sourcePath = root / "src" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"header.hpp\"\nint main() { return 0; }\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cc-test-1";
@@ -956,13 +919,8 @@ TEST_CASE("BuildManifest records a relative dependency path instead of dropping 
     // The property that matters: editing the relatively-named header must stop the
     // manifest validating. Before the fix it stayed valid forever, because the
     // header was never an entry.
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint helper(int);\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\nint helper(int);\n");
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)")
@@ -974,20 +932,12 @@ TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)
     // whole fix was to make the TU part of what a manifest revalidates.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-relative-tu" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
     std::filesystem::create_directories(root / "out");
 
     auto const headerPath = root / "src" / "header.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\n";
-    }
+    scratch.Write("src/header.hpp", "#pragma once\n");
 
-    auto const sourcePath = root / "src" / "t.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\nint main() { return 0; }\n";
-    }
+    scratch.Write("src/t.cpp", "#include \"header.hpp\"\nint main() { return 0; }\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
     constexpr std::string_view stamp = "cc-test-1";
@@ -1007,13 +957,8 @@ TEST_CASE("BuildManifest records a relatively-named translation unit (issue #57)
     CHECK(ValidateManifest(*built, layout, stamp));
 
     // Edit the .cpp body only. Before the fix this validated forever.
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"header.hpp\"\nint main() { return 1; }\n";
-    }
+    scratch.Write("src/t.cpp", "#include \"header.hpp\"\nint main() { return 1; }\n");
     CHECK_FALSE(ValidateManifest(*built, layout, stamp));
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("CanonicalSourceToken agrees whichever way the source is spelled")
@@ -1118,13 +1063,9 @@ TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #
     // and reporting the source would send them to the one file that was fine.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-fault-dep" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const sourcePath = root / "src" / "t.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "int main() { return 0; }\n";
-    }
+    scratch.Write("src/t.cpp", "int main() { return 0; }\n");
 
     // Rooted at `<root>/src` rather than at `<root>`, so the near-miss path below
     // lies under neither root. Under a root of `<root>` it would canonicalize
@@ -1184,8 +1125,6 @@ TEST_CASE("BuildManifest names the offending DEPENDENCY, not the source (issue #
         REQUIRE_FALSE(built.has_value());
         CHECK(built.error() == ManifestFailure { .fault = ManifestFault::Unreadable, .path = missing });
     }
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("CanonicalSourceToken's refusal carries the path and the reason (issue #68)")
@@ -1249,7 +1188,6 @@ TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's voca
         // exactly why the case is SKIPPED here rather than passed. A `SUCCEED` would
         // report that the rule holds on every host that cannot make a link, which is
         // the one set of hosts where nothing checked it (#685).
-        std::filesystem::remove_all(base);
         SKIP("symlinks unavailable on this host");
     }
 
@@ -1261,8 +1199,6 @@ TEST_CASE("AnchorWorkingDirectory re-spells a symlinked cwd in the layout's voca
 
     // And the point of doing it: a relative path now resolves under the root.
     CHECK(CanonicalSourceToken("t.cpp", layout, anchored) == "<SRCROOT>/sub/t.cpp");
-
-    std::filesystem::remove_all(base);
 }
 
 TEST_CASE("AnchorWorkingDirectory prefers the longest root and passes through the rest")
@@ -1285,8 +1221,6 @@ TEST_CASE("AnchorWorkingDirectory prefers the longest root and passes through th
     // anchors nothing -- which is a refusal, not a silent drop.
     auto const outside = AnchorWorkingDirectory((base / "elsewhere").string(), layout);
     CHECK_FALSE(CanonicalSourceToken("t.cpp", layout, outside).has_value());
-
-    std::filesystem::remove_all(base);
 }
 
 TEST_CASE("ResolveAgainst anchors by the layout's conventions, not the host's")
@@ -1350,16 +1284,10 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
     std::filesystem::create_directories(root / "src" / "b");
 
     auto const headerPath = root / "src" / "b" / "shared.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\n";
-    }
+    scratch.Write("src/b/shared.hpp", "#pragma once\n");
 
     auto const sourcePath = root / "src" / "a" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"../b/shared.hpp\"\n";
-    }
+    scratch.Write("src/a/a.cpp", "#include \"../b/shared.hpp\"\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
 
@@ -1385,27 +1313,18 @@ TEST_CASE("BuildManifest normalizes '..' segments and mixed separators to one to
               built->entries, std::string { "<SRCROOT>/src/b/shared.hpp" }, &DirectManifest::Entry::canonicalPath)
           == 1);
     CHECK(ValidateManifest(*built, layout, "cl-test-1"));
-
-    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("BuildManifest drops toolchain headers and deduplicates project headers")
 {
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-dedup" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "shared.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\n";
-    }
+    scratch.Write("src/shared.hpp", "#pragma once\n");
 
     auto const sourcePath = root / "src" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"shared.hpp\"\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"shared.hpp\"\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
 
@@ -1428,8 +1347,6 @@ TEST_CASE("BuildManifest drops toolchain headers and deduplicates project header
     REQUIRE(built.has_value());
     // The project header once, plus the TU; neither toolchain header appears.
     CHECK(built->entries.size() == 2);
-
-    std::filesystem::remove_all(root);
 }
 
 // --- GNU depfile parsing ----------------------------------------------------
@@ -1588,19 +1505,12 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
     // it would pay for a manifest lookup on every compile and never hit.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-depfile" };
     auto const& root = scratch.Path();
-    std::filesystem::create_directories(root / "src");
 
     auto const headerPath = root / "src" / "dep.hpp";
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\n";
-    }
+    scratch.Write("src/dep.hpp", "#pragma once\n");
 
     auto const sourcePath = root / "src" / "a.cpp";
-    {
-        std::ofstream out { sourcePath, std::ios::binary };
-        out << "#include \"dep.hpp\"\n";
-    }
+    scratch.Write("src/a.cpp", "#include \"dep.hpp\"\n");
 
     FastCache::PathCanon::Layout const layout { .sourceRoot = root.string(), .buildTree = (root / "out").string() };
 
@@ -1626,13 +1536,8 @@ TEST_CASE("A GNU depfile drives a manifest exactly as showIncludes notes do")
 
     // Editing the recorded header must invalidate the manifest — otherwise a
     // direct hit would serve an object built from stale headers.
-    {
-        std::ofstream out { headerPath, std::ios::binary };
-        out << "#pragma once\nint changed();\n";
-    }
+    scratch.Write("src/dep.hpp", "#pragma once\nint changed();\n");
     CHECK_FALSE(ValidateManifest(*built, layout, "gcc-test-1"));
-
-    std::filesystem::remove_all(root);
 }
 
 // --- issue #63: the manifest key must be as wide as it looks -----------------
@@ -1760,21 +1665,19 @@ TEST_CASE("HashFileContents separates equal-length contents and reports unreadab
     // header edit preserving length. A collision there does not miss -- it decides
     // an edited header is unchanged and serves the stale object under a zero exit
     // code (issue #63, same defect as the key itself).
-    // Cleared before it is populated, like every other filesystem case in this
-    // file. The teardown at the end does not cover a run that crashed or was
-    // interrupted, and this case asserts that `absent.hpp` is ABSENT -- so a
-    // leftover of that name would make it fail for a reason that has nothing to
-    // do with hashing.
+    // Cleared before it is populated, which `ScratchDirectory`'s constructor does --
+    // it is not something this case has to remember. That matters here rather than
+    // being tidiness: the case asserts `absent.hpp` is ABSENT, so a leftover of that
+    // name would fail it for a reason that has nothing to do with hashing.
     FastCache::Testing::ScratchDirectory const scratch { "fc-direct-hashfile" };
-    auto const& dir = scratch.Path();
-    std::filesystem::create_directories(dir);
 
+    // Through `ScratchDirectory::Write`, which creates the parents and THROWS when
+    // the open or the close fails. The lambda survives only for its RETURN: this case
+    // names every file it writes, and `Write` deliberately returns nothing so that
+    // `operator/` is the one way to name what was just written.
     auto const write = [&](std::string_view name, std::string_view contents) {
-        auto const path = dir / name;
-        std::ofstream out { path, std::ios::binary };
-        out << contents;
-        out.close();
-        return path.string();
+        scratch.Write(name, contents);
+        return (scratch / name).string();
     };
 
     auto const a = write("a.hpp", "static int value = 1;\n");
@@ -1789,10 +1692,8 @@ TEST_CASE("HashFileContents separates equal-length contents and reports unreadab
     // from every real digest: ValidateManifest compares this value for equality,
     // so an unreadable header must not compare equal to anything -- including a
     // readable one that happens to be empty.
-    CHECK(HashFileContents((dir / "absent.hpp").string()).empty());
+    CHECK(HashFileContents((scratch / "absent.hpp").string()).empty());
     CHECK_FALSE(HashFileContents(empty).empty());
-
-    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("NormalizePath answers for a spelling this host cannot read, instead of throwing")
@@ -1854,9 +1755,11 @@ struct TwoCheckouts
         // it pass for the wrong reason, on two checkouts that do not differ
         // because neither has a `dep.hpp` at all.
         //
-        // Twenty older cases in this file still open `std::ofstream` by hand, so
-        // hand-rolling would have matched the local habit. That is not a reason
-        // to add a twenty-first.
+        // This was once the local minority -- the older cases in this file each
+        // open-coded the same create/open/write/remove block -- and #70 converted
+        // them, so `Write` is now simply how this file writes a file. The sentence
+        // that stood here counted those cases, and the conversion is exactly what
+        // made the count wrong.
         // Identical in both checkouts, deliberately: that is the condition under
         // which a hollow manifest validates, and it is what the original report
         // stated before anyone was looking for it.

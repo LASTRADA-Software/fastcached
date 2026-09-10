@@ -45,6 +45,25 @@ std::vector<TextRegion> Value(std::string stdoutText, std::string stderrText, st
 
 /// A scratch directory that removes itself, so a failing assertion cannot leave a
 /// tree behind that makes the next run pass for the wrong reason.
+// Not `FastCache::Testing::ScratchDirectory`, and not hoisted into a shared header
+// either -- which is what #70 assumed had already happened.
+//
+// ONE difference carries that, and it is worth stating narrowly because the obvious
+// second reason does not hold: `Write` RETURNS the path it wrote, and
+// `ScratchDirectory::Write` returns void on purpose, so that `operator/` is the
+// single way to name what was written. Every case below names each file it writes,
+// so converting would spell each path twice.
+//
+// The nesting is NOT a second reason. `root` sits inside `base` because one name
+// below is itself a nested path, and it reads like an obstacle -- but #147 records
+// the remedy from converting two other copies: move the nesting into the relative
+// paths handed to `Write` and `operator/`, and one `remove_all` still takes the
+// whole tree. Left in the list, it would argue against that ticket's own approach
+// from a file the person doing the sweep will open.
+//
+// So: a local convenience over the shared fixture rather than a second copy of it,
+// on one property. `DirectManifest_test.cpp` uses `ScratchDirectory` directly (#70)
+// and needs neither.
 struct ScopedTree
 {
     std::filesystem::path base;
