@@ -2914,6 +2914,31 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
             "$([[ "$coverage_declared" == *"unresolved"* ]] && echo yes || echo no)"
     fi
 
+    # --- #591: the reaper ships with this gate, so this gate tests it ---------
+    #
+    # `reap-my-gate.sh` has its own `--self-test`, and it is driven from HERE
+    # rather than from a registration of its own: `local-gate-selftest` is already
+    # registered and runs on every platform CI builds, so the helper is covered the
+    # day it lands instead of the day somebody sequences a row into
+    # `src/tests/CMakeLists.txt`. A self-test nothing invokes is a self-test nobody
+    # has watched refuse.
+    #
+    # `bash <path>`, never the bare path: a mode-644 script exits 126, and inside an
+    # assertion any failure to START is indistinguishable from the rule firing.
+    #
+    # Its own summary line is what is asserted, not merely its status, so a run that
+    # SKIPPED its real-process half is visible here rather than folded into a pass.
+    # The count is not pinned -- that would be a second copy of a number the helper
+    # already prints -- but `0 failed` is.
+    reap_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/reap-my-gate.sh" --self-test 2>&1)"
+    reap_status=$?
+    expect "the gate reaper's own self-test passes" "0" "$reap_status"
+    expect "and it reports a count, so a run that judged nothing is visible" \
+        "yes" "$([[ "$reap_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
+    case "$reap_out" in
+        *SKIPPED*) self_test_skipped="${self_test_skipped:+$self_test_skipped, }the reaper's real-process half (${reap_out#*SKIPPED: })" ;;
+    esac
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
