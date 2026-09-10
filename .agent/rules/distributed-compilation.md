@@ -2648,6 +2648,20 @@ real framing, with an empty argument and one containing a space. That last one i
 only thing that would catch an encoding that drops a field on the way.
 
 ## Open work
+- **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
+  has no cancellable seam, so a compile whose client has GONE runs to completion and this
+  machine pays for an object nobody will read. The departure is already detected and
+  already counted (`WorkerJobsAbandonedClientGone`, #223, which measured 84 MB handed to a
+  socket nobody was reading for a single translation unit); what is missing is the ability
+  to act on it. The constraint is cited at the one place it bites,
+  `CompileResponder::PeerWatchCounter`, and was recorded ONLY there until #670 — which is
+  the convention this file exists to keep: deferred work is an issue linked from a
+  rulebook's `## Open work`, never a residual in prose. It is filed HERE rather than in
+  `wire-and-protocol.md`, where #670 expected it, because the seam is a compile-node
+  process runner and not a property of `ISocket`; the other three residuals that ticket
+  listed have since been implemented rather than deferred (`ISocket::CancelRead`,
+  `ISocket::ShutdownWrite`, and #663's read-slot rule), which is why it is one entry and
+  not four.
 - **[#303](https://github.com/LASTRADA-Software/fastcached/issues/303)** — a scheduler
   with no `--cluster-key-file` signs nothing and only warns, while the WORKER half of
   the same question is now a startup refusal (#282). The objection this issue was
