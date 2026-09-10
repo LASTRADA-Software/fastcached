@@ -55,7 +55,13 @@ scan() {
         { line = $0; sub(/^[ \t]*\/\/.*$/, "", line) }
         # A DEFINITION is not a call site -- the same trap as a comment, one step
         # along: its signature names the parameter type, which no call site does.
-        line ~ /\(std::string_view/ { next }
+        #
+        # Matched ANYWHERE on the line, not immediately after the `(`. The anchored
+        # form assumed the reason was the FIRST parameter, which held until #60 gave
+        # both helpers an `InvocationRecord&` ahead of it -- and then the definitions
+        # read as call sites, went UNCLASSIFIED, and reddened a correct tree. The
+        # rationale is unchanged; what was wrong was pinning it to a position.
+        line ~ /std::string_view/ { next }
         line ~ /(^|[^A-Za-z_])Warn[ \t]*\(/          { print "Warn|" FNR "|" line; next }
         line ~ /(^|[^A-Za-z_])WarnAndCarryOn[ \t]*\(/ { print "WarnAndCarryOn|" FNR "|" line }
     ' "$1/$Subject" 2>/dev/null
@@ -146,6 +152,27 @@ return Warn("preprocess failed");
 SRC
     cases=$((cases+1))
     if run_scan "$tmp/comment" >/dev/null 2>&1; then echo "  case 4 (comment ignored)       PASS"; else echo "  case 4 (comment ignored)       FAIL"; fail=1; fi
+
+    # The DEFINITIONS, which are not call sites. Six cases stood here without one,
+    # so the exclusion had never been watched accepting anything -- and when #60
+    # added a parameter ahead of the reason it broke in exactly the silent
+    # direction, reporting two findings against a correct tree. Both helpers are
+    # staged with a real call site, so a rule that stopped excluding definitions
+    # fails this case rather than the repository.
+    stage definitions <<'SRC'
+[[nodiscard]] std::optional<int> Warn(InvocationRecord& record, std::string_view reason)
+{
+    RecordFallback(record, Fallback::Unavailable, reason);
+    return std::nullopt;
+}
+void WarnAndCarryOn(InvocationRecord& record, std::string_view reason)
+{
+    RecordFallback(record, Fallback::UnavailableCarryOn, reason);
+}
+return Warn(record, "preprocess failed");
+SRC
+    cases=$((cases+1))
+    if run_scan "$tmp/definitions" >/dev/null 2>&1; then echo "  case 7 (definitions ignored)   PASS"; else echo "  case 7 (definitions ignored)   FAIL"; fail=1; fi
 
     # Helpers renamed away: the scan matches nothing and must REFUSE, not pass.
     stage renamed <<'SRC'
