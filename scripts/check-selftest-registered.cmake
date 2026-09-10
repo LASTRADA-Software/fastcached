@@ -121,6 +121,45 @@ include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 # keeps this copy inside that ticket's audit rather than hiding from it -- an
 # uncited copy is one #495 will not find.
 #
+# ## Cost
+#
+# Conditions, stated rather than pointed at, because a measurement is a quantity UNDER
+# conditions and the citation is where they get lost: Windows 11, Git Bash, native NTFS,
+# CMake 4.3.1-msvc1, 67 scanned scripts, minimum of seven runs. Taken back to back --
+# an earlier session measured a 90 ms process floor where these runs measure 47 ms, on
+# the same machine, so figures from different sittings are not comparable and only the
+# rows within one block are.
+#
+#     empty `cmake -P` (process floor)         47 ms
+#     line walk, before #1168                 330 ms   (283 ms of work)
+#     token jump                              155 ms   (108 ms of work)
+#
+# The second property is the one worth having, and it is measured on a COPY of the tree
+# so that another lane's file is not edited to take a reading. Those figures are slower
+# throughout than the block above -- a different path and a cold cache -- and are to be
+# read only against each other:
+#
+#                                          line walk    token jump
+#     the copied tree as it stands            538 ms       225 ms
+#     + ONE comment line carrying a QUOTED
+#       token in the 4,103-line
+#       check-e2e-helpers.sh                  917 ms       207 ms
+#
+# So a line walk's cost is a property of a file's LENGTH, and one sentence written in an
+# unrelated file cost it 379 ms. That was a trap laid for whoever wrote the sentence
+# rather than a cost anybody chose, and the whole-file pre-filter below existed to buy
+# immunity from it. The token-jump walk has that immunity intrinsically: cost is a
+# property of how often a file MENTIONS the flag, which is what the question is about.
+# The pre-filter stays anyway -- it is what makes the two-filter DISAGREEMENT detectable,
+# which is #1220's refusal.
+#
+# Both walks were compared as SETS and not as counts, because two totals agreeing is
+# weak evidence -- a file gained and a file lost cancel exactly. Instrumented to print
+# every file read as offering and the shape recognised, the two listings are identical:
+# 36 files, same shapes. The comparison carries its own controls, since a `diff` of two
+# empty listings agrees perfectly: the listing must be non-empty, and removing one row
+# must make it compare unequal.
+#
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-selftest-registered.cmake
 #
@@ -284,6 +323,20 @@ foreach(script IN LISTS allScripts)
     endif()
     math(EXPR carryingCount "${carryingCount} + 1")
 
+    # The `selftest-offer:` marker is read HERE, in the pass that already holds this
+    # file, rather than in a second loop that re-read every script to ask one question.
+    # Only a file CARRYING the token can have a marker that means anything -- the marker
+    # explains a token, so on a file with none it describes nothing.
+    set(hasOfferMarker FALSE)
+    if(scriptContent MATCHES "#[ \t]*selftest-offer:[ \t]*([^\n]*)")
+        set(hasOfferMarker TRUE)
+        string(STRIP "${CMAKE_MATCH_1}" offerMarkerReason)
+        if(offerMarkerReason STREQUAL "")
+            list(APPEND unreadable
+                 "${scriptName} (its `selftest-offer:` marker states no reason)")
+        endif()
+    endif()
+
     # Second reject, over the whole content, before any walking: can a dispatch shape
     # exist in this file AT ALL?
     #
@@ -294,26 +347,11 @@ foreach(script IN LISTS allScripts)
     # whole-file before splitting -- each needle is a strict prefix of the regex that
     # would have matched it.
     #
-    # MEASURED, on this tree (Windows, CMake 4.3.1, 57 scripts / 1.59 MB), because the
-    # walk copies the remainder of the file per line and the cost is therefore a
-    # property of what a file CONTAINS rather than of what it declares:
-    #
-    #                                      without reject   with reject
-    #     as the tree stands                    201 ms          201 ms
-    #     + ONE comment line naming the token
-    #       in the 3,658-line check-e2e-helpers.sh
-    #                                           499 ms          200 ms
-    #
-    # So it buys IMMUNITY, not speed, and the distinction is the whole reason it is
-    # here. The steady-state total does not move -- the 29 files that really do offer
-    # are still walked, and they are where the time goes. What it removes is a check
-    # whose cost TRIPLES because somebody wrote a sentence in an unrelated file, which
-    # is a trap laid for whoever writes the sentence rather than a cost anybody chose.
-    #
-    # 201 ms is unremarkable beside its neighbours (`check-script-check-signals` runs at
-    # ~962 ms). Getting the steady state down means not walking line-by-line at all --
-    # a token-jump walk measures ~69 ms and is #1168, kept out of this branch because
-    # bounding a line to a window changes what "the line" means for a very long one.
+    # It buys IMMUNITY, not speed, and that distinction is the whole reason it is here:
+    # what it removes is a check whose cost jumps because somebody wrote a SENTENCE in an
+    # unrelated file, which is a trap laid for whoever writes the sentence rather than a
+    # cost anybody chose. The figures are in the `## Cost` section of the header, pinned
+    # to the conditions they were taken under.
     set(prefilterPassed TRUE)
     if(scriptExt STREQUAL ".ps1")
         if(NOT scriptContent MATCHES "\\[switch\\][ \t]*\\$SelfTest")
@@ -340,56 +378,106 @@ foreach(script IN LISTS allScripts)
 
     # An offer this table cannot read is not an absence of an offer.
     if(NOT prefilterPassed)
-        if(tokenOnCodeLine AND NOT scriptContent MATCHES "#[ \t]*selftest-offer:")
+        if(tokenOnCodeLine AND NOT hasOfferMarker)
             list(APPEND unreadable "${scriptName}")
         endif()
         continue()
     endif()
 
     set(offerShape "")
-    set(rest "${scriptContent}")
-    while(NOT rest STREQUAL "")
-        string(FIND "${rest}" "\n" newlineAt)
-        if(newlineAt EQUAL -1)
-            set(line "${rest}")
-            set(rest "")
-        else()
-            string(SUBSTRING "${rest}" 0 ${newlineAt} line)
-            math(EXPR afterNewline "${newlineAt} + 1")
-            string(SUBSTRING "${rest}" ${afterNewline} -1 rest)
-        endif()
-
-        string(FIND "${line}" "${token}" lineTokenAt)
-        if(lineTokenAt EQUAL -1)
-            continue()
-        endif()
-        if(line MATCHES "^[ \t]*#")
-            continue()
-        endif()
-
-        if(scriptExt STREQUAL ".ps1")
-            if(line MATCHES "\\[switch\\][ \t]*\\$SelfTest")
-                set(offerShape "param-switch")
-            endif()
-        else()
-            if(line MATCHES "(^|[ \t(|])--self-test\\)")
-                set(offerShape "case-arm")
-            elseif(line MATCHES "[\"']--self-test[\"']"
-                    AND line MATCHES "(\\$1|\\$\\{1|\\$@|\\$\\*)")
-                set(offerShape "positional-comparison")
-            endif()
-        endif()
-        # The shape is all that is wanted, so stop at the first one rather than walking
-        # the rest of a 3,600-line script to learn nothing further.
-        if(NOT offerShape STREQUAL "")
+    # ## Jump to the token; do not walk the lines (#1168)
+    #
+    # The line walk this replaces did `string(SUBSTRING "${rest}" ${afterNewline} -1 rest)`
+    # once PER LINE, and each of those copies the whole remainder of the file -- so
+    # reading a 3,658-line script cost thousands of copies averaging half its size, and
+    # the price was paid on every line whether or not it had anything to do with the
+    # token. Cost was a property of a file's LENGTH.
+    #
+    # This jumps from token to token instead. The number of copies is the number of
+    # OCCURRENCES, which is a handful per file, so cost becomes a property of how often
+    # a file mentions the flag -- which is what the question is actually about.
+    #
+    # ## There is NO window bound, deliberately
+    #
+    # #1168 anticipated one, and the note this replaces said a token-jump walk was kept
+    # out "because bounding a line to a window changes what `the line` means for a very
+    # long one". That is a real hazard and this design does not have it: the line is
+    # recovered by a REVERSE find for the preceding newline over the exact text between
+    # the last line consumed and the token, and a forward find for the next one. Both
+    # are exact, so the line handed to the patterns below is the WHOLE line, byte for
+    # byte the one the line walk produced, at any length.
+    #
+    # A bound would have been the weaker answer twice over: it would make the verdict
+    # depend on a constant nobody could derive, and #1168 requires the verdict to be
+    # IDENTICAL. The corpus would not have told anyone it was wrong, either -- 38,188
+    # lines across the scanned scripts, longest 950 characters, six over 500 and none
+    # over 1,000 -- so any window above about 1 KB would have looked perfect and been a
+    # silent cliff for whoever first wrote a longer line. `selftest-registered-selftest`
+    # stages a 4,000-character line for exactly that reason.
+    #
+    # `string(FIND ... REVERSE)` answers -1 when the token is on the first line, and
+    # `-1 + 1` is 0, which is the right line start -- so that case needs no branch and
+    # gets none.
+    string(LENGTH "${scriptContent}" contentLength)
+    set(searchFrom 0)
+    while(searchFrom LESS contentLength)
+        string(SUBSTRING "${scriptContent}" ${searchFrom} -1 tail)
+        string(FIND "${tail}" "${token}" tokenAt)
+        if(tokenAt EQUAL -1)
             break()
+        endif()
+
+        string(SUBSTRING "${tail}" 0 ${tokenAt} beforeToken)
+        string(FIND "${beforeToken}" "\n" lastNewline REVERSE)
+        math(EXPR lineStart "${lastNewline} + 1")
+
+        string(SUBSTRING "${tail}" ${tokenAt} -1 fromToken)
+        string(FIND "${fromToken}" "\n" nextNewline)
+        if(nextNewline EQUAL -1)
+            math(EXPR lineEnd "${contentLength} - ${searchFrom}")
+        else()
+            math(EXPR lineEnd "${tokenAt} + ${nextNewline}")
+        endif()
+        math(EXPR lineLength "${lineEnd} - ${lineStart}")
+        string(SUBSTRING "${tail}" ${lineStart} ${lineLength} line)
+
+        # Advance past the LINE rather than past the token, so a line mentioning the
+        # flag twice is examined once.
+        #
+        # This is a COST property and not a correctness one, and the distinction is
+        # written down because the first version of this comment claimed the opposite --
+        # that advancing by the token would "count the same offer twice". It would not:
+        # `offeringCount` rises once per FILE, and the loop breaks at the first shape, so
+        # re-examining a line yields the same answer and changes no verdict. The
+        # mutation matrix is what said so, by advancing with the token and staying
+        # GREEN. Left as-is it would have been a plausible sentence nothing could
+        # falsify, sitting in a comment, vouching for the line beneath it.
+        math(EXPR searchFrom "${searchFrom} + ${lineEnd} + 1")
+
+        if(NOT line MATCHES "^[ \t]*#")
+            if(scriptExt STREQUAL ".ps1")
+                if(line MATCHES "\\[switch\\][ \t]*\\$SelfTest")
+                    set(offerShape "param-switch")
+                endif()
+            else()
+                if(line MATCHES "(^|[ \t(|])--self-test\\)")
+                    set(offerShape "case-arm")
+                elseif(line MATCHES "[\"']--self-test[\"']"
+                        AND line MATCHES "(\\$1|\\$\\{1|\\$@|\\$\\*)")
+                    set(offerShape "positional-comparison")
+                endif()
+            endif()
+            # The shape is all that is wanted, so stop at the first one.
+            if(NOT offerShape STREQUAL "")
+                break()
+            endif()
         endif()
     endwhile()
 
     if(offerShape STREQUAL "")
         # The two filters now DISAGREE: a dispatch shape exists somewhere in this file
         # and no line carries one. That is the state a new spelling arrives in.
-        if(tokenOnCodeLine AND NOT scriptContent MATCHES "#[ \t]*selftest-offer:")
+        if(tokenOnCodeLine AND NOT hasOfferMarker)
             list(APPEND unreadable "${scriptName}")
         endif()
         continue()
@@ -416,19 +504,6 @@ if(offeringCount EQUAL 0)
         "has stopped matching this tree's spellings, so this check would pass over "
         "every unregistered self-test in it.")
 endif()
-
-# A marker with no reason is refused. The reason is the forcing function: without one
-# the marker is a way to spell "forgot" that looks like "decided".
-foreach(script IN LISTS allScripts)
-    file(READ "${script}" markerContent)
-    if(markerContent MATCHES "#[ \t]*selftest-offer:[ \t]*([^\n]*)")
-        string(STRIP "${CMAKE_MATCH_1}" markerReason)
-        if(markerReason STREQUAL "")
-            get_filename_component(markerName "${script}" NAME)
-            list(APPEND unreadable "${markerName} (its `selftest-offer:` marker states no reason)")
-        endif()
-    endif()
-endforeach()
 
 if(unreadable)
     list(REMOVE_DUPLICATES unreadable)
