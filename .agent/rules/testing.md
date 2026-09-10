@@ -510,6 +510,105 @@ does: a list of what is wrong today is maintained by the same person who
 introduces the next one. Put the flag anywhere but first — "Naming `--cache-dir`
 gives the node an on-disk tier" reads no worse and runs.
 
+### A COMMA splits the spec, so such a name cannot select itself — and the miss is a RED
+
+The dash is one instance of the rule; the comma is the next, and **the rule is
+that the name is an argument, not that these two characters are bad.** Whatever
+Catch2 adds to its spec grammar joins this list, so read the general form first:
+**a filter that matched nothing must never be read as a subject that failed.**
+
+Catch2 parses a test spec as a **comma-separated list of specs**. So
+
+```
+The endpoint arms the responder's deadline, not its own
+```
+
+splits into two fragments, neither of which names a case, and the run reports
+`No test cases matched ...` twice and `No tests ran`. **`No tests ran` exits
+non-zero**, so the miss does not present as an empty result — it presents as a
+**deterministic red**, identical on every iteration, which is exactly what a real
+reproducible failure looks like.
+
+Re-measured against a built `FastCacheTest` rather than taken from the tickets,
+both directions, because a subject with no control cannot tell *this name matches
+nothing* from *my quoting is broken* — the first attempt's control picked the
+`--list-tests` header instead of a case and reported `No tests ran` for the
+control too, which would have proved nothing:
+
+```
+"A push while the consumer is parked does not resume it inline"   exit 0
+                              All tests passed (8 assertions in 1 test case)
+"A deadline fires exactly once, on the reactor"                   exit 2
+    No test cases matched '"A deadline fires exactly once"'
+    No test cases matched '"on the reactor"'
+    No tests ran
+``` A lane stress-checking a timing-sensitive case
+got five runs and five "failures" for a case that had just passed inside the full
+suite (#636). Another, measuring an abort rate, selected its case by name and read
+`0 failed` over **zero cases executed** — for a measurement whose expected result
+was 20/20, that is indistinguishable from a clean pass (#895).
+
+**Both readings of that output are wrong in the direction you were hoping for**,
+which is what makes it worth a rule rather than a footnote.
+
+Measured 2026-09-10 on this tree — pattern stated because three tickets quote
+three different figures and those are **different questions asked of earlier
+trees, not drift**: over `src/**/*_test.cpp`, the four case macros, the name taken
+as the first string literal on the line, **529 of 3503 names (15.1%) contain a
+comma**. #895 recorded 455 of 3263, #636 418 of 3074, #729 3166 names.
+
+**This is not a reason to rename them.** The names are sentences stating what the
+case establishes, that convention is deliberate and good, and 15% is not a corner
+to be tidied away — the filter is what cannot express the convention, and
+`test-name-hygiene` therefore does **not** refuse a comma. What to do instead:
+
+- **`ctest -R` is unaffected.** `catch_discover_tests` registers each case under
+  its full name and CTest matches by regex, so CI and `scripts/local-gate.sh`
+  never meet this. It bites the person narrowing a failure by hand, which is the
+  worst moment for it.
+- **Select by TAG**, or by a comma-free substring, wherever tooling picks a case —
+  rate measurements, reproductions, bisects.
+- **Anything selecting a subset asserts HOW MANY CASES RAN**, not only how many
+  failed. A run that executed nothing and a run that passed are one number today,
+  and the assertion is what separates them. That is the positive control that
+  caught #895 in the first place.
+
+**That last obligation is the CALLER's, and `flake-rate.sh` is where this is easy
+to misplace.** It counts exit statuses of an arbitrary `"$@"` and never selects a
+case itself, so its `ran=` is a count of ITERATIONS, not of cases executed — a
+comma-bearing name handed to it yields `ran=200 pass=0 fail=200`, which is a
+perfect deterministic red produced by a filter that matched nothing. The script
+cannot fix that for you without assuming its command is Catch2, and `--quiet`
+discards the `No tests ran` that would have said so. So the caller selects by tag
+and checks the case actually ran, before reading any rate off it.
+
+### A DUPLICATED name registers two entries that each run BOTH cases
+
+A different mechanism, same subject. `catch_discover_tests` registers one entry
+per NAME, so two cases sharing one name produce two ctest entries that each run
+the binary filtered by that name — and Catch2 matches **both** cases for either
+entry, tolerating names that differ only in tags.
+
+**Nothing is skipped, and that is why it reads as harmless.** It is the mirror of
+this tree's usual disease: work done twice under a name that cannot say which case
+it was, rather than work skipped. What breaks is attribution — one defect surfaces
+as two red entries and neither names the failing case, `ctest -R "^<name>$"` cannot
+select one of the pair, and per-case timings and `--repeat` flake hunts are filed
+under an ambiguous name.
+
+`test-name-hygiene` refuses duplicates. Its exemption table carries a **reason**
+per row, so an allowed duplicate cannot be spelled the same way as a forgotten one
+— and a row that has **stopped** describing a duplicate is refused as stale,
+because an exemption nobody must keep true is a licence that outlives its argument
+and would wave through the next duplicate of that name. There is one row: the
+Epoll and Kqueue reactor tests are wholly inside `#if defined(__linux__)` and
+`#if defined(__APPLE__)`, so they never co-exist in one build, and the parallel
+naming is what makes one property greppable across the two platform reactors.
+
+The check also refuses a scan that matched **no file or no case**. Every verdict
+in it is drawn from an accumulated list, so an empty scan and a clean tree produced
+byte-identical output — two empty lists agree perfectly (#729).
+
 ## The shared helpers: `Unwrap`, `ScratchPath` and `ScriptedSocket`
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
