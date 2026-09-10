@@ -274,9 +274,21 @@ status=$?
 set -e
 expect_status 0 "get --raw"
 # `$(cat)` strips the trailing newline, so what was stored is the payload without it.
-expected=$(( $(wc -c < "$WORK/payload") - 1 ))
-actual=$(wc -c < "$WORK/raw")
-[[ "$actual" == "$expected" ]] || fail "--raw wrote $actual bytes, expected $expected (newline translation?)"
+#
+# `count_bytes`, not `$(wc -c < ...)`: BSD `wc` pads its count with blanks, so a
+# captured `11` is `      11` on macOS and the string comparison below failed there
+# while passing on Linux -- reporting `wrote       11 bytes, expected 11`, whose two
+# numbers are equal. The `expected` side never had the bug because `$(( ))`
+# normalises, which is exactly why only one of the two spellings was suspicious.
+expected=$(( $(count_bytes "$WORK/payload") - 1 ))
+actual=$(count_bytes "$WORK/raw")
+# The message names BOTH causes rather than guessing one. It read "(newline
+# translation?)" and the failure it actually reported was a padded count -- so a
+# reader on macOS was pointed at a Windows text-mode bug, with two equal numbers on
+# screen. A diagnosis in a failure message is a claim like any other.
+if [[ "$actual" != "$expected" ]]; then
+    fail "--raw wrote [$actual] bytes, expected [$expected] -- newline translation, or a count that is not a bare integer"
+fi
 
 # ---------------------------------------------------------------------------------
 # case 7: the stats ladder, both rungs
@@ -292,12 +304,12 @@ if grep -qF "did not answer" "$WORK/err"; then
     e2e_note "stderr: $(cat "$WORK/err")"
     fail "stats reported 'did not answer' for a source it never dialled"
 fi
-infoFields=$(wc -l < "$WORK/out")
+infoFields=$(count_lines "$WORK/out")
 
 run_cli --admin-addr="127.0.0.1:$metricsPort" stats --format=kv
 expect_status 0 "stats with an admin address"
 expect_stdout "source=metrics" "stats prefers /metrics"
-metricsFields=$(wc -l < "$WORK/out")
+metricsFields=$(count_lines "$WORK/out")
 
 # The ladder is only worth having if the rungs differ, so the difference is asserted
 # rather than assumed.
