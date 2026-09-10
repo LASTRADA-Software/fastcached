@@ -429,8 +429,6 @@ struct InvocationRecord
     bool directHit = false;
 };
 
-InvocationRecord invocation;
-
 /// Milliseconds elapsed since `start`, for the phase counters above.
 [[nodiscard]] std::uint64_t MsSince(std::chrono::steady_clock::time_point start)
 {
@@ -443,10 +441,18 @@ InvocationRecord invocation;
 /// already decided — a miss that compiled successfully but could not be stored
 /// is still a miss, and recording it as a cache failure would inflate the
 /// "unavailable" bucket in `--show-stats` and hide the real cause.
+/// @param verbose Whether FASTCACHE_VERBOSE was set; `InvocationRecord::verbose`.
 /// @param reason The diagnostic text.
-void Note(std::string_view reason)
+///
+/// Takes the FLAG and not the record, deliberately. This reads one bool and writes
+/// to stderr -- it contributes nothing to the eventual statistics line -- and
+/// `Notice` below parks its sink in a function-local `static`, where a captured
+/// `InvocationRecord const&` would outlive the call that supplied it. Trading the
+/// ambient global for a dangling reference is not a fix; a `bool` captured by value
+/// has no such hazard (#60).
+void Note(bool verbose, std::string_view reason)
 {
-    if (invocation.verbose)
+    if (verbose)
         std::cerr << "fastcache-cc: " << reason << '\n';
 }
 
@@ -483,11 +489,12 @@ void Note(std::string_view reason)
 /// The decode error's own context names both generations, so nothing here has to
 /// restate them.
 ///
+/// @param record The invocation record; read here, never written.
 /// @param what  Which fetch this was, so two sites are told apart in a build log.
 /// @param error What `DecodeCompileValue` refused with.
-void NoteUndecodableValue(std::string_view what, ProtocolError const& error)
+void NoteUndecodableValue(InvocationRecord const& record, std::string_view what, ProtocolError const& error)
 {
-    Note(std::format("{} could not be decoded ({})", what, error.context));
+    Note(record.verbose, std::format("{} could not be decoded ({})", what, error.context));
 }
 
 /// The ways the cache can fail to serve a compile, as far as anybody outside this
@@ -562,6 +569,7 @@ static_assert(RowsInEnumeratorOrder(FallbackTable, &FallbackRow::kind),
 /// OVERWRITES the recorded outcome, so it is only for a compile the cache has not
 /// answered for. Once a HIT or MISS has been traced, use Note() instead.
 ///
+/// @param record The invocation record this updates.
 /// @param kind   Which fall-back this is; its row supplies everything but the reason.
 /// @param reason The fall-back reason, recorded as the statistics detail. A FIXED
 ///               string wherever one will do: `--show-stats` tallies these, so one
@@ -571,12 +579,12 @@ static_assert(RowsInEnumeratorOrder(FallbackTable, &FallbackRow::kind),
 ///               for the reason `DescribeOutcome` gives: they are bounded by
 ///               cause, and lumping a version mismatch in with an unreachable
 ///               daemon is what makes the tally useless.
-void RecordFallback(Fallback kind, std::string_view reason)
+void RecordFallback(InvocationRecord& record, Fallback kind, std::string_view reason)
 {
     auto const& row = RowFor(kind);
-    invocation.outcome = row.outcome;
-    invocation.outcomeDetail = reason;
-    if (invocation.verbose)
+    record.outcome = row.outcome;
+    record.outcomeDetail = reason;
+    if (record.verbose)
         std::cerr << "fastcache-cc: " << row.leadIn << " (" << reason << "); " << row.continuation << '\n';
 }
 
@@ -623,11 +631,12 @@ void RecordFallback(Fallback kind, std::string_view reason)
 /// the only spelling at a call site is `return Warn(...)`. Announcing one
 /// continuation and taking the other was previously a thing a caller could do by
 /// accident, and issue #236 is what it costs.
+/// @param record The invocation record this updates.
 /// @param reason The fall-back reason, under `RecordFallback`'s fixed-string rule.
 /// @return Always `std::nullopt` — "fall back to a plain real compile".
-[[nodiscard]] std::optional<int> Warn(std::string_view reason)
+[[nodiscard]] std::optional<int> Warn(InvocationRecord& record, std::string_view reason)
 {
-    RecordFallback(Fallback::Unavailable, reason);
+    RecordFallback(record, Fallback::Unavailable, reason);
     return std::nullopt;
 }
 
@@ -640,10 +649,11 @@ void RecordFallback(Fallback kind, std::string_view reason)
 /// reached, both leave this launcher holding a key and a fleet that knows nothing
 /// about either, so the compile goes on being attempted, remotely first. It
 /// returns nothing for the same reason `Warn` returns `std::nullopt`.
+/// @param record The invocation record this updates.
 /// @param reason The fall-back reason, under `RecordFallback`'s fixed-string rule.
-void WarnAndCarryOn(std::string_view reason)
+void WarnAndCarryOn(InvocationRecord& record, std::string_view reason)
 {
-    RecordFallback(Fallback::UnavailableCarryOn, reason);
+    RecordFallback(record, Fallback::UnavailableCarryOn, reason);
 }
 
 /// Report that this compile is deliberately not cacheable.
@@ -652,11 +662,12 @@ void WarnAndCarryOn(std::string_view reason)
 /// launcher will not cache — because it could never hit (a time macro), or
 /// because caching it could not be made truthful (a path that is neither keyed
 /// nor guarded, issue #104).
+/// @param record The invocation record this updates.
 /// @param reason The refusal reason, under `RecordFallback`'s fixed-string rule.
 /// @return Always `std::nullopt`, as `Warn` does and for the same reason.
-[[nodiscard]] std::optional<int> Decline(std::string_view reason)
+[[nodiscard]] std::optional<int> Decline(InvocationRecord& record, std::string_view reason)
 {
-    RecordFallback(Fallback::Uncacheable, reason);
+    RecordFallback(record, Fallback::Uncacheable, reason);
     return std::nullopt;
 }
 
@@ -669,11 +680,12 @@ void WarnAndCarryOn(std::string_view reason)
 /// reached only a verbose-gated `Note` and the record said nothing at all -- so a
 /// fleet in which every dispatch failed produced an ordinary miss rate and total
 /// silence ([#427](https://github.com/LASTRADA-Software/fastcached/issues/427)).
+/// @param record The invocation record this updates.
 /// @param recording The state and its FIXED tally reason; see `Cc::RecordingFor`.
-void ApplyDispatchRecording(Cc::DispatchRecording const& recording)
+void ApplyDispatchRecording(InvocationRecord& record, Cc::DispatchRecording const& recording)
 {
-    invocation.dispatch = recording.outcome;
-    invocation.dispatchDetail = recording.reason;
+    record.dispatch = recording.outcome;
+    record.dispatchDetail = recording.reason;
 }
 
 /// Record that distribution did not serve this compile, and end the attempt.
@@ -687,6 +699,7 @@ void ApplyDispatchRecording(Cc::DispatchRecording const& recording)
 /// as `NotAttempted`. That is a false claim rather than a gap, and an invisible one:
 /// `NotAttempted` neither prints a line of its own nor moves the dispatch rate.
 ///
+/// @param record The invocation record this updates.
 /// @param recording What to record.
 /// @param note The verbose line, or `std::nullopt` when the caller has already
 ///        announced this itself. The line's variable half — an offending flag, a
@@ -694,12 +707,13 @@ void ApplyDispatchRecording(Cc::DispatchRecording const& recording)
 ///        reason, which is what keeps the tally one row per cause rather than one
 ///        row per machine. The exact wordings are asserted by `dist-compile-e2e`.
 /// @return Always `std::nullopt` — "compile this translation unit locally".
-[[nodiscard]] std::optional<Cc::CompileRun> DeclineDispatch(Cc::DispatchRecording const& recording,
+[[nodiscard]] std::optional<Cc::CompileRun> DeclineDispatch(InvocationRecord& record,
+                                                            Cc::DispatchRecording const& recording,
                                                             std::optional<std::string> note)
 {
-    ApplyDispatchRecording(recording);
+    ApplyDispatchRecording(record, recording);
     if (note.has_value())
-        Note(*note);
+        Note(record.verbose, *note);
     return std::nullopt;
 }
 
@@ -760,21 +774,23 @@ constexpr std::string_view CrossedReplyReason = "a worker answered about a diffe
 /// this translation unit is still a MISS that the local compiler will serve and the
 /// daemon will store; what failed was a worker. Recording it as `Unavailable` would
 /// blame the cache and file the source under "never cached", both untrue.
+/// @param record The invocation record this updates.
 /// @param detail What the dispatch saw — the worker and the two correlations.
-void ReportCrossedReply(std::string_view detail)
+void ReportCrossedReply(InvocationRecord& record, std::string_view detail)
 {
-    invocation.outcomeDetail = CrossedReplyReason;
+    record.outcomeDetail = CrossedReplyReason;
     std::cerr << "fastcache-cc: " << CrossedReplyReason << " (" << detail
               << "); refusing that object and compiling this translation unit locally\n";
 }
 
 /// Emit a HIT/MISS trace line (stderr) when FASTCACHE_VERBOSE is set. Useful in
 /// real use to see the cache working, and the signal the E2E harness asserts on.
-void TraceOutcome(std::string_view outcome, std::string_view key)
+/// @param record The invocation record this updates.
+void TraceOutcome(InvocationRecord& record, std::string_view outcome, std::string_view key)
 {
-    invocation.outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
-    invocation.outcomeDetail.clear();
-    if (invocation.verbose)
+    record.outcome = (outcome == "HIT") ? Cc::Outcome::Hit : Cc::Outcome::Miss;
+    record.outcomeDetail.clear();
+    if (record.verbose)
         std::cerr << "fastcache-cc: " << outcome << " key=" << key << '\n';
 }
 
@@ -785,14 +801,18 @@ void TraceOutcome(std::string_view outcome, std::string_view key)
 /// the one outcome meaning the daemon is reachable, answered, and declined —
 /// including the version mismatch that would otherwise leave the cache silently
 /// useless for an entire build with nothing at all to show for it.
+/// @param record The invocation record; read here, never written.
 /// @param outcome The completed exchange.
 /// @param what Short label for the operation, e.g. "STORE (raw)".
 /// @param key The key involved.
-void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std::string_view key)
+void WarnIfRejected(InvocationRecord const& record,
+                    Cc::CacheOutcome const& outcome,
+                    std::string_view what,
+                    std::string_view key)
 {
     if (outcome.kind != Cc::CacheOutcomeKind::Rejected)
         return;
-    Note(std::format("{} key={} {}", what, key, Cc::DescribeOutcome(outcome)));
+    Note(record.verbose, std::format("{} key={} {}", what, key, Cc::DescribeOutcome(outcome)));
 }
 
 /// Report a compile whose roots do not describe it at all.
@@ -816,6 +836,7 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
 /// that reported nothing on the preprocess line, a different fault this message
 /// would misdescribe.
 ///
+/// @param record The invocation record; read here, never written.
 /// @param cfg          Launcher config, for the roots to name.
 /// @param sourcePath   The translation unit, as the build system spelled it.
 /// @param dependencies The classified dependency set, which carries both counts
@@ -824,7 +845,8 @@ void WarnIfRejected(Cc::CacheOutcome const& outcome, std::string_view what, std:
 ///                     derived twice and come to disagree — the reason
 ///                     `DependencySet::Reported` exists at all.
 /// @param reconciler   Decides whether the source has a portable form at all.
-void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
+void NoteIfRootsDoNotDescribeCompile(InvocationRecord const& record,
+                                     Config const& cfg,
                                      std::string_view sourcePath,
                                      Cc::DependencySet const& dependencies,
                                      Cc::RootReconciler& reconciler)
@@ -834,7 +856,8 @@ void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
 
     // The roots next to the source they fail to contain: the mismatch is only
     // visible as a pair, and a list of every reported path would bury it.
-    Note(std::format("the configured roots do not contain this translation unit, so nothing about this compile is"
+    Note(record.verbose,
+         std::format("the configured roots do not contain this translation unit, so nothing about this compile is"
                      " portable -- the checkout path stays in the key, a moved header cannot re-key, and the replay"
                      " guard is checking nothing (source root: {}, build tree: {}, source: {})",
                      cfg.srcRoot,
@@ -855,9 +878,14 @@ void NoteIfRootsDoNotDescribeCompile(Config const& cfg,
 /// through. The notice now travels with the exchange, so every path reports and none
 /// of them has to remember to.
 /// @return The process's credential notice.
-[[nodiscard]] Cc::CredentialNotice& Notice()
+[[nodiscard]] Cc::CredentialNotice& Notice(bool verbose)
 {
-    static Cc::CredentialNotice notice { [](std::string_view text) { Note(text); } };
+    // Captured BY VALUE into a function-local `static`: the notice outlives this
+    // call, so a reference to the caller's record would dangle. `verbose` is
+    // settled in `main` before any exchange runs, so the snapshot is the same
+    // answer the record would have given -- and one process serves one compile,
+    // so there is no second record for the first-call-wins rule to get wrong.
+    static Cc::CredentialNotice notice { [verbose](std::string_view text) { Note(verbose, text); } };
     return notice;
 }
 
@@ -1025,16 +1053,17 @@ void ReplayStreams(std::string_view out, std::string_view err)
 /// operator must not have to have opted into: a wrong object that was detected and
 /// then only counted is a number somebody has to come back and ask about, and the
 /// whole reason #368 went unnoticed is that nothing said anything.
+/// @param record The invocation record; read here, never written.
 /// @param comparison What the comparison found, and what it turned on.
 /// @param key The key, so the entry can be looked at rather than only counted.
-void ReportVerification(Cc::HitComparison const& comparison, std::string const& key)
+void ReportVerification(InvocationRecord const& record, Cc::HitComparison const& comparison, std::string const& key)
 {
     // A clean verification stays SILENT by default and still says what it saw when
     // asked. On Windows every hit is "identical apart from the clock" (#493), so
     // printing that unconditionally would put a line on every hit of every build and
     // teach a reader to filter exactly the stream the loud case arrives on.
     if (comparison.comparison == Cc::ObjectComparison::EquivalentApartFromVolatile)
-        Note(std::format("verified the hit for key {}: identical apart from {}", key, comparison.detail));
+        Note(record.verbose, std::format("verified the hit for key {}: identical apart from {}", key, comparison.detail));
 
     auto const line = Cc::DescribeVerdict(comparison, key);
     if (line.empty())
@@ -1293,11 +1322,13 @@ struct ProbedDependencies
 /// against a moved header and nothing else; refusing to cache would be the larger
 /// harm.
 ///
+/// @param record The invocation record; read here, never written.
 /// @param cmd The parsed compile command.
 /// @param originalArgs The original full invocation.
 /// @return The preprocessed text and dependency paths, or nullopt when the probe
 ///         itself failed.
-[[nodiscard]] std::optional<SourceProbe> Preprocess(Cc::ParsedCommand const& cmd,
+[[nodiscard]] std::optional<SourceProbe> Preprocess(InvocationRecord const& record,
+                                                    Cc::ParsedCommand const& cmd,
                                                     std::span<std::string const> originalArgs,
                                                     Cc::RootReconciler& reconciler)
 {
@@ -1325,7 +1356,7 @@ struct ProbedDependencies
             probeDepFilePath = probeRequest;
         else
         {
-            Note("dependency probe destination is not writable; keying without the dependency set");
+            Note(record.verbose, "dependency probe destination is not writable; keying without the dependency set");
             probeRequest.clear();
         }
     }
@@ -1361,7 +1392,7 @@ struct ProbedDependencies
             probe.dependencyPaths =
                 Cc::ParseDepFilePaths(std::string_view { reinterpret_cast<char const*>(bytes->data()), bytes->size() });
         else
-            Note("dependency probe wrote no depfile; keying without the dependency set");
+            Note(record.verbose, "dependency probe wrote no depfile; keying without the dependency set");
         // Reconciled at the boundary, so KeyDependencySet and everything after it
         // stay pure string work over paths spelled the way this host spells them.
         reconciler.All(probe.dependencyPaths);
@@ -1462,15 +1493,19 @@ struct ProbedDependencies
 
 /// FETCH one key and return its raw stored bytes, or nullopt on miss or any
 /// transport failure. Used for manifests, whose payload is not a compile-value.
+/// @param record The invocation record; read here, never written.
 /// @param cfg  Launcher config (daemon address and socket deadline).
 /// @param key  The key to fetch.
 /// @return The stored bytes on hit.
-[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(Config const& cfg, std::string const& key)
+[[nodiscard]] std::optional<std::vector<std::byte>> FetchRaw(InvocationRecord const& record,
+                                                             Config const& cfg,
+                                                             std::string const& key)
 {
-    auto outcome = Cc::RunOneExchange(cfg.addr, Notice(), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
+    auto outcome =
+        Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
     if (!outcome.IsHit())
     {
-        WarnIfRejected(outcome, "manifest fetch", key);
+        WarnIfRejected(record, outcome, "manifest fetch", key);
         return std::nullopt;
     }
     return std::move(outcome.value);
@@ -1484,17 +1519,22 @@ struct ProbedDependencies
 /// manifest therefore travels as a compile-value whose object blob is the manifest
 /// and whose text-region list is empty — nothing to canonicalize, and no protocol
 /// change needed.
+/// @param record The invocation record; read here, never written.
 /// @param addr Daemon address.
 /// @param cfg  Launcher config (prefetch group and layout travel with the store).
 /// @param key  The key to store under.
 /// @param body The bytes to store.
-void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key, std::string_view body)
+void StoreRaw(InvocationRecord const& record,
+              std::string const& addr,
+              Config const& cfg,
+              std::string const& key,
+              std::string_view body)
 {
     // Check the outcome rather than discarding it: a rejected STORE is silent
     // otherwise, and a manifest that never lands makes direct mode look simply
     // ineffective.
     auto const outcome = Cc::RunOneExchange(addr,
-                                            Notice(),
+                                            Notice(record.verbose),
                                             Wire::EncodeStore(Wire::StoreRequest { .key = key,
                                                                                    .prefetchGroup = cfg.prefetchGroup,
                                                                                    .srcRoot = cfg.srcRoot,
@@ -1502,7 +1542,7 @@ void StoreRaw(std::string const& addr, Config const& cfg, std::string const& key
                                                                                    .value = Wire::AsBytes(body) }),
                                             cfg.credential,
                                             BudgetOf(cfg));
-    WarnIfRejected(outcome, "STORE (raw)", key);
+    WarnIfRejected(record, outcome, "STORE (raw)", key);
 }
 
 /// What became of a cache hit we tried to honour.
@@ -1556,6 +1596,7 @@ struct MaterializedHit
 /// guard examine precisely the bytes that are about to be written; it also leaves
 /// exactly one copy of a loop that used to exist twice.
 ///
+/// @param record The invocation record; read here, never written.
 /// @param cmd              The parsed compile command (object path, depfile path).
 /// @param decoded          The decoded cached value.
 /// @param layout           This machine's roots.
@@ -1567,7 +1608,8 @@ struct MaterializedHit
 ///                         replay re-spells it; passing the canonical marker is a
 ///                         byte-exact no-op and is what an English build does.
 /// @return What happened, plus the localized streams for the manifest backfill.
-[[nodiscard]] MaterializedHit MaterializeHit(Cc::ParsedCommand const& cmd,
+[[nodiscard]] MaterializedHit MaterializeHit(InvocationRecord const& record,
+                                             Cc::ParsedCommand const& cmd,
                                              CompileValue const& decoded,
                                              PathCanon::Layout const& layout,
                                              std::filesystem::path const& workingDirectory,
@@ -1594,7 +1636,7 @@ struct MaterializedHit
     {
         // Named rather than merely counted: "why does this TU never cache" is
         // otherwise a whole investigation, and the answer is one path.
-        Note(std::format("STALE HIT (replayed dependency missing: {}); recompiling", *missing));
+        Note(record.verbose, std::format("STALE HIT (replayed dependency missing: {}); recompiling", *missing));
         return NotMaterialized(HitDisposition::Stale);
     }
 
@@ -1635,20 +1677,22 @@ struct MaterializedHit
 
 /// Fetch `key`, and if it holds a compile value, materialize it: write the object
 /// and replay the captured streams with paths localized to this machine.
+/// @param record The invocation record this updates.
 /// @param cfg              Launcher config.
 /// @param cmd              The parsed compile command (object path, source).
 /// @param key              The object key to serve.
 /// @param layout           This machine's roots, for localizing the replayed text.
 /// @param workingDirectory The directory this compile runs in.
 /// @return The exit code to return on a hit, or nullopt when not served.
-[[nodiscard]] std::optional<int> TryServeFromCache(Config const& cfg,
+[[nodiscard]] std::optional<int> TryServeFromCache(InvocationRecord& record,
+                                                   Config const& cfg,
                                                    Cc::ParsedCommand const& cmd,
                                                    std::span<std::string const> argv,
                                                    std::string const& key,
                                                    PathCanon::Layout const& layout,
                                                    std::filesystem::path const& workingDirectory)
 {
-    auto const payload = FetchRaw(cfg, key);
+    auto const payload = FetchRaw(record, cfg, key);
     if (!payload.has_value())
         return std::nullopt;
 
@@ -1659,7 +1703,7 @@ struct MaterializedHit
         // path here, so an undecodable value costs a whole preprocess and shows up
         // as nothing but a slower build. During a rolling upgrade that is every
         // compile on the machine.
-        NoteUndecodableValue("the direct-mode object", decoded.error());
+        NoteUndecodableValue(record, "the direct-mode object", decoded.error());
         return std::nullopt;
     }
 
@@ -1667,16 +1711,16 @@ struct MaterializedHit
     // check and, if it also finds the value stale, recompiles and re-stores it.
     // Direct mode only ever declines to shortcut; repairing the entry is not its
     // job, and doing it here would duplicate the miss path.
-    if (MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker).disposition
+    if (MaterializeHit(record, cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker).disposition
         != HitDisposition::Served)
         return std::nullopt;
 
-    invocation.valueBytes = decoded->objectBlob.size();
+    record.valueBytes = decoded->objectBlob.size();
     // Before the trace, so a build log reads in the order the events happened: the
     // hit, then what verifying it found. Off unless `FASTCACHE_VERIFY` names a rate,
     // in which case this costs a whole compile (#423).
-    ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
-    TraceOutcome("HIT", key);
+    ReportVerification(record, VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
+    TraceOutcome(record, "HIT", key);
     return 0;
 }
 
@@ -1687,10 +1731,11 @@ struct MaterializedHit
 /// what makes the reason the thing a reader's eye lands on. Verbose-gated like
 /// every other launcher diagnostic; NoteIfRootsDoNotDescribeCompile carries why
 /// that call was made, unmade and deliberately made again.
+/// @param record The invocation record; read here, never written.
 /// @param reason Why no manifest is being recorded.
-void NoteNoManifest(std::string_view reason)
+void NoteNoManifest(InvocationRecord const& record, std::string_view reason)
 {
-    Note(std::format("not recording a direct-mode manifest ({})", reason));
+    Note(record.verbose, std::format("not recording a direct-mode manifest ({})", reason));
 }
 
 /// Record the direct-mode manifest for a compile whose object bytes are already
@@ -1713,6 +1758,7 @@ void NoteNoManifest(std::string_view reason)
 /// The manifest records the object's ordinary key
 /// rather than causing a second copy of the object to be stored: see
 /// DirectManifest::objectKey for why duplicating it is not affordable.
+/// @param record The invocation record; read here, never written.
 /// @param cfg             Launcher config.
 /// @param cmd             The parsed compile command.
 /// @param layout              This machine's roots.
@@ -1724,7 +1770,8 @@ void NoteNoManifest(std::string_view reason)
 /// @param objectKeyForPointer Key the object is already stored under; recorded in
 ///                            the manifest so the object is never stored twice.
 /// @param reconciler      Translates a driver's spelling into this build's.
-void RecordManifest(Config const& cfg,
+void RecordManifest(InvocationRecord const& record,
+                    Config const& cfg,
                     Cc::ParsedCommand const& cmd,
                     PathCanon::Layout const& layout,
                     std::filesystem::path const& workingDirectory,
@@ -1744,7 +1791,7 @@ void RecordManifest(Config const& cfg,
         // source with no canonical token can never key a manifest, so direct mode is
         // off for this translation unit permanently while the compile goes on
         // succeeding: nothing else in the log so much as mentions it (issue #68).
-        NoteNoManifest(Cc::DescribeManifestFailure(canonicalSource.error()));
+        NoteNoManifest(record, Cc::DescribeManifestFailure(canonicalSource.error()));
         return;
     }
 
@@ -1784,7 +1831,7 @@ void RecordManifest(Config const& cfg,
     // decline but the record itself.
     if (reconciler.UnreadablePaths() != 0)
     {
-        NoteNoManifest("a reported dependency path is not text this host can read");
+        NoteNoManifest(record, "a reported dependency path is not text this host can read");
         return;
     }
 
@@ -1842,7 +1889,8 @@ void RecordManifest(Config const& cfg,
         // observed and false about the world there, which is the string issue #692
         // exists to stop printing for this case. The refusal still comes from the
         // seam; only the wording is the caller's, because the provenance is.
-        NoteNoManifest(probed.unreadable
+        NoteNoManifest(record,
+                       probed.unreadable
                            ? std::format("the compiler reported dependencies in a language this launcher does not read "
                                          "(its notes do not begin with \"{}\"), so direct mode cannot populate: {}",
                                          Cc::IncludeNoteMarker,
@@ -1862,8 +1910,10 @@ void RecordManifest(Config const& cfg,
     // (`NoProjectDeps`, #319) and this line is not reached for it. What the pair is
     // still for is the partial version -- nine paths dropped of ten -- which is a
     // misconfigured root in every way but the one that trips the refusal.
-    Note(std::format(
-        "manifest: {} entries from {} reported dependency path(s) plus the source", manifest->entries.size(), reported));
+    Note(record.verbose,
+         std::format("manifest: {} entries from {} reported dependency path(s) plus the source",
+                     manifest->entries.size(),
+                     reported));
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
 
@@ -1874,11 +1924,12 @@ void RecordManifest(Config const& cfg,
     manifestValue.objectBlob.assign(reinterpret_cast<std::byte const*>(manifestEncoded.data()),
                                     reinterpret_cast<std::byte const*>(manifestEncoded.data()) + manifestEncoded.size());
     auto const manifestFrame = EncodeCompileValue(manifestValue);
-    StoreRaw(cfg.addr,
+    StoreRaw(record,
+             cfg.addr,
              cfg,
              manifestKey,
              std::string_view { reinterpret_cast<char const*>(manifestFrame.data()), manifestFrame.size() });
-    if (invocation.verbose)
+    if (record.verbose)
         std::cerr << "fastcache-cc: MANIFEST stored key=" << manifestKey << " entries=" << manifest->entries.size() << '\n';
 }
 
@@ -1890,6 +1941,7 @@ void RecordManifest(Config const& cfg,
 /// Any failure here just means we preprocess as before: direct mode never
 /// decides a compile is uncacheable, only that it cannot shortcut.
 ///
+/// @param record The invocation record this updates.
 /// @param cfg              Launcher config.
 /// @param cmd              The parsed compile command.
 /// @param layout           This machine's source-root / build-tree layout.
@@ -1899,7 +1951,8 @@ void RecordManifest(Config const& cfg,
 /// @param toolchainStamp   The compiler identity folded into the manifest key.
 /// @param reconciler       Translates a driver's spelling into this build's.
 /// @return The exit code if the object was served, nullopt to keep going.
-[[nodiscard]] std::optional<int> TryDirectMode(Config const& cfg,
+[[nodiscard]] std::optional<int> TryDirectMode(InvocationRecord& record,
+                                               Config const& cfg,
                                                Cc::ParsedCommand const& cmd,
                                                std::span<std::string const> argv,
                                                PathCanon::Layout const& layout,
@@ -1911,8 +1964,8 @@ void RecordManifest(Config const& cfg,
     auto const directStarted = std::chrono::steady_clock::now();
     // Every early return records how long the attempt took, so the statistics
     // show the cost of a direct-mode miss as well as a direct-mode hit.
-    auto const giveUp = [directStarted]() -> std::optional<int> {
-        invocation.directMs = MsSince(directStarted);
+    auto const giveUp = [directStarted, &record]() -> std::optional<int> {
+        record.directMs = MsSince(directStarted);
         return std::nullopt;
     };
 
@@ -1934,14 +1987,14 @@ void RecordManifest(Config const& cfg,
         return giveUp();
 
     auto const manifestKey = Cc::ComputeManifestKey(*canonicalSource, relativizedArgs, toolchainStamp);
-    auto const manifestBytes = FetchRaw(cfg, manifestKey);
+    auto const manifestBytes = FetchRaw(record, cfg, manifestKey);
     if (!manifestBytes.has_value())
         return giveUp();
 
     // Unwrap the compile-value envelope the manifest was stored in.
     auto const envelope = DecodeCompileValue(*manifestBytes);
     if (!envelope.has_value())
-        NoteUndecodableValue("the direct-mode manifest", envelope.error());
+        NoteUndecodableValue(record, "the direct-mode manifest", envelope.error());
     auto const manifestSpan =
         envelope.has_value() ? std::span<std::byte const> { envelope->objectBlob } : std::span<std::byte const> {};
     auto const manifest =
@@ -1960,19 +2013,19 @@ void RecordManifest(Config const& cfg,
     // ordinary preprocessed key rather than falling back to the real compiler.
     if (Cc::ManifestAssertsNothing(*manifest))
     {
-        Note("direct-mode manifest has no entries; refusing it rather than validating on nothing");
+        Note(record.verbose, "direct-mode manifest has no entries; refusing it rather than validating on nothing");
         return giveUp();
     }
 
     if (!Cc::ValidateManifest(*manifest, layout, toolchainStamp))
         return giveUp();
 
-    invocation.directMs = MsSince(directStarted);
+    record.directMs = MsSince(directStarted);
     // Follow the manifest's pointer to the object, which is stored exactly once
     // under its ordinary preprocessed key.
-    auto served = TryServeFromCache(cfg, cmd, argv, manifest->objectKey, layout, workingDirectory);
+    auto served = TryServeFromCache(record, cfg, cmd, argv, manifest->objectKey, layout, workingDirectory);
     if (served.has_value())
-        invocation.directHit = true;
+        record.directHit = true;
     return served;
 }
 
@@ -2007,6 +2060,7 @@ void RecordManifest(Config const& cfg,
 /// builds that are fine, which is the failure mode that gets distribution turned
 /// off and never turned back on. The cost is one wasted remote attempt.
 ///
+/// @param record The invocation record this updates.
 /// @param cfg Launcher config (scheduler endpoint, credential, timeout).
 /// @param cmd The parsed compile command.
 /// @param argv The original full invocation.
@@ -2016,7 +2070,8 @@ void RecordManifest(Config const& cfg,
 /// @param targetTriple The target this client generates for, stated on the wire.
 /// @param dependencyPaths What the key's probe reported this TU depends on.
 /// @return A run to continue with, or nullopt to compile locally.
-[[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(Config const& cfg,
+[[nodiscard]] std::optional<Cc::CompileRun> TryRemoteCompile(InvocationRecord& record,
+                                                             Config const& cfg,
                                                              Cc::ParsedCommand const& cmd,
                                                              std::span<std::string const> argv,
                                                              std::string_view key,
@@ -2038,7 +2093,8 @@ void RecordManifest(Config const& cfg,
     if (!args.has_value())
         // The offending flag varies per compile, so it rides the verbose line and
         // never the tally -- otherwise one row per command line instead of per cause.
-        return DeclineDispatch(RefusedHere("the command line is not dispatchable"),
+        return DeclineDispatch(record,
+                               RefusedHere("the command line is not dispatchable"),
                                std::format("not dispatchable ({}); compiling locally", args.error()));
 
     // Preprocessed again, with `#line` markers this time. The key's text has them
@@ -2048,8 +2104,8 @@ void RecordManifest(Config const& cfg,
     // under `-Werror` is a failed compile rather than noise.
     auto const preprocessRun = RunCaptureSplit(Cc::DispatchPreprocessCommand(cmd, argv));
     if (preprocessRun.exitCode != 0)
-        return DeclineDispatch(RefusedHere("the dispatch preprocess failed"),
-                               "dispatch preprocess failed; compiling locally");
+        return DeclineDispatch(
+            record, RefusedHere("the dispatch preprocess failed"), "dispatch preprocess failed; compiling locally");
 
     // The DISPATCH identity, which is not the cache key's -- and it is built on the
     // BANNER ALONE, deliberately, where the key also folds the target.
@@ -2085,6 +2141,7 @@ void RecordManifest(Config const& cfg,
         // as `NoWorker`, which reads as "the fleet has nobody on your toolchain".
         // The tally must not repeat that misdirection.
         return DeclineDispatch(
+            record,
             RefusedHere("this toolchain has no usable fingerprint"),
             std::format("not dispatched ({}); compiling locally", Cc::ExplainDefect(identity.defect).reason));
 
@@ -2173,7 +2230,7 @@ void RecordManifest(Config const& cfg,
                                 : std::string_view {};
     auto const sourceRootReplacement = sourceRoot.empty() ? std::string_view {} : std::string_view { sourceName };
 
-    auto const exchange = Cc::MakeTcpExchange(Notice());
+    auto const exchange = Cc::MakeTcpExchange(Notice(record.verbose));
     auto const outcome = Cc::Dispatch(*exchange,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = identity.fingerprint,
@@ -2197,15 +2254,15 @@ void RecordManifest(Config const& cfg,
         // about somebody else's compile is a defect rather than a fleet declining,
         // so it is announced unconditionally and the sentence goes on the CACHE
         // axis. That is why this is the one decline with no verbose line of its own.
-        ReportCrossedReply(outcome.detail);
-        return DeclineDispatch(fleetAnswer, std::nullopt);
+        ReportCrossedReply(record, outcome.detail);
+        return DeclineDispatch(record, fleetAnswer, std::nullopt);
     }
     if (!outcome.Ran())
         // Declined and Unavailable are both ordinary and both end the same way, but
         // they are fixed in different places, which is why they are two states. The
         // reason is named because "distribution stopped working" is otherwise a
         // whole investigation, and the answer is one line.
-        return DeclineDispatch(fleetAnswer, std::format("not dispatched ({}); compiling locally", outcome.detail));
+        return DeclineDispatch(record, fleetAnswer, std::format("not dispatched ({}); compiling locally", outcome.detail));
     if (outcome.exitCode != 0)
         // A worker RAN the compiler and this client is about to throw the result
         // away, which is `Discarded` -- see `Cc::DispatchOutcome`. It is the only
@@ -2214,7 +2271,8 @@ void RecordManifest(Config const& cfg,
         // signal. Which of the two it was -- broken code or a broken node -- needs
         // the local retry's verdict, which this function never sees, so the reason
         // claims neither.
-        return DeclineDispatch(Discarded("a worker compile failed and was retried locally"),
+        return DeclineDispatch(record,
+                               Discarded("a worker compile failed and was retried locally"),
                                std::format("worker {} reported exit {}; recompiling locally to confirm",
                                            outcome.workerEndpoint,
                                            outcome.exitCode));
@@ -2223,14 +2281,16 @@ void RecordManifest(Config const& cfg,
     // writing those first would leave a dependency record describing a file that is
     // not there if the write fails.
     if (!WriteFileBytes(cmd.objPath, outcome.object))
-        return DeclineDispatch(Discarded("the dispatched object could not be written"),
+        return DeclineDispatch(record,
+                               Discarded("the dispatched object could not be written"),
                                "could not write the dispatched object; compiling locally");
 
     // The dependency record, in whichever form this build asked for. Both can be
     // wanted at once, and neither is inferred from the other.
     Cc::CompileRun run { .exitCode = 0, .out = outcome.stdoutText, .err = outcome.stderrText };
     if (!cmd.depPath.empty() && !WriteDepFile(cmd.depPath, Cc::RenderDepFile(cmd.objPath, dependencyPaths)))
-        return DeclineDispatch(Discarded("the depfile for a dispatched compile could not be written"),
+        return DeclineDispatch(record,
+                               Discarded("the depfile for a dispatched compile could not be written"),
                                "could not write the depfile for a dispatched compile; compiling locally");
     if (cmd.wantShowIncludes)
     {
@@ -2268,10 +2328,12 @@ void RecordManifest(Config const& cfg,
         // "no dependency flags on this command line" and "the probe's notes could not be
         // read" both arrive here and are fixed in different places.
         if (dependencyPaths.empty())
-            Note("/showIncludes: no dependencies to write, so this translation unit gets no notes at all "
+            Note(record.verbose,
+                 "/showIncludes: no dependencies to write, so this translation unit gets no notes at all "
                  "and the build records none for it");
         else
-            Note(std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
+            Note(record.verbose,
+                 std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
                              cfg.showIncludesMarker,
                              cfg.showIncludesMarkerNamed ? "named by" : "the default; override with",
                              Cc::EnvName::MsvcDepsPrefix));
@@ -2302,8 +2364,8 @@ void RecordManifest(Config const& cfg,
     // beside the call above, because every branch between the two returns through
     // `DeclineDispatch` and a state written up front would be overwritten by each of
     // them -- an ordering nothing would enforce.
-    ApplyDispatchRecording(fleetAnswer);
-    Note(std::format("DISPATCHED to {} key={}", outcome.workerEndpoint, key));
+    ApplyDispatchRecording(record, fleetAnswer);
+    Note(record.verbose, std::format("DISPATCHED to {} key={}", outcome.workerEndpoint, key));
     return run;
 }
 
@@ -2313,14 +2375,18 @@ void RecordManifest(Config const& cfg,
 ///
 /// A cache that refused or could not be reached is NOT one of those signals — see
 /// `Cc::CacheIsServing`, and issue #236 for what returning here cost.
+/// @param record The invocation record this updates.
 /// @param cmd Taken BY VALUE so the driver flavour can be corrected in place once
 ///        the banner is known -- see `ClassifyCompilerFromBanner`. A copy of a few
 ///        strings, once per invocation, against a correction every consumer below
 ///        has to see the same way.
-[[nodiscard]] std::optional<int> RunCached(Config const& cfg, Cc::ParsedCommand cmd, std::span<std::string const> argv)
+[[nodiscard]] std::optional<int> RunCached(InvocationRecord& record,
+                                           Config const& cfg,
+                                           Cc::ParsedCommand cmd,
+                                           std::span<std::string const> argv)
 {
     if (cfg.addr.empty() || cfg.srcRoot.empty() || cfg.buildTree.empty())
-        return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
+        return Warn(record, "missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
 
     // One layout, and it is the build system's own spelling — every consumer of it
     // below either tokenizes against it or emits from it, and both want that form.
@@ -2346,8 +2412,9 @@ void RecordManifest(Config const& cfg,
     {
         // The argument goes in a Note and not in the reason: the reason is what
         // `--show-stats` tallies, and one carrying a path is a row per compile.
-        Note(std::format("drive-relative path under no root, in argument {}", *unkeyable));
-        return Decline("a command-line path is drive-relative under no root; not caching "
+        Note(record.verbose, std::format("drive-relative path under no root, in argument {}", *unkeyable));
+        return Decline(record,
+                       "a command-line path is drive-relative under no root; not caching "
                        "(neither keyed nor guarded)");
     }
 
@@ -2397,7 +2464,7 @@ void RecordManifest(Config const& cfg,
     // generators share a key again. Nothing downstream can tell the two cases apart,
     // so a driver that has a way to name its target and did not is worth a line.
     if (targetTriple.empty() && driver.targetDiscovery != Cc::TargetDiscovery::None)
-        Note("the compiler did not report a target; keying on its banner alone");
+        Note(record.verbose, "the compiler did not report a target; keying on its banner alone");
 
     // The banner and the target, joined once. Everything that decides which OBJECT
     // may be served keys on this; the fingerprint, which decides which WORKER may
@@ -2427,7 +2494,7 @@ void RecordManifest(Config const& cfg,
 
     if (cfg.direct && !SourceReferencesVolatileMacro(cmd.source))
         if (auto served =
-                TryDirectMode(cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
+                TryDirectMode(record, cfg, cmd, argv, layout, workingDirectory, relativizedArgs, toolchainStamp, reconciler))
             return served;
 
     auto const preprocessStarted = std::chrono::steady_clock::now();
@@ -2456,9 +2523,9 @@ void RecordManifest(Config const& cfg,
     // them -- see `RecordManifest` (issue #692).
     ProbedDependencies probed;
     {
-        auto probe = Preprocess(cmd, argv, reconciler);
+        auto probe = Preprocess(record, cmd, argv, reconciler);
         if (!probe.has_value())
-            return Warn("preprocess failed");
+            return Warn(record, "preprocess failed");
 
         // Skip translation units that reference a time/date macro. `__TIME__` /
         // `__DATE__` / `__TIMESTAMP__` expand to a run-varying (second-granular)
@@ -2469,7 +2536,7 @@ void RecordManifest(Config const& cfg,
         // TU is the overwhelmingly common case; header-introduced use is rare and
         // its only cost is a permanent miss, never incorrectness.
         if (SourceReferencesVolatileMacro(cmd.source))
-            return Decline("uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
+            return Decline(record, "uses __TIME__/__DATE__/__TIMESTAMP__; not caching (non-deterministic)");
 
         // The dependency set is reduced to its portable form before it reaches the
         // key: canonical tokens only, sorted and deduplicated, with toolchain paths
@@ -2497,13 +2564,14 @@ void RecordManifest(Config const& cfg,
         // test target. Semicolon-separated from the filesystem-call count, which is
         // not a path count and must not read as another entry in the list.
         auto const dropped = Cc::DescribeDropped(dependencies);
-        Note(std::format("dependency set: {} of {} reported path(s) keyed ({}{}{} filesystem call(s))",
+        Note(record.verbose,
+             std::format("dependency set: {} of {} reported path(s) keyed ({}{}{} filesystem call(s))",
                          dependencies.keyed.size(),
                          dependencies.Reported(),
                          dropped,
                          dropped.empty() ? "" : "; ",
                          PathResolver().FilesystemCalls()));
-        NoteIfRootsDoNotDescribeCompile(cfg, cmd.source, dependencies, reconciler);
+        NoteIfRootsDoNotDescribeCompile(record, cfg, cmd.source, dependencies, reconciler);
 
         // The one disposition that is not merely a drop. A drive-relative path under
         // no root is keyed by nothing here and stat'ed by nothing in ReplayGuard, so
@@ -2519,7 +2587,8 @@ void RecordManifest(Config const& cfg,
         // is a second place for the answer to drift.
         if (dependencies.Count(Cc::PathDisposition::DriveRelative) != 0)
         {
-            return Decline("a reported dependency path is drive-relative under no root; not caching "
+            return Decline(record,
+                           "a reported dependency path is drive-relative under no root; not caching "
                            "(neither keyed nor guarded)");
         }
 
@@ -2535,7 +2604,8 @@ void RecordManifest(Config const& cfg,
         // console: `chcp 65001` makes `cl` emit UTF-8 and this stops firing.
         if (reconciler.UnreadablePaths() != 0)
         {
-            return Decline("a reported dependency path is not text this host can read; not caching "
+            return Decline(record,
+                           "a reported dependency path is not text this host can read; not caching "
                            "(neither keyed nor guarded) -- try a UTF-8 console code page");
         }
 
@@ -2566,7 +2636,7 @@ void RecordManifest(Config const& cfg,
         // distributed one.
         probed = { .paths = std::move(probe->dependencyPaths), .unreadable = probe->dependenciesUnreadable };
     }
-    invocation.preprocessMs = MsSince(preprocessStarted);
+    record.preprocessMs = MsSince(preprocessStarted);
 
     auto const cacheStarted = std::chrono::steady_clock::now();
 
@@ -2582,7 +2652,8 @@ void RecordManifest(Config const& cfg,
 
     // FETCH.
     {
-        auto const outcome = Cc::RunOneExchange(cfg.addr, Notice(), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
+        auto const outcome =
+            Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
         fetchKind = outcome.kind;
         if (!Cc::CacheIsServing(fetchKind))
         {
@@ -2595,7 +2666,7 @@ void RecordManifest(Config const& cfg,
             // string so the tally gets a row per cause rather than one per compile.
             if (fetchKind == Cc::CacheOutcomeKind::Rejected)
             {
-                WarnAndCarryOn(Cc::DescribeOutcome(outcome));
+                WarnAndCarryOn(record, Cc::DescribeOutcome(outcome));
 
                 // A refusal that will be true of every unit of this build is said out
                 // loud, once per interval, whatever the verbosity (#181). The tally
@@ -2614,14 +2685,14 @@ void RecordManifest(Config const& cfg,
                     std::cerr << Cc::RefusalNoticeLine(cfg.addr, *row, outcome.message) << '\n';
             }
             else
-                WarnAndCarryOn("fetch exchange failed");
+                WarnAndCarryOn(record, "fetch exchange failed");
         }
         else if (outcome.IsHit())
         {
             auto decoded = DecodeCompileValue(outcome.value);
             if (!decoded.has_value())
             {
-                NoteUndecodableValue("the fetched object", decoded.error());
+                NoteUndecodableValue(record, "the fetched object", decoded.error());
                 // CARRY ON rather than return, and that is what makes a generation
                 // bump cost one cold cache instead of a permanent outage.
                 //
@@ -2640,7 +2711,7 @@ void RecordManifest(Config const& cfg,
                 // STALE-hit branch below already does, and for the same reason stated
                 // there. `WarnAndCarryOn` is the spelling the fetch-failure arms above
                 // use; the bucket an operator sees is unchanged.
-                WarnAndCarryOn(DecodeFailureReason(decoded.error()));
+                WarnAndCarryOn(record, DecodeFailureReason(decoded.error()));
             }
             else
             {
@@ -2651,13 +2722,14 @@ void RecordManifest(Config const& cfg,
                 // Reproducing the depfile is not optional: skipping it silently breaks
                 // incremental builds, because Ninja/Make would see no header
                 // dependencies for this TU and stop rebuilding it when they change.
-                auto const materialized = MaterializeHit(cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
+                auto const materialized =
+                    MaterializeHit(record, cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
                 if (materialized.disposition == HitDisposition::Unusable)
-                    return Warn("could not write object on hit");
+                    return Warn(record, "could not write object on hit");
                 if (materialized.disposition == HitDisposition::Served)
                 {
-                    invocation.valueBytes = decoded->objectBlob.size();
-                    invocation.cacheMs = MsSince(cacheStarted);
+                    record.valueBytes = decoded->objectBlob.size();
+                    record.cacheMs = MsSince(cacheStarted);
 
                     // Backfill the direct-mode manifest from the hit we just served.
                     //
@@ -2672,15 +2744,23 @@ void RecordManifest(Config const& cfg,
                     // between machines that happened to share a locale (issue #692). The
                     // probe already ran, so this still costs no compiler invocation.
                     if (cfg.direct)
-                        RecordManifest(
-                            cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
+                        RecordManifest(record,
+                                       cfg,
+                                       cmd,
+                                       layout,
+                                       workingDirectory,
+                                       relativizedArgs,
+                                       toolchainStamp,
+                                       probed,
+                                       key,
+                                       reconciler);
 
                     // The preprocessed-key hit, verified exactly as the direct-mode one
                     // is. Both paths, because a wrong object served through either is the
                     // same defect and a feature that covered one would be a feature an
                     // operator could not rely on (#423).
-                    ReportVerification(VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
-                    TraceOutcome("HIT", key);
+                    ReportVerification(record, VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
+                    TraceOutcome(record, "HIT", key);
                     return 0;
                 }
                 // Stale: the object is fine but the dependency record it carries is not
@@ -2696,14 +2776,14 @@ void RecordManifest(Config const& cfg,
         // MISS — fall through to compile. A refused generation arrives here too,
         // which is what turns a bump into one cold cache rather than a dead one.
     }
-    invocation.cacheMs = MsSince(cacheStarted);
+    record.cacheMs = MsSince(cacheStarted);
     // Only a daemon that answered produces a MISS. A refusal and a transport
     // failure have already recorded themselves as fall-backs, and tracing a MISS
     // over the top would clear the reason `--show-stats` ranks and report a broken
     // cache as a cold one -- the exact conflation `CacheOutcomeKind` was split to
     // end, arriving by a different road.
     if (Cc::CacheIsServing(fetchKind))
-        TraceOutcome("MISS", key);
+        TraceOutcome(record, "MISS", key);
 
     // MISS: try a worker first when one is configured, then the real compiler.
     //
@@ -2712,8 +2792,9 @@ void RecordManifest(Config const& cfg,
     // everything below this point is unchanged and cannot tell the difference. That
     // is deliberate: the STORE, the manifest and the statistics all have one path,
     // and a second one would be a second place for them to diverge.
-    auto run = dispatchConfigured ? TryRemoteCompile(cfg, cmd, argv, key, compilerBanner, targetTriple, dispatchDependencies)
-                                  : std::optional<Cc::CompileRun> {};
+    auto run = dispatchConfigured
+                   ? TryRemoteCompile(record, cfg, cmd, argv, key, compilerBanner, targetTriple, dispatchDependencies)
+                   : std::optional<Cc::CompileRun> {};
     if (!run.has_value())
         run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
@@ -2742,7 +2823,7 @@ void RecordManifest(Config const& cfg,
         // operator to look for an unreachable daemon that is in fact running and
         // rejecting, which is the rule this tree records about reporting a refusal
         // under the wrong reason. The fall-back reason above already names which.
-        Note("the cache did not serve the fetch; not offering this object to it");
+        Note(record.verbose, "the cache did not serve the fetch; not offering this object to it");
         return code;
     }
 
@@ -2751,7 +2832,7 @@ void RecordManifest(Config const& cfg,
     {
         // The compile itself succeeded, so this stays a MISS: only the caching
         // of it failed. Note() rather than Warn() keeps the recorded outcome.
-        Note("object missing after compile; not caching");
+        Note(record.verbose, "object missing after compile; not caching");
         return code;
     }
 
@@ -2820,7 +2901,8 @@ void RecordManifest(Config const& cfg,
     // can canonicalize, localize or check.
     if (reconciler.UnreadablePaths() != 0)
     {
-        Note("a captured region names a path that is not text this host can read; not caching "
+        Note(record.verbose,
+             "a captured region names a path that is not text this host can read; not caching "
              "-- try a UTF-8 console code page");
         return code;
     }
@@ -2832,8 +2914,10 @@ void RecordManifest(Config const& cfg,
         // the real one. Only the caching of it is declined, and declined here
         // rather than by the daemon so the build does not spend the transfer to
         // be refused on every rebuild of this translation unit.
-        Note(std::format(
-            "value {} bytes exceeds {}={}; not caching", encoded.size(), Cc::EnvName::MaxStoreBytes, cfg.maxStoreBytes));
+        Note(
+            record.verbose,
+            std::format(
+                "value {} bytes exceeds {}={}; not caching", encoded.size(), Cc::EnvName::MaxStoreBytes, cfg.maxStoreBytes));
         return code;
     }
 
@@ -2845,7 +2929,7 @@ void RecordManifest(Config const& cfg,
     // a transport failure, which reads the same way it always did.
     auto const outcome =
         Cc::RunOneExchange(cfg.addr,
-                           Notice(),
+                           Notice(record.verbose),
                            Wire::EncodeStore(Wire::StoreRequest { .key = key,
                                                                   .prefetchGroup = cfg.prefetchGroup,
                                                                   .srcRoot = cfg.srcRoot,
@@ -2854,11 +2938,11 @@ void RecordManifest(Config const& cfg,
                            cfg.credential,
                            BudgetOf(cfg));
     if (outcome.IsHit())
-        Note(std::format("STORED key={} bytes={}", key, encoded.size()));
+        Note(record.verbose, std::format("STORED key={} bytes={}", key, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        Note(std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::DescribeOutcome(outcome)));
+        Note(record.verbose, std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::DescribeOutcome(outcome)));
     else
-        Note(std::format("STORE exchange failed key={}", key));
+        Note(record.verbose, std::format("STORE exchange failed key={}", key));
 
     // Record the direct-mode manifest so the NEXT compile of this TU can reach the
     // object without preprocessing. The include set comes from the /showIncludes
@@ -2871,7 +2955,7 @@ void RecordManifest(Config const& cfg,
     // lands on RAM where compression cannot help. A direct hit therefore costs one
     // extra fetch to follow the pointer — see DirectManifest::objectKey.
     if (cfg.direct)
-        RecordManifest(cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
+        RecordManifest(record, cfg, cmd, layout, workingDirectory, relativizedArgs, toolchainStamp, probed, key, reconciler);
     return code;
 }
 
@@ -2978,6 +3062,13 @@ void RecordManifest(Config const& cfg,
 
 int main(int argc, char** argv)
 {
+    /// The one instance, owned by the one function that reports it. Every helper
+    /// that contributes to it now takes it as a parameter, so what a function does
+    /// to the eventual statistics line is visible in its signature -- and the
+    /// const-ness says WHICH: a `const&` reads the verbosity gate, a mutable `&`
+    /// records an outcome (#60).
+    InvocationRecord record;
+
     std::vector<std::string> args;
     args.reserve(static_cast<std::size_t>(argc));
     for (int i = 1; i < argc; ++i) // argv[0] is fastcache-cc itself; drop it
@@ -3026,7 +3117,7 @@ int main(int argc, char** argv)
     }
 
     Config const cfg = LoadConfig();
-    invocation.verbose = cfg.verbose;
+    record.verbose = cfg.verbose;
     // Seeded before anything can dispatch, so the axis always says something true.
     // `NotConfigured` is an ABSENCE, not a failure: a launcher with no scheduler
     // reported as a failed dispatch would read as a 100% dispatch failure rate
@@ -3034,7 +3125,7 @@ int main(int argc, char** argv)
     // node's upstream-store figure. Every path that gets as far as asking overwrites
     // this; every path that does not leaves "a fleet was configured and this compile
     // never reached it", which is a different fact again.
-    invocation.dispatch = DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
+    record.dispatch = DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
 
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
@@ -3048,31 +3139,32 @@ int main(int argc, char** argv)
         // a module-using build get no hits at all deserves to be told why rather
         // than left to conclude the cache is broken.
         if (cmd.sideArtefact)
-            Note("the compile writes a second artefact (a BMI or a precompiled header) "
+            Note(record.verbose,
+                 "the compile writes a second artefact (a BMI or a precompiled header) "
                  "that a cache hit cannot reproduce; not cached");
         return RunPassthrough(std::span<std::string const> { args });
     }
 
     auto const started = std::chrono::steady_clock::now();
-    auto const handled = RunCached(cfg, cmd, std::span<std::string const> { args });
+    auto const handled = RunCached(record, cfg, cmd, std::span<std::string const> { args });
     int const code = handled.has_value() ? *handled : RunPassthrough(std::span<std::string const> { args });
 
     if (cfg.stats)
     {
         auto const elapsed = std::chrono::steady_clock::now() - started;
         Cc::AppendRecord({
-            .outcome = invocation.outcome,
-            .dispatch = invocation.dispatch,
+            .outcome = record.outcome,
+            .dispatch = record.dispatch,
             .prefetchGroup = cfg.prefetchGroup,
             .source = cmd.source,
-            .valueBytes = invocation.valueBytes,
+            .valueBytes = record.valueBytes,
             .elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-            .detail = invocation.outcomeDetail,
-            .dispatchDetail = invocation.dispatchDetail,
-            .preprocessMs = invocation.preprocessMs,
-            .cacheMs = invocation.cacheMs,
-            .directMs = invocation.directMs,
-            .directHit = invocation.directHit,
+            .detail = record.outcomeDetail,
+            .dispatchDetail = record.dispatchDetail,
+            .preprocessMs = record.preprocessMs,
+            .cacheMs = record.cacheMs,
+            .directMs = record.directMs,
+            .directHit = record.directHit,
         });
     }
     return code;
