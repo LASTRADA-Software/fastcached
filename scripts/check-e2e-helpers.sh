@@ -31,8 +31,15 @@
 # whoever made it.
 #
 # Usage:
-#   check-e2e-helpers.sh              run every case
-#   check-e2e-helpers.sh --case NAME  run one case in this process (used above)
+#   check-e2e-helpers.sh                   run every case
+#   check-e2e-helpers.sh --case NAME       run one case and REPORT on it:
+#                                          0 clean, 3 the case printed BUG:,
+#                                          anything else the case aborted
+#   check-e2e-helpers.sh --case-body NAME  the inner half, whose status answers
+#                                          only *did this case run*. Used by
+#                                          `--case`; not the mode to re-run by
+#                                          hand, because its verdict is the
+#                                          OUTPUT and nothing reads it for you.
 set -uo pipefail
 
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1508,6 +1515,30 @@ run_case() {
             ;;
         esac
         ;;
+
+    # --- the two canaries for `--case`'s own verdict ------------------------
+    #
+    # In no table, and driven only by the `--case verdict` block far below. They
+    # are the pair that makes `--case` a guard rather than a mode nobody has
+    # watched refuse (#1104): they differ in ONE thing, the `BUG:` prefix, so the
+    # refusing arm cannot be passing for some other reason and the accepting arm
+    # cannot be passing because everything passes.
+    #
+    # A canary and not a real case, because every real case here reports `BUG:`
+    # only when a helper is broken -- so there is no case that can be relied on to
+    # print one, and asserting the refusing direction against a genuine defect
+    # would mean keeping a broken helper in the tree.
+    #
+    # `run_case` has already sourced the library and armed cleanup by this point,
+    # so both arms exercise the whole `--case` path and not a short-circuit.
+    selftest-case-clean)
+        echo "the canary ran and found nothing"
+        ;;
+    selftest-case-bug)
+        echo "the canary ran and found something"
+        echo "BUG: this line is what --case must refuse on"
+        ;;
+
     *)
         echo "unknown case: ${name}" >&2
         exit 2
@@ -1691,8 +1722,64 @@ _selftest_node() {
 # The driver
 # ---------------------------------------------------------------------------
 
-if [ "${1:-}" = "--case" ]; then
+# `--case-body NAME` is the INNER half: it runs one case and its status answers
+# only *did this case run* -- non-zero when the case aborted (a `fail`, or the
+# `set -e` inside `run_case` firing), zero when it reached the end. That question
+# is a real one and the five internal consumers below have always read it
+# correctly, which is why the bare `exit 0` survived so long.
+#
+# It is not, however, the question somebody re-running a case is asking. The
+# failure block at the bottom of this file prints
+#
+#     re-run one alone with: bash check-e2e-helpers.sh --case <name>
+#
+# and sends an investigator to a mode whose status could not say whether the case
+# found a defect: a run printing `BUG: the bound is sleeping through commands that
+# have already finished` exited 0, exactly as a healthy run did. A lane followed
+# that advice, built a harness on the status, and reported 6 of 6 PASS including a
+# run that should have failed -- nothing errored, the output was well-formed, and
+# the status was simply not a verdict (#1104).
+#
+# So `--case` WRAPS it and applies the SAME rule the driver applies: the absence of
+# `BUG:` from the case's output. One rule, one text, two readers -- rather than a
+# marker beside the printing, which would be a second mechanism free to disagree
+# with the first.
+#
+# THREE outcomes, not two, because *aborted* and *ran and reported a defect* are
+# different diagnoses fixed in different places:
+#
+#     0  the case ran and printed no BUG:
+#     3  the case ran to completion and reported a defect
+#     *  whatever the case exited with -- it aborted, and did not reach the end
+#
+# An inner PROCESS rather than a redirection: `fail` sends SIGTERM to
+# `_e2e_top_pid`, which `e2e_begin` sets to `$$` -- so the case must own that pid,
+# or a `fail` would kill the wrapper mid-read and take the output with it. A
+# `tee` keeps the case streaming live, which matters because several cases are
+# about waits and hangs. Its cost is one extra process per case.
+#
+# The two streams are MERGED here, as all five consumers already merge them with
+# their own `2>&1`, so a `BUG:` on either is seen and the ordering a consumer
+# captures is the ordering of one stream rather than a race between two.
+if [ "${1:-}" = "--case-body" ]; then
     run_case "$2"
+    exit 0
+fi
+
+if [ "${1:-}" = "--case" ]; then
+    caseLog="$(mktemp)" || { echo "could not create a scratch file for --case" >&2; exit 2; }
+    trap 'rm -f "$caseLog"' EXIT
+    bash "${BASH_SOURCE[0]}" --case-body "$2" 2>&1 | tee "$caseLog"
+    caseStatus=${PIPESTATUS[0]}
+    if [ "$caseStatus" -ne 0 ]; then
+        exit "$caseStatus"
+    fi
+    # A FILE, not a pipe: `grep -q` over a pipe is the SIGPIPE hazard this file's
+    # own early-exit scan refuses.
+    if grep -q 'BUG:' "$caseLog"; then
+        echo "--case ${2}: the case ran to completion and printed BUG:, so it reported a defect" >&2
+        exit 3
+    fi
     exit 0
 fi
 
@@ -2110,6 +2197,78 @@ for record in "${cases[@]}"; do
     ran=$(( ran + 1 ))
     expect "$record" "$out" "$status" || note_failure "${record%%|*}"
 done
+
+# --- `--case` is a verdict, in BOTH directions -----------------------------
+#
+# The mode this file's own failure block tells an investigator to use. It exited
+# a literal 0 whatever the case printed, so a run reporting `BUG: the bound is
+# sleeping through commands that have already finished` was indistinguishable
+# from a healthy one -- and a lane that followed the advice and keyed a harness
+# on the status reported 6 of 6 PASS including a run that should have failed
+# (#1104). Nothing errored; the status was simply not a verdict.
+#
+# Both directions, against the two canaries in `run_case` whose only difference
+# is the `BUG:` prefix. Refusing alone would leave a guard that might refuse
+# everything (#1031); accepting alone is the defect being fixed.
+#
+# The status is asserted EXACTLY, not merely as non-zero: 3 is *ran and reported
+# a defect* and 1 is *aborted*, and folding them would be this repository's
+# once-a-session state collapse inside the fix for one.
+echo "== --case reports on the case, in both directions"
+
+ran=$(( ran + 1 ))
+verdict_clean="$( bash "${BASH_SOURCE[0]}" --case selftest-case-clean 2>&1 )"
+verdict_clean_status=$?
+if [ "$verdict_clean_status" -ne 0 ]; then
+    echo "FAIL case-verdict-accepts: --case exited ${verdict_clean_status} for a clean case, expected 0" >&2
+    printf '%s\n' "$verdict_clean" | sed 's/^/     | /' >&2
+    note_failure "case-verdict-accepts"
+fi
+
+ran=$(( ran + 1 ))
+verdict_bug="$( bash "${BASH_SOURCE[0]}" --case selftest-case-bug 2>&1 )"
+verdict_bug_status=$?
+if [ "$verdict_bug_status" -ne 3 ]; then
+    echo "FAIL case-verdict-refuses: --case exited ${verdict_bug_status} for a case that printed BUG:," >&2
+    echo "     expected 3. The mode this file tells people to re-run in cannot report a defect (#1104)." >&2
+    printf '%s\n' "$verdict_bug" | sed 's/^/     | /' >&2
+    note_failure "case-verdict-refuses"
+fi
+
+# The case's own output still reaches the caller -- a wrapper that swallowed it
+# would pass both assertions above while making every `expect` row vacuous.
+ran=$(( ran + 1 ))
+if ! grep -qF "the canary ran and found something" <<< "$verdict_bug"; then
+    echo "FAIL case-verdict-streams: --case did not pass the case's output through" >&2
+    printf '%s\n' "$verdict_bug" | sed 's/^/     | /' >&2
+    note_failure "case-verdict-streams"
+fi
+
+# And the advertised mode is the mode in use. `--case-body` is the inner half,
+# whose status answers a different question; a consumer routed around the wrapper
+# would be reading that question while this block vouches for the other one --
+# "the mode under test was not the mode in use", which is #499's shape.
+# DERIVED from this file rather than restated: seven self-invocations today, and
+# the number moves with the file, so only a FLOOR is asserted.
+#
+# The flag names are ASSEMBLED rather than spelled, because the first version of
+# this block counted its own grep lines: three "variable" invocations where two
+# exist and two "inner" ones where one does. A scan whose needle appears in its
+# own source is reporting on itself, which is the same defect as a comment being
+# read as a call site -- caught by the block failing on a correct tree, which is
+# the direction a guard is least often watched in.
+ran=$(( ran + 1 ))
+caseFlag="--case"
+advertised="$(grep -cF "bash \"\${BASH_SOURCE[0]}\" ${caseFlag} \"" "${BASH_SOURCE[0]}" || true)"
+advertised_named="$(grep -cE "bash \"\\\$\\{BASH_SOURCE\\[0\\]\\}\" ${caseFlag} [a-z]" "${BASH_SOURCE[0]}" || true)"
+inner="$(grep -cF "bash \"\${BASH_SOURCE[0]}\" ${caseFlag}-body \"" "${BASH_SOURCE[0]}" || true)"
+if [ "$(( advertised + advertised_named ))" -lt 5 ] || [ "$inner" != "1" ]; then
+    echo "FAIL case-mode-in-use: ${advertised} variable and ${advertised_named} named ${caseFlag}" >&2
+    echo "     self-invocations and ${inner} ${caseFlag}-body ones. Expected at least five of the" >&2
+    echo "     former and exactly one of the latter (the wrapper); a consumer reaching" >&2
+    echo "     ${caseFlag}-body directly reads 'did this case run', not 'was it clean'." >&2
+    note_failure "case-mode-in-use"
+fi
 
 # --- the bound is a duration, not an iteration count -----------------------
 #
