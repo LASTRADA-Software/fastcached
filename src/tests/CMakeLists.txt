@@ -2950,8 +2950,9 @@ endif()
 # and the full sweep still runs, still fails and still reaches nobody: 18 of 18
 # failed master-push runs were never once re-run.
 #
-# `scripts/tidy-sweep.sh --self-test` covers the scope COMPUTATION. Nothing
-# covered which events reach it with which scope, which is the half #554 changed.
+# `scripts/tidy-sweep.sh --self-test` covers the scope COMPUTATION and, since
+# #257, the CANARY's verdict. Nothing covered which events reach it with which
+# scope, which is the half #554 changed.
 #
 # Two registrations for the reason `target-file-guards` carries: the check reads
 # the real workflow, and the self-test drives every rule against synthetic ones in
@@ -3182,6 +3183,14 @@ if(NOT WIN32)
         # `SKIP_RETURN_CODE 77` STAYS. The interpreter is known to clear the floor here,
         # so this arm should not skip -- but the script exits 77 for its own reasons too,
         # and a registration that scores those a FAILURE is #499 exactly.
+        #
+        # What this covers grew with #257: the self-test now drives `CanaryVerdict`
+        # as well as the scope computation, so the guard that stops a whole branch
+        # being reported clean by an analyser that never ran is exercised on every
+        # platform and from `local-gate.sh` -- rather than only where a full sweep
+        # with a working clang-tidy was already happening. The registration itself
+        # did not have to change, which is why #257's first two acceptance clauses
+        # were already met when it was picked up.
         add_test(
             NAME "tidy-sweep-selftest"
             COMMAND ${FASTCACHED_BASH44} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
@@ -3196,7 +3205,7 @@ if(NOT WIN32)
         # skipped, and dropping the row is what makes a permanent gap indistinguishable
         # from a platform that was never meant to run it.
         fastcached_register_skipped_test("tidy-sweep-selftest"
-            "no bash >= 4.4 on this host, so tidy-sweep.sh's scope computation was not exercised")
+            "no bash >= 4.4 on this host, so tidy-sweep.sh's scope computation and canary verdict were not exercised")
     endif()
 endif()
 
