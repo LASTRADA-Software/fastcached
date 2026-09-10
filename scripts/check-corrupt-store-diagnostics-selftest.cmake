@@ -100,8 +100,10 @@ function(fastcached_run_check tree outVerdict outOutput)
     set(combined "${captured}${capturedErrors}")
     set(${outOutput} "${combined}" PARENT_SCOPE)
 
-    string(FIND "${combined}" "CMake Error" errorAt)
-    if(NOT errorAt EQUAL -1)
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    if(combined MATCHES "CMake Error|CMake Warning")
         set(${outVerdict} "refused" PARENT_SCOPE)
         return()
     endif()
@@ -119,9 +121,16 @@ macro(fastcached_case what want tree expect)
     fastcached_run_check("${tree}" verdict output)
     if(verdict STREQUAL "inconclusive")
         list(APPEND inconclusive "  ${what}")
-    elseif(want STREQUAL "want-pass" AND NOT verdict STREQUAL "passed")
+    # `"${want}"`, not a bare `want`. This is a MACRO, so its parameters are not
+    # variables -- the body is text-substituted before it runs and a bare name is left
+    # standing as the literal string `want`, which equals neither expectation. Both arms
+    # were therefore dead: every case fell through to the substring check below, the two
+    # `want-pass` cases pass an empty substring and so asserted NOTHING, and this fixture
+    # would have gone green with the check refusing every tree it was handed. Found by
+    # #672's mutation, which could not move this harness in either direction.
+    elseif("${want}" STREQUAL "want-pass" AND NOT verdict STREQUAL "passed")
         list(APPEND failures "  ${what}: expected a pass, got ${verdict}")
-    elseif(want STREQUAL "want-refuse" AND NOT verdict STREQUAL "refused")
+    elseif("${want}" STREQUAL "want-refuse" AND NOT verdict STREQUAL "refused")
         list(APPEND failures "  ${what}: expected a refusal, got ${verdict}")
     elseif(NOT "${expect}" STREQUAL "")
         string(FIND "${output}" "${expect}" expectAt)
