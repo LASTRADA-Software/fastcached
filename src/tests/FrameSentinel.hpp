@@ -13,7 +13,17 @@ namespace FastCache::Testing
 /// run against `TestReactor` and `PlatformReactor` without changing shape.
 struct FrameCounters
 {
-    std::atomic<int> parked { 0 };    ///< Coroutines that reached their suspend point.
+    /// Coroutines that ENTERED the body, counted on the statement before the
+    /// `co_await` -- which is where every call site increments it.
+    ///
+    /// It does NOT establish that the coroutine suspended, and it used to say it
+    /// did (#1194). The difference is invisible wherever nothing can complete the
+    /// awaitable concurrently, which is every use but one, and load-bearing in
+    /// that one: a worker thread settling before the park finds no waiter
+    /// registered, hands nothing back, and the body resumes inline. A case that
+    /// reads `parked == 1` as "the waiter is registered" is asserting something
+    /// no counter here observes -- close that window with the fixture's own gate.
+    std::atomic<int> parked { 0 };
     std::atomic<int> completed { 0 }; ///< Coroutine bodies that ran to their end.
     std::atomic<int> destroyed { 0 }; ///< Frames freed, counted by the sentinel each carries.
 };

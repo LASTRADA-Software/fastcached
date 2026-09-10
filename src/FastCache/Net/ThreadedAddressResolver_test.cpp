@@ -451,10 +451,35 @@ TEST_CASE("A detached lookup handed back and never dequeued is freed at teardown
         FastCache::ManualClock clock;
         FastCache::TestReactor reactor { clock };
         ScriptedResolver inner;
+
+        // HELD before the lookup starts, and that is what makes this case
+        // deterministic (#1194). `Settle` hands the waiter back only if one is
+        // REGISTERED, and `slot.waiter` is written in `SlotPark::await_suspend` --
+        // so a worker that dequeues and settles before the coroutine suspends finds
+        // an empty waiter, submits NOTHING, and the body resumes inline through the
+        // already-done path. `PendingSubmissions()` then reads 0 and this case's
+        // premise never held. Seen once on a hosted runner and not once in 400 runs
+        // here, which is the rate that makes it read as somebody else's regression.
+        //
+        // `counters.parked` cannot close that window while reading exactly as
+        // though it does: it is incremented on the statement BEFORE the await.
+        // `Stop()` cannot either -- it orders the hand-back against its own return,
+        // and the worker is free to settle long before it is called.
+        inner.Hold();
         FastCache::ThreadedAddressResolver resolver { inner };
 
         ResolveDetached(&resolver, &reactor, FrameSentinel { &counters }, &counters);
         REQUIRE(counters.parked == 1);
+
+        // The gate's effect, asserted rather than assumed: with a worker held
+        // inside `Resolve` nothing can have been handed back yet. Without this the
+        // case cannot tell "the gate held the window open" from "the hand-back
+        // happened early and the count below is a coincidence".
+        REQUIRE(reactor.PendingSubmissions() == 0);
+
+        // Released BEFORE `Stop()`, never after: a held gate keeps the worker inside
+        // `Resolve`, where the join below would wait on it forever.
+        inner.Release();
 
         // A name rather than a literal, or the fast path answers inline and no
         // worker -- and so no hand-back -- ever happens.

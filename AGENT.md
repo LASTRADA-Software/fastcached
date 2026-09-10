@@ -578,9 +578,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
     `ForeignGeneration` and is REFUSED, carrying no bytes to store — the one `nullopt`
     that used to mean that AND "damaged bytes" met a node whose policy for the second
     is *store verbatim*, which is #229 during an ordinary rolling upgrade (#483).
-- A manifest naming the TU and no header revalidates forever: `IsToolchainHeader` calls
+- A manifest naming the TU and no header revalidates forever: `ClassifyAgainstRoots` calls
   every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
-  exactly as an SDK's are. `BuildManifest` refuses (`NoProjectDeps`) when deps were
+  exactly as an SDK's are. It answers in THREE values and there is no bool beside it:
+  `IsToolchainHeader` was retired in #657 once nothing production called it, because a
+  predicate collapsing *outside the roots* into *toolchain* cannot say which of the two an
+  operator repairs by editing a root rather than by moving a file, and a rulebook naming a
+  dead function sends a reader tracing the invariant into code nothing runs. `BuildManifest` refuses (`NoProjectDeps`) when deps were
   reported and none survived, and (`DepsNotObserved`) when no dependency record was
   observed at all — a fact the caller STATES through `ReportedDependencies`, never one
   inferred from an empty vector, since "depends on nothing" and "nothing was observed"

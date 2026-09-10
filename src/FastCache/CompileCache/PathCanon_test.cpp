@@ -106,7 +106,7 @@ TEST_CASE("Root match is on a segment boundary, not a bare prefix")
 TEST_CASE("RelateToLayout is the segment-boundary test Canonicalize applies")
 {
     // The exported form of the rule the case above pins through Canonicalize, and
-    // the reason it is exported: the launcher's `IsToolchainHeader` used to answer
+    // the reason it is exported: the launcher's path classifier used to answer
     // this question with a bare `starts_with` and no boundary check, so the two
     // disagreed about a sibling directory whose name merely extends the root's last
     // segment (issue #562). Every assertion here is written twice on purpose --

@@ -259,7 +259,7 @@ TEST_CASE("A drive-relative path under a drive-relative root is still keyed")
 TEST_CASE("A vendored tree under a drive-relative root is toolchain, not drive-relative")
 {
     // The mirror of the case above, and the reason the drive-relative label is
-    // not simply "the anchor was DriveRelative". `IsToolchainHeader` tests its
+    // not simply "the anchor was DriveRelative". `ClassifyAgainstRoots` tests its
     // markers BEFORE any root, deliberately — a vcpkg tree nested under the build
     // tree is toolchain content even though it canonicalizes — so under a
     // drive-relative root every such path is both drive-relative and toolchain.
