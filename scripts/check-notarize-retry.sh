@@ -39,6 +39,15 @@ set(CPACK_FASTCACHED_NOTARIZE ON)
 set(CPACK_FASTCACHED_BUILD_DMG OFF)
 set(CPACK_FASTCACHED_NOTARY_PROFILE "fake-profile")
 set(CPACK_PACKAGE_FILES "$ENV{ART}")
+# Set only when a case NAMES them, so every case that does not exercises the
+# absent-variable arm -- which for the stall policy is the fail-closed default, and
+# that is the arm a release depends on (#1156).
+if(NOT "$ENV{STALL_FATAL}" STREQUAL "")
+    set(CPACK_FASTCACHED_NOTARY_STALL_IS_FATAL "$ENV{STALL_FATAL}")
+endif()
+if(NOT "$ENV{NOTARY_BUDGET}" STREQUAL "")
+    set(CPACK_FASTCACHED_NOTARY_BUDGET "$ENV{NOTARY_BUDGET}")
+endif()
 include("$ENV{HOOK}")
 message(STATUS "DRIVER-COMPLETED")
 DRIVE
@@ -48,11 +57,15 @@ failures=0
 
 # @param 1 name  @param 2 expect completed|fatal  @param 3 substring the output must carry
 #        @param 4 how many submit attempts the fake must have seen
+#        @param 5 the stall policy, or empty to leave the variable UNSET
+#        @param 6 the per-artefact budget in seconds, or empty for the shipped 600
 run_case() {
     name="$1"; want="$2"; wantMsg="$3"; wantSubmits="$4"
+    stallFatal="${5:-}"; budget="${6:-}"
     cases=$((cases + 1))
     : > "$work/submits"
     out="$(PATH="$work/bin:$PATH" ART="$work/thing.pkg" HOOK="$hook" \
+           STALL_FATAL="$stallFatal" NOTARY_BUDGET="$budget" \
            cmake -P "$work/drive.cmake" 2>&1)"
     got=fatal
     grep -q 'DRIVER-COMPLETED' <<< "$out" && got=completed
@@ -63,7 +76,15 @@ run_case() {
         failures=$((failures + 1))
         return
     fi
-    if ! grep -q -- "$wantMsg" <<< "$out"; then
+    # FLATTENED before matching, because CMake wraps its diagnostics at about 74
+    # columns and a phrase can then exist in the output and in no single LINE of it.
+    # `.agent/rules/build-and-toolchain.md` records that as its own trap; it bit here
+    # the moment a verdict sentence grew past one line, and the symptom is the worst
+    # available one -- "the right outcome for the wrong reason" about a message that
+    # says exactly the right thing. A herestring rather than a pipe: `producer |
+    # grep -q` is a false negative under `pipefail` on the SUCCESS path.
+    flat="$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ')"
+    if ! grep -q -- "$wantMsg" <<< "$flat"; then
         refuse "case '$name' gave the right outcome for the wrong reason -- expected '$wantMsg'"
         printf '%s\n' "$out" | sed 's/^/    /' >&2
         failures=$((failures + 1))
@@ -90,7 +111,11 @@ case "$2" in submit) echo sub >> '"$work"'/submits
   if [ "$(wc -l < '"$work"'/submits | tr -d " ")" -le 1 ]; then exit 3; fi
   echo "{\"id\":\"11111111-2222-3333-4444-555555555555\",\"status\":\"Accepted\"}";; esac
 exit 0'
-run_case stall_then_accept completed "did not answer" 2
+# RENAMED from `stall_then_accept`: with the budget spent across attempts, a stall
+# and a fast failure are no longer the same thing, and this fake exits IMMEDIATELY --
+# it is the fast one. The slow one is its own case further down, and calling this a
+# stall would have left the file claiming to test a distinction neither case made.
+run_case a_fast_failure_is_retried completed "did not answer" 2
 
 # The one this file exists for. A refusal is an ANSWER; retrying it buys nothing and
 # costs the step budget.
@@ -100,7 +125,7 @@ case "$2" in
   log) echo "LOG-FETCHED";;
 esac
 exit 0'
-run_case refusal_is_not_retried fatal "was not accepted" 1
+run_case refusal_is_not_retried fatal "the answer was not Accepted" 1
 
 # And a refusal must still fetch the log, or the rejection is undebuggable.
 fake_xcrun '#!/bin/sh
@@ -114,7 +139,80 @@ run_case refusal_fetches_log fatal "LOG-FETCHED" 1
 fake_xcrun '#!/bin/sh
 case "$2" in submit) echo sub >> '"$work"'/submits;; esac
 exit 3'
-run_case never_answers fatal "did not answer within" 2
+run_case never_answers fatal "did not answer the notarization submission" 2
+
+# --------------------------------------------------------------------------
+# The budget is per ARTEFACT and spent ACROSS attempts, so a SLOW failure is not
+# retried where a FAST one is (#1156).
+#
+# The two cases above and this one are the same fake in every respect except how
+# long it takes to fail, which is the whole discrimination: `notarytool submit`
+# uploads and enqueues a NEW submission, so retrying after a stall joins the back of
+# the same slow queue with less time than the first attempt had. Measured on the run
+# that filed #1156, two attempts spent twenty minutes to be told the same thing
+# twice.
+#
+# The budget is shrunk through `CPACK_FASTCACHED_NOTARY_BUDGET` because no
+# test can wait 600 s to watch this; that seam exists for this case and for nothing
+# else, and `cmake/Packaging.cmake` does not export it. Six seconds, so the FIRST
+# attempt still clears the minimum-attempt floor the hook derives from the budget --
+# a case that failed by skipping attempt one would pass this assertion for the wrong
+# reason.
+# TWO clauses gate the retry and they cover different failures, so there are two
+# cases. Stated plainly because ONE of them cannot be isolated by any test here, and
+# a reader who does not know that would delete the clause it protects:
+#
+#   * the previous attempt returned an EXIT CODE (`_rc` is a number). A bound that
+#     fired, or a command that never started, is not asked again.
+#   * and there is budget LEFT. A numeric failure that took most of the budget is
+#     not retried either.
+#
+# On a well-behaved clock those two agree for a TIMEOUT -- the bound is the whole
+# remaining budget, so firing it exhausts the budget by construction -- and the case
+# below therefore fails only if BOTH are removed. That is not a reason to drop
+# either: the `_rc` clause exists for a clock that is NOT well behaved, measured on
+# this project's WSL2 development host at ~2 s backwards every ~32 s, where the
+# clock-only version reported two submissions in 3 of 15 runs with its own log
+# saying "after 4s of a 6s budget" for an attempt killed at six. No `cmake -P` test
+# can inject a clock step, so that clause is argued rather than asserted.
+fake_xcrun '#!/bin/sh
+case "$2" in submit) echo sub >> '"$work"'/submits;; esac
+sleep 30
+exit 3'
+run_case a_slow_timeout_is_not_retried fatal "did not answer the notarization submission" 1 "" 6
+
+# The budget clause on its own, and this one IS isolated: the fake EXITS, so `_rc` is
+# a number and the first clause admits a retry -- only the budget stops it. Five
+# seconds against a six-second budget, so what is left is below the minimum attempt.
+fake_xcrun '#!/bin/sh
+case "$2" in submit) echo sub >> '"$work"'/submits;; esac
+sleep 5
+exit 3'
+run_case a_slow_exit_leaves_no_budget_to_retry_with fatal "did not answer the notarization submission" 1 "" 6
+
+# --------------------------------------------------------------------------
+# And WHERE a stall is fatal is a policy, not a property of the stall (#1156).
+#
+# The control is every case above: none of them sets the variable, so all of them
+# run on the absent-variable arm and expect `fatal`. That arm is what a release
+# depends on, and an implementation that defaulted the other way would pass this
+# case and fail those.
+fake_xcrun '#!/bin/sh
+case "$2" in submit) echo sub >> '"$work"'/submits;; esac
+exit 3'
+run_case stall_is_reported_when_the_policy_says_so completed "Not fatal on this ref" 2 OFF
+
+# A REJECTION is not covered by that policy and must not be: Apple having looked and
+# refused is a fact about the artefact. Same OFF policy as the case above, opposite
+# outcome -- which is what makes the softening a discrimination rather than a switch
+# that turns the guard off.
+fake_xcrun '#!/bin/sh
+case "$2" in
+  submit) echo sub >> '"$work"'/submits; echo "{\"id\":\"11111111-2222-3333-4444-555555555555\",\"status\":\"Invalid\"}";;
+  log) echo "LOG-FETCHED";;
+esac
+exit 0'
+run_case a_refusal_is_fatal_under_every_policy fatal "the answer was not Accepted" 1 OFF
 
 echo "notarize-retry: ran $cases case(s), $failures failure(s)"
 [[ $failures -eq 0 ]] || exit 1

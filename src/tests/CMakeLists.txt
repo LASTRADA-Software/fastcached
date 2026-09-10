@@ -256,9 +256,9 @@ endif()
 #
 # `powershell` (Windows PowerShell 5.1) is deliberately NOT on this list, and the reason
 # is a mistake worth recording. It WAS, on the evidence that
-# `node-scratch-isolation-e2e.ps1 -SelfTest` passes 23 of 23 cases under both pwsh 7.6.5
-# and 5.1 -- measured, and true. But this variable gates TWO scripts, and the second was
-# never asked. Measured:
+# `node-scratch-isolation-e2e.ps1 -SelfTest` passes under both pwsh 7.6.5 and Windows
+# PowerShell 5.1 -- measured, and true. But this variable gates TWO scripts, and the
+# second was never asked. Measured:
 #
 #     pwsh        dist-compile-e2e.ps1 -SelfTest  ->  exit 0, PASSED
 #     powershell  dist-compile-e2e.ps1 -SelfTest  ->  exit 1, MethodNotFound
@@ -3966,11 +3966,30 @@ else()
     )
     # Starts three nodes and a daemon twice over and drives real compiles, so it must
     # not race the other server-starting smoke tests for ports or for CPU.
+    #
+    # **This TIMEOUT has to dominate the fixture's OWN bounds, and that is the whole
+    # of how it is chosen** (#1157). ctest killing the process produces no classifier
+    # output at all -- the one instrument in that fixture that can say whether a host
+    # was slow or a node was wedged -- so if this fires first, the most useful thing
+    # in the run is lost and what is left is `***Timeout`.
+    #
+    # It was 900 against a 600 s survey ceiling, which left 300 s for four other
+    # waits, two phases, four node startups and four real MSVC compiles. On the run
+    # that filed #1157 the survey alone spent 600 s and the test reported at 602.83 s
+    # with about 8% of headroom, on a runner measurably ~2x slower than the one the
+    # same leg passed on the next day (`dist-compile-e2e` 105.66 s against 53.40 s).
+    #
+    # 1800 = the survey ceiling this fixture now carries (1200 s, derived beside
+    # `$SurveySeconds` in the script) plus the rest of the fixture, measured at
+    # 96.20 s on a fast runner and allowed ~200 s on a slow one, plus margin. The
+    # margin is cheap because the survey wait no longer reaches its ceiling on a
+    # WEDGE -- a node that stops emitting progress lines ends that wait in 180 s --
+    # so this budget is only ever spent on a machine that is genuinely working.
     set_tests_properties("node-scratch-isolation-e2e" PROPERTIES
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 900
+        TIMEOUT 1800
     )
 endif()
 
@@ -3994,8 +4013,11 @@ endif()
 # needed a core to itself, took 53 seconds, and still failed on CI, because the
 # band it had to land a figure inside is 0.35s wide while a PowerShell process's
 # own startup costs 0.2-0.5s. The decision is now a pure function over a readings
-# record and the cases are rows -- 17 of them, both sides of every bound, in about
-# a third of a second. See `.agent/rules/testing.md`.
+# record and the cases are rows -- both sides of every bound -- in about a third of
+# a second. The CASE COUNT is deliberately not written down in this file: it moves
+# whenever a case is added, it was stated in three separate comments here and had
+# gone stale in all three, and the run derives and prints its own total. See
+# `.agent/rules/testing.md`.
 # Gated on an INTERPRETER, not on the platform (#837).
 #
 # `if(WIN32)` was narrower than the thing it guarded. The end-to-end fixture needs
@@ -4008,7 +4030,8 @@ endif()
 #
 # An interpreter that could not run it would turn this skip into a FAILURE, which is worse
 # than the `if(WIN32)` it replaces -- so `FASTCACHED_PWSH` names pwsh only. This script
-# itself passes 23 of 23 under Windows PowerShell 5.1 as well, measured; its sibling
+# itself passes under Windows PowerShell 5.1 as well -- re-measured 2026-09-10 on
+# 5.1.26100.9444 and on pwsh 7.6.5, both green; its sibling
 # `dist-compile-e2e.ps1` does not, and they share the gate. See the derivation beside
 # `find_program(FASTCACHED_PWSH ...)`.
 if(FASTCACHED_PWSH)

@@ -64,6 +64,22 @@ set(FASTCACHED_MACOS_NOTARY_PROFILE "fastcached-notary" CACHE STRING
 option(FASTCACHED_MACOS_NOTARIZE "Submit the macOS artifacts to Apple's notary service" OFF)
 option(FASTCACHED_MACOS_BUILD_DMG "Also wrap the macOS .pkg in a .dmg" ON)
 
+# Whether *Apple did not answer* fails this build (#1156).
+#
+# **Default ON, and the default is the point.** A stall says nothing about the
+# artefact -- it is the notary service's queue -- so it is the one notarization
+# outcome worth softening where the artefact never leaves the runner. But an
+# unnotarized package that reaches a user is the failure this whole pipeline
+# exists to prevent, so the soft answer has to be asked for by a caller that
+# knows nothing ships from its ref. Absence keeps the strict answer, here and
+# again in the hook, which re-derives the same default rather than trusting a
+# variable to have arrived.
+#
+# A REJECTION is not covered by this and must not be: Apple having looked and
+# refused is a fact about the artefact, and it is fatal on every ref.
+option(FASTCACHED_MACOS_NOTARY_STALL_IS_FATAL
+       "Fail the build when Apple does not answer a notarization submission in time" ON)
+
 # Apple rejects an unsigned or ad-hoc-signed submission — but only after the
 # multi-minute round trip to the notary service. Fail here instead, where the
 # mistake costs nothing.
@@ -361,6 +377,12 @@ if(APPLE AND FASTCACHED_PACKAGE_ROOT_PREFIX)
     set(CPACK_FASTCACHED_NOTARIZE          "${FASTCACHED_MACOS_NOTARIZE}")
     set(CPACK_FASTCACHED_NOTARY_PROFILE    "${FASTCACHED_MACOS_NOTARY_PROFILE}")
     set(CPACK_FASTCACHED_BUILD_DMG         "${FASTCACHED_MACOS_BUILD_DMG}")
+    set(CPACK_FASTCACHED_NOTARY_STALL_IS_FATAL "${FASTCACHED_MACOS_NOTARY_STALL_IS_FATAL}")
+    # One line per artefact the notarization hook considered, written in the order
+    # things happened. The packaging job removes it before `cpack` and classifies
+    # from it afterwards, so its ABSENCE is a state that hook did not run rather
+    # than a state nothing happened -- see `cmake/MacOSNotarizePkg.cmake`.
+    set(CPACK_FASTCACHED_NOTARY_VERDICT_FILE "${CMAKE_BINARY_DIR}/notarization-verdict.txt")
     # CPack builds packages in a staging directory and copies them back
     # afterwards; a .dmg this hook creates is not part of that copy, so it must
     # be written to its final home directly.

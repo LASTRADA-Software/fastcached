@@ -461,13 +461,26 @@ SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
     std::size_t departedDecided = 0;
 
     // Computed CONCURRENTLY, and the cost is why. A cold fingerprint is a full walk
-    // of the include tree -- about two seconds over 288 MB on an ordinary Xcode
-    // toolchain, per `ToolchainProbe.hpp` -- and a machine the node surveyed itself
-    // routinely holds four or five. Sequentially that is a node sitting silent for
-    // half a minute at first boot before it reaches its scheduler, on exactly the
-    // start where an operator is watching. Warm starts read the cache and are
-    // instant, so this buys nothing on any boot after the first; it is the first one
-    // that decides whether the feature looks like it works.
+    // of the include tree, and the figure that belongs beside the word COLD is the
+    // cold one. This comment used to read "about two seconds over 288 MB on an
+    // ordinary Xcode toolchain": that is `ToolchainProbe.hpp`'s Xcode row measured
+    // WARM, and dropping the condition while keeping the number is the citation
+    // defect `AGENT.md` records against this very figure -- an operation observed
+    // exceeding 300 s reasoned about as though it cost two seconds.
+    //
+    // Pinned rather than linked, because a measurement's conditions are the state of
+    // the world at one instant and must not track their source. As of that table
+    // (re-read 2026-09-10) one Windows toolchain is 4,771 files at 5.00 ms each
+    // cold with anti-malware active -- ~24 s on a fast local box, and measured
+    // exceeding 300 s on a CI runner (#1157) -- against ~3 s for the same operation
+    // on Linux.
+    //
+    // A machine the node surveyed itself routinely holds four or five, so
+    // sequentially that is a node sitting silent for MINUTES at first boot before it
+    // reaches its scheduler, on exactly the start where an operator is watching.
+    // Warm starts read the cache and are instant, so this buys nothing on any boot
+    // after the first; it is the first one that decides whether the feature looks
+    // like it works.
     auto fingerprints = FingerprintAll(stop, entries, runner, host, clock, logger, voice);
 
     // Asked after the walk rather than instead of it: the check inside skips the work
