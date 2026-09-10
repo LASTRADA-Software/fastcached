@@ -63,11 +63,13 @@ namespace Detail
     [[nodiscard]] constexpr bool StatesOneClaim(CacheRefusalPolicy const& policy) noexcept
     {
         // Delegated rather than restated. The rule belongs to a refusal ROW and not to
-        // this surface, so it lives beside the enumerator with the wire codes and the
-        // shared rationale. Three surfaces spelling one truth table separately is how
-        // it briefly came to exist in two idioms, one of them the double-negated form
-        // -- and a grep for the name reached only one of the three.
-        return StatesOneRefusalClaim(policy.counter.has_value(), policy.rationale);
+        // this surface, so it lives beside the three spellings it is about, in
+        // `Protocol/SurfaceRefusal.hpp` (#640) -- any surface that refuses owes it, and
+        // it sat in the node's endpoint header only because `Protocol/` was outside
+        // #523's grant. Three surfaces spelling one truth table separately is how it
+        // briefly came to exist in two idioms, one of them the double-negated form --
+        // and a grep for the name reached only one of the three.
+        return Cc::StatesOneRefusalClaim(policy.counter.has_value(), policy.rationale);
     }
 
     /// Answer a cache-surface refusal the way its row decided.
@@ -141,8 +143,11 @@ namespace Detail
     // And that each row asserts exactly one thing. A row with neither is the vacuous
     // pass above; a row with both is an author who could not choose, answered here
     // rather than at whichever call site read the fields in the luckier order.
-    static_assert(std::ranges::all_of(CacheEndpointRefusals,
-                                      [](CacheEndpointRefusal const& row) { return StatesOneClaim(row.policy); }),
+    static_assert(Cc::RowsStateOneRefusalClaim(CacheEndpointRefusals,
+                                               [](CacheEndpointRefusal const& row) {
+                                                   return Cc::RefusalClaim { row.policy.counter.has_value(),
+                                                                             row.policy.rationale };
+                                               }),
                   "every cache endpoint refusal must state either a counter or a rationale, and not both");
 
     /// What the CACHE surface does about each pre-payload decision (#491).
@@ -273,10 +278,10 @@ namespace Detail
     // reason: a row asserting neither is the vacuous pass, and one asserting both is
     // an author who could not choose, answered here rather than at whichever call
     // site read the fields in the luckier order.
-    static_assert(std::ranges::all_of(SchedulerEndpointRefusals,
-                                      [](SchedulerEndpointRefusal const& row) {
-                                          return StatesOneRefusalClaim(row.answer.has_value(), row.rationale);
-                                      }),
+    static_assert(Cc::RowsStateOneRefusalClaim(SchedulerEndpointRefusals,
+                                               [](SchedulerEndpointRefusal const& row) {
+                                                   return Cc::RefusalClaim { row.answer.has_value(), row.rationale };
+                                               }),
                   "every scheduler endpoint refusal must state either a counted answer or a rationale, not both");
 
     // Positional rows alone would not have caught this: appending an enumerator leaves
