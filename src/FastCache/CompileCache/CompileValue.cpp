@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/ByteCursor.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
-#include <array>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -39,25 +38,6 @@ namespace
                 return true;
         }
         return false;
-    }
-
-    /// Append a big-endian u32 to `out`.
-    /// @param out Destination byte vector.
-    /// @param n   Value to append.
-    void AppendU32(std::vector<std::byte>& out, std::uint32_t n)
-    {
-        std::array<std::byte, sizeof(std::uint32_t)> buf {};
-        WriteBigEndian<std::uint32_t>(buf, n);
-        out.insert(out.end(), buf.begin(), buf.end());
-    }
-
-    /// Append raw bytes of a string to `out`.
-    /// @param out Destination byte vector.
-    /// @param s   Source string.
-    void AppendBytes(std::vector<std::byte>& out, std::string_view s)
-    {
-        auto const* p = reinterpret_cast<std::byte const*>(s.data());
-        out.insert(out.end(), p, p + s.size());
     }
 
     /// One typed refusal from this decoder.
@@ -109,20 +89,17 @@ std::string ForeignGenerationMessage(std::uint8_t generation)
 
 std::vector<std::byte> EncodeCompileValue(CompileValue const& value)
 {
-    std::vector<std::byte> out;
-    out.push_back(static_cast<std::byte>(CompileValueVersion));
-
-    AppendU32(out, static_cast<std::uint32_t>(value.objectBlob.size()));
-    out.insert(out.end(), value.objectBlob.begin(), value.objectBlob.end());
-
-    AppendU32(out, static_cast<std::uint32_t>(value.textRegions.size()));
+    std::vector<std::byte> blob;
+    ByteAppender out { blob };
+    out.AppendByte(static_cast<std::byte>(CompileValueVersion));
+    out.AppendField(value.objectBlob);
+    out.AppendCount(value.textRegions.size());
     for (auto const& region: value.textRegions)
     {
-        out.push_back(static_cast<std::byte>(region.grammar));
-        AppendU32(out, static_cast<std::uint32_t>(region.bytes.size()));
-        AppendBytes(out, region.bytes);
+        out.AppendByte(static_cast<std::byte>(region.grammar));
+        out.AppendField(region.bytes);
     }
-    return out;
+    return blob;
 }
 
 namespace

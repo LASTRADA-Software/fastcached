@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/ByteCursor.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
-#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -154,35 +153,16 @@ struct Stream
 
 namespace detail
 {
-    /// Append a host-order u32 as big-endian to `out`.
-    inline void AppendU32(std::vector<std::byte>& out, std::uint32_t v)
-    {
-        std::array<std::byte, 4> bytes {};
-        WriteBigEndian(std::span<std::byte> { bytes }, v);
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
+    /// The appender this codec's encoder writes through.
+    using Appender = ByteAppender<std::vector<std::byte>>;
 
-    /// Append a host-order u64 as big-endian to `out`.
-    inline void AppendU64(std::vector<std::byte>& out, std::uint64_t v)
+    /// Append a stream ID: two big-endian `u64`s, as `ReadId` reads them.
+    /// @param out The appender to write through.
+    /// @param id The id to write.
+    inline void AppendId(Appender& out, StreamId id)
     {
-        std::array<std::byte, 8> bytes {};
-        WriteBigEndian(std::span<std::byte> { bytes }, v);
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
-
-    /// Append a length-prefixed (u32) byte string to `out`.
-    inline void AppendString(std::vector<std::byte>& out, std::string_view s)
-    {
-        AppendU32(out, static_cast<std::uint32_t>(s.size()));
-        auto const* const p = reinterpret_cast<std::byte const*>(s.data());
-        out.insert(out.end(), p, p + s.size());
-    }
-
-    /// Append a stream ID (two big-endian u64s) to `out`.
-    inline void AppendId(std::vector<std::byte>& out, StreamId id)
-    {
-        AppendU64(out, id.ms);
-        AppendU64(out, id.seq);
+        out.AppendU64(id.ms);
+        out.AppendU64(id.seq);
     }
 
     /// Read a stream id: two big-endian `u64`s, as `AppendId` writes them.
@@ -242,42 +222,43 @@ namespace detail
 /// @return The encoded blob.
 [[nodiscard]] inline std::vector<std::byte> Encode(Stream const& stream)
 {
-    std::vector<std::byte> out;
-    out.push_back(Magic);
-    out.push_back(TypeStream);
+    std::vector<std::byte> blob;
+    detail::Appender out { blob };
+    out.AppendByte(Magic);
+    out.AppendByte(TypeStream);
     detail::AppendId(out, stream.lastId);
     detail::AppendId(out, stream.maxDeletedId);
-    detail::AppendU64(out, stream.entriesAdded);
-    detail::AppendU32(out, static_cast<std::uint32_t>(stream.entries.size()));
+    out.AppendU64(stream.entriesAdded);
+    out.AppendCount(stream.entries.size());
     for (auto const& entry: stream.entries)
     {
         detail::AppendId(out, entry.id);
-        detail::AppendU32(out, static_cast<std::uint32_t>(entry.fields.size()));
+        out.AppendCount(entry.fields.size());
         for (auto const& [name, value]: entry.fields)
         {
-            detail::AppendString(out, name);
-            detail::AppendString(out, value);
+            out.AppendField(name);
+            out.AppendField(value);
         }
     }
-    detail::AppendU32(out, static_cast<std::uint32_t>(stream.groups.size()));
+    out.AppendCount(stream.groups.size());
     for (auto const& group: stream.groups)
     {
-        detail::AppendString(out, group.name);
+        out.AppendField(group.name);
         detail::AppendId(out, group.lastDelivered);
-        detail::AppendU64(out, group.entriesRead);
-        detail::AppendU32(out, static_cast<std::uint32_t>(group.consumers.size()));
+        out.AppendU64(group.entriesRead);
+        out.AppendCount(group.consumers.size());
         for (auto const& consumer: group.consumers)
-            detail::AppendString(out, consumer);
-        detail::AppendU32(out, static_cast<std::uint32_t>(group.pel.size()));
+            out.AppendField(consumer);
+        out.AppendCount(group.pel.size());
         for (auto const& pending: group.pel)
         {
             detail::AppendId(out, pending.id);
-            detail::AppendU64(out, pending.deliveryTimeMs);
-            detail::AppendU64(out, pending.deliveryCount);
-            detail::AppendString(out, pending.consumer);
+            out.AppendU64(pending.deliveryTimeMs);
+            out.AppendU64(pending.deliveryCount);
+            out.AppendField(pending.consumer);
         }
     }
-    return out;
+    return blob;
 }
 
 /// Decode a stream value blob.

@@ -12,7 +12,37 @@
 #include <string>
 #include <vector>
 
+#include <tests/DeclaredCountBlob.hpp>
+
 using namespace FastCache;
+
+TEST_CASE("The manifest value carries the layout DecodeKeyList reads, byte for byte")
+{
+    // **The assertion that distinguishes.** Every other case here writes with `AddKey`
+    // and reads with `Keys`, which agrees with whatever layout and byte order the two
+    // halves share -- so it passes under the hand-rolled `appendU32` this encoder used
+    // to carry and under `ByteAppender` alike (#305). `EncodeKeyList` has no external
+    // caller, so its output is read back off the storage it was written to and compared
+    // with bytes spelled field by field through a builder sharing no code with it.
+    InMemoryLruStorage storage { 0 };
+    PrefetchGroupManifest manifest { storage };
+    ManualClock clock;
+    auto const now = clock.Now();
+
+    REQUIRE(manifest.AddKey("envA", "one", now).has_value());
+    REQUIRE(manifest.AddKey("envA", "two", now).has_value());
+
+    // The manifest's own storage key, spelled the way the neighbouring cases spell it:
+    // a 0x01 control byte that keeps it out of the user keyspace, then `cohort:`.
+    std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envA";
+    auto const stored = storage.Peek(manifestKey, now);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->found);
+    auto const bytes = stored->entry.ValueBytes();
+
+    auto const expected = Testing::DeclaredCountBlob {}.U32(2).Field("one").Field("two").Vector();
+    CHECK(std::vector<std::byte>(bytes.begin(), bytes.end()) == expected);
+}
 
 TEST_CASE("PrefetchGroupManifest accumulates keys per prefetch group id")
 {

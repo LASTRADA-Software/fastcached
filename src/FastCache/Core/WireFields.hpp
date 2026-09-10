@@ -162,6 +162,32 @@ void PutBigEndian(std::span<std::byte> out, std::size_t offset, T value) noexcep
     WriteBigEndian<T>(out.subspan(offset, sizeof(T)), value);
 }
 
+/// The length prefix a field of @p size bytes declares, refusing a size it cannot
+/// describe.
+///
+/// **The one place the field ceiling is enforced and the one place its refusal is
+/// worded.** `RequireEncodable` walks a whole field list through it, and
+/// `ByteAppender::AppendField` writes one field through it -- so an encoder that packs
+/// its fields at once and an encoder that appends them one at a time refuse the same
+/// input with the same sentence, rather than the second silently truncating.
+///
+/// Truncating is what a `static_cast<std::uint32_t>(size)` does, and it was the
+/// spelling at every hand-rolled append site this replaced (#305): the field would
+/// carry a declared length disagreeing with its contents, which is precisely the
+/// desynchronisation a declared length exists to prevent. It is unreachable at the
+/// sizes this tree encodes today, and that is an argument for making it unreachable by
+/// construction rather than for leaving the cast in place for the next caller to inherit.
+///
+/// @param size The field's byte count.
+/// @return The same number as the `u32` its length prefix carries.
+/// @throws std::length_error When the field exceeds the u32 ceiling.
+[[nodiscard]] inline std::uint32_t RequireFieldLength(std::size_t size)
+{
+    if (std::uint64_t { size } > MaxPayload)
+        throw std::length_error("wire field exceeds the u32 field length");
+    return static_cast<std::uint32_t>(size);
+}
+
 /// A field list, which is what every function below takes.
 using FieldList = std::span<std::span<std::byte const> const>;
 
@@ -204,11 +230,7 @@ using FieldList = std::span<std::span<std::byte const> const>;
 {
     auto total = std::uint64_t { 0 };
     for (auto const& field: fields)
-    {
-        if (std::uint64_t { field.size() } > MaxPayload)
-            throw std::length_error("wire field exceeds the u32 field length");
-        total += FieldPrefixSize + std::uint64_t { field.size() };
-    }
+        total += FieldPrefixSize + std::uint64_t { RequireFieldLength(field.size()) };
 
     if (total > MaxPayload)
         throw std::length_error("wire payload exceeds the u32 field length");

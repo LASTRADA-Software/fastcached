@@ -2,6 +2,7 @@
 #include "DirectManifest.hpp"
 #include "KeyDigest.hpp"
 
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/ByteCursor.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
@@ -68,22 +69,6 @@ namespace
             return lowered == '/' ? '\\' : lowered;
         });
         return out;
-    }
-
-    void AppendU32(std::string& out, std::uint32_t value)
-    {
-        // Big-endian, matching the compile-cache framing so both codecs read the
-        // same way on every host.
-        out.push_back(static_cast<char>((value >> 24) & 0xFFU));
-        out.push_back(static_cast<char>((value >> 16) & 0xFFU));
-        out.push_back(static_cast<char>((value >> 8) & 0xFFU));
-        out.push_back(static_cast<char>(value & 0xFFU));
-    }
-
-    void AppendField(std::string& out, std::string_view field)
-    {
-        AppendU32(out, static_cast<std::uint32_t>(field.size()));
-        out.append(field);
     }
 
     /// What a resolved dependency path is to a manifest.
@@ -168,17 +153,18 @@ namespace
 
 std::string EncodeManifest(DirectManifest const& manifest)
 {
-    std::string out;
-    out.push_back(static_cast<char>(ManifestVersion));
-    AppendField(out, manifest.toolchainStamp);
-    AppendField(out, manifest.objectKey);
-    AppendU32(out, static_cast<std::uint32_t>(manifest.entries.size()));
+    std::string text;
+    ByteAppender out { text };
+    out.AppendByte(static_cast<std::byte>(ManifestVersion));
+    out.AppendField(manifest.toolchainStamp);
+    out.AppendField(manifest.objectKey);
+    out.AppendCount(manifest.entries.size());
     for (auto const& entry: manifest.entries)
     {
-        AppendField(out, entry.canonicalPath);
-        AppendField(out, entry.contentHash);
+        out.AppendField(entry.canonicalPath);
+        out.AppendField(entry.contentHash);
     }
-    return out;
+    return text;
 }
 
 std::expected<DirectManifest, DirectError> DecodeManifest(std::string_view bytes)
