@@ -4421,6 +4421,43 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# fastcache-cli-e2e: the client against a real daemon.
+#
+# Registered HERE and not beside the app because it names two targets, and
+# `src/apps` walks its table in order: a `$<TARGET_FILE:>` guard on a target
+# configured later does not fail, it silently skips the test forever.
+#
+# What this reaches that `fastcache-cli-tests` cannot is the exit codes against a
+# live server. The unit tests drive every handler over a scripted exchange and can
+# prove the mapping from an outcome to a code; only a real daemon proves that a
+# miss, a refused credential and a closed port arrive as three different outcomes
+# in the first place. That discrimination is the whole reason the outcome table has
+# six rows, and it is the property an operator's script depends on.
+#
+# NOT marked POSIX-only, unlike its neighbours above, and that is a measurement
+# rather than an assumption: it was run to completion on Windows through Git Bash
+# before this registration was written. It uses `mktemp`, `/dev/tcp` through
+# `wait_for_port`, and the shared helpers -- all of which Git Bash supplies.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-cli)
+    message(STATUS "fastcache-cli-e2e: daemon or client not built — skipping")
+else()
+    add_test(
+        NAME "fastcache-cli-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fastcache-cli-e2e.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --cli "$<TARGET_FILE:fastcache-cli>"
+    )
+    # Starts real daemons on drawn ports, so it must not race the other
+    # server-starting smoke tests.
+    set_tests_properties("fastcache-cli-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # fetch-transfer-bound: the dependency-fetch bound is watched refusing a stall.
 #
 # A dependency `git clone` that stops delivering never ends, because nothing
