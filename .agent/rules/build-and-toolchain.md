@@ -4228,6 +4228,60 @@ sufficient" rule above wearing a different hat: that one is about a guard that w
 never sufficient, this one is about a guard that WAS sufficient and stopped being,
 without anybody touching it. A green suite distinguishes neither.
 
+## A configure's OUTPUT is the module's claim; the generated buildsystem is the artefact
+
+`check-compile-cache-caveat.cmake` asserted entirely on what a configure PRINTED --
+every row comparing against `${configureOutput}${configureError}`. So it proved what
+`CompileCache.cmake` **says** and never what it **wired**, and a row could print
+`-- [cache] Enabling sccache ...` with the full caveat, at the right severity, while
+the generated build carried no compiler launcher at all, and every assertion passed
+(#187).
+
+The cache cannot answer this. The module sets `CMAKE_C_COMPILER_LAUNCHER` and its CXX
+sibling as NORMAL variables, never cache entries, so `CMakeCache.txt` is silent --
+measured across eleven build trees on one workstation, unset in every one, five of
+them demonstrably running sccache on every compile. What carries the decision is the
+generated buildsystem: Ninja emits a per-rule `LAUNCHER = <path>`, and the Makefile
+generators put the program at the head of the compile command in `build.make`.
+
+Three things the fix needed that the ticket did not name:
+
+- **The fixture had no target**, so it generated no compile edge and there was
+  nothing to read. A project that only calls `project()` and includes the module
+  proves the module's prose and can prove nothing else. It has an OBJECT library
+  now, defined after the include so the launcher variable is in scope, and still
+  never built.
+- **The two stand-in launchers had to DIFFER.** Both were `${CMAKE_COMMAND}`, which
+  makes the assertion a presence check: it can say a launcher was wired and not
+  which, so `sccache-not-preferred` -- whose entire claim is that ccache won over
+  sccache -- would still rest on a status line. They are `${CMAKE_COMMAND}` and
+  `${CMAKE_CTEST_COMMAND}` now, two real programs a CMake script can always name.
+- **A generator whose buildsystem the reader cannot parse is a THIRD state**,
+  reported by name rather than folded into *no launcher was wired* -- and if the
+  generator IS one the reader claims to handle and it read NOTHING, that is a
+  violation, because every row's wiring assertion is then vacuous. The rule that
+  guards a check against reporting clean has to guard this check too.
+
+Proved by breaking it, not by assuming: with the module's two `set(...LAUNCHER)`
+lines replaced by a comment -- so it prints `-- [cache] Enabling sccache
+(/usr/bin/cmake) for C/C++ compilation` and the caveat, and wires nothing -- the
+check refuses with exactly three violations, the three rows that expect a launcher,
+and none of the three that expect none.
+
+**And the decision a guard makes is what gets tested, not the acquisition around
+it.** `tidy-sweep.sh`'s canary -- the thing that stops a whole branch being reported
+clean by an analyser that never ran -- needed clang-tidy, a compile database and a
+real translation unit, so it could only be exercised on a machine already running a
+full sweep, which is the population it is not for. `CanaryVerdict` is now a pure
+function over `(exit status, output)` driven by `--self-test`, which is already a
+registered ctest on every platform (#257). Its two failing arms are NOT one: an exit
+at or above 126 is the shell saying the program never started, with no output, while
+the pattern arm is a binary that DID start and analysed nothing, exiting normally.
+And `ok` for every other non-zero exit is deliberate -- clang-tidy exits non-zero
+when it has FINDINGS, so a canary refusing that would refuse every branch with
+something to fix. Neutered to `echo ok`, exactly the five refusing cases fail and the
+two accepting ones stay green.
+
 ## A branch behind master is unverified, and only a build says otherwise
 
 A pull request's CI ran against the master it was branched from. Every green check

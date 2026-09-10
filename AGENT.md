@@ -1868,6 +1868,28 @@ what differs between compilers, standard libraries, hosts and tool versions.
   whose only negative case is a closed issue passes under all three. Grammar in the
   default set, resolution in `smoke`; only a PREREQUISITE missing before any entry
   resolved may skip.
+- **A configure's OUTPUT is the module's CLAIM; the generated buildsystem is the
+  artefact.** `check-compile-cache-caveat` asserted only on what `CompileCache.cmake`
+  printed, so a module printing `-- [cache] Enabling sccache …` with the full caveat at
+  the right severity while wiring NO launcher passed every row (#187). The cache cannot
+  answer it — the launcher is a NORMAL variable, unset in `CMakeCache.txt` across all
+  eleven trees measured, five of them demonstrably running sccache — so read Ninja's
+  per-rule `LAUNCHER =` or the Makefile compile line. Three things the ticket did not
+  name: the fixture had **no target**, so there was no compile edge to read; the two
+  stand-in launchers were **one program**, which makes the assertion presence rather
+  than identity and leaves *ccache won over sccache* resting on a status line (they are
+  `${CMAKE_COMMAND}` and `${CMAKE_CTEST_COMMAND}` now); and a generator the reader
+  cannot parse is a THIRD state, named — while a generator it CLAIMS to handle reading
+  nothing is a violation, since every row's assertion is then vacuous. Broken on
+  purpose: the check refuses with exactly the three rows expecting a launcher.
+  Its sibling is #257 — **the DECISION a guard makes is what gets tested, not the
+  acquisition around it**: `tidy-sweep.sh`'s canary needed clang-tidy, a database and a
+  real TU, so it was reachable only where a full sweep was already running, which is the
+  population it is not for. `CanaryVerdict` is pure now and `--self-test` (already a
+  ctest on every platform) drives it. Its two failing arms are NOT one — ≥126 is the
+  shell saying the program never started, with no output; the pattern arm is a binary
+  that started and analysed nothing, exiting normally — and every OTHER non-zero exit is
+  `ok`, because clang-tidy exits non-zero when it has FINDINGS.
 - A branch BEHIND master is unverified, and only a build says otherwise: its green
   checks are a true statement about the tree it was branched from, and stay one however
   often they are re-read. Neither shortcut works. **How far behind is not a measure of
