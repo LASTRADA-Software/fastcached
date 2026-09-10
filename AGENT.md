@@ -1556,6 +1556,21 @@ what differs between compilers, standard libraries, hosts and tool versions.
   that gets believed, because refuting looks like rigour). And measure an idiom at REAL
   size: `producer | grep -q` under `pipefail` is size-dependent — wrong 20 of 20 at
   101 KB, right 20 of 20 at 1.1 KB — so a small fixture reports it working.
+- **A count that OVERSTATES what is wrong is the same defect as one that understates it**,
+  and the tell is an arm reporting a number nobody can explain — which is the only
+  actionable half, since all three instances were caught that way and none by reading the
+  code. The directions are not symmetric: an under-report is silent and found late, while
+  an over-report is **loud and misattributed**, sending somebody to a defect that is not
+  there and discrediting the instrument when they find nothing. A literal `;` in a CMake
+  list element made one violation count as **2**; an edit landing a `string(REPLACE ...)`
+  *between* `list(APPEND violations` and its argument made the run report **10**; a missing
+  file gave three findings for one cause because the loop still ran after the guard. And a
+  `macro()` substitutes its arguments TEXTUALLY, so CMake re-parses them and a backslash is
+  eaten twice — `"\\("` at the call site reaches `MATCHES` as a bare `(` and fails at
+  regex-COMPILE time, which reads as *my pattern is wrong* rather than *my macro ate a
+  backslash*; the same textual substitution makes `if(param ...)` inside a macro compare
+  the literal string `param`, silently dead
+  ([#1216](https://github.com/LASTRADA-Software/fastcached/issues/1216)).
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
   reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
   process is attributed by its ancestor chain and never by a cmdline match or a leaf `cwd`,
