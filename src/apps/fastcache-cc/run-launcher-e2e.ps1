@@ -38,12 +38,47 @@
 #
 # Output is generic status only; nothing project-private is read or emitted,
 # nothing is committed.
+#
+# ## The port (#220)
+#
+# DRAWN per run, from 20000..32000, like every sibling fixture. It used to be the
+# constant 21714, and nothing reaped the daemon when a run did not reach its
+# cleanup -- so a ctest interrupted, timed out or cancelled left `fastcached.exe`
+# listening for as long as the machine was up, and every later run failed at
+# `fastcached exited immediately (exit 1)`, naming neither the port nor the
+# process.
+#
+# The reason offered for the constant was real and did not support it: the launcher
+# under test reads `FASTCACHE_ADDR` from the environment and several child
+# processes inherit it, so the port must be decided BEFORE the daemon starts. That
+# is an argument for deciding it early, which drawing does.
+#
+# Its three siblings were checked rather than assumed: `scripts/compile-cache-e2e.sh`
+# (the POSIX half of this same test) and `scripts/dist-compile-e2e.sh` both call
+# `free_port`. `scripts/sccache-smoke.{sh,ps1}` and `FASTCACHED_SMOKE_PORT` in
+# `src/tests/CMakeLists.txt` still fix 11611, which is issue #183 and is not
+# touched here.
+#
+# An explicitly passed `-Port` is honoured and PROBED first, and a holder is
+# refused by name rather than adopted -- a leftover listener is of an unknown
+# vintage and may hold a store from a different build, which is the class of
+# confusion this fixture exists to detect rather than reproduce. The one exception
+# is a listener whose image path is byte-for-byte the daemon this run would start:
+# that is reaped, which is not adoption but the manual `Stop-Process` somebody
+# already does.
 
 [CmdletBinding()]
 param(
     [string]$Fastcached  = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Launcher    = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcache-cc.exe",
-    [int]$Port           = 21714,
+    # 0 means DRAW one, which is what this fixture should always have done and what
+    # every sibling already does. A constant made a run that did not reach its
+    # cleanup break every later run with `fastcached exited immediately (exit 1)`,
+    # naming neither the port nor the process -- diagnosed once by hand from
+    # `Get-NetTCPConnection -LocalPort 21714`, after it survived a rebase and read
+    # as a regression the rebase had caused (#220). A value passed explicitly is
+    # honoured and is then PROBED first, since the caller chose the collision risk.
+    [int]$Port           = 0,
     # Left empty on purpose: these default to a directory beside the build tree,
     # computed once the launcher path is resolved. See the note there for why not
     # %TEMP%. Passing one explicitly still works and is honoured verbatim.
@@ -51,7 +86,12 @@ param(
     [string]$ShallowTemp,
     [string]$MoveTemp,
     [string]$EditTemp,
-    [string]$AliasTemp
+    [string]$AliasTemp,
+    # Drive the port helpers above against real listeners and exit. Needs no
+    # daemon, no launcher and no compiler -- which is the point: the decision is
+    # what can be wrong, and it was previously reachable only by running a fixture
+    # that needs an MSVC toolchain.
+    [switch]$SelfTestPorts
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,8 +102,14 @@ $exit = 0
 $SKIP = 77
 $ranAnyCompiler = $false
 
-if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
-if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
+# `-SelfTestPorts` needs neither binary -- it drives the port helpers and nothing
+# else -- so these skips must not fire ahead of it. Without the guard the self-test
+# would report SKIPPED on every machine that has not built the tree, which is a
+# check that does not run and does not say so.
+if (-not $SelfTestPorts) {
+    if (-not (Test-Path $Fastcached)) { Write-Host "fastcached not found: $Fastcached; skipping"; exit $SKIP }
+    if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launcher; skipping"; exit $SKIP }
+}
 
 # Scratch trees live beside the build tree, not under %TEMP%.
 #
@@ -94,8 +140,14 @@ if (-not (Test-Path $Launcher))   { Write-Host "fastcache-cc not found: $Launche
 # Start-Process resolves a relative -FilePath against the PROCESS working
 # directory, not PowerShell's, so a caller passing "out/build/..." would get a
 # spurious "file not found". Resolve both up front.
-$Fastcached = (Resolve-Path $Fastcached).Path
-$Launcher   = (Resolve-Path $Launcher).Path
+# Guarded for the same reason the skips above are: `-SelfTestPorts` drives the
+# port helpers and touches neither binary, and `Resolve-Path` is a hard error for
+# a path that does not exist. Everything below this is pure string work, so it is
+# left alone.
+if (-not $SelfTestPorts) {
+    $Fastcached = (Resolve-Path $Fastcached).Path
+    $Launcher   = (Resolve-Path $Launcher).Path
+}
 
 # AFTER the resolution above, and that ordering is the whole point: both callers
 # pass a RELATIVE launcher path, and a relative root is the same defect as a short
@@ -120,6 +172,198 @@ foreach ($name in 'DeepTemp', 'ShallowTemp', 'MoveTemp', 'EditTemp', 'AliasTemp'
     if (-not [System.IO.Path]::IsPathRooted($value)) {
         Set-Variable -Name $name -Value (Join-Path (Get-Location).Path $value)
     }
+}
+
+# A port this machine is not using, drawn per run.
+#
+# 20000..32000 for the reason `free_port` in `scripts/lib/e2e-common.sh` gives in
+# full: deliberately BELOW the kernel's ephemeral range, because a connect probe
+# cannot see a port already held as an OUTBOUND connection's local endpoint. The
+# same argument holds on Windows, whose dynamic range starts at 49152.
+#
+# The probe is a LISTENER bind rather than a connect: binding is what the daemon
+# is about to do, so it answers the question actually being asked, and it also
+# catches a port held in TIME_WAIT that nothing is listening on.
+#
+# Issued ports are remembered for the life of the run, because two draws a moment
+# apart can both find the same port free -- the first holder has not bound it yet.
+$script:IssuedPorts = @()
+function New-E2EPort {
+    for ($attempt = 0; $attempt -lt 200; $attempt++) {
+        $candidate = Get-Random -Minimum 20000 -Maximum 32000
+        if ($script:IssuedPorts -contains $candidate) { continue }
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $candidate)
+            $listener.Start()
+        } catch {
+            continue
+        } finally {
+            if ($null -ne $listener) { $listener.Stop() }
+        }
+        $script:IssuedPorts += $candidate
+        return $candidate
+    }
+    throw "could not find a free port in 20000..32000 after 200 attempts"
+}
+
+# What is holding a port, as a RECORD, so the decision below is a pure function
+# over it and can be driven without a listener.
+#
+# `$null` when nothing holds it. Every lookup is best-effort: `Get-NetTCPConnection`
+# is absent on some hosts and `Get-Process` fails for a process owned by another
+# user, and neither of those means the port is free -- so a failure to NAME the
+# holder still reports a holder, with what it could learn.
+function Get-E2EPortHolder([int]$port) {
+    $owner = $null
+    try {
+        $owner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop |
+                 Select-Object -First 1 -ExpandProperty OwningProcess
+    } catch {
+        # No cmdlet, or nothing listening. Fall through to the bind probe, which
+        # is the authority and needs no elevation.
+    }
+    if ($null -eq $owner) {
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+            $listener.Start()
+            return $null
+        } catch {
+            return @{ ProcessId = 0; Name = "(unknown)"; Path = "" }
+        } finally {
+            if ($null -ne $listener) { $listener.Stop() }
+        }
+    }
+    $name = "(unknown)"
+    $path = ""
+    try {
+        $proc = Get-Process -Id $owner -ErrorAction Stop
+        $name = $proc.ProcessName
+        if ($proc.Path) { $path = $proc.Path }
+    } catch {
+    }
+    return @{ ProcessId = [int]$owner; Name = $name; Path = $path }
+}
+
+# The DECISION, pure over the record above. THREE outcomes, never two.
+#
+# `reap` is for a leftover of THIS build -- a run that did not reach its cleanup --
+# and it is a reap rather than an adoption, which is the distinction #220 asks to
+# have made: adopting a stale listener is tempting and wrong, because it is of an
+# unknown vintage and may hold a store from a different build, which is the class
+# of confusion this fixture exists to DETECT rather than reproduce. Killing one
+# whose image path is byte-for-byte the daemon we are about to start is not
+# adoption; it is the manual `Stop-Process` somebody already does.
+#
+# Anything else is `refuse`, by name. A port some other program holds is not this
+# fixture's to take.
+#
+# @param holder The record from Get-E2EPortHolder, or $null.
+# @param expectedPath The daemon this run would start.
+# @return 'free', 'reap' or 'refuse'.
+function Resolve-E2EPortHolder($holder, [string]$expectedPath) {
+    if ($null -eq $holder) { return 'free' }
+    if ($holder.Path -and $expectedPath -and
+        ([string]::Equals($holder.Path, $expectedPath, [StringComparison]::OrdinalIgnoreCase))) {
+        return 'reap'
+    }
+    return 'refuse'
+}
+
+# The pre-flight. Only reached for an explicitly passed -Port, since a drawn one
+# was proved free a moment ago.
+function Assert-E2EPortAvailable([int]$port, [string]$expectedPath) {
+    $holder = Get-E2EPortHolder $port
+    switch (Resolve-E2EPortHolder $holder $expectedPath) {
+        'free' { return }
+        'reap' {
+            Write-Host ("port ${port} is held by a leftover {0} (pid {1}) from this build; reaping it" -f `
+                        $holder.Name, $holder.ProcessId)
+            Stop-Process -Id $holder.ProcessId -Force -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt 50; $i++) {
+                if ($null -eq (Get-E2EPortHolder $port)) { return }
+                Start-Sleep -Milliseconds 100
+            }
+            throw ("port ${port} is still held after reaping pid {0}" -f $holder.ProcessId)
+        }
+        'refuse' {
+            throw ("port ${port} is already held by {0} (pid {1}, {2}); this fixture will not take a port " +
+                   "another program is using, and will not adopt a listener of unknown vintage" -f `
+                   $holder.Name, $holder.ProcessId, $(if ($holder.Path) { $holder.Path } else { "path unknown" }))
+        }
+    }
+}
+
+if ($SelfTestPorts) {
+    $cases = 0
+    $bad = 0
+    function Expect([string]$what, $want, $got) {
+        $script:cases++
+        if ("$want" -eq "$got") {
+            Write-Host "  ok   $what"
+        } else {
+            Write-Host "  FAIL ${what}: want [$want] got [$got]"
+            $script:bad++
+        }
+    }
+
+    Write-Host "run-launcher-e2e port self-test"
+
+    # The DECISION, every arm, over staged records -- no listener needed. The
+    # ACCEPTING arm first and deliberately: a `Resolve-E2EPortHolder` that answered
+    # `refuse` unconditionally would satisfy every refusing case below while
+    # refusing every honest run.
+    Expect "nothing listening is free" "free" (Resolve-E2EPortHolder $null "C:\build\fastcached.exe")
+    Expect "our own daemon is reaped, not adopted" "reap" `
+        (Resolve-E2EPortHolder @{ ProcessId = 1; Name = "fastcached"; Path = "C:\build\fastcached.exe" } `
+                               "C:\build\fastcached.exe")
+    Expect "and case-insensitively, because Windows paths are" "reap" `
+        (Resolve-E2EPortHolder @{ ProcessId = 1; Name = "fastcached"; Path = "C:\Build\FastCached.EXE" } `
+                               "c:\build\fastcached.exe")
+    Expect "another build of the same daemon is REFUSED, not adopted" "refuse" `
+        (Resolve-E2EPortHolder @{ ProcessId = 2; Name = "fastcached"; Path = "D:\other\fastcached.exe" } `
+                               "C:\build\fastcached.exe")
+    Expect "somebody else entirely is refused" "refuse" `
+        (Resolve-E2EPortHolder @{ ProcessId = 3; Name = "sqlservr"; Path = "C:\sql\sqlservr.exe" } `
+                               "C:\build\fastcached.exe")
+    # A holder whose path could not be read is REFUSED. It is the direction that
+    # matters: an unreadable path reaching `reap` would kill a process this fixture
+    # knows nothing about.
+    Expect "a holder we cannot name is refused, never reaped" "refuse" `
+        (Resolve-E2EPortHolder @{ ProcessId = 0; Name = "(unknown)"; Path = "" } "C:\build\fastcached.exe")
+
+    # And the ACQUISITION, against real sockets on this machine.
+    $drawn = @(1..5 | ForEach-Object { New-E2EPort })
+    Expect "five draws are five distinct ports" 5 (($drawn | Select-Object -Unique).Count)
+    $inRange = @($drawn | Where-Object { $_ -ge 20000 -and $_ -lt 32000 }).Count
+    Expect "every draw is below the ephemeral range" 5 $inRange
+
+    # A real listener, so the probe is measured rather than argued. `Get-E2EPortHolder`
+    # must report SOMETHING for a port that is held -- which is the half that decides
+    # whether the pre-flight can fire at all.
+    $held = New-E2EPort
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $held)
+    $listener.Start()
+    try {
+        $holder = Get-E2EPortHolder $held
+        Expect "a held port reports a holder" $true ($null -ne $holder)
+        Expect "and an unheld one reports none" $true ($null -eq (Get-E2EPortHolder (New-E2EPort)))
+        # The whole point, end to end: a taken port refuses by name rather than
+        # letting the daemon start and fail with a sentence naming neither.
+        $refused = $false
+        try { Assert-E2EPortAvailable $held "C:\nothing\fastcached.exe" } catch { $refused = $true }
+        Expect "an occupied port is refused before the daemon starts" $true $refused
+    } finally {
+        $listener.Stop()
+    }
+
+    if ($bad -ne 0) {
+        Write-Host "run-launcher-e2e port self-test FAILED after $cases case(s)"
+        exit 1
+    }
+    Write-Host "run-launcher-e2e port self-test passed, $cases case(s)"
+    exit 0
 }
 
 function Start-Fastcached {
@@ -292,6 +536,22 @@ function Invoke-LauncherBounded([string]$compiler, [string]$srcRoot, [string]$bu
     $err = Get-Content -Raw $errFile -ErrorAction SilentlyContinue
     Remove-Item $errFile -ErrorAction SilentlyContinue
     return @{ code = $p.ExitCode; stderr = $err; timedOut = $false }
+}
+
+# Settled here, before the daemon starts and before anything reads
+# `FASTCACHE_ADDR`, which is the one real constraint on this fixture: the launcher
+# under test takes the address from the environment and several child processes
+# inherit it. That is a reason to decide the port EARLY, and it was mistaken for a
+# reason to make it a constant (#220).
+if ($Port -eq 0) {
+    $Port = New-E2EPort
+    Write-Host "fastcached port for this run: $Port"
+} else {
+    # The caller chose the collision risk, so the collision is checked for. This
+    # is the half that would have turned a twenty-minute diagnosis into a
+    # sentence.
+    Assert-E2EPortAvailable $Port $Fastcached
+    Write-Host "fastcached port (given): $Port"
 }
 
 $server = Start-Fastcached

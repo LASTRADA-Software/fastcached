@@ -155,6 +155,56 @@ the one remedy that cannot work.
   and improving the resolution, which is why the surrounding comments all argue
   about resolution. Resolution was never the whole defect.
 
+## A fixed port needs a reaper, and a leftover listener is refused rather than adopted
+
+`run-launcher-e2e.ps1` bound the constant `21714` and nothing reaped the daemon when
+a run did not reach its cleanup — a ctest interrupted, a test killed by a timeout, a
+build cancelled mid-suite. `fastcached.exe` then listened for as long as the machine
+was up and **every later run** failed at
+
+```
+fastcached exited immediately (exit 1)
+```
+
+which names neither the port nor the process and reads exactly like a daemon that
+cannot start. It was diagnosed by hand from `Get-NetTCPConnection -LocalPort 21714`,
+after surviving a rebase and presenting as a regression the rebase had caused (#220).
+
+**The reason offered for the constant was true and did not support it.** The launcher
+under test reads `FASTCACHE_ADDR` from the environment and several child processes
+inherit it, so the port has to be decided BEFORE the daemon starts — which is an
+argument for deciding it early, and drawing does that. The fixture draws from
+20000..32000 like every sibling now, and the four were CHECKED rather than assumed:
+`compile-cache-e2e.sh` and `dist-compile-e2e.sh` call `free_port`;
+`sccache-smoke.{sh,ps1}` and `FASTCACHED_SMOKE_PORT` still fix 11611, which is #183.
+
+Three things worth keeping:
+
+- **A probe that NAMES the holder turns a twenty-minute diagnosis into a sentence**,
+  and it is the cheapest half. It is only reached for an explicitly passed port,
+  since a drawn one was proved free a moment earlier.
+- **Refused, never adopted.** A leftover listener is of an unknown vintage and may
+  hold a store from a different build, which is the class of confusion the fixture
+  exists to DETECT rather than reproduce. The one exception is a listener whose image
+  path is byte-for-byte the daemon this run would start: that is REAPED, which is not
+  adoption but the manual `Stop-Process` somebody already does — and a holder whose
+  path could not be read is refused, because an unreadable path reaching the reap arm
+  would kill a process the fixture knows nothing about.
+- **The DECISION is what can be wrong, so it is what gets tested.** It was reachable
+  only by running the whole fixture, which needs a built daemon, a built launcher and
+  an MSVC toolchain — so on every machine and every CI leg without those it was
+  asserted by nothing. `-SelfTestPorts` drives it over staged holder records and
+  against real listeners, needs none of the three, and is registered as
+  `launcher-e2e-ports-selftest`. Where `pwsh` is absent the row is REGISTERED and
+  SKIPPED rather than dropped, because absent and skipped are two states.
+
+Shown red and only where expected: with the classifier neutered to `return 'free'`,
+exactly the six decision-dependent cases fail — the five staged records and the real
+end-to-end refusal — while the accepting case, the three acquisition cases and the
+two holder-detection cases stay green. The accepting case staying green under the
+mutation is the reason it cannot stand alone.
+
+
 ## A bounded wait must also say WHICH KIND of failure it was
 
 "Every wait is bounded" is the rule above, and it is not enough on its own. A wait
