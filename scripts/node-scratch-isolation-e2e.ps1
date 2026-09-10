@@ -73,6 +73,125 @@ function Get-FreePort {
     throw "could not allocate a free port below the ephemeral range"
 }
 
+# ---------------------------------------------------------------------------
+# The toolchain survey's two bounds, and the relation between them (#1157).
+#
+# ## Why this is not a fourth budget
+#
+# The survey wait has had three ceilings -- 90, then 300 (#354), then 600 (#428) --
+# and every one of them was outrun. #354 is closed saying a guard widened once and
+# blown through again is not a tuning problem, and it is right, because the quantity
+# these numbers are set against is not stable. Measured, one walker, MSVC `cl.exe`:
+#
+#   | where                                    | files | cost                    |
+#   |------------------------------------------|-------|-------------------------|
+#   | Windows-clangcl-release, run that filed   |  5136 | 4931 done at 600 s,     |
+#   | #1157 (windows-2025, GitHub-hosted)       |       | 8 file/s cumulative,    |
+#   |                                           |       | so ~642 s for the walk  |
+#   | the SAME leg, same day, same test order,  |  5136 | the whole fixture in    |
+#   | one commit later                          |       | 96.20 s, so >= 53 file/s|
+#   | this developer box, warm page cache,      |  6183 | 2.2 s, ~2800 file/s     |
+#   | NVMe, Defender exclusions on the tree     |       |                         |
+#
+# Same runner class, same position in the run (this fixture is the first test on
+# that leg to walk `cl.exe`'s include tree, so it always pays the cold one), an
+# order of magnitude apart. A ceiling derived from any single reading is derived
+# from one sample of that spread, which is why three of them have gone.
+#
+# ## What IS stable: the node says what it is doing
+#
+# `ToolchainHashProgress` emits a line every `DefaultInterval` while the hash runs.
+# So this wait can be bounded the way a dispatched compile is
+# (`.agent/rules/wire-and-protocol.md`): a SLIDING idle deadline against a known
+# cadence, re-armed by every line, with the ceiling left as a backstop. Silence
+# against something that would otherwise be said is evidence; a ceiling is not.
+#
+# That is what pays for the ceiling being generous. It is no longer the instrument
+# that tells a slow host from a wedged one -- the idle bound is -- so a slow but
+# genuinely progressing walk is allowed to finish, and a wedge is caught in three
+# minutes instead of ten.
+#
+# ## The two numbers
+#
+# The cadence and the idle bound are ONE pair, and the relation is the load-bearing
+# part: a bound at or below the cadence refuses healthy nodes on their own jitter.
+# `Invoke-SelfTest` asserts the relation rather than the values, so changing either
+# in isolation is a red test rather than a silent regression.
+#
+# 180 s is 18x the cadence, and it is not smaller because of the one phase inside
+# this wait that logs NOTHING: between `read the compiler banner` and
+# `hashing <n> toolchain file(s)` the node resolves the include roots (registry,
+# environment and filesystem reads -- no spawn, see `IncludeSearchRoots`) and then
+# ENUMERATES them serially. That enumeration has never been measured on a slow
+# runner, so the bound covers it with room rather than pretending to know it.
+#
+# Anything OTHER than a progress line that grows the log makes this bound more
+# lenient, never less -- it can delay a failure, never invent one -- which is the
+# safe direction for a signal this fixture reads as progress.
+$ProgressCadenceSeconds = 10   # ToolchainHashProgress::DefaultInterval
+$SurveyIdleSeconds = 180
+$SurveySeconds = 1200
+
+# How long a wait may be silent before its log-growth signal stops counting as
+# progress.
+#
+# Pure, so `Invoke-SelfTest` can pin BOTH arms and the relation between the idle
+# bound and the limit derived from it. Get that relation wrong and a wait that
+# ended ON the idle bound would still report "the log was still growing", which is
+# the exact `-or` mistake `Get-WaitVerdict`'s header records: a signal that cannot
+# be false in the failing case is not evidence.
+#
+# @param seconds the wait's ceiling
+# @param idleSeconds its idle bound, or 0 when it has none
+# @return the seconds of silence past which growth is no longer progress
+function Get-StallLimit([int]$seconds, [int]$idleSeconds) {
+    if ($idleSeconds -gt 0) {
+        # Strictly BELOW the idle bound, so a wait that ends on silence always has
+        # `StalledFor >= idleSeconds > stallLimit` however the integer seconds
+        # round. Derived from the bound rather than from the ceiling, because with
+        # a ceiling this generous a tenth of it would exceed the bound and the
+        # comparison would be vacuous.
+        #
+        # **The `Min` is the whole guarantee and it is not decoration.** The first
+        # version of this function was `Max(5, idle * 0.75)`, which holds the
+        # relation at the production pair (135 < 180) and INVERTS it at any bound
+        # below seven seconds: at `idleSeconds = 4` the floor returns 5, a wait that
+        # ended on four seconds of silence has `StalledFor = 4 < 5`, and the verdict
+        # is "the log was still growing" about a wait that gave up BECAUSE it had
+        # stopped. That is `Get-WaitVerdict`'s own recorded error arriving through
+        # the arithmetic instead of through an `-or`, and a self-test that pinned
+        # only the production pair passed over it -- it was caught by driving a real
+        # wait, which is why the relation is now asserted across a RANGE of bounds
+        # rather than at the one this fixture happens to use.
+        return [Math]::Min([Math]::Max(5, [int]($idleSeconds * 0.75)), $idleSeconds - 1)
+    }
+    # A wait with no idle bound keeps the original rule: ten percent of the
+    # ceiling, floored at five so a short wait still has a usable threshold.
+    return [Math]::Max(5, [int]($seconds * 0.1))
+}
+
+# Whether a wait should give up because its subject has gone quiet.
+#
+# The DECISION, lifted out of the loop for the reason `Get-WaitVerdict` was: the
+# loop is acquisition -- a clock, a poll and a file read -- and a self-test cannot
+# reach a decision that lives inside one. Neutering the loop's use of this is
+# invisible to any test that does not spend real seconds, and that limit is stated
+# rather than papered over; what CAN be pinned on every platform in microseconds is
+# the boundary, which is where an off-by-one would live.
+#
+# `0` is *this wait has no idle bound*, not *give up immediately* -- the ready waits
+# pass it, and reading it as a bound of zero would end every one of them on the
+# first poll. `-ge` and not `-gt`: silence that has REACHED the bound is not
+# progress, matching `Get-WaitVerdict`'s own `-lt` on the stall limit.
+#
+# @param idleSeconds the bound, or 0 for a wait that has none
+# @param stalledSeconds how long the log has not grown
+# @return $true when the wait should stop and report
+function Test-WaitHasGoneQuiet([int]$idleSeconds, [double]$stalledSeconds) {
+    if ($idleSeconds -le 0) { return $false }
+    return ($stalledSeconds -ge $idleSeconds)
+}
+
 function Get-ProcessTreeCpu([int]$rootPid, $rootStarted) {
     # The CPU of every DESCENDANT of a process, and how many there are.
     #
@@ -238,7 +357,7 @@ function Get-WaitVerdict($readings) {
     return $lines
 }
 
-function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what, $proc) {
+function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]$what, $proc, [int]$idleSeconds) {
     # Bounded, and it says what it waited for. Reading the node's OWN log rather than
     # the scheduler's counters, because this wait is about one process reaching a
     # state -- the fleet-level wait comes after and asks a different question.
@@ -306,11 +425,15 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     $lastSize = -1
     $lastGrowth = $started
     $everGrew = $false
+    # WHICH bound ended the wait. "waited 1200s" and "silent for 180s" are opposite
+    # findings and were the same sentence, so the two are named apart -- one says
+    # the machine is slow, the other says nothing is happening.
+    $endedOn = "ceiling"
 
-    # Scaled to the budget rather than fixed: a 30s stall means nothing in a 6s wait
-    # and everything in a 300s one. Ten percent, floored at five seconds so a short
-    # wait still has a usable threshold.
-    $stallLimit = [Math]::Max(5, [int]($seconds * 0.1))
+    # See `Get-StallLimit` and the block above it: with an idle bound this is
+    # derived from the BOUND, so a wait that ends on silence can never report the
+    # log as still growing.
+    $stallLimit = Get-StallLimit $seconds $idleSeconds
 
     # The window the CPU verdict is drawn from, and the two bounds it is judged
     # against. Both bounds are printed beside the verdict, because they are
@@ -375,6 +498,15 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
             Write-Host (Get-Content -Raw $log -ErrorAction SilentlyContinue)
             return $false
         }
+        # The SLIDING half, and it is asked before the ceiling so a wedged process is
+        # reported as silent rather than as slow. Re-armed by every successful read
+        # that saw the log change, which for this wait is the node's own progress
+        # line -- so what is measured is silence against a known cadence rather than
+        # elapsed time against a guess.
+        if (Test-WaitHasGoneQuiet $idleSeconds ((Get-Date) - $lastGrowth).TotalSeconds) {
+            $endedOn = "silence"
+            break
+        }
         if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Milliseconds 400
     }
@@ -432,7 +564,13 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
         }
     }
 
-    Write-Host "waited ${seconds}s for $what"
+    $spent = [int]((Get-Date) - $started).TotalSeconds
+    if ($endedOn -eq "silence") {
+        Write-Host ("gave up on {0} after {1}s of a {2}s ceiling: its log had not grown for {3}s, and this wait covers a step that reports progress every {4}s while it runs" `
+                    -f $what, $spent, $seconds, $idleSeconds, $ProgressCadenceSeconds)
+    } else {
+        Write-Host ("waited ${seconds}s for $what -- the ceiling ran out")
+    }
     if ($proc) {
         $readings = [pscustomobject]@{
             Alive        = (-not $proc.HasExited)
@@ -576,6 +714,30 @@ function Invoke-SelfTest {
             Readings = @{ EverGrew = $false; StalledFor = 0 }
             Expect = "VERDICT: BLOCKED"
             Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # The two ways the survey wait can now END, at the bounds it actually
+            # runs with (#1157). The classifier is what tells a slow host from a
+            # wedged one, so a change to the bounds that quietly retired it would be
+            # worse than the timeout it replaced -- these two rows are that check.
+            #
+            # Ended on SILENCE: `StalledFor` is the idle bound and `StallLimit` is
+            # what `Get-StallLimit` derives from it, so the log-growth branch must
+            # NOT fire and a quiet process must read as blocked.
+            Name = "the survey wait ended on silence, at the real bounds"
+            Readings = @{ StalledFor = $SurveyIdleSeconds
+                          StallLimit = (Get-StallLimit $SurveySeconds $SurveyIdleSeconds) }
+            Expect = "VERDICT: BLOCKED"
+            Forbid = @("WORKING", "INCONCLUSIVE") },
+
+        @{  # Ended on the CEILING while the node was still emitting progress
+            # lines -- which is exactly the reading #1157 was filed on. It must
+            # still be WORKING, because it is: a slow machine is not a wedge, and
+            # calling it one would send somebody hunting a hang that is not there.
+            Name = "the survey wait ended on the ceiling, still progressing"
+            Readings = @{ StalledFor = 4
+                          StallLimit = (Get-StallLimit $SurveySeconds $SurveyIdleSeconds) }
+            Expect = "VERDICT: WORKING -- the log was still growing"
+            Forbid = @("BLOCKED", "INCONCLUSIVE") },
 
         @{  Name = "a child exactly at the working bound"
             Readings = @{ ChildRecent = 0.50; ChildrenNow = 1; ChildrenSeen = 1 }
@@ -797,7 +959,76 @@ function Invoke-SelfTest {
         }
     }
 
-    $total = $cases.Count + $messageCases.Count
+    # --- the survey wait's two BOUNDS, and the relation between them (#1157) ----
+    #
+    # A third subject and a third block, for the reason the second one has: these
+    # are arithmetic over the bounds rather than verdicts over readings, so they
+    # carry no evidence lines and go through no classifier.
+    #
+    # What is asserted is the RELATION, never the values. The values are judgements
+    # and the next reader should be free to change them; what must not change
+    # silently is that the idle bound dominates the node's cadence and that the
+    # stall limit sits strictly below the idle bound. Get the second wrong and a wait
+    # that ended ON silence still reports "the log was still growing", which is
+    # `Get-WaitVerdict`'s own recorded mistake with a new cause.
+    $boundCases = @(
+        @{  Name = "the idle bound dominates the node's progress cadence"
+            Holds = ($SurveyIdleSeconds -ge $ProgressCadenceSeconds * 3)
+            Why  = "an idle bound at or near the cadence refuses a healthy node on its own jitter (idle=$SurveyIdleSeconds cadence=$ProgressCadenceSeconds)" }
+        @{  Name = "the ceiling leaves the idle bound room to fire first"
+            Holds = ($SurveySeconds -gt $SurveyIdleSeconds)
+            Why  = "a ceiling at or below the idle bound retires the idle bound (ceiling=$SurveySeconds idle=$SurveyIdleSeconds)" }
+        @{  # Across a RANGE, not at the pair this fixture uses. The first version of
+            # `Get-StallLimit` satisfied the production pair and inverted the relation
+            # at every bound below seven seconds, and a case pinned to 180/1200 passed
+            # over it -- what caught it was driving a real wait at a four-second bound.
+            # A property asserted at the one point you had in mind is not a property.
+            Name = "a stall limit sits strictly below its idle bound, at EVERY bound"
+            Holds = (@(1, 2, 4, 5, 6, 7, 10, 30, 60, 120, $SurveyIdleSeconds, 600) |
+                     Where-Object { (Get-StallLimit $SurveySeconds $_) -ge $_ }).Count -eq 0
+            Why  = "a wait ending on silence must not be able to report the log as still growing" }
+        @{  Name = "a stall limit is never negative"
+            Holds = (@(1, 2, 4, 5, 6, 7, 10, 30, 60, 120, $SurveyIdleSeconds, 600) |
+                     Where-Object { (Get-StallLimit $SurveySeconds $_) -lt 0 }).Count -eq 0
+            Why  = "a negative limit would make `StalledFor -lt StallLimit` unreachable for the wrong reason" }
+        @{  Name = "a wait with no idle bound keeps the tenth-of-the-ceiling rule"
+            Holds = ((Get-StallLimit 300 0) -eq 30)
+            Why  = "the ready waits pass 0 and must be unchanged by #1157" }
+        @{  Name = "the stall limit is floored for a short wait with no idle bound"
+            Holds = ((Get-StallLimit 6 0) -eq 5)
+            Why  = "ten percent of six seconds is not a usable threshold" }
+        @{  Name = "the production pair derives the figure it is documented with"
+            Holds = ((Get-StallLimit $SurveySeconds $SurveyIdleSeconds) -eq 135)
+            Why  = "0.75 x 180; a change to either number should show up here rather than only in behaviour" }
+
+        # `Test-WaitHasGoneQuiet`, both sides of the boundary and both readings of
+        # zero. What this canNOT see is the loop declining to CALL it -- that is
+        # acquisition and needs real seconds, and it is why the end-to-end fixture
+        # is still where the sliding deadline is finally proven.
+        @{  Name = "silence reaching the bound ends the wait"
+            Holds = (Test-WaitHasGoneQuiet 180 180.0)
+            Why  = "`-ge`, not `-gt`: silence that has reached the bound is not progress" }
+        @{  Name = "silence just under the bound does not"
+            Holds = (-not (Test-WaitHasGoneQuiet 180 179.9))
+            Why  = "the bound must not fire early, or a healthy node dies on poll granularity" }
+        @{  Name = "an idle bound of zero means NO bound, not an instant one"
+            Holds = (-not (Test-WaitHasGoneQuiet 0 100000.0))
+            Why  = "the ready waits pass 0; reading it as a bound would end every one of them on the first poll" }
+        @{  Name = "a negative idle bound is also no bound"
+            Holds = (-not (Test-WaitHasGoneQuiet -1 100000.0))
+            Why  = "`-le 0`, so a miscomputed bound cannot become an instant refusal" }
+    )
+
+    foreach ($case in $boundCases) {
+        if ($case.Holds) {
+            Write-Host ("PASS  {0}" -f $case.Name)
+        } else {
+            $failures++
+            Write-Host ("FAIL  {0}: {1}" -f $case.Name, $case.Why)
+        }
+    }
+
+    $total = $cases.Count + $messageCases.Count + $boundCases.Count
     if ($failures -gt 0) {
         Write-Host ("node-scratch-isolation-e2e -SelfTest: {0} of {1} cases FAILED" -f $failures, $total)
         return 1
@@ -920,13 +1151,20 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # not be started on top of. "serving <compiler> as <fingerprint>" is logged once
         # the survey has an identity -- for a toolchain pinned with `<name>=<compiler>`
         # that is immediate, since an override is never probed.
-        function Wait-ForNodeUp([string]$name, $proc, [int]$readySeconds, [int]$surveySeconds) {
-            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $readySeconds "$name to report serving on its compile port" $proc)) {
+        # The idle bound is passed at every call site rather than defaulted, because
+        # the two waits want different answers and neither wants a default. The READY
+        # wait covers a startup sequence with no cadence to measure silence against,
+        # so it gets `0` -- its ceiling is its only bound, and that is stated here
+        # rather than arrived at by omission. The SURVEY wait covers a step that
+        # reports every `$ProgressCadenceSeconds`, so silence there means something
+        # (#1157).
+        function Wait-ForNodeUp([string]$name, $proc, [int]$readySeconds, [int]$surveySeconds, [int]$surveyIdleSeconds) {
+            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "compile node ready" $readySeconds "$name to report serving on its compile port" $proc 0)) {
                 # States what was and was not established, and stops. A bound port is
                 # NOT evidence this succeeded, so the message must not point at one.
                 throw (Get-NodeNotServingMessage $name)
             }
-            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc)) {
+            if (-not (Wait-ForLogLine (Join-Path $phaseDir "$name.err.log") "serving .* as " $surveySeconds "$name to finish its toolchain survey" $proc $surveyIdleSeconds)) {
                 throw "$name did not finish its toolchain survey"
             }
         }
@@ -972,14 +1210,39 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # Both waits are kept, and separately: serving and surveying are different
         # stages with different costs, and a fixture that folds them cannot say which
         # one stalled.
-        Wait-ForNodeUp "sched" $schedProc 180 120
+        #
+        # **That serialisation is intact, and #1157 is NOT a second instance of #365.**
+        # Asked and answered rather than assumed, because the ticket offered it as one
+        # of two possibilities and guessing is how the previous two budgets were set.
+        # On the run that filed it, one walker:
+        #
+        #   * the scheduler's survey took 0 s -- its toolchain is pinned, so
+        #     `DiscoverToolchainEntries` gives the entry a fingerprint and the probe is
+        #     skipped;
+        #   * workerA reached `compile node ready` in 0 s and then walked while nothing
+        #     else did: workerB is not STARTED until the wait below returns;
+        #   * `--toolchain` REPLACES machine discovery rather than adding to it
+        #     (`ToolchainSource::OperatorNamed`), so a worker surveys exactly one
+        #     toolchain and not every compiler on the runner;
+        #   * the node's progress lines were a single monotonic series, 161 -> 4931 of
+        #     5136, with no second series interleaved -- one `ToolchainHashProgress`;
+        #   * and the test is `RUN_SERIAL`.
+        #
+        # So it is the other possibility: one walker now costs more than the ceiling on
+        # that runner. What the ceiling is set from, and why it is no longer the thing
+        # that catches a wedge, is at `$SurveySeconds` near the top of this file.
+        # The scheduler's toolchain is PINNED (`<name>=<compiler>`), so its survey is
+        # not a walk at all: a non-empty fingerprint on the entry skips the probe
+        # entirely, measured at 0 s on the run that filed #1157. Hence a short ceiling
+        # and no idle bound -- there is no cadence to measure silence against.
+        Wait-ForNodeUp "sched" $schedProc 180 120 0
 
         $workerAProc = Start-NodeIn "workerA" @(
             "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerA",
             "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
-        Wait-ForNodeUp "workerA" $workerAProc 120 600
+        Wait-ForNodeUp "workerA" $workerAProc 120 $SurveySeconds $SurveyIdleSeconds
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $workerBProc = Start-NodeIn "workerB" @(
@@ -987,7 +1250,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
-        Wait-ForNodeUp "workerB" $workerBProc 120 600
+        Wait-ForNodeUp "workerB" $workerBProc 120 $SurveySeconds $SurveyIdleSeconds
 
         # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
         # logging "compile node ready" says that worker is serving -- its own surface

@@ -46,7 +46,7 @@ if(NOT "$ENV{STALL_FATAL}" STREQUAL "")
     set(CPACK_FASTCACHED_NOTARY_STALL_IS_FATAL "$ENV{STALL_FATAL}")
 endif()
 if(NOT "$ENV{NOTARY_BUDGET}" STREQUAL "")
-    set(CPACK_FASTCACHED_NOTARY_BUDGET_SECONDS "$ENV{NOTARY_BUDGET}")
+    set(CPACK_FASTCACHED_NOTARY_BUDGET "$ENV{NOTARY_BUDGET}")
 endif()
 include("$ENV{HOOK}")
 message(STATUS "DRIVER-COMPLETED")
@@ -111,7 +111,11 @@ case "$2" in submit) echo sub >> '"$work"'/submits
   if [ "$(wc -l < '"$work"'/submits | tr -d " ")" -le 1 ]; then exit 3; fi
   echo "{\"id\":\"11111111-2222-3333-4444-555555555555\",\"status\":\"Accepted\"}";; esac
 exit 0'
-run_case stall_then_accept completed "did not answer" 2
+# RENAMED from `stall_then_accept`: with the budget spent across attempts, a stall
+# and a fast failure are no longer the same thing, and this fake exits IMMEDIATELY --
+# it is the fast one. The slow one is its own case further down, and calling this a
+# stall would have left the file claiming to test a distinction neither case made.
+run_case a_fast_failure_is_retried completed "did not answer" 2
 
 # The one this file exists for. A refusal is an ANSWER; retrying it buys nothing and
 # costs the step budget.
@@ -148,17 +152,43 @@ run_case never_answers fatal "did not answer the notarization submission" 2
 # that filed #1156, two attempts spent twenty minutes to be told the same thing
 # twice.
 #
-# The budget is shrunk through `CPACK_FASTCACHED_NOTARY_BUDGET_SECONDS` because no
+# The budget is shrunk through `CPACK_FASTCACHED_NOTARY_BUDGET` because no
 # test can wait 600 s to watch this; that seam exists for this case and for nothing
 # else, and `cmake/Packaging.cmake` does not export it. Six seconds, so the FIRST
 # attempt still clears the minimum-attempt floor the hook derives from the budget --
 # a case that failed by skipping attempt one would pass this assertion for the wrong
 # reason.
+# TWO clauses gate the retry and they cover different failures, so there are two
+# cases. Stated plainly because ONE of them cannot be isolated by any test here, and
+# a reader who does not know that would delete the clause it protects:
+#
+#   * the previous attempt returned an EXIT CODE (`_rc` is a number). A bound that
+#     fired, or a command that never started, is not asked again.
+#   * and there is budget LEFT. A numeric failure that took most of the budget is
+#     not retried either.
+#
+# On a well-behaved clock those two agree for a TIMEOUT -- the bound is the whole
+# remaining budget, so firing it exhausts the budget by construction -- and the case
+# below therefore fails only if BOTH are removed. That is not a reason to drop
+# either: the `_rc` clause exists for a clock that is NOT well behaved, measured on
+# this project's WSL2 development host at ~2 s backwards every ~32 s, where the
+# clock-only version reported two submissions in 3 of 15 runs with its own log
+# saying "after 4s of a 6s budget" for an attempt killed at six. No `cmake -P` test
+# can inject a clock step, so that clause is argued rather than asserted.
 fake_xcrun '#!/bin/sh
 case "$2" in submit) echo sub >> '"$work"'/submits;; esac
 sleep 30
 exit 3'
-run_case a_slow_failure_is_not_retried fatal "did not answer the notarization submission" 1 "" 6
+run_case a_slow_timeout_is_not_retried fatal "did not answer the notarization submission" 1 "" 6
+
+# The budget clause on its own, and this one IS isolated: the fake EXITS, so `_rc` is
+# a number and the first clause admits a retry -- only the budget stops it. Five
+# seconds against a six-second budget, so what is left is below the minimum attempt.
+fake_xcrun '#!/bin/sh
+case "$2" in submit) echo sub >> '"$work"'/submits;; esac
+sleep 5
+exit 3'
+run_case a_slow_exit_leaves_no_budget_to_retry_with fatal "did not answer the notarization submission" 1 "" 6
 
 # --------------------------------------------------------------------------
 # And WHERE a stall is fatal is a policy, not a property of the stall (#1156).

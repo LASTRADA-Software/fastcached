@@ -218,8 +218,8 @@ function(fastcached_notarize artifact)
     # `cmake/Packaging.cmake` does not export it, so no configured build can carry it,
     # and every attempt prints the budget it is spending -- a shrunk one is visible in
     # the log rather than silent.
-    if(DEFINED CPACK_FASTCACHED_NOTARY_BUDGET_SECONDS)
-        set(_notaryBudget "${CPACK_FASTCACHED_NOTARY_BUDGET_SECONDS}")
+    if(DEFINED CPACK_FASTCACHED_NOTARY_BUDGET)
+        set(_notaryBudget "${CPACK_FASTCACHED_NOTARY_BUDGET}")
     endif()
 
     # A retry with less than this left cannot upload the artefact and wait for an
@@ -229,8 +229,19 @@ function(fastcached_notarize artifact)
     # budget would skip the FIRST attempt and the guard above would be testing that
     # instead of what it says.
     math(EXPR _notaryMinAttempt "${_notaryBudget} / 20")
-    if(_notaryMinAttempt LESS 1)
-        set(_notaryMinAttempt 1)
+    # Floored, and the floor is the CLOCK ERROR rather than a judgement about
+    # uploads. `_notarySpent` is the difference of two `string(TIMESTAMP "%s")`
+    # readings -- a WALL clock, truncated to whole seconds, on a host that may step
+    # it. So a remainder can be over-reported, and a floor at the granularity would
+    # let a mis-measurement admit a retry that the budget does not actually have room
+    # for. Five seconds: above the ~2 s backward steps measured on this project's
+    # WSL2 development host, and above the one second the truncation alone can cost.
+    #
+    # It only ever PREVENTS a retry, which is the safe direction, and the shipped
+    # 600 s budget derives 30 and never reaches it. Found by the guard being flaky
+    # rather than by reading.
+    if(_notaryMinAttempt LESS 5)
+        set(_notaryMinAttempt 5)
     endif()
     set(_notarySpent 0)
     set(_rc "not attempted")
@@ -261,6 +272,36 @@ function(fastcached_notarize artifact)
         message(WARNING
             "notarytool submit for ${artifact} did not answer (${_rc}) after "
             "${_notarySpent}s of a ${_notaryBudget}s budget")
+
+        # **The RETRY decision comes from `_rc`, never from the clock**, and that
+        # separation is the whole robustness of this loop.
+        #
+        # `execute_process` reports a child's exit code as a NUMBER and everything
+        # else as a sentence -- "Process terminated due to timeout" for the bound
+        # above, a diagnostic for a command it could not start. So the question this
+        # loop actually asks, *was this a slow failure or a fast one*, is answered
+        # exactly, by the thing that knows, with no arithmetic in between.
+        #
+        # The first version decided it from `_notaryBudget - _notarySpent`, and
+        # `string(TIMESTAMP "%s")` is a WALL clock: a host that steps it makes a
+        # consumed budget read as a partly-spent one and a stall gets retried after
+        # all. Measured on this project's own WSL2 development host, where the clock
+        # steps about 2 s backwards every ~32 s: 3 of 15 runs of
+        # `check-notarize-retry.sh` reported two submissions where the property under
+        # test is one, with the hook's own log saying "after 4s of a 6s budget" for an
+        # attempt that had just been killed at six. `.agent/rules/testing.md` records
+        # that a wall clock is not a duration; this is that rule reaching a bound in
+        # production rather than a fixture.
+        #
+        # The clock still bounds the RETRY -- two numeric failures must not spend two
+        # budgets -- and a stepped clock there costs at most one extra attempt that is
+        # itself bounded, rather than turning a stall into a re-submission.
+        if(NOT _rc MATCHES "^[0-9]+$")
+            # No exit code: the bound fired, or the command never started. Neither is
+            # helped by asking again -- a re-submit joins the back of the same queue,
+            # and a missing `xcrun` is missing twice.
+            break()
+        endif()
     endforeach()
 
     # No answer at all. Distinct from a refusal below, and named separately because
