@@ -4348,6 +4348,31 @@ lines replaced by a comment -- so it prints `-- [cache] Enabling sccache
 check refuses with exactly three violations, the three rows that expect a launcher,
 and none of the three that expect none.
 
+**And the first version of it was GREEN on Linux and red on all three Windows legs,
+for one and the same file.** `build.ninja` writes
+
+```
+LAUNCHER = "C:\Program Files\CMake\bin\cmake.exe"
+```
+
+-- QUOTED, because the path holds a space, and with BACKSLASH separators -- while
+`${CMAKE_COMMAND}` is `C:/Program Files/CMake/bin/cmake.exe`. A `STREQUAL` over those
+is false for a path that is the same path, and on Linux the two spellings are
+byte-identical, so the green run there could not have shown it. That is the
+platform-arm hazard reaching a `cmake -P` check: **a comparison written against the
+spelling one generator on one platform happens to emit is a comparison nobody has
+tested.** Normalise a path as a PATH -- a matched surrounding quote pair is the
+generator's escaping, `file(TO_CMAKE_PATH)` settles separators, and case folds only
+where the filesystem folds it -- and normalise BOTH SIDES, or the two are normalised
+asymmetrically, which is its own way to compare two things that were never the same
+shape.
+
+The measured strings are in the check's own comment rather than described, so nobody
+simplifies the normalisation away on the platform that does not need it. And the
+mutation was re-run **on Windows**, not only on Linux: a normalisation's whole risk
+is accepting too much, so "it stopped failing" is not the same claim as "it still
+bites". Same three violations there, same exit 1.
+
 **And the decision a guard makes is what gets tested, not the acquisition around
 it.** `tidy-sweep.sh`'s canary -- the thing that stops a whole branch being reported
 clean by an analyser that never ran -- needed clang-tidy, a compile database and a

@@ -1968,6 +1968,15 @@ what differs between compilers, standard libraries, hosts and tool versions.
   cannot parse is a THIRD state, named — while a generator it CLAIMS to handle reading
   nothing is a violation, since every row's assertion is then vacuous. Broken on
   purpose: the check refuses with exactly the three rows expecting a launcher.
+  **Its first version was green on Linux and red on all three Windows legs for one
+  and the same file** — `build.ninja` writes `LAUNCHER = "C:\Program
+  Files\CMake\bin\cmake.exe"`, quoted for the space and backslashed, against
+  `${CMAKE_COMMAND}`'s `C:/Program Files/CMake/bin/cmake.exe`, and on Linux the two
+  spellings are byte-identical. A comparison written against the spelling ONE
+  generator on ONE platform happens to emit is a comparison nobody has tested:
+  normalise a path as a PATH, on BOTH sides, and re-run the MUTATION on the platform
+  that failed — a normalisation's risk is accepting too much, so *it stopped failing*
+  is not *it still bites*.
   Its sibling is #257 — **the DECISION a guard makes is what gets tested, not the
   acquisition around it**: `tidy-sweep.sh`'s canary needed clang-tidy, a database and a
   real TU, so it was reachable only where a full sweep was already running, which is the
