@@ -1226,6 +1226,56 @@ command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
 
 note "build directory: ${BUILD_DIR}"
 
+# What this gate HANDS DOWN, which is not what it sets: it sets nothing. An
+# ignored signal disposition is inherited across fork and exec, and this gate
+# EXECS the suite where ctest would have spawned it -- ctest uses libuv, which
+# resets every disposition to the default in the child. #1229 was one case
+# asserting the absolute SIGPIPE disposition, failing here and passing four
+# other Linux legs on the same commit, with nothing in this log saying which
+# disposition the binaries had been handed. This is that line.
+#
+# Read with the shell's OWN `read`, forking nothing. `/proc/self/status` is the
+# READER's status, so an external tool reports on the tool: measured on one
+# host, GNU awk 5.2.1 answers `0000000000001000` for a shell whose real answer
+# is `0000000000000000`, because awk ignores SIGPIPE for itself. grep, sed, cat
+# and this loop all agree with the shell.
+#
+# A note and never a refusal. An inherited ignore is the environment's business,
+# the suite now asserts a delta rather than an absolute, and a gate that refused
+# to run here would be unrunnable from any such shell.
+ReportInheritedSigPipe() {
+    local line ignored="" low bits
+
+    if [[ ! -r /proc/self/status ]]; then
+        note "SIGPIPE handed to the sanitized binaries: not readable on this platform"
+        return 0
+    fi
+
+    while read -r line; do
+        case "$line" in
+            SigIgn:*) set -- $line; ignored="$2" ;;
+        esac
+    done < /proc/self/status
+
+    # Four hex digits carry signals 1..16, and SIGPIPE is 13 -> bit 12 -> 0x1000.
+    # The `if` is what makes the arithmetic below safe under `set -e`: `(( 0 ))`
+    # exits 1, so the same expression as a bare statement would end the gate on
+    # the ordinary answer.
+    low="${ignored: -4}"
+    if [[ -z "$low" || "$low" != [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F] ]]; then
+        note "SIGPIPE handed to the sanitized binaries: unreadable (SigIgn=${ignored:-<absent>})"
+        return 0
+    fi
+
+    bits=$(( 16#$low ))
+    if (( bits & 0x1000 )); then
+        note "SIGPIPE handed to the sanitized binaries: SIG_IGN, inherited from this gate's own ancestry (SigIgn=${ignored}). See #1229."
+    else
+        note "SIGPIPE handed to the sanitized binaries: SIG_DFL (SigIgn=${ignored})"
+    fi
+}
+ReportInheritedSigPipe
+
 # A build that dropped `add_compile_options` and kept `add_link_options` is the
 # shape of the defect `cmake/portable/Sanitizers.cmake` records, and this is the
 # cheap half of catching it: the rulebook names where to read the compile line --
