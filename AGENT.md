@@ -1738,6 +1738,25 @@ what differs between compilers, standard libraries, hosts and tool versions.
   (`FASTCACHED_REPORT_ONLY_IF_NEW`), or a context failing on every push comments
   forever; and a push with no branch is REFUSED, never assumed master, because `fix-ci`
   is expected to fail.
+- A step's `env:` is its OWN, and a whole-file grep cannot tell a line that runs from one
+  that cannot. `EVENT` was defined on the `decide` step and READ by the reporting step, so
+  #684's notifier died on `EVENT: unbound variable` and opened no report in its entire life
+  — measured over 200 runs: 190 `success` on the `reportable == 0` path that never enters
+  the step, and **all 10** that had something to report were that line, swallowing
+  `clang-tidy-windows`, `macOS-clang-release`, `compile-cache E2E (Windows)` and `Code
+  coverage` twice (#1174). Its own guard passed, correctly: the rule motivating the
+  `$EVENT` read is a whole-file `grep -q FASTCACHED_REPORT_ONLY_IF_NEW`, satisfied by the
+  line inside the step that cannot run — a rule satisfied by a line that never executes is
+  a rule satisfied by prose. So the rule is per STEP, and it covers EVERY `run:` and not
+  only the `set -u` ones: without `-u` the name expands to EMPTY and the branch is taken
+  the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the model
+  of bash is deliberately narrower than bash (the first version made `echo` and `gh`
+  variables — a model MORE PERMISSIVE than the thing it stands for, in the check whose
+  whole point is that permissiveness), and the refusal names the STEP, because a guard
+  printing `(unnamed)` cannot be acted on. The self-test's *correct* fixture had modelled
+  the defect and vouched for it; `no-event-env` is the positive control. One workflow's
+  scan, not the repository's — 28 `run:` blocks across six files are outside it, and that
+  is #1175.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
   `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
   the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict
