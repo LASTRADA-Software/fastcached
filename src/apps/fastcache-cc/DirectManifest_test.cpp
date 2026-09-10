@@ -22,6 +22,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/DeclaredCountBlob.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache::Cc;
@@ -113,16 +114,19 @@ namespace
 {
 /// A manifest blob declaring `count` entries and carrying `trailing` bytes after the
 /// header for them to be decoded from.
+///
+/// The shape, not the format, is shared (#306): three files had written this
+/// independently down to the same big-endian shift loop, and the defect class it
+/// guards is not finished. What stays here is which fields a MANIFEST header has.
 [[nodiscard]] std::string BlobDeclaring(std::uint32_t count, std::size_t trailing)
 {
-    std::string out;
-    out.push_back('\x01'); // version
-    out.append(4, '\0');   // toolchainStamp: empty
-    out.append(4, '\0');   // objectKey: empty
-    for (auto const shift: { 24, 16, 8, 0 })
-        out.push_back(static_cast<char>((count >> shift) & 0xFFU));
-    out.append(trailing, '\0');
-    return out;
+    return FastCache::Testing::DeclaredCountBlob {}
+        .Byte(0x01)   // version
+        .EmptyField() // toolchainStamp
+        .EmptyField() // objectKey
+        .U32(count)
+        .Pad(trailing)
+        .String();
 }
 } // namespace
 
@@ -137,7 +141,7 @@ TEST_CASE("DecodeManifest refuses an entry count the blob cannot supply")
     //
     // The bytes come off the network: the launcher fetches this manifest from the
     // cache server, so the count is a peer's number rather than its own.
-    auto const hostile = BlobDeclaring(0xFFFFFFFFU, 0);
+    auto const hostile = BlobDeclaring(FastCache::Testing::ImpossibleCount, 0);
     REQUIRE(hostile.size() == 13);
 
     auto const decoded = DecodeManifest(hostile);

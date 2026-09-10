@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/DeclaredCountBlob.hpp>
 #include <tests/ForeignGenerationValue.hpp>
 
 using namespace FastCache;
@@ -119,19 +120,19 @@ namespace
 /// `trailingBytes` bytes after the header for them to be decoded from.
 [[nodiscard]] std::vector<std::byte> FrameDeclaring(std::uint32_t regionCount, std::size_t trailingBytes)
 {
-    std::vector<std::byte> frame;
     // The constant, not a literal: this helper exists to exercise the region-count
     // guard and needs a frame of the CURRENT generation to do it. The literal that
     // used to sit here was the byte's only anchor by accident, and a generation
     // bump then failed two tests that have nothing to do with versioning. The byte
     // is pinned deliberately instead, in its own case below.
-    frame.push_back(std::byte { CompileValueVersion });
-    for ([[maybe_unused]] auto const i: { 0, 1, 2, 3 })
-        frame.push_back(std::byte { 0 }); // objectLen = 0
-    for (auto const shift: { 24, 16, 8, 0 })
-        frame.push_back(static_cast<std::byte>((regionCount >> shift) & 0xFFU));
-    frame.insert(frame.end(), trailingBytes, std::byte { 0 });
-    return frame;
+    //
+    // The assembly is shared (#306); which fields a compile-value header has is not.
+    return FastCache::Testing::DeclaredCountBlob {}
+        .Byte(CompileValueVersion)
+        .U32(0) // objectLen
+        .U32(regionCount)
+        .Pad(trailingBytes)
+        .Vector();
 }
 } // namespace
 
@@ -164,7 +165,7 @@ TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
     // Reachable from the daemon's STORE path, so `fastcached` itself was exposed and
     // not only the compile fleet, and from a worker's reply to the launcher. Run under
     // a 2 GiB address-space cap, the pre-fix decoder aborts on `std::bad_alloc`.
-    auto const frame = FrameDeclaring(0xFFFFFFFFU, 0);
+    auto const frame = FrameDeclaring(FastCache::Testing::ImpossibleCount, 0);
     REQUIRE(frame.size() == 9);
 
     auto const decoded = DecodeCompileValue(frame);
