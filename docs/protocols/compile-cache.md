@@ -307,9 +307,21 @@ includes; what the client needs is not a claim about the token but its own budge
 from the scheduler that is already telling it which worker to dial.
 
 The worker reads the same number from inside the MAC, where it belongs, because the
-worker *can* verify. Both ends therefore bound the same job by the same value, and
-the scheduler reclaims the key at it. A grant already minted keeps the bound it was
-issued under, whatever the setting does afterwards.
+worker *can* verify. Both ends therefore bound the same job by the same **moment** —
+the grant's expiry — and the scheduler reclaims the key at it. A grant already minted
+keeps the bound it was issued under, whatever the setting does afterwards.
+
+The moment rather than the number, and the difference is the client's: a lifetime runs
+end to end from the mint, while the client's compile leg does not start until the
+`LEASE` round trip is over, so it subtracts what that round trip cost before using the
+value. It measures that on its own monotonic clock, from its own `LEASE` send, and no
+instant crosses the wire — an instant from another machine would be a comparison
+against a clock this one has no relationship with. The mint happened somewhere inside
+that round trip, so charging the whole of it over-states the elapsed and the client
+gives up a little early rather than a little late. Taking the lifetime whole made it
+wait past its own grant by roughly a round trip
+([#1122](https://github.com/LASTRADA-Software/fastcached/issues/1122)), which was
+harmless only because the worker declines an outrun job first.
 
 ### Bulk fields carry a codec envelope
 
