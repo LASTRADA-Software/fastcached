@@ -4932,6 +4932,33 @@ set_tests_properties("macos-package-e2e-selftest" PROPERTIES
     TIMEOUT 120
 )
 
+# How close each `hygiene` test ran to its OWN timeout, as a distribution (#1143).
+#
+# The class this measures is not any one check: five unrelated hygiene checks failed
+# together in one contended run, and all five appear in the TOP SEVEN of a run where
+# none of them failed. A test at 95% of its budget PASSES, so nobody looks at it, and
+# it is one slow runner from red -- which is invisible to every instrument that
+# reports only what failed.
+#
+# What is registered here is the DECISION, not the measurement. Ranking a real suite
+# needs a build directory and a quiet box, and a run on a shared one measures the box;
+# `headroom_percent` needs neither and is where the state collapse would live. Its
+# `no-budget` answer is the row that matters: a test carrying no TIMEOUT is one the
+# ranking cannot place, and folding it into 0% would sort it as the safest thing in
+# the table. Driven in both directions, including the two #1143 rows verbatim.
+#
+# The reporting half is deliberately not a ctest: it exits 0 whatever it finds, so
+# there is no verdict for ctest to carry, and a number that can fail a build is a
+# number people tune rather than read.
+add_test(
+    NAME "hygiene-headroom-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/hygiene-headroom.sh" --self-test
+)
+set_tests_properties("hygiene-headroom-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
 # What the node's option table says RELOADS, against what the shipped artefacts claim
 # (#1026). `OptionSpec::reloadable` decides it and nothing derived either artefact from
 # the table; it had already drifted, hand-corrected from four to five to seven in one
