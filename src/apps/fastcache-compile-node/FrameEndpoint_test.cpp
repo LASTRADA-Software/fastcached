@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "EndpointWriters.hpp"
 #include "FrameEndpoint.hpp"
 #include "NodeIoLoop.hpp"
 #include "Responders.hpp"
@@ -23,11 +24,14 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -3143,4 +3147,117 @@ TEST_CASE("A connection parked on a TIMER at shutdown does not hold the drain to
     static_assert(std::chrono::milliseconds { 2 * FrameServer::SweepInterval } < DrainBound {}.ceiling,
                   "the margin must sit strictly inside the ceiling, or this case cannot tell them apart");
     CHECK(elapsed < generous);
+}
+
+namespace
+{
+
+/// `FrameEndpoint.cpp` with every full-line comment removed.
+///
+/// **A COMMENT is not a call site**, and this file discusses `WriteAll` and the
+/// one-writer property in prose that reaches the shapes below -- the loop's own header
+/// note names four writes in a sentence. Dropping full-line comments before the search
+/// is the remedy this repository has had to write down more than once.
+[[nodiscard]] std::string EndpointCodeWithoutComments()
+{
+    auto const path =
+        std::filesystem::path { FASTCACHED_SOURCE_DIR } / "src" / "apps" / "fastcache-compile-node" / "FrameEndpoint.cpp";
+    std::ifstream in { path, std::ios::binary };
+    std::ostringstream contents;
+    // Via the stream buffer rather than `istreambuf_iterator`, for the reason
+    // `NodeCredential_test.cpp` records: GCC at `-O3` refuses the iterator form under
+    // `-Werror=null-dereference` inside `<streambuf>` itself.
+    contents << in.rdbuf();
+    auto const text = std::move(contents).str();
+
+    std::string code;
+    code.reserve(text.size());
+    std::size_t line = 0;
+    while (line < text.size())
+    {
+        auto const end = std::min(text.find('\n', line), text.size());
+        auto const first = text.find_first_not_of(" \t", line);
+        auto const isComment = first != std::string::npos && first < end && text.compare(first, 2, "//") == 0;
+        if (!isComment)
+            code.append(text, line, end - line);
+        code.push_back('\n');
+        line = end + 1;
+    }
+    return code;
+}
+
+/// Every occurrence of @p needle in @p text.
+[[nodiscard]] std::size_t CountOf(std::string_view text, std::string_view needle)
+{
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string_view::npos; at = text.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
+} // namespace
+
+TEST_CASE("Every write on a framed endpoint names a sanctioned writer", "[node][frame][writers]")
+{
+    // **The reader `EndpointWriterTable` would otherwise not have.** #675's complaint is
+    // that the exactly-one-writer property is STRUCTURAL: the loop is the only writer
+    // because it is the only thing that writes, with nothing saying so -- and the loop
+    // sits near a complexity ceiling that pushes the next lane toward extracting a
+    // block, which is as likely as not to be a write. A table of the sanctioned writers
+    // that nothing consults is a comment; this is what makes a fifth one a row with a
+    // reason rather than a `WriteAll` call that appeared in a helper.
+    //
+    // What it does NOT establish is which FUNCTION a call sits in, so a new helper could
+    // still name `Loop`. That is the residual, and it is stated in `EndpointWriters.hpp`
+    // rather than papered over: this checks that there is ONE write primitive, that
+    // every use of it declares a writer, and that no row is dead.
+    auto const code = EndpointCodeWithoutComments();
+    REQUIRE_FALSE(code.empty());
+
+    // Positive control on the scan itself, before anything is concluded from what it did
+    // NOT find: the file must contain at least one write per row, or the search is
+    // reading something other than this endpoint.
+    auto const calls = CountOf(code, "WriteAll(EndpointWriter::");
+    CHECK(calls >= EndpointWriterTable.size());
+
+    // ONE write primitive. `ISocket::Write` is reached from exactly one place -- the
+    // definition of `WriteAll` itself -- so a second spelling of "put bytes on this
+    // socket" cannot be added without this failing.
+    CHECK(CountOf(code, "->Write(") == 1);
+
+    // And every use of that primitive declares which writer it is. Counting the bare
+    // form against the declared form is what catches an overload creeping back in:
+    // `WriteAll(` appears once more than the call sites, for the definition.
+    CHECK(CountOf(code, "WriteAll(") == calls + 1);
+
+    // No dead row. A writer nobody is is a writer that was removed and left a rationale
+    // behind, which is how a table stops describing the file it is about.
+    for (auto const& row: EndpointWriterTable)
+    {
+        INFO("writer: " << row.function);
+        CHECK(code.contains(std::format("WriteAll(EndpointWriter::{}", row.name)));
+    }
+}
+
+TEST_CASE("Every sanctioned writer names a function that exists and says why it may write", "[node][frame][writers]")
+{
+    // The `rationale` is a forcing function rather than a dead field: a fifth writer
+    // that cannot be given one is a fifth writer that should not exist, and the answer
+    // is to hand the bytes back to the loop instead. A placeholder would spell "forgot"
+    // in the vocabulary of "decided", so the length floor is deliberate -- a one-word
+    // reason is not one.
+    auto const code = EndpointCodeWithoutComments();
+    REQUIRE_FALSE(code.empty());
+
+    for (auto const& row: EndpointWriterTable)
+    {
+        INFO("writer: " << row.function);
+        CHECK_FALSE(row.function.empty());
+        CHECK(row.rationale.size() > 40);
+
+        // The named function is DEFINED in the file this table describes, so a rename
+        // that leaves the row behind fails here rather than being discovered by somebody
+        // grepping for a function that no longer exists.
+        CHECK(code.contains(std::format("{}(", row.function)));
+    }
 }
