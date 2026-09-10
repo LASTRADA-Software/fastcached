@@ -421,7 +421,8 @@ done
 
 # The conditional GET the whole arrangement exists for.
 svg="$(dash_get "$admin_port" "/fleet/chart/dispatched.svg?range=24h" "Bearer ${TOKEN}")"
-etag="$(printf '%s' "$svg" | tr -d '\r' | sed -n 's/^ETag: //p' | head -1)"
+etags="$(printf '%s' "$svg" | tr -d '\r' | sed -n 's/^ETag: //p')"
+etag="${etags%%$'\n'*}"
 [[ -n "$etag" ]] || fail "a chart was served with no ETag, so a browser can never revalidate it"
 [[ "$svg" == *Cache-Control:\ max-age=* ]] || fail "a chart was served with no Cache-Control"
 
@@ -508,7 +509,8 @@ if [[ -n "$tls" ]]; then
 
             # And the fingerprint the node logged is the one on the wire -- the
             # only thing that authenticates a certificate nothing signed.
-            logged="$(grep -oE 'fingerprint [0-9a-f]{64}' "${workdir}/node.log" | awk '{print $2}' | head -1)"
+            loggedAll="$(grep -oE 'fingerprint [0-9a-f]{64}' "${workdir}/node.log" | awk '{print $2}' || true)"
+            logged="${loggedAll%%$'\n'*}"
             [[ -n "$logged" ]] || fail "the node did not report the generated certificate's fingerprint"
             wire="$(openssl x509 -in "$pem" -noout -fingerprint -sha256 2>/dev/null \
                     | sed 's/.*=//' | tr -d ':' | tr 'A-F' 'a-f')"

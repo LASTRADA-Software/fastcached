@@ -1046,7 +1046,8 @@ worker_pid="$started_pid"
 # while testing nothing.
 worker_fingerprint=""
 for _ in $(seq 1 150); do
-    worker_fingerprint="$(sed -n 's/.*serving .* as //p' "${workdir}/worker.log" | head -1)"
+    worker_fingerprints="$(sed -n 's/.*serving .* as //p' "${workdir}/worker.log")"
+    worker_fingerprint="${worker_fingerprints%%$'\n'*}"
     [[ -n "$worker_fingerprint" ]] && break
     if ! kill -0 "$worker_pid" 2>/dev/null; then
         cat "${workdir}/worker.log" >&2
@@ -1124,7 +1125,8 @@ cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" || {
     # investigation from a size mismatch.
     echo "  reference: $(wc -c < "${proj}/build/reference.o") bytes" >&2
     echo "  produced:  $(wc -c < "${proj}/build/one.o") bytes" >&2
-    cmp -l "${proj}/build/reference.o" "${proj}/build/one.o" 2>/dev/null | head -5 >&2
+    one_diff="$(cmp -l "${proj}/build/reference.o" "${proj}/build/one.o" 2>/dev/null || true)"
+    if [[ -n "$one_diff" ]]; then head -5 <<< "$one_diff" >&2; fi
     fail "the worker's object differs from the locally compiled one"
 }
 echo "   byte-identical to the local object"
@@ -1354,7 +1356,8 @@ grep -q "DISPATCHED to " "${workdir}/case7.log"     || { cat "${workdir}/case7.l
 cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
         # C compiled as C++ differs in far more than a byte: this source has
         # external linkage, so the symbol names themselves are mangled.
-        cmp -l "${proj}/build/seven-ref.o" "${proj}/build/seven.o" 2>/dev/null | head -5 >&2
+        seven_diff="$(cmp -l "${proj}/build/seven-ref.o" "${proj}/build/seven.o" 2>/dev/null || true)"
+        if [[ -n "$seven_diff" ]]; then head -5 <<< "$seven_diff" >&2; fi
         fail "a .c source did not come back compiled the way this driver compiles it"
     }
 echo "   a .c source came back matching what this driver produces locally"
@@ -1511,7 +1514,9 @@ sizing_pid="$started_pid"
 # worker that never sizes itself are told apart rather than both reading as a stall.
 sizing_slots=""
 _sizing_slots_ready() {
-    sizing_slots="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p" "${workdir}/sizing.log" | head -1)"
+    local sizing_all
+    sizing_all="$(sed -n "s/.*, \([0-9][0-9]*\) slot(s) as a dedicated node.*/\1/p" "${workdir}/sizing.log")"
+    sizing_slots="${sizing_all%%$'\n'*}"
     [ -n "$sizing_slots" ]
 }
 wait_until _sizing_slots_ready \

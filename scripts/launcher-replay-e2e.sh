@@ -219,7 +219,10 @@ grep -q "LAUNCHER = " "${workdir}/control/build.ninja" \
 note "control built, and build.ninja confirms no launcher"
 
 control_bin="${workdir}/control/target/${target}"
-[ -x "$control_bin" ] || control_bin="$(find "${workdir}/control" -name "$target" -type f -perm -u+x | head -1)"
+if [ ! -x "$control_bin" ]; then
+    control_candidates="$(find "${workdir}/control" -name "$target" -type f -perm -u+x)"
+    control_bin="${control_candidates%%$'\n'*}"
+fi
 [ -n "$control_bin" ] && [ -x "$control_bin" ] || fail "the control build produced no ${target} binary"
 "$control_bin" > "${workdir}/control.tests" 2>&1 \
     || { tail -30 "${workdir}/control.tests" >&2; fail "the control suite failed; the source itself is not good"; }
@@ -316,7 +319,10 @@ note "compared ${compared} object(s)"
 
 echo "== and the replayed build must pass its own tests"
 warm_bin="${workdir}/warm/target/${target}"
-[ -x "$warm_bin" ] || warm_bin="$(find "${workdir}/warm" -name "$target" -type f -perm -u+x | head -1)"
+if [ ! -x "$warm_bin" ]; then
+    warm_candidates="$(find "${workdir}/warm" -name "$target" -type f -perm -u+x)"
+    warm_bin="${warm_candidates%%$'\n'*}"
+fi
 [ -n "$warm_bin" ] && [ -x "$warm_bin" ] || fail "the warm build produced no ${target} binary"
 "$warm_bin" > "${workdir}/warm.tests" 2>&1 \
     || { tail -40 "${workdir}/warm.tests" >&2; fail "the suite FAILED on replayed objects while passing on freshly compiled ones -- this is the #319 shape"; }

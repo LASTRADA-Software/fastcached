@@ -122,7 +122,8 @@ while [[ "$i" -lt "$RUNS" ]]; do
         # the correlation #473 turned on: every silent run printed a count showing
         # the race HAD happened. A silent run whose count shows no lost increments
         # would be a different finding and should not be folded in quietly.
-        silentCounts+=("$(printf '%s\n' "$out" | sed -n 's/.*: \([0-9]*\) increments observed.*/\1/p' | head -1)")
+        observed="$(printf '%s\n' "$out" | sed -n 's/.*: \([0-9]*\) increments observed.*/\1/p')"
+        silentCounts+=("${observed%%$'\n'*}")
     fi
     i=$(( i + 1 ))
 done

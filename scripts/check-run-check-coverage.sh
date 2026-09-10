@@ -174,9 +174,13 @@ MarkersAreSafe() {
     [ -f "$wrapper" ] || { echo "FAIL: no such wrapper: ${wrapper}" >&2; return 1; }
 
     # The marker text, read from the wrapper's own assignments.
-    local start terminal
-    start="$(sed -n 's/^StartMarker="\(.*\)"$/\1/p' "$wrapper" | head -1)"
-    terminal="$(sed -n 's/^TerminalMarker="\(.*\)"$/\1/p' "$wrapper" | head -1)"
+    # Captured, then first-lined. A `| head -1` here is the SIGPIPE shape the
+    # early-exit scan refuses (#1181).
+    local start terminal startAll terminalAll
+    startAll="$(sed -n 's/^StartMarker="\(.*\)"$/\1/p' "$wrapper")"
+    terminalAll="$(sed -n 's/^TerminalMarker="\(.*\)"$/\1/p' "$wrapper")"
+    start="${startAll%%$'\n'*}"
+    terminal="${terminalAll%%$'\n'*}"
     if [ -z "$start" ] || [ -z "$terminal" ]; then
         echo "FAIL: could not read the markers out of ${wrapper##*/}; this check cannot vouch for anything" >&2
         return 1
@@ -209,7 +213,9 @@ ${terminal}: ${outcome}"
             '${'*'}')
                 name="${p#\$\{}"
                 name="${name%\}}"
-                p="$(grep -v '^[[:space:]]*#' "$list" | sed -n 's/^set('"${name}"' "\(.*\)")$/\1/p' | head -1)"
+                local pAll
+                pAll="$(grep -v '^[[:space:]]*#' "$list" | sed -n 's/^set('"${name}"' "\(.*\)")$/\1/p')"
+                p="${pAll%%$'\n'*}"
                 # REFUSED, never dropped. A variable this cannot follow takes its
                 # pattern out of the scan silently, and the patterns that remain then
                 # report "no collision" for a set no longer containing the one that

@@ -271,7 +271,12 @@ entry_re='^[[:space:]]*[-*+][[:space:]]+(\*\*)?\[#([0-9]+)\]\(https://github\.co
 #
 # @param 1 the file gh's stderr was captured into
 _http_status() {
-    sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p' "$1" | head -1
+    # Captured, then first-lined. `sed ... | head -1` leaves sed writing into a
+    # closed pipe; it takes SIGPIPE and `pipefail` reports SED's status -- a false
+    # reading on the SUCCESS path, precisely when a status WAS found (#1181).
+    local all
+    all="$(sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p' "$1")"
+    if [ -n "$all" ]; then printf '%s\n' "${all%%$'\n'*}"; fi
 }
 
 scratch="$(mktemp -d)" || { echo "could not create a scratch directory" >&2; exit 2; }

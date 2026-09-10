@@ -56,9 +56,12 @@ done
 # Send PING then QUIT: the QUIT makes the daemon close the connection, so
 # `openssl s_client` exits cleanly (it otherwise keeps the socket open —
 # `-quiet` implies `-ign_eof` — and a fixed-size read would block forever).
-resp="$(printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n' \
-    | openssl s_client -connect "127.0.0.1:${port}" -quiet 2>/dev/null \
-    | head -c 128 || true)"
+raw="$(printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nQUIT\r\n' \
+    | openssl s_client -connect "127.0.0.1:${port}" -quiet 2>/dev/null || true)"
+# The first 128 characters, in bash. `| head -c 128` would leave openssl writing
+# into a closed pipe, and `pipefail` under the `set -e` above then reports
+# OPENSSL's status for a perfectly good response (#1181).
+resp="${raw:0:128}"
 echo "response: ${resp}"
 case "$resp" in
     *PONG*) echo "TLS smoke OK"; exit 0 ;;

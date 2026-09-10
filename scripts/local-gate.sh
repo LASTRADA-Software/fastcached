@@ -1064,13 +1064,16 @@ launcher_verdict() {
 # unreadable. `unknown` is not `none`: a gate that cannot check must not report.
 # @param 1 Path to the build directory.
 compiler_shim_verdict() {
-    local file compiler resolved base
-    file="$(ls "$1"/CMakeFiles/*/CMakeCXXCompiler.cmake 2>/dev/null | head -1)"
+    local file files compiler resolved base
+    files="$(ls "$1"/CMakeFiles/*/CMakeCXXCompiler.cmake 2>/dev/null || true)"
+    file="${files%%$'\n'*}"
     if [[ -z "$file" || ! -r "$file" ]]; then
         echo "unknown"
         return 0
     fi
-    compiler="$(sed -n 's/^set(CMAKE_CXX_COMPILER "\(.*\)")$/\1/p' "$file" | head -1)"
+    local compilers
+    compilers="$(sed -n 's/^set(CMAKE_CXX_COMPILER "\(.*\)")$/\1/p' "$file")"
+    compiler="${compilers%%$'\n'*}"
     if [[ -z "$compiler" ]]; then
         echo "unknown"
         return 0
@@ -1136,10 +1139,12 @@ header_filter_coverage() {
     local config="$1" root="$2"
     [[ -r "$config" ]] || { echo "no-config"; return 0; }
 
-    local include exclude
-    include="$(sed -n "s/^HeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config" | head -1)"
+    local include exclude includeAll excludeAll
+    includeAll="$(sed -n "s/^HeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config")"
+    include="${includeAll%%$'\n'*}"
     [[ -n "$include" ]] || { echo "no-regex"; return 0; }
-    exclude="$(sed -n "s/^ExcludeHeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config" | head -1)"
+    excludeAll="$(sed -n "s/^ExcludeHeaderFilterRegex:[[:space:]]*'\(.*\)'[[:space:]]*$/\1/p" "$config")"
+    exclude="${excludeAll%%$'\n'*}"
 
     # The tracked set, not a directory walk: a header the repository does not
     # carry is not one this gate owes an opinion about, and a build directory is
@@ -2289,10 +2294,10 @@ $gate_passed_marker"
     _unknown_head="== gate-clang-debug: SKIPS UNKNOWN -- this output carries no ctest totals line, so"
     expect "output with no totals line is UNKNOWN, never nothing-skipped" \
         "$_unknown_head" \
-        "$(skip_report gate-clang-debug <<< "a truncated log that stops mid-run" | head -1)"
+        "$(head -1 <<< "$(skip_report gate-clang-debug <<< "a truncated log that stops mid-run")")"
     expect "empty output is UNKNOWN too -- the shape a killed leg leaves" \
         "$_unknown_head" \
-        "$(skip_report gate-clang-debug <<< "" | head -1)"
+        "$(head -1 <<< "$(skip_report gate-clang-debug <<< "")")"
 
     # ctest prints `The following tests FAILED:` AFTER the did-not-run block, so a
     # reader that took the block to end of input would report those failures as
@@ -2482,7 +2487,7 @@ $gate_passed_marker"
     # stop precisely that.
     expect "a dumped 'All tests passed' line does not satisfy the finished check" \
         "$_unknown_head" \
-        "$(skip_report gate-clang-debug <<< "control suite: All tests passed (3 assertions in 2 test cases)" | head -1)"
+        "$(head -1 <<< "$(skip_report gate-clang-debug <<< "control suite: All tests passed (3 assertions in 2 test cases)")")"
     expect "... while ctest's real totals line does" \
         "== gate-clang-debug: no tests skipped" \
         "$(skip_report gate-clang-debug <<< "100% tests passed, 0 tests failed out of 10")"
@@ -2698,7 +2703,9 @@ run_preset() {
 
     echo "== $preset: build"
     if ! cmake --build --preset "$preset" > "$log" 2>&1; then
-        grep -E 'error:|FAILED' "$log" | head -40
+        local build_errors
+        build_errors="$(grep -E 'error:|FAILED' "$log" || true)"
+        if [[ -n "$build_errors" ]]; then head -40 <<< "$build_errors"; fi
         fail "$preset build (full log: $log)"
     fi
 
