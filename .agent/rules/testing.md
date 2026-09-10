@@ -1096,6 +1096,13 @@ questions, and only the second one tests anything — so an acceptance criterion
 hypothesis, and it is worth asking the second question separately before writing the
 test that satisfies it.
 
+An acceptance clause has a second failure mode that is not about the hypothesis at all:
+it may name an operation the tree cannot perform, in which case no tree can show it red
+and the ticket can be closed by nobody. That, and the wider rule it belongs to — **a
+ticket is a claim about a tree and it decays, so a premise is CHECKED before it is built
+on, never read** — live in `AGENT.md`'s *Issues and pull requests* section and are
+deliberately not restated here, because two copies of a rule are two things to be wrong.
+
 Three entries in this file are instances of it: a bounded wait that must say which
 KIND of failure it was, a fixture that states which PATH it exercised, and `SUCCEED`
 standing in for a skip. **A harness earns its place by asserting something that can be

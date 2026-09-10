@@ -2432,6 +2432,45 @@ re-apply it and read that warning rather than assuming the gate is flaky (#347).
 Deferred work is a GitHub issue linked from the matching rulebook file's
 `## Open work` section, never a residual recorded only in prose.
 
+**A ticket is a claim about a tree, taken once, and every merge since is an unrecorded
+condition change — so a premise is CHECKED against the tree before it is built on, never
+read.** The rulebook already carries this for performance figures (*a quantity UNDER
+CONDITIONS, and the citation is where the conditions get lost*); a ticket is the same
+object with a longer half-life and no units, and the difference is that a figure at least
+LOOKS like it might be stale while a sentence does not. Eight instances in one evening
+across five lanes, none of them a coding mistake and **not one visible from reading the
+ticket** — every one was found by checking, and the check is cheap: a `grep` for a cited
+symbol, `gh issue view` on a cited number, `git log -S` on a cited claim. The stale-body
+six are #401 (three separate premises: a flag that exists, a symbol `FleetMemory` that is
+in no tree, and a version pair that had moved from 2 to 3 at #730), #386 (line numbers
+moved), #614 (*"no diagnostic"* — there is one), #543 (*"one hunk superseded, three to
+land"*, all four stale, two of which would have added CLOSED work to an `## Open work`
+section), and #665 (assumes a shared cost layer #664 never built). **The cost is
+asymmetric**: a stale figure makes somebody re-measure, a stale premise sends a whole lane
+to build against a tree that does not exist, and two of the eight would have made the
+documentation actively wrong.
+
+Three consequences, none of which follows from the headline:
+
+- **The ticket may not be OPEN.** #489 and #203 were dispatched as open work with both
+  closed two days earlier, #489 having been escalated and decided at owner level. Asking
+  `gh issue view` is one call and it is not the same question as *is the body accurate*.
+- **"Does not reproduce" is a first-class outcome with a DELIVERABLE**, not a close and
+  not a shrug: the falsified claims with `file:line`, plus **a test at the production seam
+  that stays green**, committed `Refs #N` rather than `Closes #N`. A test that records why
+  a ticket does not reproduce is worth keeping, and it must not silently close a design
+  question underneath it. #401 is the worked example.
+- **A ticket whose acceptance clause cannot be EXECUTED is a different failure from one
+  that is merely stale, and it can be closed by nobody, ever.** #401's clause said *"by
+  removing the identity from the registration reply"* and the REGISTER reply is a bare id
+  string — there is nothing to remove, so the clause could not have been shown red even on
+  a tree where the defect existed. #537 is the other variant: dispatched as buildable, and
+  a signature record by design with no acceptance clause at all. Separate these from the
+  stale-body six rather than filing them together. This generalises the counts rule in
+  [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) — *a ticket
+  cannot be closed against a count that no longer describes the tree* — from counts to
+  claims.
+
 When several sessions work this repository in parallel — a manager plus two or three
 developers — the lane ownership, rebase and merge protocol, review gates and the
 type-label check's cancelled-versus-failed distinction are in
