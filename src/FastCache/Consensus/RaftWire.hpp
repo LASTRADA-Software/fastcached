@@ -207,14 +207,15 @@ namespace Detail
     /// Decode a single-byte field into `E`.
     ///
     /// The width check is this function's; the *range* check is
-    /// `Consensus::DecodeWireEnum`, whose bound lives beside the enum so this
-    /// decoder and `FileRaftStorage`'s cannot disagree about what the highest
-    /// enumerator is.
-    /// @tparam E The enumeration.
+    /// `Consensus::DecodeWireEnum`, whose bound is DERIVED from the enum's own
+    /// `Last` -- so this decoder and `FileRaftStorage`'s cannot disagree about
+    /// where the enum ends, and neither of them can be left behind when an
+    /// enumerator is appended.
+    /// @tparam E The enumeration, which must carry a trailing `Last`.
     /// @param field The field's bytes.
     /// @return The value, or nullopt when the field is the wrong width or the
     ///         byte names no enumerator.
-    template <typename E>
+    template <EnumWithLast E>
     [[nodiscard]] std::optional<E> DecodeEnum(std::span<std::byte const> field) noexcept
     {
         auto const raw = WireFields::FromBigEndian<std::uint8_t>(field);

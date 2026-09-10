@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/EnumTable.hpp>
+
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -111,22 +113,31 @@ using NodeId = std::string;
 /// directions: `FileRaftStorage` writes it into every log record on disk and
 /// `RaftWire` puts it on the peer wire, and `DecodeWireEnum<EntryKind>` casts it back.
 ///
-/// Inserting an enumerator mid-enum therefore does not fail to load. `WireEnumBound`
-/// is raised, the build is green, every test passes -- and every record already in
+/// Inserting an enumerator mid-enum therefore does not fail to load. The bound moves
+/// with the enum -- since #197 it is `Last`, derived, so not even a second edit is
+/// needed -- the build is green, every test passes, and every record already in
 /// `raft.log` comes back one kind along, so a committed `Configuration` reads as the
 /// entry below it and the membership change is ordered, committed and never adopted.
 /// A leader and a follower on either side of the change disagree about what every
 /// frame means with nothing anywhere reporting a fault.
 ///
-/// The explicit `= N` is the enforcement rather than decoration: without it a mid-enum
-/// insertion is one added line with nothing else visible, and with it the same edit
-/// shows up in review as a renumbered literal on every row below it.
+/// The `static_assert`s below are the enforcement rather than decoration: without them
+/// a mid-enum insertion is one added line with nothing else visible. They pin what
+/// TRAVELS and stop where the wire does -- `Last` is deliberately unpinned, because a
+/// pinned sentinel is a second edit on every append and that is the whole of #197.
+/// So an insertion FAILS THE BUILD and an append costs nothing, which is the way round
+/// these two need to be.
 enum class EntryKind : std::uint8_t
 {
-    Command = 0,       ///< Application bytes, delivered through `RaftOutput::applied`.
-    NoOp = 1,          ///< Consensus' own; ordered and committed, but never delivered.
-    Configuration = 2, ///< The cluster's member set; adopted on append, never delivered.
+    Command,       ///< Application bytes, delivered through `RaftOutput::applied`.
+    NoOp,          ///< Consensus' own; ordered and committed, but never delivered.
+    Configuration, ///< The cluster's member set; adopted on append, never delivered.
+    Last,          ///< Not a kind, has no ordinal on the wire: the count `DecodeWireEnum` bounds on.
 };
+
+static_assert(static_cast<std::uint8_t>(EntryKind::Command) == 0, "EntryKind ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(EntryKind::NoOp) == 1, "EntryKind ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(EntryKind::Configuration) == 2, "EntryKind ordinals are a wire contract");
 
 /// One entry in the replicated log.
 ///
@@ -170,9 +181,13 @@ enum class Role : std::uint8_t
 /// times. A swap here is a denied vote read as granted, which is two leaders.
 enum class VoteDecision : std::uint8_t
 {
-    Denied = 0,  ///< The vote was refused; the response's term says why it may have been.
-    Granted = 1, ///< The voter has committed its one vote for this term to the candidate.
+    Denied,  ///< The vote was refused; the response's term says why it may have been.
+    Granted, ///< The voter has committed its one vote for this term to the candidate.
+    Last,    ///< Not a decision, and never travels. See `DecodeWireEnum`.
 };
+
+static_assert(static_cast<std::uint8_t>(VoteDecision::Denied) == 0, "VoteDecision ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(VoteDecision::Granted) == 1, "VoteDecision ordinals are a wire contract");
 
 /// Whether a follower accepted an AppendEntries.
 ///
@@ -182,66 +197,56 @@ enum class VoteDecision : std::uint8_t
 /// accepted, so a leader advances `matchIndex` for a log that does not match.
 enum class AppendResult : std::uint8_t
 {
-    Rejected = 0, ///< Term too old, or the consistency check at `prevLogIndex` failed.
-    Accepted = 1, ///< The follower's log now matches the leader's through the entries sent.
+    Rejected, ///< Term too old, or the consistency check at `prevLogIndex` failed.
+    Accepted, ///< The follower's log now matches the leader's through the entries sent.
+    Last,     ///< Not a result, and never travels. See `DecodeWireEnum`.
 };
 
-/// The largest enumerator of an enum that travels on the wire or on disk.
-///
-/// A trait rather than an argument each decoder passes, because "what is the
-/// highest `EntryKind`?" is a property of the enum and not of the call site. The
-/// primary template is deliberately **left undefined**, so a new wire enum that
-/// forgets its bound is a compile error at the decode site rather than a decoder
-/// that silently accepts every byte.
-///
-/// The alternative — and what this replaced — was each decoder naming the current
-/// highest enumerator itself, which `RaftWire` and `FileRaftStorage` were both
-/// doing for `EntryKind`. Adding a kind then means finding every site, and a
-/// missed one does not fail to compile: it *rejects* every frame or log record
-/// carrying the new kind, which reads as corruption rather than as an omission.
-/// @tparam E The enumeration.
-template <typename E>
-struct WireEnumBound;
-
-/// `EntryKind`'s bound. Raise it in lock-step with the last enumerator.
-template <>
-struct WireEnumBound<EntryKind>
-{
-    static constexpr EntryKind Highest = EntryKind::Configuration;
-};
-
-/// `VoteDecision`'s bound.
-template <>
-struct WireEnumBound<VoteDecision>
-{
-    static constexpr VoteDecision Highest = VoteDecision::Granted;
-};
-
-/// `AppendResult`'s bound.
-template <>
-struct WireEnumBound<AppendResult>
-{
-    static constexpr AppendResult Highest = AppendResult::Accepted;
-};
+static_assert(static_cast<std::uint8_t>(AppendResult::Rejected) == 0, "AppendResult ordinals are a wire contract");
+static_assert(static_cast<std::uint8_t>(AppendResult::Accepted) == 1, "AppendResult ordinals are a wire contract");
 
 /// Turn a byte that arrived from a peer or from disk into an enumerator.
 ///
 /// Casting an arbitrary byte into an enumeration produces a value no `switch`
-/// handles and no invariant covers, and the byte is not this process's to trust —
+/// handles and no invariant covers, and the byte is not this process's to trust --
 /// so an out-of-range one is a malformed record to refuse, never a precondition
 /// to assert on.
 ///
+/// **The bound is DERIVED from the enum's own `Last`, never named** (#197). What
+/// this replaced was a `WireEnumBound<E>::Highest` trait naming the last enumerator
+/// BY NAME, one specialization per enum -- the shape
+/// `.agent/rules/build-and-toolchain.md` bans for a table length, arriving as a
+/// bound. It fails CLOSED rather than open, which is why it was not a correctness
+/// bug: append an enumerator, forget to raise the trait, and the new value is
+/// REFUSED. But it is refused on a peer that understands it perfectly, with nothing
+/// anywhere saying why -- a rolling upgrade where one side quietly rejects frames
+/// the other treats as ordinary.
+///
+/// It also left the tree with TWO mechanisms for one job, and the better one was the
+/// local copy: `Cluster::DecodeCommand` could not use the trait at all, because
+/// `CommandKind` had gained a trailing `Last` for its `EnumTable` and specializing
+/// `WireEnumBound` would have re-introduced the name anchor that change had just
+/// removed (#159). So it open-coded `raw >= EnumeratorCount<CommandKind>` -- which is
+/// exactly this, written out. That is now the only mechanism.
+///
+/// **`Last` never travels, and this is what enforces it**: the comparison is
+/// `>=`, so `Last`'s own ordinal decodes to `nullopt` like any other byte naming no
+/// enumerator. That answers the question #197 left open -- every wire enum here does
+/// want `Last`, because the cost is one enumerator that is refused by construction
+/// and the alternative is a second edit nothing reminds you to make.
+///
 /// **Every enum reaching here has ordinals that leave this process**, and the cast
-/// below spells the enum as `E` — so a census of `static_cast<SomeEnum>(byte)` finds
-/// none of them, and the three specializations above have to be reached by reading
-/// (#308). Each says so at its own declaration; a fourth must too.
-/// @tparam E The enumeration, which must specialize `WireEnumBound`.
+/// below spells the enum as `E` -- so a census of `static_cast<SomeEnum>(byte)` finds
+/// none of them, and the enums have to be reached by reading (#308). Each says so at
+/// its own declaration; a new one must too.
+///
+/// @tparam E The enumeration, which must carry a trailing `Last`.
 /// @param raw The byte as read.
 /// @return The enumerator, or nullopt when the byte names none.
-template <typename E>
+template <EnumWithLast E>
 [[nodiscard]] constexpr std::optional<E> DecodeWireEnum(std::uint8_t raw) noexcept
 {
-    if (raw > static_cast<std::uint8_t>(WireEnumBound<E>::Highest))
+    if (static_cast<std::size_t>(raw) >= EnumeratorCount<E>)
         return std::nullopt;
     return static_cast<E>(raw);
 }
