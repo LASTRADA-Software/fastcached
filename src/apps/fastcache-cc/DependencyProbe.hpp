@@ -220,9 +220,10 @@ struct DependencySet
 /// is *not* refused — that layout is portable precisely because the consumer
 /// substitutes its own root, and refusing it would un-key a layout that works.
 ///
-/// Inequality against the input is what says a token was produced — the same test
-/// `PortableForm`, `ProjectToken` and `RootReconciler::Translate` each apply. It is
-/// the ONLY test there is: nothing in PathCanon can fail (issues #59, #69).
+/// Inequality against the input is what says a token was produced — spelled once, in
+/// `PathCanon::CanonicalToken`, which `PortableForm` and the direct manifest both
+/// call and which `RootReconciler::Translate` applies for itself (#122). It is the
+/// ONLY test there is: nothing in PathCanon can fail (issues #59, #69).
 ///
 /// Pure: touches no filesystem. A drive-relative path is one of the few a
 /// filesystem could not place anyway.

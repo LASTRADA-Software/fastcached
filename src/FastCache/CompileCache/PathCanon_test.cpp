@@ -7,7 +7,10 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
+using namespace FastCache::Testing;
 using PathCanon::Grammar;
 using PathCanon::Layout;
 
@@ -27,6 +30,51 @@ TEST_CASE("Canonicalize prefers the longest (build-tree) root when nested under 
     Layout const layout { .sourceRoot = R"(C:\src)", .buildTree = R"(C:\src\build)" };
     auto const token = PathCanon::Canonicalize(R"(C:\src\build\gen\config.h)", layout);
     CHECK(token == "<BUILDTREE>/gen/config.h");
+}
+
+TEST_CASE("CanonicalToken reports a rewrite as a value and a non-rewrite as nullopt")
+{
+    // BOTH directions in one case, because they are only meaningful against each
+    // other: a function returning a value always passes the first, and one returning
+    // nullopt always passes the second. What is being pinned is that it
+    // DISCRIMINATES, which is the whole reason the two call sites can share it.
+    Layout const layout { .sourceRoot = R"(C:\ci\src)", .buildTree = R"(C:\ci\build)" };
+
+    auto const under = PathCanon::CanonicalToken(R"(C:\ci\src\include\foo.h)", layout);
+    REQUIRE(under.has_value());
+    CHECK(Unwrap(under) == "<SRCROOT>/include/foo.h");
+
+    // Under no root, so `Canonicalize` hands the input back and there is no token.
+    CHECK_FALSE(PathCanon::CanonicalToken(R"(C:\elsewhere\foo.h)", layout).has_value());
+
+    // A path that is ALREADY a token is not rewritten either, and must not read as a
+    // token this layout produced -- the same nullopt, for a different reason, which
+    // is the caller's business rather than this function's.
+    CHECK_FALSE(PathCanon::CanonicalToken("<SRCROOT>/include/foo.h", layout).has_value());
+}
+
+TEST_CASE("CanonicalToken is exactly Canonicalize's own signal, not a second rule")
+{
+    // #122 folded two file-local copies into this one. The property that makes that
+    // safe is that it adds NOTHING: for every path, having a value must be identical
+    // to `Canonicalize` returning something other than its input. Asserted over a set
+    // that reaches all three branches -- under a root, under neither, and a near miss
+    // on a segment boundary -- so agreement is not a coincidence of one input.
+    Layout const layout { .sourceRoot = R"(C:\ci\src)", .buildTree = R"(C:\ci\src\build)" };
+    for (auto const* path: { R"(C:\ci\src\a.h)",
+                             R"(C:\ci\src\build\gen.h)",
+                             R"(C:\ci\srcx\a.h)",
+                             R"(C:\other\a.h)",
+                             "<SRCROOT>/a.h",
+                             "relative/a.h" })
+    {
+        INFO("path " << path);
+        auto const rewritten = PathCanon::Canonicalize(path, layout);
+        auto const token = PathCanon::CanonicalToken(path, layout);
+        CHECK(token.has_value() == (rewritten != std::string { path }));
+        if (token.has_value())
+            CHECK(Unwrap(token) == rewritten);
+    }
 }
 
 TEST_CASE("Localize is the inverse of Canonicalize under a different layout")
