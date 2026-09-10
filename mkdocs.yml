@@ -112,6 +112,7 @@ nav:
     - Overview: tools/index.md
     - fastcache-cc (compiler launcher): tools/fastcache-cc.md
     - fastcache-compile-node (compile worker): tools/fastcache-compile-node.md
+    - fastcache-cli (operator client): tools/fastcache-cli.md
   - Protocols:
     - Overview: protocols/overview.md
     - Coverage matrix: protocols/coverage-matrix.md

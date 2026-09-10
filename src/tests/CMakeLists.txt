@@ -3559,7 +3559,7 @@ set_tests_properties("node-working-directory-selftest" PROPERTIES
 # the binary; do not make it go away by changing a code page, and read the
 # script's header before reaching for `ENCODING`, one value of which reports a
 # PASS for the very defect this checks for.
-foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node compile-cache-testclient)
+foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node fastcache-cli compile-cache-testclient)
     if(TARGET ${_utf8ArgvTarget})
         add_test(
             NAME "utf8-argv-${_utf8ArgvTarget}"

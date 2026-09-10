@@ -128,7 +128,7 @@ set(FASTCACHED_MACOS_NODE_LABEL      "software.lastrada.fastcachecompilenode")
 # own comment records what that cost: "The uninstaller has the mirror of this
 # guard; this is the half that went missing." A tool added to one and not the
 # other is either a link nothing removes or a link nothing creates.
-set(FASTCACHED_MACOS_LINKED_TOOLS "fastcached fastcache-cc fastcache-compile-node")
+set(FASTCACHED_MACOS_LINKED_TOOLS "fastcached fastcache-cc fastcache-compile-node fastcache-cli")
 
 # The machine-wide configuration directory. Declared here, not in packaging/,
 # for the same scoping reason as the macOS variables above: packaging/ installs
