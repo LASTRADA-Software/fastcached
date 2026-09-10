@@ -19,3 +19,19 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${FASTCACHED_MODULE_DIR}")
 include(CompileCache)
+
+# A compile edge, and it has to come AFTER the include (#187).
+#
+# The module sets `CMAKE_CXX_COMPILER_LAUNCHER` as a normal variable rather than a
+# cache entry, so `CMakeCache.txt` is silent about what it chose -- measured across
+# eleven build trees on one workstation, unset in every one, including five that
+# were demonstrably running sccache on every compile. What DOES carry the decision
+# is the generated buildsystem, and a project with no target generates no compile
+# edge to carry it. So a check that reads only the configure OUTPUT is asserting
+# what the module SAID and never what it WIRED, and a module that printed the right
+# sentence while wiring nothing would pass every row.
+#
+# Still never built: the stand-in launchers the caveat check points this at are
+# `cmake` and `ctest`, which are real programs precisely so the module records
+# them, and are not compilers.
+add_library(compile-cache-fixture-probe OBJECT probe.cpp)

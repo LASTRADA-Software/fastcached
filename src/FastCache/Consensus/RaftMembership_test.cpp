@@ -183,6 +183,55 @@ TEST_CASE("A leader adopts a new configuration before it commits", "[consensus][
     CHECK(sawNewMember);
 }
 
+TEST_CASE("A change proposed while one is in flight is a MOMENT, not an invalid configuration",
+          "[consensus][raft][membership]")
+{
+    LeaderFixture fix;
+
+    // One accepted change, deliberately left uncommitted.
+    auto const first = fix.node.ProposeMembership({ "n1", "n2", "n3", "n4" }, At(200));
+    REQUIRE(first.has_value());
+
+    auto const second = fix.node.ProposeMembership({ "n1", "n2", "n3", "n4", "n5" }, At(210));
+    REQUIRE_FALSE(second.has_value());
+
+    // The assertion that DISTINGUISHES, and the whole of #196: this used to answer
+    // `InvalidConfiguration`, which `SubjectOf` classifies `Command` -- permanent,
+    // reported at Warn as a record somebody must go and correct. It clears the
+    // instant the first change commits.
+    CHECK(second.error().code == ConsensusErrorCode::ConfigurationChangeInFlight);
+    CHECK(second.error().code != ConsensusErrorCode::InvalidConfiguration);
+    CHECK(SubjectOf(second.error().code) == RefusalSubject::Moment);
+
+    // And it still says why, because a caller that gives up needs to know it may
+    // ask again.
+    CHECK(second.error().context.contains("already in flight"));
+}
+
+TEST_CASE("Proposing the member set already in force is SATISFIED, not a refusal to act on", "[consensus][raft][membership]")
+{
+    LeaderFixture fix;
+
+    auto const unchanged = fix.node.ProposeMembership({ "n1", "n2", "n3" }, At(200));
+    REQUIRE_FALSE(unchanged.has_value());
+
+    // Neither of the other two answers is true of it. `Command` would report an
+    // idempotent request as a record that can never be agreed; `Moment` would
+    // abandon a reconcile pass that had nothing left to do. Naming the third state
+    // is what #196 settled, and it is this repository's own four-states rule
+    // arriving in a consensus taxonomy.
+    CHECK(unchanged.error().code == ConsensusErrorCode::MembershipUnchanged);
+    CHECK(unchanged.error().code != ConsensusErrorCode::InvalidConfiguration);
+    CHECK(SubjectOf(unchanged.error().code) == RefusalSubject::Satisfied);
+    CHECK(SubjectOf(unchanged.error().code) != RefusalSubject::Command);
+    CHECK(SubjectOf(unchanged.error().code) != RefusalSubject::Moment);
+
+    CHECK(unchanged.error().context.contains("current one"));
+
+    // Nothing was appended, which is why it is not a success carrying an index.
+    CHECK(fix.node.ActiveMembers().size() == 3);
+}
+
 TEST_CASE("A two-member change is refused", "[consensus][raft][membership]")
 {
     LeaderFixture fix;

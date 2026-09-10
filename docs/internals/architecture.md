@@ -117,10 +117,23 @@ differs by platform:
   bind round-robins accepted sockets across the IOCP reactors. Each handed-off
   socket runs `co_await ResumeOn{reactor}` first, which re-schedules the
   coroutine onto the target reactor's thread before any I/O — restoring the
-  "one connection, one reactor thread" invariant. (On the persistent-disk
-  backend several threads additionally drain one IOCP so a blocking page-store
-  `fsync` overlaps serving other connections; that backend is therefore always
-  wrapped in a thread-safe `ShardedStorage`.)
+  "one connection, one reactor thread" invariant. **No completion port is ever
+  drained from several threads**: `IocpReactor.hpp` calls that unsafe, because
+  it migrates a coroutine across threads, and `RunMultiReactorWindows` runs one
+  thread per reactor exactly as the POSIX path does. This page claimed the
+  opposite — several threads draining one IOCP so a page-store `fsync` overlaps
+  serving other connections — until
+  [#896](https://github.com/LASTRADA-Software/fastcached/issues/896); that
+  mechanism is in no source.
+
+The disk backend is always wrapped in a thread-safe `ShardedStorage`, but that
+is not a Windows property and the paragraph above is not its reason.
+`main.cpp` wraps whenever more than one thread can reach the storage, and the
+persistent backend is one of four conditions that say so — the others being an
+explicit multi-shard layout, the reactor running on more than one thread (the
+default, since `--threads` unset means `hardware_concurrency()`), and the
+metrics endpoint, whose `fc-admin` thread calls `engine.Snapshot()`
+concurrently with the reactor.
 
 See `Server/ReactorServerLoop.cpp` for both paths.
 

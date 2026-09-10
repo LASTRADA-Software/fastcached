@@ -1723,6 +1723,61 @@ set_tests_properties("test-name-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A test may not decide anything from the architecture it was COMPILED for.
+#
+# `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the
+# BUILD, while the implementation picks its answer from the same fact -- so both
+# flip together and the case is green under every build, unable to fail for the
+# reason it exists. That is #146: the MSVC bindir chosen by the architecture the
+# binary was compiled for rather than the machine it runs on, with a test pointed
+# straight at it that could not have caught it.
+#
+# Scoped to architecture macros and NOT to `_WIN32`, and the distinction is the
+# whole reason this check can exist: a Windows build runs on Windows, so an
+# operating-system condition is a fact and a per-platform literal is sound, while
+# an x64 build runs on ARM64 Windows routinely, so an architecture condition is a
+# PROXY. Measured when this landed: 35 of 215 test files carry a platform or
+# architecture directive and 33 are the legitimate shape, so a scan over platform
+# directives generally would refuse 33 correct files -- and a guard that refuses
+# correct code gets disabled, taking the real finding with it. The script's header
+# carries the full reasoning; do not widen it.
+#
+# Default set rather than "smoke": it reads source files, needs no daemon, socket
+# or compiler, and has no skip path.
+#
+# **50 ms, and the figure carries its conditions** because they differ by 168x.
+# Measured on one machine, one afternoon, same check and same 215 files: 0.050 s
+# on ext4, 8.4 s idle on a DrvFs checkout under WSL, 11.9 s there at load average
+# 27, and one outright TIMEOUT at 60 s while a full gate ran alongside it. The
+# cost is the filesystem's per-file open, not this check -- a whole-file filter
+# before the line read, the optimisation that took `worker-refusals-counted` from
+# 2.9 s to 208 ms, was tried here and moved nothing (8.385 s against 8.420 s),
+# because there is no line-matching cost to remove. So a slow local run is the
+# checkout, and anyone meeting one should not optimise a 50 ms check or raise this
+# timeout to silence it.
+#
+# **No `SKIP_RETURN_CODE` here, and its absence is load-bearing.** It reads as a
+# redundant observation until #1128: a status this registration does not claim is
+# a status CTest is free to reinterpret. Catch2's exit code IS its failed-assertion
+# count, so a case failing exactly four assertions exits 4, collides with the
+# `SKIP_RETURN_CODE 4` the Catch2 registrations must carry, and ctest reports
+# `100% tests passed` over a red binary. This check exits 1 on a refusal, claims
+# no skip code, and has no skip path to want one -- so its refusal cannot be
+# silently rescored into a skip. Verified through the real harness rather than
+# read off the idiom: with a violation planted, ctest scores it **Failed**.
+add_test(
+    NAME "architecture-conditioned-tests"
+    COMMAND ${CMAKE_COMMAND}
+        "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}/src"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-architecture-conditioned-tests.cmake"
+)
+set_tests_properties("architecture-conditioned-tests" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # Byte-order qualifier hygiene. Fails when a source file writes `::htonl(...)`
 # or any of its siblings.
 #
@@ -2895,8 +2950,9 @@ endif()
 # and the full sweep still runs, still fails and still reaches nobody: 18 of 18
 # failed master-push runs were never once re-run.
 #
-# `scripts/tidy-sweep.sh --self-test` covers the scope COMPUTATION. Nothing
-# covered which events reach it with which scope, which is the half #554 changed.
+# `scripts/tidy-sweep.sh --self-test` covers the scope COMPUTATION and, since
+# #257, the CANARY's verdict. Nothing covered which events reach it with which
+# scope, which is the half #554 changed.
 #
 # Two registrations for the reason `target-file-guards` carries: the check reads
 # the real workflow, and the self-test drives every rule against synthetic ones in
@@ -3127,6 +3183,14 @@ if(NOT WIN32)
         # `SKIP_RETURN_CODE 77` STAYS. The interpreter is known to clear the floor here,
         # so this arm should not skip -- but the script exits 77 for its own reasons too,
         # and a registration that scores those a FAILURE is #499 exactly.
+        #
+        # What this covers grew with #257: the self-test now drives `CanaryVerdict`
+        # as well as the scope computation, so the guard that stops a whole branch
+        # being reported clean by an analyser that never ran is exercised on every
+        # platform and from `local-gate.sh` -- rather than only where a full sweep
+        # with a working clang-tidy was already happening. The registration itself
+        # did not have to change, which is why #257's first two acceptance clauses
+        # were already met when it was picked up.
         add_test(
             NAME "tidy-sweep-selftest"
             COMMAND ${FASTCACHED_BASH44} "${CMAKE_SOURCE_DIR}/scripts/tidy-sweep.sh" --self-test
@@ -3141,7 +3205,7 @@ if(NOT WIN32)
         # skipped, and dropping the row is what makes a permanent gap indistinguishable
         # from a platform that was never meant to run it.
         fastcached_register_skipped_test("tidy-sweep-selftest"
-            "no bash >= 4.4 on this host, so tidy-sweep.sh's scope computation was not exercised")
+            "no bash >= 4.4 on this host, so tidy-sweep.sh's scope computation and canary verdict were not exercised")
     endif()
 endif()
 
@@ -3885,12 +3949,52 @@ else()
 endif()
 if(TARGET fastcached AND TARGET fastcache-cc)
     # Binds a port and spawns a daemon, so it must not run concurrently with the
-    # other server-starting smoke tests.
+    # other server-starting smoke tests. The port is DRAWN per run since #220 --
+    # `RUN_SERIAL` stays because the daemon is still a shared machine resource and
+    # the compiles are not cheap, not because the port collides any more.
     set_tests_properties("compile-cache-e2e" PROPERTIES
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
     )
+endif()
+
+# The port discipline the Windows fixture above now has, driven WITHOUT it (#220).
+#
+# `run-launcher-e2e.ps1` used to bind a constant `21714`, so a run that did not
+# reach its cleanup left a daemon listening for as long as the machine was up and
+# every later run failed at `fastcached exited immediately (exit 1)` -- naming
+# neither the port nor the process, and reading exactly like a daemon that cannot
+# start. It was diagnosed once by hand from `Get-NetTCPConnection`, after it
+# survived a rebase and looked like a regression the rebase had introduced.
+#
+# The fix draws a port per run and, for an explicitly passed one, PROBES it and
+# refuses by name. That decision is what can be wrong, and until this registration
+# it was reachable only by running the whole fixture, which needs a built daemon, a
+# built launcher and an MSVC toolchain -- so on every machine and every CI leg
+# without those it was asserted by nothing. `-SelfTestPorts` drives the decision
+# over staged holder records AND against real listeners on this machine, and needs
+# none of the three.
+#
+# Not guarded on `TARGET fastcached`, deliberately: needing no binary is the whole
+# point, and gating it on one would put it back to running only where the fixture
+# already ran.
+find_program(FASTCACHED_PWSH NAMES pwsh)
+if(FASTCACHED_PWSH)
+    add_test(
+        NAME "launcher-e2e-ports-selftest"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File
+                "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/run-launcher-e2e.ps1" -SelfTestPorts
+    )
+    set_tests_properties("launcher-e2e-ports-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+else()
+    # Absent is not skipped, and dropping the row is what makes a permanent gap
+    # indistinguishable from a platform that was never meant to run it.
+    fastcached_register_skipped_test("launcher-e2e-ports-selftest"
+        "no pwsh on this host, so run-launcher-e2e.ps1's port decision was not exercised")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -4819,5 +4923,56 @@ add_test(
 )
 set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
     LABELS "hygiene"
+    TIMEOUT 300
+)
+
+# The cluster key must live in a container that zeroes its storage (#324).
+#
+# Registered because fixing the eight holders is not fixing the defect: a ninth is one
+# declaration away and looks exactly like the eight did. It earned this row on its first
+# real run -- a careful hand census of this same tree found SIX holders, and the scan then
+# named two more in `FleetHarness.hpp` that the census had walked straight past.
+#
+# In the DEFAULT set rather than `smoke`, because it needs no daemon, socket or compiler,
+# and a check that runs on one leg is a check that is not consulted.
+#
+# It reads NAMES, and what that cannot see is written on the script rather than implied
+# here: a credential under a name its table does not carry is invisible to it. The
+# compensating rule is that every row must still MATCH something -- a term that has quietly
+# stopped matching is a guard that has quietly stopped guarding, and reads identically to a
+# clean tree (#492). That arm is not decoration: the table's first draft carried a
+# `clusterKey` row, the check refused the real tree over it, and the row was wrong -- this
+# tree names no such variable, only `clusterKeyFile`, which is a PATH and not the secret.
+add_test(
+    NAME "credential-containers"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh"
+)
+set_tests_properties("credential-containers" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+
+# Six cases, both directions, and the ones with teeth are the negatives.
+#
+# Case 1 asserts the PASSING direction, which is the arm nobody writes: #1031 was a guard
+# that refused every tree and stood for two days, because a guard nobody has watched ACCEPT
+# is not known to work.
+#
+# Cases 3 and 4 are the two silent failures -- a vocabulary term that has stopped matching,
+# and an empty population, both of which a naive check reports as clean.
+#
+# Case 6 pins the two FALSE POSITIVES this check produced on its first run against the real
+# tree: `std::string` matched as a RETURN type on a line whose parameter was a span, and
+# `std::string` matched inside `std::string_view`. Both are one mistake -- a pattern is
+# broader than its author reads it as -- and both point at REFUTING a correct declaration,
+# which is the direction that gets acted on because a finding looks like work.
+add_test(
+    NAME "credential-containers-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh" --self-test
+)
+set_tests_properties("credential-containers-selftest" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
     TIMEOUT 300
 )

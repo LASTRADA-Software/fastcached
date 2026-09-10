@@ -88,6 +88,15 @@ namespace
                                              // numbers a fleet is sized from.
                                              Wire::ErrorCode::NoCluster,
                                              Wire::ErrorCode::InvalidClusterChange,
+                                             // Neither is an event. One is what a
+                                             // healthy cluster answers while a change
+                                             // it accepted replicates, and the other
+                                             // is an idempotent request arriving
+                                             // twice -- so a rise in either would
+                                             // measure how often somebody retried,
+                                             // not anything a fleet is sized from.
+                                             Wire::ErrorCode::ClusterChangeInFlight,
+                                             Wire::ErrorCode::ClusterChangeNotNeeded,
                                              Wire::ErrorCode::StorageWriteFailed };
 
     /// Whether every refusal this service can produce is accounted for exactly once.
@@ -202,6 +211,12 @@ namespace
     /// closed-by-default answer rather than a claim about what happened.
     constexpr EnumTable<ConsensusErrorCode, ProposalRefusalRow> ProposalRefusals { {
         { .code = ConsensusErrorCode::InvalidConfiguration, .reported = Wire::ErrorCode::InvalidClusterChange },
+        // The two #196 split out, and the split reaches the wire because it is the
+        // wire that an operator reads. One says ask again in a moment and the other
+        // says there was nothing to ask; reporting either as `InvalidClusterChange`
+        // sends somebody to correct a record that is already correct.
+        { .code = ConsensusErrorCode::ConfigurationChangeInFlight, .reported = Wire::ErrorCode::ClusterChangeInFlight },
+        { .code = ConsensusErrorCode::MembershipUnchanged, .reported = Wire::ErrorCode::ClusterChangeNotNeeded },
         { .code = ConsensusErrorCode::NotLeader, .reported = Wire::ErrorCode::NotLeader },
         { .code = ConsensusErrorCode::StorageFailure, .reported = Wire::ErrorCode::StorageWriteFailed },
         { .code = ConsensusErrorCode::MalformedFrame, .reported = Wire::ErrorCode::InvalidClusterChange },

@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include <tests/ForeignGenerationValue.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -170,13 +171,10 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
     // generation this build does not implement.
     Fixture fix;
 
-    CompileValue produced;
-    produced.objectBlob = { std::byte { 0x01 } };
-    produced.textRegions.push_back(
-        TextRegion { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = "Note: including file: /src/inc/a.hpp\n" });
-    auto foreign = EncodeCompileValue(produced);
-    REQUIRE(static_cast<std::uint8_t>(foreign.front()) == CompileValueVersion);
-    foreign.front() = std::byte { CompileValueVersion + 1 };
+    // Encoded through the real encoder and then restamped, so the framing is honest and
+    // what marks it foreign is the leading byte alone. Which byte that is lives in
+    // `src/tests/ForeignGenerationValue.hpp`, and in no other test binary (#649).
+    auto const foreign = Testing::ForeignGenerationValue();
 
     auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
         .key = "k-foreign", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = foreign })));

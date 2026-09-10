@@ -55,6 +55,29 @@ Decider="scripts/ci-merge-group-report.sh"
 Reporter="scripts/ci-report-issue.sh"
 BuildWorkflow=".github/workflows/build.yml"
 
+# The runner's own vocabulary: names a step may read without declaring, because
+# GitHub sets them. An ALLOWLIST and not a pattern, so it fails CLOSED -- a
+# `GITHUB_`-prefixed regex would have admitted nothing here, but the general
+# shape (an exclusion list bets on the world's layout; an inclusion list states
+# your own) is what stopped `EVENT` being waved through by a broad rule.
+# Both scans over `scripts/` read this list as CODE, and it is data: it spells
+# `BASHPID` (bash 4.0+, and inert on macOS) and `SECONDS` (a clock reading, never
+# a bound -- #1066), neither of which this script executes. A declared REGION and
+# never a whole-file exemption, for the reason `check-e2e-helpers.sh` gives about
+# its own token table: exempting the file would make the one file a scan can
+# never read the one most likely to break its rule.
+# bash32-scan: data-begin
+# seconds-scan: data-begin
+RunnerProvided="HOME PATH PWD SHELL USER TMPDIR LANG IFS OSTYPE HOSTNAME
+RUNNER_TEMP RUNNER_OS RUNNER_ARCH RUNNER_TOOL_CACHE RUNNER_WORKSPACE RUNNER_DEBUG
+GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STEP_SUMMARY GITHUB_WORKSPACE
+GITHUB_REPOSITORY GITHUB_SHA GITHUB_REF GITHUB_REF_NAME GITHUB_EVENT_NAME
+GITHUB_EVENT_PATH GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_ACTOR GITHUB_JOB
+GITHUB_SERVER_URL GITHUB_API_URL GITHUB_HEAD_REF GITHUB_BASE_REF GITHUB_TOKEN
+BASH_VERSION BASH_SOURCE BASH_REMATCH BASHPID FUNCNAME LINENO RANDOM SECONDS PIPESTATUS"
+# seconds-scan: data-end
+# bash32-scan: data-end
+
 problems=0
 Fail() { echo "  FAIL: $*" >&2; problems=$((problems + 1)); }
 Ok()   { echo "ok: $*"; }
@@ -173,6 +196,271 @@ Shape() {
         Fail "the notifier has become a JOB in $BuildWorkflow. \`check-release-gate\` requires every job there to appear in \`release.needs\`, and a notifier job is SKIPPED on a tag push -- which skips the release with it."
     else
         Ok "the notifier is not a job in $BuildWorkflow, so it cannot gate the release"
+    fi
+
+    # Per STEP, and last, because every rule above is a whole-file grep -- which
+    # is exactly how #1174 passed them all.
+    StepEnvComplete
+}
+
+# ---------------------------------------------------------------------------
+# Every name a step's script READS is one that step's own `env:` DEFINES.
+#
+# A step's environment is its own: a name declared by the step next door is not
+# in scope, and `${{ ... }}` is substituted before bash ever sees the script, so
+# nothing about the file's appearance says which names will exist. #1174 is what
+# that cost -- `EVENT` was defined on the `decide` step and read by the reporting
+# step, which died on its first line under `set -u`:
+#
+#     line 7: EVENT: unbound variable
+#
+# The notifier therefore opened no report in its entire life. Measured over 200
+# runs at the time of the fix: 190 concluded `success` on the `reportable == 0`
+# path, which never enters that step, and all 10 that had something to report
+# died on that line. #684's whole subject is a failure nobody was told about, and
+# it was announcing itself as a red run in the Actions tab that nothing points at
+# -- #774's complaint one door further out.
+#
+# **Why no rule here caught it.** The rule that motivated the `$EVENT` read is a
+# whole-file `grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW'`, and the line satisfying it
+# is IN the step that cannot run. A rule satisfied by a line that never executes
+# is the same defect as a rule satisfied by prose, which this file's header
+# already records making twice -- one level up, in the file that recorded it. So
+# this rule is per STEP and never whole-file; that is the whole of it.
+#
+# It applies to every `run:`, not only the ones turning on `set -u`. Without `-u`
+# an undefined name expands to EMPTY and the branch is silently taken the wrong
+# way, which is the worse of the two failures and the one nothing would report.
+#
+# ## What it does NOT cover
+#
+# Names a step could legitimately have without an `env:` row of its own, all of
+# which it accepts:
+#
+#   * workflow-level and job-level `env:`, which do propagate -- collected and
+#     honoured, so adding one is not refused;
+#   * assignments the script makes itself, including `export`, `local`,
+#     `declare`, `readonly`, `mapfile`/`readarray`, `read`, and `for x in`;
+#   * the runner's own vocabulary (`$RUNNER_TEMP`, `$GITHUB_OUTPUT`, `$HOME` ...),
+#     which is an ALLOWLIST below and therefore fails CLOSED: a runner variable
+#     nobody has listed is refused and gets added deliberately, where an
+#     open-ended pattern would have admitted `EVENT`.
+#
+# And what it genuinely cannot see, so that nobody reads a pass as more than it
+# is: a name reached by `eval` or indirect expansion, one an action's `outputs`
+# supply through `${{ steps.x.outputs.y }}` (substituted, so invisible here), one
+# a sourced file defines, and `${#arr[@]}`, whose `#` this deliberately does not
+# treat as a read. It is one workflow's rule, not the repository's -- 28 `run:`
+# blocks across six workflow files are outside it, and generalising the scan is
+# its own ticket rather than a wider glob bolted on here.
+StepEnvComplete() {
+    local report scanned violations
+    report="$(
+        # The list is FLATTENED before it becomes an `awk -v` value. BSD awk --
+        # macOS ships it, and this check is in the default ctest set -- refuses a
+        # raw newline in one, so the multi-line definition above would have made
+        # the program never run on exactly one platform (#1153 is the same awk
+        # and the same mistake, one lane over).
+        awk -v provided="$(printf '%s' "$RunnerProvided" | tr '\n' ' ')" '
+        function indentOf(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : length(s) }
+
+        function collectDefs(s,   t, rest, name, i, declarator) {
+            t = s
+            sub(/^[ \t]+/, "", t)
+
+            # A DECLARATOR names several variables at once; anything else names
+            # at most one, and only with an `=` after it. Taking bare words off
+            # any line would have made every command word a definition -- `echo`,
+            # `gh`, `api` -- which is a model MORE PERMISSIVE than bash, and this
+            # check exists because a permissive model waves through the one read
+            # that matters. Narrow on purpose.
+            declarator = 0
+            if (t ~ /^(export|readonly|local|declare|typeset)[ \t]/) {
+                declarator = 1
+                sub(/^(export|readonly|local|declare|typeset)[ \t]+(-[A-Za-z]+[ \t]+)*/, "", t)
+            }
+            if (declarator) {
+                while (match(t, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+                    name = substr(t, RSTART, RLENGTH)
+                    rest = substr(t, RSTART + RLENGTH)
+                    defs[name] = 1
+                    if (rest !~ /^[ \t]/) break
+                    sub(/^[ \t]+/, "", rest)
+                    t = rest
+                }
+            } else if (match(t, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+                defs[substr(t, RSTART, RLENGTH - 1)] = 1
+            }
+            # The two spellings of the array-reading builtin, NAMED so a
+            # workflow using one is understood. Naming a construct is not using
+            # it, and this file is bash 3.2 throughout.
+            # bash32-scan: data-begin
+            if (match(s, /(mapfile|readarray)[ \t]+(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*/)) {
+            # bash32-scan: data-end
+                rest = substr(s, RSTART, RLENGTH)
+                if (match(rest, /[A-Za-z_][A-Za-z0-9_]*$/)) defs[substr(rest, RSTART, RLENGTH)] = 1
+            }
+            # for NAME in ... / while read NAME NAME ...
+            if (match(s, /(^|[^A-Za-z0-9_])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in([ \t]|$)/)) {
+                rest = substr(s, RSTART, RLENGTH)
+                sub(/^[^A-Za-z0-9_]*for[ \t]+/, "", rest)
+                if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) defs[substr(rest, RSTART, RLENGTH)] = 1
+            }
+            i = index(s, "read ")
+            if (i > 0 && (i == 1 || substr(s, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+                rest = substr(s, i + 5)
+                while (match(rest, /^-[A-Za-z]+[ \t]+/)) { rest = substr(rest, RLENGTH + 1) }
+                while (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+                    defs[substr(rest, RSTART, RLENGTH)] = 1
+                    rest = substr(rest, RSTART + RLENGTH)
+                    if (rest !~ /^[ \t]/) break
+                    sub(/^[ \t]+/, "", rest)
+                }
+            }
+        }
+
+        # A quoted YAML scalar, with the quote named rather than written: this
+        # whole program is one shell-quoted string and an apostrophe would end
+        # it. `sprintf("%c", 39)` is also what keeps this off `\047`, which is
+        # not portable across every awk this check runs on.
+        function unquote(t,   sq, first, last) {
+            sq = sprintf("%c", 39)
+            first = substr(t, 1, 1)
+            last = substr(t, length(t), 1)
+            if (length(t) >= 2 && first == last && (first == "\"" || first == sq))
+                return substr(t, 2, length(t) - 2)
+            return t
+        }
+
+        function collectRefs(s,   t, name) {
+            # A `${{ ... }}` expression is substituted before bash sees it, so it
+            # is not a read. Removed first, or its inner text is scanned as one.
+            gsub(/\$\{\{[^}]*\}\}/, "", s)
+            t = s
+            while (match(t, /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/)) {
+                name = substr(t, RSTART, RLENGTH)
+                gsub(/[${}]/, "", name)
+                refs[name] = 1
+                t = substr(t, RSTART + RLENGTH)
+            }
+        }
+
+        function flush(   i, name, missing, n) {
+            if (!hasRun) return
+            scanned++
+            for (i = 0; i < nbody; i++) collectDefs(body[i])
+            for (i = 0; i < nbody; i++) {
+                if (body[i] ~ /^[ \t]*#/) continue
+                collectRefs(body[i])
+            }
+            missing = ""; n = 0
+            for (name in refs) {
+                if (name in stepEnv) continue
+                if (name in globalEnv) continue
+                if (name in defs) continue
+                if (name in providedSet) continue
+                missing = missing (n++ ? ", " : "") "$" name
+            }
+            if (n) printf "VIOLATION\t%d\t%s\t%s\n", stepLine, stepName, missing
+        }
+
+        function resetStep() {
+            split("", stepEnv); split("", defs); split("", refs); split("", body)
+            nbody = 0; hasRun = 0; stepName = "(unnamed)"; stepLine = NR
+        }
+
+        BEGIN {
+            n = split(provided, p, " ")
+            for (i = 1; i <= n; i++) if (p[i] != "") providedSet[p[i]] = 1
+            resetStep(); inStep = 0; inRun = 0; inEnv = 0
+        }
+
+        {
+            line = $0
+            blank = (line ~ /^[ \t]*$/)
+            ind = indentOf(line)
+
+            if (inRun) {
+                if (blank || ind > runIndent) { body[nbody++] = line; next }
+                inRun = 0
+            }
+            if (inEnv) {
+                if (blank) next
+                if (ind > envIndent) {
+                    if (match(line, /^[ ]*[A-Za-z_][A-Za-z0-9_]*[ \t]*:/)) {
+                        name = line
+                        sub(/^[ ]*/, "", name); sub(/[ \t]*:.*$/, "", name)
+                        if (envIsStep) stepEnv[name] = 1; else globalEnv[name] = 1
+                    }
+                    next
+                }
+                inEnv = 0
+            }
+
+            # A steps list item carries its FIRST key on the dash line, so
+            # `- env:` and `- run: |` are a step boundary AND a key. Turning the
+            # dash into two spaces re-dispatches it through the key handling
+            # below, rather than duplicating that handling here -- which the first
+            # version did, and it therefore read the decider step of the OWN
+            # fixture of this check as declaring no `env:` at all. An
+            # apostrophe cannot appear in this comment either: the whole awk
+            # program is one shell-quoted string, and one would end it.
+            if (line ~ /^[ ]*- /) {
+                flush(); resetStep(); inStep = 1; stepIndent = ind
+                sub(/- /, "  ", line)
+                ind = indentOf(line)
+            }
+
+            # The step NAME, which is the only thing telling a reader which step
+            # to edit: a refusal naming "(unnamed)" is a guard whose remedy text
+            # cannot be acted on.
+            if (inStep && ind > stepIndent && match(line, /^[ ]*name[ \t]*:[ \t]*/)) {
+                t = substr(line, RLENGTH + 1)
+                sub(/[ \t]+$/, "", t); t = unquote(t)
+                if (t != "") stepName = t
+                next
+            }
+
+            if (match(line, /^[ ]*env[ \t]*:[ \t]*$/)) {
+                inEnv = 1; envIndent = ind
+                envIsStep = (inStep && ind > stepIndent)
+                next
+            }
+            if (match(line, /^[ ]*run[ \t]*:[ \t]*\|/)) {
+                hasRun = 1; inRun = 1; runIndent = ind; next
+            }
+            if (match(line, /^[ ]*run[ \t]*:[ \t]*[^ \t|>]/)) {
+                hasRun = 1
+                t = line; sub(/^[ ]*run[ \t]*:[ \t]*/, "", t)
+                body[nbody++] = t
+                next
+            }
+            # A key at or above the step indent ends the step for env purposes
+            # only; the step itself is closed by the next `- ` or by EOF.
+        }
+
+        END { flush(); printf "SCANNED\t%d\n", scanned }
+        ' "$Workflow"
+    )"
+
+    scanned="$(printf '%s\n' "$report" | awk -F'\t' '$1 == "SCANNED" { print $2 }')"
+    violations="$(printf '%s\n' "$report" | awk -F'\t' '$1 == "VIOLATION"' || true)"
+
+    # A scan that matched nothing agrees perfectly with a clean file, so the
+    # count is asserted before its silence is read as a pass. The positive
+    # control is the self-test's `no-event-env` case, which must be REFUSED.
+    if [[ -z "$scanned" || "$scanned" -eq 0 ]]; then
+        Fail "$Workflow: found no \`run:\` block at all. Either the file has no steps or this rule stopped parsing it -- and a rule that parses nothing reports clean, which is the state it exists to remove."
+        return
+    fi
+
+    if [[ -n "$violations" ]]; then
+        while IFS="$(printf '\t')" read -r _ line name missing; do
+            [[ -n "$name" ]] || continue
+            Fail "$Workflow:$line step \"$name\" reads $missing, which its own \`env:\` does not define. A step's environment is its own -- a sibling step's \`env:\` does not lend it one -- so under \`set -u\` the step dies on that line and under no \`-u\` the name expands to EMPTY and the branch is silently taken the wrong way. That is #1174: #684's notifier read \$EVENT from the decide step's \`env:\` and opened no report in its entire life. Add the row to THIS step's \`env:\`."
+        done <<< "$violations"
+    else
+        Ok "every name each of the $scanned \`run:\` block(s) reads is defined by its own step"
     fi
 }
 
@@ -544,8 +832,19 @@ STUB
                 echo "          HEAD_BRANCH: \${{ github.event.workflow_run.head_branch }}"
                 echo "        run: scripts/ci-merge-group-report.sh x y z \"\$HEAD_BRANCH\""
             }
+            # The reporter step, and its `env:` is the case rather than scenery.
+            # This fixture shipped WITHOUT it, modelling the exact defect as the
+            # CORRECT workflow: `$EVENT` read where nothing defines it, which is
+            # #1174 -- so the baseline vouched for the bug and the `no-event-env`
+            # variant below is what a positive control for the new rule looks
+            # like. A fixture more permissive than the thing it stands for.
             [[ "$steps" != "no-reporter" ]] && {
-                echo "      - run: |"
+                echo "      - name: \"Open or update one report per unreported failure\""
+                [[ "$steps" != "no-event-env" ]] && {
+                    echo "        env:"
+                    echo "          EVENT: \${{ github.event.workflow_run.event }}"
+                }
+                echo "        run: |"
                 echo "          [[ \"\$EVENT\" == push ]] && export FASTCACHED_REPORT_ONLY_IF_NEW=1"
                 echo "          scripts/ci-report-issue.sh t b"
             }
@@ -613,6 +912,14 @@ STUB
 
     GenerateWorkflow "${scratch}/wf.yml" workflow_run cancelled plain issues no-reporter yes
     ShapeCase "nothing opens the issue" want-fail "${scratch}/wf.yml"
+
+    # #1174's positive control, and the only case here whose subject is a step
+    # rather than the file: the reporter step reads `$EVENT` while its own `env:`
+    # defines nothing. Every whole-file rule above passes on this workflow --
+    # which is precisely how the shipped one passed them for its entire life --
+    # so a green run of the other twelve cases says nothing about this one.
+    GenerateWorkflow "${scratch}/wf.yml" workflow_run cancelled plain issues no-event-env yes
+    ShapeCase "a step reading a name its own env: does not define is refused" want-fail "${scratch}/wf.yml"
 
     # And a workflow with NO comment at all still passes, so the rules are
     # satisfied by the settings rather than by the prose beside them.

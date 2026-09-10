@@ -3805,6 +3805,86 @@ the change is a ROW of `EventPolicy` and nothing else:
   after some jobs finished carries a mix, and reading the mix reports the failures of a
   run nobody let finish.
 
+### And the notifier then opened no report in its entire life (#1174)
+
+`EVENT` was defined on the `decide` step's `env:` and read by the **reporting** step,
+whose own `env:` never named it. A step's environment is its own — a sibling's `env:`
+lends it nothing — so under `set -euo pipefail` the step died on its first line of real
+work:
+
+```
+line 7: EVENT: unbound variable
+##[error]Process completed with exit code 1.
+```
+
+Measured over the last 200 runs of the workflow at the time of the fix: **190 `success`,
+10 `failure`, and all ten failures were that line.** The 190 are the `reportable == 0`
+path, which never enters the step. So #684's notifier — the whole of the machinery above
+— had never once opened a report, and #774's `push` half never had either. The contexts
+it swallowed were real: `clang-tidy-windows` on a `pr-1153` queue attempt, `macOS-clang-release`
+and `compile-cache E2E (Windows)` on `pr-1154`, `Code coverage` twice, and five more.
+
+Three things had to be true at once for that to be quiet, which is #1031's shape
+arriving in the instrument whose entire subject is failures nobody was told about:
+
+- `-u` making the read an error rather than an empty string — the loud direction, and
+  still invisible because nobody was watching this workflow's step-level results;
+- the failing runs being **indistinguishable from the 190 healthy ones** in any listing
+  that shows a conclusion per RUN. `gh run list` prints `failure` beside `success` in the
+  same column for a workflow nobody has a reason to open;
+- the workflow announcing itself exactly the way #774 says an unreported failure does —
+  as a red run in the Actions tab that nothing points at.
+
+**Why no rule caught it.** `check-merge-group-report.sh` asserts the shape of this
+workflow and passed, correctly by its own rules. The rule that motivated the `$EVENT`
+read is
+
+```sh
+grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW' <<< "$(NonComment "$Workflow")"
+```
+
+a **whole-file** grep — and the line satisfying it is inside the step that cannot run. A
+rule satisfied by a line that never executes is the same defect as a rule satisfied by
+prose, which that file's own header records making twice. **So the rule is per STEP and
+never whole-file; that is the whole of it.** `StepEnvComplete` refuses a `run:` block
+reading a name that neither its own `env:`, the workflow- or job-level `env:`, the
+script's own assignments, nor a named allowlist of runner variables supplies.
+
+It applies to **every** `run:`, not only the ones turning on `set -u`. Without `-u` an
+undefined name expands to EMPTY and the branch is silently taken the wrong way, which is
+the worse of the two failures and the one nothing would report.
+
+Four things that shaped the guard rather than decorating it:
+
+- The runner vocabulary is an **allowlist**, not a `GITHUB_*` pattern. An exclusion list
+  bets on the world's layout; an inclusion list states your own — and a pattern broad
+  enough to be convenient is what would have waved `EVENT` through.
+- The model of bash is deliberately **narrow**. The first version took bare words off
+  the front of any line as definitions, which made `echo`, `gh` and `api` variables —
+  a model MORE PERMISSIVE than the shell, in a check whose entire purpose is that a
+  permissive model waves through the one read that matters. Only a declarator
+  (`export`/`readonly`/`local`/`declare`/`typeset`) names several; anything else names
+  at most one, and only with an `=`.
+- The refusal names the **step**. A guard's remedy text is part of the guard, and one
+  saying `(unnamed)` cannot be acted on — which is what the first version printed,
+  because a steps list item carries its first key on the dash line and the parser
+  consumed the whole line as a boundary. That same bug read `- env:` as declaring no
+  environment at all, so the check's own fixture passed for the wrong reason.
+- The self-test's `correct` fixture **modelled the defect**: it emitted a reporter step
+  reading `$EVENT` with no `env:` at all, and called that the correct workflow. A
+  fixture more permissive than the thing it stands for, vouching for the bug it was
+  built beside. Its `no-event-env` sibling is now the positive control, and every
+  whole-file rule still passes on that fixture — which is precisely how the shipped
+  workflow passed them for its entire life, so a green run of the other twelve cases
+  says nothing about this one.
+
+The scan is **one workflow's**, not the repository's: 28 `run:` blocks across six
+workflow files are outside it, and generalising it is
+[#1175](https://github.com/LASTRADA-Software/fastcached/issues/1175) rather than a wider
+glob bolted on here. What it cannot see is stated in its own header — `eval`, indirect
+expansion, a name an action's `outputs` supply through a `${{ }}` that is substituted
+before bash sees it, a sourced file, and `${#arr[@]}`.
+
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
 Observed on `Windows-cl-debug`: six failures, all exit `0xc0000142`
@@ -4227,6 +4307,85 @@ the better design and stays. And it is not the "deriving is necessary and not
 sufficient" rule above wearing a different hat: that one is about a guard that was
 never sufficient, this one is about a guard that WAS sufficient and stopped being,
 without anybody touching it. A green suite distinguishes neither.
+
+## A configure's OUTPUT is the module's claim; the generated buildsystem is the artefact
+
+`check-compile-cache-caveat.cmake` asserted entirely on what a configure PRINTED --
+every row comparing against `${configureOutput}${configureError}`. So it proved what
+`CompileCache.cmake` **says** and never what it **wired**, and a row could print
+`-- [cache] Enabling sccache ...` with the full caveat, at the right severity, while
+the generated build carried no compiler launcher at all, and every assertion passed
+(#187).
+
+The cache cannot answer this. The module sets `CMAKE_C_COMPILER_LAUNCHER` and its CXX
+sibling as NORMAL variables, never cache entries, so `CMakeCache.txt` is silent --
+measured across eleven build trees on one workstation, unset in every one, five of
+them demonstrably running sccache on every compile. What carries the decision is the
+generated buildsystem: Ninja emits a per-rule `LAUNCHER = <path>`, and the Makefile
+generators put the program at the head of the compile command in `build.make`.
+
+Three things the fix needed that the ticket did not name:
+
+- **The fixture had no target**, so it generated no compile edge and there was
+  nothing to read. A project that only calls `project()` and includes the module
+  proves the module's prose and can prove nothing else. It has an OBJECT library
+  now, defined after the include so the launcher variable is in scope, and still
+  never built.
+- **The two stand-in launchers had to DIFFER.** Both were `${CMAKE_COMMAND}`, which
+  makes the assertion a presence check: it can say a launcher was wired and not
+  which, so `sccache-not-preferred` -- whose entire claim is that ccache won over
+  sccache -- would still rest on a status line. They are `${CMAKE_COMMAND}` and
+  `${CMAKE_CTEST_COMMAND}` now, two real programs a CMake script can always name.
+- **A generator whose buildsystem the reader cannot parse is a THIRD state**,
+  reported by name rather than folded into *no launcher was wired* -- and if the
+  generator IS one the reader claims to handle and it read NOTHING, that is a
+  violation, because every row's wiring assertion is then vacuous. The rule that
+  guards a check against reporting clean has to guard this check too.
+
+Proved by breaking it, not by assuming: with the module's two `set(...LAUNCHER)`
+lines replaced by a comment -- so it prints `-- [cache] Enabling sccache
+(/usr/bin/cmake) for C/C++ compilation` and the caveat, and wires nothing -- the
+check refuses with exactly three violations, the three rows that expect a launcher,
+and none of the three that expect none.
+
+**And the first version of it was GREEN on Linux and red on all three Windows legs,
+for one and the same file.** `build.ninja` writes
+
+```
+LAUNCHER = "C:\Program Files\CMake\bin\cmake.exe"
+```
+
+-- QUOTED, because the path holds a space, and with BACKSLASH separators -- while
+`${CMAKE_COMMAND}` is `C:/Program Files/CMake/bin/cmake.exe`. A `STREQUAL` over those
+is false for a path that is the same path, and on Linux the two spellings are
+byte-identical, so the green run there could not have shown it. That is the
+platform-arm hazard reaching a `cmake -P` check: **a comparison written against the
+spelling one generator on one platform happens to emit is a comparison nobody has
+tested.** Normalise a path as a PATH -- a matched surrounding quote pair is the
+generator's escaping, `file(TO_CMAKE_PATH)` settles separators, and case folds only
+where the filesystem folds it -- and normalise BOTH SIDES, or the two are normalised
+asymmetrically, which is its own way to compare two things that were never the same
+shape.
+
+The measured strings are in the check's own comment rather than described, so nobody
+simplifies the normalisation away on the platform that does not need it. And the
+mutation was re-run **on Windows**, not only on Linux: a normalisation's whole risk
+is accepting too much, so "it stopped failing" is not the same claim as "it still
+bites". Same three violations there, same exit 1.
+
+**And the decision a guard makes is what gets tested, not the acquisition around
+it.** `tidy-sweep.sh`'s canary -- the thing that stops a whole branch being reported
+clean by an analyser that never ran -- needed clang-tidy, a compile database and a
+real translation unit, so it could only be exercised on a machine already running a
+full sweep, which is the population it is not for. `CanaryVerdict` is now a pure
+function over `(exit status, output)` driven by `--self-test`, which is already a
+registered ctest on every platform (#257). Its two failing arms are NOT one: an exit
+at or above 126 is the shell saying the program never started, with no output, while
+the pattern arm is a binary that DID start and analysed nothing, exiting normally.
+And `ok` for every other non-zero exit is deliberate -- clang-tidy exits non-zero
+when it has FINDINGS, so a canary refusing that would refuse every branch with
+something to fix. Neutered to `echo ok`, exactly the five refusing cases fail and the
+two accepting ones stay green.
 
 ## A branch behind master is unverified, and only a build says otherwise
 

@@ -623,6 +623,19 @@ void ConsensusTier::Reconcile()
                 return;
             }
 
+            // Already true, so there is nothing to report and nothing to skip past
+            // -- Debug rather than silence, because "the pass did nothing" and "the
+            // pass was not reached" are the two states a quiet log cannot tell
+            // apart. No `Cluster::Command` produces this today; the arm is here
+            // because `SubjectOf` is a total function over the code and a `Satisfied`
+            // falling through to the Warn below would announce a healthy no-op as a
+            // record somebody must go and correct.
+            if (SubjectOf(proposed.error().code) == RefusalSubject::Satisfied)
+            {
+                _logger.Logf(LogLevel::Debug, "cluster: {} is already recorded: {}", command.key, proposed.error().context);
+                continue;
+            }
+
             // Warn, and "never" rather than "right now", because the two want
             // different things from whoever reads them: one is a leader election
             // in progress and the other is a record that has to be corrected
@@ -765,17 +778,36 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
     auto const proposed = _driver->ProposeMembership(*change, std::chrono::steady_clock::now());
     if (!proposed.has_value())
     {
-        // One line and out, and deliberately WITHOUT the `SubjectOf` split the
-        // proposal loop above uses. `ProposeMembership` answers
-        // `InvalidConfiguration` for two conditions that are plainly moments -- a
-        // change already in flight, and a member set equal to the current one -- so
-        // classifying by code here would report "wait for it to commit" as permanent,
-        // at Warn, every interval. That is issue #196; until it is split, this path
-        // treats every refusal as the moment it usually is.
+        // Classified by CODE, which #196 is what made possible: this path used to
+        // treat every refusal as the moment it usually is, because
+        // `ProposeMembership` answered `InvalidConfiguration` for two conditions
+        // that are not permanent and `SubjectOf` would have called them so. Wiring
+        // it in was the obvious next tidy-up and would have reported "wait for the
+        // change in flight to commit" as **can never be recorded as it stands**, at
+        // Warn, every interval, for a condition that resolves itself in one commit.
         //
-        // The commonest reason is that leadership moved between the two, which is
-        // not a fault.
-        _logger.Logf(LogLevel::Info, "cluster: cannot change the quorum right now: {}", proposed.error().context);
+        // The commonest reason really is that leadership moved between the two,
+        // which is not a fault -- and that is now a `Moment` because the code says
+        // so, rather than because this comment assumed it.
+        switch (SubjectOf(proposed.error().code))
+        {
+            case RefusalSubject::Moment:
+                _logger.Logf(LogLevel::Info, "cluster: cannot change the quorum right now: {}", proposed.error().context);
+                break;
+            case RefusalSubject::Satisfied:
+                // `NextQuorumChange` does not propose an unchanged set, so reaching
+                // this is a disagreement between it and the configuration this node
+                // just read -- worth a line, worth nobody being paged.
+                _logger.Logf(LogLevel::Debug, "cluster: the quorum already reads as proposed: {}", proposed.error().context);
+                break;
+            case RefusalSubject::Command:
+                // Permanent, and therefore the one an operator has to act on: a
+                // member set that no validator will ever accept is not repaired by
+                // another interval.
+                _logger.Logf(
+                    LogLevel::Warn, "cluster: the quorum can never be changed as proposed: {}", proposed.error().context);
+                break;
+        }
         return;
     }
 

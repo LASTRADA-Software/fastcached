@@ -36,6 +36,10 @@ inline constexpr std::uint8_t MinimumVersion = 1;
 inline constexpr std::uint8_t CurrentVersion = 1;
 
 /// What a datagram is.
+///
+/// **ORDINALS ARE A WIRE CONTRACT. Append only; never insert or reorder.** (#308) The
+/// enumerator's value IS the byte `ClassifyDatagram` switches on, and this is a LAN
+/// protocol between builds that upgrade at different times.
 enum class Kind : std::uint8_t
 {
     Invalid = 0x00,   ///< Never sent; the zero value a default-constructed field would take.

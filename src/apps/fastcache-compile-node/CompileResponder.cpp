@@ -133,10 +133,11 @@ namespace
     // reason the cache and scheduler tables do: a row asserting neither passes a guard
     // that short-circuits on the absent counter, and ships the new refusal uncounted
     // and unexplained.
-    static_assert(std::ranges::all_of(EndpointRefusalTable,
-                                      [](EndpointRefusalRow const& row) {
-                                          return StatesOneRefusalClaim(row.answer.has_value(), row.rationale);
-                                      }),
+    static_assert(Cc::RowsStateOneRefusalClaim(EndpointRefusalTable,
+                                               [](EndpointRefusalRow const& row) {
+                                                   return Cc::RefusalClaim { .counted = row.answer.has_value(),
+                                                                             .rationale = row.rationale };
+                                               }),
                   "every endpoint refusal row must state either a counted answer or a rationale, not both");
 
     // The rows above are CONVERTED from `CompileRefusal`, which already pairs a code
