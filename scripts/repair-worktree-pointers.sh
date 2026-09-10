@@ -329,6 +329,19 @@ repair_worktree() {
 repair_self_test() {
     local ran=0 failed=0
 
+    # An inherited `GIT_DIR`/`GIT_WORK_TREE` would make every `git init` below operate
+    # on the REAL repository instead of on the fixture. Measured on a throwaway repo,
+    # git 2.43.0: with that pair exported a fixture's `git init .` creates no `.git` of
+    # its own at all, and the fixture's `git config user.email ...` lands in the SHARED
+    # config -- so it is not one key leaking, it is every later git call in the fixture
+    # reaching the real admin directory. `extensions.worktreeConfig = true`, which this
+    # repository carries, does NOT contain it; that was checked rather than assumed.
+    #
+    # A lane was gating with exactly that pair exported while this was written, to work
+    # around the very defect this script repairs. The header above has described the
+    # hazard in prose since the file was created, and a comment is not a guard.
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
     _rw_expect() {
         ran=$(( ran + 1 ))
         if [ "$2" != "$3" ]; then
@@ -447,15 +460,45 @@ repair_self_test() {
     # the rewrite below is a change rather than a no-op. If git ever started writing
     # relative pointers this whole section would be vacuous and nothing else would
     # say so.
+    # `case` at STATEMENT level, never inside `$( )`. bash 3.2 -- which macOS ships,
+    # and which every default-set script must parse under -- counts parentheses
+    # naively inside a command substitution, so the `)` that closes a case PATTERN is
+    # read as closing the `$(`.
+    #
+    # Measured on `macOS-clang-release` (#1224): the substitution truncated at
+    # `gitdir:\ /*`, the expansion returned the literal remainder of this file's own
+    # source -- ` echo yes ;; *) echo no ;; esac)` -- and `_rw_expect` compared against
+    # THAT. So it reported a wrong ANSWER where the truth was that the instrument had
+    # not run, sending a reader to git's pointer format rather than to a parse error
+    # four lines up. It refused rather than passing, which is the one mercy.
+    #
+    # Same family as the rulebook's heredoc-inside-`$( )`, and NOT on the bash-3.2
+    # scan's token list (`mapfile`, `declare -A`, `${var^^}`, `local -n`) -- a
+    # multi-line-equivalent construct inside a substitution passes that scan and dies
+    # on the host.
+    local wtPointer adminPointer verdict
+    wtPointer="$(cat "${wt}/.git")"
+    case "$wtPointer" in gitdir:\ /*) verdict=yes ;; *) verdict=no ;; esac
     _rw_expect "git wrote an ABSOLUTE pointer, which is what makes this necessary" \
-        "yes" "$(case "$(cat "${wt}/.git")" in gitdir:\ /*) echo yes ;; *) echo no ;; esac)"
+        "yes" "$verdict"
 
     write_relative_pointers "$wt" "${repo}/.git/worktrees/lane"
 
-    _rw_expect "the worktree pointer is relative afterwards" \
-        "yes" "$(case "$(cat "${wt}/.git")" in gitdir:\ /*|gitdir:\ [A-Za-z]:*) echo no ;; gitdir:*) echo yes ;; *) echo no ;; esac)"
-    _rw_expect "and so is the admin pointer" \
-        "yes" "$(case "$(cat "${repo}/.git/worktrees/lane/gitdir")" in /*|[A-Za-z]:*) echo no ;; ?*) echo yes ;; *) echo no ;; esac)"
+    wtPointer="$(cat "${wt}/.git")"
+    case "$wtPointer" in
+        gitdir:\ /*|gitdir:\ [A-Za-z]:*) verdict=no ;;
+        gitdir:*)                        verdict=yes ;;
+        *)                               verdict=no ;;
+    esac
+    _rw_expect "the worktree pointer is relative afterwards" "yes" "$verdict"
+
+    adminPointer="$(cat "${repo}/.git/worktrees/lane/gitdir")"
+    case "$adminPointer" in
+        /*|[A-Za-z]:*) verdict=no ;;
+        ?*)            verdict=yes ;;
+        *)             verdict=no ;;
+    esac
+    _rw_expect "and so is the admin pointer" "yes" "$verdict"
     _rw_expect "git still reads the worktree" \
         "yes" "$( ( cd "$wt" && git ls-files 2>/dev/null | grep -c . ) | { read -r n; [ "${n:-0}" -gt 0 ] && echo yes || echo no; } )"
 
