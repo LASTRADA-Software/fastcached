@@ -73,6 +73,11 @@
 # argument and the script errors out rather than answering.
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 foreach(_required FASTCACHED_SOURCE_DIR FASTCACHED_TABLE FASTCACHED_REFERENCE FASTCACHED_LABEL)
     if(NOT DEFINED ${_required})
         message(FATAL_ERROR "check-config-reference: ${_required} must be set")
@@ -123,11 +128,7 @@ list(SORT _tableKeys)
 # [#495](https://github.com/LASTRADA-Software/fastcached/issues/495) and is
 # deliberately not done here.
 file(READ "${_reference}" _referenceText)
-string(REPLACE "\\" " " _referenceText "${_referenceText}")
-string(REPLACE ";" " " _referenceText "${_referenceText}")
-string(REPLACE "[" " " _referenceText "${_referenceText}")
-string(REPLACE "]" " " _referenceText "${_referenceText}")
-string(REGEX REPLACE "\r?\n" ";" _lines "${_referenceText}")
+fastcached_split_lines_tokenised("${_referenceText}" _lines)
 set(_referenceKeys "")
 foreach(_line IN LISTS _lines)
     if(_line MATCHES "^#([a-z_]+):")

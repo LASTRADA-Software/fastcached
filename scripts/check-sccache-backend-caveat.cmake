@@ -328,72 +328,11 @@ endif()
 
 fastcached_wall_seconds(runStartSeconds)
 
-# Split one '|'-separated row into the variables named in ARGN, the last of which
-# takes whatever remains -- so only the final field may contain a '|', which is
-# what lets a reason be written in ordinary prose.
-#
-# Named `fastcached_row_fields` rather than the `fastcached_split_rows` that
-# check-net-boundary.cmake defines: that one is a different contract (a whole
-# table, two fixed outputs), and two functions answering to one name with
-# different signatures is a trap for whoever consolidates them. Consolidating the
-# five row-splitters across scripts/ is worth doing and is not this change.
-#
-# @param row The '|'-separated row.
-# @param ARGN Output variable names, in field order.
-function(fastcached_row_fields row)
-    list(LENGTH ARGN fieldCount)
-    math(EXPR lastField "${fieldCount} - 1")
-    set(rest "${row}")
-    foreach(field RANGE 0 ${lastField})
-        list(GET ARGN ${field} outVar)
-        if(field EQUAL lastField)
-            set(value "${rest}")
-        else()
-            string(FIND "${rest}" "|" separator)
-            if(separator EQUAL -1)
-                message(FATAL_ERROR "Malformed row (wanted ${fieldCount} '|'-separated fields): ${row}")
-            endif()
-            string(SUBSTRING "${rest}" 0 ${separator} value)
-            math(EXPR restStart "${separator} + 1")
-            string(SUBSTRING "${rest}" ${restStart} -1 rest)
-        endif()
-        set(${outVar} "${value}" PARENT_SCOPE)
-    endforeach()
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). What it does with a
+# malformed row, and which field may hold a `|`, are stated there and not here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
-# Split file content into a list of lines, one element per line.
-#
-# `file(STRINGS)` cannot be used: it returns a CMake list, so a line containing a
-# ';' becomes several elements and every line number after it is wrong. Splitting
-# by hand meets the same hazard from the other side, and ESCAPING does not survive
-# it -- CMake's list syntax reserves four characters, and each was measured
-# breaking this scan on a real file in this tree:
-#
-#   ';'       the separator itself.
-#   '\'       its escape -- and CMake reads any ';' preceded by a backslash as
-#             escaped without counting the backslashes first, so a line ending in
-#             one (every shell continuation in this repository's READMEs) eats the
-#             separator after it. README.md came out 365 lines where it has 368.
-#   '[' ']'   grouping: a ';' between them is not a separator. One stray '`]`' in
-#             a comment swallowed 451 lines into a single element -- the dangerous
-#             direction, because a merged element does not shrink a caveat window,
-#             it WIDENS it to whatever it swallowed.
-#
-# All four are replaced by a space rather than escaped. Nothing is lost: no marker
-# and no caveat spelling contains any of them, and no line's text is ever printed
-# -- only its number. Four calls rather than a table because a CMake list cannot
-# hold a bare ';' or '\' to iterate over in the first place.
-#
-# @param content File content.
-# @param linesOut Set to the content's lines, in order.
-function(fastcached_split_lines content linesOut)
-    string(REPLACE "\\" " " content "${content}")
-    string(REPLACE ";" " " content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
-    set(${linesOut} "${lines}" PARENT_SCOPE)
-endfunction()
+
 
 # Every cost band row parses, checked HERE rather than where a row is selected.
 #
@@ -705,7 +644,7 @@ foreach(scanFile IN LISTS scanFiles)
         continue()
     endif()
 
-    fastcached_split_lines("${content}" fileLines)
+    fastcached_split_lines_tokenised("${content}" fileLines)
     list(LENGTH fileLines lineCount)
 
     # A split that lost a line does not report a missing line -- it reports a

@@ -20,7 +20,7 @@
 # right version and platform, running it, and handing it to the selection logic.
 #
 # Usage:
-#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_WORK_DIR=<scratch>
+#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<scratch>
 #         -DFASTCACHED_CXX_COMPILER=<c++> [-DFASTCACHED_MAKE_PROGRAM=<make>]
 #         [-DFASTCACHED_GENERATOR=<gen>]
 #         -P scripts/check-compile-cache-install.cmake
@@ -50,7 +50,7 @@ set(FastCachedInstallOracle
 # bug that reached the real GitHub anyway could not accidentally succeed.
 set(mirrorVersion "9.8.7")
 
-foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPILER)
+foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR FASTCACHED_CXX_COMPILER)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} must be set (cmake -D${required}=... -P ${CMAKE_CURRENT_LIST_FILE})")
     endif()
@@ -100,15 +100,15 @@ if(NOT platform)
     return()
 endif()
 
-file(REMOVE_RECURSE "${FASTCACHED_WORK_DIR}")
-file(MAKE_DIRECTORY "${FASTCACHED_WORK_DIR}")
+file(REMOVE_RECURSE "${FASTCACHED_SCRATCH_DIR}")
+file(MAKE_DIRECTORY "${FASTCACHED_SCRATCH_DIR}")
 
 # Build the archive the module will be asked to install: the same name and the
 # same interior layout a real release has, holding a launcher that answers
 # --version and nothing else. A script rather than a compiled binary, because
 # what is under test is the plumbing around the file, not the file.
 set(stem "fastcached-${mirrorVersion}-${platform}")
-set(payloadRoot "${FASTCACHED_WORK_DIR}/payload")
+set(payloadRoot "${FASTCACHED_SCRATCH_DIR}/payload")
 get_filename_component(memberDir "${payloadRoot}/${stem}/${member}" DIRECTORY)
 file(MAKE_DIRECTORY "${memberDir}")
 file(WRITE "${payloadRoot}/${stem}/${member}"
@@ -116,7 +116,7 @@ file(WRITE "${payloadRoot}/${stem}/${member}"
 file(CHMOD "${payloadRoot}/${stem}/${member}"
      PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 
-set(mirrorDir "${FASTCACHED_WORK_DIR}/mirror/fastcached-mirror/releases/download/v${mirrorVersion}")
+set(mirrorDir "${FASTCACHED_SCRATCH_DIR}/mirror/fastcached-mirror/releases/download/v${mirrorVersion}")
 file(MAKE_DIRECTORY "${mirrorDir}")
 # Deliberately `cmake -E tar` rather than `file(ARCHIVE_CREATE)`, and the reason
 # is the interior layout. A real release tarball holds `${stem}/...` relative
@@ -138,12 +138,12 @@ if(NOT archiveResult EQUAL 0)
     message(FATAL_ERROR "could not build the mirror archive: ${archiveResult} ${archiveError}")
 endif()
 
-set(sandbox "${FASTCACHED_WORK_DIR}/sandbox")
+set(sandbox "${FASTCACHED_SCRATCH_DIR}/sandbox")
 file(MAKE_DIRECTORY "${sandbox}/usr/bin")
 file(CREATE_LINK "${hostUname}" "${sandbox}/usr/bin/uname" COPY_ON_ERROR SYMBOLIC)
 
-set(stageDir "${FASTCACHED_WORK_DIR}/stage")
-set(buildDir "${FASTCACHED_WORK_DIR}/build")
+set(stageDir "${FASTCACHED_SCRATCH_DIR}/stage")
+set(buildDir "${FASTCACHED_SCRATCH_DIR}/build")
 set(arguments
     "-DFASTCACHED_MODULE_DIR=${moduleDir}"
     "-DCMAKE_CXX_COMPILER=${FASTCACHED_CXX_COMPILER}"
@@ -153,7 +153,7 @@ set(arguments
     "-DFASTCACHE_AUTO_INSTALL_DIR=${stageDir}"
     "-DFASTCACHE_AUTO_INSTALL_REPO=fastcached-mirror"
     "-DFASTCACHE_AUTO_INSTALL_VERSION=${mirrorVersion}"
-    "-DFASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE=file://${FASTCACHED_WORK_DIR}/mirror")
+    "-DFASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE=file://${FASTCACHED_SCRATCH_DIR}/mirror")
 if(FASTCACHED_MAKE_PROGRAM)
     list(APPEND arguments "-DCMAKE_MAKE_PROGRAM=${FASTCACHED_MAKE_PROGRAM}")
 endif()

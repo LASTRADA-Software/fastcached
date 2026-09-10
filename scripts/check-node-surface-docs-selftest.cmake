@@ -52,6 +52,11 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -320,12 +325,7 @@ file(READ "${check}" checkText)
 # none is bracketed. Where brackets ARE the data, blanking them is wrong and the
 # remedy is a list-free offset walk instead -- see `check-tsan-scope`, whose rows
 # are Catch2 tags like `[async]`.
-string(REGEX REPLACE "\r\n" "\n" checkText "${checkText}")
-string(REPLACE "\\" " " checkText "${checkText}")
-string(REPLACE ";" " " checkText "${checkText}")
-string(REPLACE "[" " " checkText "${checkText}")
-string(REPLACE "]" " " checkText "${checkText}")
-string(REPLACE "\n" ";" checkLines "${checkText}")
+fastcached_split_lines_tokenised("${checkText}" checkLines)
 set(FastCachedSelftestExemptions "")
 set(inExemptions FALSE)
 foreach(line IN LISTS checkLines)
@@ -392,6 +392,19 @@ foreach(caseRow IN LISTS FastCachedSurfaceSelftestCases)
         continue()
     endif()
     math(EXPR casesRun "${casesRun} + 1")
+
+    # This table asserts in terms of `CMake Error` alone, so a sub-run that merely WARNS
+    # satisfies every needle and is scored a clean pass (#672) -- and ctest's own
+    # FAIL_REGULAR_EXPRESSION would refuse it. No case here expects a warning, so one is a
+    # failure whatever the case wanted; a case that ever should expect one says so at this
+    # line. Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    if(output MATCHES "CMake Warning")
+        list(APPEND failures
+             "[${caseName}] the check WARNED, and a warning changes meaning silently. Every needle in this table is spelled with `CMake Error`, so this case would have passed without this line. It said: ${output}")
+    endif()
+
+    # verdict-error-only: a read of the CASE TABLE, not of the sub-run -- `CMake Error` in
+    # the `must not appear` field is how a row says it expects acceptance.
     string(FIND "${caseMustNotAppear}" "CMake Error" refusalProbe)
     if(refusalProbe EQUAL -1)
         math(EXPR refusalCases "${refusalCases} + 1")

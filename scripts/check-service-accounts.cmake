@@ -87,27 +87,14 @@ if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${FastCachedAccountDeclaration}")
         "Is FASTCACHED_SOURCE_DIR the source root?")
 endif()
 
-# Split a "a|b|c" row into its three fields. Positional rather than named because
-# a row is three values in a fixed order, and CMake has no record type to give
-# them names with.
-#
-# @param row The raw row text.
-# @param variableOut Set to field 1, the cmake variable holding the account name.
-# @param sourceOut Set to field 2, the C++ source that must name the same account.
-# @param reasonOut Set to field 3, why the account exists (printed on failure).
-function(fastcached_split_account_row row variableOut sourceOut reasonOut)
-    string(REPLACE "|" ";" fields "${row}")
-    list(LENGTH fields fieldCount)
-    if(NOT fieldCount EQUAL 3)
-        message(FATAL_ERROR "Malformed row (expected 3 '|'-separated fields, got ${fieldCount}): ${row}")
-    endif()
-    list(GET fields 0 rowVariable)
-    list(GET fields 1 rowSource)
-    list(GET fields 2 rowReason)
-    set(${variableOut} "${rowVariable}" PARENT_SCOPE)
-    set(${sourceOut} "${rowSource}" PARENT_SCOPE)
-    set(${reasonOut} "${rowReason}" PARENT_SCOPE)
-endfunction()
+# The `"value|reason"` row convention, defined once (#513). This file used to carry a
+# splitter of its own that went through `string(REPLACE "|" ";")` and `list(GET)`.
+# The shared one builds no CMake list, and the difference was MEASURED rather than
+# assumed: the two agree on every well-formed row, and where they part it is always
+# the private one REFUSING -- a reason holding a `|`, a `;`, or an unbalanced `[` in
+# a field before the last. So this is a change toward laxity, not a repair, and the
+# table of inputs is in `lib/CheckCommon.cmake` rather than restated here.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 # Read a file whole. `file(READ)` rather than `file(STRINGS)` throughout this
 # script, and that is not a preference: file(STRINGS) returns a LIST, so a line
@@ -187,7 +174,7 @@ elseif(NOT helperText MATCHES "${FastCachedCreateAccountHelper}[ \t]*\\(")
 endif()
 
 foreach(row IN LISTS FastCachedServiceAccounts)
-    fastcached_split_account_row("${row}" variable source reason)
+    fastcached_row_fields("${row}" variable source reason)
 
     # --- the declaration ---------------------------------------------------
     set(account "")
@@ -261,7 +248,7 @@ if(NOT violations STREQUAL "")
 
     set(rulebook "")
     foreach(row IN LISTS FastCachedServiceAccounts)
-        fastcached_split_account_row("${row}" variable source reason)
+        fastcached_row_fields("${row}" variable source reason)
         string(APPEND rulebook "  ${variable}\n      named in ${source}\n      ${reason}\n")
     endforeach()
 

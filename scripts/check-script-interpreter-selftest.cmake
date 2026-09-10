@@ -92,7 +92,10 @@ function(fastcached_run tree outObjected outOutput)
         RESULT_VARIABLE ignored
     )
     set(all "${captured}${capturedErr}")
-    if(all MATCHES "CMake Error")
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    if(all MATCHES "CMake Error|CMake Warning")
         set(${outObjected} TRUE PARENT_SCOPE)
     else()
         set(${outObjected} FALSE PARENT_SCOPE)

@@ -44,6 +44,11 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -137,11 +142,7 @@ foreach(sourceFile IN LISTS scanFiles)
     # while it still passed. Same shape, different corpus, opposite verdict --
     # which is why exposure is judged per (reader, file, surviving lines).
     file(READ "${sourceFile}" _vslangText)
-    string(REPLACE "\\" " " _vslangText "${_vslangText}")
-    string(REPLACE ";" " " _vslangText "${_vslangText}")
-    string(REPLACE "[" " " _vslangText "${_vslangText}")
-    string(REPLACE "]" " " _vslangText "${_vslangText}")
-    string(REGEX REPLACE "\r?\n" ";" matchedLines "${_vslangText}")
+    fastcached_split_lines_tokenised("${_vslangText}" matchedLines)
     list(FILTER matchedLines INCLUDE REGEX "${vslangAssignmentPattern}")
     list(LENGTH matchedLines matchCount)
     if(matchCount EQUAL 0)
@@ -236,11 +237,7 @@ foreach(row IN LISTS vslangEnglishEntryPoints)
     # while it still passed. Same shape, different corpus, opposite verdict --
     # which is why exposure is judged per (reader, file, surviving lines).
     file(READ "${resolvedHelper}" _vslangText)
-    string(REPLACE "\\" " " _vslangText "${_vslangText}")
-    string(REPLACE ";" " " _vslangText "${_vslangText}")
-    string(REPLACE "[" " " _vslangText "${_vslangText}")
-    string(REPLACE "]" " " _vslangText "${_vslangText}")
-    string(REGEX REPLACE "\r?\n" ";" helperLines "${_vslangText}")
+    fastcached_split_lines_tokenised("${_vslangText}" helperLines)
     list(FILTER helperLines INCLUDE REGEX "${helperName}")
     list(LENGTH helperLines helperCount)
     if(NOT helperCount EQUAL helperAllowed)

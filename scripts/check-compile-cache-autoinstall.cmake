@@ -29,7 +29,7 @@
 # on every platform, so covering them on Linux and macOS covers them.
 #
 # Usage:
-#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_WORK_DIR=<scratch>
+#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<scratch>
 #         -DFASTCACHED_CXX_COMPILER=<c++> [-DFASTCACHED_MAKE_PROGRAM=<make>]
 #         [-DFASTCACHED_GENERATOR=<gen>]
 #         -P scripts/check-compile-cache-autoinstall.cmake
@@ -58,7 +58,7 @@ set(FastCachedAutoInstallRows
     "no-such-release|Not auto-installing fastcache-cc:||-DFASTCACHE_AUTO_INSTALL=ON -DFASTCACHE_AUTO_INSTALL_VERSION=9.9.9"
 )
 
-foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPILER)
+foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR FASTCACHED_CXX_COMPILER)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} must be set (cmake -D${required}=... -P ${CMAKE_CURRENT_LIST_FILE})")
     endif()
@@ -87,7 +87,7 @@ if(NOT EXISTS "${FASTCACHED_CXX_COMPILER}")
     return()
 endif()
 
-set(sandbox "${FASTCACHED_WORK_DIR}/sandbox")
+set(sandbox "${FASTCACHED_SCRATCH_DIR}/sandbox")
 file(REMOVE_RECURSE "${sandbox}")
 file(MAKE_DIRECTORY "${sandbox}/usr/bin")
 file(CREATE_LINK "${hostUname}" "${sandbox}/usr/bin/uname" COPY_ON_ERROR SYMBOLIC)
@@ -123,9 +123,9 @@ foreach(row IN LISTS FastCachedAutoInstallRows)
 
     # A staging directory of its own per row, never the user's: a test must not
     # write into ~/.cache, and two rows must not inherit each other's download.
-    set(rowBinaryDir "${FASTCACHED_WORK_DIR}/${name}/build")
-    set(rowStageDir "${FASTCACHED_WORK_DIR}/${name}/stage")
-    file(REMOVE_RECURSE "${FASTCACHED_WORK_DIR}/${name}")
+    set(rowBinaryDir "${FASTCACHED_SCRATCH_DIR}/${name}/build")
+    set(rowStageDir "${FASTCACHED_SCRATCH_DIR}/${name}/stage")
+    file(REMOVE_RECURSE "${FASTCACHED_SCRATCH_DIR}/${name}")
 
     execute_process(
         COMMAND "${CMAKE_COMMAND}"

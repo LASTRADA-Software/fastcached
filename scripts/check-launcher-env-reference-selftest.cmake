@@ -71,10 +71,11 @@ function(fastcached_case name header page want)
     # LINE of it. Flattened before matching, which is why `CMake Error` -- short, and
     # never straddling a wrap -- is what is matched rather than a sentence.
     string(REPLACE "\n" " " flattened "${combined}")
-    string(FIND "${flattened}" "CMake Error" position)
-    if(position EQUAL -1)
-        set(verdict "ACCEPTED")
-    else()
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    set(verdict "ACCEPTED")
+    if(flattened MATCHES "CMake Error|CMake Warning")
         set(verdict "OBJECTED")
     endif()
 

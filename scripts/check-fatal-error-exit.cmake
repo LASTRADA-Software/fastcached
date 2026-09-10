@@ -110,6 +110,11 @@ function(ReadChildExitStatus outVar script arm requireObjection)
     # bare `0` it comes out as the loud "FATAL_ERROR exits 0 here" discovery
     # below: an instrument fault wearing the finding's clothes, which is the
     # one outcome a file arguing for measurement over memory must not produce.
+    # verdict-error-only: this asks whether the `fatal` arm's own `message(FATAL_ERROR)`
+    # fired, which is the quantity this file measures -- not whether a check refused. A
+    # child that WARNED and exited 0 did not run that arm either, so hearing a warning
+    # here would report the arm as having fired when it did not: the wrong answer rather
+    # than a stricter one.
     if(requireObjection AND status EQUAL 0 AND NOT "${ignoredOut}${ignoredErr}" MATCHES "CMake Error")
         set("${outVar}" "silent" PARENT_SCOPE)
         return()

@@ -154,7 +154,10 @@ function(fastcached_run_check tree outObjected outOutput)
         RESULT_VARIABLE ignored
     )
     set(all "${captured}${capturedErr}")
-    if(all MATCHES "CMake Error")
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    if(all MATCHES "CMake Error|CMake Warning")
         set(${outObjected} TRUE PARENT_SCOPE)
     else()
         set(${outObjected} FALSE PARENT_SCOPE)
@@ -174,7 +177,14 @@ endfunction()
 # The patterns below therefore carry NO backslash escapes at all -- a literal
 # `(`, `.` or backtick is written as `.`, which is laxer than an escape and is
 # the trade for a pattern that means the same thing at the call site and inside.
+# @param ARGN `no-count` when the expected refusal is a positive CONTROL firing rather
+#        than a finding. A control reports no findings at all, so asserting `1 finding(s)`
+#        on one would fail it for being exactly what it is.
 macro(fastcached_case label tree wantFinding)
+    set(_wantCount TRUE)
+    if("${ARGN}" STREQUAL "no-count")
+        set(_wantCount FALSE)
+    endif()
     math(EXPR caseCount "${caseCount} + 1")
     fastcached_run_check("${tree}" _objected _output)
 
@@ -190,13 +200,17 @@ macro(fastcached_case label tree wantFinding)
     elseif(NOT _output MATCHES "${wantFinding}")
         fastcached_selftest_failed("${label}" "the refusal never says '${wantFinding}'")
         message("${_output}")
-    elseif(NOT _output MATCHES "1 finding\\(s\\)")
+    elseif(_wantCount AND NOT _output MATCHES "1 finding\\(s\\)")
         # A defect that reports as several findings is the check miscounting its
         # own output, which is how the semicolon defect was noticed at all.
         fastcached_selftest_failed("${label}" "refused, but not with exactly one finding")
         message("${_output}")
     else()
-        message(STATUS "  ok    (want-fail, one finding, attributed) ${label}")
+        set(_shape "one finding, attributed")
+        if(NOT _wantCount)
+            set(_shape "a control firing, attributed")
+        endif()
+        message(STATUS "  ok    (want-fail, ${_shape}) ${label}")
     endif()
 endmacro()
 
@@ -289,6 +303,132 @@ file(WRITE "${packaging}" "${before}")
 file(READ "${packaging}" restored)
 if(NOT restored STREQUAL before)
     fastcached_selftest_failed("semicolon" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# ---------------------------------------------------------------------------
+# Pass 5 (#672): the three ways it has to be seen behaving.
+#
+# It is the pass whose subject is a SPELLING, so all three failures are silent by
+# construction -- a harness reading half the signal passes everything it is given, a
+# marker with no reason still looks marked, and a detector that has stopped
+# recognising the shape prints the same summary as one that read every file.
+
+# The rule itself: a harness that reads only the error word.
+set(harness "${tree}/scripts/check-glob-traversals-selftest.cmake")
+file(READ "${harness}" before)
+string(REPLACE "MATCHES \"CMake Error|CMake Warning\"" "MATCHES \"CMake Error\"" after "${before}")
+file(WRITE "${harness}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("half-read" "the injection changed nothing, so the case stages no defect")
+endif()
+# The label spells the word as `CMake` + `Error` deliberately. It is printed on the
+# SUCCESS path, and this test is registered with
+# FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}" -- so a label carrying
+# the literal would take the test red on a tree with nothing wrong, on ctest only,
+# which is not where this file is usually run from. Same family as a checker
+# reporting its own remediation example.
+fastcached_case("a harness reading only the error half of the signal is refused, and named"
+                "${tree}" "check-glob-traversals-selftest.cmake:.*not for .CMake Warning")
+file(WRITE "${harness}" "${before}")
+file(READ "${harness}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("half-read" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# An exception marker carrying no reason. That is how "forgot" would come to be spelled
+# in the vocabulary of "decided", so it is refused rather than counted.
+set(marked "${tree}/scripts/check-fatal-error-exit.cmake")
+file(READ "${marked}" before)
+string(REPLACE
+       "# verdict-error-only: this asks whether the `fatal` arm's own `message(FATAL_ERROR)`"
+       "# verdict-error-only:" after "${before}")
+file(WRITE "${marked}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("bare-marker" "the injection changed nothing, so the case stages no defect")
+endif()
+fastcached_case("a `verdict-error-only:` marker with no reason is refused"
+                "${tree}" "check-fatal-error-exit.cmake:.*no reason after it")
+file(WRITE "${marked}" "${before}")
+file(READ "${marked}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("bare-marker" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# And the positive control, which is the arm nobody would think to stage: a tree the
+# scan reads to the end and finds NO verdict reader in. That is what a detector which
+# has stopped recognising the shape looks like, and it reports zero findings -- so it
+# is indistinguishable from a clean tree by every other assertion in this file.
+#
+# A SYNTHESISED tree rather than a mutated copy, and the reason is cost: blinding the
+# real copy means rewriting every file under scripts/ that carries the word, and this
+# fixture already measures its staging as the thing it costs on DrvFs. Six small files
+# satisfy passes 1 through 4 and carry the word nowhere.
+set(blind "${FASTCACHED_SCRATCH_DIR}/no-verdict-readers")
+file(REMOVE_RECURSE "${blind}")
+file(MAKE_DIRECTORY "${blind}/scripts")
+file(MAKE_DIRECTORY "${blind}/src/tests")
+file(MAKE_DIRECTORY "${blind}/cmake")
+file(WRITE "${blind}/scripts/subject.cmake" "cmake_minimum_required(VERSION 3.28)\n")
+file(WRITE "${blind}/scripts/canary.cmake"
+     "cmake_minimum_required(VERSION 3.28)\nmessage(STATUS \"a canary that exits 0\")\n")
+file(WRITE "${blind}/cmake/pre.cmake" "cmake_minimum_required(VERSION 3.28)\n")
+file(WRITE "${blind}/cmake/post.cmake" "cmake_minimum_required(VERSION 3.28)\n")
+file(WRITE "${blind}/cmake/Packaging.cmake"
+     "set(CPACK_PRE_BUILD_SCRIPTS \"\${CMAKE_SOURCE_DIR}/cmake/pre.cmake\")\n"
+     "set(CPACK_POST_BUILD_SCRIPTS \"\${CMAKE_SOURCE_DIR}/cmake/post.cmake\")\n")
+file(WRITE "${blind}/src/tests/CMakeLists.txt"
+     "add_test(\n    NAME \"subject\"\n    COMMAND \${CMAKE_COMMAND} -P \"\${CMAKE_SOURCE_DIR}/scripts/subject.cmake\"\n)\n"
+     "set_tests_properties(\"subject\" PROPERTIES\n    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"\n)\n"
+     "add_test(\n    NAME \"canary\"\n    COMMAND \${CMAKE_COMMAND} -P \"\${CMAKE_SOURCE_DIR}/scripts/canary.cmake\"\n)\n"
+     "set_tests_properties(\"canary\" PROPERTIES\n    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"\n    WILL_FAIL TRUE\n)\n")
+fastcached_case("a tree the scan reads to the end with no verdict reader in it fires the control"
+                "${blind}" "no compliant verdict reader" no-count)
+
+# ---------------------------------------------------------------------------
+# Pass 2 (#679): the rule this check was written for, and the walk that now answers
+# it in one pass.
+#
+# Neither was covered here before. The cases above drive passes 3, 3b and 5, and
+# pass 2 -- a registration that cannot report failure, which is the whole reason
+# this file exists -- had never been watched refusing anything. A rewrite of an
+# unwatched function is the shape worth staging a case for.
+
+# The rule. ONE registration loses its signal, and the finding must name that one
+# and only that one: a lookup that blurred two registrations together would report a
+# violation against a check that has nothing wrong with it, and nothing in the
+# message would say so.
+set(registrations "${tree}/src/tests/CMakeLists.txt")
+file(READ "${registrations}" before)
+string(REPLACE
+       "set_tests_properties(\"glob-traversals-selftest\" PROPERTIES\n    FAIL_REGULAR_EXPRESSION \"\${FASTCACHED_SCRIPT_CHECK_FAILED}\"\n"
+       "set_tests_properties(\"glob-traversals-selftest\" PROPERTIES\n" after "${before}")
+file(WRITE "${registrations}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("unsignalled" "the injection changed nothing, so the case stages no defect")
+endif()
+fastcached_case("a registration with no FAIL_REGULAR_EXPRESSION is refused, and named"
+                "${tree}" ".glob-traversals-selftest. runs a .cmake -P. script but has no FAIL_REGULAR_EXPRESSION")
+file(WRITE "${registrations}" "${before}")
+file(READ "${registrations}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("unsignalled" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# And the walk itself losing the shape it reads. The finding has to name the WALK: a
+# check that answers an instrument fault with 71 findings against 71 innocent
+# registrations is an instrument fault wearing the findings' clothes.
+file(READ "${registrations}" before)
+string(REPLACE "set_tests_properties(" "set_test_properties(" after "${before}")
+file(WRITE "${registrations}" "${after}")
+if(before STREQUAL after)
+    fastcached_selftest_failed("blocks-unreadable" "the injection changed nothing, so the case stages no defect")
+endif()
+fastcached_case("a walk that stops recognising property blocks names ITSELF, not 71 innocent checks"
+                "${tree}" "has stopped recognising the shape" no-count)
+file(WRITE "${registrations}" "${before}")
+file(READ "${registrations}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("blocks-unreadable" "the tree was not restored, so every later case reads an undescribed tree")
 endif()
 
 # The control AGAIN, over the tree every case above has now written to. The

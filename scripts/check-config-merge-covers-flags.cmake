@@ -37,6 +37,11 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -70,11 +75,7 @@ endforeach()
 # idiom exists in two incompatible families that must not be merged.
 function(fastcached_lines_of relative outVar)
     file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" content)
-    string(REPLACE ";" "\\;" content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REPLACE "\r\n" "\n" content "${content}")
-    string(REPLACE "\n" ";" lines "${content}")
+    fastcached_split_lines_verbatim("${content}" lines)
     set(${outVar} "${lines}" PARENT_SCOPE)
 endfunction()
 
