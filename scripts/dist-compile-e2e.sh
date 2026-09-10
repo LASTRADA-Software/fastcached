@@ -1123,8 +1123,8 @@ cmp -s "${proj}/build/reference.o" "${proj}/build/one.o" || {
     # How they differ, not just that they do: equal sizes with different bytes
     # means something environment-specific was embedded, which is a different
     # investigation from a size mismatch.
-    echo "  reference: $(wc -c < "${proj}/build/reference.o") bytes" >&2
-    echo "  produced:  $(wc -c < "${proj}/build/one.o") bytes" >&2
+    echo "  reference: $(wc -c < "${proj}/build/reference.o" | tr -d ' ') bytes" >&2
+    echo "  produced:  $(wc -c < "${proj}/build/one.o" | tr -d ' ') bytes" >&2
     one_diff="$(cmp -l "${proj}/build/reference.o" "${proj}/build/one.o" 2>/dev/null || true)"
     if [[ -n "$one_diff" ]]; then head -5 <<< "$one_diff" >&2; fi
     fail "the worker's object differs from the locally compiled one"

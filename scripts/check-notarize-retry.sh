@@ -87,7 +87,7 @@ run_case accepted completed "DRIVER-COMPLETED" 1
 
 fake_xcrun '#!/bin/sh
 case "$2" in submit) echo sub >> '"$work"'/submits
-  if [ "$(wc -l < '"$work"'/submits)" -le 1 ]; then exit 3; fi
+  if [ "$(wc -l < '"$work"'/submits | tr -d " ")" -le 1 ]; then exit 3; fi
   echo "{\"id\":\"11111111-2222-3333-4444-555555555555\",\"status\":\"Accepted\"}";; esac
 exit 0'
 run_case stall_then_accept completed "did not answer" 2

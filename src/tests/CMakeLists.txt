@@ -2882,6 +2882,51 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Every RESP verb the server answers is documented, and every verb the docs
+# claim is answered exists.
+#
+# `RedisResp.hpp` has said for a long time that `CommandTable` is the source of
+# truth "if this prose drifts". That is a sentence, not a reader, and the prose
+# drifted: six doc pages said RESP3 was unsupported while a probe returns a
+# RESP3 map, `unsupported.md` named `SADD` and `SMEMBERS` as examples of an
+# absent family that is in fact served, and `COMMAND` was documented as always
+# answering `*0` against a live `:66`. None of it could fail, so none of it did.
+#
+# `docs-subject` as well as `hygiene`: the subject IS documentation, and #687 is
+# what happens when a check about prose is gated on a code change -- prose
+# drifts by being edited, and by the code beneath it moving.
+#
+# `if(NOT WIN32)` for the reason its neighbours above carry it: the script is
+# POSIX and what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "resp-command-docs"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-resp-command-docs.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("resp-command-docs" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against synthetic trees. A suite with only a correct case
+    # passes under every bug the check exists to catch -- and the correct case is
+    # not decoration either: a guard nobody has watched ACCEPT is not known to
+    # work, which is #1031. Both ways the reader can fail to LOOK (an unreadable
+    # array literal, a renamed doc heading) are watched REFUSING rather than
+    # passing over two empty lists, and the stated row count is driven in both
+    # directions.
+    add_test(
+        NAME "resp-command-docs-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-resp-command-docs.sh" --self-test
+    )
+    set_tests_properties("resp-command-docs-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # A config file this package used to ship is retired from operators' disks.
@@ -3559,7 +3604,7 @@ set_tests_properties("node-working-directory-selftest" PROPERTIES
 # the binary; do not make it go away by changing a code page, and read the
 # script's header before reaching for `ENCODING`, one value of which reports a
 # PASS for the very defect this checks for.
-foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node compile-cache-testclient)
+foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node fastcache-cli compile-cache-testclient)
     if(TARGET ${_utf8ArgvTarget})
         add_test(
             NAME "utf8-argv-${_utf8ArgvTarget}"
@@ -4413,6 +4458,43 @@ else()
     # Starts a real daemon to create the stores, so it must not race the other
     # server-starting smoke tests.
     set_tests_properties("migrate-storage-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# fastcache-cli-e2e: the client against a real daemon.
+#
+# Registered HERE and not beside the app because it names two targets, and
+# `src/apps` walks its table in order: a `$<TARGET_FILE:>` guard on a target
+# configured later does not fail, it silently skips the test forever.
+#
+# What this reaches that `fastcache-cli-tests` cannot is the exit codes against a
+# live server. The unit tests drive every handler over a scripted exchange and can
+# prove the mapping from an outcome to a code; only a real daemon proves that a
+# miss, a refused credential and a closed port arrive as three different outcomes
+# in the first place. That discrimination is the whole reason the outcome table has
+# six rows, and it is the property an operator's script depends on.
+#
+# NOT marked POSIX-only, unlike its neighbours above, and that is a measurement
+# rather than an assumption: it was run to completion on Windows through Git Bash
+# before this registration was written. It uses `mktemp`, `/dev/tcp` through
+# `wait_for_port`, and the shared helpers -- all of which Git Bash supplies.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-cli)
+    message(STATUS "fastcache-cli-e2e: daemon or client not built — skipping")
+else()
+    add_test(
+        NAME "fastcache-cli-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fastcache-cli-e2e.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --cli "$<TARGET_FILE:fastcache-cli>"
+    )
+    # Starts real daemons on drawn ports, so it must not race the other
+    # server-starting smoke tests.
+    set_tests_properties("fastcache-cli-e2e" PROPERTIES
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE

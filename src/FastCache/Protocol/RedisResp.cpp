@@ -8,6 +8,7 @@
 #include <FastCache/Cache/StreamCodec.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
+#include <FastCache/Core/NumericText.hpp>
 #include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
@@ -33,12 +34,10 @@
 #include <expected>
 #include <format>
 #include <limits>
-#include <locale>
 #include <memory>
 #include <mutex>
 #include <ranges>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1134,84 +1133,20 @@ namespace
         return ec == std::errc {} && ptr == sv.data() + sv.size();
     }
 
-    /// Parse a finite double from `sv` in a locale-independent way, rejecting
-    /// trailing garbage and non-finite inputs.
+    /// Parse a finite double from `sv`, locale-independently.
     ///
-    /// Implementation: validate the byte sequence against the redis numeric
-    /// grammar (`[-+]?[0-9]*(\.[0-9]+)?([eE][-+]?[0-9]+)?`) first, then parse
-    /// the canonicalised text with `std::istringstream` pinned to the classic
-    /// C locale via `imbue(std::locale::classic())`. That side-steps the
-    /// global-LC_NUMERIC hazard that would otherwise let a non-`.`-LC_NUMERIC
-    /// host (e.g. de_DE.UTF-8) reject the wire format the daemon's own
-    /// `std::format` writes — and is portable across POSIX and Windows
-    /// (unlike `uselocale`).
-    ///
-    /// We don't use `std::from_chars<double>` because the floating-point
-    /// from_chars overload is unavailable on some libc++ versions (macOS
-    /// before 26.0). Once the project floor catches up, this collapses
-    /// to a single from_chars call.
+    /// Delegates to `Core/NumericText.hpp`, which is where this implementation now
+    /// lives. It was MOVED out of this file rather than copied: the reason it cannot
+    /// be a `std::from_chars` call -- libc++ has no floating-point overload before
+    /// macOS 26.0 -- is a fact about the whole tree, and stated only here it reached
+    /// nobody writing a new file. `fastcache-cli` walked straight into it and went
+    /// red on `macOS-clang-release`.
     /// @param sv  Text to parse.
     /// @param out Receives the parsed value on success.
     /// @return True iff the whole string is a finite double.
     [[nodiscard]] bool ParseDouble(std::string_view sv, double& out) noexcept
     {
-        if (sv.empty())
-            return false;
-        // Locale-neutral pre-validation: every byte must be from the redis
-        // numeric grammar. Catches embedded NUL, whitespace, and any
-        // locale-specific decimal separators (',') the daemon doesn't speak.
-        bool sawDot = false;
-        bool sawExp = false;
-        bool sawDigit = false;
-        for (auto const i: std::views::iota(std::size_t { 0 }, sv.size()))
-        {
-            auto const c = sv[i];
-            if (c >= '0' && c <= '9')
-                sawDigit = true;
-            else if (c == '.')
-            {
-                if (sawDot || sawExp)
-                    return false;
-                sawDot = true;
-            }
-            else if (c == 'e' || c == 'E')
-            {
-                if (sawExp || !sawDigit)
-                    return false;
-                sawExp = true;
-                sawDigit = false; // exponent must have its own digits
-            }
-            else if (c == '+' || c == '-')
-            {
-                if (i != 0 && !(sawExp && (sv[i - 1] == 'e' || sv[i - 1] == 'E')))
-                    return false;
-            }
-            else
-                return false;
-        }
-        if (!sawDigit)
-            return false;
-
-        // The validator guarantees ASCII; pin the stream to the classic
-        // (C) locale so a non-`.`-LC_NUMERIC host (e.g. de_DE.UTF-8)
-        // still parses the wire format the daemon emits. Portable across
-        // POSIX and Windows. One istringstream construction per call —
-        // not on any hot path (INCRBYFLOAT only).
-        try
-        {
-            std::istringstream iss { std::string { sv } };
-            iss.imbue(std::locale::classic());
-            double value = 0;
-            iss >> value;
-            if (iss.fail() || !iss.eof() || !std::isfinite(value))
-                return false;
-            out = value;
-            return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
+        return ParseFiniteDouble(sv, out);
     }
 
     Task<bool> WriteAll(ISocket* socket, std::string_view payload)

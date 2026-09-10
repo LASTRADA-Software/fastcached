@@ -1457,6 +1457,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Neither a `.pkg` nor an MSI has a conffile mechanism — only a `.default` ships.
 - Every `build.yml` checkout that could configure passes `fetch-depth: 0`, and the
   release job's asset list stays the **last** key of its `with:` mapping.
+- **A new INSTALLED binary is not one CMake row.** CPack installs the whole Runtime
+  component while the three `Package (...)` jobs name their build targets by hand, so
+  a target with an `install()` rule that no packaging job builds fails at INSTALL time
+  on all three platforms at once — and none of those contexts is required, so it lands
+  on whoever cuts the release. Three `--target` lines in `build.yml`, the macOS
+  redistributable loop (a different list: payload, not symlinks) and
+  `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
@@ -1563,6 +1570,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
   `coverage.sh`'s comments, where nobody looking at a new script would find it.
+- **`std::from_chars` has no FLOATING-POINT overload in libc++ before macOS 26.0** --
+  the `macos-14` runners -- so `std::from_chars(first, last, someDouble)` compiles on
+  libstdc++ and on MSVC and fails to BUILD on the one leg CI runs it on. Every integral
+  `from_chars` in this tree is fine, and there are many, which is what makes the
+  standing remedy for a missing libc++ facility (*grep for it in non-test code and see
+  that macOS already compiles it*) answer YES and be WRONG: a grep tests a NAME while
+  the hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's
+  one answer, and it pins the C locale as well, which the obvious `istringstream`
+  spelling does not. It cost a red `macOS-clang-release` once, written by an author with
+  the correct implementation already in the tree -- in a comment only the RESP handler's
+  readers ever see, which is why it has moved.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable
   declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
   boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy
@@ -1576,6 +1594,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory
   of its own; `PATH` resolving to an older binary reports clean in the way that
   means nothing.
+- **And `CLANG_TOOLS_VERSION: 22` pins a MAJOR, not a BUILD.** apt.llvm.org ships
+  rolling snapshots under one version number, so `clang-tidy-22 --version` prints
+  `Ubuntu LLVM version 22.1.8` for two binaries a month apart, and only
+  `dpkg-query -W -f='${Version}\n' clang-tidy-22` tells them apart. Measured
+  2026-09-10 (PR #1198): local `20260613092238+e80beda6e255` against CI's
+  `20260714014902+ca7933e47d3a`. CI reported **19**
+  `modernize-use-designated-initializers` errors in a new test file; the local sweep
+  of the same file, same database, with the check NAMED EXPLICITLY and a canary
+  proving the analyser ran, reported **0** — and after
+  `apt-get install --only-upgrade clang-tidy-22` reported exactly 19. Both directions
+  measured, so the variable is the binary. What makes it expensive is that the remedy
+  reads as already applied: you have a binary called `clang-tidy-22`, so the rule
+  above looks satisfied while the analyser is silent about a check it does not carry —
+  and it invalidates every earlier verdict of that session, not just the one file.
+  `clang-format-22` rides the same stream and was equally stale, which is the mirror
+  hazard, so upgrade the pair; read `apt-cache policy`, never the `--version` banner.
 - A script that NAMES a tool version must name it **everywhere that version matters**.
   `local-gate.sh` pinned the formatter and handed the analyser to `PATH`, with the
   paragraph explaining why that is wrong in its own header four lines above — an

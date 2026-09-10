@@ -1578,7 +1578,7 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     BuildIncludeGraph "${sources[@]}"
     AffectedTranslationUnits "${touched[@]}" > "${scratch}/selection"
     selection="${scratch}/selection"
-    echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection") candidate file(s)"
+    echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection" | tr -d ' ') candidate file(s)"
 fi
 
 # `--cached --others --exclude-standard` rather than plain `git ls-files`: a new

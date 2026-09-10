@@ -31,7 +31,10 @@ compatible with well-behaved clients written against those references.
 
 - Real SASL authentication. The opcodes are recognised so probing
   clients fail fast rather than hang.
-- Redis RESP3. `HELLO 3` is rejected with `-NOPROTO`.
+- Redis lists, hashes and sorted sets. Sets and streams are supported
+  in part; the set-algebra verbs (`SINTER`, `SUNION`, ...) are not.
+- Key enumeration on any protocol: no `KEYS`, `SCAN`, `DBSIZE` or
+  `stats cachedump`.
 - The `watch` command's streaming event subscription.
 - Multiple Redis databases. There is a single flat keyspace; `SELECT`
   is accepted as a no-op (any index replies `+OK`) for client

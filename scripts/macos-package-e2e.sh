@@ -93,6 +93,34 @@ esac
 # `runs = 3` / `last exit code = 2` signature and the reason sitting on the runner's
 # disk, discarded (#1055).
 #
+# The tools the installer symlinks into /usr/local/bin, read from the ONE variable
+# the postinstall and the uninstaller are generated from.
+#
+# Two copies of this list used to be spelled out below, and a fourth installed
+# binary reached the variable and neither copy -- so its symlink was asserted
+# neither present after an install nor GONE after an uninstall. The second is the
+# quiet direction: a leftover symlink points at a deleted executable and nothing
+# else in the tree would report it.
+#
+# `sed` on the source tree rather than a build-tree query, because this fixture is
+# handed a `.pkg` and knows nothing about a build directory. It REFUSES when it
+# reads nothing: an empty list makes both loops below pass vacuously, which is the
+# failure mode a derived list has and a restated one does not.
+#
+# @return Prints the tool names, whitespace-separated. Fails the run when the
+#         variable cannot be read or is empty.
+linked_tools() {
+    local root line tools
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    [[ -r "${root}/CMakeLists.txt" ]] \
+        || fail "linked_tools: cannot read ${root}/CMakeLists.txt"
+    line="$(sed -n 's/^set(FASTCACHED_MACOS_LINKED_TOOLS "\(.*\)")$/\1/p' "${root}/CMakeLists.txt")"
+    tools="${line%%$'\n'*}"
+    [[ -n "$tools" ]] \
+        || fail "linked_tools: FASTCACHED_MACOS_LINKED_TOOLS is not set in ${root}/CMakeLists.txt, so every symlink assertion would pass vacuously"
+    printf '%s' "$tools"
+}
+
 # The PATH is read from the plist launchd was actually given, never recomputed here.
 # `DefaultLogDirectory` builds it under `FC_MACOS_PREFIX`, which is a BUILD setting,
 # so a fixture recomputing the rule would agree with itself rather than with the
@@ -502,7 +530,14 @@ grep -q "^${LABEL}\." <<< "$installedPackages" \
 # open, and in fish, which never reads /etc/paths.d. Every tool, including the
 # worker: /etc/paths.d takes effect only for LOGIN shells, so without a link the
 # command an operator is told to run is not on PATH where they will run it.
-for tool in fastcached fastcache-cc fastcache-compile-node; do
+#
+# The list is DERIVED from the variable the postinstall and the uninstaller are
+# generated from, never restated. It was a hand-kept copy here and in the
+# uninstall check below, and a fourth installed binary went into the variable
+# and into neither copy -- so its symlink was asserted neither present nor,
+# worse, REMOVED. `linked_tools` refuses when it reads nothing, because an
+# empty list makes both loops pass vacuously.
+for tool in $(linked_tools); do
     [[ -L "/usr/local/bin/${tool}" ]] || fail "no /usr/local/bin/${tool} symlink"
 done
 
@@ -776,7 +811,7 @@ uninstall_log="$(sudo "${PREFIX}/bin/fastcached-uninstall" 2>&1)" \
 
 [[ ! -e "$PREFIX" ]]  || fail "$PREFIX still present"
 [[ ! -e "$PATHS_D" ]] || fail "$PATHS_D still present"
-for tool in fastcached fastcache-cc fastcache-compile-node; do
+for tool in $(linked_tools); do
     [[ ! -e "/usr/local/bin/${tool}" ]] || fail "/usr/local/bin/${tool} symlink left behind"
 done
 ! registered_agent_domain >/dev/null || fail "user agent still registered in $(registered_agent_domain)"

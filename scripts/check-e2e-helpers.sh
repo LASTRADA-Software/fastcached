@@ -3059,6 +3059,104 @@ if [ "$earlyexit_scanned" -lt 1 ]; then
     note_failure "early-exit-scan"
 fi
 
+# --- no script captures a `wc` count without normalising it -----------------
+#
+# **BSD `wc` pads its count with leading blanks; GNU `wc` does not.** So
+# `$(wc -c < f)` is `11` on Linux and `      11` on macOS, and a fixture that
+# captures it and compares it as a STRING is green on one platform and red on the
+# other. `fastcache-cli-e2e` shipped exactly that and failed on its first macOS run
+# with `--raw wrote       11 bytes, expected 11` -- a message whose two numbers are
+# EQUAL, which reads as the check being broken rather than as the shell, and is the
+# reading that gets an assertion deleted.
+#
+# The trap is asymmetric in a way that hides it: the same line computed `expected`
+# inside `$(( ))`, which normalises, and `actual` as a bare capture, which does not.
+# One of the two spellings was suspicious and it was not obvious which.
+#
+# The rule is normalisation AT CAPTURE, not "normalise where it is compared". A
+# regex cannot see where a captured count is later used, and a scan that guesses is
+# noise -- so this demands the stronger, uniform property. 12 of the 18 sites in the
+# tree already satisfied it by hand, which is what makes it cheap: the idiom was
+# already the house style and one file simply did not know.
+#
+# Remedy: `count_bytes` / `count_lines` from `scripts/lib/e2e-common.sh` in a
+# fixture, or `| tr -d ' '` inside the substitution anywhere else.
+echo "== no script captures a wc count without normalising it"
+
+# A `$(wc ...)` or backticked `wc` that neither pipes through `tr -d` nor sits in an
+# arithmetic context, and is not the operand of a numeric test.
+#
+# The three accepted forms are each visible on the line, which is what keeps this
+# from needing dataflow:
+#   * `| tr -d ' '` inside the substitution -- normalised at capture
+#   * `$(( $(wc ...) ... ))` -- arithmetic evaluation skips blanks
+#   * `[ "$(wc ...)" -le N ]` -- so does a numeric test
+#
+# Comment lines are stripped first. A COMMENT IS NOT A CALL SITE, and this file's
+# own neighbours have twice matched their own headers -- the three surviving `wc`
+# mentions in the tree after this scan landed are all prose explaining the trap,
+# including the one in `e2e-common.sh` that documents the remedy.
+_bare_wc_capture() {
+    grep -nE '(\$\(|`)[[:space:]]*wc[[:space:]]' "$1" \
+        | grep -v '^[0-9][0-9]*: *#' \
+        | grep -vE 'tr[[:space:]]+-d' \
+        | grep -vE '\$\(\(' \
+        | grep -vE '\)"?[[:space:]]+-(eq|ne|lt|le|gt|ge)[[:space:]]' \
+        || true
+}
+
+# The canary, both directions. A scan nobody has watched refuse is a scan reporting
+# PASS over a set in which nothing could fail.
+wc_canary_dir="$(mktemp -d)"
+cat > "${wc_canary_dir}/must-catch.sh" <<'CANARY'
+actual=$(wc -c < "$WORK/raw")
+n=`wc -l < "$file"`
+fields=$(wc -l < "$out")
+echo "read $(wc -c < "$blob") bytes"
+if [ "$(wc -l < "$f")" = "1" ]; then :; fi
+CANARY
+cat > "${wc_canary_dir}/must-not-catch.sh" <<'CANARY'
+actual=$(count_bytes "$WORK/raw")
+expected=$(( $(wc -c < "$payload") - 1 ))
+n="$(wc -l < "$calls" | tr -d ' ')"
+seen=$(wc -l < "$work/submits" | tr -d " ")
+if [ "$(wc -l < "$f")" -le 1 ]; then :; fi
+# actual=$(wc -c < "$WORK/raw")
+CANARY
+_scan_canary "wc-scan-canary" _bare_wc_capture \
+    "${wc_canary_dir}/must-catch.sh" "${wc_canary_dir}/must-not-catch.sh" \
+    5 "captures" "a spelling that is already normalised"
+rm -rf "$wc_canary_dir"
+
+wc_allowed="check-e2e-helpers.sh:this file, which stages the scan's own canary captures above. They are heredoc text and run nothing; the canary asserting all five are caught is what covers them."
+wc_scanned=0
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    _scan_exempt "$base" "$wc_allowed" && continue
+    wc_scanned=$(( wc_scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_bare_wc_capture "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL wc-scan: ${base} captures a wc count without normalising it." >&2
+        echo "     BSD wc pads with blanks and GNU wc does not, so the capture compares" >&2
+        echo "     equal to itself only on Linux -- a red macOS leg whose message reads" >&2
+        echo "     'wrote       11 bytes, expected 11'." >&2
+        echo "     Use count_bytes/count_lines from scripts/lib/e2e-common.sh, or pipe" >&2
+        echo "     the substitution through | tr -d ' '." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        note_failure "wc-scan"
+    fi
+done < <( _shell_scripts )
+
+# A census, for the reason its neighbours record: a walk that matched nothing
+# reports clean over zero files and reads exactly like complete coverage.
+ran=$(( ran + 1 ))
+if [ "$wc_scanned" -lt 1 ]; then
+    echo "FAIL wc-scan: the walk matched no shell scripts, so every one of them 'passed'." >&2
+    note_failure "wc-scan"
+fi
+
 # --- no script keeps its own copy of a shared helper ------------------------
 #
 # The other half of #449, and the half a conversion cannot enforce on its own.

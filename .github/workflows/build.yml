@@ -2197,7 +2197,7 @@ jobs:
         run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build --preset gcc-release --target fastcached fastcache-cc fastcache-compile-node
+        run: cmake --build --preset gcc-release --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
 
       - name: "Package"
         working-directory: out/build/gcc-release
@@ -2711,7 +2711,7 @@ jobs:
             -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build out/build/macos-package --target fastcached fastcache-cc fastcache-compile-node
+        run: cmake --build out/build/macos-package --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
 
       - name: "Verify the binaries are redistributable"
         # The regression that would otherwise ship silently: everything builds,
@@ -2719,7 +2719,7 @@ jobs:
         # without the build host's Homebrew prefix.
         run: |
           set -euo pipefail
-          for tool in fastcached fastcache-cc fastcache-compile-node; do
+          for tool in fastcached fastcache-cc fastcache-compile-node fastcache-cli; do
             binary="out/build/macos-package/target/$tool"
             echo "== $tool"; otool -L "$binary"
             strays="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
@@ -2897,7 +2897,7 @@ jobs:
         run: cmake --preset cl-release -DALLOW_SCCACHE_FALLBACK=ON -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
-        run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node
+        run: cmake --build --preset cl-release --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
 
       # Same assertion as the `windows` job, where the reasoning is written out.
       - name: "Assert sccache actually handled the build"

@@ -134,7 +134,7 @@ while IFS= read -r path; do
 done <<< "$changed"
 
 if [[ ${#codePaths[@]} -eq 0 ]]; then
-    echo "ci-scope: documentation only ($(wc -l <<< "$changed") path(s)); the build matrix is skipped" >&2
+    echo "ci-scope: documentation only ($(wc -l <<< "$changed" | tr -d ' ') path(s)); the build matrix is skipped" >&2
     Publish "code=false"
     exit 0
 fi

@@ -1,6 +1,6 @@
 # Tools
 
-The project ships three executables, and these are all of them: every target
+The project ships four executables, and these are all of them: every target
 carrying an `install()` rule appears below.
 
 ## `fastcached` — the cache daemon
@@ -48,6 +48,33 @@ falls back to a local compile, so distribution cannot fail a build.
 
 Full reference: [fastcache-compile-node](fastcache-compile-node.md).
 
+## `fastcache-cli` — the operator's client
+
+A `redis-cli`-shaped client for everything the other three expose. It reads and
+writes the keyspace (`get`, `set`, `mget`, `del`, `ttl`, `expire`, `incr`, …) and
+it gathers statistics, which is the part an operator on an SSH session has
+otherwise had to do with `telnet` or a browser.
+
+Two things make it worth having rather than reaching for `redis-cli`:
+
+**It answers in five registers.** Human-readable aligned columns by default, and
+`--format=json|kv|tsv|csv` for anything that parses. The output shape does not
+change when stdout is a pipe — only colour does — so a command that works by hand
+works in a script.
+
+**An absent value is not a zero.** A field the chosen source could not supply
+renders as a dash, or as `null` in JSON, and never as `0`. A counter that has
+counted nothing does render `0`, because that is the truth about events that did
+not happen. `stats` reports *which* source answered as a field of its own output,
+because the difference between a 127-series `/metrics` scrape and a 7-field
+`INFO` reply is not something a dashboard should have to guess at.
+
+Its exit codes distinguish six outcomes rather than success and failure: a cache
+**miss** exits 1 and an **unreachable** daemon exits 3, so a script can retry one
+and give up on the other.
+
+Full reference: [fastcache-cli](fastcache-cli.md).
+
 ## Which do I want?
 
 | Goal | Use |
@@ -56,6 +83,7 @@ Full reference: [fastcache-compile-node](fastcache-compile-node.md).
 | Compile on other machines too, not just cache | add `fastcache-compile-node` workers |
 | Back an existing sccache setup, on GCC or Clang | `fastcached` alone, via `SCCACHE_MEMCACHED` / `SCCACHE_REDIS` |
 | A memcached- or Redis-compatible cache | `fastcached` alone |
+| Read, write or measure a running cache from a terminal | `fastcache-cli` |
 
 The sccache row is the one with a condition on it, and the condition is the
 compiler rather than the goal:

@@ -779,8 +779,40 @@ wait_until() {
         "$alive" "$status" "$grew" "$stall" "$logfile" "$requestedMs"
 }
 
+# Bytes in a file, as a bare integer. Fails the run when the file is missing.
+#
+# **`wc` pads on BSD and does not on GNU**, so `$(wc -c < f)` is `11` on Linux and
+# `      11` on macOS. A fixture that captures that and compares it as a STRING is
+# green on one platform and red on the other, saying `wrote       11 bytes, expected
+# 11` -- a message whose two numbers are equal, which reads as the instrument being
+# broken rather than as the shell. `fastcache-cli-e2e` shipped that way and it was
+# the fixture's first run on macOS that found it.
+#
+# Arithmetic contexts (`$(( ))`) and numeric tests (`[ x -eq y ]`) normalise on
+# their own; a bare capture does not. Use these rather than remembering which.
+#
+# @param 1 path to read
+# @return the byte count on stdout
+count_bytes() {
+    [ -r "$1" ] || fail "count_bytes: cannot read $1"
+    wc -c < "$1" | tr -d ' '
+}
+
+# Lines in a file, as a bare integer. Same padding reason as `count_bytes`.
+#
+# @param 1 path to read
+# @return the line count on stdout
+count_lines() {
+    [ -r "$1" ] || fail "count_lines: cannot read $1"
+    wc -l < "$1" | tr -d ' '
+}
+
 # Size of a file in bytes, or 0 when it does not exist yet. `wc -c` rather than
 # `stat`, whose flags differ between GNU and BSD.
+#
+# Not `count_bytes`: a missing file is ORDINARY here (a wait polls a log before
+# anything has written it) where for `count_bytes` it is a fixture bug. Two
+# contracts, so two functions.
 _e2e_size() {
     if [ -r "$1" ]; then
         wc -c < "$1" 2>/dev/null | tr -d ' '
