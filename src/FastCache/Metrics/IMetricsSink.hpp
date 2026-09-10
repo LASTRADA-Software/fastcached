@@ -255,9 +255,10 @@ class IMetricsSink
         /// Compiles handed to the runner.
         ///
         /// **Their difference with `WorkerJobsCompleted` is NOT the in-flight
-        /// count**, which this said until #307. All four runner refusals —
-        /// `UnknownFingerprint`, `RejectedArgument`, `ScratchUnavailable`,
-        /// `SpawnFailed` — increment this and then return without reaching
+        /// count**, which this said until #307. EVERY runner refusal — one per
+        /// `JobRefusal`, which is `RefusalTable`'s length and not a list anybody
+        /// keeps here; it was written out as four and was stale by #264 —
+        /// increments this and then returns without reaching
         /// `WorkerJobsCompleted`, so the difference gains one permanently per
         /// refusal. The counters are monotone, so nothing retracts it, and it is
         /// worst exactly where it hurts most: an unknown fingerprint is documented
@@ -326,6 +327,11 @@ class IMetricsSink
         /// Distinct from a compiler that ran and failed: this one says the
         /// toolchain this worker advertises is not actually usable here.
         WorkerJobsRefusedSpawnFailed,
+        /// Jobs refused because this worker cannot classify the compiler its own
+        /// configuration names. Its own counter rather than folded into
+        /// `WorkerJobsRefusedSpawnFailed`, because the remedies differ: that one is
+        /// a path to fix, this one is a toolchain this build does not recognise.
+        WorkerJobsRefusedCompilerUnclassified,
         /// Jobs refused because this worker had not finished surveying its
         /// toolchains. Its own counter rather than folded into
         /// `WorkerJobsRefusedUnknownFingerprint`, because the two send an operator

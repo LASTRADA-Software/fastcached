@@ -234,6 +234,13 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Jobs refused because the compiler could not be spawned: the "
               "toolchain this worker advertises is not usable here.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedCompilerUnclassified,
+      .prometheusName = "fastcache_worker_jobs_refused_compiler_unclassified_total",
+      .help = "Jobs refused because this worker cannot classify the compiler its "
+              "own --toolchain names: it ran, and this build does not recognise "
+              "which driver it is. Not a path fault -- see "
+              "fastcache_worker_jobs_refused_spawn_failed_total for that one.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedSurveyInFlight,
       .prometheusName = "fastcache_worker_jobs_refused_survey_in_flight_total",
       .help = "Jobs refused because this worker had not finished identifying its "

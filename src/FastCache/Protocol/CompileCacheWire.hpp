@@ -434,6 +434,14 @@ enum class ErrorCode : std::uint8_t
     /// means the program named by the worker's own --toolchain could not be
     /// executed at all.
     WorkerSpawnFailed = 0x11,
+    /// The worker cannot CLASSIFY the program its own `--toolchain` names, so it
+    /// cannot build a command line for it. Split from `WorkerSpawnFailed` because
+    /// the two send an operator to different places: that one says the program
+    /// could not be run (missing, unreadable, wrong architecture) and this one says
+    /// it ran fine and this build does not recognise what it is. Numbered 0x21
+    /// rather than 0x12 because a code's VALUE is a wire contract and the low bytes
+    /// are long since spent; the enum is not dense and does not need to be.
+    WorkerCompilerUnclassified = 0x21,
     /// This node is not the cluster's leader. The message carries the leader's
     /// endpoint when one is known, so a client can redirect rather than give up --
     /// and is empty during an election, which is a *different* fact and one the
@@ -1301,6 +1309,9 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::WorkerSpawnFailed,
                       .name = "worker-spawn-failed",
                       .defaultMessage = "the worker could not start the compiler" },
+    ErrorDescriptor { .code = ErrorCode::WorkerCompilerUnclassified,
+                      .name = "worker-compiler-unclassified",
+                      .defaultMessage = "the worker cannot classify its own configured compiler" },
     ErrorDescriptor {
         .code = ErrorCode::NotLeader, .name = "not-leader", .defaultMessage = "this node does not lead the cluster" },
     ErrorDescriptor {

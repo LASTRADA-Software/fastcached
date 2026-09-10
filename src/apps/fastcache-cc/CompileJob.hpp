@@ -84,6 +84,17 @@ enum class JobRefusal : std::uint8_t
     /// wrong machines, the other says this machine is still coming up and will serve
     /// the identical request shortly (#365).
     ToolchainSurveyInFlight,
+    /// This worker cannot classify the compiler its own configuration names, so it
+    /// cannot build a command line for it at all.
+    ///
+    /// Kept apart from `SpawnFailed`, which is where it used to be answered (#240
+    /// declined to invent this without its wire and metrics rows, and said so).
+    /// Both mean "this worker is broken, compile elsewhere" to a CLIENT -- which is
+    /// why the client's behaviour does not change -- and opposite things to an
+    /// OPERATOR: `SpawnFailed` says the program named could not be executed, this
+    /// one says it was executed and this build does not know what it is. One
+    /// remedy is a path, the other is a toolchain this build does not support.
+    CompilerUnclassified,
     Last, ///< Not a refusal, and has no row: `RefusalTable`'s length.
 };
 

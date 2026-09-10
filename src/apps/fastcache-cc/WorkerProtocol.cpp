@@ -69,6 +69,9 @@ namespace
         { .refusal = JobRefusal::ToolchainSurveyInFlight,
           .code = Wire::ErrorCode::WorkerToolchainSurveyInFlight,
           .counter = IMetricsSink::Counter::WorkerJobsRefusedSurveyInFlight },
+        { .refusal = JobRefusal::CompilerUnclassified,
+          .code = Wire::ErrorCode::WorkerCompilerUnclassified,
+          .counter = IMetricsSink::Counter::WorkerJobsRefusedCompilerUnclassified },
     } };
 
     static_assert(RowsInEnumeratorOrder(RefusalTable, &RefusalDescriptor::refusal),
