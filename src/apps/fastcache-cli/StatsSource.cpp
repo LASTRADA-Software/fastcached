@@ -158,7 +158,16 @@ Answer ChooseStats(std::span<StatsAttempt const> attempts)
 
         auto answer = Answered(std::move(chosen));
         if (!row.caveat.empty())
-            answer.advisories.emplace_back(row.caveat);
+        {
+            // The count is what this source RETURNED, read off the record a moment ago,
+            // never a constant: the number belongs to the daemon's `INFO` handler and a
+            // copy of it here is a claim nothing checks. Taken from the attempt rather
+            // than from `chosen`, whose `source` field was just prepended -- that
+            // off-by-one is the whole reason two neighbouring numbers (7 and 8) were
+            // circulating for one fact.
+            answer.advisories.emplace_back(
+                std::format("{} returned {} field(s); {}", row.what, attempt->record->fields.size(), row.caveat));
+        }
 
         // Say what the richer sources did, but only the ones that were actually
         // tried: reporting a failure for an endpoint nothing dialled sends an

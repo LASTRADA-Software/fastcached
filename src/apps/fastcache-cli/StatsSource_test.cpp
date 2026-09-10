@@ -4,6 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <format>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -22,6 +25,22 @@ namespace
                           .asked = true,
                           .record = RecordValue(
                               { Field { .name = std::move(field), .value = NumberCell(std::uint64_t { 1 }) } }) };
+}
+
+/// An attempt that answered with @p count fields.
+///
+/// Beside the one-field `Answered` because the advisory names the count it OBSERVED,
+/// and one case cannot tell a derivation from a constant: two sizes can.
+///
+/// @param origin Which source.
+/// @param count How many fields the record carries; must be at least one.
+/// @return The attempt.
+[[nodiscard]] StatsAttempt AnsweredWith(StatsOrigin origin, std::size_t count)
+{
+    std::vector<Field> fields;
+    for (auto const index: std::views::iota(std::size_t { 0 }, count))
+        fields.push_back(Field { .name = std::format("f{}", index), .value = NumberCell(std::uint64_t { 1 }) });
+    return StatsAttempt { .origin = origin, .asked = true, .record = RecordValue(std::move(fields)) };
 }
 
 /// An attempt that was made and failed.
@@ -113,12 +132,35 @@ TEST_CASE("falling back to the thin source carries its caveat", "[cli][stats]")
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(SourceOf(answer) == "info");
     // The caveat says what choosing this rung costs, which is the whole reason for
-    // naming the source at all.
-    CHECK(Mentions(answer, "seven fields"));
+    // naming the source at all -- and it opens with the count this source RETURNED,
+    // read off the record rather than compiled in. `1` is what this fixture's record
+    // holds; the case below drives a different size, because one case cannot tell a
+    // derivation from a second constant.
+    CHECK(Mentions(answer, "RESP INFO on the data port returned 1 field(s)"));
+    CHECK(Mentions(answer, "--admin-port"));
+    // And the number is NOT the rendered row count: `source` is prepended after the
+    // record is read, so a count taken from the rendered value would say 2 here. Those
+    // two neighbouring numbers are what put a wrong `seven` in this advisory.
+    CHECK_FALSE(Mentions(answer, "returned 2 field(s)"));
     // And the richer source's failure is reported, because an operator who wanted the
     // full set needs to know why they did not get it.
     CHECK(Mentions(answer, "connection refused"));
     CHECK(Mentions(answer, "did not answer"));
+}
+
+TEST_CASE("the caveat's field count follows the record, not a constant", "[cli][stats]")
+{
+    // The other half of the pair above. A constant satisfies exactly one of these two
+    // cases, so it is the disagreement that tests anything.
+    auto const attempts = std::vector<StatsAttempt> {
+        Failed(StatsOrigin::Metrics, "connection refused"),
+        AnsweredWith(StatsOrigin::Info, 5),
+    };
+
+    auto const answer = ChooseStats(attempts);
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    CHECK(Mentions(answer, "returned 5 field(s)"));
+    CHECK_FALSE(Mentions(answer, "returned 1 field(s)"));
 }
 
 TEST_CASE("a source that was never asked is not reported as having failed", "[cli][stats]")

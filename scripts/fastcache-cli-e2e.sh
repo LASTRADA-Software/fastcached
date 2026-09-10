@@ -304,18 +304,22 @@ if grep -qF "did not answer" "$WORK/err"; then
     e2e_note "stderr: $(cat "$WORK/err")"
     fail "stats reported 'did not answer' for a source it never dialled"
 fi
-infoFields=$(count_lines "$WORK/out")
+infoRows=$(count_lines "$WORK/out")
 
 run_cli --admin-addr="127.0.0.1:$metricsPort" stats --format=kv
 expect_status 0 "stats with an admin address"
 expect_stdout "source=metrics" "stats prefers /metrics"
-metricsFields=$(count_lines "$WORK/out")
+metricsRows=$(count_lines "$WORK/out")
 
 # The ladder is only worth having if the rungs differ, so the difference is asserted
 # rather than assumed.
-[[ "$metricsFields" -gt "$infoFields" ]] \
-    || fail "/metrics reported $metricsFields fields and INFO $infoFields; the ladder buys nothing"
-e2e_note "INFO reported $infoFields fields, /metrics reported $metricsFields"
+# ROWS, not fields: this counts what the CLI RENDERED, which carries the `source`
+# field the ladder prepends. The daemon's INFO handler emits one fewer, and calling
+# both numbers "fields" is how a wrong count reached an advisory. What the case
+# asserts is the ORDERING, which needs no agreement on either figure.
+[[ "$metricsRows" -gt "$infoRows" ]] \
+    || fail "/metrics rendered $metricsRows rows and INFO $infoRows; the ladder buys nothing"
+e2e_note "INFO rendered $infoRows rows, /metrics rendered $metricsRows"
 
 # ---------------------------------------------------------------------------------
 # case 8: the authentication gate

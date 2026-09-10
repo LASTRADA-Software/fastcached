@@ -166,7 +166,7 @@ $ fastcache-cli stats --format=kv
 source=info
 fastcached_version=fastcached-0.2.0
 ...
-fastcache-cli: INFO reports seven fields; start the daemon with its metrics listener enabled, or pass --admin-port, for the full counter set
+fastcache-cli: RESP INFO on the data port returned 7 field(s); start the daemon with its metrics listener enabled, or pass --admin-port, for the full counter set
 fastcache-cli: the admin surface's /metrics endpoint was not asked: no admin address is known; pass --admin-addr or set $FASTCACHE_ADMIN_ADDR
 ```
 

@@ -43,7 +43,10 @@ enum class StatsOrigin : std::uint8_t
     /// does need the daemon to have been started with its metrics listener enabled,
     /// and it is on a different port from the data plane.
     Metrics,
-    /// RESP `INFO` on the data port. Always present, and seven fields.
+    /// RESP `INFO` on the data port. Always present, and a small fixed set of
+    /// fields -- deliberately not numbered here: that count belongs to the DAEMON's
+    /// `INFO` handler, and a copy of it in the client is a claim nothing checks.
+    /// The advisory states what was actually returned instead.
     Info,
     Last,
 };
@@ -51,10 +54,12 @@ enum class StatsOrigin : std::uint8_t
 /// One origin's fixed properties.
 struct StatsOriginSpec
 {
-    StatsOrigin origin;      ///< The enumerator this row describes.
-    std::string_view name;   ///< Stable lower-case name; reported as the `source` field.
-    std::string_view what;   ///< Where it is, for a remark an operator can act on.
-    std::string_view caveat; ///< What choosing it costs; empty when nothing.
+    StatsOrigin origin;    ///< The enumerator this row describes.
+    std::string_view name; ///< Stable lower-case name; reported as the `source` field.
+    std::string_view what; ///< Where it is, for a remark an operator can act on.
+    /// What choosing it costs, as the TAIL of a sentence the emitter opens by naming
+    /// the source and the field count it observed. Empty when nothing.
+    std::string_view caveat;
 };
 
 /// The origins, one row per enumerator, in enumerator order -- which is ladder order.
@@ -63,8 +68,8 @@ inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
     { .origin = StatsOrigin::Info,
       .name = "info",
       .what = "RESP INFO on the data port",
-      .caveat = "INFO reports seven fields; start the daemon with its metrics listener "
-                "enabled, or pass --admin-port, for the full counter set" },
+      .caveat = "start the daemon with its metrics listener enabled, or pass "
+                "--admin-port, for the full counter set" },
 } };
 
 static_assert(RowsInEnumeratorOrder(StatsOriginTable, &StatsOriginSpec::origin),
