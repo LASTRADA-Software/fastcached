@@ -1898,10 +1898,6 @@ green Linux run is not evidence about it.
   class, and the mechanism adds ~3500 spawns. `src/tests/CatchSkipCanary.cpp` carries
   the shapes it must survive; `catch-skip-exit-collision` asserts the premises so this
   entry cannot rot into a false rule.
-- **[#147](https://github.com/LASTRADA-Software/fastcached/issues/147)** — two
-  scratch-directory helpers still shadow `Testing::ScratchDirectory`, in
-  `PathResolve_test.cpp` and `Stats_test.cpp`. Both correct today; the shape is what
-  has been copied wrong before.
 - **[#813](https://github.com/LASTRADA-Software/fastcached/issues/813)** —
   `launcher-replay-e2e.sh` is the last POSIX fixture that does not source
   `lib/e2e-common.sh` at all, so its `fail`, `skip` and `note` are private copies.
