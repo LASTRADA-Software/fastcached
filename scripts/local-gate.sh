@@ -267,6 +267,41 @@ for _gate_row in "${gate_presets[@]}"; do
 done
 unset _gate_row
 
+# The default-OFF targets the gate turns ON, so its `ctest` total describes the
+# same target set CI's does (#1144).
+#
+# `FASTCACHED_BUILD_TESTCLIENT` and `FASTCACHED_BUILD_BENCHMARKS` default OFF in
+# `src/apps/CMakeLists.txt` and no preset mentions them, so both gate legs took
+# the default and `compile-cache-testclient-tests` was never built by any gate
+# run that has ever happened. Nothing said so: there is no flag to notice
+# missing, no skip and no warning, and the totals line reads exactly like a
+# full-suite number. A lane reading `LOCAL GATE PASSED` over `3541 tests` had
+# nothing to suspect, and the case where four-of-five is not a rounding error is
+# precisely a change whose subject IS the test registrations.
+#
+# A TABLE rather than two literals on the configure line, because the failure is
+# a third such target arriving and nobody noticing: `src/apps/CMakeLists.txt`
+# gates each executable on a row, so a new default-OFF target is invisible to
+# this gate rather than absent from CI.
+#
+# Nothing CHECKS that yet, and this comment previously said something did --
+# it cited `ctest -R gate-target-set`, which does not exist anywhere in the
+# tree. A comment asserting what nothing checks cannot fail, so the claim is
+# gone and the work is #1197: derive the gate's set from HERE and CI's from
+# `build.yml`, failing closed when either scan matches nothing. The table is
+# the place that guard will read.
+#
+# Turning them on is the half that gives the gate the coverage; STATING the set
+# beside the totals is the half that makes the number readable, and it is kept
+# even though the set is now complete -- the ticket's own alternative was to
+# state the scope rather than expand it, and a reader who cannot see the scope
+# cannot tell a narrowed gate from a full one. Both, because either alone leaves
+# the other failure open.
+gate_target_flags=(
+    FASTCACHED_BUILD_TESTCLIENT
+    FASTCACHED_BUILD_BENCHMARKS
+)
+
 # What each leg has done so far, by index into the table above. Declared empty and
 # never pre-filled: `leg_pairs` reads an absent entry as `not-run`, which is the
 # truth for every leg until the loop reaches it and is what a failure BEFORE the loop
@@ -1380,6 +1415,23 @@ configure_reason() {
         reasons="${reasons:+$reasons; }compiler caching is ${caching:-absent}, not OFF"
     fi
 
+    # And the TARGET SET (#1144), for the reason the analyser is re-asked: a `-D`
+    # writes a cache entry, so a directory configured by an older gate keeps the
+    # narrower set forever and re-running the gate is what skips the configure
+    # that would widen it. Passing the flag is not the fact.
+    #
+    # `absent` and `OFF` are one answer here on purpose. They differ in provenance
+    # -- one gate predates the row, the other was configured against it -- and not
+    # in what they cost: either way the target is not built and the total is
+    # narrower than it reads. A configure fixes both.
+    local flag have_flag
+    for flag in "${gate_target_flags[@]}"; do
+        have_flag="$(cached_entry "$dir/CMakeCache.txt" "$flag")"
+        if [[ "$have_flag" != "ON" ]]; then
+            reasons="${reasons:+$reasons; }${flag} is ${have_flag:-absent}, not ON"
+        fi
+    done
+
     # Whatever the refusal will read is also a reason to configure, or the gate
     # cannot repair the state it refuses -- and CMake makes that state reachable:
     # `-D` values are entered into `CMakeCache.txt` and the file is written even
@@ -1414,6 +1466,43 @@ configure_reason() {
     # Unguarded: every caller takes this through `$( )`, which strips the trailing
     # newline, so an empty `echo` and printing nothing are the same value.
     echo "$reasons"
+}
+
+# What target set a leg's `ctest` total is a total OVER (#1144).
+#
+# A ctest total counts only the targets the directory was configured with, and
+# nothing in the number says which those were: `3541` and `3555` are the same
+# sentence. The gate now configures the full set, so this line is expected to
+# read the same on every run -- and it is printed anyway, because a reader who
+# cannot see the scope cannot tell a full gate from a narrowed one, and the
+# narrowing is silent by construction.
+#
+# TWO observables, deliberately, because they can disagree and the disagreement
+# is the interesting state. The cache entries are what was ASKED for; the
+# `*_tests.cmake` files `catch_discover_tests` writes are what the build actually
+# DISCOVERED tests from, one per registration. A cache reading ON beside four
+# discovered binaries is a target that failed to build, which is the shape a flag
+# alone cannot report -- passing the flag is not the fact.
+#
+# @param 1 Path to the build directory.
+# @return One line, always -- this is a report and never a verdict.
+target_set_report() {
+    local dir="$1" flag values="" have discovered
+    for flag in "${gate_target_flags[@]}"; do
+        have="$(cached_entry "$dir/CMakeCache.txt" "$flag")"
+        values="${values:+$values }${flag}=${have:-absent}"
+    done
+    # `-name '*_tests.cmake'` is `catch_discover_tests`' own output file, one per
+    # registered Catch2 binary. Counted rather than named: the names carry a
+    # per-configuration hash, and a count is what the sentence needs.
+    discovered="$(find "$dir" -name '*_tests.cmake' 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$discovered" == "0" ]]; then
+        # Zero is not "no test binaries"; it is this derivation finding nothing,
+        # which after a green ctest run cannot be true of the tree. Say which.
+        echo "target set: ${values}; Catch2 binaries discovered: NONE FOUND (this line's derivation, not the build)"
+    else
+        echo "target set: ${values}; Catch2 binaries discovered: ${discovered}"
+    fi
 }
 
 # Whether the formatter should be run at all, and over how many files.
@@ -1510,27 +1599,48 @@ if [[ "$self_test" -eq 1 ]]; then
         esac
     }
 
-    # Every fixture states BOTH pinned entries, because a cache is only a useful
+    # Every fixture states EVERY pinned entry, because a cache is only a useful
     # stand-in for a build directory if it is complete: one missing
     # `USE_COMPILER_CACHE` would make the caching clause fire in the cases written
-    # to isolate the analyser one, and the two would stop being separable.
-    fixture right     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'      ninja
-    fixture wrong     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=OFF\n'      ninja
-    fixture notfound  'CLANG_TIDY_EXE:FILEPATH=CLANG_TIDY_EXE-NOTFOUND\nUSE_COMPILER_CACHE:BOOL=OFF\n'     ninja
-    fixture absent    'CMAKE_BUILD_TYPE:STRING=Debug\nUSE_COMPILER_CACHE:BOOL=OFF\n'                       ninja
+    # to isolate the analyser one, and the two would stop being separable. The
+    # target-set entries (#1144) join that rule rather than being an exception to
+    # it -- they are spelled through one variable so a third row in
+    # `gate_target_flags` is one edit here rather than eleven, and a fixture that
+    # forgets one is a case testing the wrong clause.
+    #
+    # DERIVED from the table, so the two cannot drift: a row added above and not
+    # here would leave every fixture incomplete, which is the failure this
+    # paragraph exists to prevent.
+    targets_on=""
+    for _fixture_flag in "${gate_target_flags[@]}"; do
+        targets_on="${targets_on}${_fixture_flag}:BOOL=ON\n"
+    done
+
+    fixture right     "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}"  ninja
+    fixture wrong     "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}"  ninja
+    fixture notfound  "CLANG_TIDY_EXE:FILEPATH=CLANG_TIDY_EXE-NOTFOUND\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}" ninja
+    fixture absent    "CMAKE_BUILD_TYPE:STRING=Debug\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}"                   ninja
 
     # The compiler-cache side. `caching-on` is what every gate directory on a
     # developer's machine looks like today, since the option defaults to ON;
     # `caching-unset` is one configured before the gate asked at all.
-    fixture caching-on     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=ON\n'  ninja
-    fixture caching-unset  'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\n'                              ninja
-    fixture both-wrong     'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=ON\n'  ninja
+    fixture caching-on     "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=ON\n${targets_on}"  ninja
+    fixture caching-unset  "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\n${targets_on}"                              ninja
+    fixture both-wrong     "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-20\nUSE_COMPILER_CACHE:BOOL=ON\n${targets_on}"  ninja
 
     # Everything the gate pins is right, and the generated build is either missing
     # or stale and launcher-fronted. Both are what a FAILED configure leaves behind:
     # CMake writes the cache with the `-D` values and then does not regenerate.
-    fixture no-ninja      'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'  none
-    fixture stale-fronted 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n'  fronted
+    fixture no-ninja      "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}"  none
+    fixture stale-fronted "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}"  fronted
+
+    # The target set (#1144). `targets-narrow` is a directory an OLDER gate
+    # configured: everything it pinned at the time is right, and the total it
+    # produces silently covers four of the five Catch2 binaries. `targets-off` is
+    # the same fact arrived at deliberately, and gets the same answer for the same
+    # reason -- what it costs is identical, and a configure fixes both.
+    fixture targets-narrow "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n"  ninja
+    fixture targets-off    "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\nFASTCACHED_BUILD_TESTCLIENT:BOOL=OFF\nFASTCACHED_BUILD_BENCHMARKS:BOOL=ON\n" ninja
 
     expect "reads the cached analyser" \
         "/usr/bin/clang-tidy-20" "$(cached_entry "$scratch/wrong/CMakeCache.txt" CLANG_TIDY_EXE)"
@@ -1589,6 +1699,53 @@ if [[ "$self_test" -eq 1 ]]; then
         "cached clang-tidy is /usr/bin/clang-tidy-20, not /usr/bin/clang-tidy-22; compiler caching is ON, not OFF" \
         "$(configure_reason "$scratch/both-wrong" tidy /usr/bin/clang-tidy-22)"
 
+    # The target-set clause (#1144). Asked of every preset like the compiler-cache
+    # one: a narrow set makes BOTH legs' totals describe four Catch2 binaries while
+    # reading like five, and a clause that skipped `gcc-release` would leave half
+    # the gate lying.
+    #
+    # `targets-narrow` is the state every existing gate directory is in, so this is
+    # the arm that fires on the first run after this change and then never again --
+    # which is exactly why it must be a REASON rather than only a `-D` on the
+    # configure line. A `-D` that is never reached because nothing asked for a
+    # configure is a flag the build directory does not have.
+    expect "a directory that predates the target set is re-configured" \
+        "FASTCACHED_BUILD_TESTCLIENT is absent, not ON; FASTCACHED_BUILD_BENCHMARKS is absent, not ON" \
+        "$(configure_reason "$scratch/targets-narrow" tidy /usr/bin/clang-tidy-22)"
+    expect "a no-tidy preset is re-configured over the target set too" \
+        "FASTCACHED_BUILD_TESTCLIENT is absent, not ON; FASTCACHED_BUILD_BENCHMARKS is absent, not ON" \
+        "$(configure_reason "$scratch/targets-narrow" no-tidy /usr/bin/clang-tidy-22)"
+    expect "one target off is reported, and only that one" \
+        "FASTCACHED_BUILD_TESTCLIENT is OFF, not ON" \
+        "$(configure_reason "$scratch/targets-off" tidy /usr/bin/clang-tidy-22)"
+    # The ACCEPTING direction, which is the half a guard nobody has watched accept
+    # does not have: every fixture above carries the entries ON, so a clause that
+    # fired unconditionally would redden all of them -- and `right` says so by
+    # name rather than leaving it to be inferred from the others passing.
+    expect "a directory already carrying the full target set is left alone" \
+        "" "$(configure_reason "$scratch/right" tidy /usr/bin/clang-tidy-22)"
+
+    # And what the leg PRINTS about its own scope. Two observables, so both are
+    # driven: `right` has the entries and no discovered binaries beside them,
+    # which is the disagreement that means a target failed to build; `discovered`
+    # has both and is the ordinary line.
+    expect "the report names every flag and says when the derivation found nothing" \
+        "target set: FASTCACHED_BUILD_TESTCLIENT=ON FASTCACHED_BUILD_BENCHMARKS=ON; Catch2 binaries discovered: NONE FOUND (this line's derivation, not the build)" \
+        "$(target_set_report "$scratch/right")"
+    mkdir -p "$scratch/discovered/src/tests" "$scratch/discovered/src/CowTree"
+    printf 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\n%b' "$targets_on" > "$scratch/discovered/CMakeCache.txt"
+    : > "$scratch/discovered/src/tests/FastCacheTest-abc1234_tests.cmake"
+    : > "$scratch/discovered/src/CowTree/CowTreeTests-abc1234_tests.cmake"
+    expect "the report counts catch_discover_tests' own output, one per Catch2 binary" \
+        "target set: FASTCACHED_BUILD_TESTCLIENT=ON FASTCACHED_BUILD_BENCHMARKS=ON; Catch2 binaries discovered: 2" \
+        "$(target_set_report "$scratch/discovered")"
+    # `absent` renders as a WORD, never as an empty gap in the sentence: a leg
+    # printing `FASTCACHED_BUILD_TESTCLIENT=` beside a total is the same silence
+    # this line exists to end.
+    expect "an absent entry says absent rather than rendering blank" \
+        "target set: FASTCACHED_BUILD_TESTCLIENT=absent FASTCACHED_BUILD_BENCHMARKS=absent; Catch2 binaries discovered: NONE FOUND (this line's derivation, not the build)" \
+        "$(target_set_report "$scratch/targets-narrow")"
+
     # A directory the refusal cannot READ must be re-configured rather than left to
     # be refused forever. Everything this fixture pins is already correct, so
     # without the clause it would get no configure, then fail `unknown` on a
@@ -1631,7 +1788,7 @@ if [[ "$self_test" -eq 1 ]]; then
     # on such a host this case is reported SKIPPED rather than passing vacuously. A
     # check that cannot fail is not a check, and saying so is the difference between
     # a state that was tested and one that merely did not complain.
-    fixture denied 'CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n' fronted
+    fixture denied "CLANG_TIDY_EXE:FILEPATH=/usr/bin/clang-tidy-22\nUSE_COMPILER_CACHE:BOOL=OFF\n${targets_on}" fronted
     chmod 000 "$scratch/denied/build.ninja" 2>/dev/null
     if [[ -r "$scratch/denied/build.ninja" ]]; then
         self_test_skipped="${self_test_skipped:+$self_test_skipped, }unreadable build.ninja (this user reads a 0000 file)"
@@ -2459,6 +2616,14 @@ run_preset() {
     # variable (#487). The refusal below still reads `build.ninja` rather than the
     # cache, for #471's reason -- passing the flag is not the fact.
     configure=(cmake --preset "$preset")
+    # The default-OFF targets, from the one table (#1144). On the command line
+    # rather than in the preset for the same reason the analyser is: `-D` sets the
+    # entry even on a directory that already cached a different one, and the
+    # preset is shared with nothing the gate owns.
+    local _target_flag
+    for _target_flag in "${gate_target_flags[@]}"; do
+        configure+=("-D${_target_flag}=ON")
+    done
     if [[ "$analyser" == "tidy" ]]; then
         configure+=("-DCLANG_TIDY_EXE=${tidy_path}")
         echo "== $preset: clang-tidy pinned to $tidy ($tidy_path)"
@@ -2564,6 +2729,10 @@ run_preset() {
     fi
 
     grep -E -m 1 "$gate_totals_pattern" "$log"
+    # #1144: and what that total is a total OVER. Immediately after the number,
+    # because the two are one statement -- a scope printed anywhere else is a line
+    # nobody reads beside the figure it qualifies.
+    echo "== $preset: $(target_set_report "$build_dir")"
     # #1130: the totals line above is the one #1128 makes untrustworthy, so the
     # skipped NAMES go in the log beside it, before the log this read is deleted.
     skip_report "$preset" "$build_dir" < "$log"

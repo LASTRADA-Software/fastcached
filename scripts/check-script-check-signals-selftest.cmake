@@ -17,7 +17,9 @@
 # ## What it drives, and why these four
 #
 # One control that must PASS, then four defects that must each be refused with
-# ONE finding attributed to the right file:
+# ONE finding attributed to the right file, then the control AGAIN over the same
+# tree -- see `fastcached_stage_tree` for why there is one tree and what the
+# closing control is for:
 #
 #   strip       a hook loses its `cmake_minimum_required` -- the rule itself
 #   rename      the hook VARIABLE is renamed, so the scan matches nothing
@@ -108,6 +110,29 @@ endmacro()
 # name, and the packaging file pass 3b discovers the CPack hooks from. A COPY of
 # the real tree rather than a fabricated one, so a case cannot pass by testing a
 # simplified world -- the control asserts that copy is still green.
+#
+# ONE tree for every case, mutated and restored, rather than one copy per case
+# (#1137). The copy is 158 files, and on a Windows checkout reached over DrvFs it
+# is what this test COSTS: five copies were 81% of a 63 s run, against 8% for the
+# five nested `cmake -P` invocations the ticket's hypothesis named. Measured
+# 2026-09-10 on WSL2 / Ubuntu-24.04 / 32 CPUs, load average 0.08 at the start,
+# min of three, timed with CLOCK_MONOTONIC because CLOCK_REALTIME is stepped in
+# both directions on that host:
+#
+#   whole selftest, five copies    DrvFs 63.26 s     ext4  3.01 s
+#   ONE staging (file COPY x158)   DrvFs 10.24 s     ext4  0.01 s
+#   the check under test, once     DrvFs  1.03 s     ext4  0.56 s
+#   `cmake -P` process floor       DrvFs  0.017 s    ext4  0.004 s
+#
+# Those conditions are PINNED rather than pointed at: they are the state of one
+# host at one instant and must not silently start describing a different one.
+#
+# What one tree costs is that a case which fails to restore leaves the next case
+# reading a tree nobody described. Two independent guards, because the restore is
+# the whole risk: every case asserts its own file came back byte-identical, and
+# the control is run AGAIN at the end over the same tree -- which is strictly
+# more than the per-copy arrangement could say, since that one never checked that
+# an injection had been undone at all.
 function(fastcached_stage_tree name outVar)
     set(tree "${FASTCACHED_SCRATCH_DIR}/${name}")
     file(REMOVE_RECURSE "${tree}")
@@ -188,13 +213,23 @@ endmacro()
 # nothing and reports success, and this file was already bitten by the
 # neighbouring failure -- an anchor that matched and landed in a structurally
 # invalid position -- which is why the arms assert the finding COUNT too.
+#
+# The RESTORE carries an assertion of its own, and for a different reason than
+# the injection's. An injection that changes nothing stages no defect and the
+# case passes vacuously; a restore that does not land leaves the NEXT case
+# reading a tree the file does not describe, and its verdict then belongs to no
+# stated arrangement. Both are read back with bare variable NAMES -- `if(a
+# STREQUAL b)` compares two values without expanding either into an argument
+# list, which is what keeps a file's contents out of a macro call and out of
+# CMP0219's way.
+
+# ONE tree, for the reason `fastcached_stage_tree` gives.
+fastcached_stage_tree("tree" tree)
 
 # The control. Every negative case below is evidence only if this passes.
-fastcached_stage_tree("control" tree)
 fastcached_case("the real tree, copied unmodified" "${tree}" "")
 
 # The rule itself: a CPack hook that declares no CMake minimum.
-fastcached_stage_tree("strip" tree)
 set(hook "${tree}/cmake/MacOSSignBinaries.cmake")
 file(READ "${hook}" before)
 string(REPLACE "cmake_minimum_required(VERSION 3.28)\n" "" after "${before}")
@@ -204,9 +239,13 @@ if(before STREQUAL after)
 endif()
 fastcached_case("a CPack hook declaring no cmake_minimum_required is refused, and named"
                 "${tree}" "MacOSSignBinaries.cmake.*declares no cmake_minimum_required")
+file(WRITE "${hook}" "${before}")
+file(READ "${hook}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("strip" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
 
 # The arm that fails CLOSED: the scan matches nothing.
-fastcached_stage_tree("rename" tree)
 set(packaging "${tree}/cmake/Packaging.cmake")
 file(READ "${packaging}" before)
 string(REPLACE "set(CPACK_POST_BUILD_SCRIPTS" "set(CPACK_POSTBUILD_SCRIPTS" after "${before}")
@@ -216,10 +255,13 @@ if(before STREQUAL after)
 endif()
 fastcached_case("a renamed hook variable is REFUSED, not read as 'nothing to check'"
                 "${tree}" "no .set.CPACK_POST_BUILD_SCRIPTS")
+file(WRITE "${packaging}" "${before}")
+file(READ "${packaging}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("rename" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
 
 # A hook variable naming a script that is not there.
-fastcached_stage_tree("repoint" tree)
-set(packaging "${tree}/cmake/Packaging.cmake")
 file(READ "${packaging}" before)
 string(REPLACE "cmake/MacOSNotarizePkg.cmake" "cmake/MacOSGoneAway.cmake" after "${before}")
 file(WRITE "${packaging}" "${after}")
@@ -228,10 +270,13 @@ if(before STREQUAL after)
 endif()
 fastcached_case("a hook variable naming a missing script is refused"
                 "${tree}" "MacOSGoneAway.cmake., which is not there")
+file(WRITE "${packaging}" "${before}")
+file(READ "${packaging}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("repoint" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
 
 # And a `;` in the value, which is this check's own defect turned into a case.
-fastcached_stage_tree("semicolon" tree)
-set(packaging "${tree}/cmake/Packaging.cmake")
 file(READ "${packaging}" before)
 string(REPLACE "cmake/MacOSNotarizePkg.cmake" "cmake/Gone;Away.cmake" after "${before}")
 file(WRITE "${packaging}" "${after}")
@@ -240,6 +285,20 @@ if(before STREQUAL after)
 endif()
 fastcached_case("a `;` in a hook path stays ONE finding rather than splitting into two"
                 "${tree}" "Gone.;Away.cmake")
+file(WRITE "${packaging}" "${before}")
+file(READ "${packaging}" restored)
+if(NOT restored STREQUAL before)
+    fastcached_selftest_failed("semicolon" "the tree was not restored, so every later case reads an undescribed tree")
+endif()
+
+# The control AGAIN, over the tree every case above has now written to. The
+# per-case restores each assert their own file; this asserts the WHOLE tree is
+# back where the first control found it, which is the assertion that survives a
+# restore written against the wrong path -- one that would compare a file nobody
+# mutated against itself and agree. It is also the half the one-copy-per-case
+# arrangement could not have: five pristine trees can say nothing about whether
+# an injection was undone.
+fastcached_case("the same tree, after every injection was reverted" "${tree}" "")
 
 # ---------------------------------------------------------------------------
 if(failureCount GREATER 0)
