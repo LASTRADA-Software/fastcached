@@ -28,6 +28,22 @@ namespace
 /// already depends on both.
 constexpr std::string_view Gnu = "grammar-gnu";
 
+/// The MSVC grammar, spelled as a literal for the reason `Gnu` is.
+constexpr std::string_view Msvc = "grammar-msvc";
+
+/// What one MSVC toolset's two target variants actually print, verbatim.
+///
+/// Measured on Visual Studio 18 Community, toolset 14.51.36231, `VSLANG=1033`, `cl`
+/// spawned bare with stdout and stderr combined -- which is how `CompilerBanner` asks
+/// it. Exit code 0, and the first line is the banner. Eight of eight `Host<a>/<b>`
+/// pairs across toolsets 14.44 and 14.51 answered in this shape, and the suffix
+/// follows the TARGET rather than the host: `HostX86/x64` also says `for x64`.
+///
+/// Pinned as data rather than pointed at, because a measurement's conditions are the
+/// state of the world at one instant and must not track a source that moves.
+constexpr std::string_view ClForX64 = "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x64";
+constexpr std::string_view ClForX86 = "Microsoft (R) C/C++ Optimizing Compiler Version 19.51.36252 for x86";
+
 } // namespace
 
 TEST_CASE("The same toolchain at two install prefixes fingerprints identically", "[toolchain][fingerprint]")
@@ -103,6 +119,35 @@ TEST_CASE("A different compiler banner over the same headers is a different tool
     // key one; see issue #195.
     CHECK(ComputeToolchainFingerprint("gcc 13.2.0", Gnu, SampleTree())
           != ComputeToolchainFingerprint("gcc 14.1.0", Gnu, SampleTree()));
+}
+
+TEST_CASE("One MSVC toolset's target variants are two toolchains", "[toolchain][fingerprint]")
+{
+    // **The case that makes #1126 empty, and it is here because the tree carried the
+    // opposite claim in a comment for months.** `MsvcBinByHost` searched one bindir
+    // per host on the stated grounds that x64, x86 and arm64 "fingerprint IDENTICALLY"
+    // -- inherited from before #195, when `cl` was asked a `--version` it does not
+    // have, fell back to the normalized basename, and every MSVC compiler in existence
+    // identified as the string `cl`. Bare `cl` exits 0 and names its target, so they
+    // do not.
+    //
+    // The include tree really IS shared -- `MsvcToolsetIncludeRoots` derives every root
+    // from the `MSVC/<version>` toolset root, which both variants walk up to -- so this
+    // case holds the tree byte-identical on purpose. Vary it and the case would pass
+    // for a reason that has nothing to do with the claim it refutes.
+    CHECK(ComputeToolchainFingerprint(ClForX64, Msvc, SampleTree())
+          != ComputeToolchainFingerprint(ClForX86, Msvc, SampleTree()));
+
+    // Neither is the FALLBACK, and this is what stops the line above passing for the
+    // wrong reason. A driver that cannot answer keys on its normalized basename, which
+    // is `cl` for every MSVC compiler ever installed -- the pre-#195 state, and the one
+    // state in which these two really would collapse. Checking only that the two differ
+    // would pass with one of them left there, so both are asked. The mirror of
+    // `ToolchainProbe_test.cpp`'s *Two MSVC toolsets do not share one identity*, one
+    // layer down: that one guards the banner, this one guards what the banner decides.
+    auto const fallback = ComputeToolchainFingerprint("cl", Msvc, SampleTree());
+    CHECK(ComputeToolchainFingerprint(ClForX64, Msvc, SampleTree()) != fallback);
+    CHECK(ComputeToolchainFingerprint(ClForX86, Msvc, SampleTree()) != fallback);
 }
 
 TEST_CASE("The same banner over different headers is a different toolchain", "[toolchain][fingerprint]")

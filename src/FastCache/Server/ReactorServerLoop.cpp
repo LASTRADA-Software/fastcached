@@ -99,8 +99,19 @@ namespace
         // sits on the `co_return` path, which a destroyed frame does not run.
         //
         // So: anything handed to a connection whose destructor does more than nothing
-        // must outlive this reactor. Nothing enforces that, which is why it is written
-        // here rather than left to be rediscovered.
+        // must outlive this reactor. **That sentence has a reader now, and it is not
+        // this comment** ([#1051](https://github.com/LASTRADA-Software/fastcached/issues/1051)).
+        // It is `ConnectionHoldings` in `Server/Connection.hpp`: everything a connection
+        // is handed other than its socket goes through one type, and one
+        // `static_assert` refuses that type the moment anything in it grows a
+        // destructor. A comment stating an invariant nothing checks is a claim that
+        // cannot fail, which is what this paragraph was until the guard existed.
+        //
+        // What the guard cannot see is the DECLARATION ORDER below, and that is
+        // deliberate rather than a gap left open: it does not have to, because no local
+        // declared here reaches a connection except by being handed to it. The guard
+        // sits on the handing over, which is the narrow door, instead of on the wide
+        // set of things that merely happen to be declared nearby.
         PlatformReactor reactor { clock };
 
         // Declared before the servers it counts and before anything that arms one,
@@ -224,7 +235,10 @@ namespace
             }
             else
             {
-                Connection connection { WrapTls(std::move(socket), tls), engine, logger, session, logSource };
+                Connection connection {
+                    WrapTls(std::move(socket), tls),
+                    ConnectionHoldings { .engine = engine, .logger = logger, .session = session, .logSource = logSource }
+                };
                 co_await connection.Run();
             }
         }

@@ -2751,24 +2751,19 @@ only thing that would catch an encoding that drops a field on the way.
   drivers is a capability rather than a duplicate -- but it multiplies one machine into
   six registrations, and capacity is per NODE, so it is not a one-line change to the
   layout table.
+  **#1126 was the same fact read the other way round and is closed as refuted**: it
+  claimed the variants still digest identically and asked for a wire-level refusal to
+  compensate. Measured on Visual Studio 18, toolsets 14.44 and 14.51, all eight
+  `Host<a>/<b>` pairs exit 0 from a bare `cl` and name their TARGET in the banner
+  (`... for x64` against `... for x86`, following the target rather than the host), so
+  nothing needed compensating. The two entries stood here saying opposite things,
+  which is the cost of a claim inherited rather than re-derived — and the stale reading
+  survived because it also sat in `ToolchainDiscovery.cpp`'s own comment, where it read
+  as the tree's answer about itself. `ToolchainFingerprint_test.cpp`'s *One MSVC
+  toolset's target variants are two toolchains* pins it now, over a deliberately
+  byte-identical include tree, so it cannot go stale a second time in silence.
 - **[#148](https://github.com/LASTRADA-Software/fastcached/issues/148)** — every
   discovered compiler is spawned twice at startup with the same argv, once to learn
   it can be spawned and once for its banner, and the first is in a serial loop in
   front of the pool built to hide exactly that. `CompilerBanner` knows both facts
   and reports neither, so two callers reconstruct what it discarded.
-- **[#1126](https://github.com/LASTRADA-Software/fastcached/issues/1126)** — every
-  target variant of one MSVC toolset digests IDENTICALLY, so a client can be matched
-  to a worker whose `cl` generates for another target and get the wrong object under a
-  key both ends agree on. They share an include tree, and `cl` answers no `--version`
-  so the banner is the normalized basename: the fingerprint's three inputs -- banner,
-  driver grammar, and each include file's relative path and content hash -- do not
-  differ between them. A GNU driver is NOT exposed, because its include tree is
-  per-architecture and the contents differ; that asymmetry is the whole ticket and is
-  the opposite of what it was first filed as. **The obvious fix is forbidden**: the key
-  folds the target and the fingerprint must not, or #145 reopens -- and the escape that
-  rule relies on, the dispatch line stating the target, is exactly what a fixed-target
-  driver lacks, since `cl` and `gcc` take no `--target=`. So the rule is sound and
-  simply does not reach those rows. #146 made this REACHABLE on new hardware rather
-  than creating it: a node now offers its machine's native toolset, which on an ARM64
-  host is an arm64-targeting `cl` advertised under an identity that cannot say so.
-  Accepted deliberately, because before #146 that machine offered nothing at all.

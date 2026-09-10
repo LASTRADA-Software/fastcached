@@ -130,8 +130,9 @@ Task<void> Server::Run()
                 _metrics->Increment(IMetricsSink::Counter::ConnectionsTotalTls);
         }
 
-        auto connection =
-            std::make_unique<Connection>(WrapTls(std::move(*accepted), _tls), _engine, _logger, _session, _logSource);
+        auto connection = std::make_unique<Connection>(
+            WrapTls(std::move(*accepted), _tls),
+            ConnectionHoldings { .engine = _engine, .logger = _logger, .session = _session, .logSource = _logSource });
         RunConnectionDetached(std::move(connection), &_logger, _admission);
     }
     co_return;
