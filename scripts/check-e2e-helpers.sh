@@ -64,8 +64,24 @@ FastPathCommands=20
 # number cannot drift into meaning nothing without one of the two failing.
 FastPathCeilingMs=2000
 
-# What the STAGED defect must measure for the ceiling above to be said to
-# separate anything.
+# What the STAGED defect must measure PER PAUSE for the ceiling above to be said
+# to separate anything.
+#
+# PER PAUSE and not in total (#1196). The total is not a property of
+# `run_bounded` alone: its loop polls only while the command is still alive, so a
+# command that finishes before its first poll asks for no pause at all, and under
+# load the PARENT is descheduled long enough for that to happen. Measured on one
+# box, 2026-09-10, WSL2 / Ubuntu-24.04 / 32 CPUs: 20 pauses of 20 commands on
+# nine runs of ten and 18 on the tenth. On a hosted `Linux-gcc-release` runner,
+# 15 -- and 15 x 200ms is EXACTLY the 3000ms the old total floor demanded, which
+# a `-le` then refused, reddening master on a tree nobody had touched.
+#
+# So the previous fix's premise was false exactly where it was most confident:
+# *"twenty `sleep 0.2` calls were requested and performed every time -- counted"*
+# is true of an idle host and of no other. Moving the verdict off the wall clock
+# was right; moving it onto a quantity the host still decides was the half nobody
+# re-derived. **Dividing by the count cancels the host out** and keeps every
+# argument below intact, because the count is the only part the host touches.
 #
 # `bounded-fast-path-bites` used to assert only that the defect came in OVER the
 # ceiling, and "over" is not "separated": at ten commands the flat-pause defect
@@ -85,7 +101,12 @@ FastPathCeilingMs=2000
 # and `bounded-fast-path-bites` goes on passing while certifying a ceiling that
 # has stopped meaning anything. Measured, staging exactly that: with the floor
 # written out, a ceiling of 10000ms was caught by nothing.
-FastPathDefectFloorMs=$(( FastPathCeilingMs * 3 / 2 ))
+# The ceiling's share of ONE pause, times the same 1.5. Both hollowings-out the
+# paragraphs above describe are still caught, and now for a reason no host can
+# move: a ceiling raised to 10000ms puts this floor at 750ms against a defective
+# pause of 200, and halving `FastPathCommands` puts it at 300 against the same
+# 200. Integer division, so it is exact at these values (6000/40).
+FastPathDefectFloorMsPerPause=$(( (FastPathCeilingMs * 3) / (FastPathCommands * 2) ))
 
 # What a HEALTHY run may ask for before the ceiling above has stopped separating
 # anything.
@@ -229,6 +250,58 @@ fast_path_asked_ms() {
         return 1
     }
     printf '%s' "$total"
+}
+
+# How many pauses `run_bounded` requested during the last `fast_path_ms`.
+#
+# The half of the total that the HOST decides, and the reason the verdict below
+# divides by it (#1196). One line per pause, so this is the line count; a missing
+# ledger is 0 rather than an error, which the verdict treats as its own outcome.
+#
+# `awk` reading the file directly. No pipe -- this file's own early-exit scan
+# refuses `wc -l < f | ...` shapes, and a count is exactly what `END { NR }` is.
+fast_path_pause_count() {
+    local ledger
+    ledger="$(fast_path_ledger)"
+    if [ ! -e "$ledger" ]; then
+        printf '0'
+        return 0
+    fi
+    LC_ALL=C awk 'END { printf "%d", NR }' "$ledger"
+}
+
+# The verdict `bounded-fast-path-bites` reaches, as a PURE FUNCTION of what was
+# measured (#1196).
+#
+# Split out so both directions can be driven from a staged record rather than by
+# provoking a real defect and timing it -- the same argument this repository
+# makes for `node-scratch-isolation-e2e-selftest`: a decision measured through an
+# instrument whose own overhead is comparable to the quantity is not being
+# measured at all, and branches that could not be staged become one line each.
+#
+# It is what makes the ACCEPTING direction assertable too. The old total floor
+# had never been watched accepting a 15-pause run, because no local run produces
+# one; the record table below states that case by name, and it is the exact
+# reading that reddened master.
+#
+# @param 1 milliseconds of pause requested in total.
+# @param 2 how many pauses that was spread over.
+# @return prints the `BUG:` lines, or nothing at all when the defect is separable.
+fast_path_defect_verdict() {
+    local asked="$1" pauses="$2" per
+    # ZERO is its own outcome and not a division. It is also not a defect in
+    # `run_bounded`: it is every command finishing before its first poll, which is
+    # the fast path working. What it is not is a MEASUREMENT, so it may not be
+    # reported as a pass.
+    if [ "$pauses" -lt 1 ]; then
+        echo "BUG: no pause was requested at all, so nothing here measures the ceiling"
+        return 0
+    fi
+    per=$(( asked / pauses ))
+    if [ "$per" -lt "$FastPathDefectFloorMsPerPause" ]; then
+        echo "BUG: a defective pause cost ${per}ms against a ${FastPathDefectFloorMsPerPause}ms floor, so the"
+        echo "BUG: ${FastPathCeilingMs}ms ceiling no longer separates a healthy run from a broken one"
+    fi
 }
 
 # Run `FastPathCommands` commands that finish immediately through `run_bounded`,
@@ -910,8 +983,8 @@ run_case() {
     # THE PRODUCTION SHAPE, and the row that would have caught the defect the
     # rows around it missed.
     #
-    # `cluster-e2e`'s probe runs `answer="$(cluster â€¦)"`, and `cluster` runs
-    # `out="$(run_bounded â€¦)"` inside that -- so `run_bounded` executes TWO
+    # `cluster-e2e`'s probe runs `answer="$(cluster …)"`, and `cluster` runs
+    # `out="$(run_bounded …)"` inside that -- so `run_bounded` executes TWO
     # subshells below the fixture. The first version of the outcome was a shell
     # variable, and the assignment was discarded at the closing paren: every
     # unstartable probe read back as `finished`, and the fixture filed 870 of them
@@ -1173,31 +1246,32 @@ run_case() {
     # and prints nothing anyone needs on the passing path, so `expect` covers it.
     bounded-fast-path-bites)
         # Against the pause ASKED FOR, for the reason the case above gives at
-        # length. This is the half that was actually going red: the staged defect
-        # measured 2966ms, 2904ms and 2879ms against a 3000ms floor on a
-        # contended host, and a defect cannot come in SHORT by being slow. Twenty
-        # `sleep 0.2` calls were requested and performed every time -- counted --
-        # and the clock lost the difference.
+        # length -- and PER PAUSE, for the reason `FastPathDefectFloorMsPerPause`
+        # gives (#1196). The acquisition happens here; the DECISION is
+        # `fast_path_defect_verdict`, driven in both directions from staged
+        # records so this case is not the only thing that has ever exercised it.
         #
-        # The floor now bounds an exact quantity, which makes it a stronger guard
-        # than it was rather than a relaxed one: the worry recorded at
-        # `FastPathCommands` is that halving the count would halve the separation
-        # with nothing going red, and halving it now takes the requested total
-        # from 4000ms to 2000ms, straight through this floor.
+        # The count is REPORTED whatever the verdict, because it is the quantity
+        # that moves between an idle box and a loaded runner, and a line stating
+        # only the total invites exactly the inference that made the old floor
+        # look host-independent.
         _e2e_bounded_pauses=()
         # Reported and not fatal, for the reason the case above gives.
         if fast_ms="$(fast_path_ms)"; then reading=1; else reading=0; fast_ms=""; fi
         asked_ms="$(fast_path_asked_ms)"
+        pauses="$(fast_path_pause_count)"
         if [ "$reading" -eq 1 ]; then
             clock="the wall clock read ${fast_ms}ms"
         else
             clock="the wall clock produced no usable reading"
         fi
-        echo "the staged flat-pause defect asked for ${asked_ms}ms of pause over ${FastPathCommands} commands; ${clock} (ceiling ${FastPathCeilingMs}ms, floor ${FastPathDefectFloorMs}ms)"
-        if [ "$asked_ms" -le "$FastPathDefectFloorMs" ]; then
-            echo "BUG: the staged defect asked for under ${FastPathDefectFloorMs}ms of pause, so the ceiling"
-            echo "BUG: no longer separates a healthy run from a broken one"
+        if [ "$pauses" -ge 1 ]; then
+            per_pause=" ($(( asked_ms / pauses ))ms each)"
+        else
+            per_pause=""
         fi
+        echo "the staged flat-pause defect asked for ${asked_ms}ms of pause over ${pauses} pause(s) of ${FastPathCommands} commands${per_pause}; ${clock} (ceiling ${FastPathCeilingMs}ms, floor ${FastPathDefectFloorMsPerPause}ms per pause)"
+        fast_path_defect_verdict "$asked_ms" "$pauses"
         ;;
 
     # THE SHAPE GUARD IN `fast_path_ms`, WATCHED REFUSING -- and watched
@@ -2269,6 +2343,43 @@ if [ "$(( advertised + advertised_named ))" -lt 5 ] || [ "$inner" != "1" ]; then
     echo "     ${caseFlag}-body directly reads 'did this case run', not 'was it clean'." >&2
     note_failure "case-mode-in-use"
 fi
+
+# --- the fast-path defect verdict, in BOTH directions ----------------------
+#
+# `bounded-fast-path-bites` stages one defect and reaches one verdict, so on any
+# given host it exercises exactly one row of this table -- and the row it cannot
+# reach locally is the row that reddened master (#1196). Driven from staged
+# readings instead, every row is reachable everywhere, and the boundary is stated
+# rather than left to a host to stumble onto.
+#
+# The readings are REAL where they can be: 4000/20 and 3600/18 were measured here
+# on 2026-09-10, and 3000/15 is what `Linux-gcc-release` reported on f9f47ebf.
+#
+# `asked|pauses|expect-bug|why`
+fastPathVerdicts=(
+    "4000|20|0|the ordinary reading on an idle box: every command polled once, 200ms each"
+    "3600|18|0|two commands finished before their first poll -- seen here, one run in ten"
+    "3000|15|0|what the hosted runner reported, and what the old total floor refused"
+    "3000|20|0|exactly the floor, 150ms per pause: clearing it is passing it"
+    "2999|20|1|one millisecond under the floor, so the guard is watched refusing at the edge"
+    "1000|20|1|a real defect the ceiling could no longer separate: 50ms a pause"
+    "0|0|1|no pause requested at all -- not a defect, and not a measurement either"
+)
+echo "== the fast-path defect verdict, against staged readings"
+for record in "${fastPathVerdicts[@]}"; do
+    IFS='|' read -r vAsked vPauses vWantBug vWhy <<< "$record"
+    ran=$(( ran + 1 ))
+    vOut="$(fast_path_defect_verdict "$vAsked" "$vPauses")"
+    # A HERESTRING, not a pipe: this file's own early-exit scan refuses the other
+    # spelling, and a scan that its own driver violates is a scan nobody believes.
+    if grep -q 'BUG:' <<< "$vOut"; then vGotBug=1; else vGotBug=0; fi
+    if [ "$vGotBug" -ne "$vWantBug" ]; then
+        echo "FAIL fast-path-verdict [${vAsked}ms over ${vPauses}]: wanted bug=${vWantBug}, got ${vGotBug} -- ${vWhy}" >&2
+        printf '%s
+' "$vOut" | sed 's/^/     | /' >&2
+        note_failure "fast-path-verdict-${vAsked}-${vPauses}"
+    fi
+done
 
 # --- the bound is a duration, not an iteration count -----------------------
 #
