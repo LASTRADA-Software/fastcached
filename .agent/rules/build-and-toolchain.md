@@ -3805,6 +3805,86 @@ the change is a ROW of `EventPolicy` and nothing else:
   after some jobs finished carries a mix, and reading the mix reports the failures of a
   run nobody let finish.
 
+### And the notifier then opened no report in its entire life (#1174)
+
+`EVENT` was defined on the `decide` step's `env:` and read by the **reporting** step,
+whose own `env:` never named it. A step's environment is its own — a sibling's `env:`
+lends it nothing — so under `set -euo pipefail` the step died on its first line of real
+work:
+
+```
+line 7: EVENT: unbound variable
+##[error]Process completed with exit code 1.
+```
+
+Measured over the last 200 runs of the workflow at the time of the fix: **190 `success`,
+10 `failure`, and all ten failures were that line.** The 190 are the `reportable == 0`
+path, which never enters the step. So #684's notifier — the whole of the machinery above
+— had never once opened a report, and #774's `push` half never had either. The contexts
+it swallowed were real: `clang-tidy-windows` on a `pr-1153` queue attempt, `macOS-clang-release`
+and `compile-cache E2E (Windows)` on `pr-1154`, `Code coverage` twice, and five more.
+
+Three things had to be true at once for that to be quiet, which is #1031's shape
+arriving in the instrument whose entire subject is failures nobody was told about:
+
+- `-u` making the read an error rather than an empty string — the loud direction, and
+  still invisible because nobody was watching this workflow's step-level results;
+- the failing runs being **indistinguishable from the 190 healthy ones** in any listing
+  that shows a conclusion per RUN. `gh run list` prints `failure` beside `success` in the
+  same column for a workflow nobody has a reason to open;
+- the workflow announcing itself exactly the way #774 says an unreported failure does —
+  as a red run in the Actions tab that nothing points at.
+
+**Why no rule caught it.** `check-merge-group-report.sh` asserts the shape of this
+workflow and passed, correctly by its own rules. The rule that motivated the `$EVENT`
+read is
+
+```sh
+grep -q 'FASTCACHED_REPORT_ONLY_IF_NEW' <<< "$(NonComment "$Workflow")"
+```
+
+a **whole-file** grep — and the line satisfying it is inside the step that cannot run. A
+rule satisfied by a line that never executes is the same defect as a rule satisfied by
+prose, which that file's own header records making twice. **So the rule is per STEP and
+never whole-file; that is the whole of it.** `StepEnvComplete` refuses a `run:` block
+reading a name that neither its own `env:`, the workflow- or job-level `env:`, the
+script's own assignments, nor a named allowlist of runner variables supplies.
+
+It applies to **every** `run:`, not only the ones turning on `set -u`. Without `-u` an
+undefined name expands to EMPTY and the branch is silently taken the wrong way, which is
+the worse of the two failures and the one nothing would report.
+
+Four things that shaped the guard rather than decorating it:
+
+- The runner vocabulary is an **allowlist**, not a `GITHUB_*` pattern. An exclusion list
+  bets on the world's layout; an inclusion list states your own — and a pattern broad
+  enough to be convenient is what would have waved `EVENT` through.
+- The model of bash is deliberately **narrow**. The first version took bare words off
+  the front of any line as definitions, which made `echo`, `gh` and `api` variables —
+  a model MORE PERMISSIVE than the shell, in a check whose entire purpose is that a
+  permissive model waves through the one read that matters. Only a declarator
+  (`export`/`readonly`/`local`/`declare`/`typeset`) names several; anything else names
+  at most one, and only with an `=`.
+- The refusal names the **step**. A guard's remedy text is part of the guard, and one
+  saying `(unnamed)` cannot be acted on — which is what the first version printed,
+  because a steps list item carries its first key on the dash line and the parser
+  consumed the whole line as a boundary. That same bug read `- env:` as declaring no
+  environment at all, so the check's own fixture passed for the wrong reason.
+- The self-test's `correct` fixture **modelled the defect**: it emitted a reporter step
+  reading `$EVENT` with no `env:` at all, and called that the correct workflow. A
+  fixture more permissive than the thing it stands for, vouching for the bug it was
+  built beside. Its `no-event-env` sibling is now the positive control, and every
+  whole-file rule still passes on that fixture — which is precisely how the shipped
+  workflow passed them for its entire life, so a green run of the other twelve cases
+  says nothing about this one.
+
+The scan is **one workflow's**, not the repository's: 28 `run:` blocks across six
+workflow files are outside it, and generalising it is
+[#1175](https://github.com/LASTRADA-Software/fastcached/issues/1175) rather than a wider
+glob bolted on here. What it cannot see is stated in its own header — `eval`, indirect
+expansion, a name an action's `outputs` supply through a `${{ }}` that is substituted
+before bash sees it, a sourced file, and `${#arr[@]}`.
+
 **A Windows leg that cannot start processes reports six red smoke tests, not a
 runner fault** ([#966](https://github.com/LASTRADA-Software/fastcached/issues/966)).
 Observed on `Windows-cl-debug`: six failures, all exit `0xc0000142`
