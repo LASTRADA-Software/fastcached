@@ -184,14 +184,34 @@ namespace
         auto const expiry = Detail::StartExpiryCycle(reactor, expiryPool, engine, logger, options, metrics);
 
         std::atomic<bool> watchdogQuit { false };
-        auto watchdog = MakeWatchdog(watchdogQuit, [&] {
-            for (auto& s: servers)
-                s->Shutdown();
-            reactor.Stop();
-        });
+        // **`Stop()` and NOTHING else, because this runs on the watchdog's own thread**
+        // ([#1208](https://github.com/LASTRADA-Software/fastcached/issues/1208)).
+        // `Server::Shutdown()` closes the listener, which reaches
+        // `EpollReactor::Detach` and walks the batch `RunLoop` is dispatching -- so
+        // shutting the servers down from here raced the loop by construction rather
+        // than in a narrow window, since `Shutdown()` ran BEFORE `Stop()`.
+        //
+        // `Stop()` is the one call that is safe from another thread: it sets a flag and
+        // writes the wake fd, touching nothing the loop walks.
+        auto watchdog = MakeWatchdog(watchdogQuit, [&] { reactor.Stop(); });
 
         reactor.Run();
         watchdogQuit.store(true, std::memory_order_release);
+
+        // **The other half, and REORDERING ALONE would not have been it.** Moving
+        // `Stop()` above `Shutdown()` inside the watchdog leaves both on the watchdog's
+        // thread, and `Stop()` only posts a wakeup and returns -- so the loop can still
+        // be mid-batch when `Shutdown()` closes the listener. That is the gap
+        // `~FrameEndpoint` fell into in #840. What makes this safe is the THREAD and the
+        // moment: `Run()` has returned here, so `TeardownIsSerialisedWithDispatch()`
+        // holds on its `!Running()` term, which is what `Detach` now asserts.
+        //
+        // It is also tidier than leaving the accept loops parked for the reactor's
+        // destructor to abandon (#1025): closing the listener resumes each one inline,
+        // on this thread, and it ends through its own `co_return`.
+        for (auto& s: servers)
+            s->Shutdown();
+
         std::uint64_t total = 0;
         for (auto const& s: servers)
             total += s->AcceptedCount();
@@ -526,9 +546,10 @@ namespace
         announcer.AcceptorsAllSpawned();
 
         std::atomic<bool> watchdogQuit { false };
+        // `Stop()` and nothing else -- the same rule as the single-reactor path, and
+        // this is the second of the two sites #1208 reported. The servers are shut
+        // down after every loop has returned, below.
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
-            for (auto& server: servers)
-                server->Shutdown();
             for (auto& reactor: reactors)
                 reactor->Stop();
         });
@@ -583,6 +604,14 @@ namespace
         threads.clear();
 
         watchdogQuit.store(true, std::memory_order_release);
+
+        // Every loop has returned -- `runReactor(0)` above and `threads.clear()`, which
+        // joins -- so no reactor is `Running()` and closing a listener here cannot walk
+        // a batch anybody is dispatching. See the single-reactor path for why the order
+        // rather than the thread was never the fix (#1208).
+        for (auto& server: servers)
+            server->Shutdown();
+
         std::uint64_t total = 0;
         for (auto& server: servers)
             total += server->AcceptedCount();
