@@ -175,45 +175,6 @@ set(FastCachedSurfaceCountExemptions
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 
-# Split file content into a list of lines, one element per line.
-#
-# `file(STRINGS)` cannot be used: it returns a CMake list, so a line containing a
-# ';' becomes several elements and every line number after it is wrong. Splitting
-# by hand meets the same hazard from the other side, and ESCAPING does not survive
-# it -- CMake's list syntax reserves four characters, and each was measured
-# breaking this scan on a real file in this tree:
-#
-#   ';'       the separator itself.
-#   '\'       its escape -- and CMake reads any ';' preceded by a backslash as
-#             escaped without counting the backslashes first, so a line ending in
-#             one (every shell continuation in this repository's READMEs) eats the
-#             separator after it. README.md came out 365 lines where it has 368.
-#   '[' ']'   grouping: a ';' between them is not a separator. One stray '`]`' in
-#             a comment swallowed 451 lines into a single element -- the dangerous
-#             direction, because a merged element does not shrink a window, it
-#             WIDENS it to whatever it swallowed.
-#
-# All four are replaced by a space rather than escaped. Nothing is lost: no
-# surface name, protocol token, number word or exemption phrase contains any of
-# them, and a line's text is printed only as context in a diagnostic.
-#
-# Copied verbatim from the sibling checks rather than varied, and that is the
-# point: consolidating these into a shared module is #495, deliberately not
-# pre-empted here, and #495's validation compares the copies as TEXT. A copy that
-# rewrote an escape or a spelling would be equivalent and non-identical, which is
-# exactly the divergence that consolidation cannot detect. Keep this byte-for-byte
-# with `check-sccache-backend-caveat.cmake`, and count this file in when #495 lands.
-#
-# @param content File content.
-# @param linesOut Set to the content's lines, in order.
-function(fastcached_split_lines content linesOut)
-    string(REPLACE "\\" " " content "${content}")
-    string(REPLACE ";" " " content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
-    set(${linesOut} "${lines}" PARENT_SCOPE)
-endfunction()
 
 # ---------------------------------------------------------------------------
 # Every '|'-table row parses, checked up front rather than where a row is used.
@@ -272,7 +233,7 @@ if(NOT EXISTS "${surfaceSource}")
 endif()
 
 file(READ "${surfaceSource}" surfaceContent)
-fastcached_split_lines("${surfaceContent}" surfaceLines)
+fastcached_split_lines_tokenised("${surfaceContent}" surfaceLines)
 
 set(surfaceNames "")
 set(surfaceProtocols "")
@@ -343,7 +304,7 @@ if(NOT EXISTS "${surfaceHeader}")
         "cannot be cross-checked, and a partial parse would be reported as the documents being wrong.")
 endif()
 file(READ "${surfaceHeader}" headerContent)
-fastcached_split_lines("${headerContent}" headerLines)
+fastcached_split_lines_tokenised("${headerContent}" headerLines)
 
 set(enumeratorCount 0)
 set(inEnum FALSE)
@@ -444,7 +405,7 @@ foreach(docFile IN LISTS docFiles)
     if(NOT worthSplitting)
         continue()
     endif()
-    fastcached_split_lines("${docContent}" docLines)
+    fastcached_split_lines_tokenised("${docContent}" docLines)
 
     # -----------------------------------------------------------------------
     # ONE pass over the lines, serving both rules.

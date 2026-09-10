@@ -124,30 +124,6 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 
-# Split file content into a list of lines, one element per line.
-#
-# `file(STRINGS)` cannot be used: it returns a CMake list, so a line containing a
-# ';' becomes several elements and every line number after it is wrong. The four
-# characters CMake's list syntax reserves are replaced by a space rather than
-# escaped -- escaping does not survive a line ending in a backslash, which every
-# shell continuation in this repository is. Nothing is lost: none of them can
-# appear inside `::htonl(`, and no line's text is ever printed, only its number.
-#
-# Tabs become spaces in the same pass, so the pattern below can spell optional
-# whitespace as a plain space class -- CMake's regex engine does not read `\t`
-# inside a bracket expression.
-#
-# @param content File content.
-# @param linesOut Set to the content's lines, in order.
-function(fastcached_split_lines content linesOut)
-    string(REPLACE "\\" " " content "${content}")
-    string(REPLACE ";" " " content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REPLACE "\t" " " content "${content}")
-    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
-    set(${linesOut} "${lines}" PARENT_SCOPE)
-endfunction()
 
 # Turn a list of shell globs into one anchored regex, so a root can be walked ONCE
 # and the results filtered in memory.
@@ -257,7 +233,7 @@ foreach(scanFile IN LISTS scanFiles)
         continue()
     endif()
 
-    fastcached_split_lines("${content}" fileLines)
+    fastcached_split_lines_tokenised("${content}" fileLines MAP_TABS)
     list(LENGTH fileLines lineCount)
 
     # A split that merged lines does not report a missing line, it reports the

@@ -76,6 +76,20 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The `"value|reason"` row convention, defined once (#513). Rows here are
+# `<test name>|<-P value as written>` and `<test name>|<signalled>|<will fail>`; the
+# name and the path travel as ONE row because they are one registration -- two lists
+# appended in step are two lists that can stop being in step, and nothing would say
+# so.
+#
+# This file used to carry a splitter of its own, on the stated ground that neither
+# field can hold a `|` and that the count should be asserted rather than assumed.
+# The shared one asserts the count too, and it does not go through
+# `string(REPLACE "|" ";")` and `list(GET)` -- which is what made the private one
+# shift a row's fields around an unbalanced bracket. The reason was true and did not
+# support the copy.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -111,11 +125,7 @@ endif()
 # example: the same fix took it from three refusal spellings to zero, and it now
 # walks its lines without ever building a CMake list.
 file(READ "${testsFile}" content)
-string(REPLACE ";" "\\;" content "${content}")
-string(REPLACE "[" " " content "${content}")
-string(REPLACE "]" " " content "${content}")
-string(REPLACE "\r\n" "\n" content "${content}")
-string(REPLACE "\n" ";" lines "${content}")
+fastcached_split_lines_verbatim("${content}" lines)
 
 # ---------------------------------------------------------------------------
 # Pass 1: which tests are registered by running a `cmake -P` script.
@@ -163,20 +173,6 @@ if(NOT scriptRegistrations)
 endif()
 list(REMOVE_DUPLICATES scriptRegistrations)
 list(LENGTH scriptRegistrations scriptCheckCount)
-
-# The `"value|reason"` row convention, defined once (#513). Rows here are
-# `<test name>|<-P value as written>` and `<test name>|<signalled>|<will fail>`; the
-# name and the path travel as ONE row because they are one registration -- two lists
-# appended in step are two lists that can stop being in step, and nothing would say
-# so.
-#
-# This file used to carry a splitter of its own, on the stated ground that neither
-# field can hold a `|` and that the count should be asserted rather than assumed.
-# The shared one asserts the count too, and it does not go through
-# `string(REPLACE "|" ";")` and `list(GET)` -- which is what made the private one
-# shift a row's fields around an unbalanced bracket. The reason was true and did not
-# support the copy.
-include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 set(sawMissingSignal FALSE)
 set(sawMissingDeclaration FALSE)

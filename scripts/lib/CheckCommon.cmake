@@ -153,3 +153,120 @@ function(fastcached_split_rows rows valuesOut reasonsOut)
     set(${valuesOut} "${values}" PARENT_SCOPE)
     set(${reasonsOut} "${reasons}" PARENT_SCOPE)
 endfunction()
+
+# ---------------------------------------------------------------------------
+# Splitting file content into lines. TWO functions, not one, and they must not be
+# merged (#495).
+#
+# The eight-plus copies of this looked like one idiom under three names. They are
+# not: they are two idioms with OPPOSITE intent, and which one a site wants follows
+# from what it does with the line next.
+#
+#   TOKENISED  the caller is about to parse the line as CMake ARGUMENTS, so `;`,
+#              `[`, `]` and `\` are structure that has to be neutralised BEFORE
+#              parsing. `check-glob-traversals` reads `file(GLOB_RECURSE ...)`
+#              argument lists; blanking is chosen over escaping deliberately,
+#              because an escape does not survive a line ending in a backslash and
+#              every shell continuation in this repository is one.
+#
+#   VERBATIM   the caller PRINTS the line with an accurate `file:line`, so the text
+#              has to survive. `;` is escaped rather than blanked; `[` and `]` are
+#              still blanked, because nothing in this family matches on a bracket
+#              and a space preserves every column and line number.
+#
+# A single shared function would have to pick one, and would break whichever family
+# it did not choose -- SILENTLY, because the check would go on passing, having
+# matched different text. That is why "split lines" was the wrong name: it is the
+# name that hid the difference for eight copies.
+#
+# ## What was measured before they moved
+#
+# The count comparison that validates the rest of this module is structurally blind
+# here: it sees a check examining a DIFFERENT NUMBER of subjects, and a dropped
+# escape or a changed tab produces the same number of DIFFERENT ones. So the copies
+# were driven against one another over content carrying a `;`, a balanced bracket
+# pair, an unbalanced `[`, a trailing backslash and a tab, and the ELEMENTS were
+# compared rather than the count:
+#
+#   line                A1 (lossy)         A2 (+tabs)         B1 (`\\;`)      B2 (`\;`)
+#   "alpha; beta"       "alpha  beta"      same as A1         "alpha; beta"   same as B1
+#   "[bracket] pair"    " bracket  pair"   same as A1         " bracket  pair" same as B1
+#   "unbalanced [ here" "unbalanced   here" same as A1        "unbalanced   here" same
+#   "back\slash tail"   "back slash tail"  same as A1         "back\slash tail" same as B1
+#   "<TAB>tab indented" "<TAB>tab indented" " tab indented"   "<TAB>tab ..."  same as B1
+#
+# Two findings came out of that. The tab map is the ONLY within-family-A difference,
+# and it is load-bearing rather than drift -- `check-byte-order-qualifier` spells
+# optional whitespace as a plain space class, which CMake's regex engine will not
+# match against a tab, so normalising it away would silently stop that check seeing
+# tab-indented code. It is a named option here rather than a flattened default.
+#
+# And `check-target-file-guards` carried BOTH B spellings, in one file: `"\;"` at one
+# reader and `"\\;"` at the other, with the bracket blanking on opposite sides of the
+# escape. They are byte-identical on every element measured, so converging them is
+# safe -- which is worth recording, because "one file spells it two ways" reads like
+# a defect and is not one.
+#
+# ## What is NOT converted, and why
+#
+# `check-config-reference-reach` splits through an `@FC_SEMI@` PLACEHOLDER and blanks
+# no brackets at all. That is a third strategy, and converting it would change what
+# it matches: it keeps `;` inside the element rather than escaping it, and it is
+# bracket-EXPOSED where both families here are not. Which of those matters is a
+# question about that check's corpus -- exposure is a property of (reader, file,
+# surviving lines) and never of the script -- so it is left where it is and named
+# here rather than folded in quietly.
+
+# Split content into lines for TOKENISING: `\`, `;`, `[` and `]` become spaces, so a
+# line can be handed to a parser without its punctuation being read as structure.
+# Lossy on exactly those four characters, and a space preserves every column.
+#
+# @param content The file content.
+# @param linesOut Set to the content's lines, in order.
+# @param ARGN `MAP_TABS` to turn tabs into spaces as well. Ask for it only when the
+#        caller's pattern spells whitespace as a plain space class -- CMake's regex
+#        engine does not read `\t` inside a bracket expression.
+function(fastcached_split_lines_tokenised content linesOut)
+    set(mapTabs FALSE)
+    foreach(option IN LISTS ARGN)
+        if(option STREQUAL "MAP_TABS")
+            set(mapTabs TRUE)
+        else()
+            message(FATAL_ERROR "fastcached_split_lines_tokenised: unknown option `${option}`")
+        endif()
+    endforeach()
+    string(REPLACE "\\" " " content "${content}")
+    string(REPLACE ";" " " content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
+    if(mapTabs)
+        string(REPLACE "\t" " " content "${content}")
+    endif()
+    # ONE backslash each. CMake's argument parser turns `\r` and `\n` into the real
+    # characters and its regex engine has no escapes of its own, so the doubled form
+    # splits on the LETTER n instead.
+    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
+    set(${linesOut} "${lines}" PARENT_SCOPE)
+endfunction()
+
+# Split content into lines that survive VERBATIM, for a caller that prints the line
+# with an accurate `file:line`. `;` is escaped rather than blanked; `[` and `]` are
+# blanked, because a bracket is grouping structure to CMake's list parser and nothing
+# in this family matches on one.
+#
+# Only an UNBALANCED bracket groups -- `[[nodiscard]]` is inert -- so blanking every
+# bracket is broader than the truth. It is safe here by WHAT THE CALLERS MATCH rather
+# than by construction: a pattern that itself contained a bracket would stop matching,
+# silently. `check-worker-refusals-counted` is the worked example and answers it by
+# walking its lines without ever building a CMake list.
+#
+# @param content The file content.
+# @param linesOut Set to the content's lines, in order.
+function(fastcached_split_lines_verbatim content linesOut)
+    string(REPLACE ";" "\\;" content "${content}")
+    string(REPLACE "[" " " content "${content}")
+    string(REPLACE "]" " " content "${content}")
+    string(REPLACE "\r\n" "\n" content "${content}")
+    string(REPLACE "\n" ";" lines "${content}")
+    set(${linesOut} "${lines}" PARENT_SCOPE)
+endfunction()

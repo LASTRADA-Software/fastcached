@@ -52,6 +52,11 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -320,12 +325,7 @@ file(READ "${check}" checkText)
 # none is bracketed. Where brackets ARE the data, blanking them is wrong and the
 # remedy is a list-free offset walk instead -- see `check-tsan-scope`, whose rows
 # are Catch2 tags like `[async]`.
-string(REGEX REPLACE "\r\n" "\n" checkText "${checkText}")
-string(REPLACE "\\" " " checkText "${checkText}")
-string(REPLACE ";" " " checkText "${checkText}")
-string(REPLACE "[" " " checkText "${checkText}")
-string(REPLACE "]" " " checkText "${checkText}")
-string(REPLACE "\n" ";" checkLines "${checkText}")
+fastcached_split_lines_tokenised("${checkText}" checkLines)
 set(FastCachedSelftestExemptions "")
 set(inExemptions FALSE)
 foreach(line IN LISTS checkLines)

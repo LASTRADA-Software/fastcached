@@ -333,39 +333,6 @@ fastcached_wall_seconds(runStartSeconds)
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 
-# Split file content into a list of lines, one element per line.
-#
-# `file(STRINGS)` cannot be used: it returns a CMake list, so a line containing a
-# ';' becomes several elements and every line number after it is wrong. Splitting
-# by hand meets the same hazard from the other side, and ESCAPING does not survive
-# it -- CMake's list syntax reserves four characters, and each was measured
-# breaking this scan on a real file in this tree:
-#
-#   ';'       the separator itself.
-#   '\'       its escape -- and CMake reads any ';' preceded by a backslash as
-#             escaped without counting the backslashes first, so a line ending in
-#             one (every shell continuation in this repository's READMEs) eats the
-#             separator after it. README.md came out 365 lines where it has 368.
-#   '[' ']'   grouping: a ';' between them is not a separator. One stray '`]`' in
-#             a comment swallowed 451 lines into a single element -- the dangerous
-#             direction, because a merged element does not shrink a caveat window,
-#             it WIDENS it to whatever it swallowed.
-#
-# All four are replaced by a space rather than escaped. Nothing is lost: no marker
-# and no caveat spelling contains any of them, and no line's text is ever printed
-# -- only its number. Four calls rather than a table because a CMake list cannot
-# hold a bare ';' or '\' to iterate over in the first place.
-#
-# @param content File content.
-# @param linesOut Set to the content's lines, in order.
-function(fastcached_split_lines content linesOut)
-    string(REPLACE "\\" " " content "${content}")
-    string(REPLACE ";" " " content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
-    set(${linesOut} "${lines}" PARENT_SCOPE)
-endfunction()
 
 # Every cost band row parses, checked HERE rather than where a row is selected.
 #
@@ -677,7 +644,7 @@ foreach(scanFile IN LISTS scanFiles)
         continue()
     endif()
 
-    fastcached_split_lines("${content}" fileLines)
+    fastcached_split_lines_tokenised("${content}" fileLines)
     list(LENGTH fileLines lineCount)
 
     # A split that lost a line does not report a missing line -- it reports a

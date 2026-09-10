@@ -184,11 +184,7 @@ fastcached_split_rows(FastCachedNetStandaloneLeaves standaloneLeaves standaloneL
 # swallow another ticket silently.
 function(fastcached_fastcache_includes filePath includesOut)
     file(READ "${filePath}" content)
-    string(REPLACE "\\" " " content "${content}")
-    string(REPLACE ";" " " content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REGEX REPLACE "\r?\n" ";" lines "${content}")
+    fastcached_split_lines_tokenised("${content}" lines)
     list(FILTER lines INCLUDE REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]")
     set(includes "")
     foreach(line IN LISTS lines)

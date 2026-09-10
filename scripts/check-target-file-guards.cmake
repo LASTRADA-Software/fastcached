@@ -6,6 +6,11 @@
 # CMP0007: without it, `list(FILTER)` over a split file warns on every empty
 # element, and a check that prints a wall of warnings is a check nobody reads.
 cmake_minimum_required(VERSION 3.28)
+
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 #
 # Target-file guard hygiene: fail when a test registration names an OPTIONAL
 # executable through `$<TARGET_FILE:>` without first asking whether that target
@@ -91,11 +96,7 @@ endif()
 # #509 fixed this file's OTHER reader and left this one, because that change was
 # scoped to the splitter that led to it rather than to every reader in the file.
 file(READ "${appTable}" appTableContent)
-string(REPLACE "[" " " appTableSplit "${appTableContent}")
-string(REPLACE "]" " " appTableSplit "${appTableSplit}")
-string(REPLACE ";" "\;" appTableSplit "${appTableSplit}")
-string(REPLACE "\r\n" "\n" appTableSplit "${appTableSplit}")
-string(REPLACE "\n" ";" appRows "${appTableSplit}")
+fastcached_split_lines_verbatim("${appTableContent}" appRows)
 list(FILTER appRows INCLUDE REGEX "^[ \t]*\"[A-Za-z0-9_-]+\\|FASTCACHED_BUILD_")
 set(optionalTargets "")
 foreach(row IN LISTS appRows)
@@ -189,11 +190,7 @@ foreach(cmakeFile IN LISTS cmakeFiles)
     # without building a CMake list at all, which is the fix to copy if a pattern
     # here ever needs a bracket.
     file(READ "${cmakeFile}" content)
-    string(REPLACE ";" "\\;" content "${content}")
-    string(REPLACE "[" " " content "${content}")
-    string(REPLACE "]" " " content "${content}")
-    string(REPLACE "\r\n" "\n" content "${content}")
-    string(REPLACE "\n" ";" lines "${content}")
+    fastcached_split_lines_verbatim("${content}" lines)
 
     # The directory an app is defined in is added only when that app's option is
     # on, so inside `src/apps/<t>/` the target `<t>` exists by construction and

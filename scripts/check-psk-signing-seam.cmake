@@ -213,11 +213,7 @@ foreach(source IN LISTS sources)
     # merge with -- which is why exposure is a property of (reader, file,
     # surviving lines) and never of the script.
     file(READ "${source}" namingText)
-    string(REPLACE "\\" " " namingText "${namingText}")
-    string(REPLACE ";" " " namingText "${namingText}")
-    string(REPLACE "[" " " namingText "${namingText}")
-    string(REPLACE "]" " " namingText "${namingText}")
-    string(REGEX REPLACE "\r?\n" ";" namingLines "${namingText}")
+    fastcached_split_lines_tokenised("${namingText}" namingLines)
     list(FILTER namingLines INCLUDE REGEX "${FastCachedPskCallRegex}")
     if(namingLines STREQUAL "")
         # The name appears only in prose here. Not a violation, and not a match.

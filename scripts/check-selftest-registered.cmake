@@ -4,6 +4,11 @@
 # project has not stated. CMP0057 (`if(... IN_LIST ...)`) has already silently done
 # nothing in a check in this tree.
 cmake_minimum_required(VERSION 3.28)
+
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 #
 # A script that offers `--self-test` must be REGISTERED to run it (#596).
 #
@@ -96,11 +101,7 @@ file(READ "${registrationFile}" registrationRaw)
 # scripts. It is safe HERE and not there, and the difference is the data: what gets
 # matched against this content is a script NAME and a FLAG, neither of which can contain
 # a bracket, whereas the shell dispatch shapes the walk recognises ARE brackets.
-string(REPLACE ";" "\\;" registrationSplit "${registrationRaw}")
-string(REPLACE "[" " " registrationSplit "${registrationSplit}")
-string(REPLACE "]" " " registrationSplit "${registrationSplit}")
-string(REPLACE "\r\n" "\n" registrationSplit "${registrationSplit}")
-string(REPLACE "\n" ";" registrationLines "${registrationSplit}")
+fastcached_split_lines_verbatim("${registrationRaw}" registrationLines)
 set(registrationContent "")
 foreach(registrationLine IN LISTS registrationLines)
     if(registrationLine MATCHES "^[ \t]*#")

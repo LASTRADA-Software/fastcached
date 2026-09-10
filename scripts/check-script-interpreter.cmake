@@ -67,6 +67,11 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# The two line-splitting idioms, defined once (#495). They are TWO -- tokenised and
+# verbatim -- with opposite intent, and the module says which one a site wants and
+# why merging them would break whichever family it did not choose, silently.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -100,11 +105,7 @@ set(interpreterExemptions
 # going blind does not make a scan fail -- it leaves a smaller set that still
 # agrees unanimously.
 file(READ "${testsFile}" content)
-string(REPLACE ";" "\\;" content "${content}")
-string(REPLACE "[" " " content "${content}")
-string(REPLACE "]" " " content "${content}")
-string(REPLACE "\r\n" "\n" content "${content}")
-string(REPLACE "\n" ";" lines "${content}")
+fastcached_split_lines_verbatim("${content}" lines)
 
 # CMP0219 exists only on newer CMake than the declared minimum, so it is set
 # behind `if(POLICY ...)`. Unset, a macro called with a backslash in an argument
