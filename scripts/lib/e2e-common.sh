@@ -850,6 +850,36 @@ count_lines() {
 # Not `count_bytes`: a missing file is ORDINARY here (a wait polls a log before
 # anything has written it) where for `count_bytes` it is a fixture bug. Two
 # contracts, so two functions.
+#
+# **AND THIS IS THE ONE THAT WOULD BE DELETED, WHICH IS WHY THE ARGUMENT IS HERE.**
+# The two sit a few lines apart, run the same `wc -c ... | tr -d ' '`, and differ
+# only in what they do when the file cannot be read -- `count_bytes` calls `fail`,
+# this answers 0. So this one reads as the redundant copy, and it is not: routing
+# it through `count_bytes` would end the run on the FIRST POLL of essentially every
+# bounded wait in this repository, because a log that does not exist yet is the
+# ordinary state of a process that has just been started.
+#
+# Three things make that worth a paragraph rather than a shrug.
+#
+# **Nothing checks it.** The `no script keeps its own copy of a shared helper` scan
+# compares a FIXTURE against the library and cannot see two LIBRARY functions
+# overlapping. There is no guard to build either: the property is *these two must
+# not be merged*, which is a claim about intent, and prose at the site is this
+# tree's answer for that class.
+#
+# **It has a demonstrated victim from day one.** The first reader to meet the two
+# together matched `count_bytes`'s comment -- *"Fails the run when the file is
+# missing"* -- to THIS function by adjacency, within minutes of the merge that
+# introduced it, and came within one step of reporting it as a defect. A trap that
+# caught somebody on the day it appeared is not hypothetical.
+#
+# **A `/simplify` finding is a change like any other and is not exempt from the
+# review its subject just had.** This tree has a measured instance: a late cleanup
+# -- made precisely BECAUSE an off-by-one had hidden in three-origin arithmetic --
+# introduced a skipped-definition bug into the very instrument built to prevent
+# false passes, landing after four passes that would have caught it. A cleanup
+# arrives wearing the authority of a review rather than the suspicion of a change,
+# and two adjacent functions with one body is exactly the shape that attracts one.
 _e2e_size() {
     if [ -r "$1" ]; then
         wc -c < "$1" 2>/dev/null | tr -d ' '
