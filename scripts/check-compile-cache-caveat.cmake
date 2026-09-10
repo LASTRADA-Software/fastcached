@@ -50,7 +50,7 @@
 # cl.exe that exists and cannot compile.
 #
 # Usage:
-#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_WORK_DIR=<scratch>
+#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<scratch>
 #         -DFASTCACHED_CXX_COMPILER=<c++> [-DFASTCACHED_MSVC_LIKE=ON|OFF]
 #         [-DFASTCACHED_MAKE_PROGRAM=<make>] [-DFASTCACHED_GENERATOR=<gen>]
 #         -P scripts/check-compile-cache-caveat.cmake
@@ -145,7 +145,7 @@ set(FastCachedCaveatRows
     "nothing-installed|No compiler-cache launcher found|${FastCachedCaveatMarker}|none|||none"
 )
 
-foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPILER)
+foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR FASTCACHED_CXX_COMPILER)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} must be set (cmake -D${required}=... -P ${CMAKE_CURRENT_LIST_FILE})")
     endif()
@@ -288,10 +288,10 @@ endif()
 # a toolchain that has since moved would fail the canary rather than the rows, and
 # `SKIP_REGULAR_EXPRESSION` would then retire this check on that build tree
 # permanently and quietly.
-file(REMOVE_RECURSE "${FASTCACHED_WORK_DIR}/canary")
+file(REMOVE_RECURSE "${FASTCACHED_SCRATCH_DIR}/canary")
 execute_process(
     COMMAND "${CMAKE_COMMAND}"
-            -S "${fixtureDir}" -B "${FASTCACHED_WORK_DIR}/canary"
+            -S "${fixtureDir}" -B "${FASTCACHED_SCRATCH_DIR}/canary"
             ${commonArguments}
             "-DFASTCACHE_CC=" "-DSCCACHE=" "-DCCACHE="
     RESULT_VARIABLE canaryResult
@@ -351,8 +351,8 @@ foreach(row IN LISTS FastCachedCaveatRows)
     endforeach()
     set(launcherArguments "-DFASTCACHE_CC=" "-DSCCACHE=${sccachePath}" "-DCCACHE=${ccachePath}")
 
-    set(rowBinaryDir "${FASTCACHED_WORK_DIR}/${name}/build")
-    file(REMOVE_RECURSE "${FASTCACHED_WORK_DIR}/${name}")
+    set(rowBinaryDir "${FASTCACHED_SCRATCH_DIR}/${name}/build")
+    file(REMOVE_RECURSE "${FASTCACHED_SCRATCH_DIR}/${name}")
 
     execute_process(
         COMMAND "${CMAKE_COMMAND}"

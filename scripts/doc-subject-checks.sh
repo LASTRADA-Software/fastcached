@@ -67,7 +67,7 @@
 #
 # ## One check in #687's table is deliberately not labelled
 #
-# `compile-cache-caveat` takes `FASTCACHED_WORK_DIR`, `FASTCACHED_CXX_COMPILER`,
+# `compile-cache-caveat` takes `FASTCACHED_SCRATCH_DIR`, `FASTCACHED_CXX_COMPILER`,
 # `FASTCACHED_MAKE_PROGRAM`, `FASTCACHED_GENERATOR` and `FASTCACHED_MSVC_LIKE` --
 # all build-tree facts -- and it CONFIGURES a throwaway project, which is why its
 # ctest timeout is 600 s rather than 60. It cannot run from a bare checkout and it

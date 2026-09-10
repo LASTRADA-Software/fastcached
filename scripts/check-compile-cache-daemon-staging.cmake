@@ -21,7 +21,7 @@
 # and staying clear of GitHub's unauthenticated rate limit.
 #
 # Usage:
-#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_WORK_DIR=<scratch>
+#   cmake -DFASTCACHED_SOURCE_DIR=<repo> -DFASTCACHED_SCRATCH_DIR=<scratch>
 #         -DFASTCACHED_CXX_COMPILER=<c++> [-DFASTCACHED_MAKE_PROGRAM=<make>]
 #         [-DFASTCACHED_GENERATOR=<gen>]
 #         -P scripts/check-compile-cache-daemon-staging.cmake
@@ -44,7 +44,7 @@ set(FastCachedInstallOracle
 # GitHub anyway could not accidentally succeed.
 set(mirrorVersion "9.8.7")
 
-foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_WORK_DIR FASTCACHED_CXX_COMPILER)
+foreach(required FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR FASTCACHED_CXX_COMPILER)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} must be set (cmake -D${required}=... -P ${CMAKE_CURRENT_LIST_FILE})")
     endif()
@@ -91,15 +91,15 @@ if(NOT platform)
     return()
 endif()
 
-file(REMOVE_RECURSE "${FASTCACHED_WORK_DIR}")
-file(MAKE_DIRECTORY "${FASTCACHED_WORK_DIR}")
+file(REMOVE_RECURSE "${FASTCACHED_SCRATCH_DIR}")
+file(MAKE_DIRECTORY "${FASTCACHED_SCRATCH_DIR}")
 
 # Build the archive the module will be asked to install from: same name, same
 # interior layout as a real release, holding both a launcher and a daemon that
 # each answer --version and nothing else — scripts rather than compiled
 # binaries, because what is under test is the staging plumbing, not the files.
 set(stem "fastcached-${mirrorVersion}-${platform}")
-set(payloadRoot "${FASTCACHED_WORK_DIR}/payload")
+set(payloadRoot "${FASTCACHED_SCRATCH_DIR}/payload")
 
 foreach(pair "launcher:${launcherMember}:fastcache-cc" "daemon:${daemonMember}:fastcached")
     string(REPLACE ":" ";" fields "${pair}")
@@ -113,7 +113,7 @@ foreach(pair "launcher:${launcherMember}:fastcache-cc" "daemon:${daemonMember}:f
          PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 endforeach()
 
-set(mirrorDir "${FASTCACHED_WORK_DIR}/mirror/fastcached-mirror/releases/download/v${mirrorVersion}")
+set(mirrorDir "${FASTCACHED_SCRATCH_DIR}/mirror/fastcached-mirror/releases/download/v${mirrorVersion}")
 file(MAKE_DIRECTORY "${mirrorDir}")
 # See check-compile-cache-install.cmake for why this is `cmake -E tar` rather
 # than `file(ARCHIVE_CREATE)`: the latter's WORKING_DIRECTORY option needs
@@ -127,12 +127,12 @@ if(NOT archiveResult EQUAL 0)
     message(FATAL_ERROR "could not build the mirror archive: ${archiveResult} ${archiveError}")
 endif()
 
-set(sandbox "${FASTCACHED_WORK_DIR}/sandbox")
+set(sandbox "${FASTCACHED_SCRATCH_DIR}/sandbox")
 file(MAKE_DIRECTORY "${sandbox}/usr/bin")
 file(CREATE_LINK "${hostUname}" "${sandbox}/usr/bin/uname" COPY_ON_ERROR SYMBOLIC)
 
-set(stageDir "${FASTCACHED_WORK_DIR}/stage")
-set(buildDir "${FASTCACHED_WORK_DIR}/build")
+set(stageDir "${FASTCACHED_SCRATCH_DIR}/stage")
+set(buildDir "${FASTCACHED_SCRATCH_DIR}/build")
 # FASTCACHE_ADDR names a port nothing on this host is listening on, so
 # _fc_daemon_answering's pre-check finds nothing and the module proceeds to
 # stage — staging is all this test asserts; check-compile-cache-daemon-start
@@ -146,7 +146,7 @@ set(arguments
     "-DFASTCACHE_AUTO_INSTALL_DIR=${stageDir}"
     "-DFASTCACHE_AUTO_INSTALL_REPO=fastcached-mirror"
     "-DFASTCACHE_AUTO_INSTALL_VERSION=${mirrorVersion}"
-    "-DFASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE=file://${FASTCACHED_WORK_DIR}/mirror"
+    "-DFASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE=file://${FASTCACHED_SCRATCH_DIR}/mirror"
     "-DFASTCACHE_AUTO_START=ON"
     "-DFASTCACHE_ADDR=127.0.0.1:18674")
 if(FASTCACHED_MAKE_PROGRAM)
