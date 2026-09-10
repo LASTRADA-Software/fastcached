@@ -500,8 +500,56 @@ reap_self_test() {
     # left it staged. It is not -- the wrapper calls the REAPER, not this
     # self-test -- and it is the case that matters most, because the failure is a
     # helper that kills the shell that invoked it.
-    if [ ! -d /proc ] && ! command -v lsof >/dev/null 2>&1; then
-        skipped="no way to read another process's cwd on this platform"
+    # Can this platform attribute ANOTHER process's working directory? Asked by
+    # DOING it against a process staged in a known directory -- never by testing for
+    # `/proc` or for an `lsof` binary.
+    #
+    # That distinction is the whole of #1224's macOS red. macOS has no `/proc` and
+    # DOES ship `lsof`, so the old capability test answered yes while `gate_cwd_of`
+    # answered nothing. Measured on `macOS-clang-release`: the two "must die" cases
+    # failed and every "must be spared" case passed, because a reaper that attributes
+    # nothing spares everything. **The break is in the direction that looks like
+    # caution** -- the cases a reader takes as proof of care are exactly the ones that
+    # pass when the attribution is dead -- so only a control can see it, and a
+    # tool-presence test never could.
+    #
+    # It reports WHAT IT SAW rather than a bare no: "this platform cannot" and "the
+    # probe never came up" are different states, and a skip reason that cannot tell
+    # them apart sends the next reader to the wrong question. The comparison is on the
+    # exact string because that is what `reap_verdict`'s prefix test needs -- a
+    # platform that answers a different spelling of the same directory (a resolved
+    # `/private/var` for a `/var` path, say) genuinely cannot attribute here, and
+    # saying so is more use than a match that would not have held.
+    _reap_attribution_detail=""
+    _reap_can_attribute_cwd() {
+        local dir probePid seen waited=0
+        dir="$(mktemp -d)"
+        ( cd "$dir" && exec sleep 30 ) >/dev/null 2>&1 &
+        probePid=$!
+        while [ "$waited" -lt 50 ]; do
+            kill -0 "$probePid" 2>/dev/null && break
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
+        if ! kill -0 "$probePid" 2>/dev/null; then
+            _reap_attribution_detail="the probe process never came up, so this platform was never asked"
+            rm -rf "$dir"
+            return 1
+        fi
+        seen="$(gate_cwd_of "$probePid" 2>/dev/null || true)"
+        kill -KILL "$probePid" 2>/dev/null || true
+        wait "$probePid" 2>/dev/null || true
+        if [ "$seen" = "$dir" ]; then
+            rm -rf "$dir"
+            return 0
+        fi
+        _reap_attribution_detail="gate_cwd_of answered '${seen:-<nothing>}' for a process staged in '${dir}'"
+        rm -rf "$dir"
+        return 1
+    }
+
+    if ! _reap_can_attribute_cwd; then
+        skipped="cannot attribute another process's working directory here -- ${_reap_attribution_detail}"
     else
         local scratch outside inside decoy pidOut pidIn reaper_self
         # This script, so the wrapper case below invokes the REAPER rather than a
