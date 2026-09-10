@@ -3,6 +3,7 @@
 
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/RefusalClaim.hpp>
 
 #include <cstddef>
 #include <cstdint>

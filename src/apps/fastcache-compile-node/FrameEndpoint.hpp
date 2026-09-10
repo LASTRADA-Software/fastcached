@@ -140,30 +140,6 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
     "refusal-sent row; a per-surface copy would be a third tally of one event";
 
-/// Whether a refusal row states exactly one of the two claims a refusal can make.
-///
-/// `Cc::Refuse` says a rise here means something an operator acts on;
-/// `Cc::RefuseWithoutCounter` says a rise would mean nothing, and why. A row must
-/// assert one of those and not the other: a row asserting NEITHER is what a guard
-/// short-circuiting on the absent counter passes vacuously, shipping a new refusal
-/// uncounted and unexplained, and a row asserting BOTH is an author who could not
-/// choose, answered here rather than at whichever call site read the fields in the
-/// luckier order.
-///
-/// **One predicate for all three surfaces**, beside the enumerator like
-/// `EndpointRefusalCodes` and `AnswerDeadlineIsTheEndpointsRationale`, because it is a
-/// property of what a refusal row IS rather than of any surface. It was briefly three:
-/// `Detail::StatesOneClaim` for the cache, plus the same truth table open-coded twice
-/// as `answer.has_value() != !rationale.empty()` -- one rule, three sites, two of them
-/// spelled in the inverted form and neither reachable by a grep for the name.
-/// @param counted Whether the row carries a counted answer.
-/// @param rationale The row's reason for counting nothing; empty when it counts.
-/// @return True when exactly one of the two is present.
-[[nodiscard]] constexpr bool StatesOneRefusalClaim(bool counted, std::string_view rationale) noexcept
-{
-    return counted == rationale.empty();
-}
-
 /// Answer an endpoint-decided refusal the way its row decided, counted or not.
 ///
 /// The one door both the scheduler and the compile surface reach their
