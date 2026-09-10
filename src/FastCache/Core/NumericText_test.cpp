@@ -75,10 +75,16 @@ TEST_CASE("NumericText: ParseFiniteDouble reads the whole numeric grammar", "[co
     // Every shape the grammar admits, including the two `strtod` accepts that a naive
     // reading of "digits, dot, digits" would not: a trailing dot and a leading one.
     static constexpr Case accepted[] = {
-        { "0"sv, 0.0 },      { "-0"sv, 0.0 },     { "1"sv, 1.0 },      { "+1"sv, 1.0 },      { "-1"sv, -1.0 },
-        { "1.5"sv, 1.5 },    { "-1.5"sv, -1.5 },  { "+1.5"sv, 1.5 },   { "3."sv, 3.0 },      { ".5"sv, 0.5 },
-        { "-.5"sv, -0.5 },   { "2.5e1"sv, 25.0 }, { "2.5E1"sv, 25.0 }, { "1e+3"sv, 1000.0 }, { "1e-3"sv, 0.001 },
-        { "1E-3"sv, 0.001 }, { "0.0"sv, 0.0 },    { "100"sv, 100.0 },  { "1e308"sv, 1e308 },
+        { .text = "0"sv, .expected = 0.0 },       { .text = "-0"sv, .expected = 0.0 },
+        { .text = "1"sv, .expected = 1.0 },       { .text = "+1"sv, .expected = 1.0 },
+        { .text = "-1"sv, .expected = -1.0 },     { .text = "1.5"sv, .expected = 1.5 },
+        { .text = "-1.5"sv, .expected = -1.5 },   { .text = "+1.5"sv, .expected = 1.5 },
+        { .text = "3."sv, .expected = 3.0 },      { .text = ".5"sv, .expected = 0.5 },
+        { .text = "-.5"sv, .expected = -0.5 },    { .text = "2.5e1"sv, .expected = 25.0 },
+        { .text = "2.5E1"sv, .expected = 25.0 },  { .text = "1e+3"sv, .expected = 1000.0 },
+        { .text = "1e-3"sv, .expected = 0.001 },  { .text = "1E-3"sv, .expected = 0.001 },
+        { .text = "0.0"sv, .expected = 0.0 },     { .text = "100"sv, .expected = 100.0 },
+        { .text = "1e308"sv, .expected = 1e308 },
     };
 
     for (auto const& one: accepted)

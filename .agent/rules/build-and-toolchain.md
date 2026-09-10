@@ -539,6 +539,34 @@ determinism rests on.
   project's WSL image, where 22 sits right beside it as `clang-tidy-22`. So a `clang-debug`
   build reports "clang-tidy clean" in exactly the way that means nothing, and the version it
   used is printed nowhere. Configure a second build directory naming the version, and run that.
+- **`CLANG_TOOLS_VERSION` pins a MAJOR, and apt.llvm.org ships rolling SNAPSHOTS under
+  one version number** — so the bullet above bites between two binaries that both call
+  themselves 22.1.8. `clang-tidy-22 --version` prints `Ubuntu LLVM version 22.1.8` for
+  either; only `dpkg-query -W -f='${Version}\n' clang-tidy-22` distinguishes them, and
+  `apt-cache policy clang-tidy-22` says whether a newer one is sitting there already
+  configured.
+
+  Measured 2026-09-10, PR #1198: local `1:22.1.8~++20260613092238+e80beda6e255` against
+  CI's `1:22.1.8~++20260714014902+ca7933e47d3a`, a month apart. A 19-row aggregate table
+  in a new test file drew 19 `modernize-use-designated-initializers` errors in CI and
+  **zero** locally — same file, same compile database, the check named explicitly on the
+  command line, a canary proving the analyser ran. After
+  `apt-get install -y --only-upgrade clang-tidy-22 clang-format-22` the identical pre-fix
+  file reported exactly 19 locally. Both directions measured against the same source, so
+  the variable is the binary.
+
+  **What makes this expensive is that the remedy reads as already applied.** "Run the
+  analyser at the version CI pins" is satisfied, on its face, by having a binary named
+  `clang-tidy-22` — and the failure is silent in the direction that gets believed, since
+  a clean report is what you were hoping for. It also invalidates every earlier verdict
+  in the same session: a sweep that could not see one check could not see any check that
+  moved in that month, so the whole changed set is re-swept rather than the one file
+  re-checked.
+
+  `clang-format-22` rides the same stream and was equally stale, which is the mirror
+  hazard the bullet above names — a newer formatter reformatting code the older one
+  accepted. Upgrade the pair together. No `llvm.sh` re-run is needed where the
+  apt.llvm.org source is already configured; `apt-get update` surfaces the candidate.
 - **A script that NAMES a tool version must name it everywhere that version matters, and
   the gate that says so had the defect it documents.** `local-gate.sh` resolved
   `clang-format-$V` by name, and then let the `clang-debug` preset take its analyser from

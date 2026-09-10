@@ -1594,6 +1594,22 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - Run clang-format and clang-tidy **at the version CI pins**, in a build directory
   of its own; `PATH` resolving to an older binary reports clean in the way that
   means nothing.
+- **And `CLANG_TOOLS_VERSION: 22` pins a MAJOR, not a BUILD.** apt.llvm.org ships
+  rolling snapshots under one version number, so `clang-tidy-22 --version` prints
+  `Ubuntu LLVM version 22.1.8` for two binaries a month apart, and only
+  `dpkg-query -W -f='${Version}\n' clang-tidy-22` tells them apart. Measured
+  2026-09-10 (PR #1198): local `20260613092238+e80beda6e255` against CI's
+  `20260714014902+ca7933e47d3a`. CI reported **19**
+  `modernize-use-designated-initializers` errors in a new test file; the local sweep
+  of the same file, same database, with the check NAMED EXPLICITLY and a canary
+  proving the analyser ran, reported **0** — and after
+  `apt-get install --only-upgrade clang-tidy-22` reported exactly 19. Both directions
+  measured, so the variable is the binary. What makes it expensive is that the remedy
+  reads as already applied: you have a binary called `clang-tidy-22`, so the rule
+  above looks satisfied while the analyser is silent about a check it does not carry —
+  and it invalidates every earlier verdict of that session, not just the one file.
+  `clang-format-22` rides the same stream and was equally stale, which is the mirror
+  hazard, so upgrade the pair; read `apt-cache policy`, never the `--version` banner.
 - A script that NAMES a tool version must name it **everywhere that version matters**.
   `local-gate.sh` pinned the formatter and handed the analyser to `PATH`, with the
   paragraph explaining why that is wrong in its own header four lines above — an
