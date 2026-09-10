@@ -2217,7 +2217,21 @@ and what they may assume.
   expected answer — so find one instance by other means and check the census sees it.
 - Tests allocate their ports per run rather than fixing them — from **below** the
   kernel's ephemeral range, and remembered, because a connect probe cannot see a
-  port already held as an outbound connection's local endpoint.
+  port already held as an outbound connection's local endpoint. **A fixed one needs
+  a reaper**: `run-launcher-e2e.ps1` bound a constant and reaped nothing, so a run
+  that missed its cleanup left a daemon up for the life of the machine and every
+  later run failed `fastcached exited immediately (exit 1)` — naming neither the port
+  nor the process, and diagnosed by hand after surviving a rebase and reading as the
+  rebase's regression (#220). The reason offered for the constant was TRUE and did
+  not support it: `FASTCACHE_ADDR` must be decided before the daemon starts, which is
+  an argument for deciding it EARLY. A holder is **refused, never adopted** — a
+  leftover is of unknown vintage and may hold another build's store, the very
+  confusion the fixture detects — except one whose image path is byte-for-byte this
+  run's daemon, which is reaped; a holder whose path cannot be READ is refused, or
+  the reap arm kills a process nothing knows. And the DECISION is what gets tested:
+  it was reachable only by running a fixture needing a daemon, a launcher and MSVC,
+  so `-SelfTestPorts` drives it over staged records and real listeners
+  (`launcher-e2e-ports-selftest`, REGISTERED-and-skipped where `pwsh` is absent).
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so

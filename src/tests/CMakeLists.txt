@@ -3949,12 +3949,52 @@ else()
 endif()
 if(TARGET fastcached AND TARGET fastcache-cc)
     # Binds a port and spawns a daemon, so it must not run concurrently with the
-    # other server-starting smoke tests.
+    # other server-starting smoke tests. The port is DRAWN per run since #220 --
+    # `RUN_SERIAL` stays because the daemon is still a shared machine resource and
+    # the compiles are not cheap, not because the port collides any more.
     set_tests_properties("compile-cache-e2e" PROPERTIES
         LABELS "smoke"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
     )
+endif()
+
+# The port discipline the Windows fixture above now has, driven WITHOUT it (#220).
+#
+# `run-launcher-e2e.ps1` used to bind a constant `21714`, so a run that did not
+# reach its cleanup left a daemon listening for as long as the machine was up and
+# every later run failed at `fastcached exited immediately (exit 1)` -- naming
+# neither the port nor the process, and reading exactly like a daemon that cannot
+# start. It was diagnosed once by hand from `Get-NetTCPConnection`, after it
+# survived a rebase and looked like a regression the rebase had introduced.
+#
+# The fix draws a port per run and, for an explicitly passed one, PROBES it and
+# refuses by name. That decision is what can be wrong, and until this registration
+# it was reachable only by running the whole fixture, which needs a built daemon, a
+# built launcher and an MSVC toolchain -- so on every machine and every CI leg
+# without those it was asserted by nothing. `-SelfTestPorts` drives the decision
+# over staged holder records AND against real listeners on this machine, and needs
+# none of the three.
+#
+# Not guarded on `TARGET fastcached`, deliberately: needing no binary is the whole
+# point, and gating it on one would put it back to running only where the fixture
+# already ran.
+find_program(FASTCACHED_PWSH NAMES pwsh)
+if(FASTCACHED_PWSH)
+    add_test(
+        NAME "launcher-e2e-ports-selftest"
+        COMMAND "${FASTCACHED_PWSH}" -NoProfile -File
+                "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/run-launcher-e2e.ps1" -SelfTestPorts
+    )
+    set_tests_properties("launcher-e2e-ports-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+else()
+    # Absent is not skipped, and dropping the row is what makes a permanent gap
+    # indistinguishable from a platform that was never meant to run it.
+    fastcached_register_skipped_test("launcher-e2e-ports-selftest"
+        "no pwsh on this host, so run-launcher-e2e.ps1's port decision was not exercised")
 endif()
 
 # ---------------------------------------------------------------------------
