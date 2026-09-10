@@ -3349,6 +3349,17 @@ set_tests_properties("node-working-directory-selftest" PROPERTIES
 # Not labelled "smoke": each run is one process that rejects an argument and exits
 # before binding anything, needing no daemon, no socket and no compiler -- so it
 # belongs in the default `ctest` set and must survive `ctest -LE smoke`.
+#
+# **Its verdict does not depend on the console `ctest` was started from, and that
+# is a property somebody has to keep.** It did depend on it until #1134: the check
+# read the child's output through `OUTPUT_VARIABLE`, whose default `ENCODING AUTO`
+# decodes using the CONSOLE's code page, so a correct binary passed from a UTF-8
+# shell and failed from a CP437 one -- three default-set tests green or red by
+# which shell ran them, with CI green throughout because its runner is UTF-8. The
+# comparison is taken in raw BYTES now. If a red ever appears here, it is about
+# the binary; do not make it go away by changing a code page, and read the
+# script's header before reaching for `ENCODING`, one value of which reports a
+# PASS for the very defect this checks for.
 foreach(_utf8ArgvTarget IN ITEMS fastcached fastcache-cc fastcache-compile-node compile-cache-testclient)
     if(TARGET ${_utf8ArgvTarget})
         add_test(

@@ -37,3 +37,18 @@ perf.data*
 # Anchored to the root: a `Testing/` directory further down would be somebody
 # else's and is not this rule's to hide.
 /Testing/
+
+# check-utf8-argv.cmake captures the child's streams as FILES, because reading
+# them into a variable decodes them through the console's code page — which is
+# the defect that check exists to catch (#1134). Under ctest they land in the
+# build tree: WORKING_DIRECTORY is `<build>/src/tests`, measured from
+# `ctest --show-only=json-v1` rather than assumed. This rule is only for the
+# hand-run case — `cmake -P scripts/check-utf8-argv.cmake` from a checkout leaves
+# them beside wherever you stood. They are removed on a pass and deliberately
+# KEPT on a failure, so this matters exactly when somebody is mid-debug and least
+# wants a dirty tree: the local gate refuses to start on one.
+#
+# Anchored on the `/Testing/` rule's reasoning above — a file by this name
+# further down is somebody else's and not this rule's to hide.
+/utf8-argv-*.out
+/utf8-argv-*.err
