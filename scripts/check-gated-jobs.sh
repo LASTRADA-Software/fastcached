@@ -148,6 +148,24 @@ DocSubjectRunner="scripts/doc-subject-checks.sh"
 # self-test cannot drift from the rule by restating either.
 CcacheAction="hendrikmuhs/ccache-action"
 
+# Rule F's subjects. The restore spelling is a PREFIX of the writer's, so every
+# test below asks about it FIRST; reversed, every reader reads as a writer.
+CacheAction="actions/cache"
+CacheRestoreAction="actions/cache/restore"
+
+# `runs-on` -> the `runner.os` GitHub substitutes. An unrecognised label is the
+# EMPTY string and rule F refuses on it, rather than defaulting to one of the
+# three: a wrong OS silently merges two keys that never collide, or splits two
+# that do, and both readings are worse than being told the label is new.
+RunnerOs() {
+    case "$1" in
+        *ubuntu*|*linux*) echo "Linux" ;;
+        *macos*)          echo "macOS" ;;
+        *windows*)        echo "Windows" ;;
+        *)                echo "" ;;
+    esac
+}
+
 # The field separator every awk emitter below writes and every reader splits on.
 #
 # NOT a tab, and that is #791. Tab is IFS *whitespace*, so `IFS=$'\t' read` treats
@@ -426,6 +444,131 @@ elif [[ "$problems" -eq "$ccacheProblemsBefore" ]]; then
     echo "ok: all $ccacheTotal \`$CcacheAction\` step(s) save on a branch push and nowhere else"
 fi
 
+# ---------------------------------------------------------------------------
+# Rule F: exactly one job WRITES any cache key; every other job restores it.
+#
+# `actions/cache` reserves the key when it saves, so a second writer that
+# finishes second finds it taken and DISCARDS an archive it has already paid to
+# build and upload. Sharing a key is right whenever the content is identical --
+# a second key would spend the repository's 10 GB budget twice -- so the fix is
+# never a second key, it is `actions/cache/restore` (#318).
+#
+# The comment standing where this check now runs said the two jobs shared a key
+# because "a second entry would only cost the budget twice". That is true, and
+# it described the defect approvingly for months: prose cannot fail, and a third
+# job copying the obvious `uses:` line would have made it worse in silence.
+#
+# The comparison is on the RESOLVED key, and that is the whole difficulty. The
+# text `cpm-${{ runner.os }}-package-...` appears in three jobs and collides in
+# none of them, while `cpm-${{ runner.os }}-clang-debug-...` appeared in two jobs
+# on ONE runner and was the defect. Measured on this tree: a check reading the
+# raw text flags five groups, four of which are simply different operating
+# systems, so it refuses a correct workflow. `runner.os` is therefore resolved
+# from `runs-on`, and a `matrix.` axis is expanded over the job's own values --
+# one step with two legs is not two writers of one key, it is two keys.
+#
+# Every other `${{ ... }}` is left as text deliberately: `hashFiles('CMakeLists.txt')`
+# resolves to the same digest in every job of one run, so two steps spelling it
+# identically DO collide and must be compared rather than excused. What is
+# refused rather than compared is a key still naming `runner.` or `matrix.`
+# after resolution -- a key this check cannot resolve is one it cannot vouch for
+# in either direction, and vouching for it is the silent half.
+cacheSteps="$(awk -v sep="$FieldSep" '
+    function flushStep() {
+        if (inStep && stepUses != "" && stepKey != "")
+            print jobKey sep stepUses sep runsOn sep matrixSpec sep stepKey
+        inStep = 0; stepUses = ""; stepKey = ""
+    }
+    function flushJob() { flushStep(); jobKey = ""; runsOn = ""; matrixSpec = ""; inMatrix = 0 }
+    /^jobs:[ \t]*$/                 { inJobs = 1; next }
+    inJobs && /^[^ \t]/             { flushJob(); inJobs = 0 }
+    !inJobs                         { next }
+    /^[ \t]*#/                      { next }
+    /^  [A-Za-z0-9_-]+:[ \t]*$/     { flushJob()
+                                      jobKey = $0
+                                      sub(/^  /, "", jobKey); sub(/:[ \t]*$/, "", jobKey)
+                                      next }
+    /^    runs-on:[ \t]*/           { runsOn = $0; sub(/^    runs-on:[ \t]*/, "", runsOn); next }
+    /^      matrix:[ \t]*$/         { inMatrix = 1; next }
+    /^    [A-Za-z0-9_-]+:/          { inMatrix = 0 }
+    inMatrix && /^        [A-Za-z0-9_-]+:[ \t]*\[/ {
+                                      axis = $0
+                                      sub(/^        /, "", axis)
+                                      sub(/:[ \t]*\[/, "=", axis)
+                                      sub(/\][ \t]*$/, "", axis)
+                                      gsub(/[ \t]/, "", axis)
+                                      matrixSpec = matrixSpec (matrixSpec == "" ? "" : ";") axis
+                                      next }
+    /^      - /                     { flushStep(); inStep = 1 }
+    inStep && /^[ \t]*(- )?uses:[ \t]*/ { stepUses = $0
+                                      sub(/^[ \t]*(- )?uses:[ \t]*/, "", stepUses) }
+    inStep && /^          key:[ \t]*/ { stepKey = $0
+                                      sub(/^          key:[ \t]*/, "", stepKey) }
+    END                             { flushJob() }
+' "$workflow")"
+
+cacheTotal=0
+cacheProblemsBefore=$problems
+resolvedRows=""
+osPattern='${{ runner.os }}'
+while IFS="$FieldSep" read -r jobKey stepUses runsOn matrixSpec cacheKey; do
+    [[ -n "$jobKey" ]] || continue
+    # The reader spelling is tested FIRST because it is a prefix of the writer's.
+    # Reversed, every restore step reads as a writer and the check refuses a
+    # correct workflow -- loudly, but for a reason nobody could act on.
+    case "$stepUses" in
+        "$CacheRestoreAction"*)             continue ;;
+        "$CacheAction"*|*"$CcacheAction"*)  ;;
+        *)                                  continue ;;
+    esac
+    cacheTotal=$((cacheTotal + 1))
+
+    runnerOs="$(RunnerOs "$runsOn")"
+    if [[ -z "$runnerOs" ]]; then
+        Fail "the cache step in job '$jobKey' runs on '$runsOn', which this check cannot map to a \`runner.os\`, so it cannot say whether that job's key collides with another job's. Teach \`RunnerOs\` the new label rather than leaving the key uncompared."
+        continue
+    fi
+
+    expanded="${cacheKey//"$osPattern"/$runnerOs}"
+    for axisSpec in $(printf '%s' "$matrixSpec" | tr ';' ' '); do
+        axisName="${axisSpec%%=*}"
+        axisPattern='${{ matrix.'"$axisName"' }}'
+        [[ "$expanded" == *"$axisPattern"* ]] || continue
+        grown=""
+        while IFS= read -r oneKey; do
+            [[ -n "$oneKey" ]] || continue
+            for axisValue in $(printf '%s' "${axisSpec#*=}" | tr ',' ' '); do
+                grown="${grown}${oneKey//"$axisPattern"/$axisValue}"$'\n'
+            done
+        done <<< "$expanded"
+        expanded="$grown"
+    done
+
+    while IFS= read -r resolvedKey; do
+        [[ -n "$resolvedKey" ]] || continue
+        if [[ "$resolvedKey" == *'${{ matrix.'* || "$resolvedKey" == *'${{ runner.'* ]]; then
+            Fail "job '$jobKey' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`matrix.\` axis the job does not declare as an inline list, or a \`runner.\` field other than \`os\`, so whether it collides with another job's key cannot be decided in either direction."
+            continue
+        fi
+        resolvedRows="${resolvedRows}${resolvedKey}${FieldSep}${jobKey}"$'\n'
+    done <<< "$expanded"
+done <<< "$cacheSteps"
+
+if [[ -n "$resolvedRows" ]]; then
+    duplicateKeys="$(printf '%s' "$resolvedRows" | grep -v '^$' | cut -d"$FieldSep" -f1 | sort | uniq -d || true)"
+    while IFS= read -r duplicateKey; do
+        [[ -n "$duplicateKey" ]] || continue
+        writingJobs="$(printf '%s' "$resolvedRows" | grep -F "${duplicateKey}${FieldSep}" | cut -d"$FieldSep" -f2 | sort -u | tr '\n' ' ' || true)"
+        Fail "the cache key '$duplicateKey' is WRITTEN by more than one job (${writingJobs% }). On a run where that key misses, every one of them fetches the content and every one of them tries to save it; whichever finishes second finds the key taken and discards an archive it has already paid to build and upload (#318). Keep exactly one writer and change the others to \`${CacheRestoreAction}@v4\` -- never to a second key, which spends the repository's 10 GB cache budget on a duplicate."
+    done <<< "$duplicateKeys"
+fi
+
+if [[ "$cacheTotal" -eq 0 ]]; then
+    echo "ok: no keyed cache step in $workflow (nothing for rule F to vouch for)"
+elif [[ "$problems" -eq "$cacheProblemsBefore" ]]; then
+    echo "ok: all $cacheTotal keyed cache step(s) resolve to a key with exactly one writer"
+fi
+
 if [[ $problems -gt 0 ]]; then
     echo "check-gated-jobs: $problems problem(s); a failed scope classifier would go green" >&2
     return 1
@@ -470,9 +613,12 @@ REQ
     #   $7 = what `release` gates on: all | nothing
     #   $8 = the `coverage` job's ccache step:
     #        none | canonical | nosave | eventonly | comment
+    #   $9 = rule F's cache jobs: none | single | twowriters | writerreader |
+    #        crossos | matrixleg | unknownaxis
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
         local trim="${6:-none}" gate="${7:-all}" ccache="${8:-none}"
+        local cacheKnob="${9:-none}"
         local compare="needs.changes.outputs.code != 'false'"
         [[ "$comparison" == "equality" ]] && compare="needs.changes.outputs.code == 'true'"
         [[ "$comparison" == "odd" ]] && compare="contains(needs.changes.outputs.code, 'true')"
@@ -487,6 +633,7 @@ REQ
             echo "jobs:"
             echo "  style:"
             echo "    name: \"${docName}\""
+            echo "    runs-on: ubuntu-24.04"
             [[ "$cancelled" == "none" ]] || echo "    if: ${jobIf}"
             echo "    steps:"
             echo "      - uses: actions/checkout@v4"
@@ -512,6 +659,7 @@ REQ
             [[ "$trim" == "tagless" ]] && trimClause=" && github.event_name != 'push'"
             echo "  coverage:"
             echo "    name: \"Code coverage\""
+            echo "    runs-on: ubuntu-24.04"
             echo "    if: \${{ !cancelled() && ${compare}${trimClause} }}"
             echo "    steps:"
             # Rule E's subject. `comment` stages the trap rule C already fell
@@ -531,6 +679,7 @@ REQ
             echo "      - run: ctest"
 
             echo "  release:"
+            echo "    runs-on: ubuntu-24.04"
             echo "    if: startsWith(github.ref, 'refs/tags/v')"
             echo "    needs:"
             if [[ "$gate" == "all" ]]; then
@@ -539,6 +688,50 @@ REQ
             fi
             echo "    steps:"
             echo "      - run: gh release create"
+
+            # Rule F's subject, in jobs of its own so a case here can neither be
+            # satisfied nor broken by the jobs rules A-E use.
+            if [[ "$cacheKnob" != "none" ]]; then
+                echo "  pkg-a:"
+                echo "    runs-on: ubuntu-24.04"
+                if [[ "$cacheKnob" == "matrixleg" ]]; then
+                    echo "    strategy:"
+                    echo "      matrix:"
+                    echo "        preset: [one, two]"
+                fi
+                echo "    steps:"
+                echo "      - name: \"Cache CPM packages\""
+                echo "        uses: ${CacheAction}@v4"
+                echo "        with:"
+                echo "          path: .cpm"
+                case "$cacheKnob" in
+                    matrixleg|unknownaxis)
+                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x" ;;
+                    *)  echo "          key: cpm-\${{ runner.os }}-x" ;;
+                esac
+                echo "      - run: ctest"
+            fi
+            case "$cacheKnob" in
+                twowriters|writerreader|crossos)
+                    echo "  pkg-b:"
+                    if [[ "$cacheKnob" == "crossos" ]]; then
+                        echo "    runs-on: macos-15"
+                    else
+                        echo "    runs-on: ubuntu-24.04"
+                    fi
+                    echo "    steps:"
+                    echo "      - name: \"Cache CPM packages\""
+                    if [[ "$cacheKnob" == "writerreader" ]]; then
+                        echo "        uses: ${CacheRestoreAction}@v4"
+                    else
+                        echo "        uses: ${CacheAction}@v4"
+                    fi
+                    echo "        with:"
+                    echo "          path: .cpm"
+                    echo "          key: cpm-\${{ runner.os }}-x"
+                    echo "      - run: ctest"
+                    ;;
+            esac
         } > "$out"
     }
 
@@ -686,6 +879,30 @@ REQ
 
     Generate "${scratch}/wf.yml" safe yes ungated required none all comment
     Case "rule E: a COMMENT naming the action is not a step using it (rule C's own trap, one rule over)" want-pass
+
+    # Rule F. The baseline carries no keyed cache step, so "nothing to vouch for"
+    # is already covered. Two of these six are want-PASS shapes that a check
+    # comparing the raw key TEXT would refuse, and they are the reason this rule
+    # resolves the key at all rather than comparing strings -- a guard nobody has
+    # watched ACCEPT is not known to work, and here the accepting direction is
+    # where a plausible implementation gets it wrong.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none single
+    Case "rule F: one job writing one key" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none twowriters
+    Case "rule F: two jobs on one runner WRITING one key -- the loser discards an archive it has already built and uploaded (#318)" want-fail
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none writerreader
+    Case "rule F: one writer and one \`${CacheRestoreAction}\` reader on the same key -- the fix shape, which must PASS" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none crossos
+    Case "rule F: the same key TEXT in a Linux job and a macOS job -- \`runner.os\` resolves them apart, so this is not a collision" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none matrixleg
+    Case "rule F: one step over two matrix legs -- two keys, not two writers of one key" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none unknownaxis
+    Case "rule F: a key naming a \`matrix.\` axis the job does not declare is REFUSED, not read as 'resolves to something unique'" want-fail
 
     if [[ "$status" -ne 0 ]]; then
         echo "check-gated-jobs: self-test FAILED after $cases case(s)" >&2

@@ -4721,11 +4721,6 @@ Three rules fall out, each generalising past this change:
   `TEST_CASE`/`TEST_CASE_METHOD`/`SCENARIO` tag string, which
   `check-test-names.cmake` already has the macro pattern for — with the wrinkle
   that the tag string is usually on the line *after* the macro.
-- **[#318](https://github.com/LASTRADA-Software/fastcached/issues/318)** —
-  `clang-tidy` and `clang-asan-ubsan` both `actions/cache@v4` the same
-  `cpm-Linux-clang-debug-*` key, so on a `CMakeLists.txt` change both upload the
-  same archive and the loser discards it after paying for it. `clang-tsan` uses
-  `actions/cache/restore@v4` rather than becoming a third writer.
 - **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
   scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
   `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this

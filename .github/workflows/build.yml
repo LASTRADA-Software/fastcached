@@ -683,8 +683,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Same key as clang-asan-ubsan below: both configure the same preset, so a
-      # second entry would only cost the 10 GB repository cache budget twice.
+      # **The one writer of this key.** `clang-asan-ubsan` and `clang-tsan` configure
+      # the same preset and RESTORE it: the entry holds CPM source, which is identical
+      # whatever sanitizer follows, so a second entry would cost the repository's 10 GB
+      # budget twice and a second WRITER costs a wasted archive upload on every
+      # `CMakeLists.txt` change (#318). A job that wants this key reads it here.
+      #
+      # What that costs, stated rather than left to be found: `actions/cache` declares
+      # `post-if: "success()"`, so the save runs only when THIS job passes. On a run
+      # where clang-tidy fails and `CMakeLists.txt` changed, the key now goes unwritten
+      # where the second writer might have filled it. That is the abnormal case, the
+      # readers still fall back through `restore-keys` to the previous entry, and the
+      # next green run saves -- against a wasted upload on every such run, paid by the
+      # two slowest Linux jobs, in the normal case.
       - name: "Cache CPM packages"
         uses: actions/cache@v4
         with:
@@ -1083,8 +1094,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `cache/restore`, not `cache`: clang-tidy above SAVES this key and this job
+      # reads it. Sharing the key is right -- the entry holds CPM SOURCE, identical
+      # whatever sanitizer is applied afterwards, and a second entry would spend the
+      # repository's 10 GB budget on a duplicate. Two WRITERS is the part that was
+      # wrong: on any run where `CMakeLists.txt` changed, both jobs missed, both
+      # fetched every package, and whichever finished second found the key taken and
+      # discarded an archive it had already paid to build and upload (#318). That is
+      # the two slowest Linux jobs, on every push to such a branch.
+      #
+      # `clang-tsan` had already declined to become a third writer and its comment
+      # names clang-tidy as the saver, so this restores what that comment already
+      # assumed was true.
       - name: "Cache CPM packages"
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CPM_SOURCE_CACHE }}
           key: cpm-${{ runner.os }}-clang-debug-${{ hashFiles('CMakeLists.txt') }}
