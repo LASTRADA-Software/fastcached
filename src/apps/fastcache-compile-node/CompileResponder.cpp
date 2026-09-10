@@ -135,7 +135,8 @@ namespace
     // and unexplained.
     static_assert(Cc::RowsStateOneRefusalClaim(EndpointRefusalTable,
                                                [](EndpointRefusalRow const& row) {
-                                                   return Cc::RefusalClaim { row.answer.has_value(), row.rationale };
+                                                   return Cc::RefusalClaim { .counted = row.answer.has_value(),
+                                                                             .rationale = row.rationale };
                                                }),
                   "every endpoint refusal row must state either a counted answer or a rationale, not both");
 

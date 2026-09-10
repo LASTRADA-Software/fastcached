@@ -145,8 +145,8 @@ namespace Detail
     // rather than at whichever call site read the fields in the luckier order.
     static_assert(Cc::RowsStateOneRefusalClaim(CacheEndpointRefusals,
                                                [](CacheEndpointRefusal const& row) {
-                                                   return Cc::RefusalClaim { row.policy.counter.has_value(),
-                                                                             row.policy.rationale };
+                                                   return Cc::RefusalClaim { .counted = row.policy.counter.has_value(),
+                                                                             .rationale = row.policy.rationale };
                                                }),
                   "every cache endpoint refusal must state either a counter or a rationale, and not both");
 
@@ -280,7 +280,8 @@ namespace Detail
     // site read the fields in the luckier order.
     static_assert(Cc::RowsStateOneRefusalClaim(SchedulerEndpointRefusals,
                                                [](SchedulerEndpointRefusal const& row) {
-                                                   return Cc::RefusalClaim { row.answer.has_value(), row.rationale };
+                                                   return Cc::RefusalClaim { .counted = row.answer.has_value(),
+                                                                             .rationale = row.rationale };
                                                }),
                   "every scheduler endpoint refusal must state either a counted answer or a rationale, not both");
 
