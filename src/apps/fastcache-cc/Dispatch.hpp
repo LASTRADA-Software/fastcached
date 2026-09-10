@@ -4,6 +4,7 @@
 #include "CacheProtocol.hpp"
 #include "CodecEnvelope.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <array>
@@ -245,15 +246,47 @@ struct DispatchBudgetKnobs
 /// -- same connect, same idle, same keepalive -- and one field of it is now known
 /// better by the fleet than by this process.
 ///
+/// **What is left of the grant, never the whole of it**
+/// ([#1122](https://github.com/LASTRADA-Software/fastcached/issues/1122)). A lease
+/// lifetime runs end to end from the MINT, and this budget starts when the compile
+/// leg starts -- which is after the `LEASE` round trip has already happened. Taking
+/// the full lifetime restarts the client's countdown, so it waited past the grant by
+/// roughly that round trip. It never produced a wrong answer, because the worker
+/// refuses an outrun job with `LeaseExpired` first; that is a correctness argument
+/// resting on the OTHER end being stricter, and this is what stops it resting there.
+///
+/// **`spent` is measured by the CLIENT, on its own monotonic clock, and no instant
+/// crosses the wire.** The ticket proposed carrying the mint instant instead, and
+/// that is the shape this repository already refuses -- *a heartbeat age is a
+/// duration on a report, never a `TimePoint`* -- because two machines' `steady_clock`
+/// epochs are unrelated and a `system_clock` comparison is the clock-skew defect
+/// #522's second finding was. The client does not need the mint instant: the mint
+/// happened somewhere between its own `LEASE` send and the grant's arrival, so the
+/// elapsed it can measure from the send is an UPPER bound on the elapsed since the
+/// mint. Subtracting an upper bound gives back a budget that is never too generous,
+/// which is the one direction that matters here.
+///
 /// @param compile The compile leg as configured.
 /// @param granted What the scheduler said this lease lives for; zero means it named
 ///        none, which no version-6 peer does -- so the configured value stands rather
 ///        than a zero budget failing the compile instantly.
+/// @param spent How long ago this client asked for the lease. Charged in full, which
+///        over-states the elapsed by the pre-mint part of the round trip and so errs
+///        toward giving up early rather than late.
 /// @return The budget this compile actually runs under.
-[[nodiscard]] constexpr ExchangeBudget UnderGrantedLease(ExchangeBudget compile, std::chrono::milliseconds granted) noexcept
+[[nodiscard]] constexpr ExchangeBudget UnderGrantedLease(ExchangeBudget compile,
+                                                         std::chrono::milliseconds granted,
+                                                         std::chrono::milliseconds spent) noexcept
 {
-    if (granted > std::chrono::milliseconds::zero())
-        compile.total = granted;
+    if (granted <= std::chrono::milliseconds::zero())
+        return compile;
+    // Floored at one millisecond and NOT at zero, because zero is this type's
+    // spelling of *unbounded* (`ExchangeBudget::BoundsTotal`) -- so clamping there
+    // would answer an exhausted grant by removing the ceiling altogether, which is
+    // the exact inversion that comment already records once. A grant with nothing
+    // left instead expires on the compile leg's first turn, and the client compiles
+    // locally, which is what an exhausted grant should produce.
+    compile.total = granted > spent ? granted - spent : std::chrono::milliseconds { 1 };
     return compile;
 }
 
@@ -600,12 +633,20 @@ struct DispatchRequest
 /// @param budgets The deadlines each leg runs under.
 /// @param credential Presented to both peers; default-constructed sends none.
 /// @param acceptedCodecs What this client can decode, most-preferred first.
+/// @param clock Where "now" comes from, so a case can make the `LEASE` round trip take
+///        a visible amount of time. Null means this process's own `SteadyClock`, which
+///        is the same *inject it, null is the real one* spelling `ReactorServerOptions`
+///        uses -- the alternative, a defaulted reference to a function-local static, is
+///        ambient state wearing a parameter's clothes. Only ever read for
+///        `UnderGrantedLease`'s `spent`; every other deadline here belongs to the
+///        exchange.
 /// @return What happened. Never throws; every failure is a status.
 [[nodiscard]] DispatchResult Dispatch(IEndpointExchange& exchange,
                                       DispatchRequest const& request,
                                       DispatchBudgets const& budgets = {},
                                       Credential const& credential = {},
-                                      CompileCacheWire::CodecList const& acceptedCodecs = {});
+                                      CompileCacheWire::CodecList const& acceptedCodecs = {},
+                                      IClock* clock = nullptr);
 
 /// Split a COMPILE request's argument field back into arguments.
 ///

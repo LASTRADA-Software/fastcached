@@ -2,6 +2,7 @@
 #include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Net/KeepAlive.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -131,6 +132,32 @@ class ScriptedFleet final: public IEndpointExchange
         _durations.insert_or_assign(std::move(endpoint), duration);
     }
 
+    /// Make talking to `endpoint` cost `duration` of the CLIENT's clock.
+    ///
+    /// Deliberately a second knob rather than a second meaning for `AnswersAfter`,
+    /// which models a peer that is slow to answer and advances nothing. This models
+    /// the round trip PASSING, which is a fact about the client and is what
+    /// `UnderGrantedLease` charges against a grant
+    /// ([#1122](https://github.com/LASTRADA-Software/fastcached/issues/1122)). Folding
+    /// the two would have silently moved the clock under every case that already uses
+    /// `AnswersAfter` to test a deadline, which is the one place a moving clock is the
+    /// subject rather than the scenery.
+    ///
+    /// @param endpoint Which peer the time is spent talking to.
+    /// @param duration How far `UseClock`'s clock moves per exchange with it. Without
+    ///        `UseClock` this records the intent and moves nothing.
+    void CostsTime(std::string endpoint, std::chrono::milliseconds duration)
+    {
+        _costs.insert_or_assign(std::move(endpoint), duration);
+    }
+
+    /// Drive `CostsTime` against this clock, which the case also hands `Dispatch`.
+    /// @param clock The case's clock; must outlive this fleet.
+    void UseClock(ManualClock& clock) noexcept
+    {
+        _clock = &clock;
+    }
+
     CacheOutcome Exchange(std::string_view hostPort,
                           std::vector<std::byte> frame,
                           Credential const& credential,
@@ -151,6 +178,12 @@ class ScriptedFleet final: public IEndpointExchange
         if (auto const slow = _durations.find(key); slow != _durations.end())
             if (budget.BoundsTotal() && budget.total < slow->second)
                 return CacheOutcome {};
+        // Advanced before the reply is produced, so the time is spent DURING the
+        // exchange rather than after it -- which is where a `LEASE` round trip's
+        // duration actually falls relative to the mint it contains.
+        if (_clock != nullptr)
+            if (auto const cost = _costs.find(key); cost != _costs.end())
+                _clock->Advance(cost->second);
         ScriptedPeer peer { it->second, &_sent[key] };
         return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
@@ -182,6 +215,8 @@ class ScriptedFleet final: public IEndpointExchange
     std::map<std::string, std::vector<std::byte>> _scripts;
     std::map<std::string, std::size_t> _limits;
     std::map<std::string, std::chrono::milliseconds> _durations;
+    std::map<std::string, std::chrono::milliseconds> _costs;
+    ManualClock* _clock { nullptr };
 };
 
 constexpr std::string_view Scheduler = "sched:6675";
@@ -1368,11 +1403,19 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
         static_assert(granted != DefaultDispatchTotal,
                       "the assertion below is only meaningful while the granted value differs from the default");
 
+        // A clock that moves only when a case says so, and it is what makes this
+        // section a CONTROL for the one below rather than a case with a tolerance.
+        // Under the real clock `spent` is however many microseconds the scripted
+        // exchange happened to take, which rounds to zero on a quiet machine and to
+        // one millisecond on a loaded one -- an exact assertion that is a flake and a
+        // tolerant one that cannot see #1122's whole round trip.
+        ManualClock clock;
         ScriptedFleet fleet;
+        fleet.UseClock(clock);
         fleet.Serve(std::string { Scheduler }, GrantReply({}, granted));
         fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
 
-        auto const result = Dispatch(fleet, Request(args));
+        auto const result = Dispatch(fleet, Request(args), {}, {}, {}, &clock);
         REQUIRE(result.Ran());
 
         // The compile leg is the LAST exchange to the worker; the control legs go to the
@@ -1384,6 +1427,78 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
         auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
         REQUIRE(compileLeg != dialled.end());
         CHECK(budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin())).total == granted);
+    }
+
+    SECTION("what bounds the compile leg is what is LEFT of the grant, not its whole lifetime")
+    {
+        // **#1122.** The lifetime runs end to end from the scheduler's MINT, and this
+        // budget starts when the compile leg starts -- after the `LEASE` round trip has
+        // already happened. Taking the whole lifetime restarted the countdown, so the
+        // client waited past its own grant by roughly that round trip.
+        //
+        // It never produced a wrong OBJECT, because the worker refuses an outrun job
+        // with `LeaseExpired` first. That is the point rather than a reason to leave it:
+        // the client's bound was right only because the other end was stricter, and this
+        // case is what makes it right on its own terms.
+        constexpr auto granted = std::chrono::milliseconds { 2'400'000 };
+        // Ninety seconds is absurd for a `LEASE` exchange and that is deliberate: the
+        // defect's size IS the round trip, so a fixture whose two instants coincide
+        // passes under it. It has to be visible to be an assertion at all -- the
+        // acceptance clause on #1122 says exactly this.
+        constexpr auto roundTrip = std::chrono::milliseconds { 90'000 };
+        static_assert(roundTrip > std::chrono::milliseconds::zero(),
+                      "a round trip of zero makes this case agree with the defect it exists to catch");
+        static_assert(granted > roundTrip, "the exhausted-grant floor is the section below, not this one");
+
+        ManualClock clock;
+        ScriptedFleet fleet;
+        fleet.UseClock(clock);
+        fleet.CostsTime(std::string { Scheduler }, roundTrip);
+        fleet.Serve(std::string { Scheduler }, GrantReply({}, granted));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
+
+        auto const result = Dispatch(fleet, Request(args), {}, {}, {}, &clock);
+        REQUIRE(result.Ran());
+
+        auto const dialled = fleet.Dialled();
+        auto const budgets = fleet.Budgets();
+        REQUIRE(dialled.size() == budgets.size());
+        auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
+        REQUIRE(compileLeg != dialled.end());
+        CHECK(budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin())).total == granted - roundTrip);
+    }
+
+    SECTION("a round trip that outruns the grant leaves a bound, never an unbounded leg")
+    {
+        // The degenerate arm, and it is written down because the obvious arithmetic
+        // gets it exactly backwards. `ExchangeBudget::BoundsTotal` reads a non-positive
+        // total as *unbounded*, so clamping an exhausted grant at zero would answer
+        // "there is nothing left of your lease" by removing the ceiling altogether --
+        // the same inversion that comment already records once.
+        constexpr auto granted = std::chrono::milliseconds { 5'000 };
+        constexpr auto roundTrip = std::chrono::milliseconds { 30'000 };
+        static_assert(roundTrip > granted, "this section is only about the case where nothing is left");
+
+        ManualClock clock;
+        ScriptedFleet fleet;
+        fleet.UseClock(clock);
+        fleet.CostsTime(std::string { Scheduler }, roundTrip);
+        fleet.Serve(std::string { Scheduler }, GrantReply({}, granted));
+        fleet.Serve(std::string { Worker }, CompileReply(Request(args), "OBJECTBYTES"));
+
+        auto const result = Dispatch(fleet, Request(args), {}, {}, {}, &clock);
+        REQUIRE(result.Ran());
+
+        auto const dialled = fleet.Dialled();
+        auto const budgets = fleet.Budgets();
+        auto const compileLeg = std::ranges::find(dialled, std::string { Worker });
+        REQUIRE(compileLeg != dialled.end());
+        auto const compileBudget = budgets.at(static_cast<std::size_t>(compileLeg - dialled.begin()));
+        // Both halves, because they are what distinguishes the three ways this could
+        // have been written: the ceiling is still ARMED, and it is the smallest one
+        // expressible rather than the configured fallback.
+        CHECK(compileBudget.BoundsTotal());
+        CHECK(compileBudget.total == std::chrono::milliseconds { 1 });
     }
 
     SECTION("a grant naming none leaves this process's own value standing")

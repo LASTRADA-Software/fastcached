@@ -388,8 +388,12 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                         DispatchRequest const& request,
                         DispatchBudgets const& budgets,
                         Credential const& credential,
-                        Wire::CodecList const& acceptedCodecs)
+                        Wire::CodecList const& acceptedCodecs,
+                        IClock* clock)
 {
+    SteadyClock ownClock;
+    IClock& now = clock != nullptr ? *clock : ownClock;
+
     // Derived ONCE. `available` is what this build can produce; `accepted` is what
     // this client will read back, which a caller may narrow and which therefore is
     // not the same question -- see `LeasedJob::own`.
@@ -399,6 +403,15 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // --- ask the scheduler where to compile ---------------------------------
     // Following `NotLeader` rather than reading it as a refusal, and remembering who
     // answered: the lease must be resolved against whoever issued it (#237).
+    //
+    // Stamped BEFORE the ask, and this is the whole of #1122's fix on this side. The
+    // grant's lifetime runs from the scheduler's mint, which happens somewhere inside
+    // this call -- redirects included, since a `NotLeader` hop is time the client
+    // spent and the eventual mint is later still. Taking "now" here therefore
+    // over-states how much of the grant is gone rather than under-stating it, and
+    // over-stating is the safe direction: the client gives up a little early instead
+    // of waiting past a lease the scheduler has already reclaimed.
+    auto const askedAt = now.Now();
     auto const lease = LeaseFromFleet(exchange, request.schedulerEndpoint, request, accepted, credential, budgets.control);
     auto const& leaseOutcome = lease.outcome;
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
@@ -425,18 +438,23 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // launcher on nothing, and the scheduler would sweep it anyway.
 
     // --- have the worker compile it -----------------------------------------
-    auto result = CompileOnWorker(exchange,
-                                  LeasedJob { .endpoint = endpoint,
-                                              .leaseToken = token,
-                                              .codecs = grant->workerCodecs,
-                                              .accepted = accepted,
-                                              .own = available,
-                                              .credential = credential,
-                                              .request = request,
-                                              // The GRANT's bound, not this process's.
-                                              // `UnderGrantedLease` carries the argument.
-                                              .budget = UnderGrantedLease(budgets.compile, grant->lifetime),
-                                              .maxObjectBytes = budgets.maxDecompressedBytes });
+    auto result = CompileOnWorker(
+        exchange,
+        LeasedJob { .endpoint = endpoint,
+                    .leaseToken = token,
+                    .codecs = grant->workerCodecs,
+                    .accepted = accepted,
+                    .own = available,
+                    .credential = credential,
+                    .request = request,
+                    // What is LEFT of the grant's bound, not
+                    // this process's and not the grant's whole
+                    // lifetime. `UnderGrantedLease` carries the
+                    // argument for both halves.
+                    .budget = UnderGrantedLease(budgets.compile,
+                                                grant->lifetime,
+                                                std::chrono::duration_cast<std::chrono::milliseconds>(now.Now() - askedAt)),
+                    .maxObjectBytes = budgets.maxDecompressedBytes });
 
     // --- and hand the lease back, however that went -------------------------
     // On every path out of the compile, which is why the compile is a function
