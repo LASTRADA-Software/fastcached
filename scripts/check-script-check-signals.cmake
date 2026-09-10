@@ -3,10 +3,11 @@
 # Every `cmake -P` check registered in src/tests/CMakeLists.txt must be one ctest
 # can HEAR, and one whose meaning does not depend on which CMake ran it.
 #
-# Two rules over one subject: it must carry a failure signal, because a script
-# cannot report one with an exit code; and the script behind it must declare a
-# CMake minimum, because script mode sets no policies. Pass 3 states the second
-# in full.
+# Three rules over one subject: it must carry a failure signal, because a script
+# cannot report one with an exit code; the script behind it must declare a CMake
+# minimum, because script mode sets no policies; and everything that READS that
+# signal must read ALL of it. Pass 3 states the second in full and pass 5 the
+# third.
 #
 # This file used to justify itself by saying that `message(FATAL_ERROR)` in
 # script mode prints `CMake Error ...` and exits **0** on CMake 3.28, this
@@ -190,6 +191,7 @@ endfunction()
 set(sawMissingSignal FALSE)
 set(sawMissingDeclaration FALSE)
 set(sawVacuousCanary FALSE)
+set(sawVerdictHalfRead FALSE)
 set(willFailRegistrations "")
 
 # ---------------------------------------------------------------------------
@@ -449,6 +451,164 @@ foreach(hookVar IN LISTS cpackHookVars)
     fastcached_require_cmake_minimum("${resolvedHook}" "${hookPath}" "run by CPack as ${hookVar}")
 endforeach()
 
+# ---------------------------------------------------------------------------
+# Pass 5: everything that READS the signal must read ALL of it (#672).
+#
+# The signal is two words. `FASTCACHED_SCRIPT_CHECK_FAILED` is
+# `CMake Error|CMake Warning` and both halves are canaried -- `script-check-canary`
+# for the first, `script-check-warning-canary` for the second -- because
+# `message(WARNING)` exits 0 on every CMake while changing meaning, and an unset
+# policy, a deprecated command or a dev warning all arrive that way.
+#
+# A selftest harness runs the check it is about as a SUB-PROCESS and reads the
+# verdict out of the captured output itself. ctest never sees that output, so the
+# registration's pattern does not reach it and the harness has to spell the rule
+# again. Twenty of them spelled half of it -- `CMake Error` alone -- so a sub-run
+# that merely WARNED was scored a clean pass by the very fixtures whose job is to
+# prove a guard bites. Measured on the tree that fixed it, by giving every check an
+# unconditional `message(WARNING)`: 2 of 22 harnesses objected before, 22 of 22
+# after. A harness laxer than the registration it stands for is a fake more
+# permissive than the thing it models.
+#
+# So this pass is the reason nobody has to remember, which is the argument pass 2
+# makes for the registrations one level up.
+#
+# ## What it recognises, and what it deliberately does not
+#
+# A line that tests text for the literal `CMake Error` -- `string(FIND)`,
+# `string(REGEX)` or `MATCHES` -- must spell `CMake Warning` on the same line. That
+# is narrow on purpose: it is exact about the shape it reads and the remedy is one
+# word.
+#
+# It cannot see a harness that reads NO verdict at all. Two here did not: one
+# asserted only substrings, and one defaulted its `must appear` needle to the error
+# word. Both were given an explicit warning assertion rather than this scan being
+# widened, because "runs a sub-`cmake -P` and draws a conclusion from it" has no
+# reliable static shape and a guard that guessed at it would refuse correct files.
+# Said plainly, so a green pass here is not read as coverage of that.
+#
+# ## Deliberate must not be spelled like forgotten
+#
+# Some sites read the words `CMake Error` for a reason that is not a verdict: a case
+# TABLE spells it in a `must not appear` field to mean "this row expects
+# acceptance", and `check-fatal-error-exit` asks whether one specific
+# `message(FATAL_ERROR)` arm produced one, where a warning would be the wrong answer
+# rather than a stricter one. Those carry `verdict-error-only:` and a REASON in the
+# comment block immediately above, and the count is PRINTED on every run -- a marker
+# with no reason is refused, and a marker nobody ever reads would spell "forgot" in
+# the vocabulary of "decided".
+#
+# ## Why the walk builds no list
+#
+# The same reason pass 1 escapes before splitting, one step further: this is a
+# FIND/SUBSTRING walk that never hands a line to CMake's list parser, so an
+# unbalanced `[` in a comment cannot merge two lines and move a reported line
+# number. The whole-file test comes first, because most files under scripts/ hold
+# neither word and reading those line by line is the cost this repository has
+# already paid once.
+set(verdictSites 0)
+set(verdictExceptions 0)
+file(GLOB checkScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.cmake")
+
+# A glob that matched nothing would report success having read no file at all,
+# which is the vacuous shape this whole file argues against.
+if(NOT checkScripts)
+    message(FATAL_ERROR
+        "no scripts/*.cmake was found under ${FASTCACHED_SOURCE_DIR} at all; pass 5 would "
+        "vouch for every verdict reader in this tree while reading none of them")
+endif()
+
+foreach(scriptFile IN LISTS checkScripts)
+    file(READ "${scriptFile}" scriptText)
+    # verdict-error-only: the whole-file pre-filter of this very scan, so it reads the
+    # word rather than a verdict. Marked rather than exempting this file, because a
+    # real verdict reader added here later must still be caught.
+    if(NOT scriptText MATCHES "CMake Error")
+        continue()
+    endif()
+    file(RELATIVE_PATH shownScript "${FASTCACHED_SOURCE_DIR}" "${scriptFile}")
+
+    set(rest "${scriptText}")
+    set(scriptLine 0)
+    set(pendingReason "")
+    set(sawMarker FALSE)
+    while(NOT rest STREQUAL "")
+        string(FIND "${rest}" "\n" newlineAt)
+        if(newlineAt EQUAL -1)
+            set(line "${rest}")
+            set(rest "")
+        else()
+            string(SUBSTRING "${rest}" 0 ${newlineAt} line)
+            math(EXPR afterNewline "${newlineAt} + 1")
+            string(SUBSTRING "${rest}" ${afterNewline} -1 rest)
+        endif()
+        math(EXPR scriptLine "${scriptLine} + 1")
+
+        # A COMMENT is not a call site. It is where an exception is DECLARED, though,
+        # so a marker is collected here and spent on the next line of code -- which is
+        # what makes "the comment block immediately above" the only place it can go.
+        if(line MATCHES "^[ \t]*#")
+            if(line MATCHES "verdict-error-only:[ \t]*(.*)$")
+                string(STRIP "${CMAKE_MATCH_1}" pendingReason)
+                set(sawMarker TRUE)
+            endif()
+            continue()
+        endif()
+        if(line MATCHES "^[ \t]*$")
+            continue()
+        endif()
+
+        # The needle first, because it is a `string(FIND)` and the quote-strip below it is
+        # a regex, and the overwhelming majority of lines in the 44 files that carry the
+        # word do not carry it themselves. The saving is SMALL and is recorded as such:
+        # whole check, min of 5, 1557 ms per-line against 1510 ms per-candidate -- about
+        # 3%, where the cost of the pass as a whole is ~350 ms. Measured 2026-09-10 on
+        # Windows 11 / Git Bash / native NTFS / CMake 4.3.1, conditions PINNED rather
+        # than pointed at. The order is what it is because the cheap test belongs first,
+        # not because 3% was worth buying.
+        #
+        # verdict-error-only: this is the detector itself, reading a line of SOURCE for
+        # the word rather than reading a sub-run for a verdict.
+        string(FIND "${line}" "CMake Error" errorWordAt)
+
+        set(isReader FALSE)
+        if(NOT errorWordAt EQUAL -1)
+            # The OPERATOR is looked for with the quoted spans removed, and the NEEDLE in
+            # the line as written. A line whose every token sits inside a string is
+            # PRINTING, not testing -- and this file's own remedy text prints the
+            # compliant spelling, so without this it counted as a verdict reader and the
+            # "no compliant reader" control could never have fired. That is
+            # check-glob-traversals' defect (a checker reporting its own documentation)
+            # arriving in the POSITIVE CONTROL, where it is worse: it refuses nothing,
+            # it vouches.
+            string(REGEX REPLACE "\"[^\"]*\"" "" unquoted "${line}")
+            if(unquoted MATCHES "string\\(FIND|string\\(REGEX|MATCHES")
+                set(isReader TRUE)
+            endif()
+        endif()
+
+        if(isReader)
+            string(FIND "${line}" "CMake Warning" warningWordAt)
+            if(NOT warningWordAt EQUAL -1)
+                math(EXPR verdictSites "${verdictSites} + 1")
+            elseif(sawMarker AND NOT pendingReason STREQUAL "")
+                math(EXPR verdictExceptions "${verdictExceptions} + 1")
+            elseif(sawMarker)
+                set(sawVerdictHalfRead TRUE)
+                list(APPEND violations
+                     "${shownScript}:${scriptLine}: `verdict-error-only:` with no reason after it -- a marker nobody can read spells `forgot` in the vocabulary of `decided`")
+            else()
+                set(sawVerdictHalfRead TRUE)
+                list(APPEND violations
+                     "${shownScript}:${scriptLine}: tests a captured output for `CMake Error` and not for `CMake Warning`, so a sub-run that merely WARNS is scored a clean pass here while ctest would refuse it")
+            endif()
+        endif()
+
+        set(pendingReason "")
+        set(sawMarker FALSE)
+    endwhile()
+endforeach()
+
 if(violations)
     message("")
     foreach(violation IN LISTS violations)
@@ -474,6 +634,21 @@ if(violations)
     message("is the only thing left that can fail it.")
     message("")
     endif()
+    if(sawVerdictHalfRead)
+    message("The failure signal is TWO words. A harness that runs a check as a sub-process")
+    message("reads that output itself -- ctest never sees it -- so it has to spell the whole")
+    message("pattern or a sub-run that merely WARNS is scored a clean pass:")
+    message("")
+    message("    if(combined MATCHES \"CMake Error|CMake Warning\")")
+    message("")
+    message("A site that reads the error word for some OTHER reason -- a case table spelling")
+    message("it to mean `this row expects acceptance`, or a probe asking whether one specific")
+    message("`message(FATAL_ERROR)` arm fired -- says so instead, in the comment block")
+    message("immediately above it:")
+    message("")
+    message("    # verdict-error-only: <why a warning is the wrong answer here, not a stricter one>")
+    message("")
+    endif()
     if(sawMissingDeclaration)
     message("A `cmake -P` script states its policies, because script mode sets none:")
     message("")
@@ -493,6 +668,18 @@ endif()
 # canary pass gets its own positive control: the two WILL_FAIL registrations are
 # what the whole FAIL_REGULAR_EXPRESSION mechanism rests on, and a scan that found
 # none of them would have checked nothing while printing the same summary.
+# The same argument for pass 5. Should its scan stop recognising the shape it reads --
+# a reformat, a helper that moves the test off one line -- every harness in the tree
+# passes it while nothing is checked, and the summary below looks exactly the same.
+# BELOW the violations report, like the control that follows it, so a tree that HAS
+# findings reports them rather than dying on a control which is also true of it.
+if(verdictSites EQUAL 0)
+    message(FATAL_ERROR
+        "pass 5 found no compliant verdict reader in scripts/*.cmake at all; every selftest "
+        "harness here reads one, so this scan has stopped recognising the shape and has "
+        "vouched for all of them without reading any")
+endif()
+
 list(LENGTH willFailRegistrations willFailCount)
 if(willFailCount EQUAL 0)
     message(FATAL_ERROR
@@ -506,4 +693,6 @@ message(STATUS
     "report failure and all running a script that declares a CMake minimum; "
     "${willFailCount} WILL_FAIL canary/canaries, all exiting 0 so the pattern is what "
     "decides them; plus ${cpackHookCount} CPack hook script(s) discovered from "
-    "cmake/Packaging.cmake")
+    "cmake/Packaging.cmake; plus ${verdictSites} sub-run verdict reader(s) spelling both "
+    "halves of the signal and ${verdictExceptions} reading the error word for a stated "
+    "reason that is not a verdict")
