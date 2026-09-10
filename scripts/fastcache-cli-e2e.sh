@@ -352,4 +352,155 @@ run_cli --token-file="$tokenFile" ping
 expect_status 0 "ping with an unnecessary credential still succeeds"
 expect_stderr "does not require one" "the unnecessary credential is reported"
 
+
+# ---------------------------------------------------------------------------------
+# case 9: the memcached-text verbs against a real daemon
+#
+# What this reaches that `fastcache-cli-tests` cannot is the SERVER: every unit case
+# scripts the reply this client expects, so a verb whose argument order or command
+# word is wrong passes there and is refused by the daemon here. `gat`'s reversed
+# operand order and the lower-case command words are exactly that class.
+# ---------------------------------------------------------------------------------
+echo "==> case 9: the memcached verbs reach the daemon"
+start_daemon
+
+run_cli set mc-key hello
+expect_status 0 "a value to work on"
+
+run_cli touch mc-key 300
+expect_status 0 "touch on a live key"
+
+run_cli touch no-such-key 300
+# The server answered NOT_FOUND. That is a miss (1), not unreachable (3) and not a
+# refusal (4) -- the discrimination the exit-code table exists for.
+expect_status 1 "touch on an absent key"
+expect_stderr "no such key" "touch says why it answered no"
+
+run_cli inspect mc-key --format=kv
+expect_status 0 "inspect on a live key"
+# The renamed flags, and the wire spellings gone. `me` writes `exp=` and `la=`; a
+# reader gets `ttl_seconds` and `last_access_seconds`, and asserting the ABSENCE of
+# the wire names is what makes this fail if the rename stops happening.
+expect_stdout "ttl_seconds=" "inspect renames the ttl flag"
+expect_stdout "value_bytes=" "inspect renames the size flag"
+expect_stdout "cas=" "inspect reports the cas token"
+refute_stdout "exp=" "the wire spelling of the ttl flag is gone"
+refute_stdout "la=" "the wire spelling of the last-access flag is gone"
+
+run_cli inspect no-such-key
+expect_status 1 "inspect on an absent key"
+
+# `add` refuses a key that exists and `replace` refuses one that does not -- opposite
+# conditions, so a handler that got them the wrong way round passes one and fails the
+# other rather than both.
+run_cli add mc-key second
+expect_status 1 "add onto an existing key"
+expect_stderr "needs the key absent" "add says which condition failed"
+
+run_cli add fresh-key first
+expect_status 0 "add onto an absent key"
+
+run_cli replace no-such-key v
+expect_status 1 "replace onto an absent key"
+
+# The value begins with a dash, which is what `--` is for: without it the option
+# parser reads it as a flag. Written this way deliberately rather than avoided -- a
+# cache stores arbitrary bytes, so a leading dash is ordinary, and this is the only
+# case in the suite that exercises the escape.
+run_cli append -- mc-key "-suffix"
+expect_status 0 "append onto an existing key, with a value that starts with a dash"
+run_cli get mc-key
+expect_stdout "hello-suffix" "append landed at the end"
+
+run_cli prepend -- mc-key "prefix-"
+expect_status 0 "prepend onto an existing key"
+run_cli get mc-key
+expect_stdout "prefix-hello-suffix" "prepend landed at the front"
+
+# gat: the expiry comes FIRST, which is the wire's order and the opposite of touch.
+# A row that reordered them would be refused by the daemon as a bad exptime, which is
+# a failure only a live server can produce.
+run_cli gat 300 mc-key
+expect_status 0 "gat with the expiry first"
+expect_stdout "mc-key" "gat named the key it returned"
+
+run_cli gat 300 no-such-key
+expect_status 1 "gat where nothing exists"
+expect_stderr "none of the keys exist" "gat says the wire named no misses"
+
+# cas, end to end: read the token the server actually issued, spend it, then spend it
+# again. The second attempt must be refused -- a compare-and-swap that accepts a
+# stale token is the one failure mode this verb exists to prevent, and it cannot be
+# demonstrated without a server that issues real tokens.
+run_cli gats 300 mc-key --format=kv
+expect_status 0 "gats reports a cas token"
+# Not `sed ... | head -1`: `head` leaves after the first line, `sed` takes SIGPIPE,
+# and under pipefail the pipeline reports SED status -- a false negative on the
+# SUCCESS path. Capture every match and take the first line with no fork.
+casMatches="$(sed -n 's/^cas=\([0-9][0-9]*\).*/\1/p' "$WORK/out")"
+casToken="${casMatches%%$'\n'*}"
+[[ -n "$casToken" ]] || {
+    e2e_note "stdout: $(cat "$WORK/out")"
+    fail "gats did not report a cas token to spend"
+}
+e2e_note "the server issued cas token $casToken"
+
+run_cli cas mc-key swapped "$casToken"
+expect_status 0 "cas with the token the server issued"
+run_cli get mc-key
+expect_stdout "swapped" "the compare-and-swap stored the new value"
+
+run_cli cas mc-key again "$casToken"
+expect_status 1 "cas with a token the value has outlived"
+expect_stderr "changed since that cas token" "the stale cas says why"
+
+# mc-stats reaches families `stats` cannot see.
+run_cli mc-stats settings --format=kv
+expect_status 0 "mc-stats settings"
+settingsRows=$(count_lines "$WORK/out")
+[[ "$settingsRows" -gt 0 ]] || fail "mc-stats settings rendered nothing"
+e2e_note "mc-stats settings rendered $settingsRows rows"
+
+run_cli mc-stats reset
+# Refused by THIS CLIENT, before anything is sent: the daemon answers `RESET` while
+# resetting nothing, so relaying it would report a reset that did not happen.
+expect_status 2 "mc-stats reset is refused rather than relayed"
+expect_stderr "not a stats family this client offers" "the refusal lists the families"
+
+# A value that begins with a dash and NO `--`: refused, and the refusal names the
+# escape. The bare "unrecognised argument" left an operator reading a flag list for a
+# flag they never typed, which is the one case where a leading dash is ordinary.
+run_cli append mc-key "-suffix"
+expect_status 2 "a dash-leading value without -- is a usage error"
+expect_stderr "put \`--\` before the operands" "the refusal names the -- escape"
+
+run_cli cache-memlimit 512
+expect_status 0 "cache-memlimit is accepted"
+expect_stderr "NOT persisted" "cache-memlimit says the change does not survive a restart"
+
+# ---------------------------------------------------------------------------------
+# case 10: the memcached verbs under --requirepass
+#
+# **The one behaviour no unit test can establish**, because it is the SERVER's: the
+# memcached text protocol has no AUTH verb, so this daemon answers every verb but
+# `version` and `quit` with `CLIENT_ERROR authentication required` and ENDS THE
+# SESSION. The client cannot fix that with a credential, and the case asserts both
+# that it is refused and that the refusal explains why -- the server's own sentence
+# does not mention that the protocol lacks the verb.
+# ---------------------------------------------------------------------------------
+echo "==> case 10: a memcached verb cannot authenticate, and says so"
+start_daemon --requirepass s3cret
+
+# WITH the credential configured, which is the case that matters: a client holding a
+# valid token still cannot run these, and it must not be told to supply one.
+run_cli --token-file="$tokenFile" touch mc-key 300
+expect_status 4 "touch against a password-protected daemon"
+expect_stderr "authentication required" "the server's own sentence is relayed"
+expect_stderr "has no AUTH verb" "the refusal explains that no credential can help"
+
+# The RESP verbs on the same address DO authenticate, which is what the advisory
+# tells the operator to reach for -- asserted rather than merely promised.
+run_cli --token-file="$tokenFile" set mc-key v
+expect_status 0 "a RESP verb with the same credential on the same address"
+
 echo "fastcache-cli E2E OK"

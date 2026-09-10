@@ -259,7 +259,10 @@ namespace
         { .name = "FASTCACHE_ADMIN_ADDR", .summary = "the admin surface, as host:port; see --admin-addr" },
         { .name = "FASTCACHE_TOKEN", .summary = "the credential to present. --token-file is preferable" },
         { .name = "FASTCACHE_USER", .summary = "username for the two-argument AUTH form" },
-        { .name = "NO_COLOR", .summary = "set to anything non-empty to suppress colour" },
+        { .name = "NO_COLOR",
+          .summary = "set to anything non-empty to suppress colour. It governs the\n"
+                     "DEFAULT, so an explicit --color=always still colours, which\n"
+                     "is what the NO_COLOR convention asks for" },
     });
 
     /// Prose the tables cannot carry.
@@ -416,6 +419,16 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
                 command.action = Action::UsageError;
                 auto const& error = flow.error();
                 command.diagnostic = error.field.empty() ? error.context : std::format("{}: {}", error.field, error.context);
+                // A token that begins with a dash AFTER the verb is far more often a
+                // value than a mistyped flag -- `set counter -5` and `append k -suffix`
+                // are ordinary, and a cache stores arbitrary bytes. `--` is the answer
+                // and the bare refusal does not mention it, so the operator is left
+                // reading a flag list for a flag they never meant to type.
+                if (!command.verb.empty())
+                    command.diagnostic +=
+                        std::format(" (if `{}` is a value rather than a flag, put `--` before the operands: `{} -- ...`)",
+                                    token,
+                                    command.verb);
                 return command;
             }
             // `--help` and `--version` answer without reading the rest, which is right:

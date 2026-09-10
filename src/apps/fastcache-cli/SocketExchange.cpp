@@ -53,6 +53,36 @@ namespace
         return out;
     }
 
+    /// Read one chunk from @p socket and append it to @p pending.
+    ///
+    /// **The EOF rule lives here and nowhere else.** Both wires' read loops need it and
+    /// it is the subtle part: EOF means *this peer has finished sending*, which is a
+    /// complete statement when a reply was already parsed and a truncation when one was
+    /// not. The two sentences are separate because they are separate problems -- a
+    /// server that closes without answering is usually an auth gate or a wrong port,
+    /// one that closes mid-reply is a broken connection -- and a second copy of that
+    /// distinction is a second thing to get wrong.
+    ///
+    /// @param socket The connected socket.
+    /// @param pending The buffer to append to; its emptiness is what the EOF arms read.
+    /// @return Nothing on success, or why the read did not happen.
+    [[nodiscard]] std::expected<void, ExchangeError> FillMore(ISocket* socket, std::string& pending)
+    {
+        std::array<std::byte, ReadChunkBytes> chunk {};
+        auto const got = SyncRun(ReadSome(socket, chunk));
+        if (!got.has_value())
+            return std::unexpected(ExchangeError {
+                .kind = ExchangeFailure::Transport,
+                .detail = std::format("the connection failed while reading the reply ({})", got.error().context) });
+        if (*got == 0)
+            return std::unexpected(
+                ExchangeError { .kind = ExchangeFailure::Transport,
+                                .detail = pending.empty() ? "the server closed the connection without answering"
+                                                          : "the server closed the connection part-way through a reply" });
+        pending += AsChars(std::span<std::byte const> { chunk.data(), *got });
+        return {};
+    }
+
     /// Dial and hand back the socket.
     /// @param endpoint Where.
     /// @param timeouts How long.
@@ -156,25 +186,63 @@ std::expected<RespValue, ExchangeError> SocketExchange::ReadReply()
                 break;
         }
 
-        std::array<std::byte, ReadChunkBytes> chunk {};
-        auto const got = SyncRun(ReadSome(_socket.get(), chunk));
-        if (!got.has_value())
-            return std::unexpected(ExchangeError {
-                .kind = ExchangeFailure::Transport,
-                .detail = std::format("the connection failed while reading the reply ({})", got.error().context) });
-        if (*got == 0)
+        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+            return std::unexpected(filled.error());
+    }
+}
+
+MemcachedExchange::MemcachedExchange(std::unique_ptr<ISocket> socket, McParseLimits limits) noexcept:
+    _socket { std::move(socket) },
+    _limits { limits }
+{
+}
+
+MemcachedExchange::~MemcachedExchange()
+{
+    if (_socket == nullptr)
+        return;
+    // `quit` is one of the two verbs this surface answers before authentication, so
+    // this courtesy works against a password-protected daemon as well. Its reply is
+    // not read, for the reason `~SocketExchange` gives: there is nothing to do with
+    // one, and waiting would make closing able to block.
+    (void) SyncRun(SendAll(_socket.get(), AsBytes(EncodeMemcachedCommand("quit", {}))));
+    _socket->Close();
+}
+
+std::expected<std::unique_ptr<MemcachedExchange>, ExchangeError> MemcachedExchange::Open(Endpoint const& endpoint,
+                                                                                         DialTimeouts timeouts,
+                                                                                         McParseLimits const& limits)
+{
+    auto socket = Dial(endpoint, timeouts);
+    if (!socket.has_value())
+        return std::unexpected(socket.error());
+    return std::unique_ptr<MemcachedExchange> { new MemcachedExchange { std::move(*socket), limits } };
+}
+
+std::expected<McReply, ExchangeError> MemcachedExchange::Send(std::string_view request)
+{
+    if (!SyncRun(SendAll(_socket.get(), AsBytes(request))))
+        return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
+                                               .detail = "the connection failed while sending the command" });
+
+    for (;;)
+    {
+        auto parsed = ParseMemcachedReply(_pending, _limits);
+        switch (parsed.state)
         {
-            // EOF. The peer has finished sending -- which is a complete statement
-            // when a reply was already parsed, and a truncation when one was not.
-            // The two are separate sentences because they are separate problems: a
-            // server that closes without answering is usually an auth gate or a
-            // wrong port, and one that closes mid-reply is a broken connection.
-            return std::unexpected(
-                ExchangeError { .kind = ExchangeFailure::Transport,
-                                .detail = _pending.empty() ? "the server closed the connection without answering"
-                                                           : "the server closed the connection part-way through a reply" });
+            case McParseState::Complete:
+                _pending.erase(0, parsed.consumed);
+                return std::move(parsed.reply);
+            case McParseState::Malformed:
+                return std::unexpected(
+                    ExchangeError { .kind = ExchangeFailure::Malformed, .detail = std::move(parsed.diagnostic) });
+            case McParseState::Incomplete:
+            case McParseState::Last:
+                break;
         }
-        _pending += AsChars(std::span<std::byte const> { chunk.data(), *got });
+
+        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+            return std::unexpected(filled.error());
     }
 }
 

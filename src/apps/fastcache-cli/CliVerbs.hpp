@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliAnswer.hpp"
+#include "MemcachedClient.hpp"
 #include "RespClient.hpp"
 #include "StatsSource.hpp"
 
@@ -27,15 +28,27 @@ namespace FastCache::Cli
 
 /// Which wire a verb needs to reach the server.
 ///
-/// A private enum. Two entries today; the memcached-text verbs (`touch`, `gat`,
-/// `append`, `cas`, the `stats` sub-commands) and the scheduler's `0xFC` cluster verbs
-/// are each a further enumerator plus rows, which is the point of the column.
+/// A private enum. The scheduler's `0xFC` cluster verbs are a further enumerator plus
+/// rows, which is the point of the column.
 enum class Wire : std::uint8_t
 {
-    Resp,  ///< RESP on the data port.
-    Stats, ///< Whatever the stats ladder chooses; see StatsSource.hpp.
+    Resp,      ///< RESP on the data port.
+    Memcached, ///< The memcached text protocol on the same port.
+    Stats,     ///< Whatever the stats ladder chooses; see StatsSource.hpp.
     Last,
 };
+
+struct VerbContext;
+
+/// Whether a context carries the collaborator a wire needs.
+///
+/// A **column** rather than a condition inside `RunVerb`, which read
+/// `verb.wire == Wire::Resp ? ctx.resp != nullptr : ctx.stats != nullptr` -- a ternary
+/// that is exhaustive over two wires and silently wrong over three: a third wire would
+/// have taken the `stats` arm and reported *no stats source was configured* for a
+/// memcached verb, or dereferenced a null. The next wire is a row, and a row that
+/// forgets this field does not compile.
+using WireAvailable = bool (*)(VerbContext const&);
 
 /// One wire's fixed properties.
 struct WireSpec
@@ -43,16 +56,39 @@ struct WireSpec
     Wire wire;                    ///< The enumerator this row describes.
     std::string_view name;        ///< Stable lower-case name, for diagnostics.
     std::string_view unavailable; ///< What to tell an operator when it could not be opened.
+    WireAvailable available;      ///< Which collaborator says this wire is open.
+
+    /// Whether this wire can present a credential at all.
+    ///
+    /// **False for `Memcached`, and that is a property of the PROTOCOL rather than of
+    /// any deployment**: the memcached text surface has no AUTH verb, so under
+    /// `--requirepass` the server answers every verb but `version` and `quit` with
+    /// `CLIENT_ERROR authentication required` and ends the session. A client cannot fix
+    /// that by trying harder, so when such a refusal arrives it is explained rather
+    /// than relayed bare -- `FromMemcachedError` in `CliVerbs.cpp` reads this column to
+    /// decide whether to add the explanation.
+    ///
+    /// It is deliberately NOT used to refuse before dialling. A credential being
+    /// CONFIGURED does not mean the server REQUIRES one -- that is the same false
+    /// inference `SocketExchange::Open`'s AUTH advisory exists to avoid -- so refusing
+    /// on it would decline verbs that would have worked, against every daemon with no
+    /// password. Asking costs one round trip and the answer is the server's own.
+    bool authenticable;
+
+    /// Whether a caller must open a RESP connection for a verb on this wire.
+    ///
+    /// A **column** rather than a ladder in `main`, for the reason `main` holds nothing
+    /// testable: it is in no test target (#370, #909), so a decision made there is a
+    /// rule nothing can be held to. `Stats` says yes although it is not RESP, because
+    /// `INFO` is the stats ladder's fallback rung and lives on that connection.
+    bool needsResp;
+
+    /// Whether a caller must open a memcached-text connection for a verb on this wire.
+    ///
+    /// Stated per row rather than derived from `wire`, so a future wire needing BOTH
+    /// connections is a row that says so rather than a special case at the call site.
+    bool needsMemcached;
 };
-
-/// The wires, one row per enumerator, in enumerator order.
-inline constexpr EnumTable<Wire, WireSpec> WireTable { {
-    { .wire = Wire::Resp, .name = "resp", .unavailable = "no connection to the cache was opened" },
-    { .wire = Wire::Stats, .name = "stats", .unavailable = "no stats source was configured" },
-} };
-
-static_assert(RowsInEnumeratorOrder(WireTable, &WireSpec::wire),
-              "WireTable must hold one row per Wire, in enumerator order");
 
 /// The value `VerbOptions::ttlSeconds` carries when the operator named no TTL.
 ///
@@ -82,12 +118,44 @@ struct VerbSpec;
 /// `NOAUTH` or a real crossed reply needs a daemon configured to misbehave.
 struct VerbContext
 {
-    VerbSpec const* verb { nullptr };         ///< The row that was matched; set by `RunVerb`.
-    std::span<std::string const> operands {}; ///< The positional arguments after the verb.
-    VerbOptions options {};                   ///< The modifiers.
-    IExchange* resp { nullptr };              ///< The RESP connection, or null.
-    IStatsGatherer* stats { nullptr };        ///< The stats ladder, or null.
+    VerbSpec const* verb { nullptr };          ///< The row that was matched; set by `RunVerb`.
+    std::span<std::string const> operands {};  ///< The positional arguments after the verb.
+    VerbOptions options {};                    ///< The modifiers.
+    IExchange* resp { nullptr };               ///< The RESP connection, or null.
+    IMemcachedExchange* memcached { nullptr }; ///< The memcached-text connection, or null.
+    IStatsGatherer* stats { nullptr };         ///< The stats ladder, or null.
 };
+
+/// The wires, one row per enumerator, in enumerator order.
+///
+/// Below `VerbContext` rather than beside `WireSpec`, because `available` is a function
+/// of one: a column that answers a question about the context has to be able to see it.
+inline constexpr EnumTable<Wire, WireSpec> WireTable { {
+    { .wire = Wire::Resp,
+      .name = "resp",
+      .unavailable = "no connection to the cache was opened",
+      .available = [](VerbContext const& context) { return context.resp != nullptr; },
+      .authenticable = true,
+      .needsResp = true,
+      .needsMemcached = false },
+    { .wire = Wire::Memcached,
+      .name = "memcached",
+      .unavailable = "no memcached-text connection to the cache was opened",
+      .available = [](VerbContext const& context) { return context.memcached != nullptr; },
+      .authenticable = false,
+      .needsResp = false,
+      .needsMemcached = true },
+    { .wire = Wire::Stats,
+      .name = "stats",
+      .unavailable = "no stats source was configured",
+      .available = [](VerbContext const& context) { return context.stats != nullptr; },
+      .authenticable = true,
+      .needsResp = true,
+      .needsMemcached = false },
+} };
+
+static_assert(RowsInEnumeratorOrder(WireTable, &WireSpec::wire),
+              "WireTable must hold one row per Wire, in enumerator order");
 
 /// What a verb does.
 ///
@@ -130,7 +198,9 @@ struct VerbSpec
     /// **A column rather than a literal inside the handler**, which is what lets one
     /// handler serve a family: `del`, `exists`, `incr`, `decr`, `incrby` and `decrby`
     /// differ only in this word and in their operand bounds, and both are already
-    /// columns. Written the way the wire spells it, in upper case.
+    /// columns. Written **the way its own wire spells it**, which is upper case on RESP
+    /// and lower case on the memcached text protocol -- the row's `wire` says which, and
+    /// a verb sending the wrong case is refused by the server rather than by this table.
     std::string_view protocolCommand;
 
     /// Which of `Modifier`'s bits this verb honours.

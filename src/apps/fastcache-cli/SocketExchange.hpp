@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CliEndpoint.hpp"
+#include "MemcachedClient.hpp"
 #include "RespClient.hpp"
 
 #include <FastCache/Net/ISocket.hpp>
@@ -82,6 +83,54 @@ class SocketExchange final: public IExchange
     /// this one's leftovers.
     std::string _pending;
     std::vector<std::string> _advisories;
+};
+
+/// A memcached-text connection over one blocking TCP socket.
+///
+/// The same shape as `SocketExchange`, over the other wire, and it shares that class's
+/// read loop rather than carrying a second copy of the EOF rule.
+///
+/// **It takes no credential, and that is the design rather than an omission.** There is
+/// no AUTH verb on this protocol: under `--requirepass` the server answers every verb
+/// but `version` and `quit` with `CLIENT_ERROR authentication required` and then ends
+/// the session (`MemcachedText.cpp`, deliberately -- a refused storage command leaves
+/// its data block unread, so continuing would parse those bytes as the next command).
+/// So there is nothing an exchange could do with a credential, and the refusal has to
+/// happen ABOVE this class, by name and before dialling; `CliVerbs.hpp`'s
+/// `credentialRefusal` column is where that is said.
+///
+/// A `Send` after the server has ended a session fails as a transport error, which is
+/// the truth: the connection is gone. Nothing retries it, because the second attempt
+/// would be refused for the same reason as the first.
+class MemcachedExchange final: public IMemcachedExchange
+{
+  public:
+    /// Dial @p endpoint.
+    /// @param endpoint Where to dial.
+    /// @param timeouts How long to wait.
+    /// @param limits Caps this side imposes on replies.
+    /// @return The open connection, or why there is none.
+    [[nodiscard]] static std::expected<std::unique_ptr<MemcachedExchange>, ExchangeError> Open(
+        Endpoint const& endpoint, DialTimeouts timeouts, McParseLimits const& limits = {});
+
+    ~MemcachedExchange() override;
+    MemcachedExchange(MemcachedExchange const&) = delete;
+    MemcachedExchange(MemcachedExchange&&) = delete;
+    MemcachedExchange& operator=(MemcachedExchange const&) = delete;
+    MemcachedExchange& operator=(MemcachedExchange&&) = delete;
+
+    [[nodiscard]] std::expected<McReply, ExchangeError> Send(std::string_view request) override;
+
+  private:
+    /// @param socket The connected socket.
+    /// @param limits Caps this side imposes.
+    MemcachedExchange(std::unique_ptr<ISocket> socket, McParseLimits limits) noexcept;
+
+    std::unique_ptr<ISocket> _socket;
+    McParseLimits _limits;
+    /// Bytes read and not yet consumed by a reply; held across calls for the reason
+    /// `SocketExchange::_pending` is.
+    std::string _pending;
 };
 
 /// One HTTP response.

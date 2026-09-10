@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "MemcachedClient.hpp"
 #include "RespClient.hpp"
+#include "StatsSource.hpp"
 
 #include <cstddef>
 #include <initializer_list>
@@ -152,6 +154,110 @@ class ScriptedExchange final: public IExchange
     std::vector<std::expected<RespValue, ExchangeError>> _answers;
     std::size_t _at { 0 };
     std::vector<std::vector<std::string>> _sent;
+};
+
+/// An `IMemcachedExchange` that answers from a script of raw reply BYTES.
+///
+/// **Scripted in bytes rather than in parsed `McReply`s, deliberately.** A script of
+/// pre-parsed replies would let a handler case pass over a codec that reads those bytes
+/// differently, and the bytes are what a server sends -- so a case here exercises the
+/// real parser and tests the pair. It also means every script in a verb test is written
+/// in the server's own vocabulary and can be checked against `MemcachedText.cpp`.
+///
+/// Same two properties as `ScriptedExchange`: it records what was sent, and it runs out
+/// rather than repeating, so an extra round trip cannot go unnoticed.
+class ScriptedMemcachedExchange final: public IMemcachedExchange
+{
+  public:
+    /// One scripted outcome: reply bytes, or the exchange failing instead.
+    ///
+    /// A failure is scriptable because *nothing answered* and *the server declined* are
+    /// different exit codes and are fixed in different places, and a fake that can only
+    /// answer leaves that distinction untested -- which is how a case comes to assert
+    /// the running-out-of-script path under a name claiming to test a broken connection.
+    using Outcome = std::expected<std::string, ExchangeError>;
+
+    /// Answer each call with the next of @p replies, in order.
+    /// @param replies Raw reply bytes, one per expected call.
+    explicit ScriptedMemcachedExchange(std::vector<Outcome> replies):
+        _replies { std::move(replies) }
+    {
+    }
+
+    [[nodiscard]] std::expected<McReply, ExchangeError> Send(std::string_view request) override
+    {
+        _sent.emplace_back(request);
+        if (_at >= _replies.size())
+            return std::unexpected(ExchangeError { .kind = ExchangeFailure::Malformed,
+                                                   .detail = "ScriptedMemcachedExchange: the script ran out of replies" });
+        auto const& scripted = _replies[_at++];
+        if (!scripted.has_value())
+            return std::unexpected(scripted.error());
+        auto parsed = ParseMemcachedReply(*scripted);
+        if (parsed.state != McParseState::Complete)
+            // A script this parser cannot read whole is a broken TEST. Reported as
+            // malformed with the script's own diagnostic, so a mistyped fixture names
+            // itself instead of presenting as the handler mishandling a good reply.
+            return std::unexpected(ExchangeError { .kind = ExchangeFailure::Malformed,
+                                                   .detail = "ScriptedMemcachedExchange: " + parsed.diagnostic });
+        return std::move(parsed.reply);
+    }
+
+    /// What was sent, in order.
+    /// @return One entry per call, verbatim.
+    [[nodiscard]] std::vector<std::string> const& Sent() const noexcept
+    {
+        return _sent;
+    }
+
+    /// How many replies are left unused.
+    /// @return The count.
+    [[nodiscard]] std::size_t Unused() const noexcept
+    {
+        return _replies.size() - _at;
+    }
+
+  private:
+    std::vector<Outcome> _replies;
+    std::size_t _at { 0 };
+    std::vector<std::string> _sent;
+};
+
+/// A scripted memcached outcome that fails instead of replying.
+/// @param failure What kind of failure.
+/// @param detail The specifics.
+/// @return The outcome, for a `ScriptedMemcachedExchange` script.
+[[nodiscard]] inline ScriptedMemcachedExchange::Outcome McFailure(ExchangeFailure failure, std::string detail)
+{
+    return std::unexpected(ExchangeError { .kind = failure, .detail = std::move(detail) });
+}
+
+/// A gatherer that answers from a fixed list.
+class ScriptedGatherer final: public IStatsGatherer
+{
+  public:
+    /// @param attempts What to report.
+    explicit ScriptedGatherer(std::vector<StatsAttempt> attempts):
+        _attempts { std::move(attempts) }
+    {
+    }
+
+    [[nodiscard]] std::vector<StatsAttempt> Gather() override
+    {
+        ++_calls;
+        return _attempts;
+    }
+
+    /// How many times it was asked.
+    /// @return The count.
+    [[nodiscard]] int Calls() const noexcept
+    {
+        return _calls;
+    }
+
+  private:
+    std::vector<StatsAttempt> _attempts;
+    int _calls { 0 };
 };
 
 } // namespace FastCache::Cli::Testing

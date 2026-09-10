@@ -2927,6 +2927,33 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Every fastcache-cli verb is documented, and every documented verb exists.
+#
+# The same rule as resp-command-docs, over the table most likely to drift: the CLI's
+# verb list grows a block at a time, which is exactly the edit where a hand-kept doc
+# list is forgotten and exactly the size at which nobody notices it was.
+add_test(
+    NAME "cli-verb-docs"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-verb-docs.sh"
+            "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("cli-verb-docs" PROPERTIES
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# And the verdicts, against synthetic trees -- both directions, plus both ways the
+# reader can fail to LOOK, since two empty lists agree perfectly.
+add_test(
+    NAME "cli-verb-docs-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-cli-verb-docs.sh" --self-test
+)
+set_tests_properties("cli-verb-docs-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # A config file this package used to ship is retired from operators' disks.

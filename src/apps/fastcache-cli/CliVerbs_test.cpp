@@ -42,33 +42,6 @@ namespace
                                [needle](std::string const& advisory) { return advisory.contains(needle); });
 }
 
-/// A gatherer that answers from a fixed list.
-class ScriptedGatherer final: public IStatsGatherer
-{
-  public:
-    /// @param attempts What to report.
-    explicit ScriptedGatherer(std::vector<StatsAttempt> attempts):
-        _attempts { std::move(attempts) }
-    {
-    }
-
-    [[nodiscard]] std::vector<StatsAttempt> Gather() override
-    {
-        ++_calls;
-        return _attempts;
-    }
-
-    /// How many times it was asked.
-    /// @return The count.
-    [[nodiscard]] int Calls() const noexcept
-    {
-        return _calls;
-    }
-
-  private:
-    std::vector<StatsAttempt> _attempts;
-    int _calls { 0 };
-};
 } // namespace
 
 TEST_CASE("the verb table is internally consistent", "[cli][verbs]")
