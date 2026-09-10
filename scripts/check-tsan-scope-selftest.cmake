@@ -342,5 +342,9 @@ message("check-tsan-scope-selftest: ${selftestRan} case(s) ran, ${selftestFailed
 if(NOT selftestFailed EQUAL 0)
     message(FATAL_ERROR
         "check-tsan-scope-selftest: ${selftestFailed} of ${selftestRan} "
-        "case(s) failed. The rule lives in ${FastCachedScopeCheck}.")
+        "case(s) failed.\n"
+        "The cases are in ${CMAKE_CURRENT_LIST_FILE}; the rule they drive is in "
+        "${FastCachedScopeCheck}. Read the FAIL line before either: it says "
+        "whether the check took the wrong DIRECTION or merely failed to REPORT "
+        "the phrase the case asked for, and those are fixed in different files.")
 endif()

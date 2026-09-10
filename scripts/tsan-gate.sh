@@ -90,6 +90,13 @@
 # directly also collapses ~700 sanitized processes into two: measured at 1.2s and
 # 17.6s against several minutes of per-process runtime startup.
 #
+# Those two figures are from BEFORE #316 widened the tag list, when the filter
+# matched 612 cases against today's 871. They are kept because what they are
+# cited for is the COLLAPSE, which a 42% larger scope does not undo -- and they
+# are deliberately NOT restated as today's cost. Nobody has re-measured this on a
+# quiet host, and a figure taken on a box running three other builds would be a
+# worse claim than a stale one that says which scope it was taken at.
+#
 # The tag list is NOT self-evidently the right one, and it has been wrong twice.
 #
 # The first version, `[async],[consensus],[distributed]`, looks complete and

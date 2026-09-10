@@ -1831,11 +1831,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
   so the reader strips the literals BEFORE counting parenthesis depth — a reader that
   does not still closes a matched pair and passes such a case for the wrong reason.
   Every way of losing the question is a REFUSAL: a header that never closes, one past
-  a line bound, a scope holding no case at all. `check-tsan-scope.cmake
-  -DFASTCACHED_TSAN_SCOPE_SELFTEST=ON` drives 16 cases over trees staged from the
-  REAL scope table and a copy of the REAL gate; six mutations each redden exactly the
-  case that names them, and reverting to file-level matching reddens nine and leaves
-  the seven that cannot see the difference green.
+  a line bound, a scope holding no case at all. `scripts/check-tsan-scope-selftest.cmake`
+  drives 20 cases over trees staged from the REAL scope table and copies of the REAL
+  gate and root `CMakeLists.txt` — it `include()`s the check for its table rather than
+  keeping one, and it is a sibling script rather than a `-D` mode because that is what
+  every other `cmake -P` check here does and because `check-selftest-registered` reads
+  argument dispatch, so a `-D` mode is invisible to it. Ten mutations each redden
+  exactly the case that names them; reverting to file-level matching reddens eleven and
+  leaves the nine that cannot see the difference green.
 - **A workaround with an expiry date is WIRED to fire, never written down where only
   its own file's reader will meet it.** The scope is a tag expression rather than
   `ctest -L` because `catch_discover_tests` exports tags as labels only from Catch2
