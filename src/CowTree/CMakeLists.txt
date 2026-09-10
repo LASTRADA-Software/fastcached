@@ -123,13 +123,69 @@ if(FASTCACHED_BUILD_TESTS)
     # question that actually protects the bound, because a case only leaves the ctest
     # list by leaving the source.
     #
+    # **A configure-time assertion is only asked when configure RUNS, and editing a
+    # `.cpp` does not run it.** `CONFIGURE_DEPENDS` on the glob above re-runs configure
+    # when the file LIST changes and says nothing about any file's CONTENT -- so a
+    # rename inside a source that is already listed rebuilds, `catch_discover_tests`
+    # regenerates its list under the NEW name in its POST_BUILD step, and the stale
+    # bounds file below goes on naming the OLD one. Measured on a two-line
+    # `CTestTestfile.cmake`: `set_tests_properties` on a name ctest does not know is
+    # ignored, exit 0, no output. That is exactly the silent state this block exists to
+    # remove, restored on every incremental build until somebody happens to reconfigure.
+    #
+    # So the file each case was FOUND in joins `CMAKE_CONFIGURE_DEPENDS`. Every way of
+    # losing a case -- renamed, deleted, moved to another source -- edits the file it is
+    # in today, which is what re-asks the question. Only the matched sources are listed:
+    # the whole glob would reconfigure on any CowTree test edit for no added coverage.
+    #
     # 120s is the number the hygiene scans carry. It is not a performance assertion:
     # both cases run in well under a second, and the bound exists to turn an unbounded
-    # walk into a named failure rather than to police their cost.
+    # walk into a named failure rather than to police their cost. It is a variable
+    # beside the paragraph that justifies it rather than a literal in the generated
+    # line, which is twenty lines from anything explaining it.
     set(FASTCACHED_COWTREE_HANG_GUARDED_CASES
         "A free-list chain that loops refuses the store at Open"
         "ForEach refuses a tree whose child pointer loops back on itself"
     )
+    set(_cowtreeHangTimeout 120)
+
+    # Sources outside, cases inside: each file is read ONCE and asked about every
+    # guarded case, rather than the whole set being re-read per case.
+    set(_cowtreeHangFound "")
+    set(_cowtreeHangSources "")
+    foreach(testSource IN LISTS COWTREE_TEST_SOURCES)
+        file(READ "${testSource}" _testText)
+        foreach(hangGuardedCase IN LISTS FASTCACHED_COWTREE_HANG_GUARDED_CASES)
+            string(FIND "${_testText}" "TEST_CASE(\"${hangGuardedCase}\"" _caseAt)
+            if(NOT _caseAt EQUAL -1)
+                list(APPEND _cowtreeHangFound "${hangGuardedCase}")
+                list(APPEND _cowtreeHangSources "${testSource}")
+            endif()
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _cowtreeHangSources)
+
+    # Every missing case is named in ONE refusal. Failing inside the loop would report
+    # the first and hide the rest, so a reader who renamed both would fix one, wait out
+    # a reconfigure, and meet the second.
+    set(_cowtreeHangMissing "")
+    foreach(hangGuardedCase IN LISTS FASTCACHED_COWTREE_HANG_GUARDED_CASES)
+        if(NOT "${hangGuardedCase}" IN_LIST _cowtreeHangFound)
+            list(APPEND _cowtreeHangMissing "${hangGuardedCase}")
+        endif()
+    endforeach()
+    if(_cowtreeHangMissing)
+        string(REPLACE ";" "\n    " _cowtreeHangMissingText "${_cowtreeHangMissing}")
+        message(FATAL_ERROR
+            "No CowTree test source declares TEST_CASE(\"...\") for:\n"
+            "    ${_cowtreeHangMissingText}\n"
+            "Each of those pins a cycle guard whose absence HANGS rather than fails, so it "
+            "carries a per-case TIMEOUT applied BY NAME -- and a rename leaves the bound "
+            "unapplied silently, because ctest ignores a property set on a test it does not "
+            "know. If the case was renamed or moved, update the name here; if it was deleted, "
+            "delete its entry. Either way the edit is to "
+            "FASTCACHED_COWTREE_HANG_GUARDED_CASES in ${CMAKE_CURRENT_LIST_FILE} (#638).")
+    endif()
 
     set(_cowtreeHangBounds "${CMAKE_CURRENT_BINARY_DIR}/CowTreeTests_hang_bounds.cmake")
     file(WRITE "${_cowtreeHangBounds}"
@@ -140,28 +196,11 @@ if(FASTCACHED_BUILD_TESTS)
 "# script interpreter whatever exists, and `set_tests_properties` on a name ctest does\n"
 "# not know is silently ignored. The guard is the configure-time assertion in\n"
 "# src/CowTree/CMakeLists.txt, which is the one place that can answer.\n")
-
     foreach(hangGuardedCase IN LISTS FASTCACHED_COWTREE_HANG_GUARDED_CASES)
-        set(_caseFound FALSE)
-        foreach(testSource IN LISTS COWTREE_TEST_SOURCES)
-            file(READ "${testSource}" _testText)
-            string(FIND "${_testText}" "TEST_CASE(\"${hangGuardedCase}\"" _caseAt)
-            if(NOT _caseAt EQUAL -1)
-                set(_caseFound TRUE)
-                break()
-            endif()
-        endforeach()
-        if(NOT _caseFound)
-            message(FATAL_ERROR
-                "No CowTree test source declares TEST_CASE(\"${hangGuardedCase}\"). That case pins a "
-                "cycle guard whose absence HANGS rather than fails, so it carries a per-case TIMEOUT "
-                "applied BY NAME -- and a rename leaves the bound unapplied silently, because ctest "
-                "ignores a property set on a test it does not know. Update "
-                "FASTCACHED_COWTREE_HANG_GUARDED_CASES in ${CMAKE_CURRENT_LIST_FILE} (#638).")
-        endif()
         file(APPEND "${_cowtreeHangBounds}"
-"set_tests_properties(\"${hangGuardedCase}\" PROPERTIES TIMEOUT 120)\n")
+"set_tests_properties(\"${hangGuardedCase}\" PROPERTIES TIMEOUT ${_cowtreeHangTimeout})\n")
     endforeach()
 
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_cowtreeHangSources})
     set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${_cowtreeHangBounds}")
 endif()

@@ -133,8 +133,13 @@ for its lifetime. The disk backend is always wrapped in a
 `ShardedStorage`, whose per-shard mutex serialises access: `main.cpp` wraps
 whenever more than one thread can reach the storage, and the persistent
 backend is one of four conditions that say so — the others being an explicit
-multi-shard layout, `--threads` above one, and the metrics endpoint, whose
-`fc-admin` thread calls `engine.Snapshot()` concurrently with the reactor.
+multi-shard layout, the reactor running on more than one thread, and the
+metrics endpoint, whose `fc-admin` thread calls `engine.Snapshot()`
+concurrently with the reactor. That third one is the DEFAULT rather than an
+opt-in: `--threads` unset means `hardware_concurrency()`, so on any multi-core
+host the wrapper is on without anybody asking for it, and reading it as
+"`--threads` above one" describes a single-threaded default this daemon does
+not have.
 
 **No completion port is ever drained from several threads**, on Windows or
 anywhere else. `IocpReactor.hpp` says that migrates a coroutine across threads
