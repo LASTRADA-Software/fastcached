@@ -556,7 +556,22 @@ _e2e_verdict() {
     #     subject is the MACHINE, and the findings below are about a starved observer.
     #
     # `-` means the caller took no such reading, and then nothing is claimed either way.
-    if [ "$requestedMs" != "-" ] && [ "$requestedMs" -lt $(( bound * 500 )) ]; then
+    #
+    # AND A WAIT THAT ENDED EARLY CLAIMS NOTHING EITHER, which `alive = no` is the
+    # whole of. The comparison is against the BUDGET, so it only means anything for
+    # a wait that spent one: a process noticed dead on the first poll has asked for
+    # 0 ms of pauses by design, and the note then reads
+    #
+    #   the loop asked for only 0ms of pauses inside a 10s budget, so this machine
+    #   could not poll at the rate the wait assumed
+    #
+    # directly above `the process DIED` -- a confident claim about the MACHINE
+    # stacked on top of a finding that says the machine is not the subject. It
+    # fires on every prompt death, which is the one case this verdict gets exactly
+    # right, and `a confident wrong signal is worse than a vague right one` is the
+    # rule it breaks. `unknown` is deliberately NOT exempt: no pid was watched, so
+    # that wait ran to its budget and the pacing reading is real.
+    if [ "$alive" != "no" ] && [ "$requestedMs" != "-" ] && [ "$requestedMs" -lt $(( bound * 500 )) ]; then
         echo "  NOTE: the loop asked for only ${requestedMs}ms of pauses inside a ${bound}s budget, so this"
         echo "        machine could not poll at the rate the wait assumed. Read the findings below with"
         echo "        that in mind."
