@@ -177,9 +177,11 @@ trap cleanup EXIT
 #
 #   * `fail` raised inside `$( ... )` stops the RUN. The copy that lived here
 #     called `exit 1`, which ends the command substitution's subshell only --
-#     and `free_port` and `wait_for_counter` are both called that way, so a
+#     and `free_port` and `wait_for_counter` were both called that way, so a
 #     drawn-port exhaustion or a counter that never moved stopped the script
 #     only because `set -e` happened to notice the assignment's status.
+#     `wait_for_counter` is no longer called that way at all (#643): it sets
+#     `E2eCounterReading`, so the subshell is gone rather than made survivable.
 #   * `http_get` keeps a final chunk with no trailing newline. `read` returns
 #     non-zero on one, so the copy here dropped it; that is latent only because
 #     the endpoints this file reads happen to end in a newline, and
@@ -204,12 +206,17 @@ e2e_begin "dist-compile E2E" "$workdir"
 # the time any node starts, because `--print-toolchain-fingerprint` below walks
 # the same tree first.
 #
-# It is the default for the LIBRARY's waits, and this fixture has a second budget
-# it does not reach: `wait_for_counter` below is still a hand-written poll loop
-# with its own `seconds=10`, because its three-way triage -- nothing ever
-# answered, the series is absent, the reading never rose -- is not something
-# `wait_until` can say. Naming that here so the number above is not read as the
-# only one.
+# IT IS THE ONLY BUDGET IN THIS FIXTURE, and it was not until #643. The counter
+# wait kept a hand-written loop with its own `seconds=10`, so an operator raising
+# this number -- the documented remedy for a slow box -- scaled twenty-one waits
+# and not the one a slow box lengthens most: the others wait for a process to
+# bind, that one waits for a COMPILE to finish and a counter to rise. It failed at
+# the one place the remedy did not reach, and said the worker never got there,
+# which is true and points at the worker rather than at the budget.
+#
+# It was not simply converted at the time because `wait_until` cannot say its
+# three terminal states. That is what the library's findings hook is for, so the
+# triage survived the conversion rather than being traded for the budget.
 e2e_wait_seconds 30
 
 # Statistics are per-user state; keep this run out of the developer's real log.
@@ -400,83 +407,21 @@ run_launcher() {
     "$launcher" "$compiler" "$@" > "$logfile" 2>&1
 }
 
-# Pull one counter out of a Prometheus body.
+# The Prometheus grammar, the one-scrape read and the counter wait are the
+# LIBRARY's (#643). They were three private helpers here -- `metric_value`,
+# `worker_counter` and a hand-written `wait_for_counter`; what moved with them is
+# the reasoning each carried, and what the wait gained is a bound that honours the
+# `e2e_wait_seconds` above and a slow-versus-wedged verdict on expiry. Its three
+# terminal states -- nothing answered, the series is absent, the reading never
+# rose -- are `_e2e_counter_finding`'s and are unchanged, which is why it is a
+# counter-shaped wait in the library rather than a `wait_until` with the triage
+# thrown away.
 #
-# The grammar lives HERE and nowhere else. It was written out at three call sites
-# before this function existed, and the day the exporter grows a label or renders
-# `1` as `1.0` a copy that still matches nothing does not say "the series changed
-# shape" -- it says "the counter did not move", which is a statement about the
-# subject rather than about the instrument.
-#
-# Nothing on stdout means the series was ABSENT, which is a different fact from a
-# reading of zero and must not be folded into one: a counter is a tally, so zero is
-# the truth about events that never happened, while an absent series is a counter
-# nothing exports. Every caller checks for the empty string separately.
-#
-# @param 1 a whole /metrics body
-# @param 2 the Prometheus series name
-metric_value() {
-    local body="$1" name="$2"
-    sed -n "s/^${name} \([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
-}
-
-# Read one counter off a worker's admin endpoint.
-#
-# Separate from `metric_value` because the suite's assertions deliberately fetch
-# ONE body and read three series out of it -- three requests would be three
-# different instants, and a fixture comparing series taken a round trip apart is
-# asserting something nobody meant.
-#
-# @param 1 admin port
-# @param 2 the Prometheus series name
-worker_counter() {
-    local port="$1" name="$2" body=""
-    body="$(http_get 127.0.0.1 "$port" /metrics)" || return 1
-    metric_value "$body" "$name"
-}
-
-# Wait until a worker's counter reaches a floor, the way `wait_for_port` waits for
-# a listener, and echo the reading.
-#
-# The third member of the bounded-wait family rather than a fourth hand-written
-# poll loop, for exactly the reason `wait_for_log`'s header gives: two of the three
-# loops it replaced never checked that the process was still alive. A counter makes
-# that worse, not better -- a worker that DIED simply stops changing its reading,
-# so an open-coded poll runs out its bound and then explains the silence with a
-# confident sentence about what the counter means.
-#
-# @param 1 admin port
-# @param 2 the Prometheus series name
-# @param 3 the floor the reading must reach
-# @param 4 pid
-# @param 5 what it is, for the message
-# @param 6 the log to dump when it does not get there
-# A failed scrape does not end the wait, because ending it is what a retry loop
-# exists to avoid -- but it is remembered, so a bound that expires having never
-# had an answer says THAT rather than blaming the counter. Three outcomes, three
-# sentences: nothing ever answered, the series is absent, the reading never rose.
-wait_for_counter() {
-    local port="$1" name="$2" floor="$3" pid="$4" what="$5" logfile="$6"
-    local seconds=10 value="" answered=0
-    for _ in $(seq 1 $(( seconds * 5 ))); do
-        if value="$(worker_counter "$port" "$name")"; then
-            answered=1
-            if [[ -n "$value" && "$value" -ge "$floor" ]]; then
-                printf '%s\n' "$value"
-                return 0
-            fi
-        fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$logfile" >&2
-            fail "${what} exited while ${name} was still below ${floor}"
-        fi
-        sleep 0.2
-    done
-    cat "$logfile" >&2
-    [[ "$answered" == "1" ]] || fail "${what} never answered a /metrics request within ${seconds}s"
-    [[ -n "$value" ]] || fail "${what} exports no ${name} series"
-    fail "${what} never reached ${name} >= ${floor} within ${seconds}s; last reading ${value}"
-}
+# `wait_for_counter` hands its reading back in `E2eCounterReading` rather than on
+# stdout, so the call sites below read it on the next line instead of capturing
+# the call in `$( )`. That is not cosmetic: this file's own header records that a
+# counter that never moved used to end the run only because `set -e` happened to
+# notice a command substitution's status.
 
 # Slots enough that background CPU cannot withdraw all of them.
 #
@@ -778,8 +723,9 @@ if [[ "$mode" == "membership" ]]; then
     # worker served the dispatched compile without refusing anything on the way --
     # a leg that dispatched AND refused would be describing two different callers
     # and would not be the clean control leg 2 is measured against.
-    admit_completed="$(wait_for_counter "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
-        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log")"
+    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
+        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log"
+    admit_completed="$E2eCounterReading"
     admit_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
@@ -863,8 +809,9 @@ if [[ "$mode" == "membership" ]]; then
     # after the merge those two refusals share a wire code -- a caller that is not on
     # this machine and a caller with no claim on its CPU both answer `not-a-member` --
     # so the counters are the only place they are told apart.
-    tier_hits="$(wait_for_counter "$admit_admin_port" fastcache_node_cache_hits_total 1 \
-        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log")"
+    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_node_cache_hits_total 1 \
+        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log"
+    tier_hits="$E2eCounterReading"
     tier_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
@@ -962,10 +909,11 @@ if [[ "$mode" == "membership" ]]; then
     # moved and the build went green -- and this counter was the one signal that
     # would have named it. Bounded rather than read once, because the refusal is
     # counted on the worker's accept loop and the client has its answer first.
-    refuse_after="$(wait_for_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
+    wait_for_counter 127.0.0.1 "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
         $(( refuse_before + 1 )) "$refuse_worker_pid" \
         "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
-        "${workdir}/mem-refuse-worker.log")"
+        "${workdir}/mem-refuse-worker.log"
+    refuse_after="$E2eCounterReading"
     refuse_metrics="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
     refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"

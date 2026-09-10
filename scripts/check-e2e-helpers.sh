@@ -946,6 +946,141 @@ run_case() {
         echo "BUG: the wait returned for a node that never bound"
         ;;
 
+    # --- `wait_for_counter` --------------------------------------------------
+    #
+    # The wait `dist-compile-e2e.sh` kept hand-written after every other one in it
+    # had been converted, and the two things that cost (#643): it ignored
+    # `e2e_wait_seconds`, and it produced no slow-versus-wedged verdict.
+    #
+    # THE BUDGET IS WHAT THESE ASSERT, and it is the reading that distinguishes.
+    # `run_case` sets `e2e_wait_seconds 1` above, so a wait that honours it says
+    # `of a 1s budget` and the hand-written one -- `local seconds=10` -- would have
+    # said `of a 10s budget`. Whether the wait eventually fails is the reading that
+    # does NOT distinguish: both do.
+    #
+    # Nothing ever answered a scrape. No listener at all, so the port is closed by
+    # construction; `sleep` is the whole stand-in, because the wait needs a live
+    # pid or it reports a death instead of a timeout.
+    counter-never-answered)
+        log="${scratch}/quiet.log"
+        : > "$log"
+        p="$(free_port)"
+        sleep 30 >/dev/null 2>&1 &
+        staged=$!
+        wait_for_counter 127.0.0.1 "$p" staged_counter_total 1 \
+            "$staged" "an exporter that never answers" "$log"
+        echo "BUG: the wait returned with nothing listening"
+        ;;
+
+    # A process that DIED is reported the moment it is noticed, and the counter
+    # finding prints BESIDE that rather than instead of it. A separate case from
+    # the one above because the two reach `_e2e_expire` by different paths -- the
+    # death arm inside the loop and the expiry after it -- so a findings hook
+    # wired into only one of them passes the other.
+    counter-dies)
+        log="${scratch}/corpse.log"
+        : > "$log"
+        p="$(free_port)"
+        ( exit 7 ) &
+        corpse=$!
+        sleep 0.4
+        wait_for_counter 127.0.0.1 "$p" staged_counter_total 1 \
+            "$corpse" "an exporter that is already gone" "$log" 10
+        echo "BUG: the wait returned for a process that had exited"
+        ;;
+
+    # --- the counter finding, against staged records -------------------------
+    #
+    # `_e2e_counter_finding` is pure, so its three branches cost three rows here
+    # rather than three arranged stand-ins -- `_e2e_verdict`'s argument, applied to
+    # the second decision a counter wait makes. The stand-in-backed cases below
+    # cover acquisition; this covers the decision, on every platform, including the
+    # ones with no perl.
+    counter-findings)
+        for record in "no||1|c_total|nothing ever answered" \
+                      "yes||1|c_total|exports no c_total series at all" \
+                      "yes|0|1|c_total|never reached 1; the last reading was 0" \
+                      "yes|2|3|c_total|never reached 3; the last reading was 2"; do
+            old="$IFS"
+            IFS='|' read -r fanswered fvalue ffloor fname fwant <<< "$record"
+            IFS="$old"
+            got="$(_e2e_counter_finding "$fanswered" "$fvalue" "$ffloor" "$fname")"
+            grep -qF -- "$fwant" <<< "$got" \
+                || fail "the finding for '${record}' lacks '${fwant}': ${got}"
+        done
+        # Three rows that all answer the same way would satisfy every assertion
+        # above while testing nothing -- `verdict-branches`' argument, one decision
+        # over. The fourth row in the loop reaches the same branch as the third
+        # with a different reading, which is why it is not counted here.
+        #
+        # `${one%%$'\n'*}` and never `| head -1`: a pipe into an early-exiting
+        # consumer under `pipefail` reports the PRODUCER's status, and this file
+        # scans for exactly that a thousand lines below.
+        distinct="$(
+            for record in "no||1|c_total" "yes||1|c_total" "yes|0|1|c_total"; do
+                old="$IFS"
+                IFS='|' read -r fanswered fvalue ffloor fname <<< "$record"
+                IFS="$old"
+                one="$(_e2e_counter_finding "$fanswered" "$fvalue" "$ffloor" "$fname")"
+                printf '%s\n' "${one%%$'\n'*}"
+            done | sort -u | grep -c .
+        )"
+        [ "$distinct" = "3" ] \
+            || fail "the three records produced ${distinct} distinct findings, not 3"
+        echo "the counter finding named all three terminal states"
+        ;;
+
+    # --- `wait_for_counter` against a real exporter ---------------------------
+    #
+    # `wait_for_port` first, with a bound of its own, so the counter wait starts
+    # against a listener that is definitely up. Without it a slow `perl` start
+    # would leave the 1s budget with no answered scrape, and the expiring cases
+    # would report `nothing ever answered` -- a true sentence about a case that was
+    # staged to test something else.
+    counter-rises)
+        log="${scratch}/rise.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_metrics "$p" rise "$log" &
+        server=$!
+        wait_for_port 127.0.0.1 "$p" "$server" "the staged exporter" "$log" 10
+        wait_for_counter 127.0.0.1 "$p" staged_counter_total 1 \
+            "$server" "the staged exporter" "$log" 10
+        [ "$E2eCounterReading" = "1" ] \
+            || fail "E2eCounterReading is '${E2eCounterReading}', not the reading 1"
+        echo "wait_for_counter returned and handed back the reading 1"
+        ;;
+
+    # Present, answered, and never moving: the last reading is the finding, because
+    # "it sat at 0" and "it reached 2 of 3" send a reader to different places.
+    counter-flat)
+        log="${scratch}/flat.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_metrics "$p" flat "$log" &
+        server=$!
+        wait_for_port 127.0.0.1 "$p" "$server" "the staged exporter" "$log" 10
+        wait_for_counter 127.0.0.1 "$p" staged_counter_total 1 \
+            "$server" "a counter that never moves" "$log"
+        echo "BUG: the wait returned for a counter that never moved"
+        ;;
+
+    # Answered, and the series is not there at all. An absent series is not a
+    # reading of zero, and the stand-in exports a different one so the distinction
+    # is a fact about the body rather than about the connection.
+    counter-absent)
+        log="${scratch}/absent.log"
+        : > "$log"
+        p="$(free_port)"
+        _selftest_metrics "$p" absent "$log" &
+        server=$!
+        wait_for_port 127.0.0.1 "$p" "$server" "the staged exporter" "$log" 10
+        wait_for_counter 127.0.0.1 "$p" staged_counter_total 1 \
+            "$server" "an exporter carrying another series" "$log"
+        echo "BUG: the wait returned for a series that is not exported"
+        ;;
+
+
     # --- `run_bounded` -------------------------------------------------------
     #
     # The helper that exists because `cluster-e2e.sh` bounded its probe with a
@@ -1750,6 +1885,84 @@ _selftest_unprompted_listener() {
     ' "$1" "$2" "$3"
 }
 
+
+# A stand-in for an admin endpoint serving `/metrics`, in one of three shapes.
+#
+# `_selftest_listener` above cannot stage any of them: it answers one fixed JSON
+# body, so every scrape reads the same thing and neither the rising case nor the
+# absent-series case exists. The three modes are `wait_for_counter`'s three
+# terminal states seen from the other side of the socket:
+#
+#   rise    the series starts at 0 and reaches 1 from the second request on, so
+#           the wait RETURNS and hands back a reading
+#   flat    the series is there and never moves, so the wait expires knowing the
+#           last reading
+#   absent  the body carries a different series, so the wait expires knowing the
+#           scrape was answered and this counter is not exported
+#
+# The fourth state -- nothing ever answered -- needs no listener at all and is
+# staged by drawing a port and not binding it, which is why that case is in the
+# plain table rather than here.
+#
+# The body's lines end with `\n` and the headers with `\r\n`, because that is what
+# a real exporter writes and `metric_value` anchors its expression on `$`: a body
+# with CRLF line endings would match nothing, and a stand-in that used them would
+# make every case here fail for a reason having nothing to do with the wait.
+#
+# It APPENDS a line to the log per request served, so the expiring cases exercise
+# a log that grows -- which is what makes their output show a general verdict
+# saying the process was making progress beside a COUNTER finding saying what
+# actually went wrong. A stand-in that logged nothing would collapse the two.
+#
+# `exec` and `alarm` for the reasons `_selftest_listener` gives at length: `$!`
+# for a backgrounded FUNCTION is the subshell bash forks, so without `exec` every
+# `kill` here signals a wrapper and leaves a perl holding a LISTEN socket; and no
+# trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled CI job, which are
+# the paths a leak accumulates on. Only ever called with `&`.
+#
+# NOTE: a shell single-quoted string, so no apostrophe may appear anywhere inside
+# it, comments included.
+#
+# @param 1 port
+# @param 2 mode: rise | flat | absent
+# @param 3 the log to append one line per request to
+_selftest_metrics() {
+    exec perl -e '
+        use strict; use warnings; use IO::Socket::INET;
+        my ($port, $mode, $logfile) = @ARGV;
+        alarm 30;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "127.0.0.1", LocalPort => $port,
+            Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
+        open(my $log, ">>", $logfile) or die $!;
+        $log->autoflush(1);
+        my $served = 0;
+        while (my $c = $srv->accept()) {
+            my $lines = 0;
+            while (defined(my $l = <$c>)) { $lines++; last if $l =~ /^\r?\n?$/; }
+            # A CONNECT THAT SENT NOTHING IS NOT A REQUEST. port_answers opens the
+            # socket and closes it, so every free_port draw and every wait_for_port
+            # poll reaches this accept -- and counting those would push the rise
+            # mode past its threshold before the first scrape, leaving a case that
+            # returns on its first poll and demonstrates no polling at all.
+            if (!$lines) { close $c; next; }
+            $served++;
+            my $body;
+            if ($mode eq "absent") {
+                $body = "some_other_total 7\n";
+            } elsif ($mode eq "flat") {
+                $body = "staged_counter_total 0\n";
+            } else {
+                $body = "staged_counter_total " . ($served >= 2 ? 1 : 0) . "\n";
+            }
+            print $log "served request $served\n";
+            print $c "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                   . "Connection: close\r\n\r\n" . $body;
+            close $c;
+        }
+    ' "$1" "$2" "$3"
+}
+
 # A stand-in for a compile node: BINDS first, then logs `compile node ready`
 # after a delay -- or never, when the delay is `never`.
 #
@@ -2228,6 +2441,12 @@ cases=(
     "wait-for-log|0|wait_for_log returned on the marker"
     "registration-accepted|0|wait_for_registration returned on the accepted round"
     "registration-refuses-zero|1|to log: 1 of 1 toolchain(s) registered|!BUG:"
+    # `of a 1s budget` is the assertion, not decoration: `run_case` sets
+    # `e2e_wait_seconds 1`, and the hand-written wait this replaced carried its own
+    # `local seconds=10` and would print `of a 10s budget` here (#643).
+    "counter-never-answered|1|of a 1s budget|nothing ever answered a /metrics request|!BUG:"
+    "counter-dies|1|the process DIED|exit=7|COUNTER: nothing ever answered|!BUG:"
+    "counter-findings|0|the counter finding named all three terminal states"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"
@@ -2261,6 +2480,9 @@ socket_cases=(
     "node-ready-waits-for-marker|0|wait_for_node_ready returned with the node serving|!BUG:"
     "node-ready-refuses-bound-only|1|to log: compile node ready|!BUG:"
     "node-ready-refuses-unbound|1|to listen on 127.0.0.1:|!to log:|!BUG:"
+    "counter-rises|0|wait_for_counter returned and handed back the reading 1|!BUG:"
+    "counter-flat|1|of a 1s budget|never reached 1; the last reading was 0|!BUG:"
+    "counter-absent|1|of a 1s budget|exports no staged_counter_total series at all|!BUG:"
 )
 
 echo "== the helpers, in real shells"
