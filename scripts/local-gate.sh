@@ -2939,6 +2939,17 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
         *SKIPPED*) self_test_skipped="${self_test_skipped:+$self_test_skipped, }the reaper's real-process half (${reap_out#*SKIPPED: })" ;;
     esac
 
+    # #336's helper, driven here for the reason the reaper's is: it ships with this
+    # gate and the gate's own registration already runs everywhere.
+    repair_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" --self-test 2>&1)"
+    repair_status=$?
+    expect "the worktree-pointer repairer's own self-test passes" "0" "$repair_status"
+    expect "and it reports a count, so a run that judged nothing is visible" \
+        "yes" "$([[ "$repair_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
+    case "$repair_out" in
+        *SKIPPED*) self_test_skipped="${self_test_skipped:+$self_test_skipped, }the repairer's real-git half (${repair_out#*SKIPPED: })" ;;
+    esac
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -2977,6 +2988,33 @@ fi
 gate_commit="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$repo_root" diff --quiet HEAD 2>/dev/null || gate_commit="${gate_commit}-dirty"
 echo "$gate_start_marker -- pid $$, tree $repo_root, commit $gate_commit, $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# FIRST, because everything after it reads the tree through git, and because the
+# refusal it replaces named the wrong subject (#336).
+#
+# In a worktree created by the OTHER git on this machine, `git ls-files` answers
+# nothing -- the pointers are absolute in a dialect this git cannot follow -- and
+# every git-driven step here goes empty. The gate already refused rather than
+# passing, which is #1064, but it refused with
+#
+#   GATE FAILED: no tracked headers were found under this tree ... git ls-files
+#   answered nothing, which in a checkout of this repository cannot be true
+#
+# -- measured on exactly that tree. True, and it sends the reader to `.clang-tidy`
+# and the header filter, which are working perfectly. The cause is two pointer
+# files, and the remedy is one command; neither appeared anywhere in the output.
+#
+# `commit ${gate_commit}` reads `unknown-dirty` in that state for the same reason,
+# which is the tell if you already know what you are looking at.
+#
+# The check REFUSES rather than repairing: rewriting a developer's git metadata
+# without being asked is not the gate's business, and `--apply` is one line away.
+# It is also why the diagnosis lives in its own script rather than here -- the
+# thing an operator needs is a command they can run, not a paragraph they have to
+# translate into two `printf`s.
+if ! bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" "$repo_root"; then
+    fail "this work tree is not readable by the git running this gate (diagnosis above)"
+fi
 
 # Resolved once, to an absolute path, and checked before anything is built -- the
 # treatment `clang-format` already had, for the same reason: a gate whose tool is
