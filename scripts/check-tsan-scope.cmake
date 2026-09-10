@@ -358,6 +358,19 @@ if(FASTCACHED_TSAN_SCOPE_SELFTEST)
         set(FASTCACHED_SELFTEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/tsan-scope-selftest")
     endif()
 
+    # Every tree starts with `file(REMOVE_RECURSE)` on a caller-supplied path, so
+    # the path is checked before anything is deleted. Absolute and at least two
+    # segments deep: a relative one would be resolved against whatever directory
+    # ctest happened to run this in, and `/` or `/x` is nothing a scratch tree
+    # should ever be.
+    if(NOT IS_ABSOLUTE "${FASTCACHED_SELFTEST_DIR}"
+       OR NOT FASTCACHED_SELFTEST_DIR MATCHES "[^/\\]+[/\\][^/\\]+")
+        message(FATAL_ERROR
+            "check-tsan-scope --self-test: FASTCACHED_SELFTEST_DIR "
+            "(${FASTCACHED_SELFTEST_DIR}) must be an absolute path at least two "
+            "segments deep; the self-test removes it recursively.")
+    endif()
+
     set(selftestRan 0)
     set(selftestFailed 0)
 

@@ -1182,23 +1182,33 @@ jobs:
   # (#260) — which is the argument for this job, and also why the job is not
   # simply "run everything under TSan".
   #
-  # SCOPE, and what it is not. It is `FastCachedTsanScope` in
-  # `scripts/check-tsan-scope.cmake` — four directories (`Async`, `Consensus`,
-  # `Distributed`, `Net`) and six named files in `Cache/`, `Core/`, `Protocol/`
-  # and `Server/` — plus the node binary run whole. Do not restate the list here;
-  # this comment has already gone stale once by holding a second copy of it.
+  # SCOPE, and what it is not. WHAT RUNS is the `TARGETS` table in
+  # `scripts/tsan-gate.sh`; WHAT IS CLAIMED is `FastCachedTsanScope` in
+  # `scripts/check-tsan-scope.cmake`, whose rows are directories and single
+  # files. Neither list is restated here — this comment held a second copy of the
+  # tag list and duly went stale, which is the defect the whole mechanism is
+  # about, in the prose describing it.
   #
   # It has been WRONG in both of its halves, which is why neither is asserted.
-  # The TAGS were: the first version named three and silently excluded six of ten
-  # `Async/` test files while every signal in the run said clean. Then the SCOPE
-  # was: it named three directories, and a `std::thread` census over every
-  # `FastCacheTest` source finds nineteen threaded files, eleven of them in no row and under no
-  # tag — every threaded `Net/` test among them, which is the module
-  # `BlockingListener` lives in and therefore the module the one race this job has
-  # ever found (#260) came out of. It reached the gate only because the node binary
-  # is run whole. That is #316, and it is closed; what is NOT claimed is that the
-  # table is complete, because the census is a proxy and a check built on it would
-  # refuse correct files.
+  # The TAGS were: the first version named three and silently excluded six of
+  # ten `Async/` test files while every signal in the run said clean. Then the
+  # SCOPE was, and #316 is what that cost — it named three directories, while a
+  # `std::thread` census over `FastCacheTest`'s own sources finds nineteen
+  # threaded files with eleven in no row and under no tag. Every threaded `Net/`
+  # test was among them, which is the module `BlockingListener` lives in and so
+  # the module #260 came out of; that race reached this job only because the node
+  # binary is run whole.
+  #
+  # Widening it was not free and that is the argument for it, not against: the
+  # first sanitized run of the wider scope reported two races that had never been
+  # run under TSan (#1207, #1208), both in code years older than the change. They
+  # are in `.tsan-suppressions` naming their issues, so this job is red for a NEW
+  # race and not for those.
+  #
+  # What is still NOT claimed is that the scope table is COMPLETE. The census is
+  # a proxy — a test reaching threads through a helper spawns none of its own —
+  # so a check built on it would refuse correct files and miss incorrect ones.
+  # `fastcache-cc-tests` is a known gap and is #1209.
   #
   # The tags are not claimed to be confined to the scoped locations either: test
   # files elsewhere carry one and are swept in, which is harmless, because running
