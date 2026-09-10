@@ -609,6 +609,103 @@ The check also refuses a scan that matched **no file or no case**. Every verdict
 in it is drawn from an accumulated list, so an empty scan and a clean tree produced
 byte-identical output — two empty lists agree perfectly (#729).
 
+## A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG
+
+A test starts something that needs an explicit stop — a reactor on a `jthread`, a
+server, a loop — and puts its `REQUIRE`s above the `Stop()`. **Catch2 unwinds on a
+failed `REQUIRE`**, so the failure skips the stop, and `~jthread` then joins a loop
+nobody asked to end.
+
+The test hangs instead of reporting, and that is strictly worse than a plain
+failure three ways:
+
+- **The timeout does not name the assertion.** The one thing the test existed to
+  produce is the thing that is lost.
+- **A timeout and a wedge look identical**, so the reader's first hypothesis is
+  infrastructure rather than the subject — the wrong investigation, by the wrong
+  person, usually on the wrong machine.
+- **It is silent until something fails.** A green suite says nothing about it, so
+  it can only be found by breaking the thing under test, which is exactly when you
+  least want a second puzzle.
+
+**It concentrates in teardown tests, and that is not coincidence.** A test whose
+subject is orderly shutdown is by construction one that starts a thing and must
+stop it, written by somebody thinking about the *subject's* ordering rather than
+the *harness's*. Same species as the entry elsewhere here that a state-collapsing
+bug is likeliest in the tool whose job is that state distinction.
+
+**`CHECK` does not unwind.** Only the `REQUIRE` family, `FAIL` and `SKIP` throw, so
+a `CHECK` above a stop is not this hazard — and counting it as one buries the real
+ones.
+
+### The two fixes, and the second half is the one that gets forgotten
+
+**Stop before you assert**, where the diagnosis does not need the thing running —
+`HealthProbe_test.cpp` calls `server.Shutdown()` *before* its `FAIL`, having
+already taken the diagnosis into locals, precisely because `AdminHttpServer::Run`
+leaves only on the shutdown flag and its lambda takes no stop token for
+`~jthread`'s `request_stop` to reach.
+
+Or **RAII** — a guard whose destructor stops the thing, so the stop runs on the
+unwind path too. **Declaration order is half of the fix**: the fake being closed
+must be declared *before* the guard, so it outlives the thread still touching it.
+Get the guard right and the order wrong and the hang becomes a use-after-free,
+which is worse. `ThreadedAddressResolver_test.cpp` spells it with the order stated
+on the line itself (`// after 'stopper', so destroyed before it`), and
+`RaftPeerServer_test.cpp` states the whole reverse-destruction argument.
+
+**A `jthread` whose lambda takes a `std::stop_token` and loops on
+`stop_requested()` is not exposed at all** — `~jthread` requests the stop and the
+thread ends unaided. That is the cheapest fix where the body can be written that
+way, and it is what makes the census below discriminating rather than a file count.
+
+### Is it mechanizable? Not soundly — and the tractable form is a DIFFERENT check
+
+Stated rather than left open, because an unstated *"we could not check this"*
+reads as *"this is checked"*.
+
+The hazard is *"termination depends on a statement a throwing macro can skip"*.
+Deciding that needs to know which paths reach the stop — **dataflow, not a
+regex**. Anything textual is approximate in **both** directions: it cannot see RAII
+that is already correct, and it cannot see a stop reached through a helper. Both
+misreadings were observed while triaging this: a scan flagged
+`HealthProbe_test.cpp` because a *later* stop existed, missing the correctly-placed
+earlier one, and flagged an `IocpSocket` case by running past the case boundary
+into the next block.
+
+So: **not soundly mechanizable; mechanizable as a helper-usage scan — a raw thread
+in a test file refused by name, with the RAII holder in `src/tests/` — at the cost
+of an exemption list, since a thread that ends unaided is legitimate.** That
+converts an undecidable check into a decidable one over a different property, which
+is the move that worked for `ClaimReadSlot` and for `SigningDomain`.
+
+**It is deliberately not written.** With the tree measured clean below, such a scan
+would refuse the 18 legitimate raw threads on day one and arrive needing an
+exemption list longer than its findings — and a check that fails on arrival is a
+check somebody disables. That is a decision recorded here, not a residual: if a
+third instance turns up, the scan is the shape to reach for, and the exemption
+list is what it costs.
+
+### The tree was clean when this rule was written, and how that was established
+
+Measured 2026-09-10, patterns stated so the next reader can re-run them rather
+than trust the number:
+
+- **24** files under `src/**/*_test.cpp` match `std::jthread|std::thread`
+  (positive control: it finds both files the ticket names). **11** of those also
+  carry an explicit `.Stop()` / `request_stop()` / `.Shutdown()`.
+- **20** `std::jthread` declarations; **2** take a `std::stop_token`, **18** do not
+  and so depend on something else stopping their subject.
+- Every one of the resulting candidates was read **by hand**, and all were already
+  correct — stop-before-assert, an RAII guard, a bounded self-terminating body, or
+  a scoped join.
+
+**Zero is a finding only with a control**, so the triage was run against a planted
+hazard and named it, and against a `stop_token` case and correctly excluded it. The
+instances that motivated the ticket were fixed by hand as they were found; what was
+missing was the rule, which is why this section exists with no accompanying code
+change.
+
 ## The shared helpers: `Unwrap`, `ScratchPath` and `ScriptedSocket`
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
