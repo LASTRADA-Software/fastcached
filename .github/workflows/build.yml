@@ -2659,6 +2659,43 @@ jobs:
 
           security find-identity -v "$KEYCHAIN_PATH"
 
+      - name: "Decide whether a notarization stall fails this build"
+        id: notary
+        # ONE decision, read by the Configure step below and by the classifier
+        # after `Package`, so the policy the build ran under and the policy the
+        # log is judged against cannot disagree (#1156).
+        #
+        # A notarization **stall** is Apple's notary service not answering. It says
+        # nothing about the artefact -- the run that filed #1156 stapled the .pkg
+        # successfully and lost only the .dmg -- and it happened on roughly one in
+        # five completed runs from a service this repository does not control. On a
+        # ref that ships nothing that is noise on an unrequired context, which is
+        # the exact shape #684 measured people learning to ignore.
+        #
+        # On a TAG it must stay fatal: `/publish-release` gates on every expected
+        # asset being present, and an unnotarized .pkg is the "Apple could not
+        # verify..." dialog the whole signing pipeline exists to avoid.
+        #
+        # Written as "OFF only when this is definitely a branch ref" so an
+        # unrecognised `ref_type` keeps the STRICT answer. `pull_request`,
+        # `merge_group` and a push to a branch all report `branch`.
+        #
+        # A REJECTION is not covered by this and must not be: that is Apple having
+        # looked at the artefact and refused it, which is a fact about the package
+        # and is fatal on every ref. See `FASTCACHED_NOTARY_VERDICTS`.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          fatal=ON
+          says="FAILS this build"
+          if [[ "$REF_TYPE" == "branch" ]]; then
+            fatal=OFF
+            says="is reported and does not fail this build, because nothing ships from a branch ref"
+          fi
+          echo "stall_is_fatal=$fatal" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Notarization policy::Apple failing to answer $says (ref_type=$REF_TYPE). A rejection is fatal either way."
+
       - name: "Store the notarization credentials"
         if: steps.signing.outputs.sign == 'true'
         env:
@@ -2708,6 +2745,7 @@ jobs:
             -DFASTCACHED_MACOS_SIGN_IDENTITY_APP="$IDENTITY_APP" \
             -DFASTCACHED_MACOS_SIGN_IDENTITY_PKG="$IDENTITY_PKG" \
             -DFASTCACHED_MACOS_NOTARIZE="$NOTARIZE" \
+            -DFASTCACHED_MACOS_NOTARY_STALL_IS_FATAL="${{ steps.notary.outputs.stall_is_fatal }}" \
             -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       - name: "Build"
@@ -2733,10 +2771,45 @@ jobs:
           done
 
       - name: "Package"
-        # Notarization waits on Apple, hence the generous timeout.
-        timeout-minutes: 30
+        id: package
+        # **This budget is derived from the sum of the bounds in
+        # `cmake/MacOSNotarizePkg.cmake`, and it has to dominate them.** Every call
+        # in that file is individually bounded and names itself when it fires; this
+        # number's only job is to make sure one of THOSE writes the ending rather
+        # than the runner, which answers "The action 'Package' has timed out" and
+        # names no operation (#376).
+        #
+        # The longest path through the hook is the one where everything succeeds and
+        # every call takes its whole bound (a rejection aborts earlier, and a
+        # softened stall skips the stapling):
+        #
+        #   notarytool submit  .pkg   600   (per artefact, across attempts)
+        #   stapler staple+validate   600   (2 x 300)
+        #   hdiutil create            480   (2 attempts x 240)
+        #   codesign --timestamp      300
+        #   notarytool submit  .dmg   600
+        #   stapler staple+validate   600   (2 x 300)
+        #                           -----
+        #                            3180 s = 53 min
+        #
+        # plus cpack's own work before the hook -- measured at 2.4 s on the run that
+        # filed #1156, with 120 s allowed here for a cold packaging pass and the
+        # XProtect wait below. 55 minutes, rounded up to 60.
+        #
+        # It was 30, under a comment claiming 20 minutes of worst case fitted: that
+        # arithmetic counted ONE notarization call where the loop makes two, and it
+        # counted neither the stapler nor hdiutil nor codesign. A longer STEP budget
+        # is not the same trade as a longer CALL budget -- a call bound decides how
+        # long a single stall goes unreported, and this one only decides who gets to
+        # write the ending, so being generous costs nothing on the ~6-minute runs
+        # that are normal and buys a legible failure on the pathological one.
+        timeout-minutes: 60
         run: |
           set -euo pipefail
+          # A clean slate, so an ABSENT record after this step means the post-build
+          # hook did not run rather than that it ran and found nothing to say. The
+          # classifier below reads that absence as its own outcome.
+          rm -f out/build/macos-package/notarization-verdict.txt
           # hdiutil intermittently hangs on GitHub runners while XProtect scans
           # the image being created; see actions/runner-images#7522.
           #
@@ -2778,6 +2851,72 @@ jobs:
           trap 'kill -- -"$reaper" 2>/dev/null || true' EXIT
           cd out/build/macos-package && cpack -G "productbuild;TGZ"
 
+      - name: "Classify the notarization outcome"
+        # **Reports; it does not gate.** The `Package` step above is the gate and it
+        # already fails on a fatal verdict; what was missing was anybody being TOLD
+        # what the failure was. The annotation on that run read `Process completed
+        # with exit code 1` and the last words in the log were `CPack Error: Cannot
+        # initialize the generator TGZ`, for a failure that was Apple's notary
+        # service not answering (#1156).
+        #
+        # `!cancelled()` rather than `always()`, and not `continue-on-error`: a
+        # classifier that cannot run must say so. `.agent/rules/build-and-toolchain.md`
+        # records a #376 probe that staged its helper badly, printed three lines,
+        # and reported SUCCESS -- so this asserts it was REACHED, and has THREE
+        # outcomes rather than the two anybody expects:
+        #
+        #   1. the record is there  -> one annotation per artefact, by name
+        #   2. absent, Package PASSED -> the hook did not run. Nothing else catches
+        #      this, so it is the one thing this step FAILS on
+        #   3. absent, Package FAILED -> the failure was before notarization. Say so,
+        #      and claim nothing about Apple
+        #
+        # A verdict token this step does not know is refused rather than ignored: a
+        # row added to `FASTCACHED_NOTARY_VERDICTS` and not here must not pass
+        # quietly, which is what an unguarded `*)` arm would do.
+        if: ${{ !cancelled() }}
+        env:
+          RECORD: out/build/macos-package/notarization-verdict.txt
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          STALL_IS_FATAL: ${{ steps.notary.outputs.stall_is_fatal }}
+        run: |
+          set -uo pipefail
+
+          if [[ ! -f "$RECORD" ]]; then
+            if [[ "$PACKAGE_OUTCOME" == "success" ]]; then
+              echo "::warning title=Notarization was not classified::the Package step succeeded and ${RECORD} was never written, so cmake/MacOSNotarizePkg.cmake did not run over any .pkg. Nothing here vouches for the notarization of the uploaded artefacts."
+              exit 1
+            fi
+            echo "::notice title=Notarization was not reached::the Package step failed before the notarization hook ran, so this failure is NOT Apple's notary service. Read the step above."
+            exit 0
+          fi
+
+          echo "notarization record:"; cat "$RECORD"
+          unknown=0
+          while read -r verdict name; do
+            [[ -z "${verdict:-}" ]] && continue
+            case "$verdict" in
+              accepted)
+                echo "::notice title=Notarized::${name}: Apple accepted the submission and the ticket is stapled." ;;
+              disabled)
+                echo "::notice title=Not notarized::${name}: notarization was not asked for on this build (no signing secrets, or a fork pull request)." ;;
+              stalled)
+                if [[ "$STALL_IS_FATAL" == "ON" ]]; then
+                  echo "::error title=Apple did not answer::${name}: the notarization submission was not answered inside its budget. This is Apple's notary service and not this package -- compiling, signing and packaging all succeeded. Re-running the job usually meets an answer that is already waiting."
+                else
+                  echo "::warning title=Apple did not answer::${name}: the notarization submission was not answered inside its budget. This is Apple's notary service and not this package. Not fatal on this ref because nothing ships from it; the same outcome FAILS a tag build."
+                fi ;;
+              rejected)
+                echo "::error title=Apple refused this artefact::${name}: the notary service answered and the answer was not Accepted. This one IS about the package -- the notarytool log is in the step above." ;;
+              unstapled)
+                echo "::error title=Notarization ticket could not be stapled::${name}: Apple accepted the submission and the ticket could not be attached, so an offline install would fall back to an online Gatekeeper check." ;;
+              *)
+                echo "::error title=Unknown notarization verdict::'${verdict}' for ${name} is in no row this step knows. A row was added to FASTCACHED_NOTARY_VERDICTS in cmake/MacOSNotarizePkg.cmake and not here."
+                unknown=1 ;;
+            esac
+          done < "$RECORD"
+          exit "$unknown"
+
       - name: "Inspect the .pkg payload"
         working-directory: out/build/macos-package
         run: |
@@ -2801,11 +2940,38 @@ jobs:
       - name: "Verify the signature and the notarization ticket"
         if: steps.signing.outputs.sign == 'true'
         working-directory: out/build/macos-package
+        env:
+          RECORD: notarization-verdict.txt
         run: |
           set -euo pipefail
           pkg=$(ls fastcached-*.pkg)
           dmg=$(ls fastcached-*.dmg)
+
+          # Signing is independent of notarization, so this half is asserted
+          # whatever Apple did.
           pkgutil --check-signature "$pkg"
+
+          # The ticket half needs a ticket. On a tag a stall is fatal, so this step
+          # is never reached with anything but `accepted` rows and the checks below
+          # run exactly as they always have -- **a tag build's behaviour does not
+          # change** (#1156). On a branch ref a stall is reported and not fatal, and
+          # then `stapler validate` would fail for an artefact Apple never answered
+          # about, naming stapler for the notary service's problem.
+          #
+          # Branched INSIDE the step rather than skipped with an `if:`, because a
+          # skipped step reports and reads as passing -- the rule
+          # `.agent/rules/metrics-and-observability.md` states as skipped-versus-absent
+          # and `check-gated-jobs.sh` enforces one level up. What did not run is named.
+          # Asserted rather than tolerated: a missing record here would leave
+          # `unverifiable` empty, which is the same value a fully notarized build
+          # produces, and the two must not agree.
+          [[ -f "$RECORD" ]] || { echo "::error::$RECORD is missing, so nothing here can say whether these artefacts were notarized"; exit 1; }
+          unverifiable="$(awk '$1 != "accepted" { print $2 }' "$RECORD")"
+          if [[ -n "$unverifiable" ]]; then
+            echo "::warning title=Notarization ticket not verified::these artefacts carry no notarization ticket, so their Gatekeeper and stapler checks were not run: $(echo "$unverifiable" | tr '\n' ' '). The notarization record is in the classifier step above; on a tag this state fails the build before reaching here."
+            exit 0
+          fi
+
           # The exact decision Gatekeeper makes when the user double-clicks it.
           spctl --assess --verbose=4 --type install "$pkg"
           # Stapled separately from the image: a ticket on the .dmg does not
