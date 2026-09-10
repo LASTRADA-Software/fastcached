@@ -2336,6 +2336,52 @@ set_tests_properties("config-permissions" PROPERTIES
     TIMEOUT 60
 )
 
+# ---------------------------------------------------------------------------
+# The launcher's documented environment table against the variables it reads.
+#
+# `node-config-reference` below is the same check one binary over, and its argument
+# for `cmake -P` carries unchanged. The launcher's page had no equivalent, and said
+# so in prose -- a sentence naming the hazard and doing nothing about it, which is
+# what #881 is. #700 is the cost: adding one variable meant writing it into three
+# unconnected places, and one of the three had no check at all.
+#
+# `docs-subject`, because its SUBJECT is a documentation page. That label is read
+# out of this file by `doc-subject-checks.sh` and run from the style job, since a
+# check whose subject is prose is skipped by a code-gated filter on exactly the
+# change it exists to catch (#687).
+#
+# Not `smoke`: it reads two files in the source tree and compares strings, so it
+# needs no compiler, daemon or socket and must survive `ctest -LE smoke`.
+add_test(
+    NAME "launcher-env-reference"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-launcher-env-reference.cmake"
+)
+set_tests_properties("launcher-env-reference" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene;docs-subject"
+    TIMEOUT 60
+)
+
+# The two files agree today, at 17 names each, so a green run exercises the ACCEPTING
+# direction only and says nothing about whether the check can refuse. Nine synthetic
+# trees drive both, including the two empty-scan guards -- two empty lists agree
+# perfectly -- and the bracket case, which is the one property the reader claims for
+# itself.
+add_test(
+    NAME "launcher-env-reference-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-env-reference-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-launcher-env-reference-selftest.cmake"
+)
+set_tests_properties("launcher-env-reference-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 add_test(
     NAME "node-config-reference"
     COMMAND ${CMAKE_COMMAND}
