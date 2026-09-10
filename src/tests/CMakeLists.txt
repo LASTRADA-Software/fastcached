@@ -712,6 +712,49 @@ set_tests_properties("read-buffer-guard-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Every transport the library hands out ANSWERS `CancelRead`, rather than inheriting
+# `ISocket`'s default no-op.
+#
+# The sibling of the check above and deliberately a different shape: `read-buffer-guard`
+# reads bodies in `.cpp`, this reads DECLARATIONS in `.hpp`, because what a transport
+# owes here is an answer rather than a call. A socket that inherits the no-op cannot
+# retire a parked read at all -- the awaiting coroutine is never resumed and its frame
+# is never freed, with no signal anywhere (#663, #710). On #710's branch two of six
+# transports inherited it and BOTH park.
+#
+# A scan rather than a pure virtual, which was proposed, priced (13 files, 15 classes,
+# 8 new bodies) and refused: it compels seven test doubles to write `{}` with no reason
+# beside it, which is *forgot* in the vocabulary of *decided* (#892). Reach for the type
+# system when the obligation is DO SOMETHING and for a scan when it is SAY WHY.
+#
+# Not guarded to any platform: it reads TEXT, so a Linux run covers the Windows and
+# macOS transports.
+add_test(
+    NAME "cancel-read-declared"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cancel-read-declared.cmake"
+)
+set_tests_properties("cancel-read-declared" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+add_test(
+    NAME "cancel-read-declared-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/cancel-read-declared-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cancel-read-declared-selftest.cmake"
+)
+set_tests_properties("cancel-read-declared-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A reactor's teardown rule is watched refusing, on every platform rather than one.
 #
 # `IReactor::TeardownIsSerialisedWithDispatch()` is the tripwire for #668: an object
