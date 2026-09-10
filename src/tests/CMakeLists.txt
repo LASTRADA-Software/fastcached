@@ -5131,13 +5131,25 @@ set_tests_properties("credential-containers-selftest" PROPERTIES
 # status is taken from. It cannot fire on a healthy run -- the tally line says `failed`
 # in lower case and carries no colon.
 #
-# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and more sharply:
-# this script attributes a process by its ancestry and its cwd, which is a POSIX
-# process table.
+# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and here the guard
+# is LOAD-BEARING rather than conventional -- measured, not assumed. Under Git Bash
+# this self-test fails: `ps -Ao pid=,ppid=`, which `gate_ppid_of` walks, is answered
+# by MSYS2's `ps` with `unknown option -- A`. The ancestry walk therefore returns
+# nothing, the caller is not protected, and the one case that matters goes red:
+# `and the WRAPPER that invoked it -- a candidate by cwd -- survives: expected
+# 'alive', got 'gone'`. That is the script's own macOS warning arriving one platform
+# over -- *a usage error that prints nothing reads exactly like a process with no
+# ancestors* -- and its consequence is that the reaper would kill its own invoker.
+# So this is not merely untested on Windows: do not hand `reap-my-gate.sh` to a
+# Windows lane until that is fixed.
 #
-# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, an otherwise loaded six-lane
-# box: 14 cases, 2.69 s wall, no case skipped. `TIMEOUT 60` is the figure its two
-# neighbours carry rather than a new one, and leaves about 22x.
+# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, 14 cases and no case skipped.
+# A range rather than a number, because the two readings differ by the load and a
+# single figure would silently claim whichever condition the reader assumes: **2.69 s**
+# on a quiet box, **6.87 s** with two other lanes' full gates running. `TIMEOUT 60` is
+# the figure its two neighbours carry rather than a new one, so the margin is ~9x at
+# the worst reading taken here. It is a wall-clock reading and this host steps
+# CLOCK_REALTIME, so treat it as an order of magnitude, not a budget.
 if(NOT WIN32)
     add_test(
         NAME "reap-my-gate-selftest"
@@ -5172,8 +5184,14 @@ endif()
 # property; git reading the result is, and a check that stopped at "the files were
 # written" would report success for a worktree nobody can use.
 #
-# Registered with the flag passed, judged by exit status, `if(NOT WIN32)`: all three
-# for the reasons given on `reap-my-gate-selftest` above.
+# Registered with the flag passed and judged by exit status for the reasons given on
+# `reap-my-gate-selftest` above. `if(NOT WIN32)` is measured here too, and what fires
+# is the self-test's own POSITIVE CONTROL: under Git Bash it reports `git wrote an
+# ABSOLUTE pointer, which is what makes this necessary: expected 'yes', got 'no'`.
+# Windows git writes `D:/...`, which is absolute and does not begin with `/`, so the
+# control correctly says the whole section would be vacuous in that shell rather than
+# letting it pass over a fixture whose premise does not hold. A control doing its job
+# is the reason to guard the registration, not a reason to loosen the control.
 #
 # The script's two SKIP arms -- no git, and a git that could not stage a linked
 # worktree -- exit 0 having said so on the tally line. That is a `SUCCEED` where a skip
