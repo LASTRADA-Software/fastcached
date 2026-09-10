@@ -32,14 +32,42 @@
 #
 #   * `pgrep -f "scripts/local.gate"` is a REGEX and the `.` matches the `-`. A
 #     pattern is broader than its author reads it as.
-#   * `pgrep -f` inside `bash -lc` matches ITS OWN command line, and the
-#     `[p]attern` bracket trick fails the same way.
+#   * `pgrep -f` matches ITS OWN command line, and the bracket trick does NOT save
+#     it -- see below, because the two spellings are one character apart and only
+#     one is safe.
 #   * two worktrees here are named `SAN-408` and `SAN-REQ-408`, one token apart, so
 #     even an exact-looking path fragment matches a neighbour.
+#
+# **THE BRACKET TRICK WORKS IN ONE SPELLING AND NOT THE OTHER, FOR REASONS THAT ARE
+# NOT THE ONE IT IS USUALLY CREDITED WITH.** Both measured on this machine:
+#
+#   * `pgrep -f '[l]ocal-gate.sh'` **self-matches.** pgrep tests the pattern against
+#     every argv INCLUDING ITS OWN, where the bracket is still literally present, so
+#     `[l]ocal-gate.sh` matches the text `[l]ocal-gate.sh`.
+#   * `ps -eo cmd | grep -c '[l]ocal-gate.sh'` **does not.** grep searches the text
+#     `ps` produced; its own argv holds `[l]ocal-gate.sh`, which does not contain
+#     the literal `local-gate.sh` the regex matches.
+#
+# Stated in both directions on purpose: the next reader who finds only the safe
+# spelling will otherwise copy it for the wrong reason and then simplify it back.
+#
+# The observed cost of the unsafe one is precise. A `pgrep -f` listing taken from a
+# lane's own worktree came back with a fourth row -- its own `bash -lc`, `etime=00:00`,
+# `cwd=/mnt/d/fastcached-worktrees/wire` -- which **attributed by cwd is
+# indistinguishable from that lane's gate having just started.** A killer built on
+# that targets its own shell.
 #
 # So the candidate set is built by reading each process's argv for a LITERAL, with
 # no regex engine involved at all -- and then every candidate is ATTRIBUTED by
 # something the command line cannot fake.
+#
+# **THE ASKING PROCESS IS IN THE CANDIDATE SET, and that is the root of both
+# hazards above rather than two separate ones.** The self-match and the cwd
+# coincidence are the same fact: a probe necessarily runs from the worktree of the
+# lane asking the question, so it looks exactly like that lane's gate. Cwd
+# attribution is therefore NECESSARY AND NOT SUFFICIENT. `gate_protected_pids`
+# walks `$$` and its ancestors and removes them before any cwd is consulted, and
+# `spare-self` is decided FIRST in `reap_verdict` for the same reason.
 #
 # **THE ROOT IS ATTRIBUTED BY ITS WORKING DIRECTORY; EVERYTHING ELSE BY ANCESTRY.**
 # That reconciles two rules that read as contradictory. `team-run.md` says to reap
@@ -74,6 +102,29 @@
 # It also never signals itself or any of its own ancestors. Its own cwd is the
 # worktree it was asked about, so without that it would be its own first victim --
 # and would take the shell that invoked it with it.
+#
+# ---------------------------------------------------------------------------
+# Why this does not read the gate lock
+# ---------------------------------------------------------------------------
+#
+# Gate SERIALISATION moved to a `flock` on `~/gate-logs/.gate.lock` while this was
+# being written, which removes command-line matching from the WAITING side
+# entirely. The obvious follow-on is for this to read the holder's pid from the
+# lock and walk down from there, and it is declined for three reasons rather than
+# from not knowing about it:
+#
+#   * **A gate run by hand holds nothing.** `bash scripts/local-gate.sh` typed
+#     straight into a shell is the common case this helper exists for -- a lane
+#     that has to stop its own run -- and it takes no lock. A lock-based killer
+#     would find nothing and report success.
+#   * **The holder is the WRAPPER, not the gate.** The lock is taken by the shell
+#     that then execs the gate, so the pid in it needs the same PPID walk to reach
+#     anything worth signalling.
+#   * **The descendants hold nothing either.** cmake, ninja and ctest are what
+#     orphaning actually costs, and no lock names them.
+#
+# The lock is a real improvement to the convention and it does not answer this
+# question. Said here so the next reader knows it was weighed rather than missed.
 #
 # Usage:
 #   scripts/reap-my-gate.sh [<worktree>]   kill the gate rooted at <worktree>
@@ -443,18 +494,19 @@ reap_self_test() {
     # directory, which is what makes this a test of the attribution rather than of
     # the narrowing.
     #
-    # WHAT STAYS STAGED, said rather than left to be discovered: `spare-self` is
-    # covered by its decision row above and by no live process. Exercising it needs
-    # the reaper to be invoked BY something carrying the marker and standing in the
-    # root -- a gate calling the reaper from its own cleanup -- and arranging that
-    # here means a script named `local-gate.sh` that runs this self-test, which is
-    # recursive. The row is the coverage; the live failure mode is loud rather than
-    # silent, since a reaper that killed its own ancestors would take the run down
-    # and print no verdict at all.
+    # `spare-self` gets a LIVE case of its own below, and it is the one two lanes
+    # independently pointed at: **the process doing the asking is in the candidate
+    # set.** An earlier draft of this file called that arrangement recursive and
+    # left it staged. It is not -- the wrapper calls the REAPER, not this
+    # self-test -- and it is the case that matters most, because the failure is a
+    # helper that kills the shell that invoked it.
     if [ ! -d /proc ] && ! command -v lsof >/dev/null 2>&1; then
         skipped="no way to read another process's cwd on this platform"
     else
-        local scratch outside inside decoy pidOut pidIn
+        local scratch outside inside decoy pidOut pidIn reaper_self
+        # This script, so the wrapper case below invokes the REAPER rather than a
+        # copy of it -- the question is whether the shipped thing spares its caller.
+        reaper_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
         scratch="$(mktemp -d)"
         mkdir -p "${scratch}/mine" "${scratch}/other"
         decoy="${scratch}/${ReapGateMarker}"
@@ -484,6 +536,53 @@ reap_self_test() {
         _reap_expect "the decoy in THIS worktree is gone, by pid" \
             "gone" "$(kill -0 "$pidIn" 2>/dev/null && echo alive || echo gone)"
 
+
+        # --- THE ASKING PROCESS IS IN THE CANDIDATE SET ----------------------
+        #
+        # A wrapper carrying the marker in its argv, standing IN the root, which
+        # invokes the reaper. By cwd it is this lane's gate and would be killed; it
+        # is also the reaper's own parent. It must survive, and the decoy beside it
+        # must not -- a reaper that spared everything would pass the first half
+        # alone.
+        #
+        # This is the shape both hazards other lanes measured reduce to.
+        # `pgrep -f '[l]ocal-gate.sh'` SELF-MATCHES, because pgrep tests the pattern
+        # against its own argv where the bracket is still present; and a probe run
+        # from a lane's worktree is attributed BY CWD to that lane, so its own
+        # `bash -lc` reads as "this lane's gate, just started" with `etime=00:00`.
+        # Neither spelling is consulted here -- `gate_protected_pids` walks `$$` and
+        # its ancestors and removes them from the set before any cwd is looked at --
+        # and this case is what says so.
+        local wrapdir="${scratch}/wrap"
+        mkdir -p "$wrapdir"
+        local wrapper="${wrapdir}/${ReapGateMarker}"
+        printf '#!/usr/bin/env bash\nbash "%s" "%s" >/dev/null 2>&1\nsleep 30\n' \
+            "$reaper_self" "${scratch}/mine" > "$wrapper"
+        chmod +x "$wrapper"
+
+        local victim wrapperPid
+        ( cd "${scratch}/mine" && exec bash "$decoy" ) >/dev/null 2>&1 &
+        victim=$!
+        ( cd "${scratch}/mine" && exec bash "$wrapper" ) >/dev/null 2>&1 &
+        wrapperPid=$!
+
+        # Wait for the reaping to have HAPPENED rather than for a duration: the
+        # decoy dying is the signal that the wrapper's reaper ran to completion.
+        waited=0
+        while [ "$waited" -lt 150 ]; do
+            kill -0 "$victim" 2>/dev/null || break
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
+
+        _reap_expect "a decoy in the root dies when the reaper is invoked from a wrapper" \
+            "gone" "$(kill -0 "$victim" 2>/dev/null && echo alive || echo gone)"
+        _reap_expect "and the WRAPPER that invoked it -- a candidate by cwd -- survives" \
+            "alive" "$(kill -0 "$wrapperPid" 2>/dev/null && echo alive || echo gone)"
+
+        kill -KILL "$wrapperPid" 2>/dev/null || true
+        wait "$wrapperPid" 2>/dev/null || true
+        wait "$victim" 2>/dev/null || true
         kill -KILL "$pidOut" 2>/dev/null || true
         wait "$pidOut" 2>/dev/null || true
         wait "$pidIn" 2>/dev/null || true
