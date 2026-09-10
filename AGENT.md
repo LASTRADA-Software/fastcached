@@ -1806,7 +1806,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
   table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
   restating it — a second copy is not a cross-check, it is a second thing to be
   wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
-  test file in a scoped location carries no tag that expression selects. Both
+  test CASE in a scoped location carries no tag that expression selects. Both
   halves have been wrong once. The tags were: three of them looked complete and
   excluded six of ten `Async/` files, which is what the check was written for.
   Then the SCOPE was: it named three directories, and a `std::thread` census over
@@ -1819,6 +1819,23 @@ what differs between compilers, standard libraries, hosts and tool versions.
   onto a case. What it still cannot check is whether the table is COMPLETE: the
   census is a proxy (a helper spawns the thread; a comment names one) so promoting it
   to a check would refuse correct files and miss incorrect ones.
+- And it proves a CASE, not a FILE. One selected tag ANYWHERE in a file used to cover
+  every case in it, so a 28th case tagged `[fleetchart]` in a file of 27
+  `[distributed]` ones left the sanitized scope with the check reporting covered —
+  the defect the file was written for, one level down (#317). A case's tag string is
+  the **LAST** string literal of its header, never the second: three cases here spell
+  a long name as two adjacent literals, so "second" reads half a NAME as tags, and
+  489 cases tree-wide carry NO tag string, which is caught by ARITY rather than by
+  pattern because a name is free to contain `[async]` and must not talk its way in.
+  A header may span lines (28 in scope do) and may hold an unmatched `(` in a name,
+  so the reader strips the literals BEFORE counting parenthesis depth — a reader that
+  does not still closes a matched pair and passes such a case for the wrong reason.
+  Every way of losing the question is a REFUSAL: a header that never closes, one past
+  a line bound, a scope holding no case at all. `check-tsan-scope.cmake
+  -DFASTCACHED_TSAN_SCOPE_SELFTEST=ON` drives 16 cases over trees staged from the
+  REAL scope table and a copy of the REAL gate; six mutations each redden exactly the
+  case that names them, and reverting to file-level matching reddens nine and leaves
+  the seven that cannot see the difference green.
 - A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
   request unmergeable, not fast: the workflow never triggers, so no check run is
   created and the required context never reports. Master is guarded by a *ruleset*,

@@ -4908,15 +4908,6 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#317](https://github.com/LASTRADA-Software/fastcached/issues/317)** —
-  `scripts/check-tsan-scope.cmake` proves a FILE is in scope, not a test CASE: one
-  selected tag anywhere in a file covers it, so a case added to
-  `Distributed/FleetHistory_test.cpp` tagged only `[fleetchart]` leaves the
-  sanitized scope while the check reports covered. Same shape as the bug the file
-  exists for, one level down. Closing it means matching each
-  `TEST_CASE`/`TEST_CASE_METHOD`/`SCENARIO` tag string, which
-  `check-test-names.cmake` already has the macro pattern for — with the wrinkle
-  that the tag string is usually on the line *after* the macro.
 - **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
   scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
   `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
