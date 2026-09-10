@@ -14,16 +14,9 @@
 namespace FastCache
 {
 
-Connection::Connection(std::unique_ptr<ISocket> socket,
-                       CacheEngine& engine,
-                       ILogger& logger,
-                       SessionContext session,
-                       LogSource logSource) noexcept:
+Connection::Connection(std::unique_ptr<ISocket> socket, ConnectionHoldings held) noexcept:
     _socket { std::move(socket) },
-    _engine { engine },
-    _logger { logger },
-    _session { session },
-    _logSource { logSource }
+    _held { held }
 {
 }
 
@@ -35,20 +28,20 @@ Task<void> Connection::Run()
     // `sourceTag` lives in this coroutine frame and outlives every co_await, so
     // both the decorator and the storage-tag view below can reference it.
     auto sourceTag = std::string {};
-    if (_logSource == LogSource::Yes)
+    if (_held.logSource == LogSource::Yes)
     {
         if (auto const peer = _socket->PeerAddress(); !peer.empty())
             sourceTag = std::format("[{}]", peer);
     }
-    SourceLogger log { _logger, sourceTag };
+    SourceLogger log { _held.logger, sourceTag };
 
     // Wire the session collaborators for trace logging:
     //  - `logger`   : connection-level lines (accept line, non-data commands).
     //  - `sourceTag`: published to Detail::storageSourceTag by handlers so the
     //                 TracingStorage `storage:` line carries the same client IP.
     // Data operations are logged once, on the storage line — not here.
-    _session.logger = &log;
-    _session.sourceTag = sourceTag;
+    _held.session.logger = &log;
+    _held.session.sourceTag = sourceTag;
 
     // Drive any transport handshake (TLS) before reading application bytes.
     // No-op for plaintext sockets; runs on this per-connection coroutine so a
@@ -71,29 +64,29 @@ Task<void> Connection::Run()
     // One Trace line per accepted connection, recording the negotiated
     // protocol. Gated on --log-everything so the default trace output is just
     // the per-operation storage lines; with --log-source it carries the IP.
-    if (_session.logEverything)
+    if (_held.session.logEverything)
         log.Logf(LogLevel::Trace, "connection accepted ({})", ToStringView(detect->flavor));
 
     switch (detect->flavor)
     {
         case ProtocolFlavor::MemcachedText: {
             MemcachedTextHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
+            co_await handler.Run(_socket.get(), &_held.engine, std::move(detect->primer), _held.session);
             break;
         }
         case ProtocolFlavor::MemcachedBinary: {
             MemcachedBinaryHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
+            co_await handler.Run(_socket.get(), &_held.engine, std::move(detect->primer), _held.session);
             break;
         }
         case ProtocolFlavor::RedisResp: {
             RedisRespHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
+            co_await handler.Run(_socket.get(), &_held.engine, std::move(detect->primer), _held.session);
             break;
         }
         case ProtocolFlavor::CompileCache: {
             CompileCacheHandler handler;
-            co_await handler.Run(_socket.get(), &_engine, std::move(detect->primer), _session);
+            co_await handler.Run(_socket.get(), &_held.engine, std::move(detect->primer), _held.session);
             break;
         }
         case ProtocolFlavor::Unknown:
