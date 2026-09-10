@@ -600,6 +600,54 @@ sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
 
+### A fake that RESOLVES what production SUSPENDS on makes every test over it vacuous
+
+The entry above is about a fake carrying its own bugs into every consumer. This one is
+worse and has the opposite tell: **there is nothing wrong with the fake.** #778.
+
+`InMemorySocket::WaitReadable` resolves immediately in all three directions -- error when
+closed, `0` at EOF, `1` otherwise -- and its header says why, in as many words: *"so no
+caller gains a suspension point it did not have"*. That is a correct in-memory transport
+and a deliberate decision. It simply never enters the state the protocol under test is
+DEFINED by, so every assertion written over it holds for a reason unrelated to the
+property being claimed, **and the suite is green whether the protocol is implemented or
+not.** #710 (`RunBlockingRead` re-arming per iteration) and #755 (a watcher surviving the
+transition out of subscribe mode) both sat behind exactly that green.
+
+So the question to ask of a fake is not *is it correct* but **can it reach the state the
+case is about**. Where it cannot, the case needs a real socket -- `PlatformReactor` /
+`PlatformListener`, cross-platform rather than three copies under three `#if`s, because a
+per-platform test is the shape that cannot see the platforms disagreeing.
+
+**Checked-and-present must not render the same as not-checked**, so the survey records
+both. Suspension-defined properties, and where each is exercised:
+
+<!-- table-total: none -->
+| Property | Real-socket case |
+|---|---|
+| `WaitReadable`: EOF vs data vs error | `Net/WaitReadable_test.cpp`, `PlatformReactor` |
+| Read-slot exclusivity (#663) | `tests/ReadSlotGuardCanary.cpp`, must-die |
+| Reactor frees parked frames at `Stop` | `Async/ParkedWork_test.cpp` |
+| Teardown serialised with dispatch | `tests/ReactorTeardownCanary.cpp` |
+| `Read` refuses an empty buffer (#838) | **deliberately `InMemorySocket`** -- a canary aborts at the FIRST violation, so the other five sites are covered by the `read-buffer-guard` scan instead |
+| `CancelRead` retrieves a parked read | `Net/CancelRead_test.cpp` -- **added by #778; before it, Windows only** |
+
+The last row is what the survey was for. `EpollSocket::CancelRead` and
+`KqueueSocket::CancelRead` are real overrides sharing one `Detail::RetireParkedRead`, and
+their only coverage was `Net/IocpSocket_test.cpp` (Windows) and `Testing::ParkingReadableSocket`
+-- a fake built precisely because the shared one will not park. Neither runs on the legs the
+local gate runs.
+
+**And the fake being more permissive is not the only way this bites -- the real transport can
+be less predictable than the contract's wording.** `CancelRead` is documented *idempotent*,
+which invites *call it twice, the second does nothing*. On epoll and kqueue a completion
+resumes the awaiting coroutine INLINE, so the first call's resumption runs that coroutine on
+to its next `Read` and arms it before the second call executes -- and the second cancels the
+new read. Measured while writing the case above: the read after a double cancel came back
+`Cancelled` rather than its bytes. On IOCP the completion is marshalled to a later turn, so
+the same two lines behave differently again. What is idempotent is a cancel with **nothing
+parked**, which is the arrangement the contract is about.
+
 ### A value from another generation is BUILT by the shared helper, never by hand
 
 `tests/ForeignGenerationValue.hpp` (#649). Four cases across two test binaries need a
