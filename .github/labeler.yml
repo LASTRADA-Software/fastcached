@@ -64,6 +64,7 @@ area/protocol:
       - any-glob-to-any-file:
           - 'src/FastCache/Protocol/**'
           - 'src/FastCache/Auth/**'
+          - 'src/apps/fastcache-cli/**'
 
 area/net:
   - changed-files:
@@ -90,6 +91,8 @@ area/observability:
   - changed-files:
       - any-glob-to-any-file:
           - 'src/FastCache/Metrics/**'
+          - 'src/apps/fastcache-cli/**'
+          - 'scripts/fastcache-cli-e2e.sh'
 
 area/packaging:
   - changed-files:
