@@ -307,7 +307,10 @@ else
         requiredNames="$(awk '
             /^RequiredContexts=\(/ { inTable = 1; next }
             inTable && /^\)/       { inTable = 0 }
-            inTable                {
+            # A ROW is a quoted line. Without this guard every comment inside
+            # the table is read as a context name -- measured, 8 phantoms from
+            # the comment above the last row. A COMMENT is not a call site.
+            inTable && /^[ \t]*"/ {
                 line = $0
                 sub(/^[ \t]*"/, "", line); sub(/"[ \t]*$/, "", line); sub(/\|.*$/, "", line)
                 if (length(line)) print line
