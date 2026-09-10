@@ -2147,6 +2147,60 @@ was MEASURED and what was INFERRED, separately, every time.** The receiver canno
 recover the distinction at any price, and the sender can state it for free. A claim
 worth acting on is worth one clause saying which of the two it is.
 
+**And the receiver owes one thing back, because the sender's half does not always get
+done: state what would FALSIFY the claim before opening the file to check it.** Not
+*distrust the sender* -- that does not scale, and a rule nobody can follow is not a
+rule -- but derive the falsifier from the claim itself, first, so that the reading has
+somewhere to go other than the line that agrees.
+
+Two errors an hour apart made the same claim about the same function, and **the
+standard remedy for the first is the action that produced the second**
+([#536](https://github.com/LASTRADA-Software/fastcached/issues/536)). One reader
+inferred `RunLaunchctl`'s implementation from its caller's error message and reported a
+defect; the fix for that is *go and read the source*. The second reader **read the
+source** and wrote the defect down anyway.
+
+So "read the source" cannot be the lesson here: it is the step that was taken. The
+first error is cheap and self-correcting -- reading catches it, and reading is what
+eventually did. The second is expensive and **not** self-correcting, because the
+corrective action has already been performed and produces the feeling of having
+checked.
+
+What separated them was the ORDER of question and evidence. The second reader arrived
+holding a hypothesis handed over by the first -- *a stale constant standing in for a
+measurement*, the `waited += poll` silhouette this rulebook already records -- and the
+line
+
+```cpp
+return std::format("killed after {}s with no result", LaunchctlTimeoutSeconds);
+```
+
+matches that silhouette exactly. It takes reading the **loop** to see that a
+`steady_clock` deadline with a 20 ms poll and a `SIGKILL` at expiry makes `60s` the
+measurement, to within about 20 ms.
+
+**Confirmation stops at the format string; falsification has to reach the loop.**
+Reading for confirmation terminates at the first line that matches the shape, and a
+match is close to guaranteed when the shape was supplied by somebody who had also not
+read it. The falsifier here is one question -- *what would make the printed number
+differ from the elapsed?* -- and it walks straight past the format string into the
+loop, which is the only place the answer lives. Without it, *"I read the code"* is
+compatible with having read exactly the line that agreed.
+
+That is the second-order half of the handoff rule rather than a separate idea: a
+handed-over shape **carries no evidence and arrives already sounding checked**, having
+been stated as a finding rather than as a suspicion, which is a defect in the handover
+before it is one in the reading. Stated compactly, **a relayed diagnosis is relayed
+code** -- forwarding a shape propagates its bugs, and reviewing it as though you had
+written it yourself is the only reading that catches them.
+
+It is not the *absence of the negative is not the positive* rule in
+[`.agent/rules/metrics-and-observability.md`](metrics-and-observability.md), which
+covers concluding from a COUNT OF BAD THINGS. This is the opposite direction:
+concluding from a **presence** that matches an expected shape. The positive-control
+remedy there -- ask the probe for something it must find -- is the same instinct in its
+running-a-check form, and this is its form for reading code.
+
 **And where a question can be settled by ATTEMPTING THE ACTION rather than by reading
 the state and reporting it, attempt it:** a claim freezes the read permanently, carries
 no timestamp and cannot be refused by anything downstream, whereas a request against the
