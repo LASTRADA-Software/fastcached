@@ -208,11 +208,11 @@ e2e_begin "dist-compile E2E" "$workdir"
 #
 # IT IS THE ONLY BUDGET IN THIS FIXTURE, and it was not until #643. The counter
 # wait kept a hand-written loop with its own `seconds=10`, so an operator raising
-# this number -- the documented remedy for a slow box -- scaled twenty-one waits
-# and not the one a slow box lengthens most: the others wait for a process to
-# bind, that one waits for a COMPILE to finish and a counter to rise. It failed at
-# the one place the remedy did not reach, and said the worker never got there,
-# which is true and points at the worker rather than at the budget.
+# this number -- the documented remedy for a slow box -- scaled every wait here
+# except the one a slow box lengthens most: the others wait for a process to bind,
+# that one waits for a COMPILE to finish and a counter to rise. It failed at the
+# one place the remedy did not reach, and said the worker never got there, which
+# is true and points at the worker rather than at the budget.
 #
 # It was not simply converted at the time because `wait_until` cannot say its
 # three terminal states. That is what the library's findings hook is for, so the
@@ -373,6 +373,12 @@ start_node() {
 # that address is what the caller then probes. Everything else is the caller's,
 # including the log level: a default plus an override is the same flag twice, and
 # which wins is then the option table's overwrite order.
+#
+# THE READINESS LINE IS `Info`, so a caller that passes `--log-level=warn` gets a
+# daemon that never writes the marker and a wait that spends its whole budget. The
+# failure names the marker and dumps the log, so it is diagnosable rather than
+# silent -- but it is a trap, and `Info` is the config default, so the flag can
+# only ever move AWAY from it. Every call site here says `info` explicitly.
 #
 # @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message
 #          about this daemon
