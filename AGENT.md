@@ -1457,6 +1457,13 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Neither a `.pkg` nor an MSI has a conffile mechanism — only a `.default` ships.
 - Every `build.yml` checkout that could configure passes `fetch-depth: 0`, and the
   release job's asset list stays the **last** key of its `with:` mapping.
+- **A new INSTALLED binary is not one CMake row.** CPack installs the whole Runtime
+  component while the three `Package (...)` jobs name their build targets by hand, so
+  a target with an `install()` rule that no packaging job builds fails at INSTALL time
+  on all three platforms at once — and none of those contexts is required, so it lands
+  on whoever cuts the release. Three `--target` lines in `build.yml`, the macOS
+  redistributable loop (a different list: payload, not symlinks) and
+  `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
 
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.

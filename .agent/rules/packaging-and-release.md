@@ -41,6 +41,40 @@ installer pane, the version derivation, or the release job's asset list.
   asserts the result with `otool -L`. `CMAKE_OSX_DEPLOYMENT_TARGET` is pinned to
   13.3 (the floor at which the system libc++ has floating-point `std::to_chars`,
   which `std::format` needs) and must be set *before* `project()`.
+- **A new installed binary is not one CMake row: the three packaging jobs name
+  their build targets EXPLICITLY, and CPack installs the whole Runtime
+  component.** So a target carrying an `install()` rule that no packaging job
+  builds fails at INSTALL time rather than at build time, on every platform at
+  once:
+
+  ```
+  file INSTALL cannot find ".../target/fastcache-cli": No such file or directory
+  ```
+
+  Measured (PR #1198): all three `Package (...)` jobs failed identically, and the
+  two non-macOS ones had failed on the previous run too and were misread as
+  cascades of an unrelated macOS build error -- which is what a shared cause looks
+  like when one platform is red for a second reason. Add the target to all three
+  `cmake --build ... --target ...` lines in `build.yml`, to the macOS *redistributable*
+  loop -- a separate list, because that one asks which binaries are in the PAYLOAD
+  while `FASTCACHED_MACOS_LINKED_TOOLS` asks which get a `/usr/local/bin` symlink,
+  and the two coincide today without having to -- and to
+  `FASTCACHED_MACOS_LINKED_TOOLS` itself.
+
+  `macos-package-e2e.sh` used to keep two more copies of that symlink list, and
+  the new binary reached the variable and neither copy: its symlink was asserted
+  neither present after an install nor **removed** after an uninstall, the second
+  being the direction nothing else in the tree reports. It derives them now
+  (`linked_tools`, which REFUSES when it reads nothing, because an empty list makes
+  both loops pass vacuously).
+
+  **None of the `Package (...)` contexts is required**, so this does not block a
+  merge -- `check-release-gate` stops a red packaging job shipping, which means the
+  cost lands at release time on whoever is cutting it. A guard deriving each
+  packaging job's target list from the installed set is
+  [#1202](https://github.com/LASTRADA-Software/fastcached/issues/1202); until it
+  exists, the list above is the whole of it.
+
 ## The version
 
 - **The git tag is the only version source, and `version.txt` must never come
