@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 using namespace FastCache;
@@ -145,6 +146,62 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
 }
 
 #if !defined(_WIN32)
+namespace
+{
+
+/// Read the process-wide SIGPIPE disposition.
+/// @return The installed handler, or `SIG_ERR` when it could not be read.
+[[nodiscard]] auto ReadSigPipeDisposition() noexcept -> void (*)(int)
+{
+    struct sigaction current {};
+    if (::sigaction(SIGPIPE, nullptr, &current) != 0)
+        return SIG_ERR;
+    return current.sa_handler;
+}
+
+/// Name a SIGPIPE disposition, so a failure prints what it saw rather than a pointer.
+/// @param disposition The handler to name.
+/// @return A readable name for it.
+[[nodiscard]] std::string_view NameSigPipeDisposition(void (*disposition)(int))
+{
+    if (disposition == SIG_DFL)
+        return "SIG_DFL";
+    if (disposition == SIG_IGN)
+        return "SIG_IGN";
+    if (disposition == SIG_ERR)
+        return "SIG_ERR -- the disposition could not be read at all";
+    return "a handler installed by something in this process";
+}
+
+/// The SIGPIPE disposition this process was HANDED, read before any case runs.
+///
+/// The case below asserts a DELTA against this, where it used to assert the
+/// absolute value `SIG_DFL` -- and the difference is the very thing the case is
+/// about. An ignored disposition is inherited across fork AND exec, which is the
+/// sentence this case exists to keep true, so the absolute form is a claim about
+/// the whole process ANCESTRY rather than about this library: a parent that
+/// ignores SIGPIPE hands it down, and the assertion then reads `SIG_IGN` with
+/// nothing in this tree having touched a signal.
+///
+/// Not hypothetical, and not equally reachable from every leg. #1229 was this
+/// case failing `clang-tsan` while passing four other Linux legs on the same
+/// commit: the ThreadSanitizer gate execs this binary straight from its step's
+/// shell and inherits whatever that process tree holds, while every other leg
+/// reaches the case through ctest, which spawns each case with libuv and resets
+/// every disposition to `SIG_DFL` in the child. Measured in both directions on
+/// one host, one case, no ordering involved: from a parent that ignores SIGPIPE
+/// a direct exec of this binary fails `0x1 == nullptr` -- byte for byte what CI
+/// reported -- and the same case launched by ctest from that same parent passes.
+///
+/// Read at static-initialisation time, which is before any case runs. Order
+/// across translation units is unspecified, so what this cannot see is another
+/// static initialiser arming SIGPIPE first. Nothing in `src/` does: the only
+/// `SIG_IGN` in the tree is `ArmNoSigPipe`'s `#else` arm, which Linux never
+/// compiles because `MSG_NOSIGNAL` is defined.
+auto const InheritedSigPipeDisposition = ReadSigPipeDisposition();
+
+} // namespace
+
 TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][socket]")
 {
     // The defect this file's per-socket suppression exists for, asserted directly
@@ -162,6 +219,13 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
     //
     // Nothing observable goes wrong in the parent, which is why this needs saying
     // out loud: the daemon kept working, and only the children were affected.
+    //
+    // Asserted as a DELTA and not as the absolute `SIG_DFL` it used to be. The
+    // reasoning is on `InheritedSigPipeDisposition` above, and it is the same
+    // inheritance the paragraph above describes, pointed at this case.
+    auto const before = ReadSigPipeDisposition();
+    REQUIRE(before != SIG_ERR);
+
     auto listener = BindEphemeral();
     if (listener == nullptr)
         SKIP("no loopback listener available on this host");
@@ -170,9 +234,32 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
     auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
-    struct sigaction current {};
-    REQUIRE(::sigaction(SIGPIPE, nullptr, &current) == 0);
-    CHECK(current.sa_handler == SIG_DFL);
+    auto const after = ReadSigPipeDisposition();
+    REQUIRE(after != SIG_ERR);
+
+    INFO("handed to this process: " << NameSigPipeDisposition(InheritedSigPipeDisposition));
+    INFO("before this case touched a socket: " << NameSigPipeDisposition(before));
+    INFO("after: " << NameSigPipeDisposition(after));
+
+    // TWO questions, repaired in two different places, so two CHECKs rather than
+    // one. `after == before` says this case's own socket use changed nothing --
+    // the case's literal title. `after == InheritedSigPipeDisposition` says
+    // nothing ANYWHERE in this process has, which is the stronger claim and is
+    // only askable here: under ctest every case is its own process, so an arm by
+    // an earlier case is invisible, while the ThreadSanitizer gate runs the whole
+    // tag expression in ONE process, where it is not.
+    CHECK(after == before);
+    CHECK(after == InheritedSigPipeDisposition);
+
+    // What neither CHECK can see is a process that was handed `SIG_IGN` to begin
+    // with: an arm by this library would then change nothing, and both pass. So
+    // that environment is named OUT LOUD instead of passing quietly -- a green
+    // case there has not established what a green case elsewhere establishes, and
+    // those are two states one `passed` collapses into one.
+    if (InheritedSigPipeDisposition != SIG_DFL)
+        WARN("this process was handed SIGPIPE = " << NameSigPipeDisposition(InheritedSigPipeDisposition)
+                                                  << ", so this case could only assert that nothing changed the "
+                                                     "disposition, not that it is SIG_DFL. See #1229.");
 }
 #endif
 
