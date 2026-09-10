@@ -110,25 +110,6 @@ namespace
         return { .disposition = disposition, .token = {} };
     }
 
-    /// The canonical token for a path under one of the layout's roots.
-    ///
-    /// Spelled once because two questions need it and they must not answer
-    /// differently: what to hash, and — for a drive-relative path — whether the
-    /// layout can place it at all. `Canonicalize` returns its input verbatim for a
-    /// path it did not rewrite, so inequality is what says a token was produced —
-    /// and it is the only test there is, nothing in PathCanon being able to fail.
-    ///
-    /// @param path   A normalized, `/`-separated path.
-    /// @param layout This machine's roots.
-    /// @return The token, or nothing when the path lies under no root.
-    [[nodiscard]] std::optional<std::string> RootToken(std::string const& path, PathCanon::Layout const& layout)
-    {
-        auto canon = PathCanon::Canonicalize(path, layout);
-        if (canon != path)
-            return canon;
-        return std::nullopt;
-    }
-
     /// The portable form of one raw dependency path, or the reason this machine
     /// must not hash it. See the header for why each branch is load-bearing.
     ///
@@ -242,7 +223,7 @@ namespace
             // exactly one root test -- `ClassifyAgainstRoots` above, whose answer
             // also carries the near miss below, so naming that third outcome bought
             // no extra pass over the path.
-            if (driveRelative && !RootToken(path, layout).has_value())
+            if (driveRelative && !PathCanon::CanonicalToken(path, layout).has_value())
                 return Dropped(PathDisposition::DriveRelative);
 
             // A root spelled almost right, read off the classification rather than
@@ -263,7 +244,7 @@ namespace
             return Dropped(PathDisposition::Toolchain);
         }
 
-        if (auto token = RootToken(path, layout); token.has_value())
+        if (auto token = PathCanon::CanonicalToken(path, layout); token.has_value())
             return { .disposition = PathDisposition::Keyed, .token = *std::move(token) };
 
         // `ClassifyAgainstRoots` called this path rooted and `Canonicalize` then
@@ -343,7 +324,8 @@ bool IsDriveRelativeUnderNoRoot(std::string_view path, PathCanon::Layout const& 
             break;
     }
 
-    // RootToken, not a second spelling of the same Canonicalize-and-compare: this
+    // `PathCanon::CanonicalToken`, not a second spelling of the same
+    // Canonicalize-and-compare: this
     // is the SAME question PortableForm asks one line above its own
     // `PathDisposition::DriveRelative` return, and two spellings of it are two
     // places for the rule to drift. What differs is only which input each is handed
@@ -354,7 +336,7 @@ bool IsDriveRelativeUnderNoRoot(std::string_view path, PathCanon::Layout const& 
     // a root (`-IC:foo\..\src`), where this refuses a compile the root would have
     // placed. Conservative in the safe direction, and unreachable without a
     // drive-relative argument that also needs normalizing.
-    return !RootToken(std::string { path }, layout).has_value();
+    return !PathCanon::CanonicalToken(std::string { path }, layout).has_value();
 }
 
 std::string DescribeDropped(DependencySet const& set)

@@ -164,21 +164,6 @@ namespace
         return PathRole::Toolchain;
     }
 
-    /// Canonicalize a path already classified as Project.
-    /// @param resolved An absolute, normalized path under one of the roots.
-    /// @param layout   This build's roots.
-    /// @return The token, or nullopt when Canonicalize declined to rewrite it.
-    [[nodiscard]] std::optional<std::string> ProjectToken(std::string const& resolved, PathCanon::Layout const& layout)
-    {
-        auto canonical = PathCanon::Canonicalize(resolved, layout);
-        // Canonicalize returns its input verbatim for a path it did not rewrite, so
-        // inequality is what says a token was produced -- and it is the only test
-        // there is, nothing in PathCanon being able to fail.
-        if (canonical == resolved)
-            return std::nullopt;
-        return canonical;
-    }
-
 } // namespace
 
 std::string EncodeManifest(DirectManifest const& manifest)
@@ -759,7 +744,7 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
             // `ClassifyAgainstRoots` separates it, precisely so that a marker match
             // is never re-examined against the roots afterwards and reported as a
             // misspelling. It has its own arm below.
-            auto const rooted = ProjectToken(resolved, layout).has_value();
+            auto const rooted = PathCanon::CanonicalToken(resolved, layout).has_value();
             return std::unexpected(ManifestFailure {
                 .fault = rooted ? ManifestFault::ToolchainLike : ManifestFault::OutsideRoots, .path = std::move(resolved) });
         }
@@ -775,7 +760,7 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
             break;
     }
 
-    auto token = ProjectToken(resolved, layout);
+    auto token = PathCanon::CanonicalToken(resolved, layout);
     // Answered rather than asserted. `PathRole::Project` means the classifier placed
     // the path under a root, and since issue #562 that is the same
     // `PathCanon::RelateToLayout` the canonicalizer's rule agrees with, so a token
@@ -862,7 +847,7 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
                 // compile direct mode; the ordinary preprocessed key still serves it.
                 return std::unexpected(ManifestFailure { .fault = ManifestFault::Unanchored, .path = resolved });
             case PathRole::Project: {
-                auto token = ProjectToken(resolved, layout);
+                auto token = PathCanon::CanonicalToken(resolved, layout);
                 // As in CanonicalSourceToken: answered rather than asserted, the two
                 // root tests having been one predicate since issue #562, and the near
                 // miss it used to report is asked for by name in the arm above.

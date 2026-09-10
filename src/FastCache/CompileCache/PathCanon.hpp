@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -312,6 +313,40 @@ enum class Anchor : std::uint8_t
 ///         verbatim when under neither root — which is how a caller tells the two
 ///         apart, there being nothing here that can fail.
 [[nodiscard]] std::string Canonicalize(std::string_view absolutePath, Layout const& layout);
+
+/// `Canonicalize`, with "it produced nothing" as a disengaged optional.
+///
+/// **This asks nothing about the path and assumes nothing about its caller** (#122),
+/// which is the whole reason it can be shared. It was two file-local copies --
+/// `DirectManifest`'s `ProjectToken` and `DependencyProbe`'s `RootToken` -- identical
+/// in substance and sitting behind DIFFERENT preconditions, and those preconditions
+/// are load-bearing:
+///
+///   * `ProjectToken`'s caller has already run `ClassifyResolved`, so its `nullopt`
+///     means a path classified Project that nonetheless did not rewrite, and it
+///     becomes `DirectError::NotCanonical`.
+///   * `RootToken` is asked of any normalized path, so its `nullopt` means *under no
+///     root*, which `PortableForm` then reads for two questions at once: what to hash
+///     and whether a drive-relative path can be placed at all.
+///
+/// So what is shared is the COMPUTATION, and what each `nullopt` MEANS stays at the
+/// call site. Folding the preconditions in here as an assert or a classification step
+/// would give one caller the other's contract -- which reads as a tidy-up and is a
+/// silent classification change.
+///
+/// It is also why this is not the place to unify the three filters that disagree
+/// about a RELATIVE path: `IsCheckable` keeps every relative path, `BuildManifest`
+/// refuses the whole manifest rather than dropping one, and only `PortableForm`
+/// resolves before deciding. Each is right for its own question, none of them reaches
+/// this function with a relative path, and a shared helper that took a position on
+/// them would be wrong for two of the three.
+///
+/// @param path   An absolute, normalized path. What made it absolute, and whether it
+///               was classified first, is the caller's business.
+/// @param layout The roots to rewrite against.
+/// @return The canonical token, or nullopt when `Canonicalize` left the path alone --
+///         which is the only signal there is, nothing here being able to fail.
+[[nodiscard]] std::optional<std::string> CanonicalToken(std::string const& path, Layout const& layout);
 
 /// Rewrite a canonical token back to an absolute path for the given layout.
 /// @param token  A token previously produced by Canonicalize.

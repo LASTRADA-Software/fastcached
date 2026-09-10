@@ -722,6 +722,17 @@ std::string Canonicalize(std::string_view absolutePath, Layout const& layout)
     return CanonicalizeOne(absolutePath, layout, FoldRoots(layout));
 }
 
+std::optional<std::string> CanonicalToken(std::string const& path, Layout const& layout)
+{
+    auto canonical = Canonicalize(path, layout);
+    // Inequality is the signal, per `Canonicalize`'s own contract. Compared against
+    // the INPUT rather than tested for a sentinel prefix: a layout may legitimately
+    // have a root whose token spelling appears in an unrewritten path.
+    if (canonical == path)
+        return std::nullopt;
+    return canonical;
+}
+
 std::string Localize(std::string_view token, Layout const& layout)
 {
     return LocalizeOne(token, layout);
