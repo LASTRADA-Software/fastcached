@@ -61,7 +61,41 @@ concurrency:
   # A cancelled required context is not a reported one, and the queue would stall
   # on exactly the check this trigger was added to deliver.
   group: pr-labels-${{ github.event.pull_request.number || github.event.merge_group.head_ref }}
-  cancel-in-progress: true
+  # **`false`, and the reason is the sentence three lines above this one** (#761, #820).
+  #
+  # That paragraph already says a cancelled required context is not a reported one.
+  # It fixed the `merge_group` half by splitting the key, and left the
+  # `pull_request_target` half doing exactly what it describes -- because there the
+  # collision is not between two queue entries, it is between two runs answering for
+  # ONE pull request at ONE head SHA.
+  #
+  # The events this workflow listens for include `labeled`, `unlabeled` and `edited`,
+  # **none of which changes the head SHA**. So the superseding run reports on the same
+  # commit as the run it cancelled, and until it finishes the required context
+  # `Require a type label` on that commit is `cancelled` -- neither pass nor fail, and
+  # a blocked pull request.
+  #
+  # This is why `build.yml` keeps `cancel-in-progress: true` and is not a defect: it
+  # triggers on `push` and a bare `pull_request:` (`opened`, `synchronize`,
+  # `reopened`), so a superseding run there carries a NEW SHA and the contexts it
+  # cancels belong to a commit nothing gates on any more.
+  #
+  # Measured on this repository, the 100 most recent `pr-labels` runs
+  # (2026-09-10T00:34Z .. 20:36Z): **14 cancelled**, every one superseded by a
+  # same-branch run seconds to minutes later, in chains of up to three. Four inspected
+  # by hand all reported `Require a type label` as `completed/cancelled`, and in three
+  # of the four `Apply derivable labels` had already SUCCEEDED -- the labels were on
+  # the pull request and only the verdict was thrown away.
+  #
+  # The cost of `false` is a runner start: a superseded run finishes instead of being
+  # killed, and this workflow takes 20 s to 4 min. What it buys is that a verdict this
+  # repository requires is never discarded after being computed.
+  #
+  # What this does NOT claim: GitHub also cancels a run that is still PENDING when a
+  # newer one queues, and that happens whatever this setting says. Every one of the 14
+  # observed was cancelled while in progress, so that residual is unmeasured here
+  # rather than shown absent.
+  cancel-in-progress: false
 
 jobs:
   apply:
