@@ -45,7 +45,12 @@ Enumerate() {
 Check() {
     local root="$1" out mode total=0 shebanged=0 bad=0 rc=0
     out=$(Enumerate "$root")
-    mode=$(printf '%s\n' "$out" | head -1)
+    # NOT `printf ... | head -1`. `head` leaves after its line, `printf` takes
+    # SIGPIPE, `pipefail` reports PRINTF's status and the `set -e` above aborts
+    # the whole script -- measured as a deterministic exit 141 with no output at
+    # all under MSYS2 bash, on every Windows developer's machine (#1111). Pure
+    # bash here: no pipe, no fork, nothing to lose.
+    mode=${out%%$'\n'*}
     echo "check-script-modes: enumerated via $mode"
 
     local line filemode path first
@@ -116,7 +121,7 @@ Assert() {  # $1 = label, $2 = dir, $3 = expect pass|fail, $4 = expected mode
     cases=$((cases + 1))
     case "$4" in
         ?*) grep -q "enumerated via $4" <<< "$out" \
-                || { echo "  FAIL: $1 -- expected enumeration '$4', got: $(printf '%s' "$out" | head -1)"; exit 1; } ;;
+                || { echo "  FAIL: $1 -- expected enumeration '$4', got: ${out%%$'\n'*}"; exit 1; } ;;
     esac
     if [ "$3" = pass ] && [ "$rc" -ne 0 ]; then echo "  FAIL: $1 -- expected a pass"; printf '%s\n' "$out"; exit 1; fi
     if [ "$3" = fail ] && [ "$rc" -eq 0 ]; then echo "  FAIL: $1 -- expected a refusal"; printf '%s\n' "$out"; exit 1; fi
@@ -147,6 +152,6 @@ out=$(Check "$tmp/nogit" 2>&1 || true)
 cases=$((cases + 1))
 grep -q "enumerated via walk" <<< "$out" \
     && echo "  ok: a non-git tree falls back to the walk" \
-    || { echo "  FAIL: a non-git tree did not use the walk: $(printf '%s' "$out" | head -1)"; exit 1; }
+    || { echo "  FAIL: a non-git tree did not use the walk: ${out%%$'\n'*}"; exit 1; }
 
 echo "check-script-modes self-test: $cases case(s) ran, all as expected"
