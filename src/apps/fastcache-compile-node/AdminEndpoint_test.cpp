@@ -321,12 +321,16 @@ TEST_CASE("A node with no cache tier reports no cache", "[node][admin][cache]")
                                                                        .busySlots = [] { return std::size_t { 2 }; },
                                                                        .cache = nullptr,
                                                                        .slots = 4,
-                                                                       .scratchRoot = std::filesystem::path { "." } },
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
                                                    std::chrono::steady_clock::now());
 
     auto const snapshot = provider();
     CHECK_FALSE(snapshot.storage.has_value());
     CHECK_FALSE(snapshot.upstreamConfigured.has_value());
+    // And no consensus either, for the same reason and by the same spelling: this
+    // node runs none, which is a different fact from running one that counts nobody.
+    CHECK_FALSE(snapshot.consensus.has_value());
     for (auto const& tier: snapshot.storageTiers)
         CHECK_FALSE(tier.has_value());
 
@@ -350,7 +354,8 @@ TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node]
                                                                        .busySlots = [] { return std::size_t { 0 }; },
                                                                        .cache = nullptr,
                                                                        .slots = 4,
-                                                                       .scratchRoot = std::filesystem::path { "." } },
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
                                                    std::chrono::steady_clock::now());
 
     auto const body = RenderPrometheus(metrics, provider());
@@ -363,6 +368,76 @@ TEST_CASE("A scrape renders nothing for a cache the node does not have", "[node]
     // And the machine is still there, so this is an absence rather than an empty
     // scrape that would pass the checks above for the wrong reason.
     CHECK(body.contains("fastcache_node_logical_cores 4\n"));
+}
+
+TEST_CASE("A scrape renders no consensus series for a node that runs none", "[node][admin][consensus]")
+{
+    // The absence #435 has to be able to spell. A node with no `--listen-raft` leads
+    // itself and holds no configuration for anybody to read, so a member count of
+    // zero would be a claim about a cluster it is not part of -- while a node that
+    // DOES run consensus and counts nobody is the #388 state and must render. The
+    // two are told apart by whether the block is here at all, which is what the next
+    // case asserts from the other side.
+    ScrapeHost host;
+    AtomicMetricsSink metrics;
+    auto const provider = MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                                       .busySlots = [] { return std::size_t { 0 }; },
+                                                                       .cache = nullptr,
+                                                                       .slots = 4,
+                                                                       .scratchRoot = std::filesystem::path { "." },
+                                                                       .consensus = {} },
+                                                   std::chrono::steady_clock::now());
+
+    auto const body = RenderPrometheus(metrics, provider());
+    CHECK_FALSE(body.contains("fastcache_node_consensus_"));
+    // The positive control: the scrape is not simply empty, which is what would make
+    // the check above pass for the wrong reason.
+    CHECK(body.contains("fastcache_node_logical_cores 4\n"));
+}
+
+TEST_CASE("A node that runs consensus reports what IT counts, per scrape", "[node][admin][consensus]")
+{
+    // The other side of the absence, and the sampling rule with it. A role and a
+    // term are what move -- a node is deposed between one scrape and the next -- so
+    // a value captured when the provider was built would look current and describe
+    // the election before last. `busySlots` is a callable for the same reason and
+    // this is the stronger case of it, since a stale role is read as a fact about
+    // who leads.
+    ScrapeHost host;
+    AtomicMetricsSink metrics;
+    auto reads = std::size_t { 0 };
+    auto const provider =
+        MakeNodeSnapshotProvider(NodeScrapeSources { .host = &host,
+                                                     .busySlots = [] { return std::size_t { 0 }; },
+                                                     .cache = nullptr,
+                                                     .slots = 4,
+                                                     .scratchRoot = std::filesystem::path { "." },
+                                                     .consensus =
+                                                         [&reads] {
+                                                             ++reads;
+                                                             return ConsensusStatus {
+                                                                 .members = { "n1", "n2" },
+                                                                 .knownLeader = Consensus::NodeId { "n1" },
+                                                                 .term = Consensus::Term { .value = reads },
+                                                                 .commitIndex = Consensus::LogIndex { .value = 7 },
+                                                                 .role = Consensus::Role::Follower,
+                                                             };
+                                                         } },
+                                 std::chrono::steady_clock::now());
+
+    auto const first = provider();
+    REQUIRE(first.consensus.has_value());
+    CHECK(Unwrap(first.consensus).members == std::vector<Consensus::NodeId> { "n1", "n2" });
+    CHECK(Unwrap(first.consensus).knownLeader == Consensus::NodeId { "n1" });
+    CHECK(Unwrap(first.consensus).commitIndex.value == 7);
+    CHECK(Unwrap(first.consensus).term.value == 1);
+
+    // Asked AGAIN, and the term has moved: the second reading is a second read
+    // rather than the first one remembered.
+    auto const second = provider();
+    REQUIRE(second.consensus.has_value());
+    CHECK(Unwrap(second.consensus).term.value == 2);
+    CHECK(reads == 2);
 }
 
 TEST_CASE("A dashboard credential is read from its file, newline and all", "[node][admin][dashboard]")

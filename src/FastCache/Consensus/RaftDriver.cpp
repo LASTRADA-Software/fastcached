@@ -209,7 +209,14 @@ std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(std::vecto
 RaftDriver::Progress RaftDriver::CurrentProgress() const
 {
     auto const guard = std::scoped_lock { _mutex };
-    return Progress { .members = _node.ActiveMembers(), .commitIndex = _node.CommitIndex(), .term = _node.CurrentTerm() };
+    return Progress { .members = _node.ActiveMembers(),
+                      .commitIndex = _node.CommitIndex(),
+                      .term = _node.CurrentTerm(),
+                      .role = _node.CurrentRole(),
+                      // Copied out rather than referenced, like `members`: the timer
+                      // loop and every peer reader move this, and the lock ends with
+                      // this statement.
+                      .knownLeader = _node.KnownLeader() };
 }
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)

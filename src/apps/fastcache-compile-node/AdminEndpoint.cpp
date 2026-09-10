@@ -52,6 +52,14 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
             // upstream question to answer either, and a `0` there would claim it
             // does and has none.
             .upstreamConfigured = sources.cache != nullptr ? std::optional { sources.cache->HasUpstream() } : std::nullopt,
+            // And what this node counts as its own cluster, when it runs consensus
+            // at all. Sampled here rather than captured: a role and a term are what
+            // move, and a stale pair is worse than none because it looks current.
+            //
+            // Absent when there is no consensus -- and an absence rather than an
+            // empty member set, because a node that RUNS consensus and holds no
+            // configuration is the #388 state and has to be visible, not silent.
+            .consensus = sources.consensus ? std::optional { sources.consensus() } : std::nullopt,
             .uptime =
                 Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt) },
         };

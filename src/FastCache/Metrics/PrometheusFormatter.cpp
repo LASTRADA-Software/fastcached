@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
+// For `RoleTable`, which is what the role state-set's label values come from --
+// `Role` itself is in `RaftTypes.hpp` and reaches the header. Same rule the tier
+// samples follow against `StorageTierTable`: a fifth role reaches the scrape by
+// being a row rather than by somebody remembering a second place.
+#include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 
@@ -295,6 +300,97 @@ static void AppendTierMetrics(std::string& out, TieredStorageStats const& tiers)
     }
 }
 
+/// Render what a node believes about its own Raft cluster.
+///
+/// Gauges, every one: they describe a state rather than count events, which is why
+/// they arrive in the snapshot instead of through the counter-only sink. Called
+/// only for a process that runs consensus — see `MetricsSnapshot::consensus`, and
+/// `ConsensusStatus` for why an empty member set is a reading rather than an
+/// absence.
+/// @param out Destination.
+/// @param status What this node counts.
+static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& status)
+{
+    using enum MetricType;
+
+    // The size and the term first, unconditionally: they are what makes the block's
+    // PRESENCE readable, and the two label-carrying series below are absent in states
+    // that are perfectly ordinary. Without an unconditional row a node holding no
+    // configuration during an election would render nothing at all, which reads as a
+    // process with no consensus rather than as the one thing #435 exists to show.
+    Append(out,
+           Metric { .name = "fastcache_node_consensus_members",
+                    .help = "Members in the configuration this node's consensus operates under. 0 is a reading, not "
+                            "an absence: the node holds no configuration, so it campaigns in no election and grants "
+                            "no vote. That is the ordinary waiting state of a --raft-join node and a fault for any "
+                            "other. A process running no consensus renders none of these series at all.",
+                    .type = Gauge,
+                    .value = static_cast<std::uint64_t>(status.members.size()) });
+
+    Append(out,
+           Metric { .name = "fastcache_node_consensus_term",
+                    .help = "The election term this node is operating in. A gauge rather than a counter: wiping the "
+                            "state directory legitimately resets it, and a counter that resets renders as a spike.",
+                    .type = Gauge,
+                    .value = status.term.value });
+
+    Append(out,
+           Metric { .name = "fastcache_node_consensus_commit_index",
+                    .help = "How far this node's replicated log is committed. Far behind its peers means it is being "
+                            "caught up rather than participating.",
+                    .type = Gauge,
+                    .value = status.commitIndex.value });
+
+    // A state set: one sample per role, exactly one of them 1. The label values come
+    // from `RoleTable` rather than a hand-written list -- the same rule the counters
+    // follow against `MetricsCatalog` and the tier samples against
+    // `StorageTierTable`, so a fifth role reaches the scrape by being a row.
+    //
+    // `# HELP` and `# TYPE` once, with the samples following: repeating them per
+    // label value is what a parser rejects.
+    out += std::format("# HELP {0} {1}\n# TYPE {0} {2}\n",
+                       "fastcache_node_consensus_role",
+                       "What this node is playing in its cluster. Exactly one sample is 1.",
+                       TypeName(Gauge));
+    for (auto const& row: Consensus::RoleTable)
+        out += std::format("fastcache_node_consensus_role{{role=\"{}\"}} {}\n", row.name, row.role == status.role ? 1 : 0);
+
+    // One sample per member, carrying its id. The SET rather than only its size,
+    // because "which members does this node count" is the question an operator asks
+    // when a cluster will not re-elect, and the count alone cannot answer it.
+    //
+    // No line at all for a node holding no configuration -- the rule a tier the cache
+    // does not have already follows, and readable here for the same reason: the three
+    // series above are unconditional, so their presence is what says consensus is
+    // running and this one's absence says the configuration is empty.
+    if (!status.members.empty())
+    {
+        out += std::format("# HELP {0} {1}\n# TYPE {0} {2}\n",
+                           "fastcache_node_consensus_member",
+                           "One sample per member of the configuration this node operates under.",
+                           TypeName(Gauge));
+        for (auto const& member: status.members)
+            out += std::format("fastcache_node_consensus_member{{member=\"{}\"}} 1\n", member);
+    }
+
+    // And who it believes leads, absent during an election.
+    //
+    // Deliberately NOT a `_known` boolean beside it: the presence of this series is
+    // that fact, and a second field carrying it is a second thing to be wrong. It is
+    // also not constrained to the member set above -- a node with no configuration
+    // accepts entries from any leader, so it can name one while counting nobody,
+    // which is #388's signature and the pairing worth being able to see.
+    if (status.knownLeader.has_value())
+    {
+        out += std::format("# HELP {0} {1}\n# TYPE {0} {2}\n",
+                           "fastcache_node_consensus_leader",
+                           "The member this node believes leads. Absent when it believes none does, which is what an "
+                           "election in progress looks like.",
+                           TypeName(Gauge));
+        out += std::format("fastcache_node_consensus_leader{{leader=\"{}\"}} 1\n", *status.knownLeader);
+    }
+}
+
 std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
 {
     std::string out;
@@ -328,6 +424,12 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
                                 "upstream and one that has stored nothing yet both report zero.",
                         .type = MetricType::Gauge,
                         .value = *snapshot.upstreamConfigured ? 1U : 0U });
+
+    // And what this node counts as its own cluster, for a process that runs
+    // consensus. Absent for the daemon and for a node that leads itself; an empty
+    // member set INSIDE it is a reading and renders, which is the whole of #435.
+    if (snapshot.consensus.has_value())
+        AppendConsensusMetrics(out, *snapshot.consensus);
 
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the nine
