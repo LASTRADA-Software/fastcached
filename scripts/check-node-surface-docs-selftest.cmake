@@ -392,6 +392,19 @@ foreach(caseRow IN LISTS FastCachedSurfaceSelftestCases)
         continue()
     endif()
     math(EXPR casesRun "${casesRun} + 1")
+
+    # This table asserts in terms of `CMake Error` alone, so a sub-run that merely WARNS
+    # satisfies every needle and is scored a clean pass (#672) -- and ctest's own
+    # FAIL_REGULAR_EXPRESSION would refuse it. No case here expects a warning, so one is a
+    # failure whatever the case wanted; a case that ever should expect one says so at this
+    # line. Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    if(output MATCHES "CMake Warning")
+        list(APPEND failures
+             "[${caseName}] the check WARNED, and a warning changes meaning silently. Every needle in this table is spelled with `CMake Error`, so this case would have passed without this line. It said: ${output}")
+    endif()
+
+    # verdict-error-only: a read of the CASE TABLE, not of the sub-run -- `CMake Error` in
+    # the `must not appear` field is how a row says it expects acceptance.
     string(FIND "${caseMustNotAppear}" "CMake Error" refusalProbe)
     if(refusalProbe EQUAL -1)
         math(EXPR refusalCases "${refusalCases} + 1")

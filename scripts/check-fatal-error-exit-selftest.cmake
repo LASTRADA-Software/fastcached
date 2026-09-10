@@ -76,10 +76,11 @@ foreach(case IN LISTS cases)
     # selftest here uses: the needle is a literal and a regex would only add a
     # way for one to acquire a metacharacter later.
     set(combined "${out}${err}")
-    string(FIND "${combined}" "CMake Error" position)
-    if(position EQUAL -1)
-        set(got "want-pass")
-    else()
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    set(got "want-pass")
+    if(combined MATCHES "CMake Error|CMake Warning")
         set(got "want-refuse")
     endif()
     math(EXPR ran "${ran} + 1")

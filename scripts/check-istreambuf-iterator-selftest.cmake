@@ -348,13 +348,23 @@ foreach(row IN LISTS FastCachedIstreambufCases)
 
     # The verdict itself, separate from the needles, so a needle appearing inside a
     # DIFFERENT failure's text cannot stand in for it.
-    string(FIND "${output}" "CMake Error" errorPosition)
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    set(sawSignal FALSE)
+    if(output MATCHES "CMake Error|CMake Warning")
+        set(sawSignal TRUE)
+    endif()
+    # verdict-error-only: a read of the CASE TABLE, not of the sub-run. The table spells
+    # `CMake Error` in the `must not appear` field to mean "this case expects acceptance";
+    # broadening it here would ask whether the TABLE mentions a warning, which is a
+    # question about this file rather than about the check under test.
     if(caseMustNotAppear MATCHES "CMake Error")
-        if(NOT errorPosition EQUAL -1)
+        if(sawSignal)
             list(APPEND failures "${caseName}: expected the check to pass and it refused")
         endif()
     else()
-        if(errorPosition EQUAL -1)
+        if(NOT sawSignal)
             list(APPEND failures "${caseName}: expected the check to refuse and it passed")
         endif()
     endif()

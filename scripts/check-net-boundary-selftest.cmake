@@ -114,12 +114,14 @@ function(fastcached_run_check tree outObjected outOutput)
             "This is NOT a rule regression: no arm was evaluated, so no arm's verdict means anything. "
             "Re-run; if it persists, the spawn is the subject and not the boundary rule.")
     endif()
-    string(FIND "${combined}" "CMake Error" position)
-    if(position EQUAL -1)
-        set(${outObjected} FALSE PARENT_SCOPE)
-    else()
-        set(${outObjected} TRUE PARENT_SCOPE)
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    set(sawSignal FALSE)
+    if(combined MATCHES "CMake Error|CMake Warning")
+        set(sawSignal TRUE)
     endif()
+    set(${outObjected} ${sawSignal} PARENT_SCOPE)
     set(${outOutput} "${combined}" PARENT_SCOPE)
 endfunction()
 

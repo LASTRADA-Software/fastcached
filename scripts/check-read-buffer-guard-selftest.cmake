@@ -99,12 +99,14 @@ function(fastcached_run_check tree outObjected outOutput)
     # should flatten too is their question, not this one.
     string(REGEX REPLACE "[\r\n]+" " " combined "${combined}")
     string(REGEX REPLACE " +" " " combined "${combined}")
-    string(FIND "${combined}" "CMake Error" position)
-    if(position EQUAL -1)
-        set(${outObjected} FALSE PARENT_SCOPE)
-    else()
-        set(${outObjected} TRUE PARENT_SCOPE)
+    # `CMake Error|CMake Warning`, never `CMake Error` alone: a sub-run that merely WARNS
+    # changes meaning silently and, read for the error word alone, is scored a clean pass
+    # (#672). Stated in full -- and enforced -- in `scripts/check-script-check-signals.cmake`.
+    set(sawSignal FALSE)
+    if(combined MATCHES "CMake Error|CMake Warning")
+        set(sawSignal TRUE)
     endif()
+    set(${outObjected} ${sawSignal} PARENT_SCOPE)
     set(${outOutput} "${combined}" PARENT_SCOPE)
 endfunction()
 

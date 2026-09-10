@@ -274,6 +274,16 @@ foreach(row IN LISTS FastCachedSccacheSelftestCases)
         continue()
     endif()
 
+    # Every case here asserts substrings and none reads a verdict, so a sub-run that
+    # WARNED would satisfy the whole table and be scored a clean pass (#672) -- while
+    # ctest's FAIL_REGULAR_EXPRESSION refuses a warning outright. No case expects one, so
+    # one is a failure whatever the case wanted. Stated in full -- and enforced -- in
+    # `scripts/check-script-check-signals.cmake`.
+    if(output MATCHES "CMake Warning")
+        list(APPEND failures "  ${caseName}
+      the check WARNED, and a warning changes meaning silently. Nothing in this table reads a verdict, so this case would have passed without this line")
+    endif()
+
     foreach(polarityRow IN LISTS FastCachedSccacheSelftestPolarities)
         string(REPLACE "|" ";" polarityFields "${polarityRow}")
         list(GET polarityFields 0 needleField)
