@@ -630,9 +630,45 @@ node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
 
 # Captured, not discarded: the refusal this used to produce is a precise sentence
 # naming the account, and swallowing it would turn a diagnosis into "exit 1".
+# `--listen-node` NAMED, never left to its default (#1099). The default 0xFC
+# port is 6674, which is the port the daemon installed above is already serving
+# on -- so the registration succeeded, the job was kicked, and the worker died at
+# every start with
+#
+#     [ERROR] --listen-node: cannot bind 127.0.0.1:6674 (bind(...) failed: 48)
+#
+# `48` is EADDRINUSE on Darwin. What the fixture reported instead was a
+# `launchctl kickstart` timeout which says, in its own text, that it cannot tell
+# a busy host from a stall -- an honest verdict about the wrong question, with
+# the evidence naming the real cause printed twelve lines above it. The node's
+# own error even names the remedy: "give --listen-node a port of its own".
+#
+# DERIVED from `$port` rather than written out, so `--port` still moves every
+# surface this fixture opens together; a literal would collide again the day two
+# of these run with different `--port` values. `--scheduler` and `--advertise`
+# deliberately keep their literals: a scheduler address is DIALLED and an
+# advertised address is TOLD, so neither binds anything here and neither can
+# collide -- but `--advertise` MOVES WITH IT, and that is not cosmetic. Naming
+# `--listen-node` explicitly turns on a startup rule that an unset one does not
+# have: the node then refuses an `--advertise` naming a different port, because a
+# client told to dial a port nothing listens on gets no compile while the
+# registration succeeds and every counter reads normally. Measured against the
+# binary rather than reasoned about -- `--print-surfaces` accepts the pair below
+# and refuses `--listen-node=...:6677` beside `--advertise=...:6676` by name:
+#
+#     --advertise=127.0.0.1:6676 names this machine at port 6676, and this node
+#     serves compiles on 127.0.0.1:6677. ... Name the port --listen-node serves
+#
+# So fixing the bind collision alone would have traded one startup refusal for
+# another, and the fixture would have failed just as hard one line further on.
+# The unset default escapes that rule (an activated socket may be forwarded, so
+# `--advertise` is authoritative there) which is why the ORIGINAL command was
+# accepted with a 6674 bind and a 6676 advertisement.
+node_port=$(( port + 3 ))
 if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service --service-scope=system \
+        --listen-node=127.0.0.1:${node_port} \
+        --advertise=127.0.0.1:${node_port} \
         --scheduler=127.0.0.1:6675 \
-        --advertise=127.0.0.1:6676 \
         --toolchain=/usr/bin/cc 2>&1)"; then
     # **Ask launchd what it did with the job before giving up on the reading.**
     #
