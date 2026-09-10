@@ -295,6 +295,14 @@ CPMAddPackage(
 unset(CMAKE_POLICY_VERSION_MINIMUM CACHE)
 
 if(FASTCACHED_BUILD_TESTS)
+    # Bumping this is a decision somewhere else as well. The ThreadSanitizer
+    # scope is a Catch2 TAG EXPRESSION in a bash table rather than a `ctest -L`
+    # selection, because `catch_discover_tests` only exports tags as CTest labels
+    # from Catch2 3.8.0 on (`ADD_TAGS_AS_LABELS`) -- so the workaround has an
+    # expiry date, and nothing about this line says so. `scripts/check-tsan-scope.cmake`
+    # reads the version below and refuses once it moves past the one that
+    # mechanism was reasoned about, with the re-evaluation and the guard that has
+    # to survive it spelled out in the refusal (#312).
     CPMAddPackage(
         NAME Catch2
         GITHUB_REPOSITORY catchorg/Catch2

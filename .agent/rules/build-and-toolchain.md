@@ -4908,8 +4908,3 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
-  scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
-  `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
-  project's Catch2 (3.6) predates `ADD_TAGS_AS_LABELS` and so exports no tag to
-  CTest. When Catch2 moves, both collapse into a label filter.

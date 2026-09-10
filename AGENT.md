@@ -1836,6 +1836,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   REAL scope table and a copy of the REAL gate; six mutations each redden exactly the
   case that names them, and reverting to file-level matching reddens nine and leaves
   the seven that cannot see the difference green.
+- **A workaround with an expiry date is WIRED to fire, never written down where only
+  its own file's reader will meet it.** The scope is a tag expression rather than
+  `ctest -L` because `catch_discover_tests` exports tags as labels only from Catch2
+  **3.8.0** (`ADD_TAGS_AS_LABELS`); this tree pins 3.6.0, whose `extras/Catch.cmake`
+  carries zero occurrences of it — measured, against `catch_discover_tests`'s 11 in
+  the same file as the positive control. The reason lived in `tsan-gate.sh`'s header,
+  which whoever bumps the CPM block never opens (#312), so `check-tsan-scope.cmake`
+  now READS the declared version and refuses past a WATERMARK. The watermark is a
+  pinned CONDITION and must not be made to track `CMakeLists.txt` — point it at its
+  own subject and the comparison is `x > x`, false forever, the tripwire silently
+  gone. That mutation is a self-test case, because it is the tidy that suggests
+  itself. The refusal names what must survive the move regardless of where the scope
+  ends up: **a scope selecting NOTHING is a refusal**, since a typo runs zero cases
+  while every other signal says clean.
 - A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
   request unmergeable, not fast: the workflow never triggers, so no check run is
   created and the required context never reports. Master is guarded by a *ruleset*,

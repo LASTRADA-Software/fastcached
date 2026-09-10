@@ -239,6 +239,97 @@ if(NOT FastCachedTsanScopeTags)
 endif()
 
 # ---------------------------------------------------------------------------
+# The reason this scope is a Catch2 tag expression at all, wired so that whoever
+# retires the reason is told (#312).
+#
+# `catch_discover_tests` registers cases by NAME. Catch2 gained
+# `ADD_TAGS_AS_LABELS`, which exports each case's tags to CTest as labels, in
+# **3.8.0** -- so on a tree carrying an older Catch2 there is no `ctest -L`
+# selection to express the sanitized scope with, and the scope has to be a tag
+# expression in a bash table plus this check to enforce it.
+#
+# Two halves, and they were established differently, which is worth keeping
+# separate because only one of them can be re-derived from this repository:
+#
+#   * MEASURED here, 2026-09-10, against the Catch2 3.6.0 source CPM fetched for
+#     this tree: `extras/Catch.cmake` contains **zero** occurrences of
+#     `ADD_TAGS_AS_LABELS`, with `catch_discover_tests` at 11 occurrences in the
+#     same file as the positive control -- so the zero is an absence rather than
+#     a grep that stopped working.
+#   * SOURCED, not measured: that 3.8.0 is the release that added it, from
+#     Catch2's own `docs/release-notes.md`. Nothing in this tree can check that,
+#     which is why the tripwire below fires on ANY bump past the watermark rather
+#     than on `>= 3.8.0`. A threshold resting on the half nobody here can verify
+#     would be a second thing to be wrong.
+#
+# **The watermark is a pinned CONDITION, not a copy of the current version, and
+# must NOT be made to track `CMakeLists.txt`.** It records the version this
+# workaround was reasoned about. Point it at the CPM block and the day somebody
+# bumps Catch2 the comparison becomes `x > x`, which is false forever: the
+# tripwire silently stops existing, which is the failure mode of every other
+# thing in this file.
+set(FastCachedCatch2TagLabelWatermark "3.6.0")
+
+set(FastCachedProjectCMakeLists "${FASTCACHED_SOURCE_DIR}/CMakeLists.txt")
+if(NOT EXISTS "${FastCachedProjectCMakeLists}")
+    message(FATAL_ERROR
+        "check-tsan-scope: ${FastCachedProjectCMakeLists} does not exist.\n"
+        "The Catch2 version is read from there to decide whether this scope "
+        "mechanism is still necessary; a reading it cannot take must not read as "
+        "one that found nothing to say. The rule lives in "
+        "${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+
+# Read the declared version WITHOUT building a list, for the reason the TARGETS
+# reader above gives at length: `CMakeLists.txt` is full of brackets, and
+# `file(STRINGS)` would merge elements around an unbalanced one.
+file(READ "${FastCachedProjectCMakeLists}" projectCMakeLists)
+string(REPLACE "\r\n" "\n" projectCMakeLists "${projectCMakeLists}")
+string(FIND "${projectCMakeLists}" "NAME Catch2" catch2NamePos)
+set(declaredCatch2Version "")
+if(NOT catch2NamePos EQUAL -1)
+    string(SUBSTRING "${projectCMakeLists}" ${catch2NamePos} 400 catch2Block)
+    if(catch2Block MATCHES "VERSION[ \t]+([0-9]+\\.[0-9]+\\.[0-9]+)")
+        set(declaredCatch2Version "${CMAKE_MATCH_1}")
+    endif()
+endif()
+
+if(declaredCatch2Version STREQUAL "")
+    message(FATAL_ERROR
+        "check-tsan-scope: could not read a `NAME Catch2 ... VERSION x.y.z` "
+        "declaration out of ${FastCachedProjectCMakeLists}.\n"
+        "That declaration is what says whether the Catch2 in this tree can "
+        "express the sanitized scope as CTest labels. If the dependency moved, "
+        "this reader moves with it -- do not delete the question, because a "
+        "question nobody asks reads exactly like an answer of no. The rule lives "
+        "in ${CMAKE_CURRENT_LIST_FILE}.")
+endif()
+
+if(declaredCatch2Version VERSION_GREATER "${FastCachedCatch2TagLabelWatermark}")
+    message(FATAL_ERROR
+        "Catch2 has moved to ${declaredCatch2Version}, past the "
+        "${FastCachedCatch2TagLabelWatermark} this scope mechanism was reasoned "
+        "about (#312).\n\n"
+        "Re-evaluate expressing the ThreadSanitizer scope as CTest labels: "
+        "`catch_discover_tests(... ADD_TAGS_AS_LABELS)` exports each case's tags "
+        "as labels from Catch2 3.8.0 on, which would let `scripts/tsan-gate.sh` "
+        "select with `ctest -L` instead of a Catch2 tag expression, and would "
+        "make this check unnecessary.\n\n"
+        "WHAT MUST SURVIVE THAT MOVE, wherever the scope ends up being "
+        "expressed: the guard that a scope selecting NOTHING is a refusal. A "
+        "typo runs zero cases while every other signal in the run says clean, "
+        "and that is what the tag expression's `tested NOTHING` refusal and this "
+        "check between them exist for. Moving the scope without moving the guard "
+        "trades a workaround for a hole.\n\n"
+        "If the move is not being made now, that is a legitimate answer: raise "
+        "FastCachedCatch2TagLabelWatermark to ${declaredCatch2Version} in "
+        "${CMAKE_CURRENT_LIST_FILE} and say in the commit why the scope stayed a "
+        "tag expression. Do NOT make the watermark read the version out of "
+        "CMakeLists.txt -- a watermark that tracks its subject is one that can "
+        "never fire again.")
+endif()
+
+# ---------------------------------------------------------------------------
 # `-DFASTCACHED_TSAN_SCOPE_SELFTEST=ON`: drive this check over synthetic trees.
 #
 # A guard nobody has watched refuse is not a guard, and a guard nobody has
@@ -279,6 +370,10 @@ if(FASTCACHED_TSAN_SCOPE_SELFTEST)
         file(REMOVE_RECURSE "${tree}")
         file(MAKE_DIRECTORY "${tree}/scripts")
         file(COPY "${FastCachedTsanGate}" DESTINATION "${tree}/scripts")
+        # The Catch2 watermark (#312) reads the root CMakeLists, so a tree without
+        # one refuses before any scope case is reached. Copied rather than
+        # synthesised, so the baseline exercises the real declaration.
+        file(COPY "${FastCachedProjectCMakeLists}" DESTINATION "${tree}")
         foreach(row IN LISTS FastCachedTsanScope)
             if(row MATCHES "_test\\.cpp$")
                 set(staged "${tree}/${row}")
@@ -447,6 +542,27 @@ if(FASTCACHED_TSAN_SCOPE_SELFTEST)
     FastCachedStageTree("missing-file-row" tree)
     file(REMOVE "${tree}/src/FastCache/Core/Clock_test.cpp")
     FastCachedSelftestCase("a-file-row-that-does-not-exist" "${tree}" refuse "names neither a directory nor a file")
+
+    # -- the Catch2 watermark (#312) ------------------------------------------
+    # The accepting arm is the baseline case above, which stages the real
+    # declaration; these two are the directions that must not be silent. The
+    # bumped one is what the whole tripwire exists to do, and the missing one is
+    # the reading it must never take as "no, labels are not available".
+    FastCachedStageTree("catch2-bumped" tree)
+    file(READ "${tree}/CMakeLists.txt" bumped)
+    string(REPLACE "VERSION ${FastCachedCatch2TagLabelWatermark}" "VERSION 3.9.0" bumped "${bumped}")
+    file(WRITE "${tree}/CMakeLists.txt" "${bumped}")
+    FastCachedSelftestCase("a-catch2-bump-past-the-watermark" "${tree}" refuse "past the")
+
+    FastCachedStageTree("catch2-undeclared" tree)
+    file(READ "${tree}/CMakeLists.txt" undeclared)
+    string(REPLACE "NAME Catch2" "NAME SomethingElse" undeclared "${undeclared}")
+    file(WRITE "${tree}/CMakeLists.txt" "${undeclared}")
+    FastCachedSelftestCase("a-catch2-declaration-this-cannot-read" "${tree}" refuse "could not read a")
+
+    FastCachedStageTree("no-cmakelists" tree)
+    file(REMOVE "${tree}/CMakeLists.txt")
+    FastCachedSelftestCase("a-tree-with-no-root-CMakeLists" "${tree}" refuse "does not exist")
 
     # The count is printed because a self-test that STOPPED early must not look
     # like one that judged everything: `set -e`'s CMake equivalent is a
