@@ -265,7 +265,7 @@ TEST_CASE("A node refuses AUTH with the one code the launcher steps over", "[nod
     CHECK(ErrorOf(SyncRun(fix.proxy.Answer(tokenOnly))) == Wire::ErrorCode::UnknownOpcode);
 }
 
-TEST_CASE("A frame that is not this protocol is the one condition that closes", "[node][cacheproxy]")
+TEST_CASE("A frame that is not the cache proxy's protocol is the one condition that closes", "[node][cacheproxy]")
 {
     Fixture fix;
 
@@ -274,7 +274,7 @@ TEST_CASE("A frame that is not this protocol is the one condition that closes", 
     CHECK(SyncRun(fix.proxy.Answer(frame)).empty());
 }
 
-TEST_CASE("An unknown opcode is stepped over, not fatal", "[node][cacheproxy]")
+TEST_CASE("An unknown cache proxy opcode is stepped over, not fatal", "[node][cacheproxy]")
 {
     Fixture fix;
 

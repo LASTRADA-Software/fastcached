@@ -440,7 +440,7 @@ TEST_CASE("A surface with no address to bind is refused, not guessed at", "[node
     CHECK(started.error().contains("--listen-node"));
 }
 
-TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
+TEST_CASE("A frame endpoint that cannot bind reports why", "[node][scheduler]")
 {
     // Provoked with an address this host does not hold -- 192.0.2.1 is RFC 5737
     // documentation space -- rather than by binding a port twice, which needs a
@@ -460,7 +460,7 @@ TEST_CASE("An endpoint that cannot bind reports why", "[node][scheduler]")
     CHECK(started.error().contains(unreachable));
 }
 
-TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][scheduler]")
+TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[node][scheduler]")
 {
     // The reason this is a class rather than three locals in main(): the listener must
     // be closed before the serving thread can be joined, and a jthread whose loop is

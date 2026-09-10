@@ -280,7 +280,7 @@ TEST_CASE("The same tree at two prefixes fingerprints identically", "[toolchain-
     CHECK(!first.empty());
 }
 
-TEST_CASE("One changed header changes the fingerprint", "[toolchain-probe]")
+TEST_CASE("A header edited on disk changes the fingerprint through a real walk", "[toolchain-probe]")
 {
     FastCache::Testing::ScratchDirectory tree { "fc-tcp-changed" };
     tree.Write("inc/a.hpp", "original");
