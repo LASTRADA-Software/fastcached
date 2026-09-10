@@ -43,11 +43,49 @@ Run `fastcache-cli --help` for the current list with operand counts. Today:
 |---|---|
 | Read | `get`, `mget`, `exists`, `ttl`, `info`, `stats`, `version`, `ping`, `echo` |
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
+| Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
+| Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
 
 A modifier that means nothing for a verb is **refused**, not ignored:
 `set k v --raw` is a usage error rather than a store that silently prints
 nothing. `--ttl`, `--nx` and `--xx` belong to `set`; `--raw` to `get`; `--all` to
-`flush`.
+`flush`; `--ttl` also to `add`, `replace` and `cas`, but **not** to `append` or
+`prepend`, whose server-side path takes no expiry at all — accepting it there
+would discard it silently.
+
+### The memcached-only verbs
+
+The two protocols are not supersets of one another, and the second block above is
+what only the memcached text protocol can reach. Three of them are the reason it
+is worth speaking at all:
+
+- **`inspect <key>`** is the `me` inspector, and nothing else in this project
+  reports a key's last-access time, its cas token or its stored size. The flags
+  are renamed for a reader — `exp` becomes `ttl_seconds`, `la` becomes
+  `last_access_seconds`, `size` becomes `value_bytes` — and a flag this client
+  has no name for keeps its wire spelling rather than being dropped.
+- **`cas <key> <value> <cas>`** is the compare-and-swap this cache has and RESP
+  does not expose. `gats` and `inspect` are where the token comes from.
+- **`mc-stats [family]`** reaches `settings`, `items`, `slabs`, `sizes` and
+  `conns`, none of which `stats` above can see. `reset` is deliberately not
+  offered: the daemon answers it `RESET` while resetting nothing, so relaying it
+  would report a reset that did not happen.
+
+Two spellings are worth reading twice, because both mirror the wire rather than
+tidying it:
+
+- **`gat` and `gats` take the expiry FIRST** (`gat 60 key...`) while `touch`
+  takes it last (`touch key 60`). That inconsistency is memcached's and this
+  daemon's; reordering it here would make a packet capture and `--help`
+  disagree. Either spelling fails loudly on the other's input, since one operand
+  must be a number.
+- **A key carrying a space, a tab or a control character is refused before
+  anything is sent.** This protocol has no quoting and no escaping, so such a key
+  would arrive as two tokens and address a different one — or, with a carriage
+  return in it, end the line early and inject whatever followed as a command.
+
+`cache-memlimit` changes the byte budget **now and not durably**: the value lasts
+until the daemon restarts, which then reads `--max-memory` again.
 
 ## Output
 
@@ -192,6 +230,27 @@ client with `$FASTCACHE_TOKEN` set a permanent failure against a server that
 never needed one. A *wrong* credential, which is about the credential rather than
 the server, is fatal.
 
+### The memcached verbs cannot authenticate at all
+
+**The memcached text protocol has no `AUTH` verb.** Against a daemon with
+`--requirepass` set, it answers every command but `version` and `quit` with
+`CLIENT_ERROR authentication required` and ends the session — deliberately, since
+a refused storage command leaves its data block unread and continuing would parse
+those bytes as the next command. So every verb in the memcached block above is
+unavailable there, and no credential can change that.
+
+The client does **not** pre-emptively refuse them when a credential is
+configured, because a credential being configured does not mean the server
+requires one — that is the same false inference the remark above avoids, and
+refusing on it would decline verbs that work fine against every daemon with no
+password. It asks, and explains the refusal when one arrives: the server's own
+sentence does not mention that the protocol lacks the verb, so an operator would
+otherwise read it as *supply a credential* with no way to.
+
+Use the RESP verbs on the same `--addr` where they cover the need — `get`, `set`,
+`del`, `ttl` and `expire` between them cover most of what `touch`, `add` and
+`replace` are for.
+
 ## Environment
 
 | | |
@@ -200,7 +259,7 @@ the server, is fatal.
 | `FASTCACHE_ADMIN_ADDR` | the admin surface, as `host:port` |
 | `FASTCACHE_TOKEN` | the credential to present |
 | `FASTCACHE_USER` | username for the two-argument `AUTH` form |
-| `NO_COLOR` | set to anything non-empty to suppress colour |
+| `NO_COLOR` | set to anything non-empty to suppress colour. It governs the **default**, so an explicit `--color=always` still colours |
 
 Precedence is defaults, then the environment, then the command line — each
 overriding the last, applied in that order rather than merged field by field.
@@ -215,6 +274,9 @@ Stated so it is not rediscovered:
 - **No fleet or cluster verbs yet.** `fastcache-compile-node --cluster-status`
   and the `/fleet` dashboard remain where they are; bringing them here is
   tracked work.
+- **The memcached verbs are not routed over the binary protocol.** That protocol
+  has SASL and would let them work under `--requirepass`, and doing so is out of
+  scope here rather than impossible.
 - **No REPL and no live view yet.** One command per invocation, which composes
   with `watch`, `ssh` and a pipe.
 - `CONFIG GET` and `CLIENT LIST` are deliberately not exposed: the daemon answers

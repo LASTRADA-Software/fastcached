@@ -147,29 +147,51 @@ void ReportAdvisories(Answer const& answer, bool quiet)
 /// @return The process exit code.
 [[nodiscard]] int RunAndReport(Command const& command, VerbSpec const& verb)
 {
-    // The cache connection is opened for every verb, including `stats`: `INFO` is the
-    // ladder's fallback rung and it lives on this port. A verb that turns out not to
-    // need it costs one loopback connect.
-    auto exchange = SocketExchange::Open(command.cache, command.timeouts, command.credential);
+    // WHICH connections to open is the wire row's answer, never a ladder here: this
+    // file is in no test target (#370, #909), so a decision taken in it is one nothing
+    // can hold to. `Stats` asks for RESP too, because `INFO` is the ladder's fallback
+    // rung and lives on that connection.
+    auto const& wire = WireTable[static_cast<std::size_t>(verb.wire)];
+
     std::unique_ptr<SocketExchange> resp;
     std::vector<std::string> openingRemarks;
-    if (exchange.has_value())
+    if (wire.needsResp)
     {
-        resp = std::move(*exchange);
-        auto const carried = resp->Advisories();
-        openingRemarks.assign(carried.begin(), carried.end());
+        auto exchange = SocketExchange::Open(command.cache, command.timeouts, command.credential);
+        if (exchange.has_value())
+        {
+            resp = std::move(*exchange);
+            auto const carried = resp->Advisories();
+            openingRemarks.assign(carried.begin(), carried.end());
+        }
+        else if (verb.wire != Wire::Stats)
+        {
+            // A verb that needs the cache and could not reach it is finished here.
+            // `stats` is the exception: `/metrics` is on another port and may well
+            // answer, so the ladder is still given its chance and reports this rung as
+            // having failed.
+            std::cerr << ProgramName << ": " << exchange.error().detail << '\n';
+            return ExitCodeOf(Outcome::Unreachable);
+        }
+        else
+        {
+            openingRemarks.push_back(exchange.error().detail);
+        }
     }
-    else if (verb.wire != Wire::Stats)
+
+    std::unique_ptr<MemcachedExchange> memcached;
+    if (wire.needsMemcached)
     {
-        // A verb that needs the cache and could not reach it is finished here. `stats`
-        // is the exception: `/metrics` is on another port and may well answer, so the
-        // ladder is still given its chance and reports this rung as having failed.
-        std::cerr << ProgramName << ": " << exchange.error().detail << '\n';
-        return ExitCodeOf(Outcome::Unreachable);
-    }
-    else
-    {
-        openingRemarks.push_back(exchange.error().detail);
+        // No credential is presented, and none can be: this protocol has no AUTH verb.
+        // `WireSpec::authenticable` carries that fact and the refusal, when the server
+        // makes one, is explained rather than relayed bare.
+        auto exchange = MemcachedExchange::Open(command.cache, command.timeouts);
+        if (!exchange.has_value())
+        {
+            std::cerr << ProgramName << ": " << exchange.error().detail << '\n';
+            return ExitCodeOf(Outcome::Unreachable);
+        }
+        memcached = std::move(*exchange);
     }
 
     auto gatherer =
@@ -179,8 +201,11 @@ void ReportAdvisories(Answer const& answer, bool quiet)
                                                          : std::nullopt,
                          resp.get() };
 
-    auto const context =
-        VerbContext { .operands = command.operands, .options = command.verbOptions, .resp = resp.get(), .stats = &gatherer };
+    auto const context = VerbContext { .operands = command.operands,
+                                       .options = command.verbOptions,
+                                       .resp = resp.get(),
+                                       .memcached = memcached.get(),
+                                       .stats = &gatherer };
 
     auto answer = RunVerb(verb, context);
     // The connection's own remarks come first: they are about the whole exchange

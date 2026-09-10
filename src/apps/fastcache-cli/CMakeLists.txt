@@ -23,6 +23,7 @@ set(_fc_cli_sources
     CliFormat.cpp
     CliValue.cpp
     CliVerbs.cpp
+    MemcachedClient.cpp
     RespClient.cpp
     SocketExchange.cpp
     StatsGatherer.cpp
@@ -54,6 +55,8 @@ if(FASTCACHED_BUILD_TESTS)
         CliFormat_test.cpp
         CliValue_test.cpp
         CliVerbs_test.cpp
+        MemcachedClient_test.cpp
+        MemcachedVerbs_test.cpp
         RespClient_test.cpp
         StatsSource_test.cpp
     )

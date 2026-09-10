@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
+#include <optional>
 #include <ranges>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -439,6 +442,406 @@ namespace
         return ChooseStats(attempts);
     }
 
+    // --- memcached text -----------------------------------------------------------
+
+    /// What a one-line memcached status concludes.
+    struct McStatusSpec
+    {
+        std::string_view word;     ///< As the server writes it.
+        Outcome outcome;           ///< What it means for the exit code.
+        std::string_view advisory; ///< A sentence for the operator, or empty.
+    };
+
+    /// The status words this daemon writes, and what each concludes.
+    ///
+    /// A table because the mapping IS the whole of it: `STORED` and `NOT_STORED` differ
+    /// by a row, not by a handler, and five verbs share every row. Read out of
+    /// `MemcachedText.cpp`'s own writers rather than from memcached's documentation.
+    ///
+    /// **There is no default row on purpose.** A word with no row is reported as a
+    /// protocol failure naming the word, not guessed at -- an unknown status mapped to
+    /// `Affirmative` by a fallback would report success for whatever a future server
+    /// says, which is the failure this client is least able to notice.
+    constexpr auto McStatusTable = std::to_array<McStatusSpec>({
+        { .word = "STORED", .outcome = Outcome::Affirmative, .advisory = "" },
+        { .word = "TOUCHED", .outcome = Outcome::Affirmative, .advisory = "" },
+        { .word = "DELETED", .outcome = Outcome::Affirmative, .advisory = "" },
+        { .word = "OK", .outcome = Outcome::Affirmative, .advisory = "" },
+        { .word = "NOT_STORED",
+          .outcome = Outcome::Negative,
+          .advisory = "nothing was stored: `add` needs the key absent, and `replace`, `append` and "
+                      "`prepend` need it present" },
+        { .word = "EXISTS",
+          .outcome = Outcome::Negative,
+          .advisory = "the value changed since that cas token was issued, so nothing was stored" },
+        { .word = "NOT_FOUND", .outcome = Outcome::Negative, .advisory = "no such key" },
+    });
+
+    /// A readable name for one of the `me` inspector's flags.
+    struct McFlagSpec
+    {
+        std::string_view flag; ///< As `MemcachedMeta.cpp` writes it.
+        std::string_view name; ///< What `inspect` calls it.
+    };
+
+    /// `me`'s flags, renamed for a reader.
+    ///
+    /// Renaming rather than relaying: `exp`, `la` and `cls` are memcached's spellings,
+    /// and this verb exists precisely to be the readable per-key diagnostic. A flag with
+    /// no row keeps its WIRE name rather than being dropped, so a server that grows one
+    /// is visible here the day it does instead of silently absent.
+    constexpr auto McFlagTable = std::to_array<McFlagSpec>({
+        { .flag = "exp", .name = "ttl_seconds" },
+        { .flag = "la", .name = "last_access_seconds" },
+        { .flag = "cas", .name = "cas" },
+        { .flag = "fetch", .name = "fetched" },
+        { .flag = "cls", .name = "slab_class" },
+        { .flag = "size", .name = "value_bytes" },
+    });
+
+    /// One `stats` sub-command this client offers.
+    struct McStatsSub
+    {
+        std::string_view name;    ///< As the wire spells it.
+        std::string_view summary; ///< What it reports.
+    };
+
+    /// The `stats` families worth asking this daemon for.
+    ///
+    /// An allowlist, and **`reset` is deliberately not on it**: `MemcachedText.cpp`
+    /// answers `RESET` while resetting nothing -- its own comment says it acknowledges
+    /// the command rather than lying about state -- so relaying it would report a reset
+    /// that did not happen. `conns` IS offered although this daemon keeps no connection
+    /// registry, because its empty answer is a TRUE one and renders as an empty table.
+    constexpr auto McStatsSubs = std::to_array<McStatsSub>({
+        { .name = "settings", .summary = "configured limits and policy" },
+        { .name = "items", .summary = "per-slab item counts" },
+        { .name = "slabs", .summary = "slab allocator figures" },
+        { .name = "sizes", .summary = "one approximate size bucket" },
+        { .name = "conns", .summary = "connections, which this daemon does not track" },
+    });
+
+    /// The status row @p status matches, or nullptr.
+    /// @param status The whole status line.
+    /// @return The row, or nullptr.
+    [[nodiscard]] McStatusSpec const* FindMcStatus(std::string_view status) noexcept
+    {
+        for (auto const& row: McStatusTable)
+            if (row.word == status)
+                return &row;
+        return nullptr;
+    }
+
+    /// What `inspect` calls the flag @p wireName.
+    /// @param wireName The flag as the server spelled it.
+    /// @return The readable name, or @p wireName when there is no row.
+    [[nodiscard]] std::string_view McFlagName(std::string_view wireName) noexcept
+    {
+        for (auto const& row: McFlagTable)
+            if (row.flag == wireName)
+                return row.name;
+        return wireName;
+    }
+
+    /// Turn a memcached error reply into an answer.
+    ///
+    /// The server's own sentence is the advisory, because it is more specific than
+    /// anything this client could infer. The one addition is the auth explanation: the
+    /// bare `CLIENT_ERROR authentication required` does not say that this protocol has
+    /// no AUTH verb, so an operator reads it as *supply a credential* and there is no
+    /// way to. Keyed on the wire's `authenticable` column rather than on the verb, since
+    /// it is the protocol that lacks the verb.
+    /// @param context The invocation.
+    /// @param reply The error reply.
+    /// @return The answer, always `Refused`.
+    [[nodiscard]] Answer FromMemcachedError(VerbContext const& context, McReply const& reply)
+    {
+        auto answer = Concluded(Outcome::Refused, reply.status);
+        auto const& wire = WireTable[static_cast<std::size_t>(context.verb->wire)];
+        if (!wire.authenticable && reply.status.contains("authentication required"))
+            answer.advisories.emplace_back(
+                std::format("this daemon requires a password, and the memcached text protocol has no AUTH "
+                            "verb -- so `{}` cannot be run against it at all. The RESP verbs authenticate and "
+                            "reach the same --addr; `get`, `set`, `del`, `ttl` and `expire` cover most of what "
+                            "`{}` is for.",
+                            context.verb->name,
+                            context.verb->name));
+        return answer;
+    }
+
+    /// Turn a one-line status reply into an answer.
+    /// @param context The invocation.
+    /// @param reply The reply.
+    /// @return The answer.
+    [[nodiscard]] Answer FromMemcachedStatus(VerbContext const& context, McReply const& reply)
+    {
+        auto const* const row = FindMcStatus(reply.status);
+        if (row == nullptr)
+            return Concluded(Outcome::Protocol,
+                             std::format("{}: the server answered `{}`, which this client has no reading for",
+                                         context.verb->name,
+                                         reply.status));
+        auto answer = Concluded(row->outcome);
+        if (!row->advisory.empty())
+            answer.advisories.emplace_back(row->advisory);
+        return answer;
+    }
+
+    /// Send @p request over the memcached wire and hand back the reply.
+    /// @param context The invocation.
+    /// @param request The encoded command.
+    /// @return The reply, or the answer that replaces it.
+    [[nodiscard]] std::expected<McReply, Answer> AskMemcached(VerbContext const& context, std::string const& request)
+    {
+        auto reply = context.memcached->Send(request);
+        if (!reply.has_value())
+            return std::unexpected(FromExchangeError(reply.error()));
+        if (reply->kind == McLeadToken::Error)
+            return std::unexpected(FromMemcachedError(context, *reply));
+        return std::move(*reply);
+    }
+
+    /// Refuse the first of @p count leading operands this wire cannot carry.
+    ///
+    /// **Before anything is sent.** The text protocol has no quoting and no escaping, so
+    /// a key with a space arrives as two tokens and silently addresses a different key,
+    /// and one carrying a CR ends the line early and injects whatever follows as a
+    /// command. Sending it and letting the server complain is not an option for the
+    /// second of those.
+    /// @param context The invocation.
+    /// @param count How many leading operands are tokens rather than payload.
+    /// @return The refusal, or nullopt when every one is expressible.
+    [[nodiscard]] std::optional<Answer> RefuseUnsendableToken(VerbContext const& context, std::size_t count)
+    {
+        for (auto const index: std::views::iota(std::size_t { 0 }, std::min(count, context.operands.size())))
+            if (!ValidTextToken(context.operands[index]))
+                return Concluded(Outcome::Usage,
+                                 std::format("`{}` cannot travel on the memcached text protocol: it is empty, or "
+                                             "carries a space or a control character, and this wire has no quoting",
+                                             context.operands[index]));
+        return std::nullopt;
+    }
+
+    /// The verb's protocol command followed by its operands, encoded for this wire.
+    /// @param context The invocation.
+    /// @return The bytes to send.
+    [[nodiscard]] std::string MemcachedCommandWithOperands(VerbContext const& context)
+    {
+        auto const args = std::vector<std::string> { context.operands.begin(), context.operands.end() };
+        return EncodeMemcachedCommand(context.verb->protocolCommand, args);
+    }
+
+    /// `touch <key> <seconds>`: move a key's expiry without reading it.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer Touch(VerbContext const& context)
+    {
+        if (auto refusal = RefuseUnsendableToken(context, context.operands.size()); refusal.has_value())
+            return std::move(*refusal);
+        auto reply = AskMemcached(context, MemcachedCommandWithOperands(context));
+        if (!reply.has_value())
+            return std::move(reply.error());
+        return FromMemcachedStatus(context, *reply);
+    }
+
+    /// `gat <seconds> <key>...` and `gats <seconds> <key>...`.
+    ///
+    /// The operand order mirrors the WIRE, where the expiry comes first -- which is the
+    /// opposite way round from `touch`, on this daemon and on memcached. Reordering it
+    /// to match `touch` would make a packet capture and a `--help` line disagree, and
+    /// this is a protocol client; either spelling fails loudly on the other's input,
+    /// since one operand must be a number.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer FetchAndTouch(VerbContext const& context)
+    {
+        if (auto refusal = RefuseUnsendableToken(context, context.operands.size()); refusal.has_value())
+            return std::move(*refusal);
+        auto reply = AskMemcached(context, MemcachedCommandWithOperands(context));
+        if (!reply.has_value())
+            return std::move(reply.error());
+        if (reply->kind != McLeadToken::Value && reply->status != "END")
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{}: expected values, and the server answered `{}`", context.verb->name, reply->status));
+
+        Answer answer;
+        auto const wantsCas = context.verb->protocolCommand == "gats";
+        std::vector<std::string> columns { "key", "value" };
+        if (wantsCas)
+            columns.emplace_back("cas");
+
+        std::vector<std::vector<Cell>> rows;
+        rows.reserve(reply->values.size());
+        for (auto const& value: reply->values)
+        {
+            std::vector<Cell> row;
+            row.push_back(TextCell(value.key));
+            row.push_back(ValueCell(value.data, answer));
+            if (wantsCas)
+                row.push_back(value.hasCas ? NumberCell(value.cas) : AbsentCell());
+            rows.push_back(std::move(row));
+        }
+        answer.value = TableValue(std::move(columns), std::move(rows));
+
+        // **This wire SKIPS a miss rather than naming it**, so a short table reads as a
+        // complete answer unless the count is said out loud. `mget` gets that for free
+        // over RESP, which answers a null per key; here there is nothing to count but
+        // the difference, and an operator who asked about four keys and sees three rows
+        // has no way to tell which one is gone without it.
+        auto const asked = context.operands.size() - 1;
+        if (reply->values.empty())
+        {
+            answer.outcome = Outcome::Negative;
+            answer.advisories.emplace_back("none of the keys exist");
+        }
+        else if (reply->values.size() != asked)
+        {
+            answer.advisories.emplace_back(
+                std::format("{} of {} keys exist; this protocol does not name the misses", reply->values.size(), asked));
+        }
+        return answer;
+    }
+
+    /// `add`, `replace`, `append`, `prepend`, `cas`: store, conditionally.
+    ///
+    /// One handler for five rows, keyed on `protocolCommand` exactly as `Counting` is.
+    /// `--ttl` is a modifier of the three rows that HONOUR it: `append` and `prepend`
+    /// reach `CacheEngine::Append`/`Prepend`, which take no expiry at all, so accepting
+    /// `--ttl` there would silently discard it.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer StoreText(VerbContext const& context)
+    {
+        if (auto refusal = RefuseUnsendableToken(context, 1); refusal.has_value())
+            return std::move(*refusal);
+
+        std::uint64_t casToken = 0;
+        auto const isCas = context.verb->protocolCommand == "cas";
+        if (isCas && !ParseWholeUnsigned(context.operands[2], casToken))
+            return Concluded(
+                Outcome::Usage,
+                std::format("`{}` is not a cas token; `inspect <key>` reports the current one", context.operands[2]));
+
+        auto const ttl = context.options.ttlSeconds == TtlUnset ? std::int64_t { 0 } : context.options.ttlSeconds;
+        auto reply =
+            AskMemcached(context,
+                         EncodeMemcachedStorage(
+                             context.verb->protocolCommand, context.operands[0], 0, ttl, context.operands[1], casToken));
+        if (!reply.has_value())
+            return std::move(reply.error());
+        return FromMemcachedStatus(context, *reply);
+    }
+
+    /// `inspect <key>`: the `me` inspector's per-key facts.
+    ///
+    /// Nothing else in this tree exposes a key's last-access time, its cas token or its
+    /// stored size, which is why this verb exists.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer Inspect(VerbContext const& context)
+    {
+        if (auto refusal = RefuseUnsendableToken(context, 1); refusal.has_value())
+            return std::move(*refusal);
+        auto reply = AskMemcached(context, MemcachedCommandWithOperands(context));
+        if (!reply.has_value())
+            return std::move(reply.error());
+
+        if (reply->kind != McLeadToken::Meta)
+        {
+            // `EN` is the miss and is the only other shape this verb gets. Checked as
+            // *not a meta reply* rather than as *equals EN*, so an unexpected status is
+            // still reported rather than read as a hit with no flags.
+            if (reply->status != "EN")
+                return Concluded(Outcome::Protocol,
+                                 std::format("inspect: expected `ME` or `EN`, and the server answered `{}`", reply->status));
+            auto answer = Answered(ScalarValue(AbsentCell()), Outcome::Negative);
+            answer.advisories.emplace_back(std::format("no such key: {}", context.operands[0]));
+            return answer;
+        }
+
+        std::vector<Field> fields;
+        fields.reserve(reply->metaFlags.size() + 1);
+        fields.push_back(Field { .name = "key", .value = TextCell(reply->metaKey) });
+        for (auto const& flag: reply->metaFlags)
+            fields.push_back(Field { .name = std::string { McFlagName(flag.name) }, .value = TextCell(flag.value) });
+        return Answered(RecordValue(std::move(fields)));
+    }
+
+    /// `mc-stats [<family>]`: one of the memcached `stats` families, as a table.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer TextStats(VerbContext const& context)
+    {
+        if (!context.operands.empty())
+        {
+            auto const named =
+                std::ranges::any_of(McStatsSubs, [&](McStatsSub const& row) { return row.name == context.operands[0]; });
+            if (!named)
+            {
+                // Listed from the table rather than written out, so a family added there
+                // is offered AND named in the refusal by the same edit.
+                std::string names;
+                for (auto const& row: McStatsSubs)
+                {
+                    if (!names.empty())
+                        names += ", ";
+                    names += row.name;
+                }
+                return Concluded(Outcome::Usage,
+                                 std::format("`{}` is not a stats family this client offers; the families are {}",
+                                             context.operands[0],
+                                             names));
+            }
+        }
+
+        auto reply = AskMemcached(context, MemcachedCommandWithOperands(context));
+        if (!reply.has_value())
+            return std::move(reply.error());
+
+        if (reply->kind != McLeadToken::Stat)
+        {
+            // A bare `END` is an EMPTY RESULT rather than a status, and `stats conns`
+            // answers exactly that on this daemon. It renders as an empty table so
+            // every format says *nothing here* in its own vocabulary -- `[]` in JSON, a
+            // header row and no rows in the human one -- rather than saying nothing at
+            // all, which reads as the command having failed.
+            if (reply->status != "END")
+                return FromMemcachedStatus(context, *reply);
+            auto answer = Answered(TableValue(std::vector<std::string> { "name", "value" }, {}), Outcome::Negative);
+            answer.advisories.emplace_back(std::format("the server reported no rows for `{}`",
+                                                       context.operands.empty() ? "stats" : context.operands[0]));
+            return answer;
+        }
+
+        std::vector<std::vector<Cell>> rows;
+        rows.reserve(reply->stats.size());
+        Answer answer;
+        for (auto const& stat: reply->stats)
+            rows.push_back(std::vector<Cell> { TextCell(stat.name), ValueCell(stat.value, answer) });
+        answer.value = TableValue(std::vector<std::string> { "name", "value" }, std::move(rows));
+        return answer;
+    }
+
+    /// `cache-memlimit <megabytes>`: change the cache's byte budget at runtime.
+    /// @param context The invocation.
+    /// @return The answer.
+    [[nodiscard]] Answer MemoryLimit(VerbContext const& context)
+    {
+        if (auto refusal = RefuseUnsendableToken(context, context.operands.size()); refusal.has_value())
+            return std::move(*refusal);
+        auto reply = AskMemcached(context, MemcachedCommandWithOperands(context));
+        if (!reply.has_value())
+            return std::move(reply.error());
+
+        auto answer = FromMemcachedStatus(context, *reply);
+        if (answer.outcome == Outcome::Affirmative)
+            answer.advisories.emplace_back(
+                "the new limit is in force now and is NOT persisted: it lasts until this daemon restarts, "
+                "which then reads --max-memory again");
+        return answer;
+    }
+
     /// The verbs, in the order `--help` documents them.
     constexpr auto VerbTable = std::to_array<VerbSpec>({
         { .name = "get",
@@ -605,6 +1008,116 @@ namespace
           .protocolCommand = "",
           .modifiers = Modifier::None,
           .handler = &Stats },
+
+        // The memcached text verbs. Everything below this line is unavailable against a
+        // daemon with `--requirepass` set, because that protocol has no AUTH verb --
+        // `WireSpec::authenticable` carries the fact and `FromMemcachedError` explains
+        // it when the server says so.
+        { .name = "touch",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <key> <seconds>",
+          .summary = "move a key's expiry without reading the value",
+          .protocolCommand = "touch",
+          .modifiers = Modifier::None,
+          .handler = &Touch },
+        { .name = "gat",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = VariadicOperands,
+          .operands = " <seconds> <key>...",
+          .summary = "read values and move their expiry in one step; the expiry\n"
+                     "comes FIRST here, as it does on the wire",
+          .protocolCommand = "gat",
+          .modifiers = Modifier::None,
+          .handler = &FetchAndTouch },
+        { .name = "gats",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = VariadicOperands,
+          .operands = " <seconds> <key>...",
+          .summary = "`gat` with each value's cas token, for a later `cas`",
+          .protocolCommand = "gats",
+          .modifiers = Modifier::None,
+          .handler = &FetchAndTouch },
+        { .name = "add",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <key> <value>",
+          .summary = "store only if the key is absent; exits 1 if it exists",
+          .protocolCommand = "add",
+          .modifiers = Modifier::Ttl,
+          .handler = &StoreText },
+        { .name = "replace",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <key> <value>",
+          .summary = "store only if the key exists; exits 1 if it does not",
+          .protocolCommand = "replace",
+          .modifiers = Modifier::Ttl,
+          .handler = &StoreText },
+        { .name = "append",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <key> <value>",
+          .summary = "add bytes to the end of an existing value; no --ttl,\n"
+                     "because the server keeps the entry's own expiry",
+          .protocolCommand = "append",
+          .modifiers = Modifier::None,
+          .handler = &StoreText },
+        { .name = "prepend",
+          .wire = Wire::Memcached,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <key> <value>",
+          .summary = "add bytes to the front of an existing value",
+          .protocolCommand = "prepend",
+          .modifiers = Modifier::None,
+          .handler = &StoreText },
+        { .name = "cas",
+          .wire = Wire::Memcached,
+          .minOperands = 3,
+          .maxOperands = 3,
+          .operands = " <key> <value> <cas>",
+          .summary = "store only if the value still carries <cas>; exits 1 when\n"
+                     "it has changed. `gats` and `inspect` report the token",
+          .protocolCommand = "cas",
+          .modifiers = Modifier::Ttl,
+          .handler = &StoreText },
+        { .name = "inspect",
+          .wire = Wire::Memcached,
+          .minOperands = 1,
+          .maxOperands = 1,
+          .operands = " <key>",
+          .summary = "a key's ttl, last access, cas token and stored size --\n"
+                     "nothing else in this project reports the last three",
+          .protocolCommand = "me",
+          .modifiers = Modifier::None,
+          .handler = &Inspect },
+        { .name = "mc-stats",
+          .wire = Wire::Memcached,
+          .minOperands = 0,
+          .maxOperands = 1,
+          .operands = " [settings|items|slabs|sizes|conns]",
+          .summary = "the memcached `stats` families, which `stats` above cannot\n"
+                     "reach; no argument gives the 24-field default set",
+          .protocolCommand = "stats",
+          .modifiers = Modifier::None,
+          .handler = &TextStats },
+        { .name = "cache-memlimit",
+          .wire = Wire::Memcached,
+          .minOperands = 1,
+          .maxOperands = 1,
+          .operands = " <megabytes>",
+          .summary = "change the cache's byte budget now; NOT persisted, so a\n"
+                     "restart reads --max-memory again",
+          .protocolCommand = "cache_memlimit",
+          .modifiers = Modifier::None,
+          .handler = &MemoryLimit },
     });
 } // namespace
 
@@ -651,8 +1164,7 @@ Answer RunVerb(VerbSpec const& verb, VerbContext const& context)
     scoped.verb = &verb;
 
     auto const& wire = WireTable[static_cast<std::size_t>(verb.wire)];
-    auto const available = verb.wire == Wire::Resp ? scoped.resp != nullptr : scoped.stats != nullptr;
-    if (!available)
+    if (!wire.available(scoped))
         return Concluded(Outcome::Unreachable, std::string { wire.unavailable });
 
     return verb.handler(scoped);
