@@ -25,6 +25,47 @@
 using namespace FastCache;
 using PathCanon::Grammar;
 
+TEST_CASE("EncodeCompileValue writes the layout its header documents, byte for byte")
+{
+    // **The assertion that distinguishes.** The round-trip case below agrees with
+    // whatever layout and byte order `EncodeCompileValue` and `DecodeCompileValue`
+    // happen to share, so it passes under the hand-rolled `AppendU32`/`AppendBytes`
+    // this encoder used to carry and under `ByteAppender` alike (#305). These bytes are
+    // spelled field by field through a builder sharing no code with the encoder,
+    // against the layout `CompileValue.hpp` writes out:
+    // `[u8 generation][u32 objectLen][object][u32 regionCount]{[u8 grammar][u32 len][text]}`.
+    //
+    // The generation byte is read from `CompileValueVersion` rather than typed, because
+    // a literal here would have to be edited at every bump and would then be asserting
+    // its own edit. The GRAMMAR tags are typed, because those ARE a wire contract: an
+    // enum whose ordinal is written to a stored value states `= N`, and a literal is
+    // what makes a renumbering show up here as a changed number rather than as an
+    // invisible consequence of one inserted enumerator.
+    CompileValue value;
+    value.objectBlob = { std::byte { 0x01 }, std::byte { 0xFE } };
+    value.textRegions.push_back({ .grammar = Grammar::ShowIncludes, .bytes = "note" });
+    value.textRegions.push_back({ .grammar = Grammar::GccDepfile, .bytes = "" });
+
+    auto const expected = Testing::DeclaredCountBlob {}
+                              .Byte(CompileValueVersion)
+                              .U32(2)
+                              .Byte(0x01)
+                              .Byte(0xFE) // the object blob, length-prefixed
+                              .U32(2)     // regionCount
+                              .Byte(0)    // Grammar::ShowIncludes
+                              .Field("note")
+                              .Byte(2) // Grammar::GccDepfile
+                              .Field("")
+                              .Vector();
+
+    CHECK(EncodeCompileValue(value) == expected);
+
+    // And the tags above really are those grammars, so a renumbering fails the CHECK
+    // rather than being absorbed by two literals moving together.
+    CHECK(static_cast<std::uint8_t>(Grammar::ShowIncludes) == 0);
+    CHECK(static_cast<std::uint8_t>(Grammar::GccDepfile) == 2);
+}
+
 TEST_CASE("CompileValue encode/decode round-trips object blob and regions")
 {
     CompileValue v;

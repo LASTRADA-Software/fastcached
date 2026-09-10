@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/ByteCursor.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <span>
 #include <string>
@@ -80,23 +78,15 @@ constexpr std::size_t MinMemberBytes = WireFields::FieldPrefixSize;
     std::size_t total = HeaderSize;
     for (auto const& m: members)
         total += WireFields::FieldPrefixSize + m.size();
-    std::vector<std::byte> out;
-    out.reserve(total);
-    out.push_back(Magic);
-    out.push_back(TypeSet);
-    auto const appendU32 = [&out](std::uint32_t v) {
-        std::array<std::byte, WireFields::FieldPrefixSize> bytes {};
-        WriteBigEndian(std::span<std::byte> { bytes }, v);
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    };
-    appendU32(static_cast<std::uint32_t>(members.size()));
+    std::vector<std::byte> blob;
+    blob.reserve(total);
+    ByteAppender out { blob };
+    out.AppendByte(Magic);
+    out.AppendByte(TypeSet);
+    out.AppendCount(members.size());
     for (auto const& m: members)
-    {
-        appendU32(static_cast<std::uint32_t>(m.size()));
-        auto const* const p = reinterpret_cast<std::byte const*>(m.data());
-        out.insert(out.end(), p, p + m.size());
-    }
-    return out;
+        out.AppendField(m);
+    return blob;
 }
 
 /// Decode a set value blob into its sorted member list.

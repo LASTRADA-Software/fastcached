@@ -51,6 +51,34 @@ DirectManifest SampleManifest()
 }
 } // namespace
 
+TEST_CASE("EncodeManifest writes the layout DecodeManifest reads, byte for byte")
+{
+    // **The assertion that distinguishes.** The round-trip case below agrees with
+    // whatever layout and byte order the two halves share, so it passes under the
+    // `(value >> 24) & 0xFF` chain this encoder used to carry and under `ByteAppender`
+    // alike (#305) -- and this file is where that chain lived. These bytes are spelled
+    // field by field through a builder sharing no code with the encoder.
+    //
+    // The version byte is typed rather than read from `ManifestVersion`, which is file-
+    // local: a manifest a NEWER launcher cannot read is the whole point of that byte,
+    // so a bump is a wire change and belongs in review as a changed literal.
+    DirectManifest manifest;
+    manifest.toolchainStamp = "stamp";
+    manifest.objectKey = "objkey";
+    manifest.entries.push_back({ .canonicalPath = "<SRCROOT>/a.h", .contentHash = "hash" });
+
+    auto const expected = FastCache::Testing::DeclaredCountBlob {}
+                              .Byte(0x01) // ManifestVersion
+                              .Field("stamp")
+                              .Field("objkey")
+                              .U32(1) // entryCount
+                              .Field("<SRCROOT>/a.h")
+                              .Field("hash")
+                              .String();
+
+    CHECK(EncodeManifest(manifest) == expected);
+}
+
 TEST_CASE("EncodeManifest and DecodeManifest round-trip a manifest")
 {
     auto const original = SampleManifest();

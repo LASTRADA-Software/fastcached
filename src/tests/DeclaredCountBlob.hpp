@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace FastCache::Testing
@@ -25,6 +26,10 @@ namespace FastCache::Testing
 /// finished: #304 and the encoder ticket still have to write it again. A test idiom
 /// that reappears with each instance of a recurring bug class is the one worth
 /// lifting, because its whole job is to make the next instance cheap to guard (#306).
+///
+/// The encoder ticket was #305, and it landed a SECOND use for this: `Field` below
+/// spells an encoder's expected output field by field, so what a codec emits is
+/// asserted against something other than the decoder that reads it back.
 ///
 /// **No format is baked in.** The copy this generalises put `StreamCodec::Magic` and
 /// `TypeStream` in its constructor, which is exactly why neither of the other two
@@ -62,6 +67,26 @@ class DeclaredCountBlob
     DeclaredCountBlob& EmptyField()
     {
         return U32(0);
+    }
+
+    /// A length-prefixed field carrying @p text.
+    ///
+    /// The step that turns this from a hostile-header builder into a **second,
+    /// independent spelling of a whole encoder's output** (#305). Every codec here
+    /// round-trips against its own decoder, and a round trip agrees with whatever byte
+    /// order and layout the two halves happen to share -- so it passes under a
+    /// hand-rolled append loop and under `ByteAppender` alike. Spelling the expected
+    /// bytes through this instead makes the encoder's layout the thing under test.
+    /// @param text The field's contents.
+    /// @return This builder.
+    DeclaredCountBlob& Field(std::string_view text)
+    {
+        U32(static_cast<std::uint32_t>(text.size()));
+        if (text.empty()) // an empty `string_view`'s `data()` may legally be null
+            return *this;
+        auto const* const first = reinterpret_cast<std::byte const*>(text.data());
+        _out.insert(_out.end(), first, first + text.size());
+        return *this;
     }
 
     /// Trailing bytes for the declared elements to be decoded from.
