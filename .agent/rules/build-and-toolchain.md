@@ -470,6 +470,43 @@ determinism rests on.
     is enough, since the package job builds the library and every app. The
     workaround is nearly always a C++20 spelling: `std::views::iota` over the
     index range says what `enumerate` says and is ten years older.
+  - **A facility can be PRESENT and still not have the overload you want -- which makes
+    the remedy above give a FALSE PASS.** `std::from_chars` has no floating-point
+    overload in libc++ before macOS 26.0, which is what the `macos-14` runners have, so
+    `std::from_chars(first, last, someDouble)` compiles on libstdc++ and on MSVC and
+    fails to BUILD on that one leg. Every *integral* `from_chars` in this tree is fine
+    and there are many of them, so the bullet above's remedy -- grep for the facility in
+    non-test code and see that macOS already compiles it -- answers YES and is wrong.
+    **A grep tests a NAME; the hazard is a SIGNATURE**, here the third argument's type.
+    This is a third shape rather than a restatement: not two implementations disagreeing
+    (`uniform_int_distribution`), and not one of them failing to ship the contents
+    (`views::enumerate`), but a name that is present with one overload missing, so the
+    check that catches the second shape reports clean on this one.
+
+    `Core/NumericText.hpp`'s `ParseFiniteDouble` is this tree's one answer. Reach for it
+    rather than writing the call; it also pins the C locale, which the obvious
+    `istringstream` spelling does not, so a host whose `LC_NUMERIC` is not `.` still
+    reads the format this project's own `std::format` writes. It was `RedisResp.cpp`'s
+    private `ParseDouble` and was **moved** rather than copied when `fastcache-cli`
+    became its second caller -- a second implementation citing the first in a comment
+    vouches for its bugs without inheriting its fixes.
+
+    It has cost a red `macOS-clang-release` once (PR #1198), written by an author who had
+    the correct implementation *and its reasoning* sitting in the same tree, in a comment
+    only the RESP handler's readers ever see. That is the whole reason the function
+    moved: a new file's author has no occasion to open the RESP handler, and the natural
+    thing to write is the call that does not build on one platform.
+
+    **No scan enforces this, deliberately.** A regex over `from_chars` matches every
+    correct integral call in the tree and cannot see the argument's type, so a check
+    would be noise -- and noise is how a guard gets deleted. The macOS leg is the
+    enforcement; this bullet is what saves the cycle. What *is* asserted is the
+    function's own behaviour: `Core/NumericText_test.cpp` covers the grammar's edges and
+    the locale property directly, and the locale case fails when the `imbue` is removed,
+    which no wire-level test in `RedisResp_test.cpp` can see. Its finiteness guard is
+    dead code today and says so at the site, because a reader who works that out alone
+    reads it as a defect.
+
   - **And the mirror holds: a Windows verification is green about a smaller set of
     questions than it looks.** The paragraph above counts what a Linux-only gate
     misses; this direction is measured too. One session's four tickets produced

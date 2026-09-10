@@ -1563,6 +1563,17 @@ what differs between compilers, standard libraries, hosts and tool versions.
   script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
   process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
   `coverage.sh`'s comments, where nobody looking at a new script would find it.
+- **`std::from_chars` has no FLOATING-POINT overload in libc++ before macOS 26.0** --
+  the `macos-14` runners -- so `std::from_chars(first, last, someDouble)` compiles on
+  libstdc++ and on MSVC and fails to BUILD on the one leg CI runs it on. Every integral
+  `from_chars` in this tree is fine, and there are many, which is what makes the
+  standing remedy for a missing libc++ facility (*grep for it in non-test code and see
+  that macOS already compiles it*) answer YES and be WRONG: a grep tests a NAME while
+  the hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's
+  one answer, and it pins the C locale as well, which the obvious `istringstream`
+  spelling does not. It cost a red `macOS-clang-release` once, written by an author with
+  the correct implementation already in the tree -- in a comment only the RESP handler's
+  readers ever see, which is why it has moved.
 - A `char` is UTF-8 here, at run time and at compile time: every Windows executable
   declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
   boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy
