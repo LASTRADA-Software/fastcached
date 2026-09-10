@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -88,6 +89,19 @@ namespace FastCache
 /// further generation — the stored form is already locale-free, so #878 only supplies
 /// a better value to normalize with.
 inline constexpr std::uint8_t CompileValueVersion = 4;
+
+/// Where the generation sits in an encoded value: its leading byte.
+///
+/// The named form of a position `DecodeCompileValue` also reads, through its
+/// `ByteCursor`'s first `ReadU8`. One fact in two syntaxes, and they must move
+/// together -- a field added ahead of the generation changes both.
+///
+/// It is PUBLIC because a third syntax turned up outside this file: a test that builds
+/// a value carrying a generation this build does not implement has to WRITE the byte,
+/// which `DeclaredGeneration` cannot express, and four of them spelled `front()` by
+/// hand (#649). A private accessor beside a public hazard is one source of truth for
+/// readers and none for writers.
+inline constexpr std::size_t CompileValueGenerationOffset = 0;
 
 /// The highest leading byte that will ever name a compile-value generation.
 ///
@@ -197,6 +211,17 @@ struct CompileValue
 /// @param error What `DecodeCompileValue` refused with — no other producer's.
 /// @return True for a foreign generation; false for damaged or mis-framed bytes.
 [[nodiscard]] bool IsForeignGeneration(ProtocolError const& error) noexcept;
+
+/// The generation an encoded value declares.
+///
+/// It exists so a caller that needs the number -- `CanonicalStoredValue`, for a refusal
+/// that names it, and the test builder that must not stamp over a value whose generation
+/// is not this one -- asks a question with a NAME rather than writing `front()` a hundred
+/// lines from the code that guarantees the answer.
+/// @param bytes An encoded value, possibly empty.
+/// @return The declared generation, or none when there is no leading byte to declare one
+///         -- which is not the same as declaring generation zero.
+[[nodiscard]] std::optional<std::uint8_t> DeclaredGeneration(std::span<std::byte const> bytes) noexcept;
 
 /// The sentence a server sends an operator about a value it cannot canonicalize.
 ///

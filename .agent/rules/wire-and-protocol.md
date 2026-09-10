@@ -302,6 +302,117 @@ Every rule below has already been a bug.
     one-key list on the strength of bytes it had just failed to understand. It returns
     `optional` now, and both callers answer `Corrupt`.
 
+- **An enum whose ordinals are transmitted or persisted says so at its declaration; one
+  whose ordinals are private says that too, because "no comment" means both.** Inserting an
+  enumerator mid-enum shifts every later ordinal, and whether that is free or catastrophic
+  depends entirely on whether anything outside this process reads those numbers. This tree
+  holds both kinds and, until #308, nothing at either declaration said which. The session
+  working #275 checked deliberately before inserting into `IMetricsSink::Counter` and was
+  right; the point is that the check was **available to be skipped**, and skipping it shows
+  up in no test. A mid-enum insertion in a persisted enum does not fail to load — every
+  record already written comes back with each field attributed to the NEXT enumerator,
+  silently, for as long as the file exists.
+
+  The census is a PATTERN and not a number: every `static_cast<T>(...)` in `src/` whose `T`
+  is an enum, that being where an ordinal ARRIVES from bytes somebody else wrote, plus the
+  carriers that are a POSITION rather than a decoded byte and the decoders that spell the
+  enum as a template parameter. 18 enums, and the split is the finding:
+
+  <!-- table-total: enums=rows -->
+  | enum | what reads the ordinal | stated at the declaration before #308 |
+  |---|---|---|
+  | `PathCanon::Grammar` | a stored `CompileValue`'s region tag byte | **no** |
+  | `CowTree::PageType` | the page header's type byte, on disk | **no** |
+  | `CowTree::MetaSlot` | a meta page's FILE OFFSET, `slot * pageSize` | **no** |
+  | `Distributed::FleetMetric` | a history body, positionally | **no** |
+  | `IMetricsSink::Counter` | nothing outside the process — an array index | **no** |
+  | `Consensus::EntryKind` | a log record's kind byte, on disk AND on the peer wire | **no** |
+  | `Consensus::VoteDecision` | a vote response's byte | **no** |
+  | `Consensus::AppendResult` | an append response's byte | **no** |
+  | `StorageTier` | `CompileCacheWire`, positionally | the INDEX, not the wire |
+  | `DiscoveryWire::Kind` | the datagram's kind byte | implied by the file, not said |
+  | `MemcachedBinary::Opcode` | the memcached spec's byte | implied by the values, not said |
+  | `Cc::KeyPiece` | folded into the launcher's key digest | implied by the values, not said |
+  | `Cluster::CommandKind` | a replicated command's byte | yes |
+  | `CompressionCodec` | the stored codec id | yes |
+  | `RaftWire::MessageType` | the third peer-frame header byte | yes |
+  | `CompileCacheWire::Op` | the third request-header byte | yes |
+  | `CompileCacheWire::Status` | the reply's first byte | yes |
+  | `CompileCacheWire::ErrorCode` | an `Error` payload's first byte | yes |
+
+  Eight silent. `Grammar` is the one that justifies the ticket: its ordinal is the grammar
+  tag of every region of every object this cache has ever stored, every enumerator was
+  implicit, and a mid-enum insertion would have the canonicalizer rewrite a `/showIncludes`
+  region under GCC depfile rules — #229's failure, on a green build with no counter moving.
+  `EntryKind` is the one that is both PERSISTED and TRANSMITTED: insert a kind, raise
+  `WireEnumBound<EntryKind>::Highest`, and the build is green while every `Configuration`
+  entry already in `raft.log` comes back one kind along — a committed membership change
+  ordered, committed and never adopted.
+
+  **The pattern is narrower than its author reads it, in the direction that matters, and
+  it was narrower than THIS ticket's author read it too.** Three ways an enum escapes the
+  cast census, all of them found by reading rather than by grepping:
+
+  - **An encode-side table walk.** `CompileCacheWire::Op` is decoded by `FindOp`, which
+    walks `OpTable` comparing `static_cast<std::uint8_t>(row.code) == opRaw` — an ENCODE of
+    each row. `RaftWire::MessageType` and `FindMessage` are the same shape.
+  - **A position, which is no cast at all.** `StorageTier` and `FleetMetric` are indexed
+    into, and `MetaSlot` is MULTIPLIED into a file offset — the ordinal never becomes a
+    byte anybody decodes, and it still names where two meta pages live in every store.
+  - **A cast whose enum is a template parameter.** `Consensus::DecodeWireEnum<E>` ends in
+    `static_cast<E>(raw)`, so a grep for `static_cast<SomeEnum>` finds ONE hit spelled `E`
+    for THREE wire enums at once. `Cc::KeyPiece` escapes on the same edge from the other
+    side: it is folded into a digest and decoded nowhere, so there is no cast to find.
+
+  Nine of eighteen rows sit outside the pattern — exactly half — and the first pass of this
+  ticket found only three of the nine, shipping a table whose `table-total` marker made 12
+  read as complete coverage. **A census states its PATTERN, not only its number**, and here
+  the number was checked against the table while the pattern was not checked against the
+  tree. A scan derived from the cast alone would report a clean set while the enum whose
+  order is most load-bearing sat outside it.
+
+  **The explicit `= N` is the enforcement; the comment is the rule.** On a persisted or
+  transmitted enum every enumerator carries its value, so a renumbering appears in review as
+  a changed literal on every row below the insertion rather than as an invisible consequence
+  of one added line. `Last` carries one too where it exists — `readability-enum-initial-value`
+  accepts all, none or only-the-first, and this tree does not silence clang-tidy — and it
+  earns it: forgetting to bump `Last` while adding a slot makes the new enumerator COLLIDE
+  with it, which shortens `EnumeratorCount` and fails `RowsInEnumeratorOrder`'s
+  `static_assert` against the table. **On a PRIVATE enum the same edit is harmful**: a column
+  of explicit ordinals asserts a contract that does not exist, and the next person to add a
+  counter preserves it. `IMetricsSink::Counter` therefore keeps `ConnectionsTotal = 0` and
+  nothing else, which is the same lint's only-the-first form.
+
+  What actually catches an omission differs per enum and is worth knowing before relying on
+  one: `RowsInEnumeratorOrder` for the two `EnumTable` carriers, the exhaustive `switch` in
+  `IsKnownGrammar` for `Grammar` (an added enumerator is a `-Werror` warning at the one place
+  that decides whether a tag is legal), `WireEnumBound`'s undefined primary template for the
+  three Raft enums (an enum that forgets its bound is a compile error at the decode site),
+  and **nothing at all for `PageType`, `MetaSlot` or `KeyPiece`** — `PageType`'s decoder
+  refuses a byte that is neither value, which a SWAP of two live values passes perfectly,
+  and the other two are never decoded at all. The comment is the whole guard there.
+
+  **And none of those is a guard against THIS hazard, though the first one reads like one.**
+  `RowsInEnumeratorOrder` checks that `table[i]` describes enumerator `i`, so it fires on a row
+  omitted, a row misplaced, and a `Last` that was not bumped -- every edit leaving the TABLE
+  inconsistent with the enum. A mid-enum insertion **with its row inserted at the matching
+  position** leaves the two perfectly consistent: the `static_assert` passes, the build is
+  green, and every record already written now decodes shifted. So the two enums carrying an
+  `EnumTable` are precisely the ones most likely to be read as already protected, and the `= N`
+  literals are all that stands between them and this. The same shape one level down:
+  `IsKnownGrammar`'s exhaustive `switch` catches an enumerator ADDED and is silent about two
+  REORDERED, since both arms still exist. **A guard answering the neighbouring question is
+  worse than no guard wherever somebody counts it as this one** -- which happened during this
+  change's own review, where the `EnumTable` static_asserts were offered as evidence that the
+  explicit values add nothing.
+
+  **Nothing checks the comments themselves, and an approximate scan would be worse than the
+  rule.** Deciding "this enum's ordinal is read from bytes somebody else wrote" needs the two
+  facts a grep cannot hold together — that a cast crosses a boundary, and that a positional
+  layout is one — so a checker built on the cast pattern would refuse correct declarations
+  and pass the three rows above that carry no cast. So this rule is all there is, and it gets
+  a tripwire bullet in `AGENT.md` rather than a `ctest` name.
+
 ## Authentication on the compile-cache port
 
 - **Every protocol checks the configured credential, and the compile cache was the

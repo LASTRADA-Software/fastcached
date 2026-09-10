@@ -164,6 +164,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # The event, which this step BRANCHES on and which its sibling's `env:`
+          # does not lend it -- a step's environment is its own. Omitted, the
+          # first `[[ "$EVENT" == "push" ]]` below killed the step under `set -u`
+          # and #684's notifier opened no report in its entire life: 190 runs
+          # concluded `success` on the `reportable == 0` path that never enters
+          # here, and all 10 that had something to say died on that line (#1174).
+          EVENT: ${{ github.event.workflow_run.event }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}

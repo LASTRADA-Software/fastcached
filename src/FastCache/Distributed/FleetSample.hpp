@@ -19,18 +19,36 @@ namespace FastCache::Distributed
 /// edited. The five dispatch counters are `LeaseOutcomeTable`'s, read through the
 /// same `IMetricsSink::Counter` values so the page and the history cannot drift
 /// into two vocabularies for one fact.
+/// **ORDINALS ARE A PERSISTED CONTRACT. Append only; never insert or reorder.** (#308)
+///
+/// A history file's body is `[start][sample][present][coverage][9 values][9 folds]` --
+/// the readings are stored POSITIONALLY, indexed by `static_cast<std::size_t>(metric)`,
+/// and read back the same way. Inserting an enumerator mid-enum therefore does not fail
+/// to load: every bucket already on disk comes back with each reading attributed to the
+/// NEXT series, silently, for as long as the file exists. A cache-hit count rendered as
+/// a gauge of jobs in flight, with nothing anywhere reporting a fault.
+///
+/// The explicit `= N` is the enforcement rather than decoration. Without it a mid-enum
+/// insertion is one added line with no other visible change; with it, the same edit
+/// either collides or shows up in review as a renumbered literal on every row below it.
+/// `Last` carries one too, because `readability-enum-initial-value` accepts all, none or
+/// only-the-first and this tree does not silence clang-tidy. It also earns it: forgetting
+/// to bump it while adding a slot makes the new enumerator COLLIDE with `Last`, which
+/// shortens `EnumeratorCount` and fails `RowsInEnumeratorOrder`'s static_assert against
+/// `FleetMetricTable`. One line of friction, caught at compile time rather than in a
+/// history file nobody re-reads.
 enum class FleetMetric : std::uint8_t
 {
-    DispatchGranted = 0, ///< Cumulative: compiles handed to a worker.
-    DispatchNoWorker,    ///< Cumulative: nothing registered for that toolchain.
-    DispatchNoCapacity,  ///< Cumulative: every matching worker full of our own work.
-    DispatchWithdrawn,   ///< Cumulative: a ceiling withdrew the slots.
-    DispatchDuplicate,   ///< Cumulative: already being built somewhere.
-    CacheHits,           ///< Cumulative, summed over machines.
-    CacheMisses,         ///< Cumulative, summed over machines.
-    OfferableSlots,      ///< Gauge: slots a compile could start on.
-    JobsInFlight,        ///< Gauge: this fleet's compiles running.
-    Last
+    DispatchGranted = 0,    ///< Cumulative: compiles handed to a worker.
+    DispatchNoWorker = 1,   ///< Cumulative: nothing registered for that toolchain.
+    DispatchNoCapacity = 2, ///< Cumulative: every matching worker full of our own work.
+    DispatchWithdrawn = 3,  ///< Cumulative: a ceiling withdrew the slots.
+    DispatchDuplicate = 4,  ///< Cumulative: already being built somewhere.
+    CacheHits = 5,          ///< Cumulative, summed over machines.
+    CacheMisses = 6,        ///< Cumulative, summed over machines.
+    OfferableSlots = 7,     ///< Gauge: slots a compile could start on.
+    JobsInFlight = 8,       ///< Gauge: this fleet's compiles running.
+    Last = 9
 };
 
 /// Whether a slot accumulates or is read afresh each time.

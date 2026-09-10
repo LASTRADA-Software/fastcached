@@ -426,6 +426,13 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::Withdrawn, .cause = DeclineCause::Withdrawn },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NoCluster, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::InvalidClusterChange, .cause = DeclineCause::NotPermitted },
+    // Cluster administration, which no compile reaches: a launcher can only ever
+    // meet these by talking to something that is not the surface it thinks it is,
+    // and that is a protocol disagreement rather than a fleet condition. Rows so
+    // that neither arrives as `Unrecognised`, which reads exactly like a code this
+    // build has never heard of.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeInFlight, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::ClusterChangeNotNeeded, .cause = DeclineCause::NotPermitted },
     // Slots were free and MEMORY was not, which the worker's own rule calls a
     // momentary fullness the peer retries past -- the same answer as a withdrawn
     // slot, and not a machine to go and inspect.

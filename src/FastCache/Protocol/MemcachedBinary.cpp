@@ -32,6 +32,9 @@ namespace
     constexpr std::byte ResponseMagic { 0x81 };
     constexpr std::size_t HeaderSize = 24;
 
+    /// **ORDINALS ARE THE MEMCACHED BINARY PROTOCOL'S, not this project's.** (#308)
+    /// Every value below is dictated by the format real clients speak, so they are
+    /// neither ours to renumber nor ours to append to.
     enum class Opcode : std::uint8_t
     {
         Get = 0x00,

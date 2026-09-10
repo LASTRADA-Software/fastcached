@@ -39,6 +39,24 @@ class IMetricsSink
     IMetricsSink& operator=(IMetricsSink&&) = delete;
     virtual ~IMetricsSink() = default;
 
+    /// **ORDINALS ARE PRIVATE. Reorder freely; nothing outside this process reads them.** (#308)
+    ///
+    /// Said out loud because silence used to mean both this and its opposite:
+    /// `Distributed::FleetMetric` indexes a history FILE and `StorageTier` crosses a
+    /// WIRE, and at their declarations all three enums looked the same. What makes this
+    /// one private is that every consumer names an ENUMERATOR -- the refusal tables, the
+    /// catalog, the fleet page's reads -- and the only ordinal use is
+    /// `AtomicMetricsSink`'s array index below, which is built and destroyed with the
+    /// process. What an operator or a peer ever sees is `MetricsCatalog`'s exported
+    /// name, which travels with the row rather than with the position.
+    ///
+    /// So a reorder here is invisible, and an omission is a build failure rather than a
+    /// silent one: `MetricsCatalog` is an `EnumTable` guarded by `RowsInEnumeratorOrder`,
+    /// so a row that stops following the enum stops compiling. `Last` is deliberately
+    /// left implicit -- only `ConnectionsTotal = 0` carries a value, which is
+    /// `readability-enum-initial-value`'s accepted only-the-first form -- because a column
+    /// of explicit ordinals would assert a contract this enum does not have, and the next
+    /// person to add a counter would preserve it.
     enum class Counter : std::uint8_t
     {
         ConnectionsTotal = 0,

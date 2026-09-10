@@ -50,6 +50,12 @@ struct PageId
 /// or written. Which slot a commit takes is the page store's choice -- the one
 /// not holding the last durable meta -- and NOT `txnId mod 2`, which this
 /// comment claimed until #726; see `Meta`.
+///
+/// **ORDINALS ARE AN ON-DISK CONTRACT. Never insert or reorder, and there is no room
+/// to append.** (#308) The value is not decoded from a byte, it is MULTIPLIED into a
+/// file offset: `FilePageStore::MetaSlotOffset` is `slot * pageSize`, so these two
+/// numbers name the first two pages of every store this project has ever written.
+/// A third slot inserted mid-enum would put `B` where the first DATA page lives.
 enum class MetaSlot : std::uint8_t
 {
     A = 0, ///< First meta page (file offset 0).
@@ -71,6 +77,18 @@ enum class MetaSlot : std::uint8_t
 }
 
 /// Discriminator for data page kinds.
+///
+/// **ORDINALS ARE AN ON-DISK CONTRACT. Append only; never insert, reorder or reuse.**
+/// (#308) The enumerator's numeric value IS the page header's type byte:
+/// `PageLayout` writes it and reads it back with a `static_cast<PageType>`, so these
+/// two numbers describe every store this project has ever written.
+///
+/// Renumbering them does not fail to open a store -- `RecordFormats()` and the meta
+/// CRC both still agree -- it makes a walk read a leaf's entries under the internal
+/// page's layout, which is the `Corrupt` an operator is told means the bytes are
+/// damaged. `DecodePageHeader` refuses a byte that is neither value, so a zeroed or
+/// torn page is caught -- but SWAPPING two live values passes that guard perfectly,
+/// which is why the direction that matters is renumbering rather than an unknown byte.
 enum class PageType : std::uint8_t
 {
     Leaf = 1,     ///< Leaf page: holds key→value entries.

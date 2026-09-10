@@ -155,6 +155,56 @@ the one remedy that cannot work.
   and improving the resolution, which is why the surrounding comments all argue
   about resolution. Resolution was never the whole defect.
 
+## A fixed port needs a reaper, and a leftover listener is refused rather than adopted
+
+`run-launcher-e2e.ps1` bound the constant `21714` and nothing reaped the daemon when
+a run did not reach its cleanup — a ctest interrupted, a test killed by a timeout, a
+build cancelled mid-suite. `fastcached.exe` then listened for as long as the machine
+was up and **every later run** failed at
+
+```
+fastcached exited immediately (exit 1)
+```
+
+which names neither the port nor the process and reads exactly like a daemon that
+cannot start. It was diagnosed by hand from `Get-NetTCPConnection -LocalPort 21714`,
+after surviving a rebase and presenting as a regression the rebase had caused (#220).
+
+**The reason offered for the constant was true and did not support it.** The launcher
+under test reads `FASTCACHE_ADDR` from the environment and several child processes
+inherit it, so the port has to be decided BEFORE the daemon starts — which is an
+argument for deciding it early, and drawing does that. The fixture draws from
+20000..32000 like every sibling now, and the four were CHECKED rather than assumed:
+`compile-cache-e2e.sh` and `dist-compile-e2e.sh` call `free_port`;
+`sccache-smoke.{sh,ps1}` and `FASTCACHED_SMOKE_PORT` still fix 11611, which is #183.
+
+Three things worth keeping:
+
+- **A probe that NAMES the holder turns a twenty-minute diagnosis into a sentence**,
+  and it is the cheapest half. It is only reached for an explicitly passed port,
+  since a drawn one was proved free a moment earlier.
+- **Refused, never adopted.** A leftover listener is of an unknown vintage and may
+  hold a store from a different build, which is the class of confusion the fixture
+  exists to DETECT rather than reproduce. The one exception is a listener whose image
+  path is byte-for-byte the daemon this run would start: that is REAPED, which is not
+  adoption but the manual `Stop-Process` somebody already does — and a holder whose
+  path could not be read is refused, because an unreadable path reaching the reap arm
+  would kill a process the fixture knows nothing about.
+- **The DECISION is what can be wrong, so it is what gets tested.** It was reachable
+  only by running the whole fixture, which needs a built daemon, a built launcher and
+  an MSVC toolchain — so on every machine and every CI leg without those it was
+  asserted by nothing. `-SelfTestPorts` drives it over staged holder records and
+  against real listeners, needs none of the three, and is registered as
+  `launcher-e2e-ports-selftest`. Where `pwsh` is absent the row is REGISTERED and
+  SKIPPED rather than dropped, because absent and skipped are two states.
+
+Shown red and only where expected: with the classifier neutered to `return 'free'`,
+exactly the six decision-dependent cases fail — the five staged records and the real
+end-to-end refusal — while the accepting case, the three acquisition cases and the
+two holder-detection cases stay green. The accepting case staying green under the
+mutation is the reason it cannot stand alone.
+
+
 ## A bounded wait must also say WHICH KIND of failure it was
 
 "Every wait is bounded" is the rule above, and it is not enough on its own. A wait
@@ -549,6 +599,51 @@ The general form is the one `ScratchPath` taught: a helper is shared only if it
 sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
+
+### A value from another generation is BUILT by the shared helper, never by hand
+
+`tests/ForeignGenerationValue.hpp` (#649). Four cases across two test binaries need a
+stored value carrying a generation this build does not implement, and all four built one
+the same way and separately: encode through the real encoder, assert the leading byte is
+`CompileValueVersion`, write `CompileValueVersion + 1` over it. Three lines, no
+collaborator, nothing that looks like it wants a helper -- which is why it spread.
+
+**What makes it worth consolidating is that the copies fail SILENTLY.** Every one of those
+cases asserts a REFUSAL, and a value damaged in some other way is refused too. So a
+generation that moves off byte 0 leaves each copy stamping a different field: the value
+stops being a foreign generation, the case goes on passing, and the name still says what
+it no longer builds. That is the shape `Assert what DISTINGUISHES` describes, arriving
+through a construction rather than through an assertion -- and an assertion review does
+not find it, because every assertion is correct.
+
+Two facts live in the helper and nowhere else:
+
+- **Which byte carries the generation.** `StampGeneration` refuses bytes whose leading
+  byte is not `CompileValueVersion`, so a moved generation is a thrown `logic_error`
+  naming the two numbers rather than four cases quietly testing something else. A
+  precondition violation is the one thing this project throws for.
+- **Which generation is foreign.** `ForeignGeneration` is DERIVED, not spelled
+  `CompileValueVersion + 1`. That arithmetic stops being right at the top of the reserved
+  range: a leading byte outside `[1, MaxCompileValueGeneration]` is not a compile value of
+  any generation (#552), so at version 15 all four copies would have built a
+  `NotACompileValue` -- a different outcome under a different policy, in cases named for
+  the one they no longer build. A `static_assert` proves the derived byte stays inside the
+  range, so the failure is a build error rather than four confusing reds.
+
+The guard is proved in both directions by
+`The shared foreign-generation helper refuses to stamp a value it does not recognise`, in
+`CompileValue_test.cpp` -- a `CHECK_NOTHROW` on the ordinary path beside the two refusals,
+because a guard nobody has watched ACCEPT is not known to work and a helper that threw
+unconditionally would satisfy the refusing half alone. Neutering the precondition reddens
+that one arm and nothing else: measured, the empty-vector arm, the `CHECK_NOTHROW`, and
+both neighbouring cases stay green.
+
+**A hand-built frame is NOT this helper's job and must not be routed through it.**
+`CompileValue_test`'s `futureFramed` synthesises a value whose FRAMING this build cannot
+parse -- a generation byte followed by a field that does not exist here -- which is #552's
+subject and cannot come out of this build's encoder at all. The helper takes an encoder
+output; a frame this build could not have written is a different thing that happens to
+share a leading byte.
 
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 

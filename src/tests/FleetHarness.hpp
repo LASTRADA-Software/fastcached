@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -110,7 +111,7 @@ class FleetHarness final: public Cc::IEndpointExchange
     /// @param signingKey The cluster key every scheduler here signs with. Empty —
     ///        the default — means unsigned grants, which is what a fleet with no
     ///        `--cluster-key-file` runs and is the simpler thing to assert against.
-    explicit FleetHarness(std::vector<std::byte> signingKey = {}):
+    explicit FleetHarness(SecureByteBuffer signingKey = {}):
         _signingKey { std::move(signingKey) }
     {
         // A worker that refuses is the default because the release is the subject
@@ -341,7 +342,7 @@ class FleetHarness final: public Cc::IEndpointExchange
     ManualWallClock _wallClock;
     AtomicMetricsSink _metrics;
     NullLogger _logger;
-    std::vector<std::byte> _signingKey;
+    SecureByteBuffer _signingKey;
     std::vector<std::unique_ptr<Node>> _nodes;
     std::vector<std::string> _workerEndpoints;
     std::vector<std::byte> _workerReply;

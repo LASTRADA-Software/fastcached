@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DiscoveryTier.hpp"
 
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,13 +26,13 @@ using FastCache::Testing::TestBeaconPort;
 namespace
 {
 /// A key every node in a test cluster shares.
-[[nodiscard]] std::vector<std::byte> TestKey()
+[[nodiscard]] SecureByteBuffer TestKey()
 {
     // Constructed rather than typed as a hex run, for the reason the RFC 4231
     // vectors next door are: a hand-written literal of this length is one nobody
     // recounts, and a miscounted key accuses the code that reads it.
     auto bytes = std::views::iota(0, 32) | std::views::transform([](int value) { return static_cast<std::byte>(value); });
-    return std::vector<std::byte> { bytes.begin(), bytes.end() };
+    return SecureByteBuffer { bytes.begin(), bytes.end() };
 }
 
 /// What one node announces about itself.
@@ -40,7 +41,7 @@ namespace
 /// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
 [[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId,
-                                                 std::vector<std::byte> key,
+                                                 SecureByteBuffer key,
                                                  DatagramAddress beaconAddress)
 {
     return Cluster::DiscoveryConfig { .clusterId = "fleet",
@@ -66,7 +67,7 @@ struct Peer
     /// @param bus The segment.
     /// @param nodeId This node's identity.
     /// @param key The cluster key it holds.
-    Peer(DatagramBus& bus, std::string const& nodeId, std::vector<std::byte> key):
+    Peer(DatagramBus& bus, std::string const& nodeId, SecureByteBuffer key):
         Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
              DatagramBus::BroadcastAddress(),
              nodeId,
@@ -82,7 +83,7 @@ struct Peer
     Peer(std::unique_ptr<IDatagramSocket> socket,
          DatagramAddress beaconAddress,
          std::string const& nodeId,
-         std::vector<std::byte> key):
+         SecureByteBuffer key):
         tier { DiscoveryTier::Over(
             std::move(socket),
             ConfigFor(nodeId, std::move(key), std::move(beaconAddress)),

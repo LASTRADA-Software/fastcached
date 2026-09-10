@@ -85,8 +85,12 @@
 #                `MERGE_GROUP_BASE_SHA`). This is how the workflow invokes it, so
 #                that the event -> (scope, base) mapping lives in one place a
 #                reader can see whole rather than in three CI expressions.
-#   --self-test  check the scope computation against a synthetic tree and exit.
-#                Needs no compile database and no clang-tidy.
+#   --self-test  check the scope computation against a synthetic tree, and the
+#                canary's verdict against staged probe records, then exit. Needs
+#                no compile database and no clang-tidy -- which is the whole
+#                point of the second one: until #257 the canary's decision could
+#                only be exercised by a machine already running a full sweep with
+#                a working analyser, which is the population it is not for.
 set -u
 
 # 4.4 rather than 4.0, and each digit is load-bearing: associative arrays are 4.0,
@@ -807,8 +811,47 @@ OnlyCoverageVerdict() {
 # prints a confident count. So it gets asserted, on a synthetic tree, with no
 # compile database and no clang-tidy needed. The CI job runs this before the
 # sweep for the same reason the sweep canaries its binary.
+# The canary's DECISION, split out so it can be driven without an analyser (#257).
+#
+# The acquisition far below needs clang-tidy, a compile database and a real
+# translation unit, none of which a test in the default `ctest` set can assume --
+# so this verdict was reachable only on a machine already running a full sweep,
+# which is the population a canary is least needed in. Same move as
+# `InterpreterVerdict` above and `local-gate.sh`'s classifier: acquisition stays
+# thin, the decision is pure, and the decision is what is tested.
+#
+# The two failing arms are NOT one. An exit at or above 126 is the shell saying the
+# program never started -- a missing binary, a lost mode bit, a `noexec` mount --
+# and nothing is printed with it; the pattern arm is a binary that DID start and
+# then analysed nothing, which exits normally and reads as a clean sweep. Reporting
+# either as the other sends somebody to check the wrong thing.
+#
+# `ok` for every other exit code ON PURPOSE: clang-tidy exits non-zero when it has
+# FINDINGS, which is the tool working, so a canary refusing a non-zero exit would
+# refuse every branch that has something to fix.
+#
+# @param 1 The probe's exit status.
+# @param 2 Everything the probe printed, stdout and stderr together.
+# @return Prints `ok`, or `not-executed <reason>` / `not-parsing <output>`.
+CanaryVerdict() {
+    local rc="$1" output="$2"
+    if [[ "$rc" -ge 126 ]]; then
+        echo "not-executed exit ${rc}"
+        return
+    fi
+    case "$output" in
+        *"Permission denied"*|*"error: no such file or directory: '@"*|*"'stddef.h' file not found"*)
+            echo "not-parsing ${output}"
+            return ;;
+    esac
+    echo ok
+}
+
 SelfTest() {
     local status=0
+    # A literal apostrophe, so the canary expectations below can carry the ones
+    # clang-tidy's own messages do without a line of nested quoting each.
+    local SQ="'"
     local scratch
     scratch="$(mktemp -d)" || fatal "cannot create a scratch directory"
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
@@ -1206,6 +1249,40 @@ STUB
     ( CiScopeTable=(); CiScopeDefaultRow=""; CiScopeFor push '' '' >/dev/null 2>&1 )
     Expect "a default row that stopped being one is refused, never an empty answer" "2" "$?"
 
+    # The canary's verdict, every arm (#257). Until this split existed the canary
+    # could only be exercised by a machine already running a full sweep with a
+    # working analyser -- the one population it is not for.
+    #
+    # The ACCEPTING direction first, and deliberately: a guard nobody has watched
+    # accept is not known to work, and a `CanaryVerdict` answering `not-parsing`
+    # unconditionally would satisfy every refusing case below while failing every
+    # branch in the tree.
+    Expect "a clean probe passes the canary" "ok" "$(CanaryVerdict 0 "")"
+    Expect "findings are the tool WORKING, not a canary failure" \
+           "ok" \
+           "$(CanaryVerdict 1 "src/x.cpp:1:1: warning: prefer X [modernize-x]")"
+
+    # 126 and 127 are the shell saying the program never started. Nothing is
+    # printed with them, so the exit code carries this on its own.
+    Expect "a binary that cannot be executed is not-executed" \
+           "not-executed exit 126" \
+           "$(CanaryVerdict 126 "")"
+    Expect "a binary that is not there is not-executed" \
+           "not-executed exit 127" \
+           "$(CanaryVerdict 127 "")"
+
+    # And the three ways a binary that DID start analyses nothing. Each exits
+    # normally, so a sweep reading the exit code alone reports a branch clean.
+    Expect "a probe refused by the filesystem is not-parsing" \
+           "not-parsing clang-tidy: Permission denied" \
+           "$(CanaryVerdict 0 "clang-tidy: Permission denied")"
+    Expect "a response file it cannot open is not-parsing" \
+           "not-parsing error: no such file or directory: ${SQ}@args.rsp${SQ}" \
+           "$(CanaryVerdict 0 "error: no such file or directory: ${SQ}@args.rsp${SQ}")"
+    Expect "a toolchain whose headers it cannot find is not-parsing" \
+           "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
+           "$(CanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found")"
+
     [[ "$status" -eq 0 ]] && echo "TIDY SWEEP SELF-TEST PASSED"
     return "$status"
 }
@@ -1391,15 +1468,20 @@ PLAN
 # to be told it has nothing to do -- the canary exists to stop a CLEAN VERDICT
 # being believed, and a sweep with no units earns no verdict.
 Canary() {
-    local probe_file probe probe_rc
+    local probe_file probe probe_rc verdict
     probe_file="$(git ls-files 'src/FastCache/Core/*.cpp' | head -1)"
     [[ -n "$probe_file" ]] || fatal "no probe file to canary against"
     probe="$("$TIDY" -p "$DB" --quiet "$probe_file" 2>&1)"
     probe_rc=$?
-    [[ "$probe_rc" -ge 126 ]] && fatal "$TIDY could not be executed (exit ${probe_rc})"
-    case "$probe" in
-        *"Permission denied"*|*"error: no such file or directory: '@"*|*"'stddef.h' file not found"*)
-            fatal "$TIDY is not parsing: ${probe}" ;;
+    verdict="$(CanaryVerdict "$probe_rc" "$probe")"
+    case "$verdict" in
+        ok) ;;
+        not-executed*) fatal "$TIDY could not be executed (${verdict#not-executed })" ;;
+        not-parsing*) fatal "$TIDY is not parsing: ${verdict#not-parsing }" ;;
+        # A verdict this case does not know is the function above being wrong, and
+        # it must not render as the analyser being wrong. `InterpreterVerdict`'s own
+        # default arm, for its own reason.
+        *) fatal "CanaryVerdict returned an unrecognised verdict [${verdict}]; that is a bug in this script, not a problem with $TIDY" ;;
     esac
 }
 

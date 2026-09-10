@@ -12,6 +12,7 @@ transport, a manual clock and a scripted reactor.
 src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
+                SecureBytes (the one zeroing primitive, and the allocator credentials live in),
                 Utf8 (the one strict decoder), Compression, WireFrame + WireFields
                 (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
@@ -129,10 +130,37 @@ reactor (IOCP / epoll / kqueue) multiplexes every connection on its event
 loop, so the number of concurrent clients is bounded by memory, not by a
 worker count. `--threads` runs that many independent single-threaded
 reactors, each pinned to a core, with every connection pinned to one reactor
-for its lifetime. On Windows the persistent backend additionally drains the
-IOCP reactor from several threads so a blocking page-store `fsync` overlaps
-with serving other connections; the disk backend is therefore always wrapped
-in a `ShardedStorage` for thread safety.
+for its lifetime. The disk backend is always wrapped in a
+`ShardedStorage`, whose per-shard mutex serialises access: `main.cpp` wraps
+whenever more than one thread can reach the storage, and the persistent
+backend is one of four conditions that say so — the others being an explicit
+multi-shard layout, the reactor running on more than one thread, and the
+metrics endpoint, whose `fc-admin` thread calls `engine.Snapshot()`
+concurrently with the reactor. That third one is the DEFAULT rather than an
+opt-in: `--threads` unset means `hardware_concurrency()`, so on any multi-core
+host the wrapper is on without anybody asking for it, and reading it as
+"`--threads` above one" describes a single-threaded default this daemon does
+not have.
+
+**No completion port is ever drained from several threads**, on Windows or
+anywhere else. `IocpReactor.hpp` says that migrates a coroutine across threads
+and is unsafe, and `RunMultiReactorWindows` runs one thread per reactor
+exactly as the POSIX path does. This paragraph claimed the opposite until
+[#896](https://github.com/LASTRADA-Software/fastcached/issues/896) — it
+described a threading model this project does not implement and a header in
+the same tree calls unsafe, which is worse than a stale sentence twice over:
+it is the document a session reads FIRST and is told to obey, so it licenses
+the defect, and it changes how a reader grades a concurrency bug. A scoped
+review of #884 recorded that taking it as authoritative would have made its
+verdict *"too kind"* — a same-thread ordering question becomes a cross-thread
+data race — and it reached the right answer only by choosing the header over
+this file. The `fsync`-overlap mechanism it described is in no source either.
+#896 argued that from "no `ThreadPoolExecutor` appears in
+`ReactorServerLoop.cpp`", and **that half of the ticket is wrong**: one is
+constructed on all three serving paths. It is `ThreadPoolExecutor { 1 }`
+running the EXPIRY SWEEP, drains no completion port, and overlaps no `fsync`
+with anything — so the conclusion holds and the evidence offered for it did
+not, which is the shape worth catching in a document nobody re-derives.
 
 ## The rulebook
 
@@ -399,6 +427,18 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   present; counted, it would claim a bound is too short for an event that says nothing
   about the bound. Acceptance is a discrimination case; per-arm sections all pass when
   all three answer alike.
+- A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a
+  destructor: every release goes through one door, so the several COPIES (the validator
+  takes the key by value) need no holder to remember anything. It also covers a vector
+  that grows, which none here does today — say so, rather than citing a growing holder
+  this tree does not have. `std::memset` is DELETED at -O2 by both compilers — measured,
+  same `main`, both inlined. Container-agnostic is not SUFFICIENT: SSO keeps a short secret
+  inside the object where no allocator is called — measured, inline capacity **15 on
+  libstdc++ AND on MSVC, 22 on libc++**, so a 16-to-22-byte secret is on the heap on Linux
+  and Windows and inline on macOS. libc++ is the sole outlier, which makes **macOS the
+  platform to write the failing test against**. Secret STRINGS need an inline wipe too
+  (#1125), and a destructor-based one still misses the inline-to-heap transition. Holders
+  are found by NAME, so a row that has stopped matching is a refusal.
 - A lease token is a credential, and its MAC covers the granted **endpoint** or it is
   a credential for every worker that trusts the key. Fields length-prefixed, never
   joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
@@ -733,6 +773,23 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   so it presents as an election storm that settles and every *a leader exists
   eventually* test passes under it. `undecided` in a node log is
   `SchedulerRole::Undecided`, not a Raft role.
+- A refusal code carries its own PERMANENCE, and there are THREE answers.
+  `InvalidConfiguration` had two producers meaning opposite things — `Cluster::Validate`
+  for a command nothing could ever apply, and `ProposeMembership` for *a change is
+  already in flight* and *the proposed set is the current one*, both of which clear on
+  their own — so `SubjectOf`, a `constexpr` table that reads as a global fact, was right
+  on one path and wrong on the other, guarded only by a sentence in its own doc and by
+  `ReconcileQuorum` declining to consult it. Wiring it in was the obvious next tidy-up
+  and would have reported *wait for it to commit* as **can never be recorded as it
+  stands**, at Warn, every interval (#196). Two enumerators now, and `WireCodeFor` — an
+  `EnumTable` over the same enum — fails the BUILD until each says what it means on the
+  wire; both new wire codes are UNCOUNTED, one being what a healthy cluster answers
+  mid-replication and the other an idempotent request arriving twice.
+  **`RefusalSubject` gained `Satisfied`**: *already in force* is `Command` reported at
+  Warn as a record to go and correct, or `Moment` abandoning a pass with nothing left to
+  do — both the misleading symptom the classification exists to remove. It stays a
+  refusal rather than a success because a success must name an entry that does not
+  exist, and `NextQuorumChange` never proposes an unchanged set.
 - "A leader spoke" arrives at two handlers, and every rule about it belongs in
   both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
   candidate demotion included.
@@ -809,6 +866,29 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
   does not link `FastCache`. It therefore carries cache tiers **positionally**,
   which makes `StorageTier`'s enumerator order a wire contract.
+- **And an enum SAYS which kind it is at its declaration** — transmitted or persisted, or
+  private — because *no comment* meant both, in a tree holding both (#308). A mid-enum
+  insertion shifts every later ordinal: free in one file, and in the other every record
+  already written comes back with each field attributed to the NEXT enumerator, silently,
+  for as long as the file exists. Eighteen enums have an ordinal that is read from bytes or
+  from a position, and **eight said nothing** — `PathCanon::Grammar`, the region tag of every
+  object this cache has ever stored, and `Consensus::EntryKind`, which is on disk in
+  `raft.log` AND on the peer wire, both with every enumerator implicit.
+  The explicit `= N` is the enforcement (a renumbering then shows up in review as a changed
+  literal rather than as an invisible consequence of one added line) and on a PRIVATE enum
+  it is harmful, asserting a contract that does not exist. **`RowsInEnumeratorOrder` is not
+  that guard although it reads like one**: it fires on a row omitted or misplaced, and an
+  insertion whose row goes in at the matching position leaves the table perfectly
+  consistent while every record already written decodes shifted. The census pattern —
+  `static_cast<T>(byte)` — is NARROWER than it reads, in three ways: `Op` and `MessageType`
+  are decoded by a table walk that ENCODES each row; a positional carrier is no cast at all
+  (`MetaSlot` is MULTIPLIED into a file offset, `KeyPiece` folded into a digest and decoded
+  nowhere); and `DecodeWireEnum<E>` casts to a TEMPLATE PARAMETER, so one grep hit spelled
+  `E` stands for three Raft wire enums. **Nine of eighteen rows sit outside the pattern, and
+  this ticket's own first pass found three of the nine** — it shipped a table stating 12,
+  checked against itself by `table-total` and against the tree by nothing. Nothing checks
+  the comments and an approximate scan would refuse correct declarations, so this bullet is
+  the guard.
 - SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
   inherited across exec.
 - So is keepalive, and for the mirror reason: `ApplyHotSocketOptions` is where every
@@ -1688,6 +1768,25 @@ what differs between compilers, standard libraries, hosts and tool versions.
   (`FASTCACHED_REPORT_ONLY_IF_NEW`), or a context failing on every push comments
   forever; and a push with no branch is REFUSED, never assumed master, because `fix-ci`
   is expected to fail.
+- A step's `env:` is its OWN, and a whole-file grep cannot tell a line that runs from one
+  that cannot. `EVENT` was defined on the `decide` step and READ by the reporting step, so
+  #684's notifier died on `EVENT: unbound variable` and opened no report in its entire life
+  — measured over 200 runs: 190 `success` on the `reportable == 0` path that never enters
+  the step, and **all 10** that had something to report were that line, swallowing
+  `clang-tidy-windows`, `macOS-clang-release`, `compile-cache E2E (Windows)` and `Code
+  coverage` twice (#1174). Its own guard passed, correctly: the rule motivating the
+  `$EVENT` read is a whole-file `grep -q FASTCACHED_REPORT_ONLY_IF_NEW`, satisfied by the
+  line inside the step that cannot run — a rule satisfied by a line that never executes is
+  a rule satisfied by prose. So the rule is per STEP, and it covers EVERY `run:` and not
+  only the `set -u` ones: without `-u` the name expands to EMPTY and the branch is taken
+  the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the model
+  of bash is deliberately narrower than bash (the first version made `echo` and `gh`
+  variables — a model MORE PERMISSIVE than the thing it stands for, in the check whose
+  whole point is that permissiveness), and the refusal names the STEP, because a guard
+  printing `(unnamed)` cannot be acted on. The self-test's *correct* fixture had modelled
+  the defect and vouched for it; `no-event-env` is the positive control. One workflow's
+  scan, not the repository's — 28 `run:` blocks across six files are outside it, and that
+  is #1175.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
   `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
   the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict
@@ -1868,6 +1967,37 @@ what differs between compilers, standard libraries, hosts and tool versions.
   whose only negative case is a closed issue passes under all three. Grammar in the
   default set, resolution in `smoke`; only a PREREQUISITE missing before any entry
   resolved may skip.
+- **A configure's OUTPUT is the module's CLAIM; the generated buildsystem is the
+  artefact.** `check-compile-cache-caveat` asserted only on what `CompileCache.cmake`
+  printed, so a module printing `-- [cache] Enabling sccache …` with the full caveat at
+  the right severity while wiring NO launcher passed every row (#187). The cache cannot
+  answer it — the launcher is a NORMAL variable, unset in `CMakeCache.txt` across all
+  eleven trees measured, five of them demonstrably running sccache — so read Ninja's
+  per-rule `LAUNCHER =` or the Makefile compile line. Three things the ticket did not
+  name: the fixture had **no target**, so there was no compile edge to read; the two
+  stand-in launchers were **one program**, which makes the assertion presence rather
+  than identity and leaves *ccache won over sccache* resting on a status line (they are
+  `${CMAKE_COMMAND}` and `${CMAKE_CTEST_COMMAND}` now); and a generator the reader
+  cannot parse is a THIRD state, named — while a generator it CLAIMS to handle reading
+  nothing is a violation, since every row's assertion is then vacuous. Broken on
+  purpose: the check refuses with exactly the three rows expecting a launcher.
+  **Its first version was green on Linux and red on all three Windows legs for one
+  and the same file** — `build.ninja` writes `LAUNCHER = "C:\Program
+  Files\CMake\bin\cmake.exe"`, quoted for the space and backslashed, against
+  `${CMAKE_COMMAND}`'s `C:/Program Files/CMake/bin/cmake.exe`, and on Linux the two
+  spellings are byte-identical. A comparison written against the spelling ONE
+  generator on ONE platform happens to emit is a comparison nobody has tested:
+  normalise a path as a PATH, on BOTH sides, and re-run the MUTATION on the platform
+  that failed — a normalisation's risk is accepting too much, so *it stopped failing*
+  is not *it still bites*.
+  Its sibling is #257 — **the DECISION a guard makes is what gets tested, not the
+  acquisition around it**: `tidy-sweep.sh`'s canary needed clang-tidy, a database and a
+  real TU, so it was reachable only where a full sweep was already running, which is the
+  population it is not for. `CanaryVerdict` is pure now and `--self-test` (already a
+  ctest on every platform) drives it. Its two failing arms are NOT one — ≥126 is the
+  shell saying the program never started, with no output; the pattern arm is a binary
+  that started and analysed nothing, exiting normally — and every OTHER non-zero exit is
+  `ok`, because clang-tidy exits non-zero when it has FINDINGS.
 - A branch BEHIND master is unverified, and only a build says otherwise: its green
   checks are a true statement about the tree it was branched from, and stay one however
   often they are re-read. Neither shortcut works. **How far behind is not a measure of
@@ -2100,7 +2230,21 @@ and what they may assume.
   expected answer — so find one instance by other means and check the census sees it.
 - Tests allocate their ports per run rather than fixing them — from **below** the
   kernel's ephemeral range, and remembered, because a connect probe cannot see a
-  port already held as an outbound connection's local endpoint.
+  port already held as an outbound connection's local endpoint. **A fixed one needs
+  a reaper**: `run-launcher-e2e.ps1` bound a constant and reaped nothing, so a run
+  that missed its cleanup left a daemon up for the life of the machine and every
+  later run failed `fastcached exited immediately (exit 1)` — naming neither the port
+  nor the process, and diagnosed by hand after surviving a rebase and reading as the
+  rebase's regression (#220). The reason offered for the constant was TRUE and did
+  not support it: `FASTCACHE_ADDR` must be decided before the daemon starts, which is
+  an argument for deciding it EARLY. A holder is **refused, never adopted** — a
+  leftover is of unknown vintage and may hold another build's store, the very
+  confusion the fixture detects — except one whose image path is byte-for-byte this
+  run's daemon, which is reaped; a holder whose path cannot be READ is refused, or
+  the reap arm kills a process nothing knows. And the DECISION is what gets tested:
+  it was reachable only by running a fixture needing a daemon, a launcher and MSVC,
+  so `-SelfTestPorts` drives it over staged records and real listeners
+  (`launcher-e2e-ports-selftest`, REGISTERED-and-skipped where `pwsh` is absent).
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
   build failure.
 - A Catch2 case name may not begin with `-`. CTest passes it as an argument, so
@@ -2162,6 +2306,19 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
   copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
   them, found a day apart — a fake nothing exercises does not report its own bugs.
+- So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp` (#649).
+  Four cases in two binaries each hand-rolled a stored value carrying a generation this
+  build does not implement — three lines, no collaborator, nothing that looks like it
+  wants a helper. They fail SILENTLY, which is what makes them worth consolidating: every
+  one asserts a REFUSAL and a value damaged another way is refused too, so a generation
+  moving off byte 0 leaves each copy stamping a different field while every case goes on
+  passing under a name for what it no longer builds. An assertion review finds none of
+  them, because every assertion is correct. Two facts live in the helper alone: WHICH
+  byte carries the generation (a violated precondition throws, naming both numbers), and
+  WHICH generation is foreign — DERIVED, never `CompileValueVersion + 1`, which stops
+  being right at the top of the reserved range and would build a `NotACompileValue`
+  (#552) in four cases named for the opposite. A hand-built FRAME this build could never
+  have encoded is a different subject and must not be routed through it.
 - The POSIX shell fixtures share `scripts/lib/e2e-common.sh`, tested by
   `ctest -R e2e-helpers-selftest`. It was seven copies that had already diverged three
   ways, one of them a `wait_for_port` with no liveness check at all. A wait's bound is
