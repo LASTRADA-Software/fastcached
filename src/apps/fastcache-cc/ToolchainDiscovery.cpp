@@ -27,12 +27,46 @@ namespace
     /// The MSVC bindir for each host architecture, indexed by `HostArchitecture`.
     ///
     /// One directory is searched rather than every `Host<a>/<b>` combination a Visual
-    /// Studio install contains, and the restraint is deliberate. Every target variant
-    /// of one toolset -- x64, x86, arm64 -- shares an include tree AND, because `cl`
-    /// has no `--version`, a banner of the normalized basename, so all of them
-    /// fingerprint IDENTICALLY (#1126). Offering them all would register one machine
-    /// several times under one identity, and hand the scheduler a worker that might
-    /// compile for the wrong target.
+    /// Studio install contains, and the restraint is deliberate -- but NOT for the
+    /// reason this comment used to give, which was false
+    /// ([#1126](https://github.com/LASTRADA-Software/fastcached/issues/1126)).
+    ///
+    /// It said every target variant of one toolset shares an include tree AND a banner
+    /// of the normalized basename, so all of them fingerprint IDENTICALLY, so offering
+    /// them all could hand the scheduler a worker that compiles for the wrong target.
+    /// **Half of that is right and the conclusion is not.** The include tree is
+    /// genuinely shared -- `MsvcToolsetIncludeRoots` derives every root from the
+    /// `MSVC/<version>` toolset root, which both variants walk up to -- but the banner
+    /// stopped being the basename at #195. `cl` is probed BARE, exits 0, and prints a
+    /// line that names the target it generates for. Measured on a real install, eight
+    /// of eight `Host<a>/<b>` pairs across two toolsets, `VSLANG=1033`, exit 0 each:
+    /// `... Version 19.51.36252 for x64` against `... for x86`, and the suffix follows
+    /// the TARGET rather than the host (`HostX86/x64` says `for x64`). So the variants
+    /// fingerprint DIFFERENTLY, and a client cannot be matched to a worker building for
+    /// another target.
+    ///
+    /// The tree already said so in THREE places while this comment said the opposite:
+    /// `ToolchainFingerprint_test.cpp`'s *A different compiler banner over the same
+    /// headers is a different toolchain*, `ToolchainProbe_test.cpp`'s *Two MSVC
+    /// toolsets do not share one identity* -- whose `a.contains("x64")` is exactly this
+    /// property -- and
+    /// [#201](https://github.com/LASTRADA-Software/fastcached/issues/201), open, and
+    /// titled *A node could offer its cross-target MSVC drivers now that they
+    /// fingerprint apart*. The claim here was inherited from before #195 and never
+    /// re-derived, which is how it came to sit beside a ticket contradicting it.
+    ///
+    /// What survives as the reason for one directory is cost and identity hygiene, not
+    /// safety: offering all of them registers one machine as several toolchains, each
+    /// paying its own include-tree survey, and the survey is the expensive half of
+    /// startup -- and capacity is per NODE, so six registrations of one machine is a
+    /// capacity question rather than a table edit. That is #201, which already exists;
+    /// widening this table is its work and not a side effect of correcting a sentence.
+    ///
+    /// The residual, stated rather than smoothed over: a `cl` that RUNS and exits
+    /// non-zero falls back to the normalized basename, and every variant collapses onto
+    /// `cl` again. A probe that could not be spawned at all is already refused
+    /// (`exitCode == NotSpawned`, neither served nor cached); this narrower arm is not,
+    /// and no bare `cl` measured here reaches it.
     ///
     /// **Which one is the MACHINE's, not this build's** (#146). It was a `#if` on
     /// `_M_ARM64`/`_M_X64`, so an x64 build searched `bin/Hostx64/x64` wherever it
