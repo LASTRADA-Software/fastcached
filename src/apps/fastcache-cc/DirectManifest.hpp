@@ -108,7 +108,7 @@ enum class ManifestFault : std::uint8_t
     OutsideRoots,  ///< Absolute and under neither root, so it has no portable form. An
                    ///< ordinary layout for a TU (`add_subdirectory(../shared)`), which
                    ///< is why this is a refusal to shortcut and not a fault in the build.
-    ToolchainLike, ///< Under a root, but matching one of `IsToolchainHeader`'s markers
+    ToolchainLike, ///< Under a root, but matching one of `ClassifyAgainstRoots`'s markers
                    ///< -- a TU inside a vendored tree such as `vcpkg_installed/`. Split
                    ///< from OutsideRoots because the roots are fine and saying otherwise
                    ///< sends an operator to fix what is not broken.
@@ -261,29 +261,7 @@ struct ManifestFailure
 /// @return The normalized path, separated the way `layout` separates its roots.
 [[nodiscard]] std::string NormalizeForLayout(std::string_view rawPath, PathCanon::Layout const& layout);
 
-/// Classify whether an absolute include path belongs to the immutable toolchain
-/// (and is therefore covered by the toolchain stamp rather than hashed).
-///
-/// Judged by a toolchain MARKER rather than by "outside the build roots": a vcpkg
-/// tree nested inside the build tree is still toolchain-like, and misclassifying a
-/// project header as toolchain would let an edit go undetected. Failing that, by
-/// whether the path lies under a root — asked of `PathCanon::RelateToLayout`, the
-/// one definition of that, so this classifier and the canonicalizer that has to
-/// produce a token for whatever it calls project content cannot disagree about
-/// which paths those are (issue #562).
-///
-/// The key filter, the manifest and the replay guard all judge by this function, so
-/// what it means is what all three mean — through `ClassifyAgainstRoots`, whose
-/// three-way answer they take rather than asking this and a second predicate in
-/// turn. Kept as the name the rulebook and this tree's comments are written around.
-///
-/// @param absolutePath Native-form absolute include path.
-/// @param layout       This build's roots.
-/// @return True when the path is a toolchain header.
-[[nodiscard]] bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& layout);
-
-/// What an absolute path is to this build's roots: the three-way answer
-/// `IsToolchainHeader` collapses into two.
+/// What an absolute path is to this build's roots.
 enum class PathClass : std::uint8_t
 {
     Project,      ///< Under a root and matching no toolchain marker: content this
@@ -304,9 +282,12 @@ enum class PathClass : std::uint8_t
 /// nested under the build tree is toolchain content however well rooted it is), so
 /// asking "near miss?" separately, of a path a marker had already claimed, reported
 /// `<root>-deps/vcpkg_installed/.../core.h` as a misspelled root and refused a
-/// manifest over it. There is deliberately no `IsNearMissRoot` predicate beside
-/// `IsToolchainHeader` either: a name shaped like its peer invites a caller to ask
-/// the two in turn, which is that same defect written one call site further out.
+/// manifest over it. There is deliberately no `IsNearMissRoot` predicate, and no
+/// `IsToolchainHeader` beside it any more (#657): a bool-returning name invites a
+/// caller to ask two questions in turn, which is that same defect written one call
+/// site further out, and it cannot say WHICH of the two non-project answers it got
+/// — the distinction an operator repairs by editing a root rather than moving a
+/// file. Ask once and read the enumerator.
 ///
 /// @param absolutePath Native-form absolute path.
 /// @param layout       This build's roots.
@@ -672,7 +653,7 @@ struct ManifestInputs
 /// byte-identical manifests on any machine.
 ///
 /// **The anchor is classified before the toolchain test, and that order is the
-/// whole subtlety.** `IsToolchainHeader` reports every path outside both roots as
+/// whole subtlety.** `ClassifyAgainstRoots` calls every path outside both roots
 /// toolchain, and a relative path lies under no root — so asking it first reports
 /// *every* relative path as toolchain and silently drops it. A GNU build whose
 /// depfile carries relative header paths (a relative `-I`, or a compile run from

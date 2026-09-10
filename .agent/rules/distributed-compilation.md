@@ -1515,8 +1515,8 @@ follow, and each is a rule of its own:
 
 **A manifest that revalidates nothing revalidates forever, and `all_of` is how it
 gets written.** `BuildManifest` drops a reported dependency classified as toolchain,
-because `toolchainStamp` covers those collectively. `IsToolchainHeader` reports every
-path outside both roots as toolchain — so a header belonging to ANOTHER checkout is
+because `toolchainStamp` covers those collectively. `ClassifyAgainstRoots` calls every
+path outside both roots toolchain — so a header belonging to ANOTHER checkout is
 classified exactly as an SDK header is, and dropped. Feed it the paths from an
 uncanonicalized region and every one of them drops, leaving a manifest naming the
 translation unit and not one header. `ValidateManifest` then re-hashes the TU, finds

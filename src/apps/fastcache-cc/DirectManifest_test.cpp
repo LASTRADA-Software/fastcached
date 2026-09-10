@@ -203,42 +203,47 @@ TEST_CASE("A manifest encoded on one machine decodes identically on another")
     CHECK(EncodeManifest(*consumed) == wire);
 }
 
-TEST_CASE("IsToolchainHeader classifies the Windows SDK and MSVC as toolchain")
+TEST_CASE("ClassifyAgainstRoots calls the Windows SDK and MSVC toolchain")
 {
     auto const layout = WindowsLayout();
-    CHECK(IsToolchainHeader(R"(C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\windows.h)", layout));
-    CHECK(IsToolchainHeader(
-        R"(C:\Program Files\Microsoft Visual Studio\18\Professional\VC\Tools\MSVC\14.51.36231\ATLMFC\include\afxwin.h)",
-        layout));
+    CHECK(ClassifyAgainstRoots(R"(C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\windows.h)", layout)
+          == PathClass::Toolchain);
+    CHECK(
+        ClassifyAgainstRoots(
+            R"(C:\Program Files\Microsoft Visual Studio\18\Professional\VC\Tools\MSVC\14.51.36231\ATLMFC\include\afxwin.h)",
+            layout)
+        == PathClass::Toolchain);
 }
 
-TEST_CASE("IsToolchainHeader classifies project headers under the roots as project")
+TEST_CASE("ClassifyAgainstRoots calls headers under the roots project")
 {
     auto const layout = WindowsLayout();
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\src\AppCore\AppCore.hpp)", layout));
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\out\build\win64\generated\config.hpp)", layout));
+    CHECK(ClassifyAgainstRoots(R"(D:\Project\src\AppCore\AppCore.hpp)", layout) == PathClass::Project);
+    CHECK(ClassifyAgainstRoots(R"(D:\Project\out\build\win64\generated\config.hpp)", layout) == PathClass::Project);
 }
 
-TEST_CASE("IsToolchainHeader treats a vcpkg tree inside the build tree as toolchain")
+TEST_CASE("ClassifyAgainstRoots calls a vcpkg tree inside the build tree toolchain")
 {
     // vcpkg headers are canonicalizable (they sit under the build tree) but are
     // third-party and immutable, so they belong to the stamp rather than to the
     // hashed set — otherwise every build would hash thousands of vendored headers.
     auto const layout = WindowsLayout();
-    CHECK(IsToolchainHeader(R"(D:\Project\out\build\win64\vcpkg_installed\x64-windows\include\zlib.h)", layout));
+    CHECK(ClassifyAgainstRoots(R"(D:\Project\out\build\win64\vcpkg_installed\x64-windows\include\zlib.h)", layout)
+          == PathClass::Toolchain);
 }
 
-TEST_CASE("IsToolchainHeader is case-insensitive on Windows paths")
+TEST_CASE("ClassifyAgainstRoots is case-insensitive on Windows paths")
 {
     // The compiler echoes include paths in whatever case the -I spelling used, so a
     // case-sensitive match would misclassify a header as project content and then
     // fail to canonicalize it.
     auto const layout = WindowsLayout();
-    CHECK(IsToolchainHeader(R"(C:\PROGRAM FILES (X86)\WINDOWS KITS\10\include\um\windows.h)", layout));
-    CHECK_FALSE(IsToolchainHeader(R"(d:\project\src\AppCore\AppCore.hpp)", layout));
+    CHECK(ClassifyAgainstRoots(R"(C:\PROGRAM FILES (X86)\WINDOWS KITS\10\include\um\windows.h)", layout)
+          == PathClass::Toolchain);
+    CHECK(ClassifyAgainstRoots(R"(d:\project\src\AppCore\AppCore.hpp)", layout) == PathClass::Project);
 }
 
-TEST_CASE("IsToolchainHeader matches a root spelled with forward slashes")
+TEST_CASE("ClassifyAgainstRoots matches a root spelled with forward slashes")
 {
     // CMake exports FASTCACHE_SOURCE_DIR in its own native form (`D:/Project`) while
     // cl emits includes with backslashes. A separator-sensitive prefix test makes
@@ -246,26 +251,26 @@ TEST_CASE("IsToolchainHeader matches a root spelled with forward slashes")
     // toolchain content and produces an empty manifest — direct mode then never
     // engages, silently.
     FastCache::PathCanon::Layout const cmakeStyle { .sourceRoot = "D:/Project", .buildTree = "D:/Project/out/build/win64" };
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\src\AppCore\AppCore.hpp)", cmakeStyle));
-    CHECK_FALSE(IsToolchainHeader(R"(D:\Project\out\build\win64\generated\config.hpp)", cmakeStyle));
+    CHECK(ClassifyAgainstRoots(R"(D:\Project\src\AppCore\AppCore.hpp)", cmakeStyle) == PathClass::Project);
+    CHECK(ClassifyAgainstRoots(R"(D:\Project\out\build\win64\generated\config.hpp)", cmakeStyle) == PathClass::Project);
 
     // And the reverse spelling must work too.
     FastCache::PathCanon::Layout const winStyle { .sourceRoot = R"(D:\Project)", .buildTree = R"(D:\Project\out)" };
-    CHECK_FALSE(IsToolchainHeader("D:/Project/src/AppCore/AppCore.hpp", winStyle));
+    CHECK(ClassifyAgainstRoots("D:/Project/src/AppCore/AppCore.hpp", winStyle) == PathClass::Project);
 }
 
-TEST_CASE("IsToolchainHeader treats a path under no known root as toolchain")
+TEST_CASE("ClassifyAgainstRoots calls a path under no known root toolchain")
 {
     // Such a path has no canonical form, so it cannot be listed per-file; riding the
     // stamp is the only representable choice.
     auto const layout = WindowsLayout();
-    CHECK(IsToolchainHeader(R"(E:\somewhere\else\foreign.hpp)", layout));
+    CHECK(ClassifyAgainstRoots(R"(E:\somewhere\else\foreign.hpp)", layout) == PathClass::Toolchain);
 }
 
 TEST_CASE("A sibling directory extending a root's last segment is under no root, everywhere (issue #562)")
 {
     // The regression this case exists for, and it is an AGREEMENT rather than an
-    // answer: `IsToolchainHeader` judged "under a root" with a bare `starts_with`
+    // answer: the launcher's path classifier judged "under a root" with a bare `starts_with`
     // and no segment-boundary check, while `PathCanon::Canonicalize` has always
     // required the boundary. So under source root `/home/dev/proj` the sibling
     // `/home/dev/project-x/a.hpp` was project content to one and under no root to
@@ -278,10 +283,10 @@ TEST_CASE("A sibling directory extending a root's last segment is under no root,
     // caught it: every other case in this file passes with the bug present. What
     // does not pass is asking the two predicates the same question and comparing
     // the ANSWERS, so that is what this asserts -- reinstating the bare
-    // `starts_with` in `IsToolchainHeader` turns the first section red.
+    // `starts_with` in `ClassifyAgainstRoots` turns the first section red.
     FastCache::PathCanon::Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
 
-    // Not a marker path anywhere in this case, so `IsToolchainHeader` is answering
+    // Not a marker path anywhere in this case, so `ClassifyAgainstRoots` is answering
     // purely on roots and the two predicates are comparable.
     auto const rooted = [&layout](std::string_view path) {
         return FastCache::PathCanon::Canonicalize(path, layout) != path;
@@ -299,7 +304,7 @@ TEST_CASE("A sibling directory extending a root's last segment is under no root,
         for (auto const path: paths)
         {
             INFO("path: " << path);
-            CHECK(IsToolchainHeader(path, layout) == !rooted(path));
+            CHECK((ClassifyAgainstRoots(path, layout) != PathClass::Project) == !rooted(path));
         }
     }
 
@@ -345,7 +350,7 @@ TEST_CASE("A sibling directory extending a root's last segment is under no root,
 TEST_CASE("The key filter, the manifest and the replay guard all place the sibling outside the roots (issue #562)")
 {
     // The invariant stated one level up, at the three surfaces that consume it. They
-    // already share `IsToolchainHeader`; what they did NOT share was that
+    // already share `ClassifyAgainstRoots`; what they did NOT share was that
     // classifier's idea of "under a root", which disagreed with the canonicalizer
     // every one of them then hands the path to. Asserted here as well as at the
     // predicate because a shared NAME is not shared behaviour -- the rulebook
@@ -660,7 +665,7 @@ TEST_CASE("BuildManifest tells dropped, absent and unobserved dependencies apart
     //
     // The guard that turns #319 from a wrong object into a miss.
     //
-    // `IsToolchainHeader` reports every path outside both roots as toolchain, so a
+    // `ClassifyAgainstRoots` calls every path outside both roots toolchain, so a
     // header belonging to ANOTHER checkout classifies exactly as an SDK header does
     // and is dropped. When a hit replays a value whose regions were never
     // canonicalized, every path fed to BuildManifest is such a path -- so what would
@@ -878,9 +883,9 @@ TEST_CASE("ValidateManifest catches an edit to the translation unit itself, MSVC
 
 TEST_CASE("BuildManifest records a relative dependency path instead of dropping it")
 {
-    // The regression this case exists for. BuildManifest asked IsToolchainHeader
-    // before classifying the anchor, and IsToolchainHeader reports EVERY path
-    // outside both roots as toolchain -- which a relative path always is, since it
+    // The regression this case exists for. BuildManifest classified the path
+    // against the roots before classifying the anchor, and every path outside both
+    // roots is toolchain -- which a relative path always is, since it
     // lies under no root at all. So a GNU build whose depfile carries relative
     // header paths (a relative `-I`, or a compile run from the source directory)
     // recorded a manifest of its absolute entries alone, silently. Edit one of the
@@ -1032,7 +1037,7 @@ TEST_CASE("BuildManifest tells its refusals apart and names the path (issue #68)
 
     SECTION("a source that is rooted but looks vendored")
     {
-        // IsToolchainHeader tests its markers BEFORE any root, deliberately, so a
+        // ClassifyAgainstRoots tests its markers BEFORE any root, deliberately, so a
         // TU inside `vcpkg_installed/` under the build tree classifies as toolchain
         // while being perfectly well rooted. Reporting that as "under no root"
         // would send the reader to fix roots that are already correct -- the exact
@@ -1799,7 +1804,7 @@ TEST_CASE("A manifest naming the TU and no header revalidates in a checkout it w
     // How it was reached there: the node stored values without canonicalizing
     // their text regions, so a replayed dependency record named the PRODUCING
     // checkout's headers. Every one of those paths lies outside this checkout's
-    // roots, `IsToolchainHeader` calls every such path toolchain, all of them
+    // roots, `ClassifyAgainstRoots` calls every such path toolchain, all of them
     // drop -- and what is recorded is the TU and nothing else. That route is
     // closed on the produce side now, in three places: `RecordManifest` refuses when
     // a reported path is not readable as text, and `BuildManifest` refuses both when

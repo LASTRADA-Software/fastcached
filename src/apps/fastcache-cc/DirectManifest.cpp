@@ -88,7 +88,7 @@ namespace
 
     /// What a resolved dependency path is to a manifest.
     ///
-    /// A three-way answer rather than IsToolchainHeader's two, because "outside
+    /// A three-way answer rather than a bool's two, because "outside
     /// both roots" and "not anchored anywhere" are different facts with opposite
     /// consequences: the first is toolchain content the stamp already covers, the
     /// second is a path this build could not place at all, and conflating them is
@@ -105,7 +105,7 @@ namespace
     /// Classify a path that ResolveAgainst has already resolved.
     ///
     /// The anchor is decided FIRST, and that order is load-bearing:
-    /// IsToolchainHeader reports every path outside both roots as toolchain, and a
+    /// ClassifyAgainstRoots calls every path outside both roots toolchain, and a
     /// relative path lies under no root, so asking it first answers "toolchain" for
     /// every unanchored path and drops it silently. Cc::IsCheckable and
     /// Cc::PortableForm are the two other callers of that classifier and both
@@ -149,7 +149,7 @@ namespace
                 // directory it is anchored to (issue #65).
                 break;
         }
-        // One classification, read three ways -- rather than `IsToolchainHeader` here
+        // One classification, read three ways -- rather than a bool test here
         // and a near-miss test again at whichever arm happens to want it, which is how
         // a marker match came to be overruled by a root test run afterwards.
         switch (ClassifyAgainstRoots(resolved, layout))
@@ -270,11 +270,6 @@ PathClass ClassifyAgainstRoots(std::string_view absolutePath, PathCanon::Layout 
             break;
     }
     return PathClass::Toolchain;
-}
-
-bool IsToolchainHeader(std::string_view absolutePath, PathCanon::Layout const& layout)
-{
-    return ClassifyAgainstRoots(absolutePath, layout) != PathClass::Project;
 }
 
 std::string HashFileContents(std::string_view absolutePath)
@@ -728,7 +723,7 @@ std::expected<std::string, ManifestFailure> CanonicalSourceToken(std::string_vie
         case PathRole::Toolchain: {
             // Two different facts arrive here, and reporting them as one would be
             // the misdirection this whole vocabulary exists to remove.
-            // `IsToolchainHeader` tests its markers BEFORE any root -- deliberately,
+            // `ClassifyAgainstRoots` tests its markers BEFORE any root -- deliberately,
             // so a vendored tree nested under the build tree stays toolchain content
             // -- so this branch is reached both by a path under neither root and by
             // a rooted path that merely looks vendored, which `vcpkg_installed/`
@@ -864,7 +859,7 @@ std::expected<DirectManifest, ManifestFailure> BuildManifest(ManifestInputs cons
     // A compile that reported dependencies and kept none of them is refused, and
     // this is the guard that turns #319 from a wrong object into a miss.
     //
-    // `IsToolchainHeader` reports every path outside both roots as toolchain, so a
+    // `ClassifyAgainstRoots` calls every path outside both roots toolchain, so a
     // path belonging to ANOTHER checkout classifies exactly as an SDK header does
     // and is dropped by the `continue` above. That is how the hollow manifest is
     // built: a hit replaying a value whose regions were never canonicalized names
@@ -963,8 +958,8 @@ std::string ComputeManifestKey(std::string_view canonicalSource,
     // The bump is required because the defect it retires is invisible to the key.
     // A build whose TU source was absolute but whose header paths were relative
     // (a relative `-I`, or a compile run from the source directory) recorded a
-    // manifest naming the TU and nothing else: BuildManifest asked
-    // IsToolchainHeader before classifying the anchor, and every relative path
+    // manifest naming the TU and nothing else: BuildManifest classified the path
+    // against the roots before classifying the anchor, and every relative path
     // lies under no root, so every one of them was dropped as toolchain content.
     // This fix changes neither `canonicalSource` nor the args for such a build, so
     // those manifests keep the same key, keep being found, and keep validating —

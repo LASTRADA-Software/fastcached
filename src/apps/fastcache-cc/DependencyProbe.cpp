@@ -24,7 +24,7 @@ namespace
     /// host", as PathCanon.hpp puts it. Folding first is what lets one code path
     /// answer for both conventions on either host.
     ///
-    /// Emitting `/` costs nothing downstream: `IsToolchainHeader` and
+    /// Emitting `/` costs nothing downstream: `ClassifyAgainstRoots` and
     /// `PathCanon::Canonicalize` both compare through separator-insensitive forms,
     /// and a canonical token's tail is forward-slashed whatever it was built from.
     ///
@@ -214,7 +214,7 @@ namespace
             // is ordinary vendored content and toolchain is the true answer —
             // reporting THAT as drive-relative would be the loudest possible
             // reading of this vocabulary on a healthy build, which is the same
-            // defect from the other side. `IsToolchainHeader` cannot separate the
+            // defect from the other side. `ClassifyAgainstRoots` cannot separate the
             // two on its own (it tests its markers before any root, deliberately),
             // and splitting it is not worth a fourth spelling of the toolchain rule
             // — so the root question is asked here instead, and only for the

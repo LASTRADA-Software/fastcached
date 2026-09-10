@@ -265,7 +265,7 @@ struct DependencySet
 ///   canonicalizes to a token that is portable exactly because the consumer
 ///   substitutes its own root.
 /// - **Toolchain content is dropped**, judged by DirectManifest's
-///   `IsToolchainHeader` so that this filter, the manifest's and the replay
+///   `ClassifyAgainstRoots` so that this filter, the manifest's and the replay
 ///   guard's cannot disagree *about an absolute path*: one under neither root,
 ///   *and* a vcpkg tree nested under the build tree, which canonicalizes but is
 ///   still the producing machine's. (About a *relative* one the three part, and

@@ -128,7 +128,7 @@ TEST_CASE("A dependency outside every root rides the toolchain stamp", "[replay-
 
 TEST_CASE("A vcpkg tree nested inside the build tree is still toolchain content", "[replay-guard]")
 {
-    // Exercises the marker branch of IsToolchainHeader rather than the root branch:
+    // Exercises the marker branch of ClassifyAgainstRoots rather than the root branch:
     // this path IS under a root, and must still be skipped.
     auto const regions = Value("",
                                "",
@@ -140,7 +140,7 @@ TEST_CASE("A vcpkg tree nested inside the build tree is still toolchain content"
 
 TEST_CASE("A relative dependency is checked, not mistaken for toolchain content", "[replay-guard]")
 {
-    // IsToolchainHeader reports every relative path as outside the roots, so a
+    // ClassifyAgainstRoots calls every relative path outside the roots, so a
     // filter that asked it first would skip all of them — and a build whose
     // compiler emits relative dependency paths would lose the guard entirely.
     auto const regions = Value("", "", "build/a.o: ../../src/a.cpp ../../src/hdr.hpp\n");

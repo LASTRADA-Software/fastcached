@@ -258,7 +258,7 @@ same on both — the same defect with no MSVC anywhere near it.
     key entries for one header and two different keys on two machines whose generators
     spell an include directory differently. Then it keeps a path that canonicalizes to a
     `<SRCROOT>`/`<BUILDTREE>` token and **drops** toolchain content, judged by
-    `DirectManifest`'s own `IsToolchainHeader` so that this filter, the manifest's and the
+    `DirectManifest`'s own `ClassifyAgainstRoots` so that this filter, the manifest's and the
     replay guard's cannot disagree: a path under neither root, *and* a vcpkg tree nested
     under the build tree, which canonicalizes but is still the producing machine's. That is
     content already covered collectively by the compiler identity in the key, and hashing it
@@ -268,7 +268,7 @@ same on both — the same defect with no MSVC anywhere near it.
     `/showIncludes` repeats a header once per inclusion site and emission order is a
     property of the driver.
     - **Sharing the classifier is not sharing the QUESTION, and the missing half was
-      "under a root".** `IsToolchainHeader` answered it with a bare `starts_with` and no
+      "under a root".** The launcher's path classifier answered it with a bare `starts_with` and no
       segment-boundary check while `PathCanon::Canonicalize` — which every one of the three
       then hands the path to — has always required the boundary, so under a source root
       `/home/dev/proj` the sibling `/home/dev/project-x/a.hpp` was project content to the
@@ -308,8 +308,10 @@ same on both — the same defect with no MSVC anywhere near it.
         dependencies sit elsewhere. A short source root (`C:\P`) makes that total: every
         Windows SDK header becomes a "near miss". Two questions of one path, answered by two
         calls, is how the second one gets to overrule the first — which is also why there is
-        no `IsNearMissRoot` predicate beside `IsToolchainHeader`: a name shaped like its peer
-        invites a caller to reintroduce exactly that shape.
+        no `IsNearMissRoot` predicate, and no `IsToolchainHeader` beside it any more (#657):
+        a bool-returning name invites a caller to reintroduce exactly that shape, and it
+        cannot say WHICH of the two non-project answers it got. Ask once, read the
+        enumerator.
       - **The replay guard still probes such a path, and that is a difference of QUESTION,
         not of predicate.** Its exclusion of outside-roots paths rests on the toolchain stamp
         covering them collectively, so a machine with a different toolchain has a different
@@ -526,7 +528,7 @@ same on both — the same defect with no MSVC anywhere near it.
       **path** the same bytes name the drive's current directory and `AnchorForLayout` calls
       it `DriveRelative`. Both halves are pinned against the *same layout* in one test, so
       the shared helpers cannot quietly merge them in either direction. The same reasoning
-      moved `PathCanon::AsciiLower` into the header beside it: `IsToolchainHeader`'s
+      moved `PathCanon::AsciiLower` into the header beside it: the classifier's
       comparison form was folding case through `std::tolower`, and under a Turkish locale
       `std::tolower('I')` is not `i` — so a root spelled `D:\PROJECT\Inc` folds one way on
       one machine and another way on the next, and the two derive different manifests and
@@ -612,8 +614,8 @@ same on both — the same defect with no MSVC anywhere near it.
     launcher never injects those flags itself — the compile runs the build system's own argv,
     so what it can revalidate is bounded by what the build asked the compiler to report.
   - **A manifest classifies a path's anchor before asking whether it is toolchain content,
-    and the working directory is what makes that answerable.** `IsToolchainHeader` reports
-    every path outside both roots as toolchain, and a *relative* path lies under no root, so
+    and the working directory is what makes that answerable.** `ClassifyAgainstRoots` calls
+    every path outside both roots toolchain, and a *relative* path lies under no root, so
     asking it first reported every relative path as toolchain and dropped it. A GNU build
     whose depfile carried relative header paths — a relative `-I`, or a compile run from the
     source directory, which is also how the CMake Ninja generator spells its sources —
@@ -714,7 +716,7 @@ same on both — the same defect with no MSVC anywhere near it.
     put it.
   - **A root must be spelled the way the driver spells what it emits, and on Windows the
     drivers disagree.** Every root test is a string prefix comparison
-    (`IsToolchainHeader`, `PathCanon::CanonicalizeOne`), so a root carrying an 8.3 short
+    (`ClassifyAgainstRoots`, `PathCanon::CanonicalizeOne`), so a root carrying an 8.3 short
     component matches nothing `cl` reports: `cl` resolves an include through the filesystem
     and prints `C:\Users\runneradmin\...`, while clang-cl echoes the spelling it was handed
     and prints `C:\Users\RUNNER~1\...`. Measured on a GitHub runner, where `%TEMP%` is the
@@ -755,7 +757,7 @@ same on both — the same defect with no MSVC anywhere near it.
       Derived from `Last`, the missing row value-initializes to `{ Keyed, "" }` at a non-zero
       index and the coverage check rejects it. Verified by adding an enumerator without a row
       and watching the build stop.
-    - **`IsToolchainHeader` was deliberately NOT split**, though the issue's illustration
+    - **The classifier was deliberately NOT split**, though the issue's illustration
       implies it. It is the one rule three callers must agree on, and separating "a marker
       matched" from "under neither root" does not isolate #66 anyway: under a short-name root
       a genuine `/usr/include` header and a project header both land outside the roots, so
@@ -770,7 +772,7 @@ same on both — the same defect with no MSVC anywhere near it.
       drive-relative *root* the path canonicalizes, so a marker match there is ordinary
       vendored content and `toolchain` is true; reporting THAT as drive-relative would put
       the loudest reading of the new vocabulary on a healthy build, which is the same defect
-      from the other side. `IsToolchainHeader` cannot separate them — it tests its markers
+      from the other side. `ClassifyAgainstRoots` cannot separate them — it tests its markers
       before any root, deliberately — so the root question is asked again in that one
       branch, and only for a drive-relative path. That is the price of not splitting the
       classifier, and it is one extra root test on a shape no ordinary build produces: the
@@ -779,7 +781,7 @@ same on both — the same defect with no MSVC anywhere near it.
       `/x/build-other/a.h` under a `/x/build` root is a root off by a suffix, and while it
       counted as "toolchain" it was indistinguishable from an ordinary system header — though
       it is the one of the three an operator repairs by editing a root. It arrived here by
-      accident at first: `IsToolchainHeader`'s prefix match was character-wise and
+      accident at first: the classifier's prefix match was character-wise and
       `Canonicalize`'s segment-wise, so such a path fell out of the gap between them. That
       gap was itself the defect (#562, above) and is closed; the fault survived it by being
       asked for directly, as `Cc::ClassifyAgainstRoots`'s third outcome. A state produced by
@@ -819,7 +821,7 @@ same on both — the same defect with no MSVC anywhere near it.
       working directory, `OutsideRoots` is a layout, `ToolchainLike` is a TU nobody
       expected to compile from, `Uncanonical` is a root spelled almost
       right, `Unreadable` is a file — each names a different thing to go and repair, which
-      is what a fingerprint is for. `ToolchainLike` exists because `IsToolchainHeader`
+      is what a fingerprint is for. `ToolchainLike` exists because `ClassifyAgainstRoots`
       tests its markers before any root, so "toolchain" and "under no root" arrive as one
       answer -- the root question is asked again in that one branch, the same correction
       `PathDisposition::DriveRelative` makes. `Unreadable` in particular had been sharing

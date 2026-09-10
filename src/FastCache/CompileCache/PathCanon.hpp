@@ -212,7 +212,7 @@ enum class RootRelation : std::uint8_t
 ///
 /// This is the single definition of "is this path under this root", and it exists
 /// because there was briefly more than one. `Canonicalize` has always asked it
-/// segment-wise, while the launcher's `IsToolchainHeader` asked it with a bare
+/// segment-wise, while the launcher's path classifier asked it with a bare
 /// `starts_with` — so under a source root `/home/dev/proj` the sibling directory
 /// `/home/dev/project-x/a.hpp` was project content to the classifier and under no
 /// root to the canonicalizer (issue #562). That failed safe, the classifier being

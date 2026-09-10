@@ -689,8 +689,8 @@ echo "   an edit re-keys, and the object follows the source"
 
 # --- 7: a relatively-spelled build must still populate a usable manifest -----
 # Direct mode revalidates a translation unit by re-hashing the files its manifest
-# names, and BuildManifest decided what to name by asking IsToolchainHeader — which
-# reports every path outside both roots as toolchain, and a RELATIVE path lies under
+# names, and BuildManifest decided what to name by asking ClassifyAgainstRoots —
+# which calls every path outside both roots toolchain, and a RELATIVE path lies under
 # no root at all. So a build whose driver reported relative paths (a relative `-I`,
 # or a compile run from the source directory, which is how the CMake Ninja generator
 # spells its sources) recorded a manifest with those entries silently missing, and an
