@@ -173,8 +173,9 @@ namespace
           .arity = Arity::Value,
           .operand = "=<host:port>",
           .apply = AssignEndpoint<&Command::admin>(),
-          .description = "the admin surface, where /metrics is. Without it, `stats`\n"
-                         "falls back to INFO and says so" },
+          .description = "the admin surface, where /metrics is. An OVERRIDE: against\n"
+                         "a node the port is discovered over 0xFC, and `stats`\n"
+                         "names whichever rung answered either way" },
         { .primary = "--format",
           .arity = Arity::Value,
           .operand = "=<name>",

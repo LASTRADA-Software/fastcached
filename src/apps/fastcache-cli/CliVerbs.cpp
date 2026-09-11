@@ -842,6 +842,218 @@ namespace
         return answer;
     }
 
+    /// Which `NodeComponentBit` each reported component name stands for.
+    ///
+    /// A table because the set grows: a bit this build does not name is reported under
+    /// its NUMBER rather than dropped, so an older client meeting a newer node says
+    /// *there is something here I do not know about* instead of quietly under-reporting
+    /// what the node runs.
+    struct ComponentBit
+    {
+        std::uint32_t bit;     ///< The mask bit.
+        std::string_view name; ///< What to call it.
+    };
+
+    constexpr std::array<ComponentBit, 4> ComponentBits { {
+        { .bit = CompileCacheWire::NodeComponentBit::CacheTier, .name = "cache-tier" },
+        { .bit = CompileCacheWire::NodeComponentBit::Worker, .name = "worker" },
+        { .bit = CompileCacheWire::NodeComponentBit::Scheduler, .name = "scheduler" },
+        { .bit = CompileCacheWire::NodeComponentBit::Consensus, .name = "consensus" },
+    } };
+
+    /// The components @p mask names, as a comma-separated list.
+    ///
+    /// **An empty MASK renders as the word `none` rather than as an absent cell**: a
+    /// node that runs no component is a reading, not a missing one, and the two must
+    /// not render alike.
+    /// @param mask What the node reported.
+    /// @return The list.
+    [[nodiscard]] std::string DescribeComponents(std::uint32_t mask)
+    {
+        std::string out;
+        std::uint32_t named = 0;
+        for (auto const& row: ComponentBits)
+            if ((mask & row.bit) != 0)
+            {
+                named |= row.bit;
+                if (!out.empty())
+                    out += ", ";
+                out += row.name;
+            }
+
+        // Whatever is left is a component this build has no name for. Reported as the
+        // residual mask, because *some bits I do not understand* is a fact an operator
+        // can act on -- upgrade the client -- and silence is not.
+        if (auto const unknown = mask & ~named; unknown != 0)
+        {
+            if (!out.empty())
+                out += ", ";
+            out += std::format("unknown(0x{:x})", unknown);
+        }
+
+        return out.empty() ? std::string { "none" } : out;
+    }
+
+    /// What to call one reported surface.
+    /// @param surface The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfSurface(CompileCacheWire::WireSurface surface) noexcept
+    {
+        switch (surface)
+        {
+            case CompileCacheWire::WireSurface::Admin:
+                return "admin";
+            case CompileCacheWire::WireSurface::Raft:
+                return "raft";
+            case CompileCacheWire::WireSurface::Discovery:
+                return "discovery";
+        }
+        // A tag this build does not name never reaches here -- `DecodeNodeStatus` SKIPS
+        // one rather than refusing the whole reply, which is what lets an older client
+        // read a newer node at all. Closed anyway, because falling off the end of a
+        // function returning a view is a dangling one.
+        return "unknown";
+    }
+
+    /// Turn a decoded node status into the reported record.
+    ///
+    /// Pure, and separate from the handler, so the reported SHAPE is testable without a
+    /// socket -- which is the half that matters: the field names an operator greps for
+    /// are a contract, and a handler that builds them inline puts that contract
+    /// somewhere only an end-to-end run can reach.
+    /// @param fields What the node said.
+    /// @return The record.
+    [[nodiscard]] Value NodeStatusRecord(CompileCacheWire::NodeStatusFields const& fields)
+    {
+        std::vector<Field> record;
+        record.push_back({ .name = "version", .value = TextCell(fields.version) });
+
+        // **Absent, not empty.** A node running no consensus has no minted identity, and
+        // an empty string renders as a value somebody could paste into `--raft-peer`.
+        record.push_back({ .name = "node-id", .value = fields.nodeId.empty() ? AbsentCell() : TextCell(fields.nodeId) });
+        record.push_back({ .name = "uptime-seconds", .value = NumberCell(fields.uptimeSeconds) });
+        record.push_back({ .name = "components", .value = TextCell(DescribeComponents(fields.components)) });
+
+        // One field per surface the node actually opened. A surface it does not run gets
+        // no field at all rather than a zero port -- the same rule the node applies when
+        // encoding, held on both sides so neither can quietly invent a number.
+        for (auto const& surface: fields.surfaces)
+            record.push_back({ .name = std::format("{}-port", NameOfSurface(surface.surface)),
+                               .value = NumberCell(static_cast<std::uint64_t>(surface.port)) });
+
+        // The admin surface's scheme, and only when there IS an admin surface: a client
+        // that guessed `http://` against a TLS one fails in a way that reads as the
+        // surface being down.
+        auto const admin = std::ranges::find(
+            fields.surfaces, CompileCacheWire::WireSurface::Admin, &CompileCacheWire::SurfaceReport::surface);
+        if (admin != fields.surfaces.end())
+            record.push_back({ .name = "admin-tls", .value = BooleanCell(admin->tls) });
+
+        return RecordValue(std::move(record));
+    }
+
+    /// Ask the node one fieldless verb and hand back its reply.
+    ///
+    /// One door for both node verbs, so the refusal wording and the outcome mapping
+    /// cannot be spelled two ways -- which is how three surfaces in this tree came to
+    /// disagree about one refusal.
+    /// @param context What to run against.
+    /// @param request The framed request.
+    /// @return The reply, or the answer to give instead.
+    [[nodiscard]] std::expected<NodeReply, Answer> AskNode(VerbContext const& context, std::span<std::byte const> request)
+    {
+        auto reply = context.node->Send(request);
+        if (!reply.has_value())
+            return std::unexpected(FromExchangeError(reply.error()));
+
+        if (reply->status != CompileCacheWire::Status::Ok)
+            return std::unexpected(
+                Concluded(Outcome::Refused, ExplainRefusal(context.verb->name, context.node->Address(), *reply)));
+
+        return std::move(*reply);
+    }
+
+    /// `node` -- what this endpoint IS.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer NodeStatus(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeNodeStatusRequest());
+        if (!reply.has_value())
+            return reply.error();
+
+        auto const fields = CompileCacheWire::DecodeNodeStatus(reply->payload);
+        if (!fields.has_value())
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{} answered node-status with a body this client cannot read", context.node->Address()));
+
+        return Answered(NodeStatusRecord(*fields));
+    }
+
+    /// `version`, answered by a node instead of by RESP `INFO`.
+    ///
+    /// **This is the verb the whole fallback exists for.** `fastcache-compile-node`
+    /// speaks no RESP, so `version` reported *the server closed the connection without
+    /// answering* against the one binary an operator most often points this tool at --
+    /// true, and useless. A node knows its own version and will say so over `0xFC`.
+    ///
+    /// The client half is reported either way, because the interesting question is never
+    /// one of the numbers: it is whether they AGREE. A stale binary talking to an
+    /// upgraded node is exactly the shape that has cost this project a served-but-wrong
+    /// object before, and an operator cannot see it from one number.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer VersionsFromNode(VerbContext const& context)
+    {
+        auto fields = std::vector<Field> {
+            Field { .name = "client", .value = TextCell(std::string { ClientVersion }) },
+        };
+
+        auto const reply = AskNode(context, CompileCacheWire::EncodeNodeStatusRequest());
+        if (!reply.has_value())
+        {
+            fields.push_back(Field { .name = "server", .value = AbsentCell() });
+            auto answer = Answered(RecordValue(std::move(fields)), reply.error().outcome);
+            answer.advisories = reply.error().advisories;
+            return answer;
+        }
+
+        auto const status = CompileCacheWire::DecodeNodeStatus(reply->payload);
+        if (!status.has_value())
+        {
+            fields.push_back(Field { .name = "server", .value = AbsentCell() });
+            auto answer = Answered(RecordValue(std::move(fields)), Outcome::Protocol);
+            answer.advisories.push_back(
+                std::format("{} answered node-status with a body this client cannot read", context.node->Address()));
+            return answer;
+        }
+
+        fields.push_back(Field { .name = "server", .value = TextCell(status->version) });
+        // What KIND of server, so the two numbers are not read as two builds of the same
+        // binary. A node and a daemon version the same way and are different programs.
+        fields.push_back(Field { .name = "server_kind", .value = TextCell("fastcache-compile-node") });
+        return Answered(RecordValue(std::move(fields)));
+    }
+
+    /// `node-metrics` -- every counter this node's build carries.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer NodeMetrics(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeNodeMetricsRequest());
+        if (!reply.has_value())
+            return reply.error();
+
+        auto record = DecodeNodeCounters(reply->payload);
+        if (!record.has_value())
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{} answered node-metrics with a body this client cannot read", context.node->Address()));
+
+        return Answered(std::move(*record));
+    }
+
     /// The verbs, in the order `--help` documents them.
     constexpr auto VerbTable = std::to_array<VerbSpec>({
         { .name = "get",
@@ -852,7 +1064,12 @@ namespace
           .summary = "read one value; a miss exits 1",
           .protocolCommand = "GET",
           .modifiers = Modifier::Raw,
-          .handler = &Fetch },
+          .handler = &Fetch,
+          // No `0xFC` equivalent: a compile node holds no user keyspace. Spelled out
+          // rather than left to default -- clang and gcc reject the omission under
+          // this project's pedantic flags and MSVC does not say a word, which is a
+          // shape that builds clean on Windows and fails four CI legs.
+          .nodeFallback = nullptr },
         { .name = "mget",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -861,7 +1078,8 @@ namespace
           .summary = "read several values as a table",
           .protocolCommand = "MGET",
           .modifiers = Modifier::None,
-          .handler = &FetchMany },
+          .handler = &FetchMany,
+          .nodeFallback = nullptr },
         { .name = "set",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -870,7 +1088,8 @@ namespace
           .summary = "store a value; see --ttl, --nx, --xx",
           .protocolCommand = "SET",
           .modifiers = Modifier::Ttl | Modifier::Exclusivity,
-          .handler = &Store },
+          .handler = &Store,
+          .nodeFallback = nullptr },
         { .name = "del",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -879,7 +1098,8 @@ namespace
           .summary = "delete keys; reports how many existed",
           .protocolCommand = "DEL",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "exists",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -888,7 +1108,8 @@ namespace
           .summary = "count how many of the named keys exist",
           .protocolCommand = "EXISTS",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "incr",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -897,7 +1118,8 @@ namespace
           .summary = "add one and report the result",
           .protocolCommand = "INCR",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "decr",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -906,7 +1128,8 @@ namespace
           .summary = "subtract one and report the result",
           .protocolCommand = "DECR",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "incrby",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -915,7 +1138,8 @@ namespace
           .summary = "add <delta> and report the result",
           .protocolCommand = "INCRBY",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "decrby",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -924,7 +1148,8 @@ namespace
           .summary = "subtract <delta> and report the result",
           .protocolCommand = "DECRBY",
           .modifiers = Modifier::None,
-          .handler = &Counting },
+          .handler = &Counting,
+          .nodeFallback = nullptr },
         { .name = "ttl",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -934,7 +1159,8 @@ namespace
                      "a key that is gone and one with no expiry are not the same",
           .protocolCommand = "TTL",
           .modifiers = Modifier::None,
-          .handler = &Lifetime },
+          .handler = &Lifetime,
+          .nodeFallback = nullptr },
         { .name = "expire",
           .wire = Wire::Resp,
           .minOperands = 2,
@@ -943,7 +1169,8 @@ namespace
           .summary = "set a key's expiry",
           .protocolCommand = "EXPIRE",
           .modifiers = Modifier::None,
-          .handler = &Flagged },
+          .handler = &Flagged,
+          .nodeFallback = nullptr },
         { .name = "persist",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -952,7 +1179,8 @@ namespace
           .summary = "remove a key's expiry",
           .protocolCommand = "PERSIST",
           .modifiers = Modifier::None,
-          .handler = &Flagged },
+          .handler = &Flagged,
+          .nodeFallback = nullptr },
         { .name = "flush",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -961,7 +1189,8 @@ namespace
           .summary = "discard the keyspace; --all clears every database",
           .protocolCommand = "FLUSHDB",
           .modifiers = Modifier::Everything,
-          .handler = &Flush },
+          .handler = &Flush,
+          .nodeFallback = nullptr },
         { .name = "ping",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -970,7 +1199,8 @@ namespace
           .summary = "check the cache answers at all",
           .protocolCommand = "PING",
           .modifiers = Modifier::None,
-          .handler = &Echoed },
+          .handler = &Echoed,
+          .nodeFallback = nullptr },
         { .name = "echo",
           .wire = Wire::Resp,
           .minOperands = 1,
@@ -979,7 +1209,8 @@ namespace
           .summary = "have the server repeat <text> back",
           .protocolCommand = "ECHO",
           .modifiers = Modifier::None,
-          .handler = &Echoed },
+          .handler = &Echoed,
+          .nodeFallback = nullptr },
         { .name = "info",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -988,7 +1219,8 @@ namespace
           .summary = "the server's own INFO payload, as a record",
           .protocolCommand = "INFO",
           .modifiers = Modifier::None,
-          .handler = &Info },
+          .handler = &Info,
+          .nodeFallback = nullptr },
         { .name = "version",
           .wire = Wire::Resp,
           .minOperands = 0,
@@ -997,7 +1229,11 @@ namespace
           .summary = "this client's version and the server's, side by side",
           .protocolCommand = "INFO",
           .modifiers = Modifier::None,
-          .handler = &Versions },
+          .handler = &Versions,
+          // The one row with a fallback today. A node answers *what are you running*
+          // as readily as a daemon does, and this is the verb an operator reaches for
+          // first when an address does not behave.
+          .nodeFallback = &VersionsFromNode },
         { .name = "stats",
           .wire = Wire::Stats,
           .minOperands = 0,
@@ -1007,7 +1243,34 @@ namespace
                      "named in the output as `source`",
           .protocolCommand = "",
           .modifiers = Modifier::None,
-          .handler = &Stats },
+          .handler = &Stats,
+          .nodeFallback = nullptr },
+
+        // The `0xFC` verbs. These are the ONLY ones a `fastcache-compile-node` answers:
+        // that binary speaks no RESP and no memcached text, so every row above this
+        // comment is refused BY NAME against one rather than left to close silently.
+        { .name = "node",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "what the endpoint is: version, identity, uptime, the\n"
+                     "components it runs and the ports it opened",
+          .protocolCommand = "node-status",
+          .modifiers = Modifier::None,
+          .handler = &NodeStatus,
+          .nodeFallback = nullptr },
+        { .name = "node-metrics",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "every counter the endpoint's build carries, zeroes\n"
+                     "included -- a counter is a tally, so zero is a reading",
+          .protocolCommand = "node-metrics",
+          .modifiers = Modifier::None,
+          .handler = &NodeMetrics,
+          .nodeFallback = nullptr },
 
         // The memcached text verbs. Everything below this line is unavailable against a
         // daemon with `--requirepass` set, because that protocol has no AUTH verb --
@@ -1021,7 +1284,8 @@ namespace
           .summary = "move a key's expiry without reading the value",
           .protocolCommand = "touch",
           .modifiers = Modifier::None,
-          .handler = &Touch },
+          .handler = &Touch,
+          .nodeFallback = nullptr },
         { .name = "gat",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1031,7 +1295,8 @@ namespace
                      "comes FIRST here, as it does on the wire",
           .protocolCommand = "gat",
           .modifiers = Modifier::None,
-          .handler = &FetchAndTouch },
+          .handler = &FetchAndTouch,
+          .nodeFallback = nullptr },
         { .name = "gats",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1040,7 +1305,8 @@ namespace
           .summary = "`gat` with each value's cas token, for a later `cas`",
           .protocolCommand = "gats",
           .modifiers = Modifier::None,
-          .handler = &FetchAndTouch },
+          .handler = &FetchAndTouch,
+          .nodeFallback = nullptr },
         { .name = "add",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1049,7 +1315,8 @@ namespace
           .summary = "store only if the key is absent; exits 1 if it exists",
           .protocolCommand = "add",
           .modifiers = Modifier::Ttl,
-          .handler = &StoreText },
+          .handler = &StoreText,
+          .nodeFallback = nullptr },
         { .name = "replace",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1058,7 +1325,8 @@ namespace
           .summary = "store only if the key exists; exits 1 if it does not",
           .protocolCommand = "replace",
           .modifiers = Modifier::Ttl,
-          .handler = &StoreText },
+          .handler = &StoreText,
+          .nodeFallback = nullptr },
         { .name = "append",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1068,7 +1336,8 @@ namespace
                      "because the server keeps the entry's own expiry",
           .protocolCommand = "append",
           .modifiers = Modifier::None,
-          .handler = &StoreText },
+          .handler = &StoreText,
+          .nodeFallback = nullptr },
         { .name = "prepend",
           .wire = Wire::Memcached,
           .minOperands = 2,
@@ -1077,7 +1346,8 @@ namespace
           .summary = "add bytes to the front of an existing value",
           .protocolCommand = "prepend",
           .modifiers = Modifier::None,
-          .handler = &StoreText },
+          .handler = &StoreText,
+          .nodeFallback = nullptr },
         { .name = "cas",
           .wire = Wire::Memcached,
           .minOperands = 3,
@@ -1087,7 +1357,8 @@ namespace
                      "it has changed. `gats` and `inspect` report the token",
           .protocolCommand = "cas",
           .modifiers = Modifier::Ttl,
-          .handler = &StoreText },
+          .handler = &StoreText,
+          .nodeFallback = nullptr },
         { .name = "inspect",
           .wire = Wire::Memcached,
           .minOperands = 1,
@@ -1097,7 +1368,8 @@ namespace
                      "nothing else in this project reports the last three",
           .protocolCommand = "me",
           .modifiers = Modifier::None,
-          .handler = &Inspect },
+          .handler = &Inspect,
+          .nodeFallback = nullptr },
         { .name = "mc-stats",
           .wire = Wire::Memcached,
           .minOperands = 0,
@@ -1107,7 +1379,8 @@ namespace
                      "reach; no argument gives the 24-field default set",
           .protocolCommand = "stats",
           .modifiers = Modifier::None,
-          .handler = &TextStats },
+          .handler = &TextStats,
+          .nodeFallback = nullptr },
         { .name = "cache-memlimit",
           .wire = Wire::Memcached,
           .minOperands = 1,
@@ -1117,7 +1390,8 @@ namespace
                      "restart reads --max-memory again",
           .protocolCommand = "cache_memlimit",
           .modifiers = Modifier::None,
-          .handler = &MemoryLimit },
+          .handler = &MemoryLimit,
+          .nodeFallback = nullptr },
     });
 } // namespace
 
@@ -1156,6 +1430,45 @@ std::string DescribeOperandArity(VerbSpec const& verb)
     if (verb.minOperands == verb.maxOperands)
         return std::format("exactly {} {}", verb.minOperands, plural(verb.minOperands));
     return std::format("{} to {} operands", verb.minOperands, verb.maxOperands);
+}
+
+Answer RunNodeFallback(VerbSpec const& verb, VerbContext const& context, RemoteKind kind, Answer primary)
+{
+    auto scoped = context;
+    scoped.verb = &verb;
+
+    // A verb whose question a node can answer, asked of a node. Everything else falls
+    // through to the identification below -- including a verb WITH a fallback met by an
+    // endpoint that is not a node, which must not be asked a question it cannot hear.
+    if (kind == RemoteKind::CompileNode && verb.nodeFallback != nullptr && context.node != nullptr)
+        return verb.nodeFallback(scoped);
+
+    auto const explanation = ExplainRemoteKind(verb.name, context.node == nullptr ? "" : context.node->Address(), kind);
+    if (explanation.empty())
+        // The probe explained nothing the caller does not already know. Returned
+        // UNCHANGED rather than annotated, because a second sentence about one fault
+        // makes it read as two.
+        return primary;
+
+    // The identification goes FIRST: an operator reading downwards wants *this is a
+    // compile node* before *the server closed the connection*, which is the consequence
+    // rather than the cause.
+    primary.advisories.insert(primary.advisories.begin(), explanation);
+
+    // And the SAME correction for the reader that has no eyes. The sentence above is the
+    // operator's half; the exit code is the script's, and it is the published half of
+    // this tool's contract. A probe that came back with a FRAME proves the endpoint was
+    // reached and answered, so leaving `Unreachable` standing would go on saying *the
+    // server could not be reached* about an address that is serving -- and `unreachable`
+    // is the one code that reads as RETRY, which is advice that can never come true here.
+    //
+    // Keyed on the KIND, never on the explanation being non-empty: what corrects an
+    // outcome is the evidence, and a table that decides it from whether some text was
+    // produced would silently change the exit code the day a sentence is reworded.
+    if (auto const established = EstablishedBy(kind); established.has_value())
+        primary.outcome = *established;
+
+    return primary;
 }
 
 Answer RunVerb(VerbSpec const& verb, VerbContext const& context)

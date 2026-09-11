@@ -3,6 +3,7 @@
 
 #include "CliEndpoint.hpp"
 #include "MemcachedClient.hpp"
+#include "NodeClient.hpp"
 #include "RespClient.hpp"
 
 #include <FastCache/Net/ISocket.hpp>
@@ -131,6 +132,74 @@ class MemcachedExchange final: public IMemcachedExchange
     /// Bytes read and not yet consumed by a reply; held across calls for the reason
     /// `SocketExchange::_pending` is.
     std::string _pending;
+};
+
+/// A `0xFC` connection over one blocking TCP socket.
+///
+/// The third wire, and the one `fastcache-compile-node` is reachable on AT ALL: that
+/// binary speaks `0xFC` and nothing else, so the other two classes here close having
+/// sent nothing when pointed at it.
+///
+/// **It presents the credential, and unlike the RESP one it does so by VERB.** `AUTH`
+/// is a `0xFC` verb, and a surface that holds no policy answers it `Ok` while marking
+/// nothing -- so a credential offered to a node with no scheduler is accepted, changes
+/// nothing, and must not be reported as a failure. That is the same false inference
+/// `SocketExchange::Open`'s AUTH advisory exists to avoid, arriving on a different wire.
+///
+/// **Reads loop to a TERMINAL status.** `Status::Progress` is the compile pulse, and a
+/// reader that does not ask treats the first one as the answer. Nothing here sends a
+/// compile today, so the loop is unreachable in this binary -- and it is written anyway,
+/// because `IsTerminalStatus` exists in the wire header precisely so every reader asks,
+/// and a client that would misread a pulse is one that cannot later grow a verb that
+/// produces them.
+class NodeExchange final: public INodeExchange
+{
+  public:
+    /// Dial @p endpoint and present @p credential.
+    /// @param endpoint Where to dial.
+    /// @param timeouts How long to wait.
+    /// @param credential What to present; nothing is presented when unconfigured.
+    /// @return The open connection, or why there is none.
+    [[nodiscard]] static std::expected<std::unique_ptr<NodeExchange>, ExchangeError> Open(Endpoint const& endpoint,
+                                                                                          DialTimeouts timeouts,
+                                                                                          Credential const& credential);
+
+    ~NodeExchange() override;
+    NodeExchange(NodeExchange const&) = delete;
+    NodeExchange(NodeExchange&&) = delete;
+    NodeExchange& operator=(NodeExchange const&) = delete;
+    NodeExchange& operator=(NodeExchange&&) = delete;
+
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> Send(std::span<std::byte const> request) override;
+
+    [[nodiscard]] std::string_view Address() const override
+    {
+        return _endpoint;
+    }
+
+    /// Remarks gathered while opening the connection, for stderr.
+    ///
+    /// Non-empty when the credential was configured and not honoured, for the reason
+    /// `SocketExchange::Advisories` is: the operator ASKED for authentication, so
+    /// silently proceeding without it is the one outcome they cannot see.
+    /// @return The remarks, in the order they were made.
+    [[nodiscard]] std::span<std::string const> Advisories() const noexcept;
+
+  private:
+    /// @param socket The connected socket.
+    /// @param endpoint What to call this connection in a diagnostic.
+    NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept;
+
+    /// Read exactly one framed reply, whatever its status.
+    /// @return The reply, or why there is none.
+    [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadFrame();
+
+    std::unique_ptr<ISocket> _socket;
+    std::string _endpoint;
+    /// Bytes read and not yet consumed by a reply; held across calls for the reason
+    /// `SocketExchange::_pending` is.
+    std::string _pending;
+    std::vector<std::string> _advisories;
 };
 
 /// One HTTP response.

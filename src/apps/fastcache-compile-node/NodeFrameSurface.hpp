@@ -34,13 +34,9 @@ struct NodeConfig;
 class NodeFrameSurface
 {
   public:
-    /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
-    /// @param scheduler Answers the scheduler verbs and owns the credential, or
-    ///        nullptr when this node does not schedule.
-    /// @param compile Answers the compile verbs, or nullptr when this node runs no
-    ///        worker. All three must outlive this.
-    NodeFrameSurface(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
-        _responder { cache, scheduler, compile }
+    /// @param components What to route to; every non-null member must outlive this.
+    explicit NodeFrameSurface(SurfaceComponents const& components) noexcept:
+        _responder { components }
     {
     }
 
@@ -121,14 +117,11 @@ class NodeFrameSurface
 ///
 /// @param io The loop this surface accepts and answers on.
 /// @param cfg What the operator asked for.
-/// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
-/// @param scheduler Answers the scheduler verbs, or nullptr when it does not schedule.
-/// @param compile Answers the compile verbs, or nullptr when this node runs no worker.
-///        In this binary it is never null -- a node compiles, that is what it is -- so
-///        the "no component at all" outcome below is reachable only from a test. The
-///        predicate stays honest rather than being narrowed to the two that can still
-///        be absent: a component this function stopped asking about is a listener
-///        opened for verbs nobody answers.
+/// @param components What to route to. `compile` is never null in this binary -- a node
+///        compiles, that is what it is -- so the "no component at all" outcome below is
+///        reachable only from a test. The predicate stays honest rather than being
+///        narrowed to the two that can still be absent: a component this function
+///        stopped asking about is a listener opened for verbs nobody answers.
 ///
 ///        **A worker with no tier and no scheduler still opens this port**, because
 ///        since #290 stage 3 it is the only place its compiles can arrive. That is the
@@ -141,9 +134,7 @@ class NodeFrameSurface
 [[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(
     NodeIoLoop& io,
     NodeConfig const& cfg,
-    IFrameResponder* cache,
-    IFrameResponder* scheduler,
-    IFrameResponder* compile,
+    SurfaceComponents const& components,
     std::optional<int> inherited,
     IMetricsSink& metrics,
     ILogger& logger,

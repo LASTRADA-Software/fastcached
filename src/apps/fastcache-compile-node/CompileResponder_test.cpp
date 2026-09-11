@@ -469,7 +469,7 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
     ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder compile { fix.protocol, capacity, fix.membership, jobs, reactor, fix.metrics, fix.logger };
-    MergedResponder merged { nullptr, nullptr, &compile };
+    MergedResponder merged { SurfaceComponents { .compile = &compile } };
 
     CHECK(merged.OwnerOf(static_cast<std::uint8_t>(Wire::Op::Compile)) == &compile);
 
@@ -1051,7 +1051,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // Far below what this compile will take, standing in for the five seconds every
     // dispatched TU used to be given.
     ShortWindowResponder tooShort { worker.responder, std::chrono::milliseconds { 100 } };
-    MergedResponder merged { nullptr, nullptr, &tooShort };
+    MergedResponder merged { SurfaceComponents { .compile = &tooShort } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1151,7 +1151,7 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     NodeIoLoop io;
     constexpr auto Interval = std::chrono::milliseconds { 40 };
     MergedWorker worker { fix, io, Interval };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1200,7 +1200,7 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io, std::chrono::seconds { 30 } };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1238,7 +1238,7 @@ TEST_CASE("The pulse stops before the reply, so the answer is the last thing on 
     NodeIoLoop io;
     constexpr auto Interval = std::chrono::milliseconds { 20 };
     MergedWorker worker { fix, io, Interval };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1310,7 +1310,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     // The SIZE, asserted rather than waited out: an hour of held compile would be a
     // suite nobody runs. Paired with the mechanism above, the two cover both.
@@ -1381,7 +1381,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);
@@ -1477,7 +1477,7 @@ TEST_CASE("The merged listener counts the frame it refuses without reading", "[n
     Fixture fix;
     NodeIoLoop io;
     MergedWorker worker { fix, io };
-    MergedResponder merged { nullptr, nullptr, &worker.responder };
+    MergedResponder merged { SurfaceComponents { .compile = &worker.responder } };
 
     auto const port = FreePort();
     auto endpoint = FrameEndpoint::Start(io, NodeSurface::Node, ConfigForPort(port), merged, fix.metrics, fix.logger);

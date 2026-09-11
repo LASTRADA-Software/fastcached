@@ -99,6 +99,25 @@ namespace
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
                                    "fastcache-compile-node --serve-scheduler instead" },
+        // **`DispatchNotPermitted` and never `UnknownOpcode`**, for the reason `Withdraw`
+        // above states and which applies here with more force, these verbs being newer
+        // than every deployed client: *unimplemented is not served elsewhere*. A client
+        // told `UnknownOpcode` concludes this daemon is too OLD to know the verb -- when
+        // the truth is that this endpoint is a cache and a compile node answers it -- and
+        // it then STEPS OVER a refusal it should follow.
+        //
+        // Not `NoCluster`, which the four cluster rows take: that says *there is no
+        // replicated state here*, and these verbs ask about a PROCESS rather than about a
+        // cluster. A client told `NoCluster` would go looking for consensus it does not
+        // need.
+        Wire::RefusedVerb { .op = Wire::Op::NodeStatus,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache, not a compile node; ask a fastcache-compile-node "
+                                   "what it is, or read this daemon's own /metrics" },
+        Wire::RefusedVerb { .op = Wire::Op::NodeMetrics,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache, not a compile node; its counters are on the admin "
+                                   "surface's /metrics, which needs no credential" },
     };
 
     /// What to answer `op` with.
@@ -836,6 +855,18 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::ClusterSet:
             case Wire::Op::ClusterForget:
             case Wire::Op::ClusterAdmit:
+            // The operator verbs, answered by a compile node and refused HERE by name.
+            // Sharing the arm above is right rather than convenient: `HandleDistributed`
+            // is the one door to `RefusalFor`, which is the table that says which code
+            // and which sentence -- a second arm would be a second place to decide it.
+            //
+            // A missing arm here does NOT fail the build on MSVC (C4062 is off by
+            // default), and what it produces is a DROPPED FRAME rather than a refusal:
+            // the client waits, times out, and reports a dead endpoint for a daemon that
+            // is working perfectly. `Every op in the table is dispatched` is what catches
+            // it, and it caught exactly this.
+            case Wire::Op::NodeStatus:
+            case Wire::Op::NodeMetrics:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
         }

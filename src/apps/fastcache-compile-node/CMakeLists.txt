@@ -62,6 +62,7 @@ add_executable(fastcache-compile-node
     WorkerLease.cpp
     CompileCapacity.cpp
     CompileResponder.cpp
+    NodeStatusResponder.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -137,7 +138,9 @@ if(FASTCACHED_BUILD_TESTS)
         WorkerLease.cpp
         CompileCapacity.cpp
         CompileResponder.cpp
+        NodeStatusResponder.cpp
         CompileResponder_test.cpp
+        NodeStatusResponder_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
     )

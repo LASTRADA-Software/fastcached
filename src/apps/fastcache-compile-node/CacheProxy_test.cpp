@@ -615,7 +615,7 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder cache { fixture.proxy, locality, fixture.metrics };
-    MergedResponder const merged { &cache, nullptr, nullptr };
+    MergedResponder const merged { SurfaceComponents { .cache = &cache } };
 
     SECTION("no opcode routes an unknown verb to the cache, so its UnknownOpcode arm cannot fire")
     {

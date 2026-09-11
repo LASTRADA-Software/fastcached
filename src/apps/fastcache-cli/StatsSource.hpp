@@ -43,6 +43,16 @@ enum class StatsOrigin : std::uint8_t
     /// does need the daemon to have been started with its metrics listener enabled,
     /// and it is on a different port from the data plane.
     Metrics,
+    /// The node's own `NodeMetrics` verb over `0xFC`. Every counter its build carries,
+    /// zeroes included, and it needs no second port and no credential a plain worker
+    /// cannot check.
+    ///
+    /// **Below `/metrics` because it is narrower, not because it is worse**: it carries
+    /// the counter catalogue and NOT the storage series or the per-tier ones, which the
+    /// Prometheus renderer adds. Above `INFO` because it is an order of magnitude wider
+    /// than seven fields -- and it is the only rung that answers at all against a
+    /// `fastcache-compile-node`, which speaks no RESP.
+    NodeMetrics,
     /// RESP `INFO` on the data port. Always present, and a small fixed set of
     /// fields -- deliberately not numbered here: that count belongs to the DAEMON's
     /// `INFO` handler, and a copy of it in the client is a claim nothing checks.
@@ -65,11 +75,16 @@ struct StatsOriginSpec
 /// The origins, one row per enumerator, in enumerator order -- which is ladder order.
 inline constexpr EnumTable<StatsOrigin, StatsOriginSpec> StatsOriginTable { {
     { .origin = StatsOrigin::Metrics, .name = "metrics", .what = "the admin surface's /metrics endpoint", .caveat = "" },
+    { .origin = StatsOrigin::NodeMetrics,
+      .name = "node-metrics",
+      .what = "the node's own NodeMetrics verb over 0xFC",
+      .caveat = "this is the counter catalogue only; /metrics adds the storage and "
+                "per-tier series" },
     { .origin = StatsOrigin::Info,
       .name = "info",
       .what = "RESP INFO on the data port",
       .caveat = "start the daemon with its metrics listener enabled, or pass "
-                "--admin-port, for the full counter set" },
+                "--admin-addr, for the full counter set" },
 } };
 
 static_assert(RowsInEnumeratorOrder(StatsOriginTable, &StatsOriginSpec::origin),

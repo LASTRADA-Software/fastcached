@@ -21,7 +21,7 @@ a table cannot: why the output and the exit codes are shaped the way they are.
 | | |
 |---|---|
 | Data port | `--addr=<host:port>`, `$FASTCACHE_ADDR`, default `127.0.0.1:6674` |
-| Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR`, unset by default |
+| Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
@@ -35,6 +35,53 @@ Prefer `--token-file` to the environment variable. The path is not the secret;
 the file is, and an environment variable is visible to anything that can read
 this process's environment.
 
+**`--admin-addr` is an override, not a requirement.** A `fastcache-compile-node`
+knows which port its admin surface bound and whether it is TLS, and it will say so
+over the `0xFC` wire — so `stats` asks it rather than making an operator who can
+already reach the node supply a second address. The flag stays for the deployments
+where the node is reached through something that rewrites ports, and when it is
+given it wins.
+
+The *host* is never taken from the node. A node reports a **port**; the host dialled
+is the one this client already reached it on, because that is the only address known
+to route from here — a node behind NAT would otherwise hand out an address only its
+own network can use.
+
+### Three kinds of endpoint
+
+`fastcache-compile-node` speaks the `0xFC` compile-cache wire and **nothing else**:
+no RESP, no memcached text. Pointed at one, this tool used to report *the server
+closed the connection without answering* — true, and useless, because it describes
+what happened rather than what to do.
+
+So when a verb's own wire cannot answer, the endpoint is identified and named:
+
+```console
+$ fastcache-cli get some-key --addr=127.0.0.1:6674
+fastcache-cli: 127.0.0.1:6674 is a fastcache-compile-node: it speaks the 0xFC compile-cache wire only, holds no user keyspace, and cannot answer `get` -- try `node` and `node-metrics` here, or point --addr at a fastcached
+fastcache-cli: the server closed the connection without answering
+```
+
+That probe runs on the **failure path only**, so an ordinary command against a
+healthy daemon pays nothing for it.
+
+A verb whose *question* a node can also answer is answered rather than explained.
+`version` is the one such verb today:
+
+```console
+$ fastcache-cli version --addr=127.0.0.1:6674
+client       0.2.0-125-g6ba32b30
+server       0.2.0-125-g6ba32b30
+server_kind  fastcache-compile-node
+```
+
+`server_kind` is there because a node and a daemon version alike and are different
+programs; two bare version strings would read as two builds of one binary.
+
+A cache verb has no `0xFC` equivalent and never will — a compile node holds no user
+keyspace — so those are refused by name rather than retried somewhere they cannot
+work.
+
 ## Commands
 
 Run `fastcache-cli --help` for the current list with operand counts. Today:
@@ -45,6 +92,7 @@ Run `fastcache-cli --help` for the current list with operand counts. Today:
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
+| Node (`0xFC`) | `node`, `node-metrics` |
 
 A modifier that means nothing for a verb is **refused**, not ignored:
 `set k v --raw` is a usage error rather than a store that silently prints
@@ -52,6 +100,52 @@ nothing. `--ttl`, `--nx` and `--xx` belong to `set`; `--raw` to `get`; `--all` t
 `flush`; `--ttl` also to `add`, `replace` and `cas`, but **not** to `append` or
 `prepend`, whose server-side path takes no expiry at all — accepting it there
 would discard it silently.
+
+### The node verbs
+
+`node` and `node-metrics` travel over `0xFC` and are the **only** verbs a
+`fastcache-compile-node` answers.
+
+`node` reports what the endpoint is:
+
+```console
+$ fastcache-cli node
+version         0.2.0-125-g6ba32b30
+node-id         -
+uptime-seconds  15
+components      cache-tier, worker
+admin-port      36742
+admin-tls       false
+```
+
+A surface the node does not run gets **no field at all** rather than a zero port —
+a `0` renders as a dialable-looking number in every format, and an operator who
+tries it reaches nothing and reports the surface as down. The `0xFC` port is
+reported by nobody on purpose: a client learns it by dialling it, and a field that
+can only ever be right or stale is worse than none.
+
+`components` is a *reading*, so a node running none says `none` rather than going
+absent. A component bit this client has no name for is reported as
+`unknown(0x…)` beside the ones it does know — an older client meeting a newer node
+says *there is something here I do not understand* instead of quietly
+under-reporting.
+
+`node-metrics` reports every counter the endpoint's build carries, **zeroes
+included**. A counter is a tally, so zero is the truth about events that never
+happened; dropping the zero rows would make *nothing happened* and *this build has
+no such counter* the same answer.
+
+Both are gated on **fleet membership** rather than on a credential, which is what
+keeps them usable on a single-machine install: the credential on that listener
+belongs to the scheduler, so a node running none has none to check, and demanding
+one would leave these verbs permanently unauthenticated on exactly the deployment
+they exist for. Loopback is always a member. A remote caller is refused by name:
+
+```console
+fastcache-cli: 10.0.0.7:6674 refused `node`: not-a-member (this node reports its identity and counters to fleet members only)
+```
+
+The remedy is on the node — `--fleet-member` — not here.
 
 ### The memcached-only verbs
 
@@ -171,6 +265,12 @@ The pairs that matter:
   gives up on the other cannot be written if they agree.
 - **4 against 5** — the server said no, versus the server said something this
   client could not read. Different people fix those.
+- **3 against 4, pointed at a compile node** — a `fastcache-compile-node` serves no
+  keyspace, so `get` there cannot work and never will. It exits **4**, not 3: the
+  endpoint answered, and `3` is the code that reads as *retry, the daemon may be
+  down*. The advisory names what the endpoint is; the exit code is the same
+  correction for a script, which reads nothing else. An endpoint that sends no frame
+  at all is still 3 — nothing was established there to correct it with.
 
 ```sh
 if fastcache-cli get "$key" > value.txt; then
@@ -190,22 +290,43 @@ field of its own output:
 
 | `source` | Where | Size |
 |---|---|---|
-| `metrics` | the admin surface's `/metrics` | ~127 series here |
+| `metrics` | the admin surface's `/metrics` | 137 series, measured against a node here |
+| `node-metrics` | the node's own `NodeMetrics` verb over `0xFC` | 99 counters, same node |
 | `info` | RESP `INFO` on the data port | 7 fields |
 
 `/metrics` needs no credential — it is served above the dashboard's
 authentication gate — but it does need the daemon started with its metrics
-listener, and it is on a different port, so `--admin-addr` must name it.
+listener, and it is on a different port. Against a node that port is **discovered**
+over `0xFC`; `--admin-addr` is only needed when the discovered answer is wrong for
+your topology.
 
-Without one, `stats` falls back and is explicit about the difference:
+`node-metrics` sits below `/metrics` because it is *narrower*, not worse: it carries
+the counter catalogue and not the storage or per-tier series the Prometheus renderer
+adds. It sits above `INFO` because it is an order of magnitude wider than seven
+fields — and it is the only rung that answers at all against a
+`fastcache-compile-node`.
+
+Against a node with no admin surface at all:
+
+```console
+$ fastcache-cli stats --format=kv
+source=node-metrics
+fastcached_connections_total=0
+...
+fastcache-cli: the node's own NodeMetrics verb over 0xFC returned 99 field(s); this is the counter catalogue only; /metrics adds the storage and per-tier series
+fastcache-cli: the admin surface's /metrics endpoint was not asked: 127.0.0.1:36751 runs no admin surface
+```
+
+Against a daemon with no metrics listener, `stats` falls back to `INFO` and is
+explicit about the difference:
 
 ```console
 $ fastcache-cli stats --format=kv
 source=info
 fastcached_version=fastcached-0.2.0
 ...
-fastcache-cli: RESP INFO on the data port returned 7 field(s); start the daemon with its metrics listener enabled, or pass --admin-port, for the full counter set
-fastcache-cli: the admin surface's /metrics endpoint was not asked: no admin address is known; pass --admin-addr or set $FASTCACHE_ADMIN_ADDR
+fastcache-cli: RESP INFO on the data port returned 7 field(s); start the daemon with its metrics listener enabled, or pass --admin-addr, for the full counter set
+fastcache-cli: the admin surface's /metrics endpoint was not asked: no admin address is known and no 0xFC connection was opened to discover one
 ```
 
 Note **was not asked**, not *did not answer*. Those are different states, and

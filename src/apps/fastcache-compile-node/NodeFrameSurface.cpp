@@ -51,9 +51,7 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
 
 std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(NodeIoLoop& io,
                                                                                         NodeConfig const& cfg,
-                                                                                        IFrameResponder* cache,
-                                                                                        IFrameResponder* scheduler,
-                                                                                        IFrameResponder* compile,
+                                                                                        SurfaceComponents const& components,
                                                                                         std::optional<int> inherited,
                                                                                         IMetricsSink& metrics,
                                                                                         ILogger& logger,
@@ -69,7 +67,12 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // that would not open has already stopped startup, and a tier the row expects but
     // that does not exist would leave this listener answering `UnimplementedVerb` to
     // every FETCH behind an open port.
-    if (cache == nullptr && scheduler == nullptr && compile == nullptr)
+    // **`node` is deliberately NOT one of the conditions.** It is non-null on every
+    // built node, so including it here would make this guard unsatisfiable and open a
+    // port on a node that serves nothing -- the operator verbs are worth answering on a
+    // node that is doing something, not a reason to start listening. A node with no
+    // components still serves no port, exactly as before this family existed.
+    if (components.cache == nullptr && components.scheduler == nullptr && components.compile == nullptr)
     {
         logger.Logf(LogLevel::Info, "no cache tier, no scheduler and no worker; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
@@ -96,7 +99,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         return std::unique_ptr<NodeFrameSurface> {};
     }
 
-    auto surface = std::make_unique<NodeFrameSurface>(cache, scheduler, compile);
+    auto surface = std::make_unique<NodeFrameSurface>(components);
     auto bound = surface->Bind(io, cfg, inherited, metrics, logger, std::move(namer));
     if (bound.has_value())
         return surface;

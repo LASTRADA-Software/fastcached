@@ -194,20 +194,75 @@ void ReportAdvisories(Answer const& answer, bool quiet)
         memcached = std::move(*exchange);
     }
 
-    auto gatherer =
-        LadderGatherer { command.admin,
-                         command.timeouts,
-                         command.credential.Configured() ? std::optional<std::string> { command.credential.secret }
-                                                         : std::nullopt,
-                         resp.get() };
+    std::unique_ptr<NodeExchange> node;
+    if (wire.needsNode)
+    {
+        auto exchange = NodeExchange::Open(command.cache, command.timeouts, command.credential);
+        if (exchange.has_value())
+        {
+            node = std::move(*exchange);
+            auto const carried = node->Advisories();
+            openingRemarks.insert(openingRemarks.end(), carried.begin(), carried.end());
+        }
+        else if (verb.wire != Wire::Stats)
+        {
+            std::cerr << ProgramName << ": " << exchange.error().detail << '\n';
+            return ExitCodeOf(Outcome::Unreachable);
+        }
+        else
+        {
+            // `stats` again: the `0xFC` rung is one of three and the other two may well
+            // answer, so a rung that could not be opened is REPORTED rather than fatal.
+            // The same reasoning as the RESP arm above, and the same reason the ladder
+            // exists at all.
+            openingRemarks.push_back(exchange.error().detail);
+        }
+    }
+
+    auto gatherer = LadderGatherer {
+        command.admin,
+        command.cache,
+        command.timeouts,
+        command.credential.Configured() ? std::optional<std::string> { command.credential.secret } : std::nullopt,
+        resp.get(),
+        node.get()
+    };
 
     auto const context = VerbContext { .operands = command.operands,
                                        .options = command.verbOptions,
                                        .resp = resp.get(),
                                        .memcached = memcached.get(),
+                                       .node = node.get(),
                                        .stats = &gatherer };
 
     auto answer = RunVerb(verb, context);
+
+    // **The endpoint is IDENTIFIED only when its own wire could not answer**, which is
+    // what keeps this off the common path: a `get` against a healthy daemon pays for no
+    // probe at all. What is here is acquisition alone -- open a socket, ask one question
+    // -- because this file is in no test target (#370, #909); `RunNodeFallback` owns
+    // every decision, including whether the identification is worth reporting.
+    //
+    // `Protocol` joins `Unreachable` deliberately. A `fastcache-compile-node` meeting a
+    // RESP client does not always close in silence: whatever arrives is bytes this
+    // client cannot read as a reply, and reporting *the reply could not be read* for a
+    // binary that speaks another protocol entirely sends an operator hunting a codec
+    // bug.
+    auto const unanswered = answer.outcome == Outcome::Unreachable || answer.outcome == Outcome::Protocol;
+    if (unanswered && verb.wire != Wire::Node && node == nullptr)
+    {
+        if (auto probe = NodeExchange::Open(command.cache, command.timeouts, command.credential); probe.has_value())
+        {
+            auto const kind = ProbeRemote(**probe);
+            auto probed = context;
+            probed.node = probe->get();
+            answer = RunNodeFallback(verb, probed, kind, std::move(answer));
+        }
+        // A probe that could not even connect adds nothing: the primary answer already
+        // says the address did not answer, and a second sentence about one fault makes
+        // it read as two. Deliberately silent rather than logged.
+    }
+
     // The connection's own remarks come first: they are about the whole exchange
     // rather than about this one answer, and an operator reading downwards wants
     // "your credential was ignored" before "the key does not exist".
