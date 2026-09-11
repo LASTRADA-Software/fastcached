@@ -2382,6 +2382,13 @@ and what they may assume.
 - A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
   copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
   them, found a day apart — a fake nothing exercises does not report its own bugs.
+- And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a
+  suspension protocol, however correct its assertions — nothing is wrong with the fake,
+  which is what makes this the harder half of the rule above. `InMemorySocket::WaitReadable`
+  resolves immediately and says why it should; every property defined by parking is
+  therefore vacuous over it, and #710 and #755 both sat behind that green. The survey of
+  which such properties have a real-socket case, and which have none, is in
+  [`.agent/rules/testing.md`](.agent/rules/testing.md) (#778).
 - So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp` (#649).
   Four cases in two binaries each hand-rolled a stored value carrying a generation this
   build does not implement — three lines, no collaborator, nothing that looks like it
