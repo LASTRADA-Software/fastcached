@@ -5613,3 +5613,43 @@ set_tests_properties("macro-bare-parameters-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# The suite runner's verdict table (#1212).
+#
+# `scripts/run-suite.sh` exists because a test binary that CRASHES reports zero
+# failures in every summary format there is, so a mutation harness reading the
+# count scores a crash as *the mutation was caught* -- indistinguishable from a
+# real result and pointing the wrong way. Its answer is drawn from three readings
+# at once: the exit status, whether the report is COMPLETE, and how many cases it
+# carries.
+#
+# What is registered here is the DECISION and not the acquisition. The
+# acquisition needs a built binary and a crash that happens a few times in
+# twelve, which is exactly the population a verdict table must not be reachable
+# only from -- the same split `tidy-sweep.sh --self-test` and
+# `node-scratch-isolation-e2e-selftest` record for themselves.
+#
+# Two of its ten cases are the reason the table has three inputs rather than one:
+# `139 failing assertions with a complete report` and `killed by SIGSEGV with a
+# truncated one` carry the SAME exit status, because Catch2 spends its status on
+# the failure count, and only completeness tells them apart.
+#
+# `if(NOT WIN32)` for the reason `e2e-helpers-selftest` carries it: the script is
+# POSIX, and a Windows counterpart would be a translation rather than new
+# coverage. The property is platform-independent and the Linux and macOS jobs run
+# it.
+#
+# APPENDED at the end of this file rather than beside a sibling: several lanes
+# add registrations here at once, and an append-only conflict resolves by keeping
+# both blocks, which is a resolution anybody can perform correctly.
+if(NOT WIN32)
+    add_test(
+        NAME "run-suite-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/run-suite.sh" --self-test
+    )
+    set_tests_properties("run-suite-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
