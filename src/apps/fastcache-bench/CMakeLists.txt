@@ -13,5 +13,5 @@ if(NOT FASTCACHED_BUILD_TESTS)
         "(the benchmarks use Catch2, which the test suite pulls in).")
 endif()
 
-add_executable(fastcache-bench StorageBench.cpp)
+add_executable(fastcache-bench StorageBench.cpp StreamCodecBench.cpp)
 target_link_libraries(fastcache-bench PRIVATE FastCache Catch2::Catch2WithMain)
