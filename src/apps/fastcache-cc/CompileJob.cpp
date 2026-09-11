@@ -1273,6 +1273,15 @@ std::vector<std::string> CompileJobRunner::Fingerprints() const
     return out;
 }
 
+std::string CompileJobRunner::CompilerFor(std::string_view fingerprint) const
+{
+    // The same shared lock `Fingerprints` takes, for the same reason: `Run` and
+    // `ReplaceToolchains` may be on other threads, and this is a read.
+    std::shared_lock const guard { _toolchainsMutex };
+    auto const it = _toolchains.find(std::string { fingerprint });
+    return it == _toolchains.end() ? std::string {} : it->second;
+}
+
 void CompileJobRunner::ReplaceToolchains(std::map<std::string, std::string> toolchains)
 {
     std::unique_lock const guard { _toolchainsMutex };

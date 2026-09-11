@@ -61,9 +61,16 @@ class NodeFrameSurface
     ///        built from it, including when that fails.
     /// @param metrics Where the endpoint's own at-capacity refusal is counted.
     /// @param logger Where to announce the bound address.
+    /// @param namer Resolves a compile's fingerprint to the compiler this node would
+    ///        spawn, for the exchange log. Empty names nothing, which is what every
+    ///        fixture and every surface without a toolchain map gets.
     /// @return Nothing, or why it could not be served.
-    [[nodiscard]] std::expected<void, std::string> Bind(
-        NodeIoLoop& io, NodeConfig const& cfg, std::optional<int> inherited, IMetricsSink& metrics, ILogger& logger);
+    [[nodiscard]] std::expected<void, std::string> Bind(NodeIoLoop& io,
+                                                        NodeConfig const& cfg,
+                                                        std::optional<int> inherited,
+                                                        IMetricsSink& metrics,
+                                                        ILogger& logger,
+                                                        ToolchainNamer namer = {});
 
     /// The address this node's `0xFC` listener bound.
     /// @return The endpoint, or an empty string before `Bind` succeeded.
@@ -139,6 +146,7 @@ class NodeFrameSurface
     IFrameResponder* compile,
     std::optional<int> inherited,
     IMetricsSink& metrics,
-    ILogger& logger);
+    ILogger& logger,
+    ToolchainNamer namer = {});
 
 } // namespace FastCache::Node

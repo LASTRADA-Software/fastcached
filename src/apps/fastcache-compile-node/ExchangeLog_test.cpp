@@ -18,6 +18,18 @@ namespace
 {
 
 /// A reply frame whose first byte is `status`.
+/// A request frame of @p bytes, for the size the line reports.
+///
+/// The renderer takes the byte count FROM the span now rather than beside it, so a
+/// case cannot state a length that disagrees with the bytes it passed. These frames
+/// carry no valid header on purpose: every case here is about the generic line, and
+/// the toolchain clause -- which needs a decodable compile payload -- has its own
+/// cases below.
+[[nodiscard]] std::vector<std::byte> FrameOf(std::size_t bytes)
+{
+    return std::vector<std::byte>(bytes, std::byte { 0 });
+}
+
 [[nodiscard]] std::vector<std::byte> ReplyWith(Wire::Status status, std::size_t extra = 0)
 {
     std::vector<std::byte> bytes { static_cast<std::byte>(status) };
@@ -85,9 +97,9 @@ TEST_CASE("ExchangeLog: a reply that was never written is its own outcome", "[no
     // Four states -- ok, miss, error, none -- and the fourth is the one a bool or a
     // status byte alone cannot carry. A node that declined to write must not read as
     // one that answered `error`, because those are fixed in different places.
-    auto const none = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, {}, 3ms);
-    auto const err =
-        FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Error), 3ms);
+    auto const none = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", FrameOf(64), {}, 3ms);
+    auto const err = FormatExchange(
+        static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", FrameOf(64), ReplyWith(Wire::Status::Error), 3ms);
     CHECK(none.contains("no-reply"));
     CHECK(err.contains("error"));
     CHECK(none != err);
@@ -99,10 +111,10 @@ TEST_CASE("ExchangeLog: a miss and an ok are distinguishable in the line", "[nod
     // carries: it is the difference between a cache that is working and one that is
     // reachable and empty, which is exactly what an operator cannot see from the
     // journal today.
-    auto const hit =
-        FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Ok, 4096), 12ms);
-    auto const miss =
-        FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", 64, ReplyWith(Wire::Status::Miss), 1ms);
+    auto const hit = FormatExchange(
+        static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", FrameOf(64), ReplyWith(Wire::Status::Ok, 4096), 12ms);
+    auto const miss = FormatExchange(
+        static_cast<std::uint8_t>(Wire::Op::Fetch), "10.0.0.4", FrameOf(64), ReplyWith(Wire::Status::Miss), 1ms);
     CHECK(hit.contains("-> ok"));
     CHECK(miss.contains("-> miss"));
 
@@ -113,14 +125,18 @@ TEST_CASE("ExchangeLog: a miss and an ok are distinguishable in the line", "[nod
 
 TEST_CASE("ExchangeLog: a peer the kernel could not name is said so, not left blank", "[node][logging]")
 {
-    auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Lease), "", 32, ReplyWith(Wire::Status::Ok), 0ms);
+    auto const line =
+        FormatExchange(static_cast<std::uint8_t>(Wire::Op::Lease), "", FrameOf(32), ReplyWith(Wire::Status::Ok), 0ms);
     CHECK(line.contains("<unknown peer>"));
 }
 
 TEST_CASE("ExchangeLog: the line names the verb, the peer and the elapsed time", "[node][logging]")
 {
-    auto const line = FormatExchange(
-        static_cast<std::uint8_t>(Wire::Op::Compile), "192.168.1.7", 1024, ReplyWith(Wire::Status::Ok, 8192), 4210ms);
+    auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Compile),
+                                     "192.168.1.7",
+                                     FrameOf(1024),
+                                     ReplyWith(Wire::Status::Ok, 8192),
+                                     4210ms);
     CHECK(line.contains("compile"));
     CHECK(line.contains("192.168.1.7"));
     CHECK(line.contains("4210 ms"));
@@ -130,7 +146,7 @@ TEST_CASE("ExchangeLog: the line names the verb, the peer and the elapsed time",
 TEST_CASE("ExchangeLog: an unrecognised status byte renders as its byte", "[node][logging]")
 {
     std::vector<std::byte> const weird { static_cast<std::byte>(0x7F) };
-    auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "h", 8, weird, 0ms);
+    auto const line = FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch), "h", FrameOf(8), weird, 0ms);
     CHECK(line.contains("status-0x7f"));
 }
 
@@ -234,4 +250,143 @@ TEST_CASE("NoteVersionRefusal: a build's every translation unit produces one lin
                        ErrorReply(Wire::ErrorCode::UnsupportedVersion, "supported 5..5"),
                        t0 + std::chrono::seconds { 61 });
     CHECK(log.WarnCount() == 3);
+}
+
+// --- the toolchain clause (#994) --------------------------------------------
+
+namespace
+{
+/// A real, decodable compile frame naming @p fingerprint.
+///
+/// Encoded through `Wire::EncodeCompile` rather than assembled by hand, for the
+/// reason the renderer decodes rather than being told: the clause is only correct if
+/// it reads what a real client sends, and a hand-built frame would be this test
+/// agreeing with itself about an offset.
+[[nodiscard]] std::vector<std::byte> CompileFrameFor(std::string_view fingerprint)
+{
+    std::array<std::byte, 4> const source { std::byte { 1 }, std::byte { 2 }, std::byte { 3 }, std::byte { 4 } };
+    // EVERY field named, the empty ones included. clang treats
+    // `missing-designated-field-initializers` as an error under `-Werror` while GCC
+    // accepts the partial form, so the short spelling builds on a GCC lane and fails
+    // the clang-debug gate leg. It did, which is what "one configuration is not the
+    // gate" means when it happens to you.
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "a-token",
+                                                      .fingerprint = fingerprint,
+                                                      .args = {},
+                                                      .source = std::span<std::byte const> { source },
+                                                      .acceptedCodecs = {},
+                                                      .sourceName = {},
+                                                      .compileDir = {},
+                                                      .compileDirReplacement = {},
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
+}
+} // namespace
+
+TEST_CASE("ExchangeLog: a compile names the toolchain it used", "[node][logging][toolchain]")
+{
+    // #994. The line already said WHO and HOW LONG; this is the half an operator needs
+    // to answer "is the fleet using the compiler I think it is".
+    auto const frame = CompileFrameFor("631c2ecd");
+    auto const line = Node::FormatExchange(static_cast<std::uint8_t>(Wire::Op::Compile),
+                                           "192.168.1.7",
+                                           frame,
+                                           ReplyWith(Wire::Status::Ok, 8192),
+                                           4210ms,
+                                           [](std::string_view fp) {
+                                               CHECK(fp == "631c2ecd");
+                                               return std::string { "/usr/bin/gcc" };
+                                           });
+
+    // BOTH halves. A fingerprint an operator cannot resolve is close to useless on its
+    // own -- it correlates against the node's startup lines and nothing else -- and a
+    // compiler path without the fingerprint cannot be matched against what a client
+    // keyed on. The ticket calls one without the other half a fix.
+    CHECK(line.contains("toolchain=631c2ecd"));
+    CHECK(line.contains("/usr/bin/gcc"));
+
+    // And it is still the same line, not a second one. `ServeConnection` calls this
+    // "the one place this node says anything about a client".
+    CHECK(line.contains("192.168.1.7"));
+    CHECK(line.contains("4210 ms"));
+}
+
+TEST_CASE("ExchangeLog: a fingerprint this node does not serve is NAMED, not dropped", "[node][logging][toolchain]")
+{
+    // **The interesting case, and the one a silent fallback would hide.** A client
+    // keying against a toolchain this node has stopped serving is #238's symptom seen
+    // from the other side -- and if the clause simply vanished, the line would be
+    // indistinguishable from a verb that carries no toolchain at all.
+    auto const frame = CompileFrameFor("deadbeef");
+    auto const line = Node::FormatExchange(static_cast<std::uint8_t>(Wire::Op::Compile),
+                                           "10.0.0.9",
+                                           frame,
+                                           ReplyWith(Wire::Status::Error),
+                                           7ms,
+                                           [](std::string_view) { return std::string {}; });
+
+    CHECK(line.contains("toolchain=deadbeef"));
+    CHECK(line.contains("unserved"));
+}
+
+TEST_CASE("ExchangeLog: a verb that is not a compile carries no toolchain clause", "[node][logging][toolchain]")
+{
+    // The discriminator, and getting the FIXTURE right is the whole of it.
+    //
+    // **The obvious version of this case cannot fail.** Written with `FrameOf(64)` --
+    // sixty-four junk bytes -- it passed under a renderer with the verb check DELETED,
+    // measured: junk has no decodable header, so the clause is empty for that reason
+    // and the verb test is never reached. The assertion was right and the case tested
+    // nothing, which is `.agent/rules/testing.md`'s "assert what DISTINGUISHES" landing
+    // on the test written to distinguish.
+    //
+    // So the payload is held CONSTANT and only the verb varies: these are the same
+    // bytes as the compile cases above, labelled `fetch`. Everything except the verb
+    // check would now produce a clause, so the absence below can only be the verb
+    // check doing its job. Re-checked by deleting that check: this case then fails.
+    auto const frame = CompileFrameFor("631c2ecd");
+    auto const line = Node::FormatExchange(static_cast<std::uint8_t>(Wire::Op::Fetch),
+                                           "10.0.0.4",
+                                           frame,
+                                           ReplyWith(Wire::Status::Ok, 4096),
+                                           12ms,
+                                           [](std::string_view) { return std::string { "/usr/bin/gcc" }; });
+
+    CHECK_FALSE(line.contains("toolchain="));
+    CHECK_FALSE(line.contains("/usr/bin/gcc"));
+    // Still a complete line, so the absence above is a missing clause and not a
+    // renderer that gave up.
+    CHECK(line.contains("fetch"));
+    CHECK(line.contains("10.0.0.4"));
+}
+
+TEST_CASE("ExchangeLog: an undecodable compile frame drops the clause rather than guessing", "[node][logging][toolchain]")
+{
+    // A truncated or malformed compile payload has no fingerprint to name. It must not
+    // print an empty one, and it must not stop the line being written -- the exchange
+    // still happened and the peer, the size and the elapsed time are all still true.
+    auto const line = Node::FormatExchange(static_cast<std::uint8_t>(Wire::Op::Compile),
+                                           "10.0.0.4",
+                                           FrameOf(64),
+                                           ReplyWith(Wire::Status::Error),
+                                           3ms,
+                                           [](std::string_view) { return std::string { "/usr/bin/gcc" }; });
+
+    CHECK_FALSE(line.contains("toolchain="));
+    CHECK(line.contains("compile"));
+    CHECK(line.contains("10.0.0.4"));
+}
+
+TEST_CASE("ExchangeLog: with no namer a compile still names its fingerprint", "[node][logging][toolchain]")
+{
+    // Every surface without a toolchain map -- a cache tier, a scheduler, every
+    // fixture -- passes no namer at all. The clause must degrade to the half it can
+    // still answer rather than disappearing: the fingerprint is decoded from the
+    // frame and needs nobody's help.
+    auto const frame = CompileFrameFor("631c2ecd");
+    auto const line = Node::FormatExchange(
+        static_cast<std::uint8_t>(Wire::Op::Compile), "10.0.0.4", frame, ReplyWith(Wire::Status::Ok), 5ms);
+
+    CHECK(line.contains("toolchain=631c2ecd"));
+    CHECK(line.contains("unserved"));
 }

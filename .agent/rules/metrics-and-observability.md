@@ -840,13 +840,6 @@ outright rather than drawing with a gap.
 
 ## Open work
 
-- **[#143](https://github.com/LASTRADA-Software/fastcached/issues/143)** —
-  `/fleet` collects and renders a full snapshot per request and the page carries a
-  meta refresh, so tabs left open are steady load on the node that also schedules
-  every compile. Deliberately a *measurement* ticket: a TTL buys latency and pays
-  in staleness on the one page that exists to be current, and the charts already
-  avoid the cost with a validator rather than a lifetime.
-
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
   fleet scheduler should count a non-member caller in a series of its own. #494 left it
   `RefuseWithoutCounter`, deferring to `SchedulerService::UncountedRefusals`, and that

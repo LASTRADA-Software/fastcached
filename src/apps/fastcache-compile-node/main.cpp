@@ -935,7 +935,12 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                         &compileResponder,
                                         activated,
                                         metrics,
-                                        logger);
+                                        logger,
+                                        // Asked of the RUNNER rather than of a captured copy of the map, so a
+                                        // re-survey that replaces the set is reflected in the very next line
+                                        // (#238). `jobs` outlives the surface -- declared above it, destroyed
+                                        // after -- which is what makes the reference safe to hold.
+                                        [&jobs](std::string_view fingerprint) { return jobs.CompilerFor(fingerprint); });
     if (!nodeSurfaceOrRefusal.has_value())
     {
         // No flag prefix: this can fail over --listen-node or over --serve-scheduler,
