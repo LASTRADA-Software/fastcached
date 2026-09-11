@@ -6,8 +6,6 @@
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
-#include <tests/RetiredGenerations.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -23,6 +21,7 @@
 
 #include <tests/DeclaredCountBlob.hpp>
 #include <tests/ForeignGenerationValue.hpp>
+#include <tests/RetiredGenerations.hpp>
 
 using namespace FastCache;
 using PathCanon::Grammar;
@@ -1052,8 +1051,7 @@ constexpr std::array Generation4Rows {
                 .digest = "e6b6b9c572cf0ebe03bbbf9cd0635b42941308e584f8b4cc6a47b4ef8acb3311" },
     RowDigest { .row = "a drive-relative root consumes",
                 .digest = "763f779e22bcdb69025f0c75c43e3f3dcb3ca9516cfa72845bdbfd42be175b0d" },
-    RowDigest { .row = "a UNC root consumes",
-                .digest = "1f4cbb8b5b91b84a0470524f64c959e4929679ba3e5c24e7bc2f7cfaee981713" },
+    RowDigest { .row = "a UNC root consumes", .digest = "1f4cbb8b5b91b84a0470524f64c959e4929679ba3e5c24e7bc2f7cfaee981713" },
     RowDigest { .row = "a bare drive root consumes",
                 .digest = "62f9934c4822d8bd526b0e24bb8697b1c13226f734e28aed21c90a64c08e47ae" },
     RowDigest { .row = "a localized producer normalizes its marker, and an English consumer matches it",
@@ -1064,8 +1062,7 @@ constexpr std::array Generation4Rows {
                 .digest = "697f9fdbcfb486cc563d9c5919ea4714e60b1e5b56abca9faaba092dd22b4344" },
     RowDigest { .row = "a diagnostic quoting the marker mid-line is not a note",
                 .digest = "d41d57eafffe2a9a78b4ca327db1c822a55bef0ae56434677f1f8ccf31e2a1ce" },
-    RowDigest { .row = "empty region",
-                .digest = "ff7acbd998d5e32f2ba3a47c779137140e018b16b2a9875b6d4945b86975469b" },
+    RowDigest { .row = "empty region", .digest = "ff7acbd998d5e32f2ba3a47c779137140e018b16b2a9875b6d4945b86975469b" },
     RowDigest { .row = "gcc diagnostic under the source root",
                 .digest = "e6bbb746df126c4529546cc65c85e61c1b8676e11b9b05269c201fa7ee5dbc05" },
     RowDigest { .row = "gcc include chain, header and continuation",
@@ -1353,8 +1350,7 @@ TEST_CASE("Every corpus row is frozen under the live generation")
     }
     {
         INFO("these rows produce something other than what generation "
-             << static_cast<unsigned>(CompileValueVersion)
-             << " was frozen with: " << RenderRows(delta.changed)
+             << static_cast<unsigned>(CompileValueVersion) << " was frozen with: " << RenderRows(delta.changed)
              << ".\nThat is a BEHAVIOUR change and it is not repinnable: two servers on one wire at "
                 "different builds would stamp this same generation on text they rewrote differently. "
                 "Bump CompileValueVersion, freeze the new generation's rows, and add the bump row naming "
@@ -1382,11 +1378,9 @@ TEST_CASE("A generation bump names the rows it moved")
         REQUIRE(after != nullptr);
 
         auto const delta = CompareFrozenRows(before->rows, after->rows);
-        INFO("bump " << static_cast<unsigned>(bump.from) << " to " << static_cast<unsigned>(bump.to)
-                     << " claims it moved " << RenderRows(bump.changedRows) << " and actually moved "
-                     << RenderRows(delta.changed)
-                     << ".\nRows that arrived (" << RenderRows(delta.added) << ") and left ("
-                     << RenderRows(delta.removed)
+        INFO("bump " << static_cast<unsigned>(bump.from) << " to " << static_cast<unsigned>(bump.to) << " claims it moved "
+                     << RenderRows(bump.changedRows) << " and actually moved " << RenderRows(delta.changed)
+                     << ".\nRows that arrived (" << RenderRows(delta.added) << ") and left (" << RenderRows(delta.removed)
                      << ") are corpus width rather than behaviour and are not part of the claim.\nThe "
                         "order is the corpus's own, so list them as they appear there.");
         CHECK(RenderRows(delta.changed) == RenderRows(bump.changedRows));

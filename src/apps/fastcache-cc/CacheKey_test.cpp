@@ -3,8 +3,6 @@
 #include "KeyDigest.hpp"
 #include "KeyDigestTestSupport.hpp"
 
-#include <tests/RetiredGenerations.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
@@ -19,11 +17,13 @@
 #include <unordered_set>
 #include <vector>
 
+#include <tests/RetiredGenerations.hpp>
+
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 using FastCache::Testing::Generation;
 using FastCache::Testing::RequireNoRetiredDigest;
-using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {

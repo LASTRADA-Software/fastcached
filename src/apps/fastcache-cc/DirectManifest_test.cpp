@@ -6,8 +6,6 @@
 #include "KeyDigestTestSupport.hpp"
 #include "ReplayGuard.hpp"
 
-#include <tests/RetiredGenerations.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -25,13 +23,14 @@
 #include <vector>
 
 #include <tests/DeclaredCountBlob.hpp>
+#include <tests/RetiredGenerations.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
+using FastCache::Cc::Test::SplitMix64;
 using FastCache::Testing::Generation;
 using FastCache::Testing::RequireNoRetiredDigest;
-using FastCache::Cc::Test::SplitMix64;
 
 namespace
 {
