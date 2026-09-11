@@ -258,379 +258,198 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,
 `apps/fastcache-compile-node/`.
-- The text sent to a worker is **not** the text the key hashed; dispatch
-  preprocesses a second time, with `#line` markers.
-- A worker is told its input is preprocessed *and* what language it is in; the
-  file extension is the last of three answers, never the first.
-- The arguments a worker will pass on are an **allowlist** keyed on the driver family,
-  and the `-f` space is ENUMERATED rather than prefixed — a blanket `-f` with a carve-out
-  reads as an allowlist and behaves as a denylist over the largest and most volatile flag
-  family GCC and Clang have (#240). **A refusal by ABSENCE and a refusal by ROW are the
-  same answer only while nothing else is consulted**, and `--allow-compile-arg` (#293) is
-  the something else: the whole program-invoking class was refused by not being listed,
-  so a configuration file could name one and admit it. The table header had enumerated
-  that class in prose — *"absent by construction, and therefore refused"* — for months,
-  where nothing could read it. They are `Deny` rows now, and a `Deny` row takes
-  `ArgValue::AnySuffix`: a refusal must not be escapable by the shape rule that exists to
-  NARROW an allowance, or `-fplugin=evil` is refused and `-fplugin=/tmp/evil.so` is not.
-  Operator entries are consulted LAST, matched whole and exactly, and ride into
-  `MakeNodeServiceSpec` — a registration replays its command line forever.
-- A cache exchange is bounded by a round trip, a dispatched compile by how long a
-  COMPILER runs; sharing one deadline abandoned every TU worth distributing while the
-  worker finished the job anyway. And a per-call `SO_RCVTIMEO` is not a bound at all.
-- That total therefore cannot also answer *how fast is a stopped worker noticed*.
-  Keepalive answers a dead HOST; the row it cannot reach — a kernel answering every
-  probe while the process makes no progress — is the worker's own `Status::Progress`
-  pulse, against a SLIDING idle deadline the client re-arms on each pulse. Its own
-  `SocketDeadlineTarget`, so `Silent` is distinguishable from `Expired`: those are
-  opposite diagnoses fixed by different people.
-- That language is stated by the flags dispatch APPENDS, so a build that named one
-  itself (`/TP`, which CMake emits for every MSVC C++ source) is folded into the
-  language and dropped — never refused, which made the whole fleet cache and
-  distribute nothing while every scheduler counter read zero. A selector naming a
-  FILE, or an `-x` value with no exact language, is still refused.
-- Leadership and membership are one `Gate()`, and it runs for every verb — reads
-  included. But they answer different questions and only leadership stops applying at
-  demotion: a RELEASE settles an obligation this node itself created, in a per-node
-  `LeaseTable` nobody else holds, so gating it on leadership pinned the key on the one
-  machine that could free it (#371). A `GateScope`, never a verb that skips the gate;
-  membership is never relaxed; `Scheduling` is the default. A verb qualifies only if it
-  touches non-replicated state this node created AND can create nothing — both clauses,
-  since `Lease` passes the first. And the settlement still refuses a token it never
-  issued, or the fix is a hole.
-- Duplicate suppression is asked **before** capacity, or a busy fleet reports
-  `NoCapacity` for a key it is already building.
-- A lease has three transitions and expiry is the third: the **client** resolves it,
-  on every path out of the compile, over a fresh connection. Expiry is the safety net
-  for a client that died.
-- A listen flag answers "does this port face the network" only when this process
-  bound the port. Under socket activation the unit owns the address and the flag
-  still holds a value that describes nothing — a stale loopback value passed the
-  startup table and served an unauthenticated compile port. The config table's rule
-  is insufficient there, not wrong, so both it and the runtime guard stay. Recorded
-  against `--bind`, which #290 stage 3 deleted; `--listen-node` inherits the hole and
-  is now the only flag, so it is wider.
-- Whether a worker **checks** a lease is a startup decision, never a per-request
-  fallback — skipped per request, the port is open and every refusal counter reads
-  zero. The question is "can a machine that is not this one reach the compile
-  surface", not "is a key configured": a loopback bind and a loopback-only policy
-  each close it on their own. A validator returns a REASON rather than a `bool`,
-  captures the worker's own endpoint rather than taking one, and never answers
-  `UnknownLease` — that is the scheduler's code.
-- A resolve answers on liveness, not presence — an unknown token is refused, because
-  that is the only place "this job outlived its lease" can be observed.
-- And it says WHICH nothing it resolved. `Release` returned one `nullopt` for three
-  outcomes, so one `UnknownLease` was answered and none was counted — the condition
-  the line above calls the one worth naming, visible to a single client and to no
-  fleet (#1074). One wire code, three rows, keyed on the OUTCOME because a code-keyed
-  table cannot hold three refusals sharing a code. Only `Expired` is counted: the
-  other two have several causes each, so counting them buries the one signal a site
-  can act on — and the enumerators name what was OBSERVED, since a token from a dead
-  scheduler instance arrives as *unknown* or as *key mismatch* depending only on
-  whether its number was reissued. A lease RECLAIMED from a live client — a worker
-  dropped mid-compile, and #573's `Withdraw` next — is a fourth cause behind that one
-  code, safe only because `ReleaseWorker` erases the entry and `Expired` needs one
-  present; counted, it would claim a bound is too short for an event that says nothing
-  about the bound. Acceptance is a discrimination case; per-arm sections all pass when
-  all three answer alike.
-- A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a
-  destructor: every release goes through one door, so the several COPIES (the validator
-  takes the key by value) need no holder to remember anything. It also covers a vector
-  that grows, which none here does today — say so, rather than citing a growing holder
-  this tree does not have. `std::memset` is DELETED at -O2 by both compilers — measured,
-  same `main`, both inlined. Container-agnostic is not SUFFICIENT: SSO keeps a short secret
-  inside the object where no allocator is called — measured, inline capacity **15 on
-  libstdc++ AND on MSVC, 22 on libc++**, so a 16-to-22-byte secret is on the heap on Linux
-  and Windows and inline on macOS. libc++ is the sole outlier, which makes **macOS the
-  platform to write the failing test against**. Secret STRINGS need an inline wipe too
-  (#1125), and a destructor-based one still misses the inline-to-heap transition. Holders
-  are found by NAME, so a row that has stopped matching is a refusal.
-- A lease token is a credential, and its MAC covers the granted **endpoint** or it is
-  a credential for every worker that trusts the key. Fields length-prefixed, never
-  joined — an endpoint is `host:port`. Own domain label: the same PSK MACs discovery
-  proofs.
-- The PSK signs through ONE seam and the domain is a required PARAMETER, never a string
-  a caller remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its
-  `SigningDomainTable`, so there is no argument to pass a bare label to. A construction
-  that omits its domain label is a credential valid on the *other* surface — the same key
-  MACs discovery proofs and lease tokens — and this is what stops a fourth signer being
-  written against `HmacSha256` directly (#402).
-- That change moved the discovery proof wire and **`DiscoveryWire::CurrentVersion`
-  deliberately did not move**. The proof gains `fastcache-discovery-v1` as a leading
-  length-prefixed field, so every tag differs from a pre-#402 build's; lease messages are
-  byte-for-byte unchanged, `fastcache-lease-v1` having already been the leading field.
-  What changed is the MAC *input*, not the datagram grammar, and bumping the version
-  would misdescribe the format. It is also the better failure: an older node reaches the
-  proof step and is logged `failed to prove the cluster key`, where an unsupported
-  version is dropped by `ClassifyDatagram` and presents as peers seen and never admitted.
-  Loud beats silent. "We changed the MAC, so bump the version" is the tempting
-  correction, and it is wrong.
-- The MAC is checked before any other claim is reported on, or a named refusal is an
-  oracle. The expiry bounds how long a *captured* token is useful and is **not** a
-  capacity bound — slots are.
-- A grant is spendable **once**, at the worker it names, and nothing enforced that until
-  #614 — a captured token was replayable there until it expired. The spend runs LAST, so
-  a grant refused on a reading of its claims is not consumed, and every refusal a client
-  RETRIES is decided above the validator or a retry becomes a permanent `Replayed`. Keyed
-  by a DIGEST, since `LeaseTable::_nextToken` restarts at 1 with the scheduler and serials
-  repeat across a restart while tokens do not.
+- The text sent to a worker is **not** the text the key hashed; dispatch preprocesses a
+  second time, with `#line` markers.
+- A worker is told its input is preprocessed *and* what language it is in; the file
+  extension is the last of three answers, never the first.
+- That language is stated by the flags dispatch APPENDS, so a build that named one itself
+  (`/TP`) is folded into the language and dropped — never refused. A selector naming a FILE,
+  or an `-x` value with no exact language, is still refused.
+- The arguments a worker will pass on are an **allowlist** keyed on the driver family, and
+  the `-f` space is ENUMERATED rather than prefixed. **A refusal by ABSENCE and a refusal by
+  ROW are the same answer only while nothing else is consulted**, and `--allow-compile-arg`
+  is the something else — so the program-invoking class is `Deny` ROWS, and a `Deny` row takes
+  `ArgValue::AnySuffix`. Operator entries are consulted LAST, matched whole and exactly, and
+  ride into `MakeNodeServiceSpec`.
+- A cache exchange is bounded by a round trip, a dispatched compile by how long a COMPILER
+  runs; they must not share a deadline. A per-call `SO_RCVTIMEO` is not a bound at all.
+- That total cannot also answer *how fast is a stopped worker noticed*: keepalive answers a
+  dead HOST, and the worker's own `Status::Progress` pulse answers a stalled process, against
+  a SLIDING idle deadline with its own `SocketDeadlineTarget` — so `Silent` is distinguishable
+  from `Expired`.
+- Leadership and membership are one `Gate()`, run for every verb, reads included. Only
+  leadership stops applying at demotion, so a `GateScope` says which; membership is never
+  relaxed; `Scheduling` is the default. A verb qualifies for a narrower scope only if it
+  touches non-replicated state this node created AND can create nothing — both clauses — and
+  the settlement still refuses a token it never issued.
+- Duplicate suppression is asked **before** capacity.
+- A lease has three transitions and expiry is the third: the **client** resolves it, on every
+  path out of the compile, over a fresh connection.
+- A listen flag answers "does this port face the network" only when this process bound the
+  port. Under socket activation the flag describes nothing, so the config table's rule and the
+  runtime guard both stay.
+- Whether a worker **checks** a lease is a startup decision, never a per-request fallback. The
+  question is "can a machine that is not this one reach the compile surface", not "is a key
+  configured". A validator returns a REASON rather than a `bool`, captures the worker's own
+  endpoint rather than taking one, and never answers `UnknownLease`.
+- A resolve answers on liveness, not presence — an unknown token is refused.
+- And it says WHICH nothing it resolved: one wire code, three rows, keyed on the OUTCOME. Only
+  `Expired` is counted, and the enumerators name what was OBSERVED. Acceptance is a
+  discrimination case; per-arm sections all pass when all three answer alike.
+- A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a destructor.
+  Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called,
+  which makes **macOS the platform to write the failing test against**. Secret STRINGS need an
+  inline wipe too. Holders are found by NAME, so a row that has stopped matching is a refusal.
+- A lease token is a credential, and its MAC covers the granted **endpoint**. Fields
+  length-prefixed, never joined.
+- The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
+  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`.
+- That change moved the proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
+  did not move** — the datagram grammar is unchanged. "We changed the MAC, so bump the version"
+  is the tempting correction, and it is wrong.
+- The MAC is checked before any other claim is reported on, or a named refusal is an oracle. The
+  expiry bounds how long a *captured* token is useful and is **not** a capacity bound.
+- A grant is spendable **once**, at the worker it names. The spend runs LAST, so a grant refused
+  on a reading of its claims is not consumed, and every refusal a client RETRIES is decided above
+  the validator. Keyed by a DIGEST, since serials repeat across a restart while tokens do not.
 - **Retention window and acceptance window are ONE window**, and one predicate — not one
-  constant, because both sites would still spell the comparison and the comparison is the
-  part that is easy to get wrong (`expiresAt` is attacker-chosen, so it is a comparison
-  BEFORE a subtraction). A set pruned at `expiresAt` while the verifier accepts for
-  another five minutes of skew slack leaves a captured grant replayable again for the
-  difference: a spend that expires before the thing it is spending.
-- The learned scheduler term is a DIAGNOSTIC, never a gate. As a monotonic maximum it was
-  **exactly inverted** across a legitimate reset — measured: worker at term 7, scheduler
-  truthfully reset to 0, the honest grant REFUSED and a captured term-7 token ACCEPTED,
-  for every worker until every one of them restarted. The monotonic term was standing in
-  for replay protection; once the spend provides that, a lower term is ADOPTED.
-  `WorkerJobsRefusedLeaseStaleEpoch` is RETIRED rather than left reading zero — impossible
-  and did-not-happen are one number otherwise. A ratchet is a permanent denial of service
-  **with no attacker at all**: an operator turns it too.
-- **A lower term is a REGRESSION, and calling it a reset is a claim the worker cannot
-  make.** A grant minted before a leadership change and delivered after one arrives as a
-  lower term too — a client holds its grant across a preprocess and a large upload, so
-  this is ORDINARY — and nothing in the token separates it from a wiped Raft directory.
-  The first replacement asserted the reset in its log line and in a counter documented as
-  "zero except on the day somebody resets a cluster", which would have fired on every
-  election: #614's own complaint, pointing the other way. Report what is OBSERVED, name
-  both causes, and say that the RATE separates them. **A confident wrong signal is worse
-  than a vague right one.**
-- No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning,
-  never a silent fallback. Its startup refusal is still open (#303) and must take the
-  worker's shape above, or it breaks every single-machine install.
+  constant, because `expiresAt` is attacker-chosen, so it is a comparison BEFORE a subtraction.
+- The learned scheduler term is a DIAGNOSTIC, never a gate: a lower term is ADOPTED, and
+  `WorkerJobsRefusedLeaseStaleEpoch` is RETIRED rather than left reading zero. A ratchet is a
+  permanent denial of service **with no attacker at all**.
+- **A lower term is a REGRESSION, and calling it a reset is a claim the worker cannot make** — a
+  grant delivered across a leadership change arrives as one too. Report what is OBSERVED, name
+  both causes, and say that the RATE separates them. **A confident wrong signal is worse than a
+  vague right one.**
+- No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning, never a
+  silent fallback. Its startup refusal is still open (#303) and must take the worker's shape above.
 - An OUTBOUND credential is read where it is PRESENTED, through one seam
-  (`Node::ICredentialSource`), never captured at construction. `--requirepass` on the
-  worker is presented and never required — which is what lets it be `Reloadable::Yes` at
-  all, one machine at a time — and three sites held their own copy, so marking the row
-  reloadable would publish a snapshot none of them read. A rotation reaching two of
-  three is WORSE than one reaching none: none is a restart somebody planned. The
-  reference held by a site is the guard; a site that never reaches for the seam is a
-  SCAN, with a positive control on the pattern. The daemon's `SharedAuthSource` answers
-  the opposite question and does not transfer. It is also what forced `HeartbeatRound`
-  and `AnnounceOnce` out of `main.cpp`: the third site was in the one translation unit
-  no test reaches, so it was undemonstrable rather than merely untested.
-- The worker's five key files are asked about at the START **and at every accepted
-  reload**, from `main` and never from `WorkerBody`: `ApplyReloadRequest`'s decline of
-  `Subscribe` is about THAT frame's locals, not about the binary. A mode is in no
-  configuration, so the re-ask is of the FILESYSTEM and not of the reloader's two
-  snapshots. No configuration file means no second moment, so that arm reports once and
-  keeps no memory. The full rule, and why the resolved config path travels unguarded by
-  "was the file applied", is in the rule file.
-- A worker being dropped is an **event** (`ExpireStale`), or nothing releases what
-  was held against it. A node that restarts inside the heartbeat window is the second
-  route to the same pin, and `Register` closes it.
-- A discovery layout describes a **directory layout, not a vendor**: Visual Studio
-  ships its own clang-cl under `VC\Tools\Llvm`, which the `visual-studio` row walked
-  past and the three standalone-LLVM rows never reached — so those builds were cached
-  and could never be dispatched. One installation, two rows; `vswhere`'s answer is
-  memoized across them, empty answers included.
-- A port this node LISTENS on is a row of `NodeSurfaceTable()`, and an opener takes
-  the `NodeSurface` — not a listen spec, a default host and a name. The port map lived
-  in five places plus the docs; the guard is the type system, since there is no
-  argument to pass a bare string to. Protocol is a column (discovery is the only UDP
-  surface), so is the host a bare port falls back to. `--print-surfaces` prints the
-  RESOLVED configuration. `--advertise` is not a surface — it is told, not opened.
-- `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells
-  *unbounded*, so the flag that turns a cache off once turned its limit off.
-- What a node holds back from compiles is what its tier **built**, never what a flag
-  asked for — so capacity is derived *below* the tier startup. Which tiers cost RAM
-  is a column of `StorageTierTable`, and a present zero is *unbounded*, not nothing. A
-  disk tier's own key index is RAM that no budget covers (#175), and it is **a working
-  set rather than a store**: `TouchOrInsert` builds the mirror and `Open` never calls
-  it, so a store holding a million objects reports `indexBytes == 0` and
-  `itemCount == 0` the instant it reopens — measured, `ctest -R FastCacheTest`
-  `[index][capacity]`. That rules out the cheapest fix, a reservation taken at startup,
-  on exactly the node the ticket is about: a long-lived worker with a warm disk tier,
-  restarted. `itemCount` is `_index.size()` and starts at zero too, so inferring the
-  opposite from it is the available mistake.
-- A node SERVES while it identifies its toolchains. The cheap half (WHICH compilers)
-  stays at startup; the walk (over 300 s cold, at 2.7% CPU duty — a filesystem wall,
-  not a thread shortage) moves to the heartbeat thread's first round. It registers
-  NOTHING until the fingerprint is real, which is #225 and falls out of a
-  `ServedToolchain` needing one. An empty map is two opposite answers, so
-  `ToolchainSurvey` travels beside it with a deleted default constructor. "Nothing to
-  serve" stays fatal; only its timing moves. `/healthz` stays green, or every restart
-  reads as an outage.
-- A probe that did not RUN is not one that answered nothing, and an identity built on
-  one is neither served nor cached. Empty roots are ordinary — several mechanisms
-  legitimately have none — so the guard is `exitCode == NotSpawned`, never the count.
-  A short include-tree WALK is worse still: it moves nothing the stamp covers, so the
-  short digest validates forever. What counts as a gap is what two ends would DISAGREE
-  about, so an absent root, a dangling symlink and an undecodable root name are none —
-  and keying the first on `error_code` rather than on the resolved `file_type` refuses
-  every machine without `/usr/local/include`.
-- A reply's codec is chosen from what the OTHER end said it accepts, never from this
-  end's list against itself — and a codec list is `AvailableCodecs()`, never a literal.
-  A hard-coded `{ Identity }` on the node made every dispatched object *and* every
-  preprocessed TU cross the network uncompressed while every object arrived intact and
-  every counter read normally. What a test must separate is the two ends **disagreeing**;
-  "it round-trips" passes under the bug.
-- A stored value's text regions are canonicalized by **every** server on this wire,
-  through the one `CanonicalStoredValue` beside `CompileValue` — a node serves it
-  too since #229, and the copy it lacked left every value it stored carrying the
-  producing checkout's absolute paths. A replayed region becomes the object's
-  dependency record, so those never invalidate. A path with no `<SRCROOT>` sentinel is
-  ordinary (92 of 93 in a trivial TU are toolchain headers), so retirement is a schema
-  bump, never a sniff.
-  - And by every **VERSION** of them, or the rule holds at no moment a fleet is
-    actually in: a fleet is permanently mid-upgrade (#173), so "every server" spans
-    generations or means nothing. `CompileValueVersion` names the canonicalization
-    spec and not only the framing, pinned to the BEHAVIOUR by a conformance digest —
-    a rewrite rule that moves without it makes two servers stamp one number on text
-    they rewrote differently. Measured: an ordinary edit to `JoinLocalized` passed
-    2006 of 2007 cases. A value from a generation this build does not implement is
-    `ForeignGeneration` and is REFUSED, carrying no bytes to store — the one `nullopt`
-    that used to mean that AND "damaged bytes" met a node whose policy for the second
-    is *store verbatim*, which is #229 during an ordinary rolling upgrade (#483).
-- A manifest naming the TU and no header revalidates forever: `ClassifyAgainstRoots` calls
-  every path outside both roots toolchain, so ANOTHER checkout's headers are dropped
-  exactly as an SDK's are. It answers in THREE values and there is no bool beside it:
-  `IsToolchainHeader` was retired in #657 once nothing production called it, because a
-  predicate collapsing *outside the roots* into *toolchain* cannot say which of the two an
-  operator repairs by editing a root rather than by moving a file, and a rulebook naming a
-  dead function sends a reader tracing the invariant into code nothing runs. `BuildManifest` refuses (`NoProjectDeps`) when deps were
-  reported and none survived, and (`DepsNotObserved`) when no dependency record was
-  observed at all — a fact the caller STATES through `ReportedDependencies`, never one
-  inferred from an empty vector, since "depends on nothing" and "nothing was observed"
-  are two states one vector renders as one; `ValidateManifest` refuses an empty set
-  rather than letting `all_of` pass vacuously.
-- A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet:
-  `Gate()` refuses `Register` as well, so a heartbeat that only LOGGED the redirect kept
-  announcing to the demoted node, expired out of the new leader's registry, and every
-  lease answered `NoWorker` behind a green build. A leader is remembered only once a
-  round was ACCEPTED there — an endpoint that merely named one is a lead, not a leader —
-  and a remembered one that stops answering falls back to `--scheduler` in the SAME
-  round. `NotLeader` must not clear the worker id; `UnknownLease` must.
-- `NotLeader` is an instruction, not an answer about the fleet: a client follows it to
-  the endpoint it names (`RedirectTarget`, which `ClusterAdminCli` asks too), and the
-  RELEASE goes to whoever ISSUED the lease, never to the configured address. Judged by
-  PARSING the message, never by testing it for empty — an empty one is replaced by the
-  error table's default sentence, so "no leader known" and "the leader is at h:p" arrive
-  the same shape. Splitting is not parsing: `SplitHostPort` takes the LAST colon, so
-  "no leader: try again" splits into a host and a port of " try again", and a launcher
-  DIALS what the admin CLI only printed — one predicate, `ParseDialEndpoint`, because
-  `DialEndpoint` asks the same of the same string a moment later. Bounded, because two
-  nodes with a stale `_knownLeader` name each other forever. That is the CLIENT half;
-  the worker half is the bullet above, and neither works alone.
-- A COMPILE reply is tied to its request or REFUSED (`Mismatched`), before the object
-  envelope is opened — a crossed reply served is a wrong object under a correct key,
-  which is silent, stored and shared. The digest is taken in `CompileJobRunner::Run`
-  from what is about to be spawned, never folded in `WorkerProtocol` from the decoded
-  request: at that layer both crossed requests are pristine, so such a digest agrees
-  with whatever it is compared against and passes the ticket's own acceptance test
-  while catching nothing. A field is covered exactly when the client knows it before
-  sending AND the runner observes it at execution. The base name is derived ONCE, or
-  the fleet refuses every honest compile instead. It has no counter and can have none
-  — only the client can see it, and the client is a per-TU process with no sink — so
-  the alarm is an UNCONDITIONAL stderr line plus a `--show-stats` reason, and the
-  outcome stays a MISS. Input side only: #279's scratch claim is the output side and
-  neither alone is sufficient.
-- A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing
-  a cache field across `LiveWorkers()` counts one machine once per toolchain.
-- A `FETCH` outcome decides whether the daemon is worth a second command
-  (`CacheIsServing`), never whether the invocation continues: an unreachable or
-  refusing cache still dispatches, because the two live on different machines. The
-  reason is still recorded, the MISS trace is skipped so it is not overwritten, and
-  the `STORE` is skipped so a dead cache is asked no more often than before.
-- A bounded wait MEASURES its ceiling: `waited += poll` counts the sleep it ASKED for,
-  and a sleep costs what the host's timer granularity says — so a stated 5 s enforced
-  15 s and 7.5 s at two sites, silently, with every test green. One `DrainWithin`
-  (`Core/BoundedDrain.hpp`), whose `DrainBound` carries the ceiling and the cadence and
-  whose blocking and clock are ONE injected seam — a test whose sleeps cost what they
-  requested cannot tell the two implementations apart on any platform. Both copies cited
-  the correct implementation in a comment and had reimplemented it; a comment naming what
-  it duplicates vouches for the duplicate's bugs.
-- An unbounded drain does not avoid an ending, it hands the choice to the supervisor,
-  which answers `SIGKILL` with no diagnostic. `~WorkerServer` bounds it, says what it
-  abandons and ends the process itself — returning would free members a running job is
-  still inside. Killing a wedged compile's direct child would not even unblock it: the
-  grandchildren hold the pipe write ends, and the drain blocks on the pipes (#239).
-- A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch`
-  only counts it (#242). Comparing hosts refuses the documented setup (DNS names, a node
-  dialling itself, NAT, VPN, multi-homing) and stops only a *third* host, since membership
-  already let this one in. The fix is a credential, as discovery's `(node, endpoint)` MAC is.
-- `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided
-  from it. It carries no port; a peer dials from an ephemeral one.
-- A node's cache tier serves **this machine**, always: locality is a property of the
-  VERB, never of the bind and never of a member list. `--fleet-member` names who may
-  spend this machine's CPU; the tier is its entire build output, and a peer read every
-  object it had ever compiled. `CacheResponder` therefore takes no membership oracle —
-  its absence IS the fix. The question is ambient, so it arrives through
-  `Platform/ILocalityOracle`: `IsLoopbackHost` first and lock-free, then an address set
-  refreshed on an INTERVAL — a miss-triggered refresh is one 2 ms `GetAdaptersAddresses`
-  per request that any stranger can bill this machine for. Folded with `SameHost`, or a
-  `::`-bound surface refuses its own clients.
-- Cluster membership is one ROUTE to admission, never the whole policy. `--fleet-member`
-  admits *clients* — laptops, CI runners — which never join consensus, so what the
-  cluster agrees is **added** and never substituted. Composed at the `IMembershipOracle`
-  seam (`AnyOfMembership`), because the next route is a credential and not a host list.
-  The admission-layer reading of *absence from `ClusterState` is not removal*. A host on
-  both lists survives `--cluster-forget`, and revoking it is a config change on every
-  node that lists it — a **reload** since #405, where #265 recorded a restart. That does
-  not contradict the absence rule — absence is a member the state never named, a forget
-  is a positive act — and both are written down because they read as contradictory cold.
-  Pinned by a test, in the *worsen* direction: making `Publish` write the listed set
-  would look like a fix and would be #251 again. `NodeMembership::Adopt` is the SECOND
-  publisher and writes only `--fleet-member`'s list, so that pin stands rather than being
-  the thing #405 relaxed.
-- REMOVAL is the direction a live admission path has to get right, and the direction a
-  test skips. Adding a member fails CLOSED — refused until the reload lands, self-healing,
-  visible from the machine being refused; removing one fails **OPEN**, and nothing reports
-  it because admission succeeding is the ordinary case. So `NodeMembership` IS the oracle
-  rather than handing one out: surfaces bind an `IMembershipOracle const&` once, so an
-  `Oracle()` choosing between two owned objects could never see `--fleet-open` change —
-  and a test that re-asks `Oracle()` after the reload passes under exactly that defect.
-  And a reload may not WIDEN admission on a node with no `--cluster-key-file`: that node
-  built an unchecked lease validator at startup, `MakeWorkerLeaseValidator` has already
-  run, and the startup table's reachability rows are blind under socket activation — so
-  widening would open an unauthenticated compile port with every refusal counter at zero,
-  which is #282 through a new door. Asked as a TRANSITION, or it refuses the keyless
-  nodes running happily today.
-- A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served
-  inline and never on a reactor — served inline, a 32-slot worker ran one at a time and
-  the cap it advertises was unreachable while every client still got a correct object.
-  On the merged `0xFC` surface that is TWO hops, because a frame arrives on a reactor:
-  off to the pool, and **back before the reply is returned**, since `FrameEndpoint`
-  writes it to a reactor socket. The hop back is invisible at every call site — correct
-  object, successful write — so a test asserts the THREAD IDENTITIES, not the reply.
-  That door spends `WorkerServer::Capacity()`, never a second `CompileCapacity`, so one
-  drain covers both and the advertised slot figure describes both; the worker is
-  declared before the surface so the listener stops admitting before the drain counts.
-  It admits nobody the dedicated port refuses: one `RefuseUnlessMember`, the lease still
-  checked inside `WorkerProtocol`, and `AuthRequired` **false** for `Op::Compile`
-  because the lease is already a per-job credential.
-- Detaching the compiles made the per-request payload cap a per-connection one; the
-  in-flight byte budget lands in the same change, refusing with `EndpointBusy` because
-  a slot was free and memory was not.
-- That budget charges what a request **costs**, not what its frame is long: a codec
-  envelope's declared expansion is the larger number, and a ceiling on it is per
-  request while the budget is per surface. A price above the whole budget is left to
-  the decoder, because `EndpointBusy` on an idle worker is a retry loop.
-- Anything a worker derives per job is derived per THREAD: two compiles sharing a
-  scratch number shared `tu.o`, and one answered with the other's object.
-- And per PROCESS across machines: a scratch root is CLAIMED exclusively, never
-  merely named uniquely. Claiming is the liveness check, so there is no race and a
-  root whose lock is free is one whose owner is gone — `_Exit` included. `flock`,
-  never `fcntl`, which is per process and would pass the two-runner test written to
-  catch it. The lock file sits BESIDE the root, because emptying the root is what
-  both reclamation and ordinary cleanup do. No unclaimed fallback: `TEMP` is the
-  relocation mechanism and a refusal is named.
-- A child inherits what the PROCESS has, not what the call set up. Windows names the
-  handles it may inherit; POSIX marks both pipe ends close-on-exec, under the lock that
-  covers the spawn.
-- A drain waits on a condition variable, never `atomic::wait` — an atomic wait can
-  return without the notify and free the object the notifier is still inside. And it
-  calls `Shutdown()` first, or the accept loop admits one more job behind it.
-- `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same
-  arithmetic with each named, and a tie names the earlier limit in enumerator order.
-- A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` —
-  a raw instant invites `steady_clock::now()` and breaks every `ManualClock` test.
-- A CoW store file is claimed exclusively at `Open` and a second opener is refused
-  by name (`InUse`), never left to interleave meta-page writes. `flock`, never
-  `fcntl` — an fcntl lock is per process and a second store inside one would take
-  it again and succeed.
+  (`Node::ICredentialSource`), never captured at construction — which is what lets `--requirepass`
+  on the worker be `Reloadable::Yes` at all. A rotation reaching two of three sites is WORSE than
+  one reaching none. A site that never reaches for the seam is a SCAN, with a positive control on
+  the pattern. The daemon's `SharedAuthSource` answers the opposite question and does not transfer.
+- The worker's five key files are asked about at the START **and at every accepted reload**, from
+  `main` and never from `WorkerBody`. A mode is in no configuration, so the re-ask is of the
+  FILESYSTEM, not of the reloader's two snapshots; no configuration file means no second moment.
+- A worker being dropped is an **event** (`ExpireStale`), or nothing releases what was held against
+  it. A node restarting inside the heartbeat window is the second route to the same pin, closed by
+  `Register`.
+- A discovery layout describes a **directory layout, not a vendor**: one installation may match two
+  rows, and `vswhere`'s answer is memoized across them, empty answers included.
+- A port this node LISTENS on is a row of `NodeSurfaceTable()`, and an opener takes the
+  `NodeSurface` — not a listen spec, a default host and a name. Protocol is a column, so is the
+  host a bare port falls back to. `--print-surfaces` prints the RESOLVED configuration.
+  `--advertise` is not a surface — it is told, not opened.
+- `--cache-memory 0` means no tier. Zero is how `InMemoryLruStorage` spells *unbounded*.
+- What a node holds back from compiles is what its tier **built**, never what a flag asked for —
+  so capacity is derived *below* the tier startup. Which tiers cost RAM is a column of
+  `StorageTierTable`, and a present zero is *unbounded*, not nothing. A disk tier's key index is
+  RAM no budget covers, and it is **a working set rather than a store**, which rules out a
+  reservation taken at startup.
+- A node SERVES while it identifies its toolchains: the cheap half stays at startup, the walk moves
+  to the heartbeat thread's first round, and it registers NOTHING until the fingerprint is real. An
+  empty map is two opposite answers, so `ToolchainSurvey` travels beside it with a deleted default
+  constructor. "Nothing to serve" stays fatal; `/healthz` stays green.
+- A probe that did not RUN is not one that answered nothing, and an identity built on one is neither
+  served nor cached. Empty roots are ordinary, so the guard is `exitCode == NotSpawned`, never the
+  count. A short include-tree WALK is worse still. What counts as a gap is what two ends would
+  DISAGREE about.
+- A reply's codec is chosen from what the OTHER end said it accepts, never from this end's list
+  against itself — and a codec list is `AvailableCodecs()`, never a literal. A test must separate
+  the two ends **disagreeing**; "it round-trips" passes under the bug.
+- A stored value's text regions are canonicalized by **every** server on this wire, through the one
+  `CanonicalStoredValue` beside `CompileValue`. A path with no `<SRCROOT>` sentinel is ordinary, so
+  retirement is a schema bump, never a sniff.
+  - And by every **VERSION** of them, or the rule holds at no moment a fleet is actually in.
+    `CompileValueVersion` names the canonicalization spec and not only the framing, pinned to the
+    BEHAVIOUR by a conformance digest. A value from a generation this build does not implement is
+    `ForeignGeneration` and is REFUSED, carrying no bytes to store.
+- A manifest naming the TU and no header revalidates forever: `ClassifyAgainstRoots` calls every
+  path outside both roots toolchain, and answers in THREE values with no bool beside it.
+  `BuildManifest` refuses `NoProjectDeps` when deps were reported and none survived, and
+  `DepsNotObserved` when no dependency record was observed at all — a fact the caller STATES through
+  `ReportedDependencies`, never one inferred from an empty vector. `ValidateManifest` refuses an
+  empty set rather than letting `all_of` pass vacuously.
+- A WORKER follows `NotLeader` too, or the client half arrives at an empty fleet: `Gate()` refuses
+  `Register` as well. A leader is remembered only once a round was ACCEPTED there, and a remembered
+  one that stops answering falls back to `--scheduler` in the SAME round. `NotLeader` must not clear
+  the worker id; `UnknownLease` must.
+- `NotLeader` is an instruction, not an answer about the fleet: a client follows it to the endpoint
+  it names (`RedirectTarget`), and the RELEASE goes to whoever ISSUED the lease. Judged by PARSING
+  the message, never by testing it for empty — and splitting is not parsing, so one predicate,
+  `ParseDialEndpoint`. Bounded, or two nodes with a stale `_knownLeader` name each other forever.
+- A COMPILE reply is tied to its request or REFUSED (`Mismatched`), before the object envelope is
+  opened. The digest is taken in `CompileJobRunner::Run` from what is about to be spawned, never
+  folded in `WorkerProtocol` from the decoded request. A field is covered exactly when the client
+  knows it before sending AND the runner observes it at execution. The base name is derived ONCE.
+  It has no counter and can have none, so the alarm is an UNCONDITIONAL stderr line plus a
+  `--show-stats` reason, and the outcome stays a MISS. Input side only.
+- A cache is per node; the registry is keyed per `(fingerprint, endpoint)`. Summing a cache field
+  across `LiveWorkers()` counts one machine once per toolchain.
+- A `FETCH` outcome decides whether the daemon is worth a second command (`CacheIsServing`), never
+  whether the invocation continues: an unreachable or refusing cache still dispatches. The reason
+  is still recorded, the MISS trace is skipped, and the `STORE` is skipped.
+- A bounded wait MEASURES its ceiling: `waited += poll` counts the sleep it ASKED for, not what the
+  host's timer granularity charged. One `DrainWithin` (`Core/BoundedDrain.hpp`), whose `DrainBound`
+  carries the ceiling and the cadence and whose blocking and clock are ONE injected seam. A comment
+  naming what it duplicates vouches for the duplicate's bugs.
+- An unbounded drain hands the ending to the supervisor, which answers `SIGKILL` with no diagnostic.
+  `~WorkerServer` bounds it, says what it abandons and ends the process itself — returning would
+  free members a running job is still inside.
+- A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch` only
+  counts it. Comparing hosts refuses the documented setup and stops only a *third* host; the fix is
+  a credential, as discovery's `(node, endpoint)` MAC is.
+- `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided from it.
+  It carries no port; a peer dials from an ephemeral one.
+- A node's cache tier serves **this machine**, always: locality is a property of the VERB, never of
+  the bind and never of a member list. `CacheResponder` therefore takes no membership oracle — its
+  absence IS the fix. The question is ambient, so it arrives through `Platform/ILocalityOracle`:
+  `IsLoopbackHost` first and lock-free, then an address set refreshed on an INTERVAL — never on a
+  miss, which any stranger can bill this machine for. Folded with `SameHost`, or a `::`-bound
+  surface refuses its own clients.
+- Cluster membership is one ROUTE to admission, never the whole policy: `--fleet-member` admits
+  *clients*, which never join consensus, so what the cluster agrees is **added** and never
+  substituted — composed at the `IMembershipOracle` seam (`AnyOfMembership`). Absence from
+  `ClusterState` is not removal, a forget is a positive act, and revoking a host on both lists is a
+  **reload**. Pinned by a test in the *worsen* direction; `NodeMembership::Adopt` is the SECOND
+  publisher and writes only `--fleet-member`'s list.
+- REMOVAL is the direction a live admission path has to get right, and the direction a test skips:
+  adding a member fails CLOSED and self-heals, removing one fails **OPEN** and nothing reports it.
+  So `NodeMembership` IS the oracle rather than handing one out — surfaces bind an
+  `IMembershipOracle const&` once, and a test that re-asks `Oracle()` after a reload passes under
+  exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,
+  which built an unchecked lease validator at startup. Asked as a TRANSITION, or it refuses the
+  keyless nodes running happily today.
+- A compile is awaited onto a `ThreadPoolExecutor` sized to the slot cap, never served inline and
+  never on a reactor. On the merged `0xFC` surface that is TWO hops, a frame arriving on a reactor:
+  off to the pool, and **back before the reply is returned**. The hop back is invisible at every
+  call site, so a test asserts the THREAD IDENTITIES, not the reply. That door spends
+  `WorkerServer::Capacity()`, never a second `CompileCapacity`; the worker is declared before the
+  surface so the listener stops admitting before the drain counts. One `RefuseUnlessMember`, the
+  lease still checked inside `WorkerProtocol`, and `AuthRequired` **false** for `Op::Compile`.
+- Detaching the compiles made the per-request payload cap a per-connection one; the in-flight byte
+  budget lands in the same change, refusing with `EndpointBusy` because a slot was free and memory
+  was not.
+- That budget charges what a request **costs**, not what its frame is long: a codec envelope's
+  declared expansion is the larger number, and a ceiling on it is per request while the budget is
+  per surface. A price above the whole budget is left to the decoder.
+- Anything a worker derives per job is derived per THREAD: two compiles sharing a scratch number
+  shared `tu.o`, and one answered with the other's object.
+- And per PROCESS across machines: a scratch root is CLAIMED exclusively, never merely named
+  uniquely. Claiming is the liveness check, so there is no race. `flock`, never `fcntl`. The lock
+  file sits BESIDE the root, because emptying the root is what cleanup does. No unclaimed fallback:
+  `TEMP` is the relocation mechanism and a refusal is named.
+- A child inherits what the PROCESS has, not what the call set up. Windows names the handles it may
+  inherit; POSIX marks both pipe ends close-on-exec, under the lock that covers the spawn.
+- A drain waits on a condition variable, never `atomic::wait` — an atomic wait can return without
+  the notify and free the object the notifier is still inside. And it calls `Shutdown()` first.
+- `AvailableSlots` folds four ceilings into one; `SlotCeilingsFor` is the same arithmetic with each
+  named, and a tie names the earlier limit in enumerator order.
+- A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo` — a raw instant
+  invites `steady_clock::now()` and breaks every `ManualClock` test.
+- A CoW store file is claimed exclusively at `Open` and a second opener is refused by name (`InUse`).
+  `flock`, never `fcntl` — an fcntl lock is per process and a second store inside one would take it
+  again and succeed.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
