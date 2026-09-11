@@ -92,15 +92,26 @@ the split. Link them as plain markdown.
   Measured 2026-09-11 on `abb530ed`, each figure with the pattern that produced it,
   because a census states its pattern and not only its number. `^## ` over
   `.agent/rules/*.md` excluding `README.md`: **112** headings. `^- ` over `AGENT.md`
-  between one `**[`.agent/rules/X.md`]**` link and the next: **350** top-level
-  bullets, **358** counting the eight nested `  - ` ones.
+  from one `**[`.agent/rules/X.md`]**` link to the next link **or the next `^## `
+  heading, whichever comes first**: **314** top-level bullets, **322** counting the
+  eight nested `  - ` ones.
 
-  A second reader over the same file reported different per-file figures — 77 where
-  this one gives 57. That disagreement is **not reconciled here and neither number
-  is restated as a range**, because only these were taken with the pattern above:
-  quoting someone else's figure beside your own turns a relayed claim into a
-  measurement it never was. Two counts of one artefact disagreeing is a finding
-  about the walkers, and it does not touch the conclusion, which rests on the shape.
+  **That second bound is load-bearing and this figure was wrong without it.** The
+  first reading said 350, because the walker had no heading bound and the LAST
+  section therefore ran to end-of-file, sweeping in 36 bullets from
+  `## Issues and pull requests` onward — `testing.md`'s row read 71 where it is 35.
+  Only the last section is exposed, since no `^## ` falls between two links, which
+  is why every other row survived unchanged and the error hid in the total.
+
+  **The tell was there and was nearly missed.** A second reader over the same file
+  reported 348 top-level against this one's 350 — near-agreement — while the
+  per-file figures differed by twenty. *Totals that nearly agree while their parts
+  do not* is a contradiction, not a rounding difference, and pulling on it is what
+  found the missing bound. The two readers are still **not reconciled and neither
+  number is restated as a range**: only these were taken with the pattern above,
+  and quoting someone else's figure beside your own turns a relayed claim into a
+  measurement it never was. None of it touches the conclusion, which rests on the
+  shape rather than on any of these numbers.
 
   <!-- table-total: none -->
 
@@ -108,7 +119,7 @@ the split. Link them as plain markdown.
   |---|--:|--:|
   | `distributed-compilation.md` | 1 (`Open work`) | 57 |
   | `build-and-toolchain.md` | 29 | 72 |
-  | `testing.md` | 33 | 71 |
+  | `testing.md` | 33 | 35 |
   | `packaging-and-release.md` | 4 | 6 |
 
   A file with ONE heading carries dozens of tripwires. Most rules here are bullets
