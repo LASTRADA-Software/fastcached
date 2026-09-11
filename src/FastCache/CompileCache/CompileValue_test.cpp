@@ -1306,11 +1306,19 @@ TEST_CASE("Every corpus row is frozen under the live generation")
     // into `digests.back()` would dangle the moment the vector reallocated, and a
     // 64-character digest is past every standard library's inline capacity, so the
     // bug would be invisible until somebody shortened the digest.
+    //
+    // The `reserve` is what clang-tidy asks for, and it REINFORCES that argument
+    // rather than replacing it: at an exact reservation the storage never moves, so
+    // no view can dangle even transiently. The ordering above is still the guarantee
+    // — a reservation holds only while nothing else pushes, and the next person to
+    // add a row to this case owes nothing to a `capacity()` they did not read.
     std::vector<std::string> digests;
+    digests.reserve(ConformanceCorpus.size());
     for (auto const& row: ConformanceCorpus)
         digests.push_back(ConformanceRowDigest(row));
 
     std::vector<RowDigest> live;
+    live.reserve(ConformanceCorpus.size());
     for (auto const i: std::views::iota(std::size_t { 0 }, ConformanceCorpus.size()))
         live.push_back(RowDigest { .row = ConformanceCorpus[i].name, .digest = digests[i] });
 
