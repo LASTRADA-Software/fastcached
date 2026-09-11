@@ -532,347 +532,206 @@ shim is the same position from the other side.
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 `Protocol/`, `Net/`, `Async/`.
-- A frame declares its own length, so a rejection is a **reply** and a
-  resynchronization — never a close.
-- A reply carries a status byte and NO kind, so the step-over-what-you-do-not-know
-  property is REQUEST-side only. `Status::Progress` (the compile pulse, #245) therefore
-  moved `MinSupportedVersion` with `CurrentVersion`: an old client meeting a pulse
-  abandons the compile minutes in, where a refused request is `UnsupportedVersion` and
-  names the range. Which verbs admit it is a table column, `static_assert`ed to
-  `Op::Compile` alone; the payload is empty and the encoder takes no argument; a reader
-  loops to a TERMINAL status, and the exchange's total is what bounds how many arrive.
-- Silence is only measurable against something that would otherwise be said, so the
-  worker's cadence and the client's idle bound are ONE pair of numbers in
-  `CompileCacheWire`, with the relation between them `static_assert`ed — an idle bound
-  at or below the cadence refuses healthy workers on their own reactor's jitter.
-- A pulse is a SECOND writer for the length of the answer, so the endpoint settles it
-  before it writes anything, and a pulse still parked past the bound ends the
-  connection — `SettleWatch`'s rule on the write side. A test that reads one framed
-  reply cannot see a frame emitted AFTER it, and "every frame but the last is a pulse"
-  passes vacuously on a build that pulses none.
-- Which verbs are reachable before authentication is a *column of the table*, and
-  the gate runs before the payload is buffered.
-- A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one
-  cannot reopen the hole by omission.
-- An unimplemented verb is refused `Wire::UnimplementedVerb`, never
-  `DispatchNotPermitted`. The launcher steps over the first and proceeds
-  unauthenticated; the second it treats as fatal, so a `FASTCACHE_TOKEN` client got a
-  permanent 0% hit rate that presented as a cold cache, every `LEASE` declined behind
-  a green build, and a credentialled worker that never joined. The choice is a
-  `(op, code, why)` table row, not a `switch` special case — and the code is ONE named
-  constant every surface and the client spell, because three surfaces naming the
-  enumerator separately is exactly how they drifted (#283, #340). *Unimplemented* is
-  not *served elsewhere*: a verb another port answers stays `DispatchNotPermitted`,
-  because `UnknownOpcode` there tells a client this daemon is too OLD when it is in
-  fact too new. A row for a verb the surface does serve is dead — `static_assert` it
-  cannot be added.
-- A wire constant has TWO facts, its name and its value, and a symbol both ends spell
-  can only test the first. Pin the **byte** as well: change the alias consistently and
-  every in-tree test still agrees while every deployed launcher breaks, because they
-  tolerate `0x02` and nobody here can recompile them. Keep one test on the raw
-  enumerator — it is the anchor, not the code smell it looks like.
+- A frame declares its own length, so a rejection is a **reply** and a resynchronization —
+  never a close.
+- A reply carries a status byte and NO kind, so the step-over-what-you-do-not-know property
+  is REQUEST-side only. `Status::Progress` therefore moved `MinSupportedVersion` with
+  `CurrentVersion`. Which verbs admit it is a table column, `static_assert`ed to `Op::Compile`
+  alone; the payload is empty and the encoder takes no argument; a reader loops to a TERMINAL
+  status, and the exchange's total is what bounds how many arrive.
+- Silence is only measurable against something that would otherwise be said, so the worker's
+  cadence and the client's idle bound are ONE pair of numbers in `CompileCacheWire`, with the
+  relation between them `static_assert`ed.
+- A pulse is a SECOND writer for the length of the answer, so the endpoint settles it before
+  it writes anything, and a pulse still parked past the bound ends the connection —
+  `SettleWatch`'s rule on the write side. A test that reads one framed reply cannot see a
+  frame emitted AFTER it, and "every frame but the last is a pulse" passes vacuously on a
+  build that pulses none.
+- Which verbs are reachable before authentication is a *column of the table*, and the gate
+  runs before the payload is buffered.
+- A pre-auth verb carries its own payload ceiling, `static_assert`ed so a new one cannot
+  reopen the hole by omission.
+- An unimplemented verb is refused `Wire::UnimplementedVerb`, never `DispatchNotPermitted` —
+  the launcher steps over the first and proceeds unauthenticated, and treats the second as
+  fatal. The choice is a `(op, code, why)` table row, not a `switch` special case, and the
+  code is ONE named constant every surface and the client spell. *Unimplemented* is not
+  *served elsewhere*: a verb another port answers stays `DispatchNotPermitted`. A row for a
+  verb the surface does serve is dead — `static_assert` it cannot be added.
+- A wire constant has TWO facts, its name and its value, and a symbol both ends spell can only
+  test the first. Pin the **byte** as well, and keep one test on the raw enumerator — it is
+  the anchor, not the code smell it looks like.
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
-- `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher
-  does not link `FastCache`. It therefore carries cache tiers **positionally**,
-  which makes `StorageTier`'s enumerator order a wire contract.
+- `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher does not
+  link `FastCache`. It therefore carries cache tiers **positionally**, which makes
+  `StorageTier`'s enumerator order a wire contract.
 - **And an enum SAYS which kind it is at its declaration** — transmitted or persisted, or
-  private — because *no comment* meant both, in a tree holding both (#308). A mid-enum
-  insertion shifts every later ordinal: free in one file, and in the other every record
-  already written comes back with each field attributed to the NEXT enumerator, silently,
-  for as long as the file exists. Eighteen enums have an ordinal that is read from bytes or
-  from a position, and **eight said nothing** — `PathCanon::Grammar`, the region tag of every
-  object this cache has ever stored, and `Consensus::EntryKind`, which is on disk in
-  `raft.log` AND on the peer wire, both with every enumerator implicit.
-  The explicit `= N` is the enforcement (a renumbering then shows up in review as a changed
-  literal rather than as an invisible consequence of one added line) and on a PRIVATE enum
-  it is harmful, asserting a contract that does not exist. **`RowsInEnumeratorOrder` is not
-  that guard although it reads like one**: it fires on a row omitted or misplaced, and an
-  insertion whose row goes in at the matching position leaves the table perfectly
-  consistent while every record already written decodes shifted. The census pattern —
-  `static_cast<T>(byte)` — is NARROWER than it reads, in three ways: `Op` and `MessageType`
-  are decoded by a table walk that ENCODES each row; a positional carrier is no cast at all
-  (`MetaSlot` is MULTIPLIED into a file offset, `KeyPiece` folded into a digest and decoded
-  nowhere); and `DecodeWireEnum<E>` casts to a TEMPLATE PARAMETER, so one grep hit spelled
-  `E` stands for three Raft wire enums. **Nine of eighteen rows sit outside the pattern, and
-  this ticket's own first pass found three of the nine** — it shipped a table stating 12,
-  checked against itself by `table-total` and against the tree by nothing. Nothing checks
-  the comments and an approximate scan would refuse correct declarations, so this bullet is
-  the guard.
-- SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is
-  inherited across exec.
-- So is keepalive, and for the mirror reason: `ApplyHotSocketOptions` is where every
-  socket passes, so arming there would change when every idle client connection and
-  every Raft link is dropped. It is a `DialOptions` field, and the flag without the
-  intervals inherits a two-hour default that reads back as armed. A faster failure
-  nobody can NAME is not an improvement — expiry and a lost peer are one broken socket,
-  so the timer records which.
-- A child inherits this process's sockets too, and neither platform stops it: a
-  Windows handle arrives inheritable and `BlockingListener::Accept` is a plain
-  `::accept()`. Armed once, in `ApplyHotSocketOptions`. A spawn names what it hands
-  over (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
-- A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on
-  Windows, where `SO_REUSEADDR` lets a second process take a port already being
-  served. Sharing a port is `ReusePort::Yes`, and only that.
+  private — because *no comment* means both, in a tree holding both. A mid-enum insertion
+  shifts every later ordinal: free in a private enum, and in a serialized one every record
+  already written comes back with each field attributed to the NEXT enumerator, silently. The
+  explicit `= N` is the enforcement, and on a PRIVATE enum it is harmful. **`RowsInEnumeratorOrder`
+  is not that guard although it reads like one**: it fires on a row omitted or misplaced, and
+  an insertion whose row goes in at the matching position leaves the table consistent while
+  every record already written decodes shifted. The census pattern `static_cast<T>(byte)` is
+  NARROWER than it reads — a table walk, a positional carrier and a cast to a TEMPLATE
+  PARAMETER are all outside it — so nothing checks the declarations and this bullet is the guard.
+- SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is inherited
+  across exec.
+- So is keepalive, and for the mirror reason: `ApplyHotSocketOptions` is where every socket
+  passes, so arming there would change when every idle client connection and every Raft link
+  is dropped. It is a `DialOptions` field, and the flag without the intervals inherits a
+  two-hour default that reads back as armed. A faster failure nobody can NAME is not an
+  improvement — expiry and a lost peer are one broken socket, so the timer records which.
+- A child inherits this process's sockets too, and neither platform stops it. Armed once, in
+  `ApplyHotSocketOptions`. A spawn names what it hands over
+  (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
+- A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on Windows, where
+  `SO_REUSEADDR` lets a second process take a port already being served. Sharing a port is
+  `ReusePort::Yes`, and only that.
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
-  `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one
-  member becomes a view. A `*View` type borrows and says so; anything else owns. It
-  has happened three times (`CapacityFields`, then `CompileResult`/`CodecEnvelope`,
-  then `CallerContext`). Which shape to pick is per type, and the test is a
-  CONJUNCTION: OWN when the result outlives the buffer in practice
-  (`CompileResultFields`, held across statements by `Dispatch`), stay a named `*View`
-  when every consumer reads it in scope AND something depends on not copying
-  (`CodecEnvelopeView`, whose `Identity` path must not gain a second copy of a
-  preprocessed TU). One clause false is not a tie — `CallerContext` satisfied the
-  first and its measurement killed the second, so the rule selected OWN; the figures
-  are on the type in `SchedulerService.hpp` and are deliberately not repeated here.
-  The encode side goes on borrowing its inputs either way.
-- **What the borrowed field DECIDES outranks the arithmetic.** A wrong
-  `CapacityFields` is a wrong number; a wrong `CallerContext::peerId` is a membership
-  decision read from freed memory, because that field is the kernel's peer host and
-  admission is judged from it. Where the two mistakes are not commensurable — a trust
-  boundary against nanoseconds — own it and do not bother weighing the copy.
-- A regression test for the above needs a payload of REAL SIZE **and** the right
-  ARRANGEMENT, and #395 nearly went untested for want of the second. Read inline
-  (`Use(Make(x))`) nothing dangles at any size, because a by-value parameter lives to
-  the end of the full expression — so the obvious test passes under the bug. STORE
-  the value, drop the source, churn the freed storage, then read. Size then decides
-  WHICH check fires rather than whether one does: inside libstdc++'s 15-char SSO
-  buffer it is `stack-use-after-scope`, visible only with ASan's stack poisoning;
-  past it the buffer is heap and it is `heap-use-after-free`, caught with no options
-  at all. At four bytes the freed block reads back correctly and nothing reports
-  anything. Pick a size that is REAL rather than large — a 36-char IPv6 peer is what
-  `getpeername` returns on any v6 deployment — and `static_assert` it, so nobody
-  shortens it back into uselessness.
+  `Decode(Encode(x))` is the obvious spelling and is a use-after-free the moment one member
+  becomes a view. A `*View` type borrows and says so; anything else owns. Which shape to pick
+  is per type, and the test is a CONJUNCTION: OWN when the result outlives the buffer in
+  practice, stay a named `*View` when every consumer reads it in scope AND something depends
+  on not copying. One clause false is not a tie. The encode side goes on borrowing either way.
+- **What the borrowed field DECIDES outranks the arithmetic.** A wrong `CapacityFields` is a
+  wrong number; a wrong `CallerContext::peerId` is a membership decision read from freed
+  memory. Where the two mistakes are not commensurable — a trust boundary against nanoseconds
+  — own it and do not bother weighing the copy.
+- A regression test for the above needs a payload of REAL SIZE **and** the right ARRANGEMENT.
+  Read inline (`Use(Make(x))`) nothing dangles at any size, so the obvious test passes under
+  the bug: STORE the value, drop the source, churn the freed storage, then read. Size decides
+  WHICH check fires rather than whether one does. Pick a size that is REAL rather than large,
+  and `static_assert` it so nobody shortens it back into uselessness.
 - There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
-- A synchronous dial spends a thread the caller does not own — a reactor thread
-  dials through `PlatformConnector`, never `BlockingConnector`.
-- EOF means "this peer has finished SENDING", not "this peer is gone": a server
-  answers what is already determined and abandons what is still pending. Three
-  surfaces here answered that oppositely, so it was settled against a running
-  reference rather than by argument, and the measurement travels with the rule
-  (`scripts/probes/redis-eof-semantics.py`) — a citation people can re-run is one
-  they stop re-litigating. `ISocket::ShutdownWrite` exists so the question is
-  askable in PRODUCTION at all: `InMemorySocket` had one, public and widely called,
-  but on the CONCRETE type — so nothing holding an `ISocket&` could reach it, every
-  consumer was a test by construction, and a rule nothing can express is a rule
-  nothing can be held to. The answer does not transfer between wires — the compile surface reads
-  a mid-compile EOF as *gone* under the SAME rule, because a compile's reply is not
-  yet determined — so state which surface any measurement covers. A watcher for it
-  reads the COUNT: an ERROR is an abortive close and `0` is EOF, which is the
-  ORDINARY way a client leaves, so `ArmDisconnect`'s error-only arm never once fired
-  and leaked the socket it exists to free (#673). Both arms set one flag, so a green
-  suite proves nothing — **DELETE an arm and see which case fails**, and keep a
-  control that must survive an open write side, or *detect a graceful close* and
-  *abandon every blocking read* are the same passing test. The signal is that the
-  handler RETURNED: still parked and unwound-having-written-nothing are identical bytes.
-- A peer that sent NOTHING asked nothing, so it is CLOSED, not refused — and "sent nothing"
-  is TWO states (deadline expired, peer left), neither of which is "the request was bad". The
-  admin surface hid THREE outcomes behind one `bool ok` and answered every one `400`, so a
-  Chrome preconnect used after 2 s rendered `400` while `curl` — which sends immediately, like
-  every fixture here — never reproduced it. Two MORE were not behind the bool at all: it came
-  back TRUE and the truncated prefix was SERVED, dropping every header after the cut and
-  answering `401` to a browser whose credential fell beyond it. Over the byte cap that is `431`;
-  cut off by the DEADLINE it is `408`, and that is the reachable route, since `RequestTimeout` is
-  per READ and the head has no total budget; ended by EOF mid-head it is `400`. **`sawHeadEnd`
-  decides THAT a head is refused; the cause only selects WHICH code** — guarding on the cap alone
-  closed the oversize route and left the EOF route open, and that one needs no oversize client,
-  just a peer that half-closes after its request line. The tempting reading of the EOF rule — *the
-  peer finished sending, so serve what arrived* — is what a control case in this file asserted, and
-  the assertion WAS the bug: a head with no terminating blank line determines nothing, so there is
-  no reply this server can be right about. `PING` half-closed is a complete command; this is a
-  sentence cut off mid-word. The control that belongs beside it is a COMPLETE head half-closed
-  after, still served `200`, or *refuse an unfinished head* and *refuse every peer that
-  half-closes* are one passing test. Neither silent outcome is counted, deliberately — a healthy
-  browser produces them by the minute. A
-  deadline expiry is TWO codes (`WouldBlock` on POSIX, `Timeout` on Winsock): `Net::IsDeadlineExpiry`,
-  never one operand — except at a listener that arms NO poll timeout, where `Timeout` cannot arrive
-  and the operand is dead; recorded at the site, because two reviewers read the narrow test as the
-  same defect. That exception is REACHABILITY, never semantics, and the distinction is load-bearing:
-  the predicate's own two callers are accept loops whose listeners DO poll, where `WouldBlock` IS the
-  expiry, so "on an accept WouldBlock is not an expiry" invites dropping it and stops the admin and
-  Raft surfaces accepting on POSIX with one `Debug` line as the symptom. **A reason that generalises
-  further than the fact it was drawn from is worse than the narrow one** — this exact upgrade was
-  written into the rulebook and had to be taken out again. **The reported shape cannot be asserted on** — connect-wait-send is a race,
-  because the late write draws an RST that destroys the very response being asserted on (measured:
-  python saw the `400`, bash saw nothing) — so the probe never writes. And a probe reporting
-  silence must be able to say it observed none, or an expired `read -t` reads as the answer.
-  Closing is retriable where `400` is final and is still not the whole fix: one number answers
-  both *how long may a peer be silent* and *how long may a head take* (#828).
-- And a TLS peer says it with a RECORD, so the raw socket answers the OPPOSITE:
-  `close_notify` then FIN means bytes are on the wire, the raw peek reports `>0`, and
-  #673's EOF arm declined for every TLS client on the one transport where the graceful
-  close is the ORDINARY one (#712). `TlsSocket::WaitReadable` decrypts with `SSL_peek`,
-  which removes nothing — "consumes nothing" is about bytes the CALLER could have read,
-  not the decorator's own buffering. A raw EOF before a full record is EOF too.
-- And on the compile surface those two arms are COUNTED apart, so folding them is a
-  regression even though both reach one outcome. `WatchPeer` sets `gone` either way,
-  which is what makes the fold look free — #1090 proposed exactly it once the probe
-  `Read` went, and that form cannot say WHICH departure it was. A peer that RESET and
-  one that said goodbye are different diagnoses and only the first is worth an alert
-  (#1092): graceful is a cancelled build or a reclaimed runner, abortive is crashing
-  clients, a lost route, or a middlebox resetting long-lived connections. Both landed
-  together, each arm naming a `PeerDeparture` a table maps to its counter. Proved by
-  neutering, and the FIN case is the load-bearing one — counting every departure
-  abortive PASSES the RESET case.
-- An object a reactor OWNS is destroyed on that reactor's worker thread, or with that
-  reactor stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, since clearing a
-  pending awaitable anywhere else races the completion dispatch. #668 landed the
-  predicate, the shared assertion and a must-die canary and **wrote the rule down
-  nowhere**, so it fired for nobody who had not already opened `IocpSocket.cpp` —
-  #737, #840 and #875 are what that cost. It is now asked of EVERY reactor -- the
-  epoll and kqueue destructors call it too -- which needed both owners fixed first
-  (#840, and `RaftPeerServer::Shutdown` in #885, which closed its sockets on the
-  calling thread where `Close()` resumes a parked coroutine INLINE). **Match the
-  ASSERTION, never the case that happened to be running**: one site produced three
-  tickets in three test files, and #875's triage read "every teardown CASE passed"
-  as "the assertion did not fire" while its text sat in the log.
-  The defect is PORTABLE and only the predicate was Windows-only. A drain that waits for the loops does not mean
-  the reactor stopped — the last loop decrements before `NoteLoopFinished()`, and
-  `Stop()` only posts a wakeup — which is the gap `~FrameEndpoint` freed its listener
-  in (#840), reported as a different `FrameEndpoint_test` case each run (#737).
-  Posting the teardown HANGS the ordinary single-surface case, because that endpoint
-  is the last loop and nothing will dequeue it; DEFER instead (`NodeIoLoop::Retire`,
-  where member ORDER is the mechanism). A test removes the race rather than waiting
-  for it: a loop that never finishes, and a fake listener that RECORDS the predicate
-  instead of asserting.
-- `Close()` can be the last thing that runs on a socket, so it must touch no
-  member after it completes an awaitable.
-- An awaitable's address is taken in `await_suspend`, never in the factory that returns
-  it — that one is a LOCAL returned by value, so the caller suspends on a different
-  object (#734, a SIGSEGV once an eager coroutine parks). `SetSuspendCallback` is what
-  makes the right answer the only reachable one. Third of a family in one week: a fake
-  more PERMISSIVE than the thing it stands for.
-- And it is the ONLY thing that retrieves a parked read, so the shared FAKE owes that
-  too: `InMemorySocket::Close` cleared its progress callback and walked away, which
-  made the abandonment final and leaked the awaiting coroutine's frame. Detach first,
-  complete last with `Cancelled`. Prove the leak instrument before believing a green
-  ASan run — a parked frame is a live unreachable allocation, which LSan reports
-  exactly; the size-dependent caveat belongs to use-after-free, not to leaks.
-- `Read`'s buffer must be NON-EMPTY, because `0` is taken and taken by the opposite
-  fact: every transport's receive primitive answers `0` for a zero-length request, so
-  an empty span was answered *the peer has finished sending* — the one way this
-  interface could still make the exact false claim the EOF rule exists to prevent
-  (#838). `Detail::RequireReadBuffer`, beside the sentence it enforces, called as
-  `Read`'s first statement by all six transports; a PROGRAMMER ERROR, so an assert and
-  not an error code, since no result would be true. `RecvExactly` had already found it
-  and answered it at ONE consumer, which is a contract no other consumer can see. The
-  census came FIRST and is what made the assert safe (the whole suite green with it
-  live); release still answers EOF, and that is a stated trade rather than an
-  omission. `empty-read-buffer-canary` hands a REAL transport an empty span and must
-  die — but a canary aborts at the FIRST violation, so it watches one site and is
-  silent about five, and WHICH site is an accident of ordering (deleting the call from
-  `EpollSocket::Read` leaves it and the whole suite GREEN, measured). `read-buffer-guard`
-  DERIVES the set and requires the call before the body's first `return`.
-- **A guard folded INTO the operation is self-enforcing; a guard called ALONGSIDE one
-  needs a scan.** That is the general rule, and it decides the shape of the next guard
-  rather than only explaining these two: `ClaimReadSlot` takes the slot the arm site
-  must clear anyway, so there is no line to forget it on, while `RequireReadBuffer`
-  reads a parameter and changes nothing, so every site can omit it independently. Ride
-  the guard on something the site must do; where you cannot, the scan is not optional.
-  **The author of that rule broke it one commit later, in the same branch** —
-  `ISocket::CancelRead`'s default no-op was inherited by TWO of six transports that
-  both park a read, which was #710 still live on the ticket that commit closed. Same
-  author, same hours, having just written the rule down: whoever reads this and
-  concludes *I would have noticed* is the next instance. And the fix for it is NOT
-  pure virtual — **reach for the type system when the obligation is DO SOMETHING,
-  reach for a scan when it is SAY WHY**; a pure virtual compels seven fakes to write
-  `{}` with no reason beside it, which is *forgot* in the vocabulary of *decided*
-  (#892).
-- **A `/simplify` finding is a change like any other and is not exempt from the review
-  its subject just had.** The cleanup that moved `check-read-buffer-guard`'s offsets into
-  ONE coordinate system — made precisely because an off-by-one had hidden in the
-  three-origin arithmetic — left the cursor advance summing one term twice, so the walk
-  SKIPPED any second definition in a file: a false pass in the instrument built to
-  prevent false passes. It landed AFTER the four passes that would have caught it and
-  BEFORE the correctness pass that did, which is the window: a late cleanup arrives
-  wearing the authority of a review rather than the suspicion of a change. And **a
-  regression test can fail to reproduce its regression** — six self-test cases could not
-  see it, being single-implementation files at offset zero, and case 7's PADDING is
-  load-bearing because without it the over-advance lands inside the second signature and
-  the check finds it anyway.
-- A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming
-  either while the other is parked drops the parked coroutine — never resumed, never
-  freed, no signal (#663). The rule lives on `ISocket`, not in one consumer's comment;
-  `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression so no
-  arm site has a bare `awaitable = nullptr` to forget it on, and
-  `read-slot-guard-canary` double-arms a REAL socket and must die. Not a refusal, which
-  breaks a live caller — and **the second half of that sentence has been RETRACTED**: it
-  said a completion "turns a leak into a use-after-free", which was overstated and cost
-  another lane a withdrawn cancellation primitive before anyone checked it against
-  `EpollSocket::Close`, which detaches and `Complete`s with `Cancelled` on every
-  ordinary disconnect. The hazard is the **SITE**, not ownership: at the ARM site a
-  socket cannot tell a stale parked wait from a live one, and cancelling a live one is
-  a false disconnect that drops a healthy client. The CALLER can tell.
-- The WRITE slot is the same rule: one write op per direction, so arming a `Write` over
-  a parked one drops that coroutine the same way. `Detail::ClaimWriteSlot`
-  (`Net/WriteSlot.hpp`, #893) folds the claim in, Debug-only, and it reaches
-  `FrameEndpoint`'s one-writer property because `WriteAll` sends a whole frame in ONE
-  `Write` — so a parked write is a HALF-SENT frame and a second writer splices into it.
-  `write-slot-guard-canary` watches it BOTH ways, driving an ordinary sequential pair of
-  writes before the double-arm and requiring the acceptance marker first: a guard nobody
-  has watched ACCEPT is not known to work either (#1031). It landed (#893) with its own
-  doc comment citing a canary that did not exist — one `git grep` hit, the sentence
-  making the claim (#1218). What is still unenforced is a new helper naming `Loop`.
-- So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of
-  *abandon* that is not `Close()`, virtual with a default no-op like `ShutdownWrite`.
-  `RunBlockingRead` armed a watch per loop pass and cancelled none (#710): it now keeps
-  ONE, re-TARGETED per pass and re-armed only once the previous has RESOLVED (arming
-  once and never again makes #673's pipelined case pass vacuously), retired by RAII AND
-  explicitly before the reply write. Retiring is not disconnecting — the cancel arrives
-  as an ERROR and `ArmDisconnect` reads any error as a departure, so what silences it
-  must be the RETIREMENT, never the code. **Synchronous on every transport that parks a
-  read**, IOCP included since #884 — which it is not for free: the kernel owns a
-  retracted op's `OVERLAPPED` until a LATER turn, so the retired operation node is stood
-  down and the next read gets a fresh one, rather than the waiter being left for the
-  aborted completion to resolve. Left asynchronous it was worse than a leak — the reused
-  `OVERLAPPED` had its `Internal` field zeroed by the next `Read`, and since the reactor
-  reads the error FROM that field the abort dispatched as success-with-zero-bytes: a
-  spurious EOF on a healthy socket with its data unread. `InMemorySocket` never
-  parks a `WaitReadable`, so twelve blocking cases were green throughout —
+- A synchronous dial spends a thread the caller does not own — a reactor thread dials through
+  `PlatformConnector`, never `BlockingConnector`.
+- EOF means "this peer has finished SENDING", not "this peer is gone": a server answers what
+  is already determined and abandons what is still pending. `ISocket::ShutdownWrite` exists so
+  the question is askable in PRODUCTION at all — a rule nothing can express is a rule nothing
+  can be held to. The answer does not transfer between wires — the compile surface reads a
+  mid-compile EOF as *gone* under the SAME rule — so state which surface any measurement
+  covers. A watcher for it reads the COUNT: an ERROR is an abortive close and `0` is EOF,
+  which is the ORDINARY way a client leaves. Both arms set one flag, so a green suite proves
+  nothing — **DELETE an arm and see which case fails**, and keep a control that must survive
+  an open write side. The signal is that the handler RETURNED: still parked and
+  unwound-having-written-nothing are identical bytes.
+- A peer that sent NOTHING asked nothing, so it is CLOSED, not refused — and "sent nothing" is
+  TWO states, neither of which is "the request was bad". **`sawHeadEnd` decides THAT a head is
+  refused; the cause only selects WHICH code**: over the byte cap `431`, cut off by the
+  DEADLINE `408` (the reachable route, since the read timeout is per READ and the head has no
+  total budget), ended by EOF mid-head `400`. The tempting reading of the EOF rule — *the peer
+  finished sending, so serve what arrived* — is the bug: a head with no terminating blank line
+  determines nothing. The control that belongs beside it is a COMPLETE head half-closed after,
+  still served `200`. Neither silent outcome is counted, deliberately. A deadline expiry is TWO
+  codes: `Net::IsDeadlineExpiry`, never one operand — except at a listener that arms NO poll
+  timeout, where `Timeout` cannot arrive; that exception is REACHABILITY, never semantics, and
+  **a reason that generalises further than the fact it was drawn from is worse than the narrow
+  one.** The reported shape cannot be asserted on, because a late write draws an RST that
+  destroys the response, so the probe never writes — and a probe reporting silence must be able
+  to say it observed none. Closing is retriable where `400` is final, and one number still
+  answers both *how long may a peer be silent* and *how long may a head take* (#828).
+- And a TLS peer says it with a RECORD, so the raw socket answers the OPPOSITE: `close_notify`
+  then FIN means bytes are on the wire and the raw peek reports `>0`. `TlsSocket::WaitReadable`
+  decrypts with `SSL_peek`, which removes nothing — "consumes nothing" is about bytes the
+  CALLER could have read, not the decorator's own buffering. A raw EOF before a full record is
+  EOF too.
+- And on the compile surface those two arms are COUNTED apart, so folding them is a regression
+  even though both reach one outcome. A peer that RESET and one that said goodbye are different
+  diagnoses and only the first is worth an alert. Each arm names a `PeerDeparture` a table maps
+  to its counter. Proved by neutering, and the FIN case is the load-bearing one — counting
+  every departure abortive PASSES the RESET case.
+- An object a reactor OWNS is destroyed on that reactor's worker thread, or with that reactor
+  stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, asked of EVERY reactor. **Match the
+  ASSERTION, never the case that happened to be running.** The defect is PORTABLE and only the
+  predicate was Windows-only. A drain that waits for the loops does not mean the reactor stopped
+  — the last loop decrements before `NoteLoopFinished()`, and `Stop()` only posts a wakeup.
+  Posting the teardown HANGS the ordinary single-surface case; DEFER instead (`NodeIoLoop::Retire`,
+  where member ORDER is the mechanism). A test removes the race rather than waiting for it: a
+  loop that never finishes, and a fake listener that RECORDS the predicate instead of asserting.
+- `Close()` can be the last thing that runs on a socket, so it must touch no member after it
+  completes an awaitable.
+- An awaitable's address is taken in `await_suspend`, never in the factory that returns it —
+  that one is a LOCAL returned by value, so the caller suspends on a different object.
+  `SetSuspendCallback` is what makes the right answer the only reachable one.
+- And it is the ONLY thing that retrieves a parked read, so the shared FAKE owes that too:
+  detach first, complete last with `Cancelled`. Prove the leak instrument before believing a
+  green ASan run — a parked frame is a live unreachable allocation, which LSan reports exactly.
+- `Read`'s buffer must be NON-EMPTY, because `0` is taken and taken by the opposite fact: every
+  transport's receive primitive answers `0` for a zero-length request, so an empty span would be
+  answered *the peer has finished sending*. `Detail::RequireReadBuffer`, called as `Read`'s first
+  statement by all six transports; a PROGRAMMER ERROR, so an assert and not an error code.
+  Release still answers EOF, and that is a stated trade rather than an omission.
+  `empty-read-buffer-canary` watches ONE site — a canary aborts at the FIRST violation — so
+  `read-buffer-guard` DERIVES the set and requires the call before the body's first `return`.
+- **A guard folded INTO the operation is self-enforcing; a guard called ALONGSIDE one needs a
+  scan.** Ride the guard on something the site must do; where you cannot, the scan is not
+  optional. **The author of that rule broke it one commit later, in the same branch** — whoever
+  reads this and concludes *I would have noticed* is the next instance. And the fix is NOT pure
+  virtual: **reach for the type system when the obligation is DO SOMETHING, reach for a scan
+  when it is SAY WHY** — a pure virtual compels seven fakes to write `{}` with no reason beside
+  it, which is *forgot* in the vocabulary of *decided*.
+- **A `/simplify` finding is a change like any other and is not exempt from the review its
+  subject just had.** A late cleanup arrives wearing the authority of a review rather than the
+  suspicion of a change. And **a regression test can fail to reproduce its regression** — six
+  self-test cases could not see the defect the cleanup introduced.
+- A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming either while
+  the other is parked drops the parked coroutine — never resumed, never freed, no signal. The
+  rule lives on `ISocket`, not in one consumer's comment; `Detail::ClaimReadSlot` folds the claim
+  and the `assert` into one expression, and `read-slot-guard-canary` double-arms a REAL socket
+  and must die. Not a refusal, which breaks a live caller — and **the second half of that
+  sentence has been RETRACTED**: the hazard is the **SITE**, not ownership. At the ARM site a
+  socket cannot tell a stale parked wait from a live one, and cancelling a live one is a false
+  disconnect that drops a healthy client. The CALLER can tell.
+- The WRITE slot is the same rule: one write op per direction. `Detail::ClaimWriteSlot`
+  (`Net/WriteSlot.hpp`) folds the claim in, Debug-only, and it reaches `FrameEndpoint`'s
+  one-writer property because `WriteAll` sends a whole frame in ONE `Write` — so a parked write
+  is a HALF-SENT frame and a second writer splices into it. `write-slot-guard-canary` watches it
+  BOTH ways, requiring the acceptance marker first: **a guard nobody has watched ACCEPT is not
+  known to work either.** What is still unenforced is a new helper naming `Loop`.
+- So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of *abandon* that
+  is not `Close()`, virtual with a default no-op like `ShutdownWrite`. Keep ONE watch,
+  re-TARGETED per pass and re-armed only once the previous has RESOLVED (arming once and never
+  again makes the pipelined case pass vacuously), retired by RAII AND explicitly before the reply
+  write. Retiring is not disconnecting — the cancel arrives as an ERROR and any error reads as a
+  departure, so what silences it must be the RETIREMENT, never the code. **Synchronous on every
+  transport that parks a read**, IOCP included — the kernel owns a retracted op's `OVERLAPPED`
+  until a LATER turn, so the retired operation node is stood down and the next read gets a fresh
+  one. `InMemorySocket` never parks a `WaitReadable`, so
   `Testing::ParkingReadableSocket` parks and COUNTS orphaned watches instead of aborting.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
-- A reactor resumes what it parks or FREES it, and it may free only what nothing else
-  owns. `Stop()` set a flag and `RunLoop()` returned with both containers where they
-  were, so every parked frame and everything reachable from it leaked -- LSan's
-  indirect-ONLY set, the signature of a `Task` chain holding itself through its
-  continuations. A blanket destroy is the tempting fix and is a `heap-use-after-free`
-  on an arrangement already in the suite, because `Schedule` BORROWS; so ownership
-  travels with the park (`ParkedWork::abandon`, derived from the promise type, non-empty
-  exactly for a chain rooted in a `DetachedTask`). What is freed is the chain ROOT --
-  freeing the frame the reactor HOLDS took a four-allocation leak to three and left
-  LSan red, because a `Task` chain's ownership runs downward. Resuming is a hang, not
-  an alternative: a bounded wait re-parks. `Resume()` disowns and resumes in ONE
-  expression, so no fire path can forget it; IOCP's posted submissions have no entry to
+- A reactor resumes what it parks or FREES it, and it may free only what nothing else owns. A
+  blanket destroy is a `heap-use-after-free`, because `Schedule` BORROWS; so ownership travels
+  with the park (`ParkedWork::abandon`, derived from the promise type, non-empty exactly for a
+  chain rooted in a `DetachedTask`). What is freed is the chain ROOT, because a `Task` chain's
+  ownership runs downward. Resuming is a hang, not an alternative: a bounded wait re-parks.
+  `Resume()` disowns and resumes in ONE expression; IOCP's posted submissions have no entry to
   fold into and keep a side table instead, which is stated rather than left silent.
-- Re-declaring ONE overload in a derived interface HIDES the base's others, and here it hid
-  the one carrying ownership: `IReactor` re-declared `Submit(std::coroutine_handle<>)` and
-  not `IExecutor::Submit(ParkedWork)`, so seven sites could not hand ownership over rather
-  than forgetting to. Nothing diagnoses it -- every call still compiles and binds to the
-  borrowing overload. The detection is the compiler: convert the sites to pass the owning
-  type, and the `no viable conversion` errors enumerate the defect's reach.
-- A missing keyspace event has two ends — the tier that never named the victim and
-  the observer that never published it. Check both before changing either.
-- A reclaim is reported **before** the call that caused it: `ADD` on a lapsed TTL
-  names the same key twice, and the wrong order tells a subscriber a live key is gone.
-- In a layered cache no single tier's eviction is total, so none is reported. An
-  expiry is, because both tiers hold the same TTL.
-- A reclaimer nothing constructs is the bug it was written to fix: `PurgeExpired`
-  was correct and tested, and had no production caller at all. Assert the wiring.
-- The expiry cycle sweeps `engine.Storage()` — the notifying decorator. One layer
-  down it frees the bytes and publishes nothing, and every tier test still passes.
-- One cycle per daemon, on reactor 0; its reclaim ceiling sits below
-  `ReclaimLog::DefaultCapacity` or the sweep drops the events it runs to produce.
-- A bounded sweep resumes from a cursor and `ShardedStorage` rotates its starting
-  shard, or everything past the first budget never expires. That cursor outlives
-  the call, so a tier gets exactly one erase point.
-- `--expiry-interval=0` disables the cycle (a coroutine that *ends*);
-  `--expiry-scan=0` is `PurgeBudget`'s spelling of *no ceiling* and is refused.
-- On disk a read may not reclaim and a write must: `Get`/`Peek` can hold a shared
-  lock, every write verb holds the exclusive one. Reporting without erasing is
-  worse than neither — the record stays and fires `expired` again.
-
+- Re-declaring ONE overload in a derived interface HIDES the base's others, and here it hid the
+  one carrying ownership. Nothing diagnoses it — every call still compiles and binds to the
+  borrowing overload. The detection is the compiler: convert the sites to pass the owning type,
+  and the `no viable conversion` errors enumerate the defect's reach.
+- A missing keyspace event has two ends — the tier that never named the victim and the observer
+  that never published it. Check both before changing either.
+- A reclaim is reported **before** the call that caused it: `ADD` on a lapsed TTL names the same
+  key twice, and the wrong order tells a subscriber a live key is gone.
+- In a layered cache no single tier's eviction is total, so none is reported. An expiry is,
+  because both tiers hold the same TTL.
+- A reclaimer nothing constructs is the bug it was written to fix: `PurgeExpired` was correct
+  and tested, and had no production caller at all. Assert the wiring.
+- The expiry cycle sweeps `engine.Storage()` — the notifying decorator. One layer down it frees
+  the bytes and publishes nothing, and every tier test still passes.
+- One cycle per daemon, on reactor 0; its reclaim ceiling sits below `ReclaimLog::DefaultCapacity`
+  or the sweep drops the events it runs to produce.
+- A bounded sweep resumes from a cursor and `ShardedStorage` rotates its starting shard, or
+  everything past the first budget never expires. That cursor outlives the call, so a tier gets
+  exactly one erase point.
+- `--expiry-interval=0` disables the cycle (a coroutine that *ends*); `--expiry-scan=0` is
+  `PurgeBudget`'s spelling of *no ceiling* and is refused.
+- On disk a read may not reclaim and a write must: `Get`/`Peek` can hold a shared lock, every
+  write verb holds the exclusive one. Reporting without erasing is worse than neither — the
+  record stays and fires `expired` again.
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
 `packaging/`.
