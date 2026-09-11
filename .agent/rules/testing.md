@@ -2149,15 +2149,6 @@ green Linux run is not evidence about it.
   class, and the mechanism adds ~3500 spawns. `src/tests/CatchSkipCanary.cpp` carries
   the shapes it must survive; `catch-skip-exit-collision` asserts the premises so this
   entry cannot rot into a false rule.
-- **[#813](https://github.com/LASTRADA-Software/fastcached/issues/813)** —
-  `launcher-replay-e2e.sh` is the last POSIX fixture that does not source
-  `lib/e2e-common.sh` at all, so its `fail`, `skip` and `note` are private copies.
-  The DEFECT in that `fail` is gone — #627 made the signal unconditional — and
-  what is left is the duplication and the allowlist row in `check-e2e-helpers.sh`
-  that goes with it. Deliberately not folded into #627: the fixture builds three
-  CMake trees and runs a real suite, so converting it cannot be verified in the
-  session that does it, and this is the fixture whose first run anywhere died on
-  the first line that starts a process.
 - **[#1257](https://github.com/LASTRADA-Software/fastcached/issues/1257)** — a
   truncated HTTP response is indistinguishable from a complete one in
   `lib/e2e-common.sh`, and on macOS's bash 3.2 the drain answers the WRONG way

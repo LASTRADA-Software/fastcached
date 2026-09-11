@@ -3552,12 +3552,17 @@ _scan_canary "helper-scan-canary" _helper_redefinitions \
     2 "copies" "a script that defines no copy"
 rm -rf "$canary_dir"
 
-# The same `_scan_exempt` the timeout scan above uses. Each row names why, and the
-# two that are defects name the ISSUE, so an exclusion cannot rot into folklore and
-# closing the ticket has an obvious row to delete.
+# The same `_scan_exempt` the timeout scan above uses. Each row names why. Neither
+# remaining row names an issue, because neither is a defect waiting to be fixed --
+# and that is the state to keep this list in: an exemption is blind to the SECOND
+# divergence as well as the first, so a row standing for a file that ought to
+# source the library buys silence about drift nobody is watching for. The
+# `launcher-replay-e2e.sh` row was exactly that and is gone (#813); it read "the
+# last POSIX fixture that does not source the library", which was not quite true
+# even then -- `node-config-file-e2e.sh` does not either, and needs nothing from
+# it: no daemon, no port, no background process, and not one of these names.
 helper_copy_allowed="e2e-common.sh:the library itself, which defines every one of these names -- that being what the scan reads them out of. It entered this scan's set when the three enumerations were folded into one recursive walk; the row is what keeps that fold from reporting the definitions as copies.
-local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it.
-launcher-replay-e2e.sh:#813. It is the last POSIX fixture that does not source the library at all, so its 'fail' and 'note' are private. The DEFECT that row used to name is gone (#627 made its 'fail' signal unconditionally, which is what the library does); what is left is the duplication, and converting a fixture that builds three CMake trees is its own change."
+local-gate.sh:not an e2e fixture. It sources nothing, starts no daemon and opens no socket; its 'fail' prints a build-gate verdict and its own selftest (local-gate-selftest) is what covers it."
 scanned=0
 while IFS= read -r script; do
     [ -n "$script" ] || continue
@@ -3689,8 +3694,11 @@ done
 #
 # Comment lines are dropped, because the header above explains WHY several of
 # these are banned and a scan that fails on its own rationale is a scan nobody
-# can write the rationale for. Indented comments too: the reason for the guard
-# now sits inside a comment in `launcher-replay-e2e.sh`'s `fail`.
+# can write the rationale for. Indented comments too, since a rationale is as
+# likely to sit inside a function as above one: `lib/e2e-common.sh`'s own `fail`
+# names `BASHPID` twice in the paragraph explaining why it does not use it, and
+# `launcher-replay-e2e.sh` names it in the preamble recording why its private
+# copy of that `fail` is gone (#813).
 #
 # And a file may declare a DATA REGION, between
 #
