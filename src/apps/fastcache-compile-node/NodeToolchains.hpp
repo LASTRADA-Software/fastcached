@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -457,6 +458,44 @@ enum class ClaimsReloaded : std::uint8_t
     No,
     Yes,
 };
+
+/// Whether the configuration this beat will act on arrived from a reload that
+/// changed what this worker ADVERTISES.
+///
+/// **The join, and a pure function for `RecheckDepthFor`'s own reason: `main.cpp` is
+/// in no test target** ([#587](https://github.com/LASTRADA-Software/fastcached/issues/587)).
+/// It was an expression inside the heartbeat loop computing the very argument the
+/// function below consumes, so both decisions either side of it were tested and the
+/// step connecting them was verified only by reading -- this repository's
+/// `PurgeExpired` shape, two correct halves and an unasserted join.
+///
+/// **Asked here rather than signalled from the reload.** The heartbeat thread holds
+/// both operands, so a flag set on the main loop would be a second author of a fact
+/// this thread can compute -- and lossy in both directions: a beat racing the store
+/// misses it until the next one, and two reloads that cancel each other still buy a
+/// survey with nothing to find. Identity is what changed, rather than an edge that
+/// can be missed.
+///
+/// The identity test is a SHORT-CIRCUIT and not a clause with an outcome of its own:
+/// `AdvertisedClaimsDiffer(*p, *p)` is false for a single snapshot, so removing
+/// `previous != current` changes no answer, only the walk it skips. Stated here
+/// because no test can show it -- there is no input that answers differently with it
+/// gone, which is exactly the kind of claim that has to be written down rather than
+/// asserted.
+///
+/// @param previous The snapshot the previous beat acted on. Null means this worker
+///        has **no configuration file at all** -- never "this is the first beat",
+///        because the caller assigns it before the first one. Written the other way
+///        round it reads as a reload on beat 1 of every node that HAS a file, buying
+///        a second full survey immediately after the initial one: minutes of
+///        include-tree walking on a cold machine, and a window in which one transient
+///        probe failure drops toolchains the node had just identified.
+/// @param current The snapshot this beat will act on, or null when there is no
+///        reloader.
+/// @return `Yes` exactly when both snapshots exist, are different objects, and
+///         disagree about something this worker advertises.
+[[nodiscard]] ClaimsReloaded ClaimsReloadedBetween(std::shared_ptr<NodeConfig const> const& previous,
+                                                   std::shared_ptr<NodeConfig const> const& current);
 
 /// How hard the next heartbeat should look at this machine's toolchains.
 ///

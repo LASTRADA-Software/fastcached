@@ -1353,25 +1353,14 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
             // machine has; or an operator edited the file, which moves no witness at
             // all and would otherwise wait for that sweep.
             //
-            // **Asked here rather than signalled from the reload.** This thread now
-            // holds both operands -- the snapshot it last acted on and the one it is
-            // acting on now -- so a flag set on the main loop would be a second
-            // author of a fact this thread can just compute. It would also be lossy in
-            // both directions: a beat racing the store misses it until the next one,
-            // and two reloads that cancel each other still buy a survey that had
-            // nothing to find. Comparing the snapshots has neither problem, because
-            // identity is what changed rather than an edge that can be missed.
-            // `actedOn` is non-null from the moment this thread starts, so a null here
-            // means only "this worker has no configuration file" -- never "first beat".
-            // Written the other way round it read as a reload on beat 1 of every node
-            // that HAS a file, buying a second full survey immediately after the
-            // initial one: minutes of include-tree walking on a cold machine, and a
-            // window in which one transient probe failure drops toolchains the node
-            // had just successfully identified.
-            auto const reloaded = actedOn != nullptr && snapshot != nullptr && snapshot != actedOn
-                                          && Node::AdvertisedClaimsDiffer(*actedOn, *snapshot)
-                                      ? Node::ClaimsReloaded::Yes
-                                      : Node::ClaimsReloaded::No;
+            // A pure function rather than the expression that used to stand here, for
+            // the reason `RecheckDepthFor` and `SurveyVoiceFor` below already give:
+            // this file is in no test target, so the JOIN between two tested decisions
+            // was the one step verified only by reading (#587). Everything the
+            // expression encoded -- why it is computed here rather than signalled from
+            // the reload, and why a null `actedOn` is "no configuration file" rather
+            // than "first beat" -- travelled with it into that function's header.
+            auto const reloaded = Node::ClaimsReloadedBetween(actedOn, snapshot);
             actedOn = snapshot;
 
             // Compared SEPARATELY from `reloaded` above, and that is the point rather

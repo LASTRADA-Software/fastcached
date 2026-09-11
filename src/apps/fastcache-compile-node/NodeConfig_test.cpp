@@ -4124,19 +4124,26 @@ TEST_CASE("A cache the operator NAMED is refused when no node surface can serve 
         cfg.cacheMemoryExplicit = false;
         cfg.cacheDir.clear();
         auto const refusal = StartupPolicyRejection(cfg);
-        if (refusal.has_value())
-            CHECK_FALSE(Unwrap(refusal).contains("--cache-memory or --cache-dir"));
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
     }
 
     // And a configured cache WITH a port is fine, which is the ordinary case.
-    SECTION("a configured cache with a port is not refused for this reason")
+    //
+    // Named for what it asserts. It used to read "is not refused for THIS reason",
+    // which is the honest name for a section that tolerates other refusals -- and
+    // this one tolerates none: measured, `StartupPolicyRejection` returns nothing at
+    // all for this configuration. Keeping the weaker name would leave a reader
+    // auditing coverage by section name under-counting it, which is the same defect
+    // as #1039's over-counting, pointing the other way.
+    SECTION("a configured cache with a port starts")
     {
         auto cfg = Installable();
         cfg.cacheMemoryExplicit = true;
         cfg.cacheDir = "/var/lib/fastcache-node/cache";
         auto const refusal = StartupPolicyRejection(cfg);
-        if (refusal.has_value())
-            CHECK_FALSE(Unwrap(refusal).contains("--cache-memory or --cache-dir"));
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
     }
 }
 
@@ -4157,9 +4164,20 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         cfg.fleetMembers.clear();
         cfg.fleetOpen = false;
         cfg.raftListen = "6680"; // what RunsConsensus asks about (#1022)
+        // A clustered node must name the endpoint its peers dial, and this section is
+        // about the MEMBER list rather than about that -- so it is named here rather
+        // than left out. Without it the configuration does not start at all: it is
+        // refused by `ConsensusNamesNoSelfPeerRefusal`, which is a different rule
+        // saying something true. The conditional this section used to carry absorbed
+        // exactly that -- `refusal.has_value()` was TRUE, the text did not contain
+        // the fleet-member sentence, and the section passed while its name claimed a
+        // configuration that this tree refuses (#1039). `--raft-self` and not a
+        // `--raft-peer`, because that is the spelling a node whose identity was
+        // MINTED has (#1024).
+        cfg.raftSelf = "scheduler-01.internal";
         auto const refusal = StartupPolicyRejection(cfg);
-        if (refusal.has_value())
-            CHECK_FALSE(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
     }
 
     SECTION("a STANDALONE scheduler with no member list is still refused")
@@ -4234,11 +4252,28 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
     // this one, not by this one, so the two cannot disagree about the same flag.
     SECTION("an empty value is left to the emptiness rule")
     {
+        // Both halves, because "another rule owns this" is a claim about TWO rules
+        // and one of them alone cannot carry it. This used to assert only that IF
+        // something was refused it was not this rule -- and nothing is refused on
+        // this configuration, so the assertion never ran and a rule that started
+        // answering here would not have been noticed (#1039).
         auto cfg = Installable();
         cfg.advertise = {};
         auto const refusal = StartupPolicyRejection(cfg);
-        if (refusal.has_value())
-            CHECK_FALSE(Unwrap(refusal).contains("clients can dial"));
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+
+        // And the arrangement where the emptiness question DOES bite, which is what
+        // makes the sentence above mean something: an empty `--advertise` on a node
+        // that admits peers is refused -- by the wildcard rule, in its own words,
+        // naming the flags the operator actually typed. Asserting the refusal's text
+        // rather than its presence is the point: both rules refuse, and only the
+        // words say which one did.
+        cfg.fleetMembers = { "peer.example" };
+        auto const admitting = StartupPolicyRejection(cfg);
+        REQUIRE(admitting.has_value());
+        CHECK(Unwrap(admitting).contains("the wildcard resolves to"));
+        CHECK_FALSE(Unwrap(admitting).contains("clients can dial"));
     }
 }
 
