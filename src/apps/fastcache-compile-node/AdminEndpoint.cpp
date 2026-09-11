@@ -322,6 +322,36 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
 
     std::vector<AdminRoute> routes;
 
+    // **`/fleet` carries no `ETag`, and that is now MEASURED rather than an omission**
+    // (#143). Every poll is a fresh snapshot plus a full render, where each chart route
+    // above gets a bodyless `304` for the whole of a bucket -- so the obvious reading is
+    // that a browser left open on a wall display is a steady load on the one node that
+    // also schedules every compile in the fleet. #125 raised exactly that.
+    //
+    // It is not. `RenderFleetHtml`, min of N, `steady_clock`, Release (`-O2`, no
+    // sanitizers), 2026-09-11. Pinned rather than pointed at: this is one machine at one
+    // instant and must not track anything.
+    //
+    //     machines      1       10       50      200     1000
+    //     render    0.010 ms  0.019   0.055    0.193    1.010
+    //     html       21 KB    24 KB    39 KB    94 KB    387 KB
+    //
+    // A realistic fleet is tens of machines, so a poll costs TENS OF MICROSECONDS. Ten
+    // tabs at the page's own refresh interval is a few polls a second: comfortably
+    // under a thousandth of a core, against a leader whose unit of work is a compile
+    // measured in seconds. It does not show up in a profile, so there is nothing here
+    // for a cache to buy.
+    //
+    // **The same numbers under Debug read 0.66 to 22 ms -- 22x to 66x higher -- and
+    // would have argued for the cache.** That is why the row above says Release: an
+    // unoptimised render is not the shipping cost, and quoting one here would have
+    // justified adding staleness to the one page that exists to avoid it.
+    //
+    // So a validator is deliberately NOT added. It would cost nothing in staleness --
+    // the charts' bucket-counter tag is exact, not a TTL -- but it is machinery bought
+    // for a cost that is not there, and this page's snapshot has no equally exact
+    // generation to key on. Revisit if a fleet ever reaches the thousands, where the
+    // figure starts being a millisecond rather than a rounding error.
     routes.push_back(AdminRoute {
         .path = "/fleet",
         .handler = gated(
