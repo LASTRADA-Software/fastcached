@@ -658,6 +658,16 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "below peer_watch_departures. A watch that ended because the peer sent "
               "BYTES is a pipelined request and is in neither row.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FramePeerWatchDeparturesAbortive,
+      .prometheusName = "fastcache_frame_peer_watch_departures_abortive_total",
+      .help = "Of peer_watch_departures, the ones where the peer RESET rather than "
+              "closing gracefully. A subset under the same suppressions, so it is "
+              "never above that row and subtracting gives the graceful half. This is "
+              "the half worth alerting on: a graceful mid-answer departure is a "
+              "cancelled build or a reclaimed runner and its rate means nothing, while "
+              "a rise here is crashing clients, a lost route, or a middlebox resetting "
+              "long-lived connections.",
+      .type = MetricType::Counter },
 } };
 
 // Checked at compile time rather than by a test, because the failure this prevents

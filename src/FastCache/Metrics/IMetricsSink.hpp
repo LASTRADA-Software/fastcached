@@ -1016,6 +1016,32 @@ class IMetricsSink
         /// is a pipelined request, not a departure, and it reaches neither row.
         FramePeerWatchDeparturesObserved,
 
+        /// Of the departures above, the ones where the peer RESET rather than said
+        /// goodbye.
+        ///
+        /// **A subset of `FramePeerWatchDepartures`, under the same two suppressions**,
+        /// so it is never above that row and `departures - abortive` is exactly the
+        /// graceful half. A sibling rather than a split, because splitting would change
+        /// what an existing row means for anyone already scraping it and a fleet here is
+        /// permanently mid-upgrade
+        /// ([#173](https://github.com/LASTRADA-Software/fastcached/issues/173)); the
+        /// total stays comparable across the change.
+        ///
+        /// **Only one of the two halves is worth an alert, which is the whole point of
+        /// separating them.** A graceful departure mid-answer is ordinary and its rate
+        /// means nothing -- a build cancelled, a `Ctrl-C`, a CI runner reclaimed, all
+        /// day. An abortive one is a crashing client, a machine losing its route, or a
+        /// middlebox resetting long-lived connections: three causes an operator can act
+        /// on, none of which look like normal churn. Summed into one row the signal that
+        /// means something sits under the signal that never does.
+        ///
+        /// The distinction is the transport's and not this code's guess:
+        /// `WaitReadable` answers an ERROR for an abortive close and `0` for EOF, on
+        /// epoll, kqueue and IOCP alike
+        /// ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)), and
+        /// `WatchPeer` keeps those two arms apart for exactly this reason.
+        FramePeerWatchDeparturesAbortive,
+
         Last,
     };
 

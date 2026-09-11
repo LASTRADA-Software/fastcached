@@ -2180,6 +2180,7 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
     auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
     auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const abortiveBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesAbortive);
     auto const sweptBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
 
     // **The elapsed cost is recorded because it is what refutes the tempting fix.**
@@ -2269,6 +2270,13 @@ TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not w
     // The node's own teardown is not a client-side story: nothing this case does
     // after the delivery was abandoned may move the row again.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+
+    // **The half of #1092 that does the discriminating.** This peer said goodbye, so
+    // the abortive row must NOT move -- and it is this assertion rather than the RESET
+    // case's that can fail, because an implementation that counted every departure as
+    // abortive passes that one and only this one catches it. A test asserting what both
+    // departures produce would be no test at all.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesAbortive) == abortiveBefore);
 }
 
 TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
@@ -2300,6 +2308,7 @@ TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not wri
     auto const before = fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
     auto const seenBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures);
     auto const observedBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
+    auto const abortiveBefore = fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesAbortive);
 
     Testing::AbortiveClient client { port };
     REQUIRE(client.Connected());
@@ -2339,6 +2348,16 @@ TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not wri
     // A reset peer is a departure exactly as a vanished one is: the watcher saw it, and
     // it was filed rather than suppressed as a local close.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures) == seenBefore + 1);
+
+    // And #1092's point: it is filed as the ABORTIVE kind, which the FIN case above
+    // asserts stays flat. The two together are what make the row mean something -- one
+    // alone would pass under an implementation that cannot tell the causes apart.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesAbortive) == abortiveBefore + 1);
+
+    // The abortive row is a SUBSET of the departures row and never a parallel tally:
+    // both suppressions apply to it unchanged, so this relation holds by construction.
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDeparturesAbortive)
+          <= fleet.metrics.Read(IMetricsSink::Counter::FramePeerWatchDepartures));
 
     // The object was NOT written, and the compile was still paid for. Two rows,
     // because folding them would let "the compiler never ran" pass as "the delivery
