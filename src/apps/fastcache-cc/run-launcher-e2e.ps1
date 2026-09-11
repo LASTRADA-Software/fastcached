@@ -55,9 +55,10 @@
 #
 # Its three siblings were checked rather than assumed: `scripts/compile-cache-e2e.sh`
 # (the POSIX half of this same test) and `scripts/dist-compile-e2e.sh` both call
-# `free_port`. `scripts/sccache-smoke.{sh,ps1}` and `FASTCACHED_SMOKE_PORT` in
-# `src/tests/CMakeLists.txt` still fix 11611, which is issue #183 and is not
-# touched here.
+# `free_port`, and so does `scripts/sccache-smoke.sh` now, with
+# `FASTCACHED_SMOKE_PORT` in `src/tests/CMakeLists.txt` defaulting to EMPTY so the
+# registration passes no `--port`. `scripts/sccache-smoke.ps1` still fixes 11611 and
+# is what remains of issue #183; it is not touched here.
 #
 # An explicitly passed `-Port` is honoured and PROBED first, and a holder is
 # refused by name rather than adopted -- a leftover listener is of an unknown

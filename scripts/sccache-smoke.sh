@@ -81,8 +81,17 @@ trap cleanup EXIT
 # ordinary exit so the cleanup above still runs.
 e2e_begin "sccache smoke (${protocol})" "$workdir"
 
-# Drawn from below the ephemeral range and remembered in the run's ledger, so two
-# protocols in one run cannot pick the same one.
+# Drawn from below the kernel's ephemeral range, where a connect probe can answer:
+# a port above the floor may be an outbound connection's local endpoint with nothing
+# listening, so the probe says free and the bind still fails.
+#
+# What keeps the two protocols apart is `RUN_SERIAL`, NOT `free_port`'s ledger. That
+# ledger lives at `${_e2e_workdir}/.issued-ports` and `_e2e_workdir` is the `mktemp -d`
+# above, so it is per PROCESS -- and the two smokes are two ctest processes with two
+# workdirs. It covers a fixture drawing several ports before binding any of them,
+# which is one draw here. Stated because the tempting reading is that the ledger
+# makes the pair safe, and a reason that reaches further than the fact behind it is
+# what gets a `RUN_SERIAL` deleted later as redundant.
 [ -n "$port" ] || port="$(free_port)"
 
 case "$protocol" in
