@@ -4941,3 +4941,17 @@ Three rules fall out, each generalising past this change:
   `libcrypto.so.3` as system shared objects, of which TLS can be turned off and
   yaml-cpp can be forced from source. valgrind was absent on the machine that took
   these readings; apt offers 1:3.22.0-0ubuntu3, and that route needs no rebuild.
+- **[#1272](https://github.com/LASTRADA-Software/fastcached/issues/1272)** —
+  `scripts/check-gate-target-set.cmake` compares the local gate's
+  `gate_target_flags` against every `-DFASTCACHED_BUILD_*=ON` the workflow passes
+  ANYWHERE, and deliberately does not model which jobs run `ctest`: deriving *this
+  job tests* from the YAML is fragile in the direction that fails SILENT, where a
+  job whose test step is conditional or renamed reads as "does not test" and the
+  check quietly stops covering a target set CI really exercises. Failing closed
+  inverts that. The stated consequence is that a job turning one of those flags on
+  WITHOUT running tests makes the check refuse a correct tree — no such job exists
+  today, and when one appears the answer is a decision (exempt the job by name with
+  a reason, model the testing jobs, or narrow the subject) rather than a fix. It is
+  recorded before it fires because the natural response to that refusal will be
+  *the check is broken*, and it will not be: a red gate reads as "my branch is bad"
+  rather than as an instrument asking a question nobody has answered yet.
