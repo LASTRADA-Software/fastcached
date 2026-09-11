@@ -4921,3 +4921,23 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
+  **The instrumented-standard-library clause is now MEASURED rather than assessed**
+  (`scripts/probes/msan-uninstrumented-libstdcxx.sh`, 2026-09-11, clang++-22 against
+  gcc 14's `libstdc++.so.6`). MSan is live on this toolchain — a plain uninitialised
+  read reports — and the split it produces is the part a smaller probe gets wrong:
+  header-only use is CLEAN, because `vector`, `string`'s inline members and
+  `to_string` are instantiated into instrumented code, while `ostringstream`,
+  `locale`, `filesystem` and throwing an exception each report a
+  use-of-uninitialized-value INSIDE `libstdc++.so.6` on a program that has none.
+  Every Catch2 binary reaches the second set on every run, so an MSan job reports
+  about the standard library before it can report about this tree. `libc++` is no
+  escape and fails EARLIER — its `basic_string::__is_long` is out of line, so even
+  the header-only arm reports there. Three drafts of that probe were silent for
+  reasons that had nothing to do with libstdc++ (`-O1` folded the read away; a
+  store to `volatile` is not a use MSan reports), which is why it refuses when its
+  own control does not fire. Not measured, and the next thing to measure: whether
+  the tree reports under an MSan build with every dependency built from source —
+  this build additionally links `libyaml-cpp.so.0.8`, `libssl.so.3` and
+  `libcrypto.so.3` as system shared objects, of which TLS can be turned off and
+  yaml-cpp can be forced from source. valgrind was absent on the machine that took
+  these readings; apt offers 1:3.22.0-0ubuntu3, and that route needs no rebuild.
