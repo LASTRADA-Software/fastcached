@@ -440,9 +440,9 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                 auto const range = rangeAsked(request.query);
                 if (!range.has_value())
                     return RefusedParameter("text/html; charset=utf-8",
-                                            std::format("<!doctype html><title>fastcache fleet</title>"
-                                                        "<p>Unknown <code>range</code>. Try one of: <code>{}</code>.</p>",
-                                                        KnownRangeKeys()));
+                                            MinimalHtmlPage(std::format("<h1>Unknown range</h1>"
+                                                                        "<p>Try one of: <code>{}</code>.</p>",
+                                                                        KnownRangeKeys())));
                 return AdminResponse { .status = statusFor(snapshot),
                                        .contentType = "text/html; charset=utf-8",
                                        .body = Distributed::RenderFleetHtml(snapshot, viewFor(*range), refreshSeconds) };
