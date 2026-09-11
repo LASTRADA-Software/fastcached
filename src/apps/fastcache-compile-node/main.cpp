@@ -278,7 +278,13 @@ constexpr int ExitOk = 0;
 /// @param round What to announce and where to read it from.
 /// @param link Where this node believes the leader is; advanced across the round.
 /// @param connector Dials each endpoint the link names.
-void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link, BlockingConnector& connector)
+/// @return How many entries a scheduler ACCEPTED this round. Zero covers every way a
+///         round can achieve nothing -- nobody reachable, everybody refusing, a
+///         redirect chain that ran out -- which are one answer to the only question
+///         the caller asks of it: is this node getting through to a scheduler.
+[[nodiscard]] std::size_t AnnounceRound(Node::HeartbeatRound const& round,
+                                        Node::SchedulerLink& link,
+                                        BlockingConnector& connector)
 {
     for (link.BeginRound();;)
     {
@@ -296,7 +302,7 @@ void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link,
             // configured endpoint is the one still standing after an election the
             // remembered leader lost.
             if (!link.Lost().has_value())
-                return;
+                return 0;
             continue;
         }
 
@@ -311,10 +317,10 @@ void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link,
             if (outcome.accepted > 0)
             {
                 link.Accepted();
-                return;
+                return outcome.accepted;
             }
             if (!link.Lost().has_value())
-                return;
+                return 0;
             continue;
         }
 
@@ -327,9 +333,52 @@ void AnnounceRound(Node::HeartbeatRound const& round, Node::SchedulerLink& link,
             round.logger.Logf(LogLevel::Warn,
                               "gave up following leader redirects after {} hop(s); retrying next heartbeat",
                               Node::MaxAnnounceRedirects);
-            return;
+            return 0;
         }
     }
+}
+
+/// Tell `node-status` what a finished survey concluded.
+///
+/// A free function rather than a lambda inside `WorkerBody` for `AnnounceRound`'s
+/// reason, which is build-enforced rather than stylistic: that body sits at the
+/// cognitive-complexity ceiling the linter fails the build on, and two publication
+/// closures pushed it over. The rule this carries -- which state a served count implies
+/// -- lives in `ToolchainStateFor`, where a test can reach it.
+///
+/// @param state Where the worker publishes.
+/// @param served How many toolchains this node now serves.
+/// @param discovered How many candidates the cheap half of the survey found.
+void PublishToolchains(Node::NodeRuntimeState& state, std::size_t served, std::size_t discovered)
+{
+    state.PublishToolchains(Node::ToolchainReading { .state = Node::ToolchainStateFor(served),
+                                                     .served = static_cast<std::uint32_t>(served),
+                                                     .discovered = static_cast<std::uint32_t>(discovered) });
+}
+
+/// Tell `node-status` whether this node is getting through to a scheduler.
+///
+/// Counted from the REGISTRARS rather than from the round's outcome, because they answer
+/// different questions: `accepted` says *a scheduler took something just now*, and a
+/// non-empty `WorkerId()` says *this registrar is currently registered somewhere*. A
+/// worker whose scheduler has gone away keeps its ids and accepts nothing, which is
+/// exactly the state worth being able to see.
+///
+/// @param state Where the worker publishes.
+/// @param clock Stamps the acceptance; must be the clock `Describe()` differences it
+///        against, or the age it reports is the difference between two clocks.
+/// @param held Every registration this node is trying to hold.
+/// @param accepted How many entries a scheduler took this round.
+void PublishRegistration(Node::NodeRuntimeState& state,
+                         IClock const& clock,
+                         std::vector<Cc::WorkerRegistrar> const& held,
+                         std::size_t accepted)
+{
+    auto const registered =
+        std::ranges::count_if(held, [](Cc::WorkerRegistrar const& registrar) { return !registrar.WorkerId().empty(); });
+    state.PublishRegistration(static_cast<std::uint32_t>(registered),
+                              static_cast<std::uint32_t>(held.size()),
+                              accepted > 0 ? std::optional { clock.Now() } : std::nullopt);
 }
 
 /// Claim this worker's private scratch root, or say why the node must not start.
@@ -949,11 +998,32 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // is what it is for, and `compileResponder` above is unconditional. A predicate here
     // would be one nothing could make false.
     //
+    // **That was the whole complaint in #1295, and the fix is NOT to make this bit
+    // conditional.** The bit answers *does this node have a worker component*, and
+    // `true` is the correct answer to it. The question it was being read for is *is that
+    // worker serving anything yet*, which is a different question with three answers, and
+    // it is now `runtimeState` below rather than a fourth reading of this bool.
+    //
     // `consensus` is the exception, and it is the STRONGER answer rather than a weaker
     // one: the tier is constructed BELOW this point, so there is no pointer to read, and
     // `RunsConsensus` is the one predicate `StartConsensusOrExplain` itself asks (#1022,
     // #613). Reporting it cannot disagree with whether a tier gets built, which a second
     // spelling of the same question could.
+    // Where the heartbeat thread publishes what the survey has concluded, and the ONLY
+    // thing `Describe()` reads it through. The served map a few hundred lines below has
+    // exactly one writer and no lock; these verbs are answered per request on a reactor
+    // thread, so the map is not reachable from here and must not be made reachable.
+    //
+    // Seeded rather than defaulted, which is why `NodeRuntimeState` has no default
+    // constructor: the honest first reading already exists at this point. The cheap half
+    // of the survey has run -- `discoveredToolchains` is what it found -- and the
+    // expensive walk has not, so this node is `Surveying` 0 of however many candidates
+    // there are. A zero denominator here would be a reading nobody took.
+    Node::NodeRuntimeState runtimeState { Node::ToolchainReading {
+        .state = CompileCacheWire::ToolchainState::Surveying,
+        .served = 0,
+        .discovered = static_cast<std::uint32_t>(discoveredToolchains.entries.size()) } };
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -964,6 +1034,13 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                .worker = true,
                                .scheduler = schedulerTier != nullptr,
                                .consensus = Node::RunsConsensus(cfg) },
+        // `capacity` and `scheduler` are read LIVE; only `runtime` is published into.
+        // Both are already in scope and already thread-safe, and a node running no
+        // scheduler passes a null -- which is what makes an absent role mean *runs no
+        // scheduler* rather than *is in an election*.
+        Node::NodeRuntimeSources { .runtime = &runtimeState,
+                                   .capacity = &compileCapacity,
+                                   .scheduler = schedulerTier != nullptr ? &schedulerTier->Service() : nullptr },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1216,6 +1293,12 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Read from the DISCOVERED set, which this thread owns and no other touches.
     auto const startupToolchainCount = discoveredToolchains.entries.size();
 
+    // It is also the denominator every `PublishToolchains` call below reports, on a
+    // RE-survey as well as on the first one. `RefreshToolchains` answers `changed` and
+    // `served` and no candidate count, so the alternative is to invent one; this is the
+    // same number, from the same set, that the ready line above already reports, and it
+    // is the only one this thread can state honestly.
+
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
     // have no earlier reading to difference against and would report nothing,
@@ -1336,8 +1419,17 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // into the serving state rather than two.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
                 Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
+                // AFTER the two calls above, never before: this says the worker is
+                // serving, and it must not say so while the compile port still holds the
+                // previous answer.
+                PublishToolchains(runtimeState, toolchains.size(), startupToolchainCount);
                 break;
             case Node::SurveyOutcome::NothingToServe:
+                // Published even though the process is on its way out. The stop is not
+                // instant -- the watcher below has to notice it -- and this is exactly
+                // the window in which an operator asking *what is wrong with that node*
+                // gets a real answer instead of `Surveying` forever.
+                PublishToolchains(runtimeState, 0, startupToolchainCount);
                 surveyFoundNothing = true;
                 DaemonControls::Instance().RequestStop();
                 return;
@@ -1360,6 +1452,15 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 //
                 // `FingerprintToolchains` has already said so at Warn, naming the
                 // count, so nothing is logged twice here.
+                //
+                // It DOES publish, and this arm is the one that most needed a verb:
+                // the node stays up serving nothing, which read from outside as a
+                // healthy worker with an idle fleet. `NothingToServe` on the wire
+                // rather than a fourth state naming this cause -- the re-survey below
+                // cannot tell the two empty surveys apart, so a state only the first
+                // survey could fill would be guessed on every beat after it. See
+                // `CompileCacheWire::ToolchainState`.
+                PublishToolchains(runtimeState, 0, startupToolchainCount);
                 break;
             case Node::SurveyOutcome::Cancelled:
                 // Already stopping, and `surveyFoundNothing` stays false: this node
@@ -1455,6 +1556,11 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // open for a whole heartbeat.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
                 Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
+                // Same order and the same reason as the first survey's `Served` arm.
+                // Inside `changed` deliberately: an unchanged sweep concluded nothing
+                // new, and republishing on every beat would make a reading that has not
+                // moved look like one that was re-taken.
+                PublishToolchains(runtimeState, toolchains.size(), startupToolchainCount);
 
                 // A worker that ends up serving nothing keeps running and keeps
                 // saying nothing, rather than exiting: the compiler may come back
@@ -1473,7 +1579,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                 "this machine now has no usable toolchain; serving nothing until one returns");
             }
 
-            AnnounceRound(round, link, heartbeatConnector);
+            PublishRegistration(runtimeState, statusClock, registrars, AnnounceRound(round, link, heartbeatConnector));
 
             // Slept in slices so a stop request is observed promptly: a worker that
             // took a full heartbeat interval to exit would hold its port that long

@@ -165,12 +165,20 @@ would discard it silently.
 
 ```console
 $ fastcache-cli node
-version         0.2.0-125-g6ba32b30
-node-id         -
-uptime-seconds  15
-components      cache-tier, worker
-admin-port      36742
-admin-tls       false
+version                        0.2.0-125-g6ba32b30
+node-id                        -
+uptime-seconds                 15
+components                     cache-tier, worker
+toolchains                     surveying
+toolchains-served              0
+toolchains-discovered          3
+compile-slots                  8
+compiles-in-flight             0
+registrars-registered          0
+registrars-total               3
+last-registration-seconds-ago  -
+admin-port                     36742
+admin-tls                      false
 ```
 
 A surface the node does not run gets **no field at all** rather than a zero port —
@@ -184,6 +192,53 @@ absent. A component bit this client has no name for is reported as
 `unknown(0x…)` beside the ones it does know — an older client meeting a newer node
 says *there is something here I do not understand* instead of quietly
 under-reporting.
+
+`toolchains` is what `components` **cannot** tell you. That mask carries a `worker`
+bit which is a constant on the node binary — it compiles, that is what it is for —
+so it reads identically whether the worker is still identifying its toolchains or
+is serving compiles. A node *serves while it identifies them*, and that walk has
+been observed running past 300 s on a cold machine, so the state an operator most
+often needs is exactly the one the bit could not express:
+
+- **`surveying`** — the first survey has not finished, and `toolchains-served` of
+  `toolchains-discovered` is how far it has got.
+- **`serving`** — a survey finished and this node serves `toolchains-served`
+  toolchains.
+- **`nothing-to-serve`** — a survey finished and this node serves none, so it
+  accepts no compiles until a later one finds a compiler. The node stays up and
+  keeps looking; its log says why.
+
+The three go together or not at all. A node that published none of them — one too
+old to carry the record — reports all three **absent** rather than
+`surveying, 0 of 0`, which is a reading somebody would act on.
+
+Beside them, what that worker is offering and whether anyone knows about it:
+
+- **`compile-slots`** and **`compiles-in-flight`** — how many concurrent compiles this
+  node offers and how many are running. Both or neither: a slot count with no in-flight
+  figure invites the reading that the node is idle. A node running no worker tier
+  reports neither, which is **not** the same as reporting none free.
+- **`registrars-registered`** and **`registrars-total`** — one registration per
+  toolchain served, so read them as a pair. `2 of 3` is ordinary while a survey is
+  still finishing and alarming an hour later.
+- **`last-registration-seconds-ago`** — when a scheduler last accepted one. **Absent
+  means never**, and that is the whole reason it is not a number: a node whose
+  `--scheduler` has never answered and one that registered an hour ago are exactly the
+  two states you are trying to separate. A round that accepts nothing does not reset
+  it, so an unreachable scheduler shows a value that keeps growing rather than
+  disappearing.
+- **`scheduler-role`** and **`leader`** — `leader`, `follower` or `undecided`, and
+  where the leader answers. This is the question `components` cannot reach: a leading
+  scheduler and a following one both report `scheduler`, and a follower's registry is
+  empty and reads exactly like an idle fleet. `undecided` means an election is in
+  progress, so a node running **no** scheduler reports no role at all rather than
+  claiming to be in one; an `undecided` node reports the `leader` cell as absent,
+  because no leader is known yet.
+
+There is deliberately no *limited-by* field beside the slot count. Which ceiling bound a
+worker's slots is the **scheduler's** conclusion — derived on the leader from what the
+worker reported plus its live load — and a worker recomputing it would be a second
+spelling of that arithmetic that can disagree with the first.
 
 `node-metrics` reports every counter the endpoint's build carries, **zeroes
 included**. A counter is a tally, so zero is the truth about events that never

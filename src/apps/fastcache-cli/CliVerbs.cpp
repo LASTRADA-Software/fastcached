@@ -917,6 +917,61 @@ namespace
         return "unknown";
     }
 
+    /// What to call one toolchain-survey state.
+    /// @param state The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfToolchainState(CompileCacheWire::ToolchainState state) noexcept
+    {
+        switch (state)
+        {
+            case CompileCacheWire::ToolchainState::Surveying:
+                return "surveying";
+            case CompileCacheWire::ToolchainState::Serving:
+                return "serving";
+            case CompileCacheWire::ToolchainState::NothingToServe:
+                return "nothing-to-serve";
+        }
+        // Unreachable for the reason `NameOfSurface`'s tail is: `DecodeNodeRuntime`
+        // leaves a state this build has no name for DISENGAGED rather than passing it
+        // through, so nothing but a named one arrives. Closed anyway -- falling off the
+        // end of a function returning a view is a dangling one.
+        return "unknown";
+    }
+
+    /// What to call one scheduler role.
+    /// @param role The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) noexcept
+    {
+        switch (role)
+        {
+            case CompileCacheWire::WireSchedulerRole::Follower:
+                return "follower";
+            case CompileCacheWire::WireSchedulerRole::Undecided:
+                return "undecided";
+            case CompileCacheWire::WireSchedulerRole::Leader:
+                return "leader";
+        }
+        // Unreachable for `NameOfSurface`'s reason: `DecodeNodeRuntime` leaves a role
+        // this build has no name for disengaged rather than passing it through.
+        return "unknown";
+    }
+
+    /// Add an optional unsigned field, or nothing at all when the node did not say.
+    ///
+    /// **A helper rather than four copies of the same `if`.** Each of these is a fact a
+    /// node may legitimately not have -- no worker tier, no scheduler, no heartbeat yet
+    /// -- and *absent is not zero* has to hold for every one of them. Written once, a
+    /// later field cannot be the one that renders a `0` for a fact nobody stated.
+    /// @param record Where the field is appended.
+    /// @param name What to call it.
+    /// @param value The fact, or nothing.
+    void AddOptionalNumber(std::vector<Field>& record, std::string_view name, std::optional<std::uint32_t> value)
+    {
+        if (value.has_value())
+            record.push_back({ .name = std::string { name }, .value = NumberCell(static_cast<std::uint64_t>(*value)) });
+    }
+
     /// Turn a decoded node status into the reported record.
     ///
     /// Pure, and separate from the handler, so the reported SHAPE is testable without a
@@ -935,6 +990,60 @@ namespace
         record.push_back({ .name = "node-id", .value = fields.nodeId.empty() ? AbsentCell() : TextCell(fields.nodeId) });
         record.push_back({ .name = "uptime-seconds", .value = NumberCell(fields.uptimeSeconds) });
         record.push_back({ .name = "components", .value = TextCell(DescribeComponents(fields.components)) });
+
+        // **What the worker is DOING, which `components` cannot say.** That mask carries
+        // a `worker` bit which is a constant on this binary -- it compiles, that is what
+        // it is for -- so it reports a node that is still walking its include trees and
+        // one that is serving compiles identically. These three separate them.
+        //
+        // Three cells rather than one sentence like `surveying (0 of 3)`, because this
+        // record is also rendered as JSON and CSV: a consumer gets two numbers it can
+        // compare, not a string it has to parse back. The counts stand or fall WITH the
+        // state -- `0 of 0` under no state is the collapse the tri-state exists to end --
+        // so a node that said nothing gets three absent fields rather than three zeroes.
+        if (fields.runtime.toolchains.has_value())
+        {
+            record.push_back({ .name = "toolchains",
+                               .value = TextCell(std::string { NameOfToolchainState(*fields.runtime.toolchains) }) });
+            record.push_back({ .name = "toolchains-served",
+                               .value = NumberCell(static_cast<std::uint64_t>(fields.runtime.toolchainsServed)) });
+            record.push_back({ .name = "toolchains-discovered",
+                               .value = NumberCell(static_cast<std::uint64_t>(fields.runtime.toolchainsDiscovered)) });
+        }
+
+        // What this node's worker is offering and spending. Both or neither: a slot
+        // count with no in-flight figure invites the reading that the node is idle.
+        AddOptionalNumber(record, "compile-slots", fields.runtime.compileSlots);
+        AddOptionalNumber(record, "compiles-in-flight", fields.runtime.compilesInFlight);
+
+        // Whether this node is getting through to a scheduler. `2 of 3` is ordinary
+        // mid-survey and alarming an hour later, which is why both numbers are reported
+        // rather than a ratio or a bare bool.
+        AddOptionalNumber(record, "registrars-registered", fields.runtime.registrarsRegistered);
+        AddOptionalNumber(record, "registrars-total", fields.runtime.registrarsTotal);
+
+        // **Absent means NEVER, and that is not a long time ago.** A node whose
+        // `--scheduler` has never answered and one that registered an hour ago are the
+        // two states an operator is separating; rendering a `0` or a `-1` for the first
+        // reports the healthy answer for both.
+        if (fields.runtime.lastRegistrationSecondsAgo.has_value())
+            record.push_back({ .name = "last-registration-seconds-ago",
+                               .value = NumberCell(*fields.runtime.lastRegistrationSecondsAgo) });
+
+        // A leading scheduler and a following one both report `scheduler` in the
+        // component mask, and a follower's registry is empty and reads exactly like an
+        // idle fleet. A node running no scheduler reports no role at all, which is what
+        // keeps `undecided` meaning *an election is in progress*.
+        if (fields.runtime.schedulerRole.has_value())
+        {
+            record.push_back({ .name = "scheduler-role",
+                               .value = TextCell(std::string { NameOfSchedulerRole(*fields.runtime.schedulerRole) }) });
+            // Empty is a READING here -- no leader is known -- so the field is present
+            // and ABSENT rather than missing, which would say this node could not tell.
+            record.push_back(
+                { .name = "leader",
+                  .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
+        }
 
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when

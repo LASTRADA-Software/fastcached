@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CompileCapacity.hpp"
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -11,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -269,6 +271,195 @@ struct NodeComponents
     bool consensus { false }; ///< This node participates in Raft.
 };
 
+/// What one reading says about this worker's toolchain survey.
+///
+/// **The three travel together or they lie.** Read separately, a reader can catch
+/// `Serving` beside a count from the previous publication -- and the count is the whole
+/// of what `Surveying` means (*n of m*), so a torn pair is not a slightly stale reading
+/// but a sentence with two subjects.
+struct ToolchainReading
+{
+    /// How far the survey has got.
+    CompileCacheWire::ToolchainState state { CompileCacheWire::ToolchainState::Surveying };
+
+    /// How many toolchains are served under that state.
+    std::uint32_t served { 0 };
+
+    /// How many candidates the cheap half of the survey found to walk.
+    std::uint32_t discovered { 0 };
+};
+
+/// The state a FINISHED survey's served count implies.
+///
+/// **One rule with one home.** Every publication site would otherwise spell
+/// `served > 0 ? Serving : NothingToServe`, and each copy is a chance to publish
+/// `Serving` beside a zero -- which is precisely the collapse the tri-state exists to
+/// end. It says nothing about `Surveying`, deliberately: that state is not a function of
+/// the count, it is the absence of a concluded survey, and a caller that has one cannot
+/// reach this at all.
+/// @param served How many toolchains the survey left this node serving.
+/// @return `Serving` or `NothingToServe`.
+[[nodiscard]] constexpr CompileCacheWire::ToolchainState ToolchainStateFor(std::size_t served) noexcept
+{
+    return served > 0 ? CompileCacheWire::ToolchainState::Serving : CompileCacheWire::ToolchainState::NothingToServe;
+}
+
+/// What one reading says about this node's registrations with a scheduler.
+///
+/// One per toolchain served, so `registered` is read BESIDE `total`: *2 of 3* is an
+/// ordinary state mid-survey and an alarming one an hour later, and either number alone
+/// cannot say which.
+struct RegistrationReading
+{
+    /// How many registrars hold a worker id a scheduler gave them.
+    std::uint32_t registered { 0 };
+
+    /// How many registrars this node is trying to hold.
+    std::uint32_t total { 0 };
+
+    /// When a scheduler last accepted one, or nothing when none ever has.
+    ///
+    /// **Disengaged is NEVER, and it is not the same as a long time ago.** A node that
+    /// has never reached its scheduler -- the ordinary shape of a misconfigured
+    /// `--scheduler` -- and one that registered an hour ago are the two states an
+    /// operator is trying to separate, and a sentinel instant reports them alike.
+    std::optional<TimePoint> lastAccepted {};
+};
+
+/// Where the worker publishes what it is doing, for a reader on another thread.
+///
+/// **A publication seam, and it is not an incidental one.** The served-toolchain map is
+/// a `WorkerBody` local (`main.cpp`) written by the heartbeat thread under **no lock at
+/// all**, and that one-writer discipline is load-bearing and documented where it lives:
+/// a dedicated survey thread "would be a second writer to all three and would need a
+/// lock that the re-survey path has never needed". `NodeStatusResponder` answers **per
+/// request**, on a reactor thread, so reaching into that map -- or bolting a mutex onto
+/// it at the call site -- would make every `node-status` request a second reader of
+/// state whose safety rests on there being exactly one.
+///
+/// So the heartbeat thread PUSHES a reading here when it has one, and `Describe()` reads
+/// only what was pushed. Nothing on a reactor thread ever touches the map, the map keeps
+/// its single writer, and the two threads share exactly one small object whose whole
+/// contract is being shared.
+///
+/// **No default constructor**, for `Cc::ToolchainSurvey`'s reason: a defaulted value
+/// would answer the question by omission, and the answer it would give -- some count,
+/// some state -- is a reading nobody took. The first honest reading exists before this
+/// object does, because the cheap half of the survey has already run by then, so there
+/// is no moment this has to invent one.
+class NodeRuntimeState
+{
+  public:
+    /// @param initial What is true before any survey has finished -- ordinarily
+    ///        `Surveying`, with `discovered` naming what the cheap half found.
+    explicit NodeRuntimeState(ToolchainReading initial) noexcept:
+        _toolchains { initial }
+    {
+    }
+
+    NodeRuntimeState() = delete;
+    NodeRuntimeState(NodeRuntimeState const&) = delete;
+    NodeRuntimeState(NodeRuntimeState&&) = delete;
+    NodeRuntimeState& operator=(NodeRuntimeState const&) = delete;
+    NodeRuntimeState& operator=(NodeRuntimeState&&) = delete;
+    ~NodeRuntimeState() = default;
+
+    /// Record what the survey now says.
+    ///
+    /// Called from the heartbeat thread, once per survey that concluded something.
+    /// @param reading The three facts, as one publication.
+    void PublishToolchains(ToolchainReading reading)
+    {
+        std::scoped_lock const guard { _mutex };
+        _toolchains = reading;
+    }
+
+    /// @return The last published reading, whole.
+    [[nodiscard]] ToolchainReading Toolchains() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return _toolchains;
+    }
+
+    /// Record what this node's registrations now look like.
+    ///
+    /// Called from the heartbeat thread, once per round.
+    /// @param registered How many registrars hold a worker id.
+    /// @param total How many registrars this node is trying to hold.
+    /// @param acceptedAt When a scheduler accepted one in THIS round, or nothing when
+    ///        it did not -- in which case the instant already recorded is KEPT. A round
+    ///        that accepted nothing is not evidence that this node never registered,
+    ///        and overwriting would turn every unreachable scheduler into a node that
+    ///        had never reached one.
+    void PublishRegistration(std::uint32_t registered, std::uint32_t total, std::optional<TimePoint> acceptedAt)
+    {
+        std::scoped_lock const guard { _mutex };
+        // Spelled out rather than nested ternaries, which the analyser refuses and is
+        // right to: the KEPT branch is the one that matters and it should not be the
+        // hard half of a one-liner to read.
+        auto lastAccepted = acceptedAt;
+        if (!lastAccepted.has_value() && _registration.has_value())
+            lastAccepted = _registration->lastAccepted;
+        _registration = RegistrationReading { .registered = registered, .total = total, .lastAccepted = lastAccepted };
+    }
+
+    /// @return The last published registration reading, or nothing before the first
+    ///         heartbeat round has reported one. Disengaged is *has not said yet*,
+    ///         which is not *has not registered* -- that one is an engaged reading
+    ///         whose `registered` is zero.
+    [[nodiscard]] std::optional<RegistrationReading> Registration() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return _registration;
+    }
+
+  private:
+    /// Guards `_toolchains`, and `mutable` for the reason
+    /// `SchedulerService::LeaderEndpoint` is: the read is `const` and the lock is not
+    /// part of what the caller is asking about. A mutex rather than atomics because the
+    /// three facts must be published and read as ONE -- and because this is a cold path
+    /// on both sides: one write per survey, one read per `node-status` request.
+    mutable std::mutex _mutex;
+
+    ToolchainReading _toolchains;
+
+    /// Disengaged until the first heartbeat round reports one -- see `Registration()`.
+    /// Unlike `_toolchains` there IS no honest reading before then: the registrars do
+    /// not exist yet when this object is built.
+    std::optional<RegistrationReading> _registration {};
+};
+
+/// Where `ConfiguredNodeStatus` reads this node's LIVE facts from.
+///
+/// A record rather than loose constructor parameters, for `NodeComponents`' reason: a
+/// call site that learns a further source adds a named field instead of another pointer
+/// nobody can tell from its neighbours. It is expected to grow -- everything a node
+/// reports about what it is *doing* arrives through here.
+///
+/// **Every member is nullable and null means ABSENT, never zero.** A node that publishes
+/// no runtime facts must be distinguishable from one whose worker serves nothing, and
+/// the wire models that with a disengaged field rather than a `0` that renders as a real
+/// reading.
+struct NodeRuntimeSources
+{
+    /// What the worker publishes about its survey and its registrations; null when
+    /// nothing does.
+    NodeRuntimeState const* runtime { nullptr };
+
+    /// Live compile-slot accounting; null on a node that runs no worker tier.
+    ///
+    /// Read DIRECTLY rather than published, and the difference is deliberate: this one
+    /// is already thread-safe by construction and already exact at the instant it is
+    /// asked, so routing it through a publisher would make it staler for nothing. What
+    /// gets published is what only one thread can see.
+    CompileCapacity const* capacity { nullptr };
+
+    /// This node's scheduler, for its role and the leader it knows about; null on a
+    /// node that runs none -- which is why the role is ABSENT there rather than
+    /// `Undecided`, a reading that would claim this node is in an election.
+    Distributed::SchedulerService const* scheduler { nullptr };
+};
+
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.
 ///
 /// Its own type rather than a lambda in `main`, for the reason `main` holds nothing
@@ -289,12 +480,18 @@ class ConfiguredNodeStatus final: public INodeStatusSource
     ///        which is the same rule `NodeCapacityOf` holds: a `--cache-dir` that would
     ///        not open has already stopped startup, and a tier a flag asked for but that
     ///        does not exist would be reported as running.
+    /// @param sources Where the LIVE facts are read from, per call. Each member must
+    ///        outlive this. Defaulted to nothing wired, which reports every runtime
+    ///        field ABSENT rather than inventing a reading -- that is the honest answer
+    ///        for a caller that publishes none, and it is what makes *nothing was wired*
+    ///        distinguishable from *the worker serves nothing*.
     ConfiguredNodeStatus(NodeConfig const& cfg,
                          IClock const& clock,
                          TimePoint startedAt,
                          std::string version,
                          std::string nodeId,
-                         NodeComponents components) noexcept;
+                         NodeComponents components,
+                         NodeRuntimeSources sources = {}) noexcept;
 
     /// @copydoc INodeStatusSource::Describe
     [[nodiscard]] CompileCacheWire::NodeStatusFields Describe() const override;
@@ -306,6 +503,7 @@ class ConfiguredNodeStatus final: public INodeStatusSource
     std::string _version;
     std::string _nodeId;
     NodeComponents _components;
+    NodeRuntimeSources _sources;
 };
 
 } // namespace FastCache::Node

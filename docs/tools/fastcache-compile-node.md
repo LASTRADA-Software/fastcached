@@ -650,8 +650,27 @@ Eight counters on `/metrics`, and the splits are the point:
 `node-status` and `node-metrics` are answered over the `0xFC` port to **fleet
 members**, and `fastcache-cli node` / `fastcache-cli node-metrics` are what read
 them. They report what this process is — version, minted identity, uptime, the
-components it actually started, and the ports it opened — and every counter this
-build carries.
+components it actually started, the ports it opened, and **how far its worker has
+got in identifying the toolchains it will serve** — and every counter this build
+carries.
+
+That last one is the answer to *why is this node not taking any work*, and it is
+the reason these verbs are worth reaching for on a default install: a node serves
+while it identifies its toolchains, so between start and the heartbeat thread's
+first completed round it runs a worker that can honour nothing. `toolchains`
+reports `surveying`, `serving` or `nothing-to-serve` with the counts beside it; the
+component mask cannot, because its `worker` bit is a constant on this binary.
+
+Beside it they report **what that worker is offering** (`compile-slots`,
+`compiles-in-flight`), **whether a scheduler knows about it** (`registrars-registered`
+of `registrars-total`, and `last-registration-seconds-ago`, which is **absent** when
+none ever has), and **this node's consensus role** (`scheduler-role`, plus the `leader`
+it would redirect to). The last one closes the gap the dashboard already covers and the
+CLI did not: a leading scheduler and a following one are identical in the component
+mask, and a follower's registry is empty and reads exactly like an idle fleet.
+
+Together that is the first ten seconds of diagnosing a node with no `--admin-listen`,
+over a port that is up by definition and gated on fleet membership.
 
 They are gated on membership rather than on a credential, and that is deliberate:
 the credential on this listener belongs to the scheduler, so a node running none has
