@@ -802,8 +802,22 @@ RunTarget() {
     # count in it is how a suppression that has started matching more than it was
     # written for goes unnoticed. On failure, everything -- that is when the whole
     # log is the evidence.
+    #
+    # The PER-ENTRY lines are part of that, and were missing. TSan prints
+    #
+    #     ThreadSanitizer: Matched 5 suppressions (pid=NNN):
+    #     2 race_top:FastCache::BlockingListener::Close
+    #     3 race_top:FastCache::EpollReactor::Detach
+    #
+    # and this grep matched only the header, so a green run reported a bare TOTAL
+    # with no attribution -- 4 could be 4 from one entry and 0 from the other, and
+    # "matching more than it was written for" is exactly what the total cannot
+    # show. The paragraph above and the `print_suppressions=1` comment both claim
+    # that drift is visible here; until this line they claimed it of output the
+    # gate did not print. An entry that has gone DEAD is the same blind spot from
+    # the other side, and a dead suppression is a rule that has stopped applying.
     if [[ "$rc" -eq 0 ]]; then
-        summary="$(grep -E 'assertions in|Matched [0-9]+ suppressions' "$log" || true)"
+        summary="$(grep -E 'assertions in|Matched [0-9]+ suppressions|^[0-9]+ [a-z_]+:' "$log" || true)"
         [[ -n "$summary" ]] \
             || FailTarget "$name" "${name}: exited 0 but reported no assertions; refusing to call that clean."
         echo "$summary"
