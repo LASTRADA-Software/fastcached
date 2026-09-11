@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
+# Policies are pinned because a `cmake -P` script gets OLD defaults for every policy
+# the project has not stated, and this one tests strings for substrings.
+cmake_minimum_required(VERSION 3.28)
+#
 # Read `write-slot-guard-canary`'s run and report green exactly while the write-slot
 # guard was watched BOTH accepting an ordinary pair of writes AND refusing a
 # double-arm.
