@@ -268,6 +268,7 @@ if(FASTCACHED_BUILD_TESTS)
     add_executable(fastcache-cc-tests
         test_main.cpp
         ${_fc_cc_sources}
+        CacheDecision_test.cpp
         CmdLine_test.cpp
         CompileJob_test.cpp
         LauncherCli_test.cpp
