@@ -614,6 +614,45 @@ set_tests_properties("script-interpreter-selftest" PROPERTIES
 # Guarded to Debug because `assert` compiles out everywhere else. Every preset this
 # project ships is single-config Ninja with an explicit `CMAKE_BUILD_TYPE`, so this
 # is a real condition rather than one that is silently always false.
+# ---------------------------------------------------------------------------
+# The write-slot canary: the read-slot canary's missing half.
+#
+# `Detail::ClaimWriteSlot` (`src/FastCache/Net/WriteSlot.hpp`) landed with #893 and
+# its own header said it was "Watched refusing by `ctest -R write-slot-guard-canary`".
+# No such registration existed: `git grep write-slot-guard-canary` returned exactly
+# one hit tree-wide, the sentence making the claim. A guard nobody has watched refuse
+# is not a guard, and a header asserting otherwise is worse than silence because it
+# retires the suspicion (#1218).
+#
+# **This one also watches the guard ACCEPT, which the read-side canary does not.** A
+# `ClaimWriteSlot` that objected to every write would pass a refusal-only gate and
+# break every honest caller, surfacing days later somewhere else as a different
+# defect (#1031). The canary drives an ordinary sequential pair first and the gate
+# requires that marker BEFORE the abort, so the two observations are one run rather
+# than two claims.
+#
+# `scripts/write-slot-guard-gate.cmake` and not a bare `WILL_FAIL`, for the reason
+# the read-slot block above gives: an inversion cannot say WHY a green result is
+# meaningless, and it would accept a segfault, a missing library and a refused bind
+# alike.
+#
+# Guarded to Debug because `assert` compiles out everywhere else.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(write-slot-guard-canary WriteSlotGuardCanary.cpp)
+    target_link_libraries(write-slot-guard-canary PRIVATE FastCache)
+    add_test(
+        NAME "write-slot-guard-canary"
+        COMMAND ${CMAKE_COMMAND}
+            "-DFASTCACHED_CANARY=$<TARGET_FILE:write-slot-guard-canary>"
+            -P "${CMAKE_SOURCE_DIR}/scripts/write-slot-guard-gate.cmake"
+    )
+    set_tests_properties("write-slot-guard-canary" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(read-slot-guard-canary ReadSlotGuardCanary.cpp)
     target_link_libraries(read-slot-guard-canary PRIVATE FastCache)
