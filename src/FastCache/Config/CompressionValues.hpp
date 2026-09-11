@@ -11,6 +11,7 @@
 namespace FastCache
 {
 
+/// @file CompressionValues.hpp
 /// The three value parsers behind every compression setting, for both binaries.
 ///
 /// There are six such settings on the daemon and six on the worker -- an on-disk
