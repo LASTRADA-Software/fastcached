@@ -18,16 +18,22 @@
 #     one platform.
 #   * **The authentication gate**, whose interesting arm needs a daemon configured to
 #     demand a credential.
+#   * **A real `fastcache-compile-node`**, which speaks the `0xFC` wire and NOTHING
+#     else. No scripted exchange can establish what that binary does to a RESP client,
+#     and what it does is the whole reason the node verbs exist: it closes having sent
+#     nothing. Cases 11-13 are that.
 
 set -uo pipefail
 
 FASTCACHED=""
 CLI=""
+NODE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fastcached) FASTCACHED="$2"; shift 2 ;;
         --cli)        CLI="$2";        shift 2 ;;
+        --node)       NODE="$2";       shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -35,6 +41,13 @@ done
 readonly SKIP=77
 [[ -n "$FASTCACHED" && -x "$FASTCACHED" ]] || { echo "fastcached not found: '$FASTCACHED'; skipping"; exit "$SKIP"; }
 [[ -n "$CLI" && -x "$CLI" ]] || { echo "fastcache-cli not found: '$CLI'; skipping"; exit "$SKIP"; }
+
+# The node is OPTIONAL: `FASTCACHED_BUILD_NODE` can be off, and the eight cases that
+# need no node are worth running anyway. Cases 11-13 announce that they were skipped
+# rather than passing silently -- a green run that quietly covered less is the shape
+# this repository keeps paying for.
+HAVE_NODE=0
+[[ -n "$NODE" && -x "$NODE" ]] && HAVE_NODE=1
 
 WORK="$(mktemp -d)"
 
@@ -502,5 +515,98 @@ expect_stderr "has no AUTH verb" "the refusal explains that no credential can he
 # tells the operator to reach for -- asserted rather than merely promised.
 run_cli --token-file="$tokenFile" set mc-key v
 expect_status 0 "a RESP verb with the same credential on the same address"
+
+# ---------------------------------------------------------------------------------
+# cases 11-13: against a real `fastcache-compile-node`
+#
+# **What no scripted exchange can establish.** `fastcache-compile-node` speaks the
+# `0xFC` compile-cache wire and nothing else, and what it DOES to a RESP client is a
+# property of that binary: it closes having sent a single byte. Measured, not assumed.
+# ---------------------------------------------------------------------------------
+if [[ "$HAVE_NODE" -eq 0 ]]; then
+    e2e_note "cases 11-13 SKIPPED: fastcache-compile-node was not built"
+else
+    echo "==> case 11: the node verbs against a real compile node"
+
+    nodePort="$(free_port)"
+    nodeAdminPort="$(free_port)"
+    nodeLog="$WORK/node-$nodePort.log"
+    # `--scheduler` naming itself: this node schedules nothing and registers with
+    # nobody, which is fine here and is what the startup refusal demands be stated.
+    # `--no-toolchain-discovery` with an explicit `--toolchain` keeps the include-tree
+    # walk out of the fixture -- it is over 300 s cold and measures nothing this case
+    # is about.
+    "$NODE" --listen-node="127.0.0.1:$nodePort" \
+            --admin-listen="127.0.0.1:$nodeAdminPort" \
+            --scheduler="127.0.0.1:$nodePort" \
+            --no-toolchain-discovery --toolchain=cc > "$nodeLog" 2>&1 &
+    nodePid=$!
+    _CLI_E2E_PIDS="$_CLI_E2E_PIDS $nodePid"
+    wait_for_port 127.0.0.1 "$nodePort" "$nodePid" "fastcache-compile-node" "$nodeLog"
+
+    # `run_cli` dials `$port`, which is the daemon's. The node is a different address,
+    # so these run it directly -- and the helper's redirections are kept so every
+    # `expect_*` above still applies.
+    run_node() {
+        set +e
+        "$CLI" --addr="127.0.0.1:$nodePort" "$@" > "$WORK/out" 2> "$WORK/err"
+        status=$?
+        set -e
+        return 0
+    }
+
+    run_node node
+    expect_status 0 "the node answers node-status"
+    expect_stdout "components" "the node reports which components it runs"
+    expect_stdout_line "^admin-port +$nodeAdminPort\$" "the reported admin port is the one it bound"
+
+    # **Absent is not zero, end to end.** This node runs no consensus, so it has no
+    # minted identity -- and the JSON must carry `null` rather than an empty string
+    # somebody could paste into `--raft-peer`.
+    run_node node --format=json
+    expect_status 0 "node renders as JSON"
+    expect_stdout '"node-id":null' "an unminted identity is null, not an empty string"
+
+    # A surface it does not run gets NO field. Discovery is off here, so a
+    # `discovery-port` of any value -- including 0 -- is the defect.
+    refute_stdout "discovery-port" "a surface the node does not run gets no field at all"
+
+    run_node node-metrics
+    expect_status 0 "the node answers node-metrics"
+    # The zero rows are PRESENT. A freshly started node has served nothing, so a
+    # client that dropped zeroes would report almost nothing here and still exit 0 --
+    # which is the failure a check for one non-zero counter cannot see.
+    expect_stdout_line "_total +0\$" "a counter that never moved is reported as 0"
+
+    echo "==> case 12: version is ANSWERED by a node, not merely explained"
+
+    # The verb the whole fallback exists for. Before it, this reported *the server
+    # closed the connection without answering* -- true, and useless.
+    run_node version
+    expect_status 0 "version against a node"
+    expect_stdout "server_kind" "the answer says WHICH kind of server replied"
+    expect_stdout "fastcache-compile-node" "and names it"
+
+    echo "==> case 13: a cache verb is refused BY NAME, never left to close in silence"
+
+    # THE discrimination this whole change is about. A compile node holds no user
+    # keyspace, so `get` has no 0xFC equivalent -- and the operator must be told what
+    # the endpoint IS rather than that a connection closed.
+    run_node get some-key
+    expect_status 3 "a cache verb against a node is unreachable, not a miss"
+    expect_stderr "fastcache-compile-node" "the refusal names what the endpoint is"
+    expect_stderr "holds no user keyspace" "and why the verb cannot be answered"
+
+    # The stats ladder reaches the node's own counters, and it DISCOVERED the admin
+    # port over 0xFC -- no `--admin-addr` was given anywhere in this case.
+    run_node stats --format=kv
+    expect_status 0 "stats against a node with no --admin-addr"
+    expect_stdout_line "^source=(metrics|node-metrics)\$" "a 0xFC-reachable rung answered"
+
+    # And the rung that answered is NOT `info`: RESP is unreachable here, so an `info`
+    # source would mean the ladder had somehow answered from a wire this binary does
+    # not speak.
+    refute_stdout "source=info" "the ladder did not claim RESP INFO answered"
+fi
 
 echo "fastcache-cli E2E OK"

@@ -648,6 +648,35 @@ class IMetricsSink
         /// is a property of the node, and the help text says so rather than promising
         /// a zero the merge made false.
         NodeCacheRequestsRefusedNotLocal,
+        NodeStatusRequestsRefusedNotAMember,
+
+        /// An operator verb whose header declared more payload than it may carry.
+        ///
+        /// **Every one of these verbs is fieldless** -- `node-status` and
+        /// `node-metrics` have nothing to ask with -- and their `OpTable` rows bound
+        /// them to `MaxControlPayload` rather than to the session cap. So a header
+        /// declaring megabytes against one of them did not come from a client of this
+        /// tree at any version: it is a probe, or a caller that has confused the verb
+        /// with a cache one.
+        ///
+        /// **Never summed with `NodeCacheRequestsRefusedPayloadTooLarge`.** They share
+        /// a wire code, a port and nothing else -- that one is what a misconfigured
+        /// launcher storing large objects produces, and this one has no innocent
+        /// explanation.
+        NodeStatusRequestsRefusedPayloadTooLarge,
+
+        /// An operator verb refused because the surface had no bytes left in flight.
+        ///
+        /// The diagnostic verbs are the ones an operator reaches for when a node is in
+        /// trouble, and this is the node answering *I am too busy to tell you what I
+        /// am*. It names the REQUEST that was refused rather than the load that
+        /// exhausted the budget -- which on any node holding a tier is the cache's
+        /// traffic, since the listener's ceiling folds to the largest owner's.
+        ///
+        /// A rise here is therefore read together with
+        /// `NodeCacheRequestsRefusedEndpointBusy` rather than summed with it: this one
+        /// says the diagnosis failed, that one says why.
+        NodeStatusRequestsRefusedEndpointBusy,
 
         /// A cache verb whose header declared more payload than the surface will
         /// buffer, so nothing was read.

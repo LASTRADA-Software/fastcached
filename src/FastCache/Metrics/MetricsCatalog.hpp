@@ -464,6 +464,38 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "wrong verb -- and what an operator watches there is the shape of the curve rather "
               "than its existence.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember,
+      .prometheusName = "fastcache_node_status_requests_refused_not_a_member_total",
+      .help = "Operator verbs (node-status, node-metrics) refused because the caller is not a "
+              "fleet member. These report this node's version, uptime, components and its "
+              "surface PORT MAP, which is why they are gated at all rather than being pre-auth. "
+              "Unlike the cache tier's not-local refusal this is not ordinary on any deployment: "
+              "an operator asking is either listed or is being told to be, so a steady rise is a "
+              "member list that has fallen behind whoever is running fastcache-cli, and a burst "
+              "from one host is somebody scanning. Zero on a node nobody has asked, which is the "
+              "common case and is not evidence the gate works.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedPayloadTooLarge,
+      .prometheusName = "fastcache_node_status_requests_refused_payload_too_large_total",
+      .help = "Operator verbs refused because the header declared more payload than they may "
+              "carry, so nothing was read. Both of them are FIELDLESS -- there is nothing to ask "
+              "node-status or node-metrics with -- and their wire rows bound them to the control "
+              "payload cap rather than the session cap, so a header declaring megabytes against "
+              "one of them came from no client of this tree at any version. Never sum with "
+              "fastcache_node_cache_requests_refused_payload_too_large_total: that one is what a "
+              "launcher storing large objects produces and has an innocent explanation, and this "
+              "one does not.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedEndpointBusy,
+      .prometheusName = "fastcache_node_status_requests_refused_endpoint_busy_total",
+      .help = "Operator verbs refused because the surface had no bytes left in flight. These are "
+              "the verbs somebody reaches for when a node is in trouble, so this is the node "
+              "answering that it is too busy to say what it is. It names the request that was "
+              "refused, not the load that exhausted the budget -- on a node holding a tier that "
+              "is the cache's traffic, the listener's ceiling folding to the largest owner's. "
+              "Read beside fastcache_node_cache_requests_refused_endpoint_busy_total rather than "
+              "summed with it: this says the diagnosis failed, that says why.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedPayloadTooLarge,
       .prometheusName = "fastcache_node_cache_requests_refused_payload_too_large_total",
       .help = "Cache verbs refused because the header declared more payload than the surface "

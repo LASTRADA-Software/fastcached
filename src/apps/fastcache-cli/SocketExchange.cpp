@@ -246,6 +246,115 @@ std::expected<McReply, ExchangeError> MemcachedExchange::Send(std::string_view r
     }
 }
 
+NodeExchange::NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept:
+    _socket { std::move(socket) },
+    _endpoint { std::move(endpoint) }
+{
+}
+
+NodeExchange::~NodeExchange()
+{
+    if (_socket != nullptr)
+        _socket->Close();
+}
+
+std::expected<std::unique_ptr<NodeExchange>, ExchangeError> NodeExchange::Open(Endpoint const& endpoint,
+                                                                               DialTimeouts timeouts,
+                                                                               Credential const& credential)
+{
+    auto socket = Dial(endpoint, timeouts);
+    if (!socket.has_value())
+        return std::unexpected(socket.error());
+
+    std::unique_ptr<NodeExchange> exchange { new NodeExchange { std::move(*socket),
+                                                                std::format("{}:{}", endpoint.host, endpoint.port) } };
+    if (!credential.Configured())
+        return exchange;
+
+    auto const reply =
+        exchange->Send(CompileCacheWire::EncodeAuth({ .username = credential.username, .secret = credential.secret }));
+    if (!reply.has_value())
+        return std::unexpected(reply.error());
+
+    if (reply->status == CompileCacheWire::Status::Ok)
+        return exchange;
+
+    // **`UnimplementedVerb` on AUTH alone falls through; every other refusal is about
+    // the credential and is reported.** This is #283/#340's rule from the client side:
+    // a surface that holds no policy is one a credential cannot help and must not
+    // break, and a build with no `AUTH` verb at all is one an operator can still use.
+    // Anything else -- a rejected secret, a malformed one -- is about what was
+    // presented, and stopping there is what keeps a wrong token from looking like an
+    // empty node.
+    if (reply->code.has_value() && ClassifyRefusal(*reply->code) == NodeRefusalKind::Unimplemented)
+    {
+        exchange->_advisories.push_back(
+            std::format("{} does not implement AUTH; continuing without presenting the credential", exchange->_endpoint));
+        return exchange;
+    }
+
+    return std::unexpected(
+        ExchangeError { .kind = ExchangeFailure::Transport, .detail = ExplainRefusal("auth", exchange->_endpoint, *reply) });
+}
+
+std::span<std::string const> NodeExchange::Advisories() const noexcept
+{
+    return _advisories;
+}
+
+std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
+{
+    if (!SyncRun(SendAll(_socket.get(), request)))
+        return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
+                                               .detail = "the connection failed while sending the request" });
+
+    // **Loop to a TERMINAL status**, never to the first frame. A reply carries a status
+    // byte and no kind, so the step-over-what-you-do-not-know property is REQUEST-side
+    // only -- a reader that stops at frame one reads a liveness pulse as the answer.
+    // What bounds how many arrive is the exchange's own I/O deadline, which every read
+    // below is subject to.
+    for (;;)
+    {
+        auto frame = ReadFrame();
+        if (!frame.has_value())
+            return frame;
+        if (CompileCacheWire::IsTerminalStatus(frame->status))
+            return frame;
+    }
+}
+
+std::expected<NodeReply, ExchangeError> NodeExchange::ReadFrame()
+{
+    for (;;)
+    {
+        // The header first, then exactly what it declared. A peer-declared length sizes
+        // nothing on its own: this waits for the bytes rather than reserving for them,
+        // so a header claiming four gigabytes costs this process nothing at all.
+        if (_pending.size() >= CompileCacheWire::ReplyHeaderSize)
+        {
+            auto const bytes =
+                std::span<std::byte const> { reinterpret_cast<std::byte const*>(_pending.data()), _pending.size() };
+            auto const header = CompileCacheWire::DecodeReplyHeader(bytes);
+            if (!header.has_value())
+                return std::unexpected(ExchangeError { .kind = ExchangeFailure::Malformed,
+                                                       .detail = std::format("{} answered something that is not a 0xFC "
+                                                                             "frame -- is that really a fastcache port?",
+                                                                             _endpoint) });
+
+            auto const whole = CompileCacheWire::ReplyHeaderSize + header->payloadLength;
+            if (_pending.size() >= whole)
+            {
+                auto reply = DecodeNodeReply(bytes.subspan(0, whole));
+                _pending.erase(0, whole);
+                return reply;
+            }
+        }
+
+        if (auto const filled = FillMore(_socket.get(), _pending); !filled.has_value())
+            return std::unexpected(filled.error());
+    }
+}
+
 std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
                                                    std::string_view path,
                                                    DialTimeouts timeouts,

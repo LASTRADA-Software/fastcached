@@ -303,6 +303,36 @@ enum class Op : std::uint8_t
     /// correctness dependency, and it is why a worker must step over the refusal
     /// rather than treat it as fatal (#283, #340).
     Withdraw = 0x0D,
+
+    // Operator verbs. What a person with a terminal needs to ASK a node, as opposed to
+    // what the fleet needs to tell it. They exist because `fastcache-compile-node`
+    // speaks this wire and nothing else, so a client pointed at one got a silent close
+    // and no way to find out why: measured against the running node, RESP `PING`, RESP
+    // `INFO` and memcached `version` each closed having sent nothing, while a `0xFC`
+    // header got a proper refusal. `fastcache-cli` is the consumer.
+
+    /// Operator asks what this node IS: its version, what it serves, and where.
+    ///
+    /// The reply carries, per surface this node actually opened, the surface's
+    /// enumerator and its **port** -- never its bound address. A node bound
+    /// `0.0.0.0:6675` that reported its bound address would hand a client something it
+    /// cannot dial, and one bound to a loopback address would hand a REMOTE client an
+    /// address meaning that client's own machine. The client composes the endpoint from
+    /// the host it already dialled (known-good, since a frame just came back over it)
+    /// plus the reported port. That is the same *opened addresses and dialled addresses
+    /// are two tables* rule the config layer already carries.
+    ///
+    /// A surface this node does not serve is ABSENT from the reply rather than reported
+    /// as port 0 -- absent is not zero, and a client must be able to tell *this node
+    /// runs no admin surface* from *it runs one whose port I could not read*.
+    NodeStatus = 0x0E,
+
+    /// Operator asks this node for its own counters.
+    ///
+    /// The same figures `/metrics` serves, over the wire an operator is already
+    /// connected on -- which is what lets `--admin-addr` stop being required, since the
+    /// admin surface may also be off entirely while this one is by definition up.
+    NodeMetrics = 0x0F,
 };
 
 /// Reply status, the first byte of every reply.
@@ -821,6 +851,18 @@ enum class VerbFamily : std::uint8_t
     Cache,     ///< Reads and writes compile results.
     Scheduler, ///< Spends the fleet's capacity, or changes what the cluster agrees.
     Compile,   ///< Causes a compiler to run on this machine.
+    /// Reports what this node IS, rather than spending anything it holds.
+    ///
+    /// Its own family rather than a corner of `Scheduler`, because every other family
+    /// names a COMPONENT a node may or may not run, and these verbs must not depend on
+    /// WHICH of them it runs: a worker with no cache tier and no scheduler is an
+    /// ordinary deployment, and *what do you serve?* has to work there. Filing them
+    /// under a component would make the answer depend on that component being present.
+    ///
+    /// Not *answerable by a node running nothing* -- `StartNodeSurfaceOrExplain` serves
+    /// no port at all in that case, so it is unreachable and claiming it would be a
+    /// reason that generalises past the fact it was drawn from.
+    Node,
 };
 
 /// One row of the opcode table: everything the framing layer knows about a verb.
@@ -1200,6 +1242,20 @@ inline constexpr std::array OpTable {
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Scheduler },
+    OpDescriptor { .code = Op::NodeStatus,
+                   .name = "node-status",
+                   .fieldCount = 0, // nothing to ask with
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Node },
+    OpDescriptor { .code = Op::NodeMetrics,
+                   .name = "node-metrics",
+                   .fieldCount = 0, // nothing to ask with
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Node },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName,
@@ -1399,7 +1455,7 @@ static_assert(NoRetiredErrorCodeIsReused(),
 /// So "this verb asks nothing" is stated here rather than left looking like an
 /// omission, and `FieldCountsAgree` checks the two in both directions -- which is
 /// what makes this a check rather than a second place to be wrong.
-inline constexpr std::array FieldlessOps { Op::ClusterStatus };
+inline constexpr std::array FieldlessOps { Op::ClusterStatus, Op::NodeStatus, Op::NodeMetrics };
 
 /// Whether `op` legitimately carries no fields.
 /// @param op The verb.
@@ -3555,6 +3611,181 @@ struct CompileResultFields
                                  .stdoutText = own((*fields)[2]),
                                  .stderrText = own((*fields)[3]),
                                  .correlation = own((*fields)[4]) };
+}
+
+// --- the operator verbs' replies ------------------------------------------------------
+//
+// Encoded in primitive length-prefixed fields, the way `SchedulerProtocol.hpp` encodes a
+// history bucket, because this header must stay dependency-free: the launcher does not
+// link `FastCache`, so nothing here may include `Distributed/` or the node's own headers.
+
+/// A surface a node may serve, as the WIRE names it.
+///
+/// **Deliberately its own enum rather than the node's `NodeSurface`.** That one is a
+/// private enum a node may reorder freely; transmitting it would silently make its
+/// declaration order a wire contract, which is the defect `StorageTier` already carries
+/// knowingly and which there is no reason to repeat. The node maps its enumerator onto
+/// this one, so a reorder there is a compile error at the mapping rather than a client
+/// reading `Raft` where the node meant `Admin`.
+///
+/// Explicit values because these bytes are transmitted.
+enum class WireSurface : std::uint8_t
+{
+    Admin = 0x01,     ///< `/metrics`, `/healthz`, the fleet dashboard.
+    Raft = 0x02,      ///< Consensus traffic between peers.
+    Discovery = 0x03, ///< The LAN beacon.
+};
+
+/// **The `0xFC` port itself is deliberately not a `WireSurface`.**
+///
+/// A client learns this reply by dialling that port, so telling it the port it just used
+/// carries no information -- and it is not free: the node's identity is built BEFORE the
+/// listener (it is an argument to `StartNodeSurfaceOrExplain`), while the port worth
+/// reporting is the one actually BOUND, which under socket activation is the unit's
+/// choice and not the flag's. Reporting it would mean threading the listener back into
+/// the thing constructed ahead of it, to say something the reader already knows.
+///
+/// Where a THIRD party needs this node's frame address, that is `--advertise`'s job and
+/// the fleet report's, both of which already carry it.
+
+/// One surface a node reports serving.
+struct SurfaceReport
+{
+    WireSurface surface { WireSurface::Admin }; ///< Which one.
+    std::uint32_t port { 0 };                   ///< The port it is served on.
+    /// Whether it is served over TLS. Only meaningful for `Admin`.
+    ///
+    /// A field rather than an assumption: a client that guessed `http://` against a TLS
+    /// admin surface fails in a way that reads as the surface being down.
+    bool tls { false };
+};
+
+/// What a node answers `NodeStatus` with.
+struct NodeStatusFields
+{
+    std::string version;                 ///< The node's compiled-in version string.
+    std::string nodeId;                  ///< Its minted identity, or empty when it runs no consensus.
+    std::uint64_t uptimeSeconds { 0 };   ///< How long this process has served.
+    std::vector<SurfaceReport> surfaces; ///< Every surface it actually opened.
+    /// Which components it runs, as a bitmask -- see `NodeComponentBit`.
+    std::uint32_t components { 0 };
+};
+
+/// Bits of `NodeStatusFields::components`.
+///
+/// A mask rather than four booleans, because the set grows and a client must be able to
+/// step over a bit it does not know. A bit this build does not name is IGNORED rather
+/// than refused: an older client meeting a newer node should report the components it
+/// understands, not decline to report anything.
+namespace NodeComponentBit
+{
+    constexpr std::uint32_t CacheTier = 0b0001; ///< Serves the cache verbs.
+    constexpr std::uint32_t Worker = 0b0010;    ///< Runs compiles.
+    constexpr std::uint32_t Scheduler = 0b0100; ///< Spends the fleet's capacity.
+    constexpr std::uint32_t Consensus = 0b1000; ///< Participates in Raft.
+} // namespace NodeComponentBit
+
+/// Frame a NODE-STATUS request.
+///
+/// No fields at all, which is a real shape rather than a placeholder: there is nothing
+/// to ask a node about itself WITH, so a payload that is not empty is a client this
+/// build does not understand and the field-count check refuses it on the count alone.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeStatusRequest(WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::NodeStatus, {});
+}
+
+/// Frame a NODE-METRICS request.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeMetricsRequest(WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::NodeMetrics, {});
+}
+
+/// Encode a `NodeStatus` reply body.
+/// @param fields What this node is.
+/// @return The payload.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeStatus(NodeStatusFields const& fields)
+{
+    std::vector<std::vector<std::byte>> surfaceRows;
+    surfaceRows.reserve(fields.surfaces.size());
+    for (auto const& surface: fields.surfaces)
+    {
+        auto const tag = static_cast<std::uint32_t>(surface.surface);
+        surfaceRows.push_back(WireFields::Encode({ std::span<std::byte const> { EncodeU32Field(tag) },
+                                                   std::span<std::byte const> { EncodeU32Field(surface.port) },
+                                                   std::span<std::byte const> { EncodeU32Field(surface.tls ? 1U : 0U) } }));
+    }
+    std::vector<std::span<std::byte const>> surfaceViews;
+    surfaceViews.reserve(surfaceRows.size());
+    for (auto const& row: surfaceRows)
+        surfaceViews.emplace_back(row);
+    auto const surfaces = WireFields::Encode(WireFields::FieldList { surfaceViews });
+
+    return WireFields::Encode({ AsBytes(fields.version),
+                                AsBytes(fields.nodeId),
+                                std::span<std::byte const> { EncodeU64Field(fields.uptimeSeconds) },
+                                std::span<std::byte const> { EncodeU32Field(fields.components) },
+                                std::span<std::byte const> { surfaces } });
+}
+
+/// Decode a `NodeStatus` reply body.
+/// @param payload The reply body.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<NodeStatusFields> DecodeNodeStatus(std::span<std::byte const> payload)
+{
+    auto const outer = SplitFields(payload, 5);
+    if (!outer.has_value())
+        return std::nullopt;
+    auto const uptime = DecodeU64Field((*outer)[2]);
+    auto const components = DecodeU32Field((*outer)[3]);
+    if (!uptime.has_value() || !components.has_value())
+        return std::nullopt;
+
+    auto const rows = WireFields::SplitAll((*outer)[4]);
+    if (!rows.has_value())
+        return std::nullopt;
+
+    NodeStatusFields fields { .version = std::string { AsStringView((*outer)[0]) },
+                              .nodeId = std::string { AsStringView((*outer)[1]) },
+                              .uptimeSeconds = *uptime,
+                              .surfaces = {},
+                              .components = *components };
+    fields.surfaces.reserve(rows->size());
+    for (auto const& row: *rows)
+    {
+        auto const parts = WireFields::SplitExactly(row, 3);
+        if (!parts.has_value())
+            return std::nullopt;
+        auto const tag = DecodeU32Field((*parts)[0]);
+        auto const port = DecodeU32Field((*parts)[1]);
+        auto const tls = DecodeU32Field((*parts)[2]);
+        if (!tag.has_value() || !port.has_value() || !tls.has_value())
+            return std::nullopt;
+        // A port outside the 16-bit range cannot be one, and this number is
+        // peer-controlled: refuse rather than truncate, since a truncated port dials
+        // something real and wrong.
+        if (*port > 0xFFFFU)
+            return std::nullopt;
+        // A surface tag this build does not name is SKIPPED, not refused -- an older
+        // client meeting a newer node reports the surfaces it understands rather than
+        // declining to report any.
+        switch (static_cast<WireSurface>(*tag))
+        {
+            case WireSurface::Admin:
+            case WireSurface::Raft:
+            case WireSurface::Discovery:
+                break;
+            default:
+                continue;
+        }
+        fields.surfaces.push_back(
+            SurfaceReport { .surface = static_cast<WireSurface>(*tag), .port = *port, .tls = *tls != 0U });
+    }
+    return fields;
 }
 
 } // namespace FastCache::CompileCacheWire

@@ -645,6 +645,28 @@ Eight counters on `/metrics`, and the splits are the point:
 | `fastcache_node_cache_requests_refused_not_local_total` | A caller that is not on this machine asked this tier for something. Zero forever on the default loopback bind; on a widened one it is your peers, whose access [#287](https://github.com/LASTRADA-Software/fastcached/issues/287) withdrew — give them a shared `fastcached` via `--upstream`. |
 | `fastcache_node_upstream_configured` | `1` when this node has a shared cache to read through to, `0` when it does not. Absent on a node running no cache at all. |
 
+### The operator verbs
+
+`node-status` and `node-metrics` are answered over the `0xFC` port to **fleet
+members**, and `fastcache-cli node` / `fastcache-cli node-metrics` are what read
+them. They report what this process is — version, minted identity, uptime, the
+components it actually started, and the ports it opened — and every counter this
+build carries.
+
+They are gated on membership rather than on a credential, and that is deliberate:
+the credential on this listener belongs to the scheduler, so a node running none has
+none to check, and demanding one would leave these permanently unanswerable on a
+single-machine install. Loopback is always a member; a remote caller needs
+`--fleet-member`. What they hand over is strictly less than `/metrics` already
+serves unauthenticated.
+
+| Counter | What a rise means |
+|---|---|
+| `fastcache_node_status_requests_refused_not_a_member_total` | An operator verb was refused because the caller is not a fleet member. Unlike the cache tier's not-local refusal this is not ordinary on any deployment: a steady rise is a member list that has fallen behind whoever is running `fastcache-cli`, and a burst from one host is somebody scanning. |
+| `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
+| `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
+
+
 Read the two upstream counters beside the gauge, never on their own. They are
 cumulative, so a node with **no** shared cache and a node with one it has not yet
 written to both report zero — the counters cannot tell those apart and the gauge is

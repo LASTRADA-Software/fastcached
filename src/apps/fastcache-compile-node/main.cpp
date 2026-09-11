@@ -25,6 +25,7 @@
 #include "NodeLogging.hpp"
 #include "NodeMembership.hpp"
 #include "NodeReload.hpp"
+#include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 #include "SchedulerLink.hpp"
@@ -480,6 +481,14 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
 
 [[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
 {
+    // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
+    // `NodeStatus` verb both answer *how long has this been serving*, and two
+    // independently sampled origins are two numbers that can disagree about one fact --
+    // an operator comparing a scrape against the CLI would be reading a difference that
+    // describes nothing. Taken as the first statement, so it is this body's own start
+    // rather than whichever startup step happened to be declared above the reader.
+    auto const startedAt = std::chrono::steady_clock::now();
+
     // Socket activation is resolved BEFORE the toolchains, and the order is
     // deliberate. Computing a fingerprint walks the whole include tree and takes
     // seconds; a bad handoff is decided in microseconds. Doing the cheap, fallible
@@ -927,20 +936,63 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // responder -- and therefore destroyed BEFORE them, which is what keeps the router
     // from outliving what it routes to. And before consensus, because what a leader
     // advertises for the scheduler is what this BOUND.
-    auto nodeSurfaceOrRefusal =
-        Node::StartNodeSurfaceOrExplain(nodeIo,
-                                        cfg,
-                                        cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
-                                        schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
-                                        &compileResponder,
-                                        activated,
-                                        metrics,
-                                        logger,
-                                        // Asked of the RUNNER rather than of a captured copy of the map, so a
-                                        // re-survey that replaces the set is reflected in the very next line
-                                        // (#238). `jobs` outlives the surface -- declared above it, destroyed
-                                        // after -- which is what makes the reference safe to hold.
-                                        [&jobs](std::string_view fingerprint) { return jobs.CompilerFor(fingerprint); });
+    // What this node IS, for the operator verbs below. Its own clock, because uptime is
+    // the one field that moves between requests and `Describe()` is asked per request.
+    SteadyClock const statusClock;
+
+    // **Observed, never inferred from a flag** -- with one deliberate exception, below.
+    // A `--cache-dir` that would not open has already stopped startup, so a tier read off
+    // the flag that asked for it would report a component that is not there; the pointer
+    // is what actually started.
+    //
+    // `worker` is a literal `true` and that is not a shortcut: this binary compiles, that
+    // is what it is for, and `compileResponder` above is unconditional. A predicate here
+    // would be one nothing could make false.
+    //
+    // `consensus` is the exception, and it is the STRONGER answer rather than a weaker
+    // one: the tier is constructed BELOW this point, so there is no pointer to read, and
+    // `RunsConsensus` is the one predicate `StartConsensusOrExplain` itself asks (#1022,
+    // #613). Reporting it cannot disagree with whether a tier gets built, which a second
+    // spelling of the same question could.
+    Node::ConfiguredNodeStatus const nodeStatus {
+        cfg,
+        statusClock,
+        startedAt,
+        std::string { VersionString },
+        cfg.nodeId,
+        Node::NodeComponents { .cacheTier = cacheTier != nullptr,
+                               .worker = true,
+                               .scheduler = schedulerTier != nullptr,
+                               .consensus = Node::RunsConsensus(cfg) },
+    };
+
+    // The operator verbs. Declared BEFORE the surface that routes to it and therefore
+    // destroyed after, like every other responder here.
+    //
+    // `membership.Oracle()` bound once, by reference, the way every surface binds it: an
+    // implementation re-asking for an oracle per request could never see `--fleet-open`
+    // change, and a test that re-acquired it would pass under exactly that defect.
+    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, membership.Oracle(), metrics };
+
+    auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
+        nodeIo,
+        cfg,
+        // Designated, so the NAME travels with each pointer. Four bare
+        // `IFrameResponder*` arguments are four a call site can silently transpose,
+        // and a transposed pair routes every cache verb to the scheduler -- which
+        // answers *served nowhere* for traffic this node is holding a tier for.
+        Node::SurfaceComponents { .cache = cacheTier != nullptr ? &cacheTier->Responder() : nullptr,
+                                  .scheduler = schedulerTier != nullptr ? &schedulerTier->Responder() : nullptr,
+                                  .compile = &compileResponder,
+                                  .node = &nodeStatusResponder },
+        activated,
+        metrics,
+        logger,
+        // Asked of the RUNNER rather than of a captured copy of the map, so a
+        // re-survey that replaces the set is reflected in the very next line
+        // (#238). `jobs` outlives the surface -- declared above it, destroyed
+        // after -- which is what makes the reference safe to hold.
+        [&jobs](std::string_view fingerprint) { return jobs.CompilerFor(fingerprint); });
     if (!nodeSurfaceOrRefusal.has_value())
     {
         // No flag prefix: this can fail over --listen-node or over --serve-scheduler,
@@ -1032,7 +1084,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                   // declared above, so it outlives the provider: locals are destroyed in
                                   // reverse.
                                   .consensus = Node::ConsensusScrapeSource(consensusTier.get()) },
-        std::chrono::steady_clock::now());
+        startedAt);
 
     // Absent when this node runs no scheduler: there is then no registry to report,
     // so no fleet route is registered and `/fleet` is a plain 404.

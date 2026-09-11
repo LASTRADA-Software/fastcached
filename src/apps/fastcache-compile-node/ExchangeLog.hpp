@@ -113,6 +113,13 @@ inline constexpr std::array ExchangeLogTable {
                  .level = LogLevel::Info,
                  .rationale = "seconds of somebody's CPU, one per distributed TU; the heaviest thing this node "
                               "does and the cheapest to log" },
+    VerbLogRow { .code = CompileCacheWire::Op::NodeStatus,
+                 .level = LogLevel::Debug,
+                 .rationale = "a read an operator or a health check may run in a loop; logging it at Info would "
+                              "make a dashboard that polls look like traffic" },
+    VerbLogRow { .code = CompileCacheWire::Op::NodeMetrics,
+                 .level = LogLevel::Debug,
+                 .rationale = "same shape as node-status, and a scrape is by construction periodic" },
 };
 
 /// Whether every verb this build serves states a log level.

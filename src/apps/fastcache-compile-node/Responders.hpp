@@ -829,18 +829,47 @@ class CacheResponder final: public IFrameResponder
 /// and telling a client "unknown opcode" there says this daemon is too old when it is
 /// in fact merely configured differently. Here there is no other port, so the two
 /// facts coincide.
+/// What a node has to route to, one field per verb family.
+///
+/// **A record rather than four pointer parameters**, and the fourth is what forced it:
+/// four adjacent `IFrameResponder*` arguments are four things a call site can silently
+/// transpose, and the compiler cannot tell them apart. `clang-tidy` says so out loud
+/// (`bugprone-easily-swappable-parameters`), and it is right -- a transposed pair here
+/// routes every cache verb to the scheduler, which answers *served nowhere* for traffic
+/// the node is holding a tier for.
+///
+/// Designated initialisers at the call sites mean the NAME travels with the pointer, so
+/// a fifth component is a field somebody adds rather than an argument nobody can tell
+/// from its neighbours. Same reasoning as `NodeComponents`, one layer over.
+struct SurfaceComponents
+{
+    /// Answers the cache verbs, or nullptr when this node holds no tier.
+    IFrameResponder* cache { nullptr };
+
+    /// Answers the scheduler verbs, or nullptr when this node does not schedule. Also
+    /// owns the credential, so `AUTH` goes here.
+    IFrameResponder* scheduler { nullptr };
+
+    /// Answers the compile verbs, or nullptr when this node runs no worker.
+    IFrameResponder* compile { nullptr };
+
+    /// Answers the operator verbs -- what this node is, and its counters.
+    ///
+    /// Unlike the other three this is **never null on a built node**: the others name
+    /// components a node may not run, and these verbs must not depend on which of them
+    /// it runs.
+    IFrameResponder* node { nullptr };
+};
+
 class MergedResponder final: public IFrameResponder
 {
   public:
-    /// @param cache Answers the cache verbs, or nullptr when this node holds no tier.
-    /// @param scheduler Answers the scheduler verbs, or nullptr when this node does
-    ///        not schedule. Also owns the credential, so `AUTH` goes here.
-    /// @param compile Answers the compile verbs, or nullptr when this node runs no
-    ///        worker. All three must outlive this.
-    MergedResponder(IFrameResponder* cache, IFrameResponder* scheduler, IFrameResponder* compile) noexcept:
-        _cache { cache },
-        _scheduler { scheduler },
-        _compile { compile }
+    /// @param components What to route to; every non-null member must outlive this.
+    explicit MergedResponder(SurfaceComponents const& components) noexcept:
+        _cache { components.cache },
+        _scheduler { components.scheduler },
+        _compile { components.compile },
+        _node { components.node }
     {
     }
 
@@ -872,6 +901,12 @@ class MergedResponder final: public IFrameResponder
                 return _scheduler;
             case CompileCacheWire::VerbFamily::Compile:
                 return _compile;
+            case CompileCacheWire::VerbFamily::Node:
+                // Answerable by a node that runs no component at all, which is the
+                // whole point of the family: *what do you serve?* must work on the
+                // emptiest node in the fleet, so this owner is never null in a built
+                // node the way the other three legitimately are.
+                return _node;
             case CompileCacheWire::VerbFamily::Unset:
                 return nullptr;
         }
@@ -1131,6 +1166,7 @@ class MergedResponder final: public IFrameResponder
     IFrameResponder* _cache;
     IFrameResponder* _scheduler;
     IFrameResponder* _compile;
+    IFrameResponder* _node;
 };
 
 } // namespace FastCache::Node

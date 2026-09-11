@@ -3,6 +3,7 @@
 
 #include "CliAnswer.hpp"
 #include "MemcachedClient.hpp"
+#include "NodeClient.hpp"
 #include "RespClient.hpp"
 #include "StatsSource.hpp"
 
@@ -34,7 +35,12 @@ enum class Wire : std::uint8_t
 {
     Resp,      ///< RESP on the data port.
     Memcached, ///< The memcached text protocol on the same port.
-    Stats,     ///< Whatever the stats ladder chooses; see StatsSource.hpp.
+    /// The `0xFC` compile-cache wire, which is the ONLY thing
+    /// `fastcache-compile-node` speaks. Measured against the running node: RESP
+    /// `PING`, RESP `INFO` and memcached `version` each closed having sent nothing,
+    /// while a `0xFC` header got a proper refusal.
+    Node,
+    Stats, ///< Whatever the stats ladder chooses; see StatsSource.hpp.
     Last,
 };
 
@@ -88,6 +94,15 @@ struct WireSpec
     /// Stated per row rather than derived from `wire`, so a future wire needing BOTH
     /// connections is a row that says so rather than a special case at the call site.
     bool needsMemcached;
+
+    /// Whether a caller must open a `0xFC` connection for a verb on this wire.
+    ///
+    /// `Stats` says **yes**, which is the column doing real work rather than repeating
+    /// `wire`: the ladder's `/metrics` rung needs an admin address, and since #431 the
+    /// way it gets one when the operator named none is to ask the node over `0xFC`
+    /// where its admin surface is. So `stats` opens three connections and each rung
+    /// says which it needed, rather than `main` deciding.
+    bool needsNode;
 };
 
 /// The value `VerbOptions::ttlSeconds` carries when the operator named no TTL.
@@ -123,6 +138,7 @@ struct VerbContext
     VerbOptions options {};                    ///< The modifiers.
     IExchange* resp { nullptr };               ///< The RESP connection, or null.
     IMemcachedExchange* memcached { nullptr }; ///< The memcached-text connection, or null.
+    INodeExchange* node { nullptr };           ///< The `0xFC` connection, or null.
     IStatsGatherer* stats { nullptr };         ///< The stats ladder, or null.
 };
 
@@ -137,21 +153,34 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .available = [](VerbContext const& context) { return context.resp != nullptr; },
       .authenticable = true,
       .needsResp = true,
-      .needsMemcached = false },
+      .needsMemcached = false,
+      .needsNode = false },
     { .wire = Wire::Memcached,
       .name = "memcached",
       .unavailable = "no memcached-text connection to the cache was opened",
       .available = [](VerbContext const& context) { return context.memcached != nullptr; },
       .authenticable = false,
       .needsResp = false,
-      .needsMemcached = true },
+      .needsMemcached = true,
+      .needsNode = false },
+    { .wire = Wire::Node,
+      .name = "node",
+      .unavailable = "no 0xFC connection to the node was opened",
+      .available = [](VerbContext const& context) { return context.node != nullptr; },
+      // `AUTH` IS a `0xFC` verb, unlike on the memcached wire -- so this wire can
+      // present a credential and a refusal about one is about the credential.
+      .authenticable = true,
+      .needsResp = false,
+      .needsMemcached = false,
+      .needsNode = true },
     { .wire = Wire::Stats,
       .name = "stats",
       .unavailable = "no stats source was configured",
       .available = [](VerbContext const& context) { return context.stats != nullptr; },
       .authenticable = true,
       .needsResp = true,
-      .needsMemcached = false },
+      .needsMemcached = false,
+      .needsNode = true },
 } };
 
 static_assert(RowsInEnumeratorOrder(WireTable, &WireSpec::wire),
@@ -174,10 +203,10 @@ using VerbHandler = Answer (*)(VerbContext const&);
 namespace Modifier
 {
     constexpr std::uint8_t None = 0;
-    constexpr std::uint8_t Ttl = 1U << 0U;         ///< `--ttl`
-    constexpr std::uint8_t Exclusivity = 1U << 1U; ///< `--nx` and `--xx`
-    constexpr std::uint8_t Raw = 1U << 2U;         ///< `--raw`
-    constexpr std::uint8_t Everything = 1U << 3U;  ///< `--all`
+    constexpr std::uint8_t Ttl = 0b0001;         ///< `--ttl`
+    constexpr std::uint8_t Exclusivity = 0b0010; ///< `--nx` and `--xx`
+    constexpr std::uint8_t Raw = 0b0100;         ///< `--raw`
+    constexpr std::uint8_t Everything = 0b1000;  ///< `--all`
 } // namespace Modifier
 
 /// `VerbSpec::maxOperands` for a verb that takes any number.
@@ -207,6 +236,19 @@ struct VerbSpec
     std::uint8_t modifiers;
 
     VerbHandler handler; ///< What it does.
+
+    /// How to answer this verb when the endpoint turns out to be a compile node.
+    ///
+    /// **Null on almost every row, and that is the point rather than an omission.** A
+    /// compile node holds no user keyspace, so `get` has no `0xFC` equivalent and never
+    /// will -- the honest answer there is a refusal naming what the endpoint IS, not a
+    /// second attempt that cannot work. A row carrying one is a verb whose QUESTION a
+    /// node can also answer: `version` asks *what are you running*, which every
+    /// fastcache binary knows about itself.
+    ///
+    /// Reached only after the primary wire failed AND the endpoint was probed, so it
+    /// costs the common case nothing. `RunNodeFallback` is the one door.
+    VerbHandler nodeFallback;
 };
 
 /// The verbs, in the order `--help` documents them.
@@ -239,5 +281,28 @@ struct VerbSpec
 /// @param context What to run it against.
 /// @return The answer.
 [[nodiscard]] Answer RunVerb(VerbSpec const& verb, VerbContext const& context);
+
+/// Answer @p verb again, now that the endpoint has been identified.
+///
+/// **The pure half of the fallback**, so every arm is testable without a socket. What
+/// `main` contributes is acquisition alone -- opening the `0xFC` connection and running
+/// the probe -- because that file is in no test target (#370, #909) and a decision taken
+/// there is a rule nothing can be held to.
+///
+/// Three outcomes, and the middle one is the reason this is not a `bool`:
+///   - the row carries a `nodeFallback` and the endpoint is a **compile node**: run it,
+///     and the operator gets an ANSWER rather than a better-worded failure;
+///   - the endpoint was identified and there is no fallback: @p primary is returned with
+///     the identification added as an advisory, so the exit code still says what
+///     happened and the sentence says why;
+///   - the probe explained nothing: @p primary is returned unchanged, because inventing
+///     a second sentence for one fault makes it read as two.
+///
+/// @param verb The verb that could not be answered.
+/// @param context What to run against; its `node` must be the probed connection.
+/// @param kind What the endpoint turned out to be.
+/// @param primary What the verb's own wire concluded.
+/// @return The answer to report.
+[[nodiscard]] Answer RunNodeFallback(VerbSpec const& verb, VerbContext const& context, RemoteKind kind, Answer primary);
 
 } // namespace FastCache::Cli

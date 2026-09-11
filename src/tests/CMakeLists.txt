@@ -4656,11 +4656,28 @@ endif()
 if(NOT TARGET fastcached OR NOT TARGET fastcache-cli)
     message(STATUS "fastcache-cli-e2e: daemon or client not built — skipping")
 else()
+    # The node is OPTIONAL -- `FASTCACHED_BUILD_NODE` can be off -- and the eight cases
+    # that need none are worth running anyway, so it is an ARGUMENT rather than a
+    # condition on the whole registration.
+    #
+    # Resolved inside `if(TARGET ...)` rather than through a `$<TARGET_EXISTS:>`
+    # generator expression, and that is the checker's rule rather than a style
+    # preference: `target-file-guards` asks whether the QUESTION was asked, in an `if`
+    # frame it can see. A generator expression asks it at a moment nothing can scan,
+    # so a reference wearing one is indistinguishable from an unguarded one -- which
+    # is #390's failure shape, where a guard that was never a guard read as compliance.
+    set(_fc_cli_e2e_node "")
+    if(TARGET fastcache-compile-node)
+        set(_fc_cli_e2e_node "$<TARGET_FILE:fastcache-compile-node>")
+    endif()
     add_test(
         NAME "fastcache-cli-e2e"
         COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/fastcache-cli-e2e.sh"
             --fastcached "$<TARGET_FILE:fastcached>"
             --cli "$<TARGET_FILE:fastcache-cli>"
+            # Empty when the node is not built, which the script reads as *skip cases
+            # 11-13 and SAY SO*.
+            --node "${_fc_cli_e2e_node}"
     )
     # Starts real daemons on drawn ports, so it must not race the other
     # server-starting smoke tests.

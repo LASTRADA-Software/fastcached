@@ -137,7 +137,10 @@ TEST_CASE("falling back to the thin source carries its caveat", "[cli][stats]")
     // holds; the case below drives a different size, because one case cannot tell a
     // derivation from a second constant.
     CHECK(Mentions(answer, "RESP INFO on the data port returned 1 field(s)"));
-    CHECK(Mentions(answer, "--admin-port"));
+    // The flag as this binary SPELLS it. `--admin-port` stood here and exists in no
+    // option table -- a remedy nobody can type is worse than none, because it sends an
+    // operator to the help text for a flag that was never there.
+    CHECK(Mentions(answer, "--admin-addr"));
     // And the number is NOT the rendered row count: `source` is prepended after the
     // record is read, so a count taken from the rendered value would say 2 here. Those
     // two neighbouring numbers are what put a wrong `seven` in this advisory.

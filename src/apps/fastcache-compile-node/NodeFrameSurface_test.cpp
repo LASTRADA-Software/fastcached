@@ -333,7 +333,7 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     // listener cannot decide that by existing.
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
 
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Fetch))) == "cache");
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Store))) == "cache");
@@ -363,7 +363,7 @@ TEST_CASE("A progress cadence is routed to the surface that does the slow work",
     NamedResponder compile { "compile" };
     compile.SetProgressInterval(std::chrono::milliseconds { 250 });
 
-    MergedResponder responder { &cache, &scheduler, &compile };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler, .compile = &compile } };
 
     CHECK(responder.ProgressInterval(static_cast<std::uint8_t>(Wire::Op::Compile))
           == std::optional { std::chrono::milliseconds { 250 } });
@@ -390,7 +390,7 @@ TEST_CASE("A peer watch is routed to the surface whose work it would abandon", "
     NamedResponder scheduler { "scheduler" };
     NamedResponder compile { "compile" };
     compile.SetPeerWatchCounter(IMetricsSink::Counter::WorkerJobsAbandonedClientGone);
-    MergedResponder responder { &cache, &scheduler, &compile };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler, .compile = &compile } };
 
     CHECK(responder.PeerWatchCounter(static_cast<std::uint8_t>(Wire::Op::Compile))
           == std::optional { IMetricsSink::Counter::WorkerJobsAbandonedClientGone });
@@ -476,7 +476,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
 
     CacheResponder cacheResponder { proxy, locality, metrics };
     CompileResponder compileResponder { protocol, capacity, membership, pool, io.Reactor(), metrics, logger };
-    MergedResponder responder { &cacheResponder, nullptr, &compileResponder };
+    MergedResponder responder { SurfaceComponents { .cache = &cacheResponder, .compile = &compileResponder } };
 
     constexpr auto* peer = "10.0.0.1";
 
@@ -518,7 +518,7 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // `Cc::CacheProtocol` steps over rather than treating as fatal, so a launcher that
     // meets it carries on and compiles.
     NamedResponder scheduler { "scheduler" };
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    MergedResponder schedulerOnly { SurfaceComponents { .scheduler = &scheduler } };
 
     auto const fetch = AnswerNow(schedulerOnly, HeaderFor(Wire::Op::Fetch));
     CHECK(ErrorOf(fetch) == Wire::UnimplementedVerb);
@@ -529,7 +529,7 @@ TEST_CASE("A verb no component serves is refused as unimplemented", "[node][merg
     // #290's second half -- so the refusal is about a MISSING COMPONENT exactly as the
     // cache one above is, and a node passing a null one gets the honest code.
     NamedResponder cache { "cache" };
-    MergedResponder both { &cache, &scheduler, nullptr };
+    MergedResponder both { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
     CHECK(ErrorOf(AnswerNow(both, HeaderFor(Wire::Op::Compile))) == Wire::UnimplementedVerb);
 
     // **And none of them is counted, which was decided rather than left out** (#447).
@@ -548,7 +548,7 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     // nowhere from costing the surface a buffer -- the property #285 is about, held for
     // the new refusal as well as for the old ones.
     NamedResponder scheduler { "scheduler" };
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    MergedResponder schedulerOnly { SurfaceComponents { .scheduler = &scheduler } };
 
     auto const refusal = schedulerOnly.RefusePeer("10.0.0.1", static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(refusal.has_value());
@@ -577,7 +577,7 @@ TEST_CASE("The credential answer follows the verb, not the surface", "[node][mer
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
     scheduler.RequireAuth(true);
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
 
     CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Fetch)));
     CHECK(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Lease)));
@@ -594,7 +594,7 @@ TEST_CASE("A refusal is counted against the component that owned the verb", "[no
     // wrong subsystem, and naming the subsystem is what these counters are read for.
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
-    MergedResponder responder { &cache, &scheduler, nullptr };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
 
     (void) responder.RefusalReply(Wire::PrePayloadDecision::PayloadTooLarge, static_cast<std::uint8_t>(Wire::Op::Store), {});
     (void) responder.RefusalReply(Wire::PrePayloadDecision::Unauthenticated, static_cast<std::uint8_t>(Wire::Op::Lease), {});
@@ -640,7 +640,7 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
     NamedResponder scheduler { "scheduler" };
     scheduler.PlaceCeilings(SchedulerRequest, SchedulerOpen, SchedulerInFlight);
 
-    MergedResponder both { &cache, &scheduler, nullptr };
+    MergedResponder both { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
     CHECK(both.MaxRequestBytes() == CacheRequest);
     CHECK(both.MaxInFlightBytes() == CacheInFlight);
     // The largest, not the smallest: this one surface carries both populations, and
@@ -649,7 +649,7 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
 
     // A surface with one component reports that component's, never a fold over a
     // null one.
-    MergedResponder schedulerOnly { nullptr, &scheduler, nullptr };
+    MergedResponder schedulerOnly { SurfaceComponents { .scheduler = &scheduler } };
     CHECK(schedulerOnly.MaxRequestBytes() == SchedulerRequest);
     CHECK(schedulerOnly.MaxOpenConnections() == SchedulerOpen);
     CHECK(schedulerOnly.MaxInFlightBytes() == SchedulerInFlight);
@@ -668,7 +668,7 @@ TEST_CASE("A node with neither component opens no 0xFC port", "[node][node-surfa
     AtomicMetricsSink metrics;
     auto const [cfg, port] = BaseConfig();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, nullptr, std::nullopt, metrics, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents {}, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "serving no 0xFC port"));
@@ -696,7 +696,8 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     REQUIRE_FALSE(cfg.serveScheduler);
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, nullptr, nullptr, &compile, std::nullopt, metrics, logger);
+    auto surface =
+        StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .compile = &compile }, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface != nullptr);
 
@@ -716,7 +717,7 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::nullopt, metrics, logger);
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .cache = &cache }, std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
@@ -806,8 +807,8 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of this case, so the two must differ.
     cfg.advertise = "worker-01.internal:1";
 
-    auto surface =
-        StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { handed.Release() }, metrics, logger);
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .cache = &cache }, std::optional { handed.Release() }, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
 
@@ -848,7 +849,8 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // Not a descriptor. `Adopt` answers this without touching it, which is also why
     // there is nothing here to close: ownership passes on every path, including the
     // ones that fail.
-    auto refused = StartNodeSurfaceOrExplain(io, cfg, &cache, nullptr, nullptr, std::optional { -1 }, metrics, logger);
+    auto refused =
+        StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .cache = &cache }, std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("socket-activated"));
 }
@@ -909,7 +911,12 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE(holder->IsBound());
 
         auto refused = StartNodeSurfaceOrExplain(
-            io, cfg, &cache, shape.serveScheduler ? &scheduler : nullptr, nullptr, std::nullopt, metrics, logger);
+            io,
+            cfg,
+            SurfaceComponents { .cache = &cache, .scheduler = shape.serveScheduler ? &scheduler : nullptr },
+            std::nullopt,
+            metrics,
+            logger);
         REQUIRE_FALSE(refused.has_value());
 
         // The flag, so an operator knows what to edit.
