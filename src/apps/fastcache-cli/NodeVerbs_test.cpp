@@ -66,6 +66,32 @@ namespace
     return field == nullptr ? nullptr : &field->value;
 }
 
+/// The value of a record field, with its presence REQUIRED.
+///
+/// **Returns a REFERENCE, and that is the fix rather than a convenience.**
+/// `CellOf(answer, name)->lexical` reads a `std::string` through a pointer that is null
+/// for a field the answer does not carry, so a missing field SEGFAULTS the binary
+/// instead of failing the check -- and a crashed Catch2 binary reports zero failures in
+/// every summary format there is, so the test written to detect a missing field is the
+/// one that cannot report it.
+///
+/// GCC says so at `-O3`, where inlining lets `-Wnull-dereference` see the null return
+/// edge reach the dereference; no Debug build can produce that diagnostic, which is why
+/// a green local gate was not evidence here. Handing back a `Cell const&` retires the
+/// question at the CALL SITE by type -- there is no pointer left to forget to check --
+/// where seventeen hand-written guards would each have to be remembered, and nine of the
+/// ten that existed guarded a DIFFERENT key from the one being read.
+/// @param answer The answer.
+/// @param name The field.
+/// @return The cell. Fails the case rather than returning when the field is absent.
+[[nodiscard]] Cell const& RequiredCell(Answer const& answer, std::string_view name)
+{
+    INFO("required record field: " << name);
+    auto const* const cell = CellOf(answer, name);
+    REQUIRE(cell != nullptr);
+    return *cell;
+}
+
 /// The op a framed request names.
 /// @param request What was sent.
 /// @return The opcode.
@@ -99,14 +125,13 @@ TEST_CASE("`node` reports what the endpoint is", "[cli][node][verbs]")
     CHECK(OpOf(node.Sent()[0]) == static_cast<std::uint8_t>(Cc::Op::NodeStatus));
     CHECK(node.Unused() == 0);
 
-    REQUIRE(CellOf(answer, "version") != nullptr);
-    CHECK(CellOf(answer, "version")->lexical == "0.2.0-124-gd911b33e");
-    CHECK(CellOf(answer, "node-id")->lexical == "node-a");
-    CHECK(CellOf(answer, "uptime-seconds")->lexical == "3600");
-    CHECK(CellOf(answer, "components")->lexical == "cache-tier, worker");
-    CHECK(CellOf(answer, "admin-port")->lexical == "9101");
-    CHECK(CellOf(answer, "raft-port")->lexical == "9102");
-    CHECK(CellOf(answer, "admin-tls")->lexical == "false");
+    CHECK(RequiredCell(answer, "version").lexical == "0.2.0-124-gd911b33e");
+    CHECK(RequiredCell(answer, "node-id").lexical == "node-a");
+    CHECK(RequiredCell(answer, "uptime-seconds").lexical == "3600");
+    CHECK(RequiredCell(answer, "components").lexical == "cache-tier, worker");
+    CHECK(RequiredCell(answer, "admin-port").lexical == "9101");
+    CHECK(RequiredCell(answer, "raft-port").lexical == "9102");
+    CHECK(RequiredCell(answer, "admin-tls").lexical == "false");
 }
 
 TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero port", "[cli][node][verbs]")
@@ -131,8 +156,7 @@ TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero por
     SECTION("a node with no minted identity reports node-id ABSENT, not empty")
     {
         // An empty string renders as a value somebody could paste into `--raft-peer`.
-        REQUIRE(CellOf(answer, "node-id") != nullptr);
-        CHECK(CellOf(answer, "node-id")->kind == CellKind::Absent);
+        CHECK(RequiredCell(answer, "node-id").kind == CellKind::Absent);
     }
 
     SECTION("and a node running no component says `none` rather than nothing")
@@ -140,9 +164,8 @@ TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero por
         // The converse of the rule above, and it is the half that gets collapsed: a node
         // that runs no component IS a reading. Absent there would say *I could not find
         // out*, which sends an operator to check a connection that worked.
-        REQUIRE(CellOf(answer, "components") != nullptr);
-        CHECK(CellOf(answer, "components")->kind == CellKind::Text);
-        CHECK(CellOf(answer, "components")->lexical == "none");
+        CHECK(RequiredCell(answer, "components").kind == CellKind::Text);
+        CHECK(RequiredCell(answer, "components").lexical == "none");
     }
 }
 
@@ -159,9 +182,8 @@ TEST_CASE("`node` reports a component bit this client has no name for", "[cli][n
                                                 .components = Cc::NodeComponentBit::Worker | Unknown }) } };
 
     auto const answer = RunNodeVerb("node", node);
-    REQUIRE(CellOf(answer, "components") != nullptr);
-    CHECK(CellOf(answer, "components")->lexical.contains("worker"));
-    CHECK(CellOf(answer, "components")->lexical.contains("unknown(0x80)"));
+    CHECK(RequiredCell(answer, "components").lexical.contains("worker"));
+    CHECK(RequiredCell(answer, "components").lexical.contains("unknown(0x80)"));
 }
 
 TEST_CASE("`node-metrics` reports every counter the node sent", "[cli][node][verbs]")
@@ -181,13 +203,11 @@ TEST_CASE("`node-metrics` reports every counter the node sent", "[cli][node][ver
     REQUIRE(node.Sent().size() == 1);
     CHECK(OpOf(node.Sent()[0]) == static_cast<std::uint8_t>(Cc::Op::NodeMetrics));
 
-    REQUIRE(CellOf(answer, "fastcache_worker_jobs_completed_total") != nullptr);
-    CHECK(CellOf(answer, "fastcache_worker_jobs_completed_total")->lexical == "12");
+    CHECK(RequiredCell(answer, "fastcache_worker_jobs_completed_total").lexical == "12");
 
     // The zero row is PRESENT, which is the property a reading of only the non-zero
     // counter cannot see.
-    REQUIRE(CellOf(answer, "fastcache_worker_jobs_refused_no_capacity_total") != nullptr);
-    CHECK(CellOf(answer, "fastcache_worker_jobs_refused_no_capacity_total")->lexical == "0");
+    CHECK(RequiredCell(answer, "fastcache_worker_jobs_refused_no_capacity_total").lexical == "0");
 }
 
 TEST_CASE("A node verb's refusal is reported by name and exits `refused`", "[cli][node][verbs]")
@@ -332,12 +352,12 @@ TEST_CASE("`version` is ANSWERED by a compile node rather than merely explained"
 
     CHECK(answer.outcome == Outcome::Affirmative);
     REQUIRE(answer.value.shape == Shape::Record);
-    CHECK(CellOf(answer, "server")->lexical == "0.2.0-125-g6ba32b30");
+    CHECK(RequiredCell(answer, "server").lexical == "0.2.0-125-g6ba32b30");
     CHECK(CellOf(answer, "client") != nullptr);
 
     // WHICH kind of server, so two version strings are not read as two builds of one
     // binary: a node and a daemon version alike and are different programs.
-    CHECK(CellOf(answer, "server_kind")->lexical == "fastcache-compile-node");
+    CHECK(RequiredCell(answer, "server_kind").lexical == "fastcache-compile-node");
 
     // The primary failure is GONE rather than carried alongside: the command succeeded,
     // and a leftover *could not be read* beside an answer reads as a partial failure.
@@ -446,8 +466,12 @@ TEST_CASE("A fallback that cannot reach the node still reports the client half",
     CHECK(answer.outcome == Outcome::Unreachable);
     REQUIRE(answer.value.shape == Shape::Record);
     CHECK(CellOf(answer, "client") != nullptr);
-    REQUIRE(CellOf(answer, "server") != nullptr);
-    CHECK(CellOf(answer, "server")->kind == CellKind::Absent);
+
+    // **Present, carrying an Absent KIND** -- which is a different claim from the field
+    // being missing, and the two must not collapse into one. `RequiredCell` keeps them
+    // apart: it fails the case when there is no cell at all, so what this line asserts is
+    // the kind of a cell that is there.
+    CHECK(RequiredCell(answer, "server").kind == CellKind::Absent);
 }
 
 TEST_CASE("Exactly one verb carries a 0xFC fallback today, and it is `version`", "[cli][node][fallback]")
