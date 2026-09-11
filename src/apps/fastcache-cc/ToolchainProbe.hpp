@@ -183,6 +183,36 @@ struct ToolchainFileScan
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
+/// What one identity probe learned, so a caller need not spawn the driver twice.
+///
+/// The banner and the target triple are two questions with ONE answer on a clang
+/// driver: `-###` prints the version line first and the `-cc1` line below it. Asking
+/// `--version` and then `-###` is a second spawn per translation unit -- and the
+/// launcher is one process per unit, so that is a second spawn per unit of the whole
+/// build (#1237).
+///
+/// `driverOutput` is empty exactly when the merged probe was NOT taken, which is the
+/// signal a caller needs: it must then discover the target the ordinary way. It is
+/// not a `bool` beside the string, because two fields that can disagree are two
+/// states nothing could describe.
+struct DriverIdentityProbe
+{
+    std::string banner;       ///< The identity line, or the basename fallback.
+    std::string driverOutput; ///< The `-###` output the banner came from; empty otherwise.
+};
+
+/// Ask a driver who it is, in as few spawns as that driver allows.
+///
+/// `CompilerBanner` is this function's `banner` and nothing else, so both ends of the
+/// fleet move together: the compile node folds that same string into its fingerprint,
+/// and two spellings would put every worker permanently out of agreement with every
+/// client -- silently, as a scheduler that simply never matches.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler The compiler to ask.
+/// @return The banner, and the driver output it came from when the two were merged.
+[[nodiscard]] DriverIdentityProbe ProbeDriverIdentity(IProcessRunner& runner, std::string const& compiler);
+
 /// A short, readable name for a compiler: what it is, and which version.
 ///
 /// The fingerprint is the right IDENTITY and the wrong label. It stopped being
@@ -421,6 +451,18 @@ struct IncludeSearchRoots
 /// @return Its target triple; empty when this driver has none to state or would not
 ///         say.
 [[nodiscard]] std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec);
+
+/// Read a target triple out of driver output already in hand.
+///
+/// The half of `DiscoverTargetTriple` that does not spawn, so a caller holding the
+/// `-###` output from `ProbeDriverIdentity` reaches the same answer without asking
+/// the driver a second time. Which line is authoritative stays the TABLE's answer
+/// rather than the caller's -- there is no second place that decides it.
+///
+/// @param spec The driver's table row.
+/// @param driverOutput What the driver printed, as `DriverIdentityProbe::driverOutput`.
+/// @return Its target triple; empty when this driver has none to state.
+[[nodiscard]] std::string TargetTripleFromDriverOutput(DriverSpec const& spec, std::string_view driverOutput);
 
 /// Ask a driver where it searches for system headers.
 ///
