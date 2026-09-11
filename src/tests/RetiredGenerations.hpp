@@ -82,9 +82,8 @@ void RequireGenerationsPopulated(std::span<Generation<Key> const> rows)
 /// @return Whether it is non-empty lowercase hex.
 [[nodiscard]] inline bool IsHexDigest(std::string_view text)
 {
-    return !text.empty() && std::ranges::all_of(text, [](char const c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-    });
+    return !text.empty()
+           && std::ranges::all_of(text, [](char const c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
 /// Require that a live digest and its table can meaningfully be compared at all.
@@ -129,8 +128,7 @@ void RequireDigestsComparable(std::string_view live, std::span<Generation<Key> c
     for (auto const& row: rows)
     {
         INFO("retired generation " << RenderGenerationKey(row.key) << " carries '" << row.digest
-                                   << "', which is not a digest of the same construction as the live one ("
-                                   << live.size()
+                                   << "', which is not a digest of the same construction as the live one (" << live.size()
                                    << " characters). Such a row forbids nothing while the table still reports "
                                       "itself populated.");
         REQUIRE(IsHexDigest(row.digest));
@@ -139,8 +137,7 @@ void RequireDigestsComparable(std::string_view live, std::span<Generation<Key> c
     for (auto const i: std::views::iota(std::size_t { 1 }, rows.size()))
         for (auto const j: std::views::iota(std::size_t { 0 }, i))
         {
-            INFO("retired generations " << RenderGenerationKey(rows[j].key) << " and "
-                                        << RenderGenerationKey(rows[i].key)
+            INFO("retired generations " << RenderGenerationKey(rows[j].key) << " and " << RenderGenerationKey(rows[i].key)
                                         << " carry the SAME digest, so one comparison covers both and one of "
                                            "them is guarded by nothing.");
             REQUIRE(rows[i].digest != rows[j].digest);
@@ -162,9 +159,14 @@ void RequireDigestsComparable(std::string_view live, std::span<Generation<Key> c
 ///     rows in the same commit that retired generation 1), a retired digest describes
 ///     the corpus as that generation met it and nothing can re-derive it. The live
 ///     value then differs from it for a reason that has nothing to do with the bump,
-///     and this check cannot fail. Use the structural pair below instead, and see
-///     [#583](https://github.com/LASTRADA-Software/fastcached/issues/583) for what it
-///     would take to make a retired row mean something again.
+///     and this check cannot fail. Use the structural pair below instead.
+///
+/// What a growing corpus gets instead of this check is a PER-ROW freeze, which
+/// `CompileValue_test.cpp` carries as `Generation4Rows` and `GenerationBumps` (#583,
+/// landed): the aggregate digest is a fold, so it answers *behaviour moved* and never
+/// WHICH rows moved, and which rows is the only claim a bump makes. That mechanism
+/// runs FORWARD only — generations frozen before it existed stay dated records,
+/// because re-deriving one means running its behaviour and its behaviour is gone.
 ///
 /// A table of retired rows only: the live generation is not among them, by
 /// construction, since the live construction must not reproduce any row.

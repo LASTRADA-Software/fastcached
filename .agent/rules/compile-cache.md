@@ -542,9 +542,8 @@ same on both — the same defect with no MSVC anywhere near it.
           inputs are FROZEN**, as this case's `KeyInputs` are; where they GROW it is vacuous,
           which is why the stored-value table one section down asserts structurally instead
           (#548, and the header states the distinction at the helper rather than at either
-          caller). Rows reach
-          back only to `v3`, because issue #63 moved the digest itself and `v2` and earlier are
-          unreachable by construction rather than by tag.
+          caller). Rows reach back only to `v3`, because issue #63 moved the digest itself
+          and `v2` and earlier are unreachable by construction rather than by tag.
     - One diagnostic consequence of the drop that used to happen: the launcher's
       `dependency set: 0 of M reported path(s) keyed` line was reachable for a second reason,
       so that fingerprint stopped identifying the #66 short-name mismatch on its own. The two
