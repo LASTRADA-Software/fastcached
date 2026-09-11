@@ -1192,6 +1192,39 @@ and any member of the cluster is then told to admit it:
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
 ```
 
+It prints back the two things the leader wrote down:
+
+```
+recorded, as received:
+  member id           n4
+  consensus endpoint  10.0.0.4:6680
+
+Appended, not committed: a majority has to take it, and this leader cannot
+see that yet. Ask for the cluster state again to see the result.
+
+Compare both lines above against the machine itself -- the id it minted into
+--cluster-dir, and the address it answers consensus on (--raft-self with
+--listen-raft). They are two spellings of one thing, and nothing else
+compares them.
+```
+
+**Read both lines against the machine you are bringing in, because that comparison
+is the whole reason they are printed.** The address typed here and the one that node
+answers consensus on — `--raft-self` together with `--listen-raft` — are two spellings
+of one address, and nothing compares them for you. The id is the same story: the
+joiner mints its own into `--cluster-dir`, and the one typed here has to match it.
+
+When they disagree the result is a member that is in the cluster's configuration and
+contacts nobody. At three members or more that presents as an election storm which
+then settles, so the symptom points at consensus rather than at the character you
+mistyped — which is why one address can cost an afternoon, and why comparing two
+printed strings is worth the ten seconds.
+
+**Recorded is not in force, and the report says so.** The leader knows what it wrote
+into the command the instant it writes it; whether a majority has taken it, it cannot
+know until one answers. So the wording stops at *appended* — ask `--cluster-status`
+again to see the result.
+
 **`--raft-join` is not optional and its absence is not a smaller mistake.** Without
 it that command line bootstraps a cluster *of n4*: it elects itself, takes a term
 and a log of its own, and afterwards refuses `AppendEntries` from every leader its
