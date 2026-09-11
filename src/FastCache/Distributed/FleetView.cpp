@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <iterator>
@@ -15,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace FastCache::Distributed
@@ -382,7 +384,7 @@ namespace
     };
 
     /// What a worker row shows.
-    constexpr std::array<FleetColumn<WorkerReport>, 9> WorkerColumns {
+    constexpr std::array<FleetColumn<WorkerReport>, 11> WorkerColumns {
         FleetColumn<WorkerReport> { .name = "id",
                                     .help = "The id this leader assigned at registration.",
                                     .format = CellFormat::Text,
@@ -447,6 +449,35 @@ namespace
             .decor = CellDecor::Freshness,
             .project =
                 [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.heartbeatAge.count())); } },
+        // The two below are one answer in two cells, and neither half means much
+        // alone (#1297). A worker whose toolchain the scheduler never selects is
+        // healthy from every other angle on this page -- it registered, it
+        // heartbeats, its refusal counters are zero -- because nothing ever arrives
+        // to be refused, so no counter moves on either machine. "Registered forty
+        // minutes, never picked" is the one-line answer, and it needs the age of the
+        // registration beside the absence to be worth anything: an empty
+        // `last-picked-age` says nothing at all one second after a node comes up.
+        FleetColumn<WorkerReport> {
+            .name = "registered-age",
+            .help = "Since this entry last registered. Read it beside last-picked-age: never picked matters at forty "
+                    "minutes and means nothing at one second.",
+            .format = CellFormat::Millis,
+            .project =
+                [](WorkerReport const& w) { return FleetCell::Of(static_cast<std::uint64_t>(w.registeredAge.count())); } },
+        FleetColumn<WorkerReport> {
+            .name = "last-picked-age",
+            .help = "Since the scheduler last chose this entry. Absent means it never has -- which on a fleet that is "
+                    "building is a toolchain nothing is reaching.",
+            .format = CellFormat::Millis,
+            // Absent at the CELL, never flattened to zero. The two are opposite
+            // claims here rather than merely different: zero says a job went to this
+            // worker a moment ago, which is the healthiest reading on the row, and it
+            // would be printed for the worker in the worst state on the page.
+            .project =
+                [](WorkerReport const& w) {
+                    return w.lastPickedAge.has_value() ? FleetCell::Of(static_cast<std::uint64_t>(w.lastPickedAge->count()))
+                                                       : FleetCell::Nothing();
+                } },
     };
 
     /// What an outstanding-lease row shows.
@@ -700,6 +731,36 @@ FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept
     auto const used = totals.inFlight + totals.free;
     totals.withheld = used >= totals.registered ? 0U : totals.registered - used;
     return totals;
+}
+
+std::optional<ToolchainPickCoverage> PickCoverageFor(FleetSnapshot const& snapshot)
+{
+    // Absent, not zero, and this is the guard the header argues for: `0 never
+    // picked` on an empty fleet is the healthiest reading on the strip printed for
+    // the least healthy fleet there is. Zero has to go on meaning "every toolchain
+    // is being reached", which an empty fleet cannot claim.
+    if (snapshot.workers.empty())
+        return std::nullopt;
+
+    // Folded over a SET of fingerprints rather than over the rows: this registry
+    // keys `(fingerprint, endpoint)`, so one toolchain served by four machines is
+    // four rows, and counting rows would report one unreached toolchain as four.
+    // Views into `snapshot.workers`, which outlives this call by construction --
+    // the caller holds the snapshot.
+    std::unordered_map<std::string_view, bool> reached;
+    for (auto const& worker: snapshot.workers)
+    {
+        // OR across the siblings, never the last one's answer: a toolchain is being
+        // reached if ANY machine serving it has been chosen. Overwriting per row
+        // would make the verdict depend on which entry the map happened to visit
+        // last, so a two-machine toolchain would flicker between reached and not
+        // with nothing about the fleet changing.
+        auto const inserted = reached.try_emplace(worker.info.fingerprint, false).first;
+        inserted->second = inserted->second || worker.lastPickedAge.has_value();
+    }
+
+    auto const never = std::ranges::count_if(reached, [](auto const& entry) { return !entry.second; });
+    return ToolchainPickCoverage { .toolchains = reached.size(), .neverPicked = static_cast<std::size_t>(never) };
 }
 
 FleetSnapshot CollectFleet(FleetSources const& sources)
@@ -1348,6 +1409,35 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
                             .sub = std::format("across {} machine(s)", snapshot.nodes.size()) };
     }
 
+    /// How many of the fleet's toolchains nothing has ever been sent to.
+    ///
+    /// The one number on this strip that answers *is the fleet reaching everything
+    /// it registered* (#1297). Every other tile here counts something that happened;
+    /// this one counts something that did NOT, which is why it had no home before: a
+    /// toolchain the scheduler never selects produces no event on either machine, so
+    /// no counter moves and every other reading on this page stays healthy.
+    ///
+    /// Absent rather than `0` on an empty fleet, and the delegation is deliberate --
+    /// `PickCoverageFor` owns that decision so the page and any later reader cannot
+    /// answer it differently.
+    ///
+    /// **Expect a non-zero reading for a while after a failover or a rolling
+    /// restart, and do not chase it.** The record is this leader's and is per
+    /// registration, so a scheduler that has just taken over has chosen nobody yet,
+    /// and a node that has just re-registered starts again with nothing recorded --
+    /// both clear as soon as one job goes to each toolchain. A count that PERSISTS
+    /// while the fleet is building is the finding; the worker table's
+    /// `registered-age` beside `last-picked-age` is what separates the two.
+    KpiReadout KpiNeverPicked(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
+    {
+        auto const coverage = PickCoverageFor(snapshot);
+        if (!coverage.has_value())
+            return KpiReadout { .value = std::string { AbsentText }, .unit = {}, .sub = "no worker registered" };
+        return KpiReadout { .value = std::to_string(coverage->neverPicked),
+                            .unit = {},
+                            .sub = std::format("of {} toolchain(s) registered", coverage->toolchains) };
+    }
+
     /// One readout on the strip.
     ///
     /// A table rather than six calls: the strip is the part of this page most likely
@@ -1360,14 +1450,18 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         bool sparkline;                                                       ///< Whether it carries one.
     };
 
-    /// The strip, in the order it is read. The mockup's six, in the mockup's order.
-    constexpr std::array<KpiRow, 6> KpiTable {
+    /// The strip, in the order it is read. The mockup's six, in the mockup's order,
+    /// and one added after them rather than among them: the mockup's order is what a
+    /// reader of this page already knows, and an insertion would move six tiles to
+    /// place one.
+    constexpr std::array<KpiRow, 7> KpiTable {
         KpiRow { .label = "Dispatched", .project = KpiDispatched, .sparkline = true },
         KpiRow { .label = "Compiling now", .project = KpiCompilingNow, .sparkline = false },
         KpiRow { .label = "Cache hit rate", .project = KpiHitRate, .sparkline = false },
         KpiRow { .label = "Refused", .project = KpiRefused, .sparkline = false },
         KpiRow { .label = "Leases outstanding", .project = KpiLeases, .sparkline = false },
         KpiRow { .label = "Oldest heartbeat", .project = KpiOldestHeartbeat, .sparkline = false },
+        KpiRow { .label = "Never picked", .project = KpiNeverPicked, .sparkline = false },
     };
 
     /// The sentence a split of numbers needs beside it.

@@ -159,7 +159,15 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
     }
-    for (auto const& name: { "slots", "in-flight", "available", "limited-by", "toolchain", "compiler", "heartbeat-age" })
+    for (auto const& name: { "slots",
+                             "in-flight",
+                             "available",
+                             "limited-by",
+                             "toolchain",
+                             "compiler",
+                             "heartbeat-age",
+                             "registered-age",
+                             "last-picked-age" })
     {
         INFO("worker column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
@@ -932,10 +940,17 @@ TEST_CASE("The readouts are the strip's table, in its order", "[distributed][fle
 {
     auto const html = RenderFleetHtml(LeadingSnapshot(), SomeHistory(), 0);
 
-    // The mockup's six, and the order is what a reader's eye follows -- so it is
-    // asserted rather than left to whichever order the rows happened to be typed in.
-    constexpr std::array<std::string_view, 6> Expected { "Dispatched", "Compiling now",      "Cache hit rate",
-                                                         "Refused",    "Leases outstanding", "Oldest heartbeat" };
+    // The mockup's six and the one added after them, and the order is what a
+    // reader's eye follows -- so it is asserted rather than left to whichever order
+    // the rows happened to be typed in.
+    //
+    // Every tile, not most of them: this is the one case whose stated subject IS the
+    // strip's order, so a tile missing from this list has its position asserted by
+    // nothing at all. The #1297 tile's own cases check its CONTENT and would pass
+    // just as happily with it moved to the front or taken out.
+    constexpr std::array<std::string_view, 7> Expected { "Dispatched",  "Compiling now",      "Cache hit rate",
+                                                         "Refused",     "Leases outstanding", "Oldest heartbeat",
+                                                         "Never picked" };
     std::size_t cursor = 0;
     for (auto const& label: Expected)
     {
@@ -1216,4 +1231,143 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
     // be UTF-8, and the page is served as UTF-8 and embeds SVG, which is XML.
     CHECK(IsValidUtf8(RenderFleetJson(snapshot)));
     CHECK(IsValidUtf8(RenderFleetHtml(snapshot, NoHistory(), 10)));
+}
+
+// ---------------------------------------------------------------------------
+// #1297: the fleet report's half of "registered, and never chosen".
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// One registry entry, varying only what these cases are about.
+///
+/// A helper rather than six copies of a twelve-field literal: the cases below differ
+/// in a fingerprint, an endpoint and one optional, and a literal each would bury that
+/// under the fields none of them is testing.
+/// @param id The worker id.
+/// @param fingerprint The toolchain it serves.
+/// @param endpoint The machine it answers on.
+/// @param lastPicked Since the scheduler last chose it; absent means it never has.
+/// @return The report row.
+[[nodiscard]] WorkerReport Entry(std::string id,
+                                 std::string fingerprint,
+                                 std::string endpoint,
+                                 std::optional<std::chrono::milliseconds> lastPicked)
+{
+    return WorkerReport { .info =
+                              WorkerInfo { .id = std::move(id),
+                                           .fingerprint = std::move(fingerprint),
+                                           .endpoint = std::move(endpoint),
+                                           .slots = 8,
+                                           .inFlight = 0,
+                                           .capacity = NodeCapacity { .logicalCores = 32, .totalMemoryBytes = 64ULL << 30 },
+                                           .load = Busy(0),
+                                           .codecs = {} },
+                          .heartbeatAge = std::chrono::milliseconds { 30 },
+                          .registeredAge = std::chrono::milliseconds { 2'400'000 },
+                          .lastPickedAge = lastPicked };
+}
+
+} // namespace
+
+TEST_CASE("A worker the scheduler has chosen renders how long ago", "[distributed][fleetview][lastpicked]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 90'000 }) };
+
+    auto const json = RenderFleetJson(snapshot);
+    CHECK(json.contains(R"("last-picked-age":90000)"));
+    // The half that makes the absence below readable: forty minutes registered is
+    // what turns "never picked" from a fresh node into a finding.
+    CHECK(json.contains(R"("registered-age":2400000)"));
+}
+
+TEST_CASE("A worker nothing has been sent to renders an absence, never a zero", "[distributed][fleetview][lastpicked]")
+{
+    // Deliberately a separate case from the one above rather than a section of it:
+    // *renders an age* and *renders an absence* are two properties, and a renderer
+    // that flattened the optional to `0` would pass the first one perfectly.
+    // Zero is the worst possible substitution here -- it claims a job went to this
+    // worker a moment ago, which is the healthiest reading on the row, printed for
+    // the worker in the worst state on the page.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::nullopt) };
+
+    auto const json = RenderFleetJson(snapshot);
+    CHECK(json.contains(R"("last-picked-age":null)"));
+    CHECK_FALSE(json.contains(R"("last-picked-age":0)"));
+
+    // And a dash on the page, which is this table's spelling for the same fact.
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    CHECK(html.contains(">last-picked-age</th>"));
+}
+
+TEST_CASE("The never-picked count is over toolchains, not over registry entries", "[distributed][fleetview][lastpicked]")
+{
+    // The registry keys `(fingerprint, endpoint)`, so one toolchain served by three
+    // machines is three rows. Counting rows would report a single unreached
+    // toolchain as three and make the figure grow with the size of the fleet rather
+    // than with what is wrong with it.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "clang-cl-20-aaaa", "10.0.0.2:7100", std::nullopt),
+                         Entry("w2", "clang-cl-20-aaaa", "10.0.0.3:7100", std::nullopt),
+                         Entry("w3", "clang-cl-20-aaaa", "10.0.0.4:7100", std::nullopt),
+                         Entry("w4", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 1'000 }) };
+
+    auto const coverage = PickCoverageFor(snapshot);
+    REQUIRE(coverage.has_value());
+    CHECK(Unwrap(coverage).toolchains == 2);
+    CHECK(Unwrap(coverage).neverPicked == 1);
+}
+
+TEST_CASE("A toolchain one of its machines serves is reached, whichever machine was chosen",
+          "[distributed][fleetview][lastpicked]")
+{
+    // The fold is an OR across the siblings and not the last row's answer: a
+    // toolchain is being reached if ANY machine serving it has been chosen.
+    // Overwriting per row would make the verdict depend on which entry the map
+    // happened to visit last, so this figure would flicker with nothing about the
+    // fleet changing. Ordered with the picked entry FIRST, so a renderer that let a
+    // later unpicked sibling overwrite it is the thing that fails.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 500 }),
+                         Entry("w2", "gcc-13-abcdef", "10.0.0.3:7100", std::nullopt) };
+
+    auto const coverage = PickCoverageFor(snapshot);
+    REQUIRE(coverage.has_value());
+    CHECK(Unwrap(coverage).toolchains == 1);
+    CHECK(Unwrap(coverage).neverPicked == 0);
+}
+
+TEST_CASE("The strip counts the toolchains nothing has been sent to", "[distributed][fleetview][lastpicked]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 1'000 }),
+                         Entry("w2", "clang-cl-20-aaaa", "10.0.0.2:7100", std::nullopt) };
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    CHECK(html.contains(R"(<span class="kpi-label">Never picked</span><span class="kpi-value">1<small></small></span>)"));
+    CHECK(html.contains(KpiSub("of 2 toolchain(s) registered")));
+}
+
+TEST_CASE("A fleet with no registered worker reports no never-picked figure at all", "[distributed][fleetview][lastpicked]")
+{
+    // Absent, not `0`, and deliberately a separate case from the one above: a
+    // renderer that answered `0` here would pass every count assertion in this file
+    // while printing the healthiest reading on the strip -- *every toolchain is
+    // being reached* -- for the least healthy fleet there is, one with nothing in
+    // it. That is the exact inversion #1297 exists to prevent, one level up from
+    // the worker rows.
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = {};
+
+    CHECK_FALSE(PickCoverageFor(snapshot).has_value());
+
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+    CHECK(html.contains(
+        R"(<span class="kpi-label">Never picked</span><span class="kpi-value">&ndash;<small></small></span>)"));
+    CHECK(html.contains(KpiSub("no worker registered")));
+    CHECK_FALSE(
+        html.contains(R"(<span class="kpi-label">Never picked</span><span class="kpi-value">0<small></small></span>)"));
 }

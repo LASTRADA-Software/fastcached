@@ -11,6 +11,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -184,6 +185,59 @@ struct FleetTotals
 /// @param snapshot The gathered fleet.
 /// @return The split, saturating rather than wrapping if a ceiling exceeds what was registered.
 [[nodiscard]] FleetTotals TotalsFor(FleetSnapshot const& snapshot) noexcept;
+
+/// How many of the fleet's toolchains the scheduler has never chosen.
+///
+/// The fleet-wide complement of `WorkerReport::lastPickedAge`, and the cheaper of
+/// the two to read: a per-worker column has to be scanned, and this is one number
+/// that is zero on a fleet where every toolchain is being used
+/// ([#1297](https://github.com/LASTRADA-Software/fastcached/issues/1297)).
+///
+/// The grain is the **fingerprint**, not the registry entry and not the machine. A
+/// toolchain served by two machines where only one is ever chosen is being reached,
+/// so it is not what this counts; the failure it exists to find is a fingerprint
+/// *nothing at all* is sent to, which is what a driver family that fingerprints
+/// differently from the clients' looks like from the leader (#226). Counting over
+/// worker entries rather than `NodeReports()` is right here and is not the
+/// double-counting hazard that rule guards against: a fingerprint is a per-entry
+/// fact deduped into a set, where the fields that rule is about describe a machine
+/// and would be added once per toolchain it serves.
+struct ToolchainPickCoverage
+{
+    /// Distinct fingerprints registered right now.
+    std::size_t toolchains { 0 };
+    /// How many of those nothing has ever been sent to. Never more than `toolchains`.
+    std::size_t neverPicked { 0 };
+};
+
+/// Count the fleet's toolchains and how many of them are never chosen.
+///
+/// **Absent when no worker is registered at all**, and that is the same rule as
+/// every cell on this page rather than a special case: a fleet with nothing in it
+/// would otherwise report `0 never picked`, which is the healthiest possible
+/// reading printed for the least healthy possible fleet. Zero has to keep meaning
+/// *every toolchain is being reached*, so a fleet with no toolchains says nothing.
+///
+/// It answers *never*, not *not lately*, and the difference decides whether the
+/// number is worth reading. A windowed count is non-zero on every idle fleet --
+/// nothing is picked at three in the morning either -- so it could not carry the
+/// one claim this exists to support, that a non-zero reading on a fleet that is
+/// building means something is wrong.
+///
+/// One state reads non-zero legitimately and drains on its own, because the record
+/// is **this leader's**: a scheduler that has just been elected has chosen nobody
+/// yet, however long the fleet has been up, and so has a node whose entry lapsed and
+/// re-entered the registry. It clears as soon as one job goes to each toolchain, so
+/// it is a reading that PERSISTS which is the finding -- pair it with `registeredAge`
+/// on the worker rows, which is what says whether there has been time for a pick.
+///
+/// An ordinary re-registration is deliberately NOT such a state, and that took a
+/// fix: a node falls through to `Register` after any refused heartbeat, so clearing
+/// the record there would have spiked this figure on a healthy building fleet every
+/// time an election or a busy endpoint refused one round. See `WorkerRegistry`.
+/// @param snapshot The gathered fleet.
+/// @return The split, or absent when the fleet holds no registered worker.
+[[nodiscard]] std::optional<ToolchainPickCoverage> PickCoverageFor(FleetSnapshot const& snapshot);
 
 [[nodiscard]] FleetSnapshot CollectFleet(FleetSources const& sources);
 

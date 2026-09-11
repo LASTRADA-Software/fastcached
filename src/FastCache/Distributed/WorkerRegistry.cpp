@@ -65,6 +65,33 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
         existing->second.info.inFlight = 0;
         existing->second.info.load = {};
         existing->second.lastSeen = now;
+        // And NEITHER `registeredAt` nor `lastPickedAt` is reset here, which is the
+        // opposite of the two lines above and rests on the difference between them.
+        //
+        // The tempting reading -- that this path is a machine which restarted -- is
+        // false, and `SchedulerService::Register` already says so where it declines
+        // to release leases: a node re-registers after ANY refused heartbeat,
+        // `EndpointBusy` or `NotLeader` during an election, because
+        // `NodeAnnounce::AnnounceOnce` falls straight through from a failed
+        // `Heartbeat` to `Register` in the same round. `inFlight` and `load` can be
+        // reset on that weak premise because the next heartbeat CORRECTS them. These
+        // two have no corrective: cleared, the evidence is simply gone.
+        //
+        // What that would cost is exactly what #1297 exists to produce. An entry
+        // reading "registered 40 minutes, never picked" -- the finding -- would drop
+        // to "registered 0 seconds, never picked", which this file's own doc calls a
+        // row that says nothing, on a transient that has nothing to do with the
+        // worker. And every entry that HAD been picked would momentarily read never
+        // picked, pushing the fleet-wide count above zero on a healthy building
+        // fleet: a confident wrong signal where a vague right one was available.
+        //
+        // Kept, the failure runs the safe way. `lastPickedAt` is the LEADER's record
+        // of its own choices, and nothing a worker does changes what the scheduler
+        // did ten minutes ago; `registeredAt` then means *since this entry entered
+        // the registry*, which is the quantity that says whether there has been TIME
+        // for a pick. An entry that genuinely lapses is erased by `ExpireStale` and
+        // comes back as a new one below, with both fields fresh -- so the registry
+        // does draw the distinction, on the one piece of evidence it actually has.
         return existing->second.info.id;
     }
 
@@ -81,7 +108,12 @@ std::string WorkerRegistry::Register(WorkerRegistration const& registration)
                                                   .capacity = registration.capacity,
                                                   .load = {},
                                                   .codecs = registration.codecs },
-                             .lastSeen = now });
+                             .lastSeen = now,
+                             .registeredAt = now,
+                             // Disengaged, not `now`: nothing has been sent here yet,
+                             // and a fresh registration claiming it was just picked is
+                             // the exact false reassurance #1297 exists to remove.
+                             .lastPickedAt = std::nullopt });
     return id;
 }
 
@@ -160,15 +192,18 @@ namespace
     }
 } // namespace
 
-std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint) const
+std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint)
 {
     std::scoped_lock const guard { _mutex };
     auto const now = _clock.Now();
 
-    WorkerInfo const* best = nullptr;
+    // The ENTRY rather than its `info`, because the winner is stamped below and the
+    // record lives beside the entry rather than on the value handed to a lease --
+    // see `WorkerInfo`'s own note on why no instant may travel on that.
+    Entry* best = nullptr;
     bool sawMatch = false;
     bool sawWithdrawn = false;
-    for (auto const& [id, entry]: _workers)
+    for (auto& [id, entry]: _workers)
     {
         // Byte-identical, never "compatible". See the header: an over-strict match
         // costs a local compile, an over-loose one produces a wrong object that is
@@ -188,12 +223,21 @@ std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view finge
             sawWithdrawn = sawWithdrawn || entry.info.inFlight < entry.info.slots;
             continue;
         }
-        if (best == nullptr || PrefersFirst(entry.info, *best))
-            best = &entry.info;
+        if (best == nullptr || PrefersFirst(entry.info, best->info))
+            best = &entry;
     }
 
     if (best != nullptr)
-        return *best;
+    {
+        // Stamped HERE, inside the selection, so no caller has a separate line to
+        // omit -- and stamped on the winner alone, never on every entry sharing its
+        // endpoint the way `JobStarted` moves a machine's job count. That difference
+        // is the whole signal: a machine serving two toolchains where only one is
+        // ever chosen must be able to show the other as never picked, and a
+        // machine-wide record would mark both the instant either ran a job (#1297).
+        best->lastPickedAt = now;
+        return best->info;
+    }
     // Three refusals rather than one "no", because they are three different
     // operator problems: a fingerprint nobody serves, a fleet too small, and a
     // fleet whose machines are busy elsewhere. All three end the same way at the
@@ -310,7 +354,17 @@ std::vector<WorkerReport> WorkerRegistry::LiveWorkerReports() const
     out.reserve(_workers.size());
     for (auto const& [id, entry]: _workers)
         if (IsLive(entry, now))
-            out.push_back(WorkerReport { .info = entry.info, .heartbeatAge = AgeOf(entry.lastSeen, now) });
+            out.push_back(WorkerReport { .info = entry.info,
+                                         .heartbeatAge = AgeOf(entry.lastSeen, now),
+                                         .registeredAge = AgeOf(entry.registeredAt, now),
+                                         // Absent stays absent rather than becoming a zero or an enormous age:
+                                         // an entry nothing has been sent to has no such instant, which is a
+                                         // different fact from one picked at the epoch (#1297). Measured
+                                         // against the SAME `now` as the two above, so one snapshot's three
+                                         // ages are comparable -- asking the clock per field would let a row
+                                         // report ages taken at three different instants.
+                                         .lastPickedAge = entry.lastPickedAt.transform(
+                                             [now](TimePoint const picked) { return AgeOf(picked, now); }) });
 
     // Sorted for the reason `LiveWorkers()` sorts: an unordered_map's iteration
     // order is neither stable nor meaningful, and this feeds a page an operator
