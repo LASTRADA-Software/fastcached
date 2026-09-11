@@ -90,14 +90,177 @@ while [[ $# -gt 0 ]]; do
         --launcher)   launcher="$2";   shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
         --case)       mode="$2";       shift 2 ;;
+        --self-test)  mode="self-test"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 case "$mode" in
-    suite|membership) ;;
-    *) echo "unknown --case: ${mode} (expected 'suite' or 'membership')" >&2; exit 2 ;;
+    suite|membership|self-test) ;;
+    *) echo "unknown --case: ${mode} (expected 'suite', 'membership' or 'self-test')" >&2; exit 2 ;;
 esac
+
+# ---------------------------------------------------------------------------
+# The pure verdict decisions, and the self-test that drives them.
+#
+# Hoisted above the prerequisite gate ON PURPOSE. Everything in this block is a
+# function of its arguments -- no process, no port, no compiler, no filesystem --
+# so `--self-test` reaches it on a machine with none of the three binaries built,
+# which is the population a self-test is for. Requiring them would make the one
+# check that needs no build the one check that cannot run without one, which is
+# the reasoning `dist-compile-e2e.ps1` records for its own `-SelfTest`.
+#
+# WHAT THIS FIXTURE'S SELF-TEST COVERS IS NOT WHAT THE POWERSHELL ONE COVERS, and
+# #597 asked for the same decisions on both. They cannot be the same: the Windows
+# fixture decides whether two COFF objects are equivalent, excusing named sections
+# and a timestamp, and this one reads DWARF attributes out of whichever of three
+# readers a host has. Two object formats, two grammars, two different decisions --
+# so a correspondence by DECISION is a claim neither file could keep, and one
+# asserted anyway would be a name for coverage that does not exist. What IS kept is
+# the property worth having: each fixture's own verdict arithmetic is driven over
+# synthetic input by a check that needs no build. Said here rather than assumed.
+# ---------------------------------------------------------------------------
+
+# Whether a reader's output is a DWARF dump at all, rather than merely output.
+#
+# "Wrote something to stdout" is a different question: libdwarf's `dwarfdump` takes
+# `-i`, not `--debug-info`, and a reader that answers an unknown option with usage
+# text ON STDOUT would be classified as having read the object -- which turns the
+# SKIPPED state into a failure of the SUBJECT, the exact collapse the reader
+# selection exists to prevent. So the dump must name a compile unit, in one of the
+# three renderings. Exit status is not enough on its own: a reader can exit 0 having
+# printed a banner.
+#
+# A predicate of its own rather than a line inside `dwarf_dump_with`, so the decision
+# can be driven with no reader installed (#597).
+#
+# @param 1 the reader's whole output
+dump_names_a_compile_unit() {
+    grep -qE 'DW_TAG_compile_unit|TAG_compile_unit|Compilation Unit' <<< "$1"
+}
+
+# The FIRST attribute matching a pattern, in whichever of the three renderings this
+# platform's reader produces.
+#
+# The dump arrives as an ARGUMENT, never on a pipe: `producer | awk` with an exiting
+# awk is a false negative under `set -o pipefail`, and it fails on the success path.
+# $1 is the dump, $2 an awk pattern.
+dwarf_attr_of() {
+    awk -v want="$2" '$0 ~ want {
+             if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+             line = $0; sub(/.*: */, "", line)
+             gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
+         }' <<< "$1"
+}
+
+comp_dir_of() {
+    dwarf_attr_of "$1" "comp_dir"
+}
+
+# The compile unit's `DW_AT_name`: the source file as the compiler recorded it.
+#
+# The FIRST `AT_name` in the dump, which is the compile unit's -- every function and
+# type carries one too, and the CU DIE is emitted first in all three renderings. It
+# cannot collide with `comp_dir`, which no reader spells with `name` in it.
+source_name_of() {
+    dwarf_attr_of "$1" "AT_name"
+}
+
+# Drive every decision above over staged text. No process, no port, no compiler.
+_selftest_cases=0
+_selftest_failures=0
+
+_check() {
+    _selftest_cases=$((_selftest_cases + 1))
+    if [[ "$1" == "y" ]]; then
+        echo "   ok   $2"
+    else
+        echo "   FAIL $2"
+        _selftest_failures=$((_selftest_failures + 1))
+    fi
+}
+
+_is() { [[ "$1" == "$2" ]] && echo y || echo n; }
+
+run_self_test() {
+    local readelf_dump dwarfdump_dump llvm_dump pair which dump
+
+    # `metric_value`'s grammar is NOT here. #643 moved that function into
+    # `scripts/lib/e2e-common.sh`, so its six cases moved to
+    # `scripts/check-e2e-helpers.sh` (`metric-value-grammar`) -- beside the function
+    # rather than beside the fixture that used to own it. Asserting it here as well
+    # would be a second copy of a decision with one home, and keeping a private
+    # `metric_value` to assert against is what this repository's own scan refuses.
+
+    # ---- dump_names_a_compile_unit ---------------------------------------
+    _check "$(dump_names_a_compile_unit 'DW_TAG_compile_unit' && echo y || echo n)" \
+           "readelf's rendering is recognised as a dump"
+    _check "$(dump_names_a_compile_unit 'TAG_compile_unit' && echo y || echo n)" \
+           "dwarfdump's rendering is recognised as a dump"
+    _check "$(dump_names_a_compile_unit 'Compilation Unit @ offset 0x0' && echo y || echo n)" \
+           "llvm-dwarfdump's rendering is recognised as a dump"
+
+    # The case the predicate exists for: a reader that printed USAGE on stdout and
+    # exited 0. Classified as a dump, it turns "no reader on this host" into "the
+    # object carries no debug info" -- a verdict about the SUBJECT drawn from a fact
+    # about the instrument.
+    _check "$(dump_names_a_compile_unit 'usage: dwarfdump [options] file' && echo n || echo y)" \
+           "a reader that printed usage instead of a dump is NOT one"
+    _check "$(dump_names_a_compile_unit '' && echo n || echo y)" "and neither is silence"
+
+    # ---- dwarf_attr_of and its two callers -------------------------------
+    readelf_dump=$'    <10>   DW_AT_producer    : GNU C++17\n    <1e>   DW_AT_name        : src/tu.cpp\n    <2c>   DW_AT_comp_dir    : /home/build/proj\n    <40>   DW_AT_name        : someFunction\n'
+    llvm_dump=$'0x0000000b: DW_TAG_compile_unit\n              DW_AT_name\t("src/tu.cpp")\n              DW_AT_comp_dir\t("/home/build/proj")\n'
+    dwarfdump_dump=$'< 1><0x0000000b>    TAG_compile_unit\n                      AT_name                     "src/tu.cpp"\n                      AT_comp_dir                 "/home/build/proj"\n'
+
+    # All three renderings, because the reader a host has is an accident of its
+    # packaging and a grammar that works on one is not evidence about the others.
+    for pair in "readelf:$readelf_dump" "llvm:$llvm_dump" "dwarfdump:$dwarfdump_dump"; do
+        which="${pair%%:*}"
+        dump="${pair#*:}"
+        _check "$(_is "$(comp_dir_of "$dump")" "/home/build/proj")" \
+               "comp_dir is read from the ${which} rendering"
+        _check "$(_is "$(source_name_of "$dump")" "src/tu.cpp")" \
+               "and the source name from the ${which} rendering"
+    done
+
+    # THE FIRST `AT_name` IS THE COMPILE UNIT'S. Every function and type carries one
+    # too, and the CU DIE is emitted first in all three renderings -- so a reader
+    # taking a later one answers with a FUNCTION name, and the case comparing two
+    # objects' recorded sources then compares something else entirely while still
+    # looking like it worked. The readelf fixture carries a second `DW_AT_name` for
+    # exactly this, and it is the only case here that would survive taking the last.
+    _check "$(_is "$(source_name_of "$readelf_dump")" "src/tu.cpp")" \
+           "the FIRST AT_name wins, not a later function's"
+
+    # The two readers must answer DIFFERENT questions. One awk pattern serves both
+    # only because `comp_dir` contains no `name`; if that stopped being true, every
+    # comparison of a recorded directory against a recorded source would compare a
+    # value with itself and pass.
+    if [[ "$(comp_dir_of "$llvm_dump")" != "$(source_name_of "$llvm_dump")" ]]; then
+        _check y "comp_dir and the source name are NOT the same answer"
+    else
+        _check n "comp_dir and the source name are NOT the same answer"
+    fi
+
+    # An attribute the dump does not carry is EMPTY rather than the next line's value.
+    _check "$(_is "$(dwarf_attr_of "$llvm_dump" "AT_ranges")" "")" "a missing attribute reads empty"
+
+    # A self-test states how many cases it RAN: a run that stopped early must not look
+    # like one that judged something, and a scan that matched nothing must not read as
+    # a clean tree.
+    echo "dist-compile-e2e self-test: ${_selftest_cases} case(s), ${_selftest_failures} failure(s)"
+    if [[ "$_selftest_cases" -eq 0 ]]; then
+        echo "dist-compile-e2e self-test ran NO cases, which is a refusal rather than a pass" >&2
+        return 1
+    fi
+    [[ "$_selftest_failures" -eq 0 ]]
+}
+
+if [[ "$mode" == "self-test" ]]; then
+    run_self_test
+    exit $?
+fi
 
 readonly SKIP=77
 
@@ -1857,43 +2020,15 @@ dwarf_dump_with() {
         readelf) dump="$("$1" --debug-dump=info "$2" 2>/dev/null || true)" ;;
         *dwarfdump) dump="$("$1" --debug-info "$2" 2>/dev/null || true)" ;;
     esac
-    # A DUMP, not merely output. "Wrote something to stdout" is a different question:
-    # libdwarf's `dwarfdump` takes `-i`, not `--debug-info`, and a reader that answers
-    # an unknown option with usage text ON STDOUT would be classified as having read
-    # the object -- which turns the SKIPPED state into a failure of the subject, the
-    # exact collapse the selection below exists to prevent. So the dump must contain a
-    # compile unit, in one of the three renderings. Exit status is not enough on its
-    # own: a reader can exit 0 having printed a banner.
-    grep -qE 'DW_TAG_compile_unit|TAG_compile_unit|Compilation Unit' <<< "$dump" || return 0
+    # A DUMP, not merely output -- `dump_names_a_compile_unit` carries why, and is a
+    # predicate of its own so that the decision can be driven with no reader installed.
+    dump_names_a_compile_unit "$dump" || return 0
     printf '%s\n' "$dump"
 }
 
-# The FIRST attribute matching a pattern, in whichever of the three renderings this
-# platform's reader produces.
-#
-# The dump arrives as an ARGUMENT, never on a pipe: `producer | awk` with an exiting
-# awk is a false negative under `set -o pipefail`, and it fails on the success path.
-# $1 is the dump, $2 an awk pattern.
-dwarf_attr_of() {
-    awk -v want="$2" '$0 ~ want {
-             if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
-             line = $0; sub(/.*: */, "", line)
-             gsub(/^[ \t]+|[ \t\r]+$/, "", line); print line; exit
-         }' <<< "$1"
-}
-
-comp_dir_of() {
-    dwarf_attr_of "$1" "comp_dir"
-}
-
-# The compile unit's `DW_AT_name`: the source file as the compiler recorded it.
-#
-# The FIRST `AT_name` in the dump, which is the compile unit's -- every function and
-# type carries one too, and the CU DIE is emitted first in all three renderings. It
-# cannot collide with `comp_dir`, which no reader spells with `name` in it.
-source_name_of() {
-    dwarf_attr_of "$1" "AT_name"
-}
+# `dwarf_attr_of`, `comp_dir_of` and `source_name_of` are defined with the other pure
+# verdict decisions near the top of this file, so `--self-test` can drive them over
+# staged dump text with no reader installed (#597).
 
 # One spelling of the launcher's directory, compiled both ways and compared.
 # $1 is a label (it names the object files and the source, so the second spelling

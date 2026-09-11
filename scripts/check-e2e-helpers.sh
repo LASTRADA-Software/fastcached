@@ -1076,6 +1076,56 @@ run_case() {
         echo "the counter finding named all three terminal states"
         ;;
 
+    # --- the Prometheus grammar, against staged bodies ------------------------
+    #
+    # `metric_value` is pure and its grammar was driven by nothing: #643 moved it
+    # here from `dist-compile-e2e.sh` and this file names it once, in a comment a
+    # thousand lines below, so the decisions it makes have been asserted on no tree
+    # at all. That is #597's finding one file over -- the coverage gap did not close
+    # when the function moved, it relocated.
+    #
+    # A grammar is where a reading goes wrong QUIETLY. A wrong number looks like a
+    # counter that did not move, which is a statement about the subject rather than
+    # about the instrument, and every caller here then explains a healthy worker's
+    # silence with a confident sentence.
+    metric-value-grammar)
+        body=$'worker_jobs_total 7\nworker_jobs_refused_total 0\n'
+
+        [ "$(metric_value "$body" worker_jobs_total)" = "7" ] \
+            || fail "a series was not read by its exact name"
+
+        # ABSENT IS NOT ZERO, which is why this returns TEXT rather than a number: a
+        # counter is a tally, so 0 is the truth about events that never happened,
+        # while nothing exported is a counter that does not exist. Folding the two
+        # would make every caller's emptiness check dead code -- and
+        # `_e2e_counter_finding` above spends a whole terminal state on the
+        # difference, so a helper that could not express it would leave that state
+        # unreachable.
+        [ -z "$(metric_value "$body" worker_jobs_dispatched_total)" ] \
+            || fail "an absent series did not read empty"
+        [ "$(metric_value "$body" worker_jobs_refused_total)" = "0" ] \
+            || fail "a real zero did not read zero"
+
+        # A PREFIX is not the name. The day the exporter grows a longer sibling, a
+        # reader matching prefixes silently changes series -- a wrong number, which
+        # is worse than an empty one and invisible at every call site.
+        [ -z "$(metric_value "$body" worker_jobs)" ] \
+            || fail "a prefix of a series name matched something"
+
+        # A LABELLED series is a different grammar and is deliberately not read
+        # here: answering it would mean picking one label set with nobody having
+        # said which.
+        [ -z "$(metric_value $'worker_jobs_total{tier="l1"} 9\n' worker_jobs_total)" ] \
+            || fail "a labelled series was read as the bare one"
+
+        # LAST wins: a scrape may carry a series more than once and the later
+        # reading is the current one.
+        [ "$(metric_value $'c 1\nc 4\n' c)" = "4" ] \
+            || fail "the last reading of a repeated series did not win"
+
+        echo "the Prometheus grammar refused a prefix, a label and an absent series"
+        ;;
+
     # --- `wait_for_counter` against a real exporter ---------------------------
     #
     # `wait_for_port` first, with a bound of its own, so the counter wait starts
@@ -2644,6 +2694,10 @@ cases=(
     "counter-never-answered|1|of a 1s budget|nothing ever answered a /metrics request|!BUG:"
     "counter-dies|1|the process DIED|exit=7|COUNTER: nothing ever answered|!BUG:"
     "counter-findings|0|the counter finding named all three terminal states"
+    # The grammar under the finding. Driven by nothing until now: #643 moved
+    # `metric_value` into the library and left its decisions asserted on no tree
+    # (#597, which found the same gap on the fixture side before the move).
+    "metric-value-grammar|0|the Prometheus grammar refused a prefix, a label and an absent series|!BUG:"
     "bounded-returns-status|0|run_bounded said 'carried' with status 3"
     "bounded-missing-command|0|a missing command: outcome=unstartable|!BUG:"
     "bounded-outcome-survives-capture|0|two subshells down, the outcome reads unstartable"

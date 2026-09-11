@@ -4309,6 +4309,42 @@ else()
         message(STATUS "dist-compile-membership-e2e: POSIX-only — skipping")
     endif()
 
+    # The POSIX fixture's own verdict arithmetic, against synthetic text.
+    #
+    # The sibling of the PowerShell registration below, and it did not exist: that
+    # one was the only self-test either `dist-compile-e2e` had, so the POSIX
+    # fixture's decisions -- how a Prometheus series is read, and how a DWARF
+    # attribute is read out of whichever of three readers a host has -- were
+    # asserted nowhere, on the platform most CI legs run
+    # ([#597](https://github.com/LASTRADA-Software/fastcached/issues/597)).
+    #
+    # **The two self-tests do NOT cover the same decisions, and #597 asked that they
+    # should.** They cannot: the Windows fixture compares COFF objects and this one
+    # reads DWARF, so a correspondence by decision is a claim neither file could
+    # keep, and asserting one would name coverage that does not exist. What is kept
+    # instead is that each fixture's own verdict arithmetic is driven over synthetic
+    # input by a check needing no build -- stated in the script's own header rather
+    # than left to be inferred from the two registrations sitting next to each other.
+    #
+    # `if(NOT WIN32)` for `e2e-helpers-selftest`'s reason: the subject is a POSIX
+    # shell fixture. Not "smoke" -- it starts no daemon, opens no socket and runs no
+    # compiler, so it belongs in the default set beside its Windows sibling.
+    if(NOT WIN32)
+        add_test(
+            NAME "dist-compile-e2e-posix-selftest"
+            COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh" --self-test
+        )
+        set_tests_properties("dist-compile-e2e-posix-selftest" PROPERTIES
+            LABELS "hygiene"
+            TIMEOUT 120
+        )
+    else()
+        # Said out loud, for the reason the membership guard above gives: a platform
+        # guard with no `else()` is a test that does not exist there with nothing in
+        # the configure log to say so.
+        message(STATUS "dist-compile-e2e-posix-selftest: POSIX-only — skipping")
+    endif()
+
     # The Windows fixture's object comparison, against synthetic COFF input.
     #
     # NOT labelled "smoke", deliberately: it starts no daemon, opens no socket and
