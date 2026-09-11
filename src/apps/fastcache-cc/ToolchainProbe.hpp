@@ -245,7 +245,28 @@ struct DriverIdentityProbe
 /// `-###` leads with `Using built-in specs.`, so a comparison that could not tell the
 /// two apart would have been visible.
 ///
-/// Seven drivers on two hosts is not a fleet, so the property is not left as an
+/// Asserted ACROSS THE CHANGE as well, which is the question the comparison above
+/// does not answer: the launcher's own `--print-toolchain-fingerprint`, run from a
+/// binary built before this change and one built after, over 11 drivers on one host
+/// (2026-09-11, Release, `USE_COMPILER_CACHE=OFF`, both binaries from the same
+/// tree). **11 identical, 0 differing** -- 8 clang-family and, as the arm that must
+/// not move because it takes no merged path at all, gcc, g++ and gcc-13.
+///
+/// Three controls, because that table is worthless if the measurement cannot see a
+/// difference:
+///
+///   * DETERMINISM -- the before binary against itself, twice per driver: stable.
+///   * DISCRIMINATION -- the 11 rows carry 5 distinct fingerprints, so the
+///     comparison is not reporting one constant.
+///   * SENSITIVITY TO THE BANNER, which is the one that matters. A stand-in that is
+///     `clang-22` in every respect except that it doctors the first line of
+///     `--version`, passing `-###` through: the BEFORE binary moves from
+///     `347f188d...` to `368004917...`, so the banner really is folded into the
+///     fingerprint; the AFTER binary reads `-###` and answers `347f188d...`, the
+///     real one. That third reading is also the failure mode drawn in miniature --
+///     when the two spellings disagree, the fingerprint moves.
+///
+/// Eleven drivers on one host is not a fleet, so the property is not left as an
 /// assumption. `scripts/check-banner-probe-identity.sh` asks it of every merged-path
 /// driver on whatever machine runs the suite, skipping-and-naming where there is
 /// none. **That check is what stands in for the bump.** Bumping unconditionally

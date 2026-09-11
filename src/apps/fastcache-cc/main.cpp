@@ -2469,8 +2469,8 @@ void RecordManifest(InvocationRecord const& record,
     // the correction. `TargetTripleFromDriverOutput` takes the row rather than
     // assuming one, so the table stays the authority either way.
     auto const targetTriple = identity.driverOutput.empty()
-        ? Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, driver)
-        : Cc::TargetTripleFromDriverOutput(driver, identity.driverOutput);
+                                  ? Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, driver)
+                                  : Cc::TargetTripleFromDriverOutput(driver, identity.driverOutput);
 
     // Said out loud, because the failing-open story has a hole and this is the only
     // place it is visible. An empty answer on ONE end is a miss -- the two sides key
