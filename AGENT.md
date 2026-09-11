@@ -195,168 +195,65 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Only machine-independent dependency paths are hashed, and a path is classified
   by what it *resolves to*, never by its spelling.
 - The toolchain headers the key drops are covered by the compiler's *banner*, so every
-  driver is asked for one the way it answers. `cl` has no `--version`; bare `cl` is its
-  probe, and until it was asked that way every MSVC toolset keyed as the string `cl`.
+  driver is asked for one the way it answers: `cl` has no `--version`, and bare `cl` is
+  its probe.
 - A root and the paths a driver emits are reconciled on both sides, or neither.
 - Bump `manifest-v*` whenever `objkey-v*` moves. The reverse is not required.
 - A compile that writes a second artefact (a module BMI, a PCH) is refused, not cached.
-- The compiler identity is the driver AND the target it generates for: `clang-cl`
-  takes `-fms-compatibility-version` from whatever MSVC it finds, and that is code
-  generation. The **key** folds the target, the **fingerprint** must not.
-- The FINGERPRINT folds the driver's argument GRAMMAR (`DriverGrammarName`), which is
-  a different question from the target and does not contradict the line above: the
-  target is code generation, the grammar is which spellings the driver can READ.
-  `clang-cl`, `clang++` and `clang` from one LLVM install print the same banner and own
-  one include tree, so they fingerprinted identically — and a worker looks a toolchain
-  up by fingerprint, runs its OWN driver and appends the client's `args` verbatim, so a
-  GNU driver handed `/std:c++20` read it as a filename. Distribution was silently off
-  for one family on every machine with both, with no counter moving (#226). A NAME, not
-  the enumerator's value, or reordering the enum splits every fleet; and the grammar is
-  in the cache file NAME as well as the digest, since `clang++` and `clang-cl` are both
-  symlinks to `clang` and a canonicalizing resolution gives them one path — the second
-  driver would then read the first's entry under a stamp that validates, which is a
-  false MATCH.
-- Read the `-cc1` line's `-triple`; the `Target:` header three lines above it is
-  unversioned, and pinning it changes nothing while looking like a fix.
-- An empty triple means the identity is UNCHANGED, so a driver that states nothing
-  keeps its keys.
-- Discovering a target and stating one are different questions: `gcc` is keyed on
-  its target and never handed a `--target=` it does not accept.
-- `cc` and `c++` name a policy, not a product — on macOS that is Apple clang — so
-  the banner corrects the name. It must never reclassify `clang-cl`, whose banner
-  is plain clang's.
+- The compiler identity is the driver AND the target it generates for. The **key** folds
+  the target, the **fingerprint** must not.
+- The FINGERPRINT folds the driver's argument GRAMMAR (`DriverGrammarName`) — which is
+  which spellings the driver can READ, a different question from the target. A NAME,
+  never the enumerator's value, and the grammar is in the cache file NAME as well as in
+  the digest.
+- Read the `-cc1` line's `-triple`, never the unversioned `Target:` header. An empty
+  triple means the identity is UNCHANGED, so a driver that states nothing keeps its keys.
+- Discovering a target and stating one are different questions: `gcc` is keyed on its
+  target and never handed a `--target=` it does not accept.
+- `cc` and `c++` name a policy, not a product, so the banner corrects the name — and it
+  must never reclassify `clang-cl`, whose banner is plain clang's.
 - The banner and the target triple come from ONE `-###` spawn on a `ClangDriverLine`
-  driver (one process per TU, so the second probe cost a spawn per unit: 34.2 ms to
-  22.4 on Windows/clang++, confirmed by count, 4 spawns to 3). GCC keeps both — its
-  `-###` leads with `Using built-in specs.` — `cl` has neither flag, and `cc`/`c++`
-  keep both because they classify as `Gcc` BY NAME and the probe dispatches before a
-  banner exists to correct that. **No fingerprint bump rides with it because
-  `ctest -R banner-probe-identity` asserts the two spellings are byte-identical on
-  every driver the machine has; deleting that check reopens the bump question in
-  silence**, and a driver found disagreeing is a finding, not a check to adjust.
-- A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
-  the console output code page. Decoded at `RootReconciler::Path`, or the compile is
-  not cached.
-- A stored value's `/showIncludes` region is canonicalized only if the grammar can FIND
-  a note, and `Grammar::ShowIncludes` matched the literal English marker at column zero
-  — so a localized `cl` (#879) and any note `cl` INDENTED by inclusion depth (#891) were
-  stored carrying the producing checkout's absolute paths, with every server agreeing
-  perfectly about nothing. Generation 3. The MARKER is a canonical form exactly as
-  `<SRCROOT>` is: the LAUNCHER normalizes its own prefix to `IncludeNoteMarker` before
-  storing and restores this build's after localizing, so the stored bytes are locale-free
-  and no server changed. Only the producer knows its own language, which is what forces
-  that. The restore runs AFTER the stale-hit guard, which reads the canonical marker.
-  Recognition is anchored — leading blanks only — through one `IncludeNoteMarkerEnd`,
-  because the diagnostic stream carries the same tag and `SplitIncludeNotes` runs over
-  text that is also preprocessed SOURCE. A localized toolchain that names no prefix is
-  unchanged rather than worse, and is #878, which needs no further generation.
+  driver. **No fingerprint bump rides with that because `ctest -R banner-probe-identity`
+  asserts the two spellings are byte-identical; deleting that check reopens the bump
+  question in silence**, and a driver found disagreeing is a finding, not a check to adjust.
+- A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in the
+  console output code page. Decoded at `RootReconciler::Path`, or the compile is not cached.
+- The `/showIncludes` MARKER is a canonical form exactly as `<SRCROOT>` is: the LAUNCHER
+  normalizes its own prefix to `IncludeNoteMarker` before storing and restores this build's
+  after localizing, so the stored bytes are locale-free and no server changed. The restore
+  runs AFTER the stale-hit guard, and recognition is anchored — leading blanks only.
 - Reading `/showIncludes` and WRITING it are different questions and must not be
-  consolidated. The reader matches `IncludeNoteMarker`; a dispatched compile's
-  synthesised notes must match the BUILD's `msvc_deps_prefix`, which CMake took from
-  the actual — possibly localized — compiler, and which Ninja matches literally.
-  `RenderShowIncludes` therefore takes the marker as a REQUIRED, undefaulted parameter
-  and spells no literal of its own. Measured, no MSVC needed:
-  `scripts/probes/ninja-msvc-deps-prefix.sh`.
-- A compiler with debug info on records the WORKING DIRECTORY, which is on no command
-  line, so no key can relativize it and a hit replays an object naming the producing
-  checkout. Measured: `g++` 143 B, `clang++` 6 B, `clang-cl` 23 B, and `cl` **11 B with
-  no debug flag at all** — `.debug$S`'s `S_OBJNAME` holds the absolute object path, so
-  `/Z7` widens this and does not open it. `-fdebug-prefix-map` closes it on ELF and on
-  NEITHER COFF driver; that residue is an accepted cost, not open work.
+  consolidated: `RenderShowIncludes` takes the marker as a REQUIRED, undefaulted parameter
+  and spells no literal of its own.
+- A compiler with debug info on records the WORKING DIRECTORY, which is on no command line,
+  so no key can relativize it and a hit replays an object naming the producing checkout.
+  `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver; that residue is an
+  accepted cost, not open work.
   - Never `-ffile-prefix-map`, and no table row for it or `-fmacro-prefix-map` either:
-    both rewrite `__FILE__` INTO the text the key hashes, and a row would make the key
-    hash text the compile never produced.
-  - The flag names the producing root BY CONSTRUCTION, so the key relativizes its head
-    (`PathValueRole::PrefixMap`, a table COLUMN rather than a branch) and leaves the
-    replacement literal — two machines mapping differently must MISS.
-  - The build-tree rule is mapped LAST: both drivers honour the LAST match, measured off
-    `DW_AT_comp_dir`. No object comparison can see this, since both orders are
-    checkout-independent.
-  - Relative is not checkout-independent — `file(RELATIVE_PATH)` answers
-    `../../mnt/d/.../checkout` out-of-tree, and with a trailing separator — and a root
-    with a SPACE is not mapped at all, the rules being spliced into a space-separated
-    flags string. `ctest -R debug-prefix-map-rules`.
-  - A DISPATCHED compile carries the client's DIRECTORY and its REPLACEMENT, never the
-    rule — a rule's left-hand side is a path on the WORKER, so `RemoteCompileArgs` goes
-    on dropping the flag and `CompileRequest::compileDir`/`compileDirReplacement` travel
-    instead. The worker maps BOTH candidates: gcc's `-fworking-directory` is implicit
-    under `-g` and puts the CLIENT's directory in the preprocessed text, which the
-    compile adopts, while clang leaves the WORKER's showing — so mapping only its own
-    fixes clang and leaves gcc recording an unmapped path, which no object comparison
-    can see. And it is the node's WORKING directory, not the scratch directory #506
-    named. Empty means map nothing (a build that asked for nothing must not get a
-    directory neither machine has) and the DIRECTORY is what says so, never the
-    replacement — an empty replacement is a real reproducible-build spelling. It cannot
-    ride in `args` (which refuse a path separator, and `:` is a path character), and a
-    worker that cannot spell the rules REFUSES. **A prefix-map rule appends the
-    unmatched tail**, so the worker's own rule is DROPPED when its directory contains
-    the client's: `/=.` rewrites every absolute path in the object — measured, a
-    `comp_dir` of `.tmp/…/client` and system headers reading `.usr/include/...`, worse
-    than the bug. `/` was the SHIPPED value until #674 gave the unit a
-    `WorkingDirectory=` naming its own `RuntimeDirectory=`; the drop STAYS, for the
-    routes a unit does not reach — a hand-written one still may name `/`. `--daemon`
-    no longer does: `MakePosixDaemonHost` takes the directory with NO default (#784),
-    the cache daemon states `/` and the node states its scratch base, and the pidfile
-    is written before the chdir so a relative one does not move with it. The CALL
-    SITES are what is asserted, since that is the whole defect — one line of
-    `main.cpp`. That a compiler-spawning unit names a directory it
-    CREATES is `ctest -R node-working-directory`, and it has to be a scan: running the
-    real unit needs root and a live systemd, and every fixture starts the node from the
-    FIXTURE's directory, which is how #674 reached master behind a green dispatch e2e.
-    Read `comp_dir`, never compare objects. **And the directory each end predicts from is `$PWD`, not
-    `getcwd(3)`** — `CompilerWorkingDirectory`, on both sides. Both drivers record, and
-    byte-compare `<from>` against, `PWD` when it is absolute and names the SAME directory
-    as `.` (a `stat` test, so `equivalent`), falling back to `getcwd(3)` for unset, a
-    different real directory, a nonexistent path or a relative one. `current_path()` IS
-    `getcwd(3)`, so the first fix matched nothing on any build reached through a symlink,
-    sent no pair, and left the dispatched object unmapped — the ticket surviving its own
-    fix, every counter normal, green on Linux because `/tmp` is not a link while macOS's
-    `$TMPDIR` sits under one. Case 13 runs at
-    two spellings, each with its own source or the second replays the first's object.
-    A dispatched object showing the CLIENT's directory is gcc's `-fworking-directory`
-    residue, NOT proof it came from no worker — one fault, two residues, which is the
-    second independent reason one candidate was never enough. **And a model of a driver
-    that is MORE PERMISSIVE than the driver produces WRONG AGREEMENT** — two objects
-    confidently mapped to different things under one key — which is worse than the
-    visible disagreement it replaces, so err NARROW. Both wide models turned up while
-    fixing this one ticket: matching by filesystem identity rather than the byte prefix,
-    and `path::is_absolute()` rather than a leading `/`.
-- `DW_AT_name` is `comp_dir`'s SIBLING: clang takes it from the INPUT FILE PATH, so a
-  dispatched object recorded the worker's `<scratch>/job-N/<name>` — a directory on no
-  machine, with a counter that advances, so two dispatches of ONE translation unit gave
-  byte-differing objects under one key (#660). The client's spelling travels as a
-  REPLACEMENT, never a path the worker opens; the WHOLE path is mapped, and the rule goes
-  LAST or it is overridden by the `compileDir` one. Every way of not building it is NO
-  RULE — a source called `my file.cpp` is ordinary. But the WORKER's half of that skip is
-  a property of a root chosen ONCE, so it is reported at STARTUP
-  (`ScratchRootMappingWarnings`, #810) — asked of the longest `<root>/job-<n>/<name>`
-  rather than the root, and asserted TOGETHER with the rule builder, since a warning
-  without silence and silence without a warning each pass under a constant answer.
-  What `sourceName` carries is what the client's own compile would RECORD — the source
-  argument through `MappedByPrefixMapRules`, ONE model of the flag asked twice (#800).
-  It closes clang and NOT gcc, which takes the name from the `#line` marker no worker
-  rule matches; a relative source matches no rule and is unchanged. gcc needs a SECOND
-  pair (`sourceRoot`/`sourceRootReplacement`, #883) carrying the RAW spelling beside the
-  mapped one — a rewrite rule has two operands and `sourceName` is already one of them,
-  and it cannot ride `compileDir`, whose halves are the compilation DIRECTORY. Ordered
-  AFTER the directory rules (its replacement is already the answer of every client rule
-  applied in order) and BEFORE #660's, which must stay last: all three can match one
-  path and the LAST wins, so a misplaced rule is overridden with every counter normal.
-  A half-filled pair is REFUSED where a directory's empty replacement is legal, and
-  every other failure to spell it is NO RULE. `dist-compile-e2e` case 14 is the e2e, and
-  its ARRANGEMENT is the case: the mapped source root must be DISJOINT from the compile
-  directory, or the directory rule maps the path as a side effect and it passes reverted.
-- An object file is not a byte string. `FASTCACHE_VERIFY` compared one with `memcmp`,
-  and every MSVC driver stamps the CLOCK into the COFF header — a cached object is
-  older than the fresh one BY CONSTRUCTION, so every Windows hit reported a wrong
-  object on the platform where #368 was observed. Measured: the 4-byte `TimeDateStamp`
-  and nothing else at 2 s and at 300 s; ELF is identical, `-g` included, so it keeps
-  the byte comparison. `.debug$S`/`.chks64` are volatile in the PATH, not in time, and
-  the verifier holds the path fixed — so they are NOT excused, or #489 (a hit from
-  another checkout) goes silent, which is #493 cured by no longer looking. Parsing
-  never grants an excuse; it only says WHERE. A FRESH object that will not lay out is
-  `Unsupported`, refused by name; a SERVED one that will not while the fresh one does
-  is `Mismatched`, because that is a truncated transfer. Never `/Brepro`.
+    both rewrite `__FILE__` INTO the text the key hashes.
+  - The key relativizes the rule's HEAD (`PathValueRole::PrefixMap`, a table COLUMN rather
+    than a branch) and leaves the replacement literal. The build-tree rule is mapped LAST.
+    Relative is not checkout-independent, and a root with a SPACE is not mapped at all.
+    `ctest -R debug-prefix-map-rules`.
+  - A DISPATCHED compile carries the client's DIRECTORY and its REPLACEMENT, never the rule
+    — a rule's left-hand side is a path on the WORKER. The worker maps BOTH candidates and
+    DROPS its own rule; an empty directory means map nothing, and a worker that cannot spell
+    the rules REFUSES. It is the node's WORKING directory, and the DIRECTORY is what says
+    "map nothing", never the replacement. `ctest -R node-working-directory`.
+  - **Each end predicts that directory from `$PWD`, not `getcwd(3)`** — `CompilerWorkingDirectory`,
+    on both sides. Read `comp_dir`, never compare objects. **A model of a driver that is MORE
+    PERMISSIVE than the driver produces WRONG AGREEMENT**, so err NARROW.
+- `DW_AT_name` is `comp_dir`'s SIBLING: the client's spelling travels as a REPLACEMENT, never
+  a path the worker opens; the WHOLE path is mapped, and the rule goes LAST. gcc needs a
+  SECOND pair (`sourceRoot`/`sourceRootReplacement`) carrying the RAW spelling beside the
+  mapped one, ordered AFTER the directory rules and BEFORE `DW_AT_name`'s. A half-filled pair
+  is REFUSED; every other failure to spell a rule is NO RULE. The worker's half of that skip
+  is reported at STARTUP (`ScratchRootMappingWarnings`), asserted TOGETHER with the rule builder.
+- An object file is not a byte string. Every MSVC driver stamps the clock into the COFF
+  `TimeDateStamp`, so `FASTCACHE_VERIFY` cannot `memcmp` there; ELF keeps the byte comparison.
+  Parsing never grants an excuse, it only says WHERE: a FRESH object that will not lay out is
+  `Unsupported`, a SERVED one that will not while the fresh one does is `Mismatched`. Never
+  `/Brepro`.
 
 **[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)**
 — dispatch, workers, the scheduler, the node's tiers. Before `Distributed/`,
