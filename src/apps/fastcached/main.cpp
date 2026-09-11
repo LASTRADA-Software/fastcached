@@ -28,6 +28,7 @@
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/PathKind.hpp>
@@ -212,7 +213,13 @@ CowTree::FilePageStore::Durability ToPageStoreDurability(FastCache::StorageDurab
 {
     auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(
         maxBytes, effective.storageMaxValueBytes, ToLruMode(effective.lruRecency));
-    l1->SetCompression({ .codec = effective.memoryCompression,
+    // The EFFECTIVE codec, never the configured one. `ParseCompressionCodec` refuses
+    // a codec an operator NAMES, so the one route past it is a DEFAULT -- which
+    // nobody typed and nothing validates. On a build without
+    // `FASTCACHED_ENABLE_COMPRESSION` this tier stores plaintext regardless, and
+    // resolving here is what lets the banner report that rather than repeat the
+    // configuration back.
+    l1->SetCompression({ .codec = FastCache::Compression::EffectiveCodec(effective.memoryCompression),
                          .level = effective.memoryCompressionLevel,
                          .minBytes = effective.memoryCompressionMinBytes });
     return l1;
@@ -381,7 +388,11 @@ struct StorageBackendBundle
     opts.maxBytes = perShardDiskBytes;
     opts.durability = ToPageStoreDurability(effective.storageDurability);
     opts.maxValueBytes = effective.storageMaxValueBytes;
-    opts.compression = effective.compression;
+    // Resolved for the reason `MakeL1` gives about its own half: `CowTreeStorage`
+    // falls back to storing verbatim for a codec this build lacks, so an
+    // unresolved `opts.compression` goes on claiming a codec to everything that
+    // reads it back.
+    opts.compression = FastCache::Compression::EffectiveCodec(effective.compression);
     opts.compressionLevel = effective.compressionLevel;
     opts.compressionMinBytes = effective.compressionMinBytes;
     auto opened = FastCache::CowTreeStorage::Open(opts);
@@ -927,6 +938,30 @@ int DaemonBody(FastCache::Config const& effective,
     auto const bannerBinds = !effective.binds.empty() ? std::span<FastCache::BindConfig const> { effective.binds }
                                                       : std::span<FastCache::BindConfig const> { legacyBind };
     auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
+
+    // `compression=` names what the STORE will do, not what was asked for. It read
+    // `effective.compression` until the worker was found doing the same thing: the
+    // disk default is `zstd`, a default is the one value `ParseCompressionCodec`
+    // never sees, and a build without the codec then stored plaintext under a
+    // banner saying `compression=zstd`.
+    auto const diskCodec = FastCache::Compression::EffectiveCodec(effective.compression);
+
+    // And said out loud rather than left to be inferred from a field that now reads
+    // `none`. The operator cannot reach this from their own configuration -- the
+    // BUILD made the choice -- so the remedy names the build. Only for a half that
+    // exists: an in-memory daemon has no on-disk tier for a disk codec to describe.
+    auto const reportCodecFallback = [&logger](std::string_view half, FastCache::CompressionCodec configured) {
+        if (FastCache::Compression::EffectiveCodec(configured) == configured)
+            return;
+        logger.Logf(FastCache::LogLevel::Warn,
+                    "{} compression is configured {} and this build has no such codec, so that tier stores "
+                    "plaintext; rebuild with FASTCACHED_ENABLE_COMPRESSION or set the codec to none",
+                    half,
+                    FastCache::Compression::NameOf(configured));
+    };
+    reportCodecFallback("memory", effective.memoryCompression);
+    if (!effective.storagePath.empty())
+        reportCodecFallback("disk", effective.compression);
     // `anyTlsBind` was computed up-top against `effective.binds`; under the
     // current ordering `serverOpts.binds` is either `effective.binds` (when
     // non-empty) or the synthesised legacy single-bind. Either way, a TLS
@@ -942,7 +977,7 @@ int DaemonBody(FastCache::Config const& effective,
                 effective.storagePath.empty() ? std::string_view { "<in-memory>" }
                                               : std::string_view { effective.storagePath },
                 durabilityName,
-                FastCache::Compression::NameOf(effective.compression),
+                FastCache::Compression::NameOf(diskCodec),
                 FastCache::FormatByteSize(effective.storageMaxValueBytes),
                 reactorCount,
                 physicalShards,

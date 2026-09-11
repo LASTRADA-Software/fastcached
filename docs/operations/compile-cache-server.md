@@ -77,7 +77,17 @@ files compress well, so this is usually worth keeping; reads always return
 plaintext because each record decodes by its own tag. Lower
 `--compression-level` (default 3) if CPU is the constraint rather than disk.
 
-Note this applies to the L2 disk tier only — L1 holds values uncompressed.
+The in-memory L1 tier has a codec of its own, off by default:
+`--memory-compression`, `--memory-compression-level` and
+`--memory-compression-min-bytes`. Turning it on makes `--max-memory` hold more
+rather than less — the budget counts the bytes a value actually occupies — at a
+decompress on every read.
+
+`lz4` and `zstd` are only present when the build was configured with
+`FASTCACHED_ENABLE_COMPRESSION`. A codec you *name* on a build without them is
+refused at startup; the disk half's `zstd` **default** is not, since nobody typed
+it — that tier stores plaintext instead, and the startup banner then reads
+`compression=none` rather than repeating the configuration back to you.
 
 ## Prefetch groups
 
