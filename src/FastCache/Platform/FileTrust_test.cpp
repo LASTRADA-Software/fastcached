@@ -2,10 +2,13 @@
 #include <FastCache/Platform/FileTrust.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/interfaces/catch_interfaces_capture.hpp>
 
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 
@@ -13,6 +16,17 @@
     #include <sys/stat.h>
 
     #include <unistd.h>
+#endif
+
+#if defined(__linux__)
+    #include <sys/wait.h>
+
+    #include <cerrno>
+    #include <cstdlib>
+
+    #include <spawn.h>
+
+extern char** environ;
 #endif
 
 using FastCache::ClassifySecretFile;
@@ -298,5 +312,212 @@ TEST_CASE("FileTrust: securing a file that is not there fails rather than claimi
     FastCache::Testing::ScratchDirectory const scratch { "fastcached-secure-absent" };
     CHECK_FALSE(FastCache::SecureSecretFileForServices(scratch / "absent.yaml"));
 }
+
+    // --- The delegation clause against a REAL root-owned file, unprivileged -----
+    //
+    // #1127. The case above asserts the delegation clause through the real
+    // acquisition only when the suite runs AS root; unprivileged, it takes the
+    // other branch and the clause is exercised nowhere but a synthesised
+    // `SecretFileFacts`. That covers the DECISION and says nothing about whether
+    // `ObserveSecretFile` actually reports `administrativelyOwned` for a file the
+    // kernel calls root-owned.
+    //
+    // An unprivileged user namespace closes that without privilege: `unshare -r`
+    // maps the caller to uid 0, and a file created inside is genuinely `st_uid == 0`
+    // -- which is the one fact the clause reads (`FileTrust.cpp`,
+    // `.administrativelyOwned = info.st_uid == 0`). It is NOT real root, and that is
+    // sufficient here for exactly that reason and would not be for a case needing
+    // real privilege, such as `SeedConfigFile`'s privileged branch.
+    //
+    // Linux only, and deliberately not `!defined(_WIN32)`: macOS has no `unshare(1)`
+    // and no user namespaces, so on that platform this is not a skip to report but a
+    // case that should not exist.
+    #if defined(__linux__)
+
+namespace
+{
+/// Names the file the re-executed child writes what it measured into.
+constexpr char const* NsReportEnv = "FASTCACHED_FILETRUST_NS_REPORT";
+
+/// Leads the child's one-line report, so the parent can tell the child's own
+/// output from anything else that could occupy that path.
+constexpr char const* NsReportToken = "filetrust-ns";
+
+/// Run @p argv to completion.
+///
+/// @param argv Argument vector; `argv[0]` is looked up on `PATH`.
+/// @return The child's exit status; `128 + signal` for a child a signal ended; and
+///         -1 only when it could not be started or could not be reaped at all.
+///         Those are different outcomes: a missing `unshare(1)` is a skip and a
+///         child that ran and failed is not. A signalled child gets its own band
+///         rather than sharing -1, because "the facility is absent" and "it died"
+///         send a reader to different places.
+///
+/// `waitpid` is restarted on `EINTR`. Without that a signal delivered to this
+/// process -- a profiler's timer, a job-control stop -- reads as "could not be
+/// started", which the caller turns into a SKIP: a host that CAN run this case
+/// reporting that it cannot, which is the state collapse this case exists to avoid.
+[[nodiscard]] int SpawnAndWait(std::vector<std::string> argv)
+{
+    std::vector<char*> raw;
+    raw.reserve(argv.size() + 1);
+    for (auto& argument: argv)
+        raw.push_back(argument.data());
+    raw.push_back(nullptr);
+
+    ::pid_t child = 0;
+    if (::posix_spawnp(&child, raw[0], nullptr, nullptr, raw.data(), environ) != 0)
+        return -1;
+
+    int status = 0;
+    ::pid_t reaped = 0;
+    do
+        reaped = ::waitpid(child, &status, 0);
+    while (reaped == -1 && errno == EINTR);
+
+    if (reaped != child)
+        return -1;
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+} // namespace
+
+// Spelled ONCE, and the second spelling is DERIVED rather than agreed: the parent
+// passes this name to the re-executed child as a Catch2 test spec, and a drifted
+// copy would select no case at all -- which arrives as an absent report and would
+// read as "this host cannot", the one confusion this case is built to avoid. That
+// used to be a macro; a macro makes the two spellings one token and makes the name
+// invisible to `check-test-names`, which extracts the FIRST STRING LITERAL on the
+// `TEST_CASE` line and would have taken the TAGS for the name. Asking Catch2 for the
+// running case's own name gives the same guarantee and keeps the literal readable.
+TEST_CASE("FileTrust: the delegation clause meets a real root-owned file", "[platform][filetrust][secret]")
+{
+    // --- the re-executed half, running inside the namespace ------------------
+    //
+    // It MEASURES and reports; it asserts nothing. One place decides, and it is
+    // the parent -- a child that also asserted would spend its exit status on a
+    // failure count the parent then has to interpret alongside the report, which
+    // is two channels disagreeing about one fact.
+    if (char const* const reportPath = std::getenv(NsReportEnv); reportPath != nullptr)
+    {
+        FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-ns" };
+        auto const path = SecretFileAtMode(scratch, "delegated.yaml", S_IRUSR | S_IWUSR | S_IRGRP);
+
+        struct ::stat info {};
+
+        REQUIRE(::stat(path.c_str(), &info) == 0);
+
+        // Written in ONE line at the end rather than incrementally: a half-written
+        // report and a missing one would otherwise be different states the parent
+        // has no way to separate.
+        // A leading token and four integers. Parsed with `operator>>` rather than
+        // `sscanf` not because varargs are banned -- `.clang-tidy` disables that
+        // check deliberately for the POSIX calls this tree has to make -- but
+        // because the stream gives two things a field count does not: the token
+        // says the child wrote this rather than something else occupying the path,
+        // and `fail()` separates a truncated record from a complete one.
+        //
+        // The MODE travels beside the verdict, and it is what makes the parent's
+        // assertion DISCRIMINATE. `SecretExposure::None` is what the delegation
+        // clause produces (`readableByGroup && administrativelyOwned`) AND what
+        // "nothing else can read it" produces -- so a fixture that yielded `0600`
+        // here would satisfy the parent while exercising no delegation at all,
+        // which is a case that cannot fail for the reason it exists. The owner uid
+        // is already carried for the mirror-image reason; the group grant is the
+        // clause's other operand and was not.
+        std::ofstream report { reportPath, std::ios::binary | std::ios::trunc };
+        report << NsReportToken << ' ' << info.st_uid << ' ' << ::geteuid() << ' '
+               << (info.st_mode & static_cast<::mode_t>(07777)) << ' '
+               << static_cast<int>(FastCache::SecretFileExposure(path)) << '\n';
+
+        // Closed and checked HERE rather than left to the destructor, whose failure
+        // nothing observes. A write that failed would otherwise reach the parent as
+        // a missing or truncated report and be named a broken test, which sends a
+        // reader to the wrong file.
+        report.close();
+        REQUIRE(report.good());
+        return;
+    }
+
+    // --- the parent half -----------------------------------------------------
+    if (::geteuid() == 0)
+        SKIP("already root, so the acquisition case above already meets a real root-owned file");
+
+    // The PRECONDITION, measured in this run rather than inferred from the child's
+    // silence. Without it an absent report has two causes -- the facility is
+    // unavailable, or the child never selected the case -- and reporting the second
+    // as a skip is a pass for a case that never ran, which is the defect this
+    // ticket is about one level up.
+    if (SpawnAndWait({ "unshare", "-r", "true" }) != 0)
+        SKIP("unprivileged user namespaces are unavailable here (no unshare(1), a hardened kernel with "
+             "kernel.unprivileged_userns_clone=0 or user.max_user_namespaces=0, or a container runtime "
+             "refusing to nest), so the real acquisition cannot be shown a root-owned file on this host");
+
+    FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-ns-parent" };
+    auto const reportPath = scratch / "report.txt";
+
+    // `/proc/self/exe` rather than `argv[0]`, which Catch2 does not hand to a case
+    // and which a test runner is free to spell relatively.
+    std::error_code ec;
+    auto const self = std::filesystem::read_symlink("/proc/self/exe", ec);
+    REQUIRE_FALSE(ec);
+
+    REQUIRE(::setenv(NsReportEnv, reportPath.c_str(), 1) == 0);
+    auto const caseName = Catch::getResultCapture().getCurrentTestName();
+    auto const childStatus = SpawnAndWait({ "unshare", "-r", self.string(), caseName });
+    REQUIRE(::unsetenv(NsReportEnv) == 0);
+
+    // BEFORE the first assertion that can fire, because a Catch2 `INFO` attaches
+    // only to the assertions that FOLLOW it -- and the next one is the assertion
+    // whose entire diagnosis is whether the child ran and died or ran and wrote
+    // nothing. Stated after the `ifstream`, as it was, the one number that
+    // separates those two was absent from exactly the failure it explains.
+    INFO("child exit status " << childStatus);
+
+    // The facility works -- the probe above said so -- so an absent report is a
+    // broken test rather than an unsupported host, and it is named as one.
+    std::ifstream reportFile { reportPath, std::ios::binary };
+    REQUIRE_FALSE(reportFile.fail());
+
+    std::string report;
+    std::getline(reportFile, report);
+    INFO("report: " << report);
+    REQUIRE_FALSE(report.empty());
+
+    std::istringstream fields { report };
+    std::string token;
+    unsigned long ownerUid = 0;
+    unsigned long effectiveUid = 0;
+    unsigned long mode = 0;
+    int exposure = -1;
+    fields >> token >> ownerUid >> effectiveUid >> mode >> exposure;
+
+    // The token is what separates "the child wrote this" from any other content
+    // that could end up at that path, and the stream state is what separates a
+    // complete record from a truncated one.
+    REQUIRE(token == NsReportToken);
+    REQUIRE_FALSE(fields.fail());
+
+    // The namespace mapped, or it did not. Distinguished rather than folded into
+    // the assertion, because a run where the mapping silently failed would
+    // otherwise report the OwnersOwnGroup verdict as a delegation-clause failure.
+    if (ownerUid != 0 || effectiveUid != 0)
+        SKIP("the user namespace did not map this caller to uid 0, so no root-owned file was created");
+
+    // The file the child actually made, asserted before any verdict is drawn from
+    // it. Without this the case passes over a `0600` file, where `None` says
+    // nothing at all about the delegation clause -- the control the sibling 0640
+    // section applies to the OWNER, applied here to the GROUP grant, which is the
+    // clause's other operand.
+    CHECK((mode & static_cast<unsigned long>(S_IRGRP)) != 0);
+    CHECK((mode & static_cast<unsigned long>(S_IROTH)) == 0);
+
+    // The coverage this ticket exists for: the REAL acquisition, over a real
+    // `0640` file the kernel reports as root-owned, reaching the delegation clause.
+    CHECK(exposure == static_cast<int>(SecretExposure::None));
+}
+
+    #endif
 
 #endif
