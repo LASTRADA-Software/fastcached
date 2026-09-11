@@ -361,9 +361,16 @@ TEST_CASE("A verb with no 0xFC equivalent is explained, never retried", "[cli][n
     // asked the node something would pass every check on the text below.
     CHECK(node.Sent().empty());
 
-    // The outcome is UNCHANGED -- the command still failed, and the exit code still says
-    // so. Only the explanation is added.
-    CHECK(answer.outcome == Outcome::Unreachable);
+    // The command still failed, and the outcome still says so -- but it says WHICH
+    // failure. `Unreachable` means *the server could not be reached*, which this probe
+    // has just disproved: a frame came back. The identification above is the operator's
+    // half of that correction and this is the script's, and the exit code is the half
+    // this tool publishes as a contract.
+    //
+    // This case's own first paragraph already called the honest answer "a refusal naming
+    // what the endpoint IS"; the assertion used to pin `Unreachable` beside it, which is
+    // the prose and the check disagreeing inside one test.
+    CHECK(answer.outcome == Outcome::Refused);
     REQUIRE(answer.advisories.size() == 2);
 
     // The identification goes FIRST: an operator reading downwards wants *this is a
@@ -389,7 +396,11 @@ TEST_CASE("A fallback is not run against an endpoint that is not a node", "[cli]
     {
         auto const answer = RunNodeFallback(*verb, VerbContext { .node = &node }, RemoteKind::FastcacheWireOnly, primary);
         CHECK(node.Sent().empty());
-        CHECK(answer.outcome == Outcome::Unreachable);
+
+        // Reached and answered, so `Unreachable` is corrected here exactly as it is for a
+        // node -- the endpoint framed a refusal, which is the proof, and WHICH refusal
+        // deliberately narrows it no further.
+        CHECK(answer.outcome == Outcome::Refused);
         REQUIRE(answer.advisories.size() == 2);
         CHECK(answer.advisories[0].contains("0xFC"));
     }
@@ -400,6 +411,18 @@ TEST_CASE("A fallback is not run against an endpoint that is not a node", "[cli]
         // added: one fault must not read as two.
         auto const answer = RunNodeFallback(*verb, VerbContext { .node = &node }, RemoteKind::NotFastcacheWire, primary);
         CHECK(node.Sent().empty());
+
+        // **The CONTROL for the two cases above**, and the reason they mean anything: no
+        // frame came back here, so nothing was established and the outcome is left where
+        // the transport put it.
+        //
+        // What it catches is an implementation that stamps the outcome BEFORE asking
+        // whether the probe explained anything. What it does NOT catch -- measured, not
+        // assumed -- is a `RemoteKindTable` that answers `Refused` for every kind: this
+        // path returns early on the empty explanation and never reaches the table, so
+        // that mutation leaves this case green. `EstablishedBy`'s own control in
+        // `NodeClient_test.cpp` is what covers the table, and it is not redundant with
+        // this one.
         CHECK(answer.outcome == Outcome::Unreachable);
         REQUIRE(answer.advisories.size() == 1);
         CHECK(answer.advisories[0] == "the server closed the connection without answering");

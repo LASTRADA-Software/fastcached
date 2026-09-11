@@ -265,6 +265,12 @@ The pairs that matter:
   gives up on the other cannot be written if they agree.
 - **4 against 5** — the server said no, versus the server said something this
   client could not read. Different people fix those.
+- **3 against 4, pointed at a compile node** — a `fastcache-compile-node` serves no
+  keyspace, so `get` there cannot work and never will. It exits **4**, not 3: the
+  endpoint answered, and `3` is the code that reads as *retry, the daemon may be
+  down*. The advisory names what the endpoint is; the exit code is the same
+  correction for a script, which reads nothing else. An endpoint that sends no frame
+  at all is still 3 — nothing was established there to correct it with.
 
 ```sh
 if fastcache-cli get "$key" > value.txt; then

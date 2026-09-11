@@ -1454,6 +1454,20 @@ Answer RunNodeFallback(VerbSpec const& verb, VerbContext const& context, RemoteK
     // compile node* before *the server closed the connection*, which is the consequence
     // rather than the cause.
     primary.advisories.insert(primary.advisories.begin(), explanation);
+
+    // And the SAME correction for the reader that has no eyes. The sentence above is the
+    // operator's half; the exit code is the script's, and it is the published half of
+    // this tool's contract. A probe that came back with a FRAME proves the endpoint was
+    // reached and answered, so leaving `Unreachable` standing would go on saying *the
+    // server could not be reached* about an address that is serving -- and `unreachable`
+    // is the one code that reads as RETRY, which is advice that can never come true here.
+    //
+    // Keyed on the KIND, never on the explanation being non-empty: what corrects an
+    // outcome is the evidence, and a table that decides it from whether some text was
+    // produced would silently change the exit code the day a sentence is reworded.
+    if (auto const established = EstablishedBy(kind); established.has_value())
+        primary.outcome = *established;
+
     return primary;
 }
 

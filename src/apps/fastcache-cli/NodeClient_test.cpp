@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CliAnswer.hpp"
 #include "NodeClient.hpp"
 #include "ScriptedExchange.hpp"
 
@@ -339,5 +340,42 @@ TEST_CASE("An identified endpoint is explained in terms an operator can act on",
         // A second sentence about one fault makes it read as two, so the empty string
         // here is a decision rather than a gap.
         CHECK(ExplainRemoteKind("get", "10.0.0.7:6674", RemoteKind::NotFastcacheWire).empty());
+    }
+}
+
+TEST_CASE("A probe's answer establishes reachability, not only a sentence", "[cli][node][probe]")
+{
+    // **The same three states, read by the half that has no eyes.** `ExplainRemoteKind`
+    // above tells an operator what the endpoint is; this decides what the process EXITS
+    // with, which is the only thing a script sees. Getting one right and not the other
+    // leaves the state collapse `RemoteKind` was introduced to remove standing in the
+    // published half of the contract.
+    SECTION("a node and a 0xFC-only endpoint both answered, so both are refusals")
+    {
+        // The proof is that a FRAME came back, which `ProbeRemote` reaches these two
+        // values only by. WHICH refusal narrows nothing further and must not be read as
+        // though it did.
+        CHECK(EstablishedBy(RemoteKind::CompileNode) == Outcome::Refused);
+        CHECK(EstablishedBy(RemoteKind::FastcacheWireOnly) == Outcome::Refused);
+    }
+
+    SECTION("and an endpoint that sent no frame establishes NOTHING")
+    {
+        // Disengaged rather than a fourth outcome: nothing was learned, so there is
+        // nothing to correct the caller's own transport diagnostic with. This is the
+        // control -- a table that answered `Refused` for every kind would pass the
+        // section above and fail this one.
+        CHECK_FALSE(EstablishedBy(RemoteKind::NotFastcacheWire).has_value());
+    }
+
+    SECTION("and the two answers are DIFFERENT exit codes, which is the whole point")
+    {
+        // Asserting the enumerators alone would pass if both mapped to one code. What an
+        // operator's `if` reads is the number, and `3` is the one that means *retry, the
+        // daemon may be down* -- advice that can never come true for an address that
+        // just framed a reply.
+        auto const refused = ExitCodeOf(Unwrap(EstablishedBy(RemoteKind::CompileNode)));
+        CHECK(refused == 4);
+        CHECK(refused != ExitCodeOf(Outcome::Unreachable));
     }
 }

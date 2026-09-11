@@ -101,6 +101,14 @@ std::string ExplainRefusal(std::string_view verb, std::string_view endpoint, Nod
     return std::format("{} refused `{}`: {}{}", endpoint, verb, named, said);
 }
 
+std::optional<Outcome> EstablishedBy(RemoteKind kind) noexcept
+{
+    auto const index = static_cast<std::size_t>(kind);
+    if (index >= RemoteKindTable.size())
+        return std::nullopt;
+    return RemoteKindTable[index].established;
+}
+
 RemoteKind ProbeRemote(INodeExchange& node)
 {
     auto const reply = node.Send(Wire::EncodeNodeStatusRequest());

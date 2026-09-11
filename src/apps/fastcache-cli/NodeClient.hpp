@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CliAnswer.hpp"
 #include "CliValue.hpp"
 #include "RespClient.hpp"
 
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -155,6 +157,48 @@ enum class RemoteKind : std::uint8_t
     NotFastcacheWire,
     Last,
 };
+
+/// One `RemoteKind`'s rows: what it says to a person, and what it PROVES to a caller.
+struct RemoteKindSpec
+{
+    RemoteKind kind; ///< The enumerator this row describes.
+
+    /// The outcome this kind ESTABLISHES, or disengaged when it establishes nothing.
+    ///
+    /// **A probe answer is evidence about reachability, not only text for a human.**
+    /// `ProbeRemote` reaches `CompileNode` and `FastcacheWireOnly` only when a frame came
+    /// BACK, so each of them proves the endpoint was reached and answered -- which is the
+    /// one thing `Outcome::Unreachable` denies. Identifying the endpoint in an advisory
+    /// and leaving the outcome alone fixes the half an operator reads by eye and leaves a
+    /// SCRIPT -- which reads the exit code and nothing else -- told that the port is dead.
+    /// That is this enum's own state collapse surviving in the half nobody looks at, and
+    /// the exit code is the published half.
+    ///
+    /// `Refused` rather than `Protocol`: bytes this client understood perfectly came
+    /// back, and they said this endpoint does not serve that verb. It is also what the
+    /// node verbs already exit with when a node answers `UnimplementedVerb`, so one
+    /// address does not report two codes for one fact.
+    ///
+    /// `NotFastcacheWire` is disengaged, and that is a reading rather than an omission:
+    /// no frame came back, so nothing was established that the caller's own transport
+    /// diagnostic does not already say, and there is nothing here to correct it with.
+    std::optional<Outcome> established;
+};
+
+/// What each kind establishes, one row per enumerator, in enumerator order.
+inline constexpr EnumTable<RemoteKind, RemoteKindSpec> RemoteKindTable { {
+    { .kind = RemoteKind::CompileNode, .established = Outcome::Refused },
+    { .kind = RemoteKind::FastcacheWireOnly, .established = Outcome::Refused },
+    { .kind = RemoteKind::NotFastcacheWire, .established = std::nullopt },
+} };
+
+static_assert(RowsInEnumeratorOrder(RemoteKindTable, &RemoteKindSpec::kind),
+              "RemoteKindTable must hold one row per RemoteKind, in enumerator order");
+
+/// What @p kind establishes about the endpoint.
+/// @param kind What the probe turned out to find.
+/// @return The outcome it proves, or nothing when it proves nothing new.
+[[nodiscard]] std::optional<Outcome> EstablishedBy(RemoteKind kind) noexcept;
 
 /// Ask an endpoint what it is.
 ///
