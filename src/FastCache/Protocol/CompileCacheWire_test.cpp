@@ -12,6 +12,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -46,19 +47,20 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
-    // Version 7 gives the NODE-STATUS reply a nested runtime record, so a node with no
-    // `--admin-listen` can say what it is DOING rather than only what it was configured
-    // as (#1294, #1295). Version 6 put the lease's lifetime on the LEASE grant (#522);
+    // Version 8 gives the CLUSTER-ADMIT reply a receipt, so the id and endpoint the
+    // leader recorded come back as bytes an operator can read against the machine being
+    // admitted (#1296). Version 7 gave the NODE-STATUS reply a nested runtime record
+    // (#1294, #1295); version 6 put the lease's lifetime on the LEASE grant (#522);
     // version 5 added COMPILE's source-root pair (#883).
     //
-    // Both move together, and version 7's reason is NOT the one the earlier bumps had
-    // -- `MinSupportedVersion` carries the argument in full. In short: the failure here
-    // is already loud (exact arity, so a version-6 client cannot decode the body and
-    // says so), and the floor moves anyway because leaving it would have this build
-    // ACCEPT a version it has no way to answer correctly. `EncodeNodeStatus` emits one
-    // shape and takes no version.
-    CHECK(CurrentVersion == 7);
-    CHECK(MinSupportedVersion == 7);
+    // Both move together, and version 8's reason is the INVERSE of version 7's --
+    // `MinSupportedVersion` carries both arguments in full. In short: 7's older client
+    // fails loudly and cannot be served, while 8's older client SUCCEEDS quietly, reads
+    // no reply body for this verb, and drops the one string the change exists to put on
+    // the screen. A missing string does not announce itself as missing, so leaving the
+    // floor at 7 would manufacture a quiet failure inside the fix for one.
+    CHECK(CurrentVersion == 8);
+    CHECK(MinSupportedVersion == 8);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -98,7 +100,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x07,                   // version
+        0x08,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -117,7 +119,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x07,                               // version
+        0x08,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -457,7 +459,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x07, 0x03,       // magic, version, op=Auth
+        0xFC, 0x08, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -1594,4 +1596,101 @@ TEST_CASE("A verb's ceiling never exceeds what the operator configured", "[wire]
         INFO("verb " << row.name);
         CHECK(OpPayloadCap(static_cast<std::uint8_t>(row.code), TinySession) <= TinySession);
     }
+}
+
+// --- the CLUSTER-ADMIT receipt ---------------------------------------------
+
+TEST_CASE("A CLUSTER-ADMIT receipt round-trips what the leader wrote down", "[wire][cluster-admit]")
+{
+    // Both fields carry a DIFFERENT value and neither is a substring of the other:
+    // two fields sharing one value let a transposed index through, which is the
+    // mistake a two-field encoder invites and the one `RaftWire`'s exemplars were
+    // rewritten to catch.
+    auto const sent = ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" };
+
+    auto const back = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(sent));
+    REQUIRE(back.has_value());
+
+    // Compared WHOLE rather than field by field, which is what a transposition
+    // survives when each field is checked against the value it was handed.
+    CHECK(Unwrap(back) == sent);
+}
+
+TEST_CASE("A receipt survives its own buffer, because an operator reads it", "[wire][cluster-admit]")
+{
+    // `Decode(Encode(x))` above is the obvious spelling and is a use-after-free the
+    // moment either member becomes a view, which is why this record OWNS. Asserted
+    // rather than left to the type, because the type is exactly what a later tidy
+    // would change.
+    //
+    // A REAL size and the right ARRANGEMENT, or the case passes under the bug: read
+    // inline, nothing dangles at any size, because a by-value parameter lives to the
+    // end of the full expression. So the value is STORED, its source dropped, the
+    // freed storage churned, and only then read -- and the strings are past
+    // libstdc++'s 15-char inline buffer, where the block is heap and the failure is a
+    // plain `heap-use-after-free` rather than something only ASan's stack poisoning
+    // can see.
+    constexpr std::string_view Endpoint = "[2001:db8:85a3::8a2e:370:7334]:6675";
+    static_assert(Endpoint.size() > 15, "shorter than the SSO buffer and this case stops biting");
+
+    auto receipt = std::optional<ClusterAdmitReceipt> {};
+    {
+        // A NAMED local, not a temporary in the initialiser. The difference is which
+        // instrument catches a borrowing receipt: from a temporary the compiler refuses
+        // the spelling outright, so the case would never run and the property it is
+        // named for -- that the DECODED record outlives the payload -- would be
+        // demonstrated by nothing.
+        auto const endpoint = std::string { Endpoint };
+        auto const payload = EncodeClusterAdmitReceipt(
+            ClusterAdmitReceipt { .memberId = "a-node-id-of-a-realistic-length", .raftEndpoint = endpoint });
+        receipt = DecodeClusterAdmitReceipt(payload);
+    }
+
+    // Churn whatever the payload's allocation has become. The assertion is not the
+    // point of the case: it is what stops an optimiser deciding this vector is never
+    // read and eliding the allocations that do the churning.
+    auto const churn = std::vector<std::string>(64, std::string(128, 'x'));
+    CHECK(churn.size() == 64);
+
+    REQUIRE(receipt.has_value());
+    CHECK(Unwrap(receipt).raftEndpoint == Endpoint);
+}
+
+TEST_CASE("A CLUSTER-ADMIT reply with no receipt in it is refused, not read as nothing", "[wire][cluster-admit]")
+{
+    // An empty body is what a build older than this one answers, and *this leader
+    // recorded nothing* is not a state that exists -- so it is `MinSupportedVersion`'s
+    // question rather than a shape to tolerate here. Read as an absent receipt it
+    // would render as a blank endpoint, which is the missing string the whole change
+    // exists to prevent, arriving through the decoder.
+    CHECK_FALSE(DecodeClusterAdmitReceipt({}).has_value());
+}
+
+TEST_CASE("A receipt at any arity but two is refused", "[wire][cluster-admit]")
+{
+    // Exact, like every other reply body here, and BOTH directions: a decoder that
+    // only refuses short bodies reads a longer one's first two fields and silently
+    // drops whatever a newer leader added beside them.
+    auto const tooFew = WireFields::Encode({ AsBytes(std::string_view { "node-c" }) });
+    CHECK_FALSE(DecodeClusterAdmitReceipt(tooFew).has_value());
+
+    auto const tooMany = WireFields::Encode({ AsBytes(std::string_view { "node-c" }),
+                                              AsBytes(std::string_view { "10.0.0.9:6675" }),
+                                              AsBytes(std::string_view { "something-newer" }) });
+    CHECK_FALSE(DecodeClusterAdmitReceipt(tooMany).has_value());
+}
+
+TEST_CASE("A receipt carries the bytes it was given, not a tidied version of them", "[wire][cluster-admit]")
+{
+    // The receipt's one claim is *these are the bytes I wrote down*, so a codec that
+    // trimmed, folded case or otherwise normalised either field would make it a claim
+    // about something else -- and a typo is exactly the kind of difference a
+    // normaliser removes. Surrounding space and an unexpected case are both things an
+    // operator's shell and keyboard produce; what this case pins is that they come
+    // back unchanged, so they can be SEEN.
+    auto const odd = ClusterAdmitReceipt { .memberId = " Node-C ", .raftEndpoint = "[2001:DB8::1]:6675" };
+
+    auto const back = DecodeClusterAdmitReceipt(EncodeClusterAdmitReceipt(odd));
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back) == odd);
 }

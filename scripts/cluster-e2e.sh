@@ -1012,8 +1012,14 @@ answer="$(cluster "127.0.0.1:${scheduler_ports[3]}" --cluster-status)"
 [[ "$answer" != *"known settings:"* ]] || fail "a joining node answered as a leader; it bootstrapped its own cluster"
 echo "cluster E2E: a joining node leads nothing"
 
-ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[3]}" "accepted" \
-    "the leader refused to admit a member"
+# Asserted on the ENDPOINT rather than on a word like "accepted", which a leader
+# that recorded a DIFFERENT address answers just as readily -- the thing both the
+# healthy and the broken state produce. The receipt (#1296) is what makes the
+# distinguishing assertion available at all, and this is the only place in the tree
+# that exercises it end to end: real binaries, a real wire, and the operator's own
+# command line.
+ask_leader "--cluster-admit=n4=127.0.0.1:${raft_ports[3]}" "127.0.0.1:${raft_ports[3]}" \
+    "the leader did not echo back the endpoint it recorded"
 
 # Admission is two steps and this waits for the second. The record commits first,
 # which is what teaches every node where n4 answers; only then does the leader
@@ -1372,8 +1378,10 @@ answer="$(cluster "127.0.0.1:${scheduler_ports[$two_index]}" --cluster-status)"
     fail "a joining node answered as a leader; it bootstrapped its own cluster"
 echo "cluster E2E: the same node WITH --raft-join leads nothing, and waits to be admitted"
 
-ask_leader "--cluster-admit=m2=127.0.0.1:${raft_ports[$two_index]}" "accepted" \
-    "the one-member cluster refused to admit a second member"
+# The endpoint, for section 4's reason: a word both a correct and an incorrect
+# record produce asserts nothing about which one happened.
+ask_leader "--cluster-admit=m2=127.0.0.1:${raft_ports[$two_index]}" "127.0.0.1:${raft_ports[$two_index]}" \
+    "the one-member cluster did not echo back the endpoint it recorded"
 
 # Asserted on m2 rather than on the leader, and by ASKING rather than by reading a
 # log: the leader accepting a command proves nothing about the machine it names. A

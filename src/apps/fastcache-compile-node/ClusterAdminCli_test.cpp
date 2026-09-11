@@ -440,12 +440,103 @@ TEST_CASE("An admission with no dialable address is refused where it is typed", 
     }
 }
 
-TEST_CASE("An admission is reported as accepted, never as committed", "[node][clusteradmin]")
+TEST_CASE("An admission prints back the id and the endpoint the leader recorded", "[node][clusteradmin]")
 {
-    // The leader appends the entry and answers; whether a majority has taken it is
-    // not something it knows yet, and a tool that said otherwise would be the one
-    // kind of report that must not be wrong.
-    auto const rendered = InterpretClusterReply(ClusterAction::Admit, {});
+    // #1296, end to end through the real service and the real protocol rather than
+    // against a hand-built payload: what this case is for is that the three halves
+    // AGREE -- the service builds a receipt from the command it proposed, the
+    // protocol carries it, and this renderer reads it. A payload written here by hand
+    // would pass with any two of the three wired to each other.
+    FakeCluster cluster;
+    Fixture fixture;
+    fixture.service.AdministerWith(cluster);
+
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+
+    auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
     REQUIRE(rendered.has_value());
-    CHECK(rendered->contains("accepted"));
+
+    // Against what reached CONSENSUS, not only against the literals this case typed:
+    // a renderer printing a constant, or the wrong field, passes a literal check.
+    REQUIRE(cluster.proposed.size() == 1);
+    CHECK(rendered->contains(cluster.proposed.front().key));
+    CHECK(rendered->contains(cluster.proposed.front().value));
+    CHECK(rendered->contains("10.0.0.4:6680"));
+}
+
+TEST_CASE("An admission is reported as recorded and appended, never as in force", "[node][clusteradmin]")
+{
+    // **The wording half of #1296's acceptance, and it is a CEILING rather than a
+    // vocabulary.** What the leader wrote down it knows instantly and alone; whether a
+    // majority has taken it it cannot know at all. An echo that reads as the second
+    // when it is the first is worse than the silence it replaces, because an operator
+    // reads their own endpoint back and stops looking.
+    FakeCluster cluster;
+    Fixture fixture;
+    fixture.service.AdministerWith(cluster);
+
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
+    REQUIRE(rendered.has_value());
+
+    CHECK(rendered->contains("recorded"));
+    CHECK(rendered->contains("as received"));
+    // `SchedulerService::Offer`'s own phrase, not a second spelling of one state.
+    CHECK(rendered->contains("Appended, not committed"));
+
+    // The forbidden claims. Checked as ABSENCES, which is the half that discriminates:
+    // every wrong renderer this clause exists to stop would still contain the endpoint,
+    // so a positive check alone passes under all of them.
+    CHECK_FALSE(rendered->contains("admitted"));
+    CHECK_FALSE(rendered->contains("added"));
+    CHECK_FALSE(rendered->contains("in force"));
+
+    // *committed* needs its own treatment rather than a bare absence, because the
+    // ceiling phrase CONTAINS it -- negated. A substring check would refuse the one
+    // wording this clause demands, which is how a guard ends up asserting the opposite
+    // of its rule. So the negated occurrence is removed first and what remains must
+    // hold none.
+    auto residue = *rendered;
+    auto const negated = residue.find("not committed");
+    REQUIRE(negated != std::string::npos);
+    residue.erase(negated, std::string_view { "not committed" }.size());
+    CHECK_FALSE(residue.contains("committed"));
+}
+
+TEST_CASE("An admission answered with a body this build cannot read is refused", "[node][clusteradmin]")
+{
+    // Not rendered as a receipt with blank fields, which is the missing string the
+    // whole change exists to prevent arriving through the renderer -- an operator
+    // comparing two blank columns finds them equal.
+    //
+    // And deliberately NOT reported as *an older leader*: `MinSupportedVersion` equals
+    // `CurrentVersion`, so a leader speaking another version is refused by name at the
+    // header and never reaches this arm at all.
+    auto const empty = InterpretClusterReply(ClusterAction::Admit, {});
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().contains("cannot read"));
+
+    auto const shortBody = Wire::EncodeClusterAdmitReceipt(Wire::ClusterAdmitReceipt {});
+    auto truncated = std::vector<std::byte> { shortBody.begin(), shortBody.end() };
+    truncated.pop_back();
+    CHECK_FALSE(InterpretClusterReply(ClusterAction::Admit, truncated).has_value());
+}
+
+TEST_CASE("The other two cluster verbs still report exactly as they did", "[node][clusteradmin]")
+{
+    // The receipt is `cluster-admit`'s alone, and this is what makes that observable
+    // at the surface an operator reads. Both verbs in ONE case, and the admission
+    // beside them, so "all three changed" and "none changed" are each red rather than
+    // one of them passing quietly.
+    auto const set = InterpretClusterReply(ClusterAction::Set, {});
+    REQUIRE(set.has_value());
+    CHECK(*set == "accepted; the change is replicating\n");
+
+    auto const forget = InterpretClusterReply(ClusterAction::Forget, {});
+    REQUIRE(forget.has_value());
+    CHECK(*forget == "accepted; the change is replicating\n");
+
+    // The same empty body that satisfies those two is refused for an admission.
+    CHECK_FALSE(InterpretClusterReply(ClusterAction::Admit, {}).has_value());
 }

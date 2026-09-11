@@ -27,6 +27,13 @@ namespace
     /// Column width for a member id in the rendered report.
     constexpr std::size_t IdColumn = 12;
 
+    /// Column width for a receipt's labels, so the two values line up under each other.
+    ///
+    /// An operator compares these against a second screen, and two values that do not
+    /// start at the same column are two values they have to find before they can compare
+    /// them.
+    constexpr std::size_t ReceiptLabelColumn = 20;
+
     /// A dash where a value is absent, so a column is never blank.
     ///
     /// An empty cell reads as "nothing was rendered here" while a dash reads as
@@ -107,11 +114,57 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
 
         case ClusterAction::Set:
         case ClusterAction::Forget:
-        case ClusterAction::Admit:
             // Appended, not committed, and the wording says so: the leader cannot know
             // the difference until a majority answers, and claiming otherwise would be
             // the one thing a report like this must not do.
             return std::string { "accepted; the change is replicating\n" };
+
+        case ClusterAction::Admit: {
+            auto const receipt = Wire::DecodeClusterAdmitReceipt(reply);
+            if (!receipt.has_value())
+                // NOT *an older leader*, which is the tempting sentence and is wrong
+                // here: `MinSupportedVersion` equals `CurrentVersion`, so a leader that
+                // does not speak this version is refused by name at the header and
+                // never reaches this arm. A body that arrives and will not read is a
+                // damaged reply or a defect, and saying *upgrade something* would send
+                // an operator to fix a machine that is fine.
+                return std::unexpected { std::string {
+                    "the leader took the request and answered with a receipt this build cannot read" } };
+
+            // **Recorded, as received -- and about what happens next, nothing stronger
+            // than APPENDED.** The distinction is the whole of #1296: what the leader
+            // wrote into the command it knows instantly and alone, while whether a
+            // majority has taken it it cannot know at all. An echo that reads as the
+            // second when it is the first is a confident wrong signal, which is worse
+            // than the silence it replaces.
+            //
+            // *Appended, not committed* is `SchedulerService::Offer`'s own phrase and is
+            // deliberately not reworded here. Two spellings of one state is how a reader
+            // ends up believing they are two states.
+            //
+            // The closing paragraph is the POINT of the receipt rather than a
+            // pleasantry: these two lines are only worth printing because there is a
+            // second screen to hold them against, and an operator who does not know
+            // that compares them with their own memory, which is what nothing was
+            // comparing in the first place.
+            return std::format("recorded, as received:\n"
+                               "  {:<{}}{}\n"
+                               "  {:<{}}{}\n"
+                               "\n"
+                               "Appended, not committed: a majority has to take it, and this leader cannot\n"
+                               "see that yet. Ask for the cluster state again to see the result.\n"
+                               "\n"
+                               "Compare both lines above against the machine itself -- the id it minted into\n"
+                               "--cluster-dir, and the address it answers consensus on (--raft-self with\n"
+                               "--listen-raft). They are two spellings of one thing, and nothing else\n"
+                               "compares them.\n",
+                               "member id",
+                               ReceiptLabelColumn,
+                               receipt->memberId,
+                               "consensus endpoint",
+                               ReceiptLabelColumn,
+                               receipt->raftEndpoint);
+        }
     }
 
     return std::unexpected { std::string { "unknown cluster request" } };

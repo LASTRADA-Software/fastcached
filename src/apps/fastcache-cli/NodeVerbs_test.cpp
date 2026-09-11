@@ -820,13 +820,16 @@ TEST_CASE("a cluster change reports ACCEPTED, never committed", "[cli][node][clu
 {
     // The leader cannot know whether a change committed until a majority answers, so a
     // tool claiming it did is the one thing a report like this must not do.
+    //
+    // TWO verbs, not three. `cluster-admit` used to share this loop and now answers with
+    // a receipt (#1296), so it is a case of its own below rather than an omission here:
+    // a verb quietly dropped from a loop is a verb nothing asserts about.
     for (auto const& spec:
          { std::pair { std::string_view { "cluster-set" }, std::vector<std::string> { "fleet-open", "1" } },
-           std::pair { std::string_view { "cluster-forget" }, std::vector<std::string> { "node-b" } },
-           std::pair { std::string_view { "cluster-admit" }, std::vector<std::string> { "node-c", "10.0.0.9:6675" } } })
+           std::pair { std::string_view { "cluster-forget" }, std::vector<std::string> { "node-b" } } })
     {
         INFO("verb: " << spec.first);
-        // A typed empty payload: `{}` is ambiguous against `std::span`, and these three
+        // A typed empty payload: `{}` is ambiguous against `std::span`, and these two
         // verbs are acknowledged with a reply that carries no body at all.
         std::vector<std::byte> const noPayload;
         ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
@@ -834,6 +837,50 @@ TEST_CASE("a cluster change reports ACCEPTED, never committed", "[cli][node][clu
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "state").lexical == "replicating");
     }
+}
+
+TEST_CASE("cluster-admit reports what the leader RECORDED, never what is in force", "[cli][node][cluster]")
+{
+    // #1296. The address typed here and the one the joining node answers consensus on
+    // are two spellings of one address that nothing compared; when they disagree the
+    // member is in the configuration and contacts nobody, which presents as an election
+    // storm rather than as a typo. So the leader's half is printed.
+    //
+    // What it RECORDED it knows instantly and alone; whether a majority has taken it, it
+    // cannot know. The field names carry that distinction, so they are what this asserts.
+    auto const receipt =
+        Cc::EncodeClusterAdmitReceipt(Cc::ClusterAdmitReceipt { .memberId = "node-c", .raftEndpoint = "10.0.0.9:6675" });
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, receipt) } };
+
+    auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+
+    // Distinct values, neither a substring of the other, so a transposed pair reddens
+    // rather than agreeing with itself.
+    CHECK(RequiredCell(answer, "member-id-as-received").lexical == "node-c");
+    CHECK(RequiredCell(answer, "consensus-endpoint-as-recorded").lexical == "10.0.0.9:6675");
+
+    // The ceiling, asserted on the WORD: `SchedulerService::Offer`'s own phrase, not a
+    // second spelling of one state. Anything stronger here would be the confident wrong
+    // signal the whole change exists to avoid.
+    CHECK(RequiredCell(answer, "state").lexical == "appended, not committed");
+    CHECK(RequiredCell(answer, "state").lexical != "replicating");
+}
+
+TEST_CASE("cluster-admit refuses a reply whose receipt it cannot read", "[cli][node][cluster]")
+{
+    // Not rendered with blank cells, which is the missing string this change exists to
+    // prevent arriving through the renderer -- an operator comparing two empty columns
+    // finds them equal and stops looking.
+    //
+    // The empty body is exactly what the other two verbs are acknowledged with, which is
+    // what makes this the discriminating arrangement rather than a malformed-bytes one.
+    std::vector<std::byte> const noPayload;
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+
+    auto const answer = RunNodeVerb("cluster-admit", node, { "node-c", "10.0.0.9:6675" });
+    CHECK(answer.outcome == Outcome::Protocol);
+    CHECK(AdvisoryText(answer).contains("cannot read"));
 }
 
 TEST_CASE("NotLeader is followed to the endpoint it names, and separated from an election", "[cli][node][cluster]")

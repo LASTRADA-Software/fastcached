@@ -189,8 +189,26 @@ Absent is not empty in either table. A member that has never led carries no
 scheduler endpoint — a leader announces its own record on election — so that cell
 reads as absent rather than as an address nothing answers at.
 
-The three changing verbs report **accepted**, never committed. The leader cannot
-know the difference until a majority answers.
+Two of the three changing verbs report **accepted**, never committed. The leader
+cannot know the difference until a majority answers.
+
+`cluster-admit` reports more, and the extra is deliberate rather than a courtesy.
+What the leader **recorded** it knows the instant it builds the command, with no
+majority involved, so that much comes back:
+
+- `member-id-as-received` — the id, byte for byte as it arrived
+- `consensus-endpoint-as-recorded` — the address that goes into the replicated
+  configuration
+- `state` — **appended, not committed**, which is as strong a claim as a leader can
+  truthfully make here
+
+Hold both values against the machine being brought in: the id it minted into its own
+`--cluster-dir`, and the address it answers consensus on (`--raft-self` together with
+`--listen-raft`). They are two spellings of one thing and nothing else compares them.
+When they disagree the member sits in the cluster's configuration and contacts
+nobody, which at three members or more presents as an election storm that then
+settles — so the symptom points at consensus rather than at the character that was
+mistyped, and one address costs an afternoon.
 
 The same four verbs are also spelled `fastcache-compile-node --cluster-status`,
 `--cluster-set`, `--cluster-forget` and `--cluster-admit`. Prefer these: that path

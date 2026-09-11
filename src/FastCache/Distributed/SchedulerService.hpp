@@ -426,10 +426,23 @@ class SchedulerService
     /// not exist. The scheduler endpoint is not a parameter: a member announces its
     /// own once elected, and a value typed here about somebody else would be a
     /// guess that outranks what they say about themselves.
+    ///
+    /// **The reply carries a `Wire::ClusterAdmitReceipt`: what was RECORDED, never
+    /// what is in force.** `Offer` reports only that a command was appended, and that
+    /// stays true -- a leader cannot know whether a majority has taken it. The receipt
+    /// answers the other question, which needs no majority and which the leader knows
+    /// the instant it builds the command: the id as received and the endpoint as
+    /// parsed. Without it an operator's only check on a typed address was a flag
+    /// against a memory, and a member recorded at an address nothing answers on is a
+    /// symptom that points at consensus
+    /// ([#1296](https://github.com/LASTRADA-Software/fastcached/issues/1296)).
+    ///
+    /// It is attached at this call site rather than inside `Offer`, so the other two
+    /// verbs' reply shape is unchanged; the argument is at the attachment.
     /// @param caller Who is asking.
     /// @param memberId The member's identity.
     /// @param raftEndpoint host:port its consensus port answers on.
-    /// @return Accepted, or why it was refused.
+    /// @return The receipt for what was recorded, or why it was refused.
     [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint);

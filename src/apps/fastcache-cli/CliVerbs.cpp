@@ -1332,6 +1332,29 @@ namespace
     }
 
     /// `cluster-admit <id> <raft-endpoint>` -- add a member, or move one.
+    ///
+    /// **The one cluster verb that answers with more than *accepted*, and the
+    /// difference is the whole of
+    /// [#1296](https://github.com/LASTRADA-Software/fastcached/issues/1296).** The
+    /// address typed here and the one the joining node answers consensus on --
+    /// `--raft-self` with `--listen-raft` -- are two spellings of one address, and
+    /// nothing compared them. When they disagree the member is in the committed
+    /// configuration and contacts nobody, which at three members or more presents as an
+    /// election storm that settles: the symptom points at consensus rather than at the
+    /// character that was mistyped.
+    ///
+    /// So the leader's half goes on the screen. What it RECORDED it knows the instant it
+    /// builds the command, with no majority involved; whether a majority has taken it it
+    /// cannot know at all. The field names carry that distinction rather than a comment
+    /// doing it, because a field name is what an operator reads: **recorded**, **as
+    /// received**, and a state that says **appended, not committed** -- which is
+    /// `SchedulerService::Offer`'s own phrase and is deliberately not reworded here.
+    /// Never *admitted*, *added* or *in force*; an echo that reads as in-force when it
+    /// is merely taken-down is a confident wrong signal, and this codebase rates that
+    /// worse than a vague right one.
+    ///
+    /// `ClusterChangeAccepted` is untouched and still answers the other two verbs: the
+    /// hazard is `AddMember`'s alone, since it is the only command carrying an ADDRESS.
     /// @param context What to run against.
     /// @return The answer.
     [[nodiscard]] Answer ClusterAdmit(VerbContext const& context)
@@ -1341,7 +1364,24 @@ namespace
                                        .memberId = context.operands[0], .raftEndpoint = context.operands[1] }));
         if (!reply.has_value())
             return reply.error();
-        return Answered(ClusterChangeAccepted());
+
+        auto const receipt = CompileCacheWire::DecodeClusterAdmitReceipt(reply->payload);
+        if (!receipt.has_value())
+            // REFUSED rather than rendered with blank cells, which is the missing string
+            // this change exists to prevent arriving through the renderer: an operator
+            // comparing two empty columns finds them equal. Deliberately not reported as
+            // *an older node* either -- `MinSupportedVersion` equals `CurrentVersion`, so
+            // one speaking another version is refused by name at the header and never
+            // reaches here.
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{} answered cluster-admit with a receipt this client cannot read", context.node->Address()));
+
+        return Answered(
+            RecordValue({ Field { .name = "recorded", .value = BooleanCell(true) },
+                          Field { .name = "member-id-as-received", .value = TextCell(receipt->memberId) },
+                          Field { .name = "consensus-endpoint-as-recorded", .value = TextCell(receipt->raftEndpoint) },
+                          Field { .name = "state", .value = TextCell("appended, not committed") } }));
     }
 
     /// One `/fleet.txt` section, as a table.

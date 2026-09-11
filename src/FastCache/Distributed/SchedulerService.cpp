@@ -540,10 +540,45 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     // announces the new one on its next election. That is the right way round: a
     // node that moved has moved both ports, and keeping the old scheduler endpoint
     // would redirect clients to an address that member no longer answers.
-    return Offer(Cluster::Command { .kind = Cluster::CommandKind::AddMember,
-                                    .key = std::string { memberId },
-                                    .value = std::string { raftEndpoint },
-                                    .schedulerEndpoint = {} });
+    auto const command = Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                            .key = std::string { memberId },
+                                            .value = std::string { raftEndpoint },
+                                            .schedulerEndpoint = {} };
+
+    auto reply = Offer(command);
+    if (reply.status != Wire::Status::Ok)
+        return reply;
+
+    // **The receipt is attached HERE and not inside `Offer`, which is a decision and
+    // not simply the narrower of two spellings.** `Offer` is a MECHANISM -- put this
+    // command to consensus, translate the outcome -- shared with `ClusterSet` and
+    // `ClusterForget`, and a reply BODY is the answer to a verb. Letting the mechanism
+    // choose it would hand three verbs one answer because they share a transport,
+    // which is the collapse `RefusalTable` avoids by keying on the refusal rather than
+    // on the wire code it happens to be sent under.
+    //
+    // And the hazard is `AddMember`'s alone. What #1296 is about is two spellings of
+    // one ADDRESS on two machines disagreeing, and `AddMember` is the only command
+    // that carries an address at all. `SetSetting` refuses an unknown key BY NAME
+    // already, and its value is read back by CLUSTER-STATUS, a verb that exists for
+    // exactly that; `RemoveMember` names a member the cluster is already holding, so
+    // it has no second machine to disagree with.
+    //
+    // The third reason is about the verb after these three rather than about them: a
+    // payload every command gets is a payload no command is responsible for, and a
+    // fourth `CommandKind` would inherit a reply shape nobody decided it should have.
+    //
+    // It costs one conditional and duplicates nothing -- `Validate`, the refusal
+    // translation and `NotLeader`'s endpoint all stay in `Offer`, which this still
+    // goes through.
+    //
+    // Read off `command` rather than off the parameters, deliberately: the receipt's
+    // one claim is *these are the bytes I wrote down*, so it is taken from the thing
+    // that was written down. Spelling the parameters again here would make the two
+    // able to disagree, which is the whole defect one level in.
+    reply.payload = Wire::EncodeClusterAdmitReceipt(
+        Wire::ClusterAdmitReceipt { .memberId = command.key, .raftEndpoint = command.value });
+    return reply;
 }
 
 SchedulerReply SchedulerService::Refuse(Wire::ErrorCode code, std::string message) const
