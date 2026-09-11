@@ -1645,8 +1645,14 @@ namespace
           .minOperands = 0,
           .maxOperands = 0,
           .operands = "",
-          .summary = "what the endpoint is: version, identity, uptime, the\n"
-                     "components it runs and the ports it opened",
+          // Kinds of thing, never the field list. The enumerating form was already
+          // wrong -- #1294 added the toolchain survey, registration state, capacity
+          // and consensus role while this went on naming five fields as an inventory
+          // -- and it was wrong the way a list always becomes wrong: a summary that
+          // enumerates is a second place the fields live, so it drifts the moment the
+          // verb answers one more.
+          .summary = "what this endpoint is, what it is running, and how far\n"
+                     "it has got towards being useful to the fleet",
           .protocolCommand = "node-status",
           .modifiers = Modifier::None,
           .handler = &NodeStatus,
