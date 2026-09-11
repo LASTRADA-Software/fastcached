@@ -593,7 +593,7 @@ else
     # keyspace, so `get` has no 0xFC equivalent -- and the operator must be told what
     # the endpoint IS rather than that a connection closed.
     run_node get some-key
-    expect_status 3 "a cache verb against a node is unreachable, not a miss"
+    expect_status 4 "a cache verb against a node is refused by name, not unreachable"
     expect_stderr "fastcache-compile-node" "the refusal names what the endpoint is"
     expect_stderr "holds no user keyspace" "and why the verb cannot be answered"
 
