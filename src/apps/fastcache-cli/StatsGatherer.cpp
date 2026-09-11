@@ -91,8 +91,25 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     // **Absent, and that is an ANSWER rather than a failure to get one.** A node that
     // opened no admin surface said so; telling an operator the scrape *failed* would
     // send them to check a listener that does not exist.
+    //
+    // It names the flag AND says the surface is off unless asked for, and the second
+    // clause is the load-bearing one. This arm is what a DEFAULT node answers, so it is
+    // the first thing a new `fleet` user meets; without it a correct configuration reads
+    // as a fault on their own machine. The other three arms already point somewhere.
+    //
+    // **`--admin-listen` and not `--dashboard`**, even though `fleet` needs both.
+    // `--dashboard` without `--admin-listen` is a STARTUP REFUSAL -- the dashboard is
+    // served ON the admin surface, so `NodeConfig`'s policy table refuses the pair --
+    // which means naming it alone sends the reader to a node that will not boot. And
+    // this one sentence has TWO callers: the `stats` ladder's `/metrics` rung reaches
+    // its endpoint with `--admin-listen` alone and wants no dashboard at all. The
+    // necessary condition both callers share is the only remedy a shared sentence can
+    // state without being wrong for one of them.
     if (admin == identity->surfaces.end())
-        return std::unexpected(std::format("{} runs no admin surface", _node->Address()));
+        return std::unexpected(std::format("{} runs no admin surface. Start the node with --admin-listen to open "
+                                           "one: it is off unless asked for, so a node without one is configured "
+                                           "rather than broken",
+                                           _node->Address()));
 
     // This client speaks plain HTTP. A TLS admin surface is refused BY NAME rather than
     // dialled and failed: an HTTP request into a TLS listener produces a transport error

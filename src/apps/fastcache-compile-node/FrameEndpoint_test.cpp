@@ -39,11 +39,18 @@
 
 #include <tests/AbortiveClient.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
+
+// Shared rather than spelled here: this was one of five private copies of the same
+// reply readers, byte-identical once the `Wire` alias is expanded. A copy that has
+// stopped matching `DecodeReplyHeader`'s contract passes rather than fails, so the
+// duplication hid the next reply-header change rather than merely repeating itself.
+using FastCache::Testing::ErrorOf;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -377,14 +384,6 @@ class Conversation
     std::unique_ptr<ISocket> _socket;
 };
 
-/// The error code of a refusal, or nullopt when the reply is not one.
-[[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    if (!header.has_value() || header->status != Wire::Status::Error || header->payloadLength == 0)
-        return std::nullopt;
-    return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
-}
 /// A configuration serving @p surface at @p spec.
 ///
 /// Written THROUGH the surface's own row rather than by naming the config field, so
