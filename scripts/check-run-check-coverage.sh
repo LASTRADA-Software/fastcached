@@ -18,11 +18,30 @@
 #
 # ## The gap this leaves, stated rather than implied
 #
-# The `cmake -P` checks are NOT covered, and that is a decision with a residual
-# rather than a clean boundary. The wrapper runs `"$interpreter" "$check"` -- it
-# invokes a SHELL on a SCRIPT -- so covering a `cmake -P` registration means a
-# wrapper that takes an arbitrary COMMAND, which is a different tool and not a
-# wider pattern.
+# The `cmake -P` REGISTRATIONS are not covered, and that is a decision with a
+# residual rather than a clean boundary.
+#
+# This paragraph used to say that covering them "means a wrapper that takes an
+# arbitrary COMMAND, which is a different tool and not a wider pattern". Half of
+# that has since gone false and the other half was wrong, so it is corrected here
+# rather than left standing: **a sentence saying something cannot be done
+# instructs the next reader not to try**, which is the expensive shape the
+# rulebook records for `## Open work` entries.
+#
+#   * `run-check.sh --command -- <argv...>` EXISTS (#1103). It reports the same
+#     four outcomes for any command.
+#   * It is a MODE of the same script, not a different tool. Only the spawn
+#     differs; the markers, the classification, the status pass-through and the
+#     self-test are one object, and a second script would give a second spelling
+#     of the marker -- which is what `run-check.sh`'s own header argues against.
+#
+# What remains is the mechanical half: the registrations still invoke
+# `${CMAKE_COMMAND}` directly, so `outsideCMake` below is still a real count of
+# real uncovered invocations. When they are routed through the wrapper, this
+# check gains a second audit that REFUSES an uncovered `cmake -P` invocation
+# instead of counting it -- and that refusal must land WITH the rewrite, never
+# ahead of it, or it is red on arrival against a tree where none of them is
+# wrapped yet.
 #
 # The hazard does not stop at the boundary, and the tempting argument that it
 # does is wrong. It runs: a `cmake -P` check's verdict is read from its OUTPUT
@@ -35,8 +54,9 @@
 # Weaker than the `.sh` collapse, where the two are identical in every respect,
 # and still the same shape.
 #
-# So this branch closes the total collapse and leaves the partial one open. That
-# residual is a ticket, not a sentence here.
+# So #1079 closed the total collapse and left the partial one open. #1103 is that
+# residual: its wrapper half has landed, its registration half has not. A ticket,
+# not a sentence here.
 #
 # ## Why this is a check and not a convention
 #

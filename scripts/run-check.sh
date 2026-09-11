@@ -68,6 +68,7 @@
 # `mapfile`, no `declare -A`, no `local -n`, no `BASHPID`.
 #
 # Usage:  run-check.sh <check-script> [args...]
+#         run-check.sh --command -- <argv...>    # any command, same four outcomes
 #         run-check.sh --self-test
 
 # NOT `-e`: the whole job is to observe the child's status and classify it, and
@@ -266,6 +267,106 @@ if [ "${1:-}" = "--self-test" ]; then
         selfTestStatus=1
     fi
 
+    # ---- `--command` mode (#1103) ------------------------------------------
+    #
+    # Assert `--command` reports `want` and passes `wantStatus` through.
+    # @param 1 What is being checked, for the report.
+    # @param 2 The outcome word expected in the terminal marker.
+    # @param 3 The exit status expected from the wrapper itself.
+    # @param 4.. The command to run.
+    CommandCase() {
+        local what="$1" want="$2" wantStatus="$3" out="" got=0
+        shift 3
+        selfTestCases=$((selfTestCases + 1))
+        out="$("$interpreter" "$me" --command -- "$@" 2>&1)" || got=$?
+        local ok=1
+        case "$out" in
+            *"${StartMarker}"*) ;;
+            *) echo "  FAIL  '$what' printed no start marker" >&2; ok=0 ;;
+        esac
+        case "$out" in
+            *"${TerminalMarker}: ${want}"*) ;;
+            *) echo "  FAIL  '$what' did not conclude '${want}'" >&2; ok=0 ;;
+        esac
+        if [ "$got" -ne "$wantStatus" ]; then
+            echo "  FAIL  '$what' exited ${got}, expected ${wantStatus}" >&2
+            ok=0
+        fi
+        if [ "$ok" -eq 1 ]; then
+            echo "  ok    ${what}"
+        else
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            selfTestStatus=1
+        fi
+    }
+
+    CommandCase "--command: a command that succeeds" passed 0 \
+        "$interpreter" -c 'exit 0'
+    CommandCase "--command: a command that reports a problem" failed 1 \
+        "$interpreter" -c 'exit 1'
+    CommandCase "--command: a command that skips" skipped 77 \
+        "$interpreter" -c 'exit 77'
+    # The whole point of the mode. A killed command must be told from a failing
+    # one by something PRESENT, which is the marker rather than the absence of
+    # `CMake Error`.
+    CommandCase "--command: a command killed by a signal" did-not-conclude 143 \
+        "$interpreter" -c 'kill -TERM $$; sleep 5'
+    CommandCase "--command: a command that is not there" failed 2 \
+        "no-such-command-1103"
+
+    # BYTE IDENTITY, and it is the constraint #1103 turns on: 74 registrations are
+    # judged by a regex over the command's OUTPUT, so a wrapper that buffered and
+    # re-printed -- or moved a byte between streams -- would change every one of
+    # those verdicts while every outcome above still passed.
+    #
+    # The needles live in a STAGED FILE and not in the command line. The start
+    # marker echoes the argv, so a `-c 'printf "on stderr"'` spelling puts the
+    # needle into the marker itself and the case then matches its own label --
+    # measured, and it reported a stderr leak on a wrapper whose streams were
+    # correctly separated. A probe that matches its own text.
+    selfTestCases=$((selfTestCases + 1))
+    Stage "streams.sh" 'printf "CMake Error: pretend\nsecond line\n"; printf "e-r-r-needle\n" >&2'
+    cmdOut="$("$interpreter" "$me" --command -- "$interpreter" "${scratch}/streams.sh" 2>/dev/null)"
+    cmdErr="$("$interpreter" "$me" --command -- "$interpreter" "${scratch}/streams.sh" 2>&1 >/dev/null)"
+    byteOk=1
+    case "$cmdOut" in
+        *"CMake Error: pretend"*"second line"*) ;;
+        *) echo "  FAIL  the command's stdout did not survive on stdout" >&2; byteOk=0 ;;
+    esac
+    # stderr must stay stderr. If the wrapper merged the streams, the fail-pattern
+    # would still match and this would be the only case that noticed.
+    case "$cmdErr" in
+        *"e-r-r-needle"*) ;;
+        *) echo "  FAIL  the command's stderr did not survive on stderr" >&2; byteOk=0 ;;
+    esac
+    case "$cmdOut" in
+        *"e-r-r-needle"*) echo "  FAIL  stderr leaked into stdout" >&2; byteOk=0 ;;
+    esac
+    if [ "$byteOk" -eq 1 ]; then
+        echo "  ok    --command: the command's bytes survive, on the streams it wrote them to"
+    else
+        selfTestStatus=1
+    fi
+
+    # And the marker must not itself match the live fail-pattern, or wrapping a
+    # PASSING check would turn it red. `check-run-check-coverage.sh` asserts this
+    # against the patterns resolved from the registrations; this asserts it
+    # against the one spelling that matters most, here, where the marker is
+    # defined -- a guard in one file about a constant in another goes stale.
+    selfTestCases=$((selfTestCases + 1))
+    # A HERESTRING, never `printf ... | grep -q`. That idiom is a false NEGATIVE
+    # under `pipefail` on the SUCCESS path -- `grep -q` exits at the first match,
+    # the producer dies of SIGPIPE, and `pipefail` reports the producer's status.
+    # `check-e2e-helpers.sh` scans for it, and it caught this exact line here.
+    markerText="${StartMarker}
+${TerminalMarker}"
+    if grep -Eq 'CMake Error|CMake Warning' <<< "$markerText"; then
+        echo "  FAIL  a marker matches the script-check fail-pattern, so wrapping a PASSING check would redden it" >&2
+        selfTestStatus=1
+    else
+        echo "  ok    --command: no marker matches CMake Error|CMake Warning"
+    fi
+
     # A self-test that stopped early must not look like one that judged something.
     echo "run-check: self-test ran ${selfTestCases} case(s)"
     if [ "$selfTestStatus" -ne 0 ]; then
@@ -276,9 +377,73 @@ if [ "${1:-}" = "--self-test" ]; then
     exit 0
 fi
 
+# ## `--command`: the same four outcomes for an arbitrary command (#1103)
+#
+# #1079 covered the registered `scripts/check-*.sh` invocations. The registered
+# `cmake -P` ones were left out, and the argument for leaving them is that they
+# are ALREADY distinguishable: a `cmake -P` check's verdict is read from its
+# output (`FAIL_REGULAR_EXPRESSION`, because `message(WARNING)` exits 0 while
+# printing `CMake Warning`), so a killed one prints no `CMake Error` where a
+# failing one does.
+#
+# That is true and it is not sufficient. **The tell is an ABSENCE** -- there is a
+# positive signal for the failing case and none for the killed one -- which is
+# this file's opening sentence one step weaker rather than a different situation.
+# And it is the half where the absence reads most innocently: a `cmake -P` check
+# killed early looks exactly like one that ran and found nothing, right up until
+# ctest reports `***Failed` on the status alone.
+#
+# ## Why this is a MODE here and not a second script
+#
+# #1103 argued a command-taking wrapper is "a different tool rather than a wider
+# pattern". Only the SPAWN differs -- the markers, the four-way classification,
+# the status pass-through, the stdout discipline and the self-test are the same
+# object. A second script would duplicate all of that, and the duplicate this
+# file's own header warns about is precisely a second spelling of the marker:
+# *"a marker each of 22 scripts spells itself is 22 chances to spell it
+# differently"*. So the invocation is DATA and there is one tool, which is also
+# the repository's data-driven rule rather than a preference.
+#
+# ## What must not change, and does not
+#
+# The child INHERITS stdout and stderr; nothing here buffers or re-prints, so the
+# command's bytes reach ctest byte-identical and on the stream it wrote them to.
+# That is load-bearing: 74 registrations are judged by a regex over those bytes,
+# and a wrapper that re-emitted them would change every one of those verdicts.
+# The markers cannot collide with the fail-patterns either -- asserted by
+# `MarkersAreSafe` in `check-run-check-coverage.sh`, against the patterns
+# RESOLVED from the registrations rather than a copy of them.
+if [ "${1:-}" = "--command" ]; then
+    shift
+    [ "${1:-}" = "--" ] && shift
+    if [ $# -eq 0 ]; then
+        echo "usage: $0 --command -- <argv...>" >&2
+        exit 2
+    fi
+    # The whole argv is the label. A `cmake -P` invocation's interesting part is
+    # its `-D` arguments as much as its script -- two registrations of one script
+    # differing only in a `-D` are ordinary here -- so truncating to the script
+    # path would make two different runs print the same marker.
+    commandLabel="$*"
+    if ! command -v "$1" >/dev/null 2>&1 && [ ! -x "$1" ]; then
+        # Same reasoning as the missing-script path below, including the stream:
+        # on stderr, a reader capturing only stdout would see a start marker and
+        # no terminal one, which is this file's own spelling of DID NOT CONCLUDE.
+        StartLine "$commandLabel"
+        echo "${TerminalMarker}: failed -- no such command: ${1}"
+        exit 2
+    fi
+    StartLine "$commandLabel"
+    "$@"
+    commandStatus=$?
+    echo "${TerminalMarker}: $(Classify "$commandStatus") -- ${commandLabel} (exit ${commandStatus}$(StatusDetail "$commandStatus"))"
+    exit "$commandStatus"
+fi
+
 check="${1:-}"
 if [ -z "$check" ]; then
     echo "usage: $0 <check-script> [args...]" >&2
+    echo "       $0 --command -- <argv...>" >&2
     echo "       $0 --self-test" >&2
     exit 2
 fi
