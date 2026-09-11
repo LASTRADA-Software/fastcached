@@ -1368,337 +1368,219 @@ what differs between compilers, standard libraries, hosts and tool versions.
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
 - `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as
-  `100% tests passed` — measured, six consecutive green runs over a live flake, found on
-  the first try by a loop that counted. `scripts/flake-rate.sh` keeps a tally, keeps the
-  early stop, and states its N on every line, because a stability claim without one
-  invites the inference it cannot support.
+  `100% tests passed`. `scripts/flake-rate.sh` keeps a tally, keeps the early stop, and states
+  its N on every line, because a stability claim without one invites the inference it cannot
+  support.
 - **A wall clock is not a duration.** `SECONDS`, `TIMEFORMAT='%3R'` and `date` all read
-  CLOCK_REALTIME, which a VM host's time sync steps BOTH ways — measured **under WSL2**
-  on three instruments in three sessions, a 4.03 s interval read 2.76 s, a `read -t 5` that
-  consumed its whole bound measured 4 in 7 of 45 reads, and one interval came back
-  NEGATIVE (`%3R` prints `/.044`, because `'0' - 1` is `/`). That was #1058: 23% in the
-  DEFAULT set and a pull request ejected from the merge queue. Assert what a helper
-  DECIDED — the pause it REQUESTED is exact and host-independent — or time it against
-  something monotonic (`sleep` is CLOCK_MONOTONIC on both platforms). **The variable is
-  the ENVIRONMENT, not the load**, measured as a pair on ONE box in ONE 240 s window: 8
-  backward steps in 502 WSL2 samples, 0 in 429 Git Bash samples, the box near-idle by
-  Git Bash's own 545-592 ms against a 500 ms sleep. So the step does NOT need a busy
-  host, the magnitudes are not portable off WSL2, and a clean run cited against a
-  clock-step ticket names its environment or is unreadable — 120 clean Git Bash runs
-  were not weak evidence about a WSL2 defect, they were none. **A shape guard is
-  not enough**: the same host produced a *well-formed* **6 ms** reading for work that
-  requested 200 ms of pause, which every predicate accepts. And it is **BIDIRECTIONAL** —
-  a forward step SHORTENS a bound, so a healthy wait gives up early and reads as a slow
-  runner (#1081's macOS `wait-for-log` red), which is the direction that gets "fixed" by
-  raising a budget. **A derivation is only as sound as the premise it does not state**:
-  the algebra here was right, defended over 200k simulated placements, and rested on
-  *the clock does not move*, which nobody wrote down and a census cannot falsify. #678
-  fixed this same predicate's RESOLUTION and left the clock.
-- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found FIVE tests that
-  could not fail for the reason they existed — five shapes, all green, three of them acceptance criteria written by
-  whoever understood the defect best. Each asserted something the healthy AND the broken state produce, so it read
-  as coverage forever: `REQUIRE(held)` on a bind whose failure returns a non-null pointer in an ERRORED state, and
-  a refusal test pinning a flag BOTH the old and the new rule name. A refusal test asserts WHICH refusal. **Prove
-  the test can fail** — neuter the fix and check the failures are the ones you expect AND ONLY THOSE; the
-  asymmetry is the evidence. "What would prove this fixed" and "what would fail if it were not" are different
+  CLOCK_REALTIME, which a VM host's time sync steps BOTH ways. Assert what a helper DECIDED —
+  the pause it REQUESTED is exact and host-independent — or time it against something monotonic.
+  **The variable is the ENVIRONMENT, not the load**, so a clean run cited against a clock-step
+  ticket names its environment or is unreadable. **A shape guard is not enough**: a well-formed
+  reading can be an order of magnitude short of the work it describes. And it is
+  **BIDIRECTIONAL** — a forward step SHORTENS a bound, so a healthy wait gives up early and reads
+  as a slow runner, which is the direction that gets "fixed" by raising a budget. **A derivation
+  is only as sound as the premise it does not state**: the algebra here rested on *the clock does
+  not move*, which nobody wrote down and a census cannot falsify.
+- **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found
+  five tests that could not fail for the reason they existed, three of them acceptance criteria
+  written by whoever understood the defect best. Each asserted something the healthy AND the
+  broken state produce. A refusal test asserts WHICH refusal. **Prove the test can fail** —
+  neuter the fix and check the failures are the ones you expect AND ONLY THOSE; the asymmetry is
+  the evidence. "What would prove this fixed" and "what would fail if it were not" are different
   questions, and only the second one tests anything.
-- **#405 produced THREE fixtures that could not fail, in one batch, none found by reviewing
-  the assertion** — one watched an object no consumer holds, one used a candidate an earlier
-  guard refuses so it never reached the code under test, one asserted a string BOTH refusals
-  contain. One instance reads as bad luck; three read as the default outcome. What found them
-  was neutering the fix, building the neighbouring case, and asking how production ACQUIRES
-  what the fixture acquires. Reading harder finds none of them.
-- A fixture that RE-ACQUIRES a collaborator the production code binds ONCE is testing a
-  different object, and its assertion can be exactly right while the case is green over a
-  live defect. #405's first `--fleet-open` case re-asked `membership.Oracle()` after each
-  reload; every surface binds an `IMembershipOracle const&` at construction and holds it,
-  so an `Oracle()` returning one of two owned objects chosen by a flag read once was
-  invisible to the fixture and fatal in production. Bind it the way the call sites do,
-  before the mutation, and read back through that binding. Covers any cached seam — a
-  reference, an iterator, a `shared_ptr` snapshot, a resolved endpoint. The tell is that
-  the fixture is MORE CONVENIENT than the production code, which is when nobody re-reads
-  it; it is the mirror of *a fake more permissive than the thing it stands for*, with the
-  CALL PATTERN as the fake, so reading the fake never finds it.
-- Every wait is bounded and says what it waited for — and, when it times out, which KIND of failure it was.
-  A slow machine and a wedged process are fixed in different places, so a wait records what tells them apart: the cost on success, whether the process is still
-  alive, whether the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk logs nothing while it runs, so log growth alone
-  diagnoses that case confidently and wrongly. Where the signals disagree, say INCONCLUSIVE. **And an
-  INCONCLUSIVE verdict is a place to ask somebody ELSE** (#965): a `launchctl kickstart`
-  timeout with almost no CPU cannot separate a busy host from a stall, and only launchd
-  knows whether the job ever left pending — so the fixture asks `launchctl print` on the
-  FAILURE PATH, every command `|| true`, because a diagnostic on an already-failed case
-  must explain the verdict and never change it. The next move is a different instrument,
-  not a better reading of the same one.
-- A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same window is the same
-  number divided by the same 300: 3.4s spread over five minutes and 3.4s burned in the first ten before a wedge are
-  opposite diagnoses. Draw the verdict from a RECENT window and print the totals as evidence only. No magnitude bar
-  calibrates — the same include walk runs at 88% duty warm and a fraction of that cold — but **zero does not vary**, so
-  test for presence, measure the process TREE (a spawned `cl` charges its own CPU), and report the band between idle
-  and clearly-working as neither.
-- An `-or` is right for two independent CONFIRMATIONS and wrong for two competing READINGS: `logGrew` was False and
-  `busy` was True, and the disjunction let the weaker win unopposed. A signal that cannot be false in the failing case
-  is not evidence. And an instrument that prints a **remedy** cannot know when the remedy is under dispute — "raise the
-  budget" is what #354 refuses. State the finding and stop.
-- A classifier that cannot be made to say BLOCKED cannot report a hang. `ctest -R node-scratch-isolation-e2e-selftest`
-  drives each verdict against a synthesised **readings record**, in the default set.
-- A stand-in built to exhibit a MAGNITUDE must not be measured through an instrument whose own overhead is comparable
-  to it: the verdict band is 0.35s wide and a PowerShell process's startup costs 0.2–0.5s, so a stand-in that burned
-  exactly 250ms still read 0.52s on CI and 0.16s when moved. No arrangement fixes that — the noise IS the interpreter.
-  Split the DECISION out as a pure function over a record; leave acquisition alone. Branches that could not be staged
-  become one line, every bound gets pinned on BOTH sides, and 53s + RUN_SERIAL becomes 0.3s.
-- A fixture waits on what a line MEANS. `node-scratch-isolation-e2e` serialised its three include-tree walks by waiting for
-  `compile node ready`, which meant *surveyed* until #365 made it mean *serving* — same wording, different fact, and the walks
-  then ran concurrently at 2–5 file/s against ~30 single. The budget was the symptom; raising it would have bought a fixture
-  three times slower with the cause buried. Wait on the STAGE, keep bind and survey separate so a stall says which, and note
-  that the paragraph explaining the serialisation was correct and three lines above the wait that had stopped implementing it.
-- **A fixture that has never completed has told you nothing**, however carefully it was read.
-  `launcher-replay-e2e` was reviewed and merged into a CI job, and its first run anywhere died on the
-  first line that starts a process, behind which sat three more defects — one of them #390, a
-  repository bug the fixture merely reached first. A flag spelling is checked against `CliOptions()`,
-  never remembered — `--memory-limit` does not exist, and the daemon answered usage while the fixture
-  reported "never accepted a connection". `exit` inside a `( ... )` ends the subshell only, so a
-  `fail` helper signals the top-level shell and tests `BASHPID`, since bash keeps `$$` at the parent's
-  value there and the guard would silently never fire.
-- **A guard written to prove a fixture bites can itself fail to bite.** The replay canary compiled a
-  wrong object over a unit of ANOTHER target, the binary under test never linked it, and the fixture
-  announced "the suite PASSED with a wrong object linked in" — a true observation carrying a false
-  claim, which names the subject as broken when the instrument is. An injection is ASSERTED, in the
-  artefact and again in the thing that consumes it.
+- **Three fixtures that could not fail came out of one batch, none found by reviewing the
+  assertion** — one watched an object no consumer holds, one used a candidate an earlier guard
+  refuses so it never reached the code under test, one asserted a string BOTH refusals contain.
+  One instance reads as bad luck; three read as the default outcome. What found them was
+  neutering the fix, building the neighbouring case, and asking how production ACQUIRES what the
+  fixture acquires. Reading harder finds none of them.
+- A fixture that RE-ACQUIRES a collaborator the production code binds ONCE is testing a different
+  object, and its assertion can be exactly right while the case is green over a live defect. Bind
+  it the way the call sites do, before the mutation, and read back through that binding. Covers
+  any cached seam — a reference, an iterator, a `shared_ptr` snapshot, a resolved endpoint. The
+  tell is that the fixture is MORE CONVENIENT than the production code, which is when nobody
+  re-reads it; it is the mirror of *a fake more permissive than the thing it stands for*, with
+  the CALL PATTERN as the fake, so reading the fake never finds it.
+- Every wait is bounded and says what it waited for — and, when it times out, which KIND of
+  failure it was. A slow machine and a wedged process are fixed in different places, so a wait
+  records what tells them apart: the cost on success, whether the process is still alive, whether
+  the log grew, and how much CPU it burned. The last one is not optional — an include-tree walk
+  logs nothing while it runs. Where the signals disagree, say INCONCLUSIVE. **And an INCONCLUSIVE
+  verdict is a place to ask somebody ELSE**: the next move is a different instrument, not a better
+  reading of the same one — asked on the FAILURE PATH, every command `|| true`, because a
+  diagnostic on an already-failed case must explain the verdict and never change it.
+- A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same
+  window is the same number divided by the same constant. Draw the verdict from a RECENT window
+  and print the totals as evidence only. No magnitude bar calibrates, but **zero does not vary**,
+  so test for presence, measure the process TREE, and report the band between idle and clearly
+  working as neither.
+- An `-or` is right for two independent CONFIRMATIONS and wrong for two competing READINGS — the
+  disjunction lets the weaker win unopposed. A signal that cannot be false in the failing case is
+  not evidence. And an instrument that prints a **remedy** cannot know when the remedy is under
+  dispute. State the finding and stop.
+- A classifier that cannot be made to say BLOCKED cannot report a hang, so each verdict is driven
+  against a synthesised readings record, in the default set.
+- A stand-in built to exhibit a MAGNITUDE must not be measured through an instrument whose own
+  overhead is comparable to it — no arrangement fixes that, because the noise IS the interpreter.
+  Split the DECISION out as a pure function over a record; leave acquisition alone.
+- A fixture waits on what a line MEANS, not on its wording: a marker whose sentence stayed the
+  same while the fact behind it changed silently un-serialised three concurrent walks. The budget
+  was the symptom; raising it would have bought a fixture three times slower with the cause
+  buried. Wait on the STAGE, and keep the phases separate so a stall says which.
+- **A fixture that has never completed has told you nothing**, however carefully it was read: one
+  was reviewed and merged into a CI job and its first run anywhere died on the first line that
+  starts a process, behind which sat three more defects. A flag spelling is checked against
+  `CliOptions()`, never remembered. `exit` inside a `( ... )` ends the subshell only, so a `fail`
+  helper signals the top-level shell unconditionally.
+- **A guard written to prove a fixture bites can itself fail to bite**, and then announces a true
+  observation carrying a false claim — which names the subject as broken when the instrument is.
+  An injection is ASSERTED, in the artefact and again in the thing that consumes it.
 - **Attribute by asking the process, never by adjacency in interleaved output.** Reading the
-  `[n/m] Building CXX object ...` line above each launcher outcome split one unit differently across
-  two runs of the same build (74/41 against 75/40) — a guard that fails a build for a scheduling
-  accident. A wrapper that labels the unit on the same stream, from the same process, inside the same
-  edge cannot be separated from what it labels; an unlabelled outcome is counted as NEITHER and
-  refused by name. And an unattributed total hides the only column that means anything: 106 of 221
-  units missing was alarming and was entirely third-party, while one project unit missing is the
-  actual regression shape and is invisible inside the same number.
-- A `$<TARGET_FILE:x>` naming a target that was NOT built is a hard error at **generate** time, not a skipped
-  test, so the whole configure fails and the message names CMake rather than the option the operator set. Guard
-  the block on `TARGET x` as well as on whatever feature makes the test interesting — the two are independent.
-  `-DFASTCACHED_BUILD_DAEMON=OFF` could not be configured at all (#390), and only on machines that HAVE sccache,
-  since the sccache rows are gated on finding the binary. The rule was already written out four lines above the
-  block that obeys it in `fastcache-cc/CMakeLists.txt` while two blocks one directory away did not, which is a
-  rule that needs a check rather than a better comment: `ctest -R target-file-guards`, in the default set,
-  reading the optional targets from `src/apps/CMakeLists.txt` rather than restating them.
-- A fixture whose client is always LOCAL cannot test who is admitted. `Classify` returns
-  `Member` for the whole of `127.0.0.0/8` before it reads the member list, so twelve
-  loopback end-to-end cases passed a worker that admitted only its own machine and refused
-  every dispatched compile (#235). A second loopback address does not reach that list —
-  the check is `127.`, not `127.0.0.1` — and changing to one looks exactly like a fix. The
-  host's OWN non-loopback address does, with no second machine. Assert BOTH directions:
-  listed and dispatched, unlisted and refused with the refusal COUNTER moving, the
-  scheduler admitting the client in both so the refusal is the worker's. The fixture's own
-  liveness probe is a caller too, so the refusing leg's baseline is one rather than zero
-  and the compile is a delta from it. A host with no such address reports SKIPPED, loudly
-  and as its own ctest test — a quiet fall back to loopback is a pass for a case that
-  never ran, which is the defect itself.
-- A script-driven test naming more than one executable is registered in
-  `src/tests`, not beside a binary.
-- An abbreviated identifier is a DISPLAY form: the full one is read, never padded,
-  truncated or re-derived. A fabricated SHA shares its prefix with the real one, so every
-  human-readable trace of the mistake reads correctly and only the raw `422` disagrees —
-  which is how a watcher reported ALL COMPLETE, NOTHING RED for a commit that does not
-  exist. **Zero rows is not a verdict, it is the absence of one**, so a response's SHAPE
-  is checked before any conclusion is drawn from it and an unparseable answer is a hard
-  failure, never a quiet retry. And before concluding "nothing there", state what was
-  searched and whether that search could have found it — a CI log grepped for the ctest
-  block, not found THERE, was reported as "CI produces no test output" while
-  `outputOnFailure` had put it in the file all along.
-  A census returning zero gets a POSITIVE CONTROL: this repository sets
-  `grep.lineNumber`, so `git grep -h` emits `<lineno>:<content>`, an anchored
-  `^TEST_CASE("` matched nothing, and the audit reported 0 of 3135 case names carrying
-  a comma when the answer is 428. Nothing errored, nothing was empty, and zero was the
-  expected answer — so find one instance by other means and check the census sees it.
-- Tests allocate their ports per run rather than fixing them — from **below** the
-  kernel's ephemeral range, and remembered, because a connect probe cannot see a
-  port already held as an outbound connection's local endpoint. **A fixed one needs
-  a reaper**: `run-launcher-e2e.ps1` bound a constant and reaped nothing, so a run
-  that missed its cleanup left a daemon up for the life of the machine and every
-  later run failed `fastcached exited immediately (exit 1)` — naming neither the port
-  nor the process, and diagnosed by hand after surviving a rebase and reading as the
-  rebase's regression (#220). The reason offered for the constant was TRUE and did
-  not support it: `FASTCACHE_ADDR` must be decided before the daemon starts, which is
-  an argument for deciding it EARLY. A holder is **refused, never adopted** — a
-  leftover is of unknown vintage and may hold another build's store, the very
-  confusion the fixture detects — except one whose image path is byte-for-byte this
-  run's daemon, which is reaped; a holder whose path cannot be READ is refused, or
-  the reap arm kills a process nothing knows. And the DECISION is what gets tested:
-  it was reachable only by running a fixture needing a daemon, a launcher and MSVC,
-  so `-SelfTestPorts` drives it over staged records and real listeners
-  (`launcher-e2e-ports-selftest`, REGISTERED-and-skipped where `pwsh` is absent).
-- `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a
-  build failure.
-- A Catch2 case name is an ARGUMENT, and that one fact has three consequences. It may
-  not begin with `-` — CTest passes it as an argument, so `--help ...` printed usage
-  and reported a pass for a case that never ran. A **COMMA** splits the spec, so a name
-  containing one selects NOTHING and the run answers `No tests ran`, which exits
-  **non-zero** — measured, exit 2, two unmatched fragments — so the miss presents as a
-  *deterministic red* rather than an empty result, and a rate loop reads `pass=0 fail=N`
-  for a case that never ran (#636, #895). That is not a reason to rename: 529 of 3503
-  names carry a comma and the sentence-shaped convention is right, so select by TAG, and
-  **anything selecting a subset asserts how many cases RAN**, not only how many failed.
-  Write it as *the name is an argument*, never as *commas are bad*, or the next
+  progress line above each outcome split one unit differently across two runs of the same build.
+  A wrapper that labels the unit on the same stream, from the same process, inside the same edge
+  cannot be separated from what it labels; an unlabelled outcome is counted as NEITHER and refused
+  by name. And an unattributed total hides the only column that means anything.
+- A `$<TARGET_FILE:x>` naming a target that was NOT built is a hard error at **generate** time,
+  not a skipped test, so the whole configure fails and the message names CMake rather than the
+  option the operator set. Guard the block on `TARGET x` as well as on whatever feature makes the
+  test interesting — the two are independent. `ctest -R target-file-guards`, in the default set,
+  reads the optional targets from `src/apps/CMakeLists.txt` rather than restating them.
+- A fixture whose client is always LOCAL cannot test who is admitted: `Classify` returns `Member`
+  for the whole of `127.0.0.0/8` before it reads the member list. A second loopback address does
+  not reach that list, and changing to one looks exactly like a fix; the host's OWN non-loopback
+  address does, with no second machine. Assert BOTH directions, with the refusal COUNTER moving
+  and the scheduler admitting the client in both so the refusal is the worker's. The fixture's own
+  liveness probe is a caller too, so the refusing leg's baseline is one rather than zero. A host
+  with no such address reports SKIPPED, loudly and as its own ctest test — a quiet fall back to
+  loopback is a pass for a case that never ran, which is the defect itself.
+- A script-driven test naming more than one executable is registered in `src/tests`, not beside a
+  binary.
+- An abbreviated identifier is a DISPLAY form: the full one is read, never padded, truncated or
+  re-derived. A fabricated SHA shares its prefix with the real one, so every human-readable trace
+  reads correctly and only the raw error disagrees. **Zero rows is not a verdict, it is the
+  absence of one**, so a response's SHAPE is checked before any conclusion is drawn and an
+  unparseable answer is a hard failure, never a quiet retry. Before concluding "nothing there",
+  state what was searched and whether that search could have found it. A census returning zero
+  gets a POSITIVE CONTROL: this repository sets `grep.lineNumber`, so `git grep -h` emits a
+  `<lineno>:` prefix and an anchored pattern matched nothing while the true answer was in the
+  hundreds. Nothing errored, nothing was empty, and zero was the expected answer.
+- Tests allocate their ports per run rather than fixing them — from **below** the kernel's
+  ephemeral range, and remembered, because a connect probe cannot see a port already held as an
+  outbound connection's local endpoint. **A fixed one needs a reaper**, or a run that misses its
+  cleanup leaves a daemon up for the life of the machine. A holder is **refused, never adopted** —
+  a leftover is of unknown vintage and may hold another build's store — except one whose image
+  path is byte-for-byte this run's daemon, which is reaped; a holder whose path cannot be READ is
+  refused, or the reap arm kills a process nothing knows. And the DECISION is what gets tested,
+  over staged records and real listeners, REGISTERED-and-skipped where the interpreter is absent.
+- `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a build failure.
+- A Catch2 case name is an ARGUMENT, and that one fact has three consequences. It may not begin
+  with `-`. A **COMMA** splits the spec, so a name containing one selects NOTHING and the run
+  answers `No tests ran`, which exits **non-zero** — so the miss presents as a *deterministic red*
+  rather than an empty result. That is not a reason to rename: the sentence-shaped convention is
+  right, so select by TAG, and **anything selecting a subset asserts how many cases RAN**, not only
+  how many failed. Write it as *the name is an argument*, never as *commas are bad*, or the next
   separator character is a new ticket.
-- A DUPLICATED case name registers two ctest entries that each run BOTH cases, because
-  `catch_discover_tests` registers one entry per name and Catch2 matches every case
-  carrying it. Nothing is skipped — what breaks is ATTRIBUTION, so it reads as harmless:
-  one defect surfaces as two reds naming neither case, and `ctest -R "^<name>$"` cannot
-  select one of the pair (#729). `test-name-hygiene` refuses duplicates, its exemption
-  rows carry a REASON, and a row that has stopped describing a duplicate is refused as
-  STALE — an exemption nobody must keep true would wave through the next one.
-- **A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG.** Catch2
-  unwinds, so the failure skips the stop and `~jthread` joins a loop nobody stopped: the
-  timeout does not name the assertion, a timeout and a wedge look identical, and a green
-  suite says nothing about it. It concentrates in TEARDOWN tests, whose author is
-  thinking about the subject's ordering rather than the harness's. `CHECK` does not
-  unwind and is not this. Fix by stopping BEFORE asserting, or by RAII — where
-  **declaration order is half of it**, the fake outliving the thread that touches it, or
-  the hang becomes a use-after-free. A lambda taking a `std::stop_token` is not exposed
-  at all. **Not soundly mechanizable** — that needs dataflow, and a textual scan is
-  approximate in both directions (both misreadings were observed while triaging it) —
-  so no check is written, deliberately: it would refuse 18 legitimate raw threads on
-  arrival, and a check that fails on arrival gets disabled (#902).
-- A fixture states which PATH it exercised. `check-catch-skip-return-code` derives its
-  file set from `git ls-files` and falls back to a directory walk; its selftest had six
-  green cases and CI still failed, with no contradiction between them — a synthetic
-  tree is not a git repository, so every case exercised the FALLBACK while CI exercised
-  GIT. **The mode under test was not the mode in use**, which is a guard passing
-  because it is testing something else. So the mode is part of the OUTPUT and asserted
-  on both sides, or the cheap-to-construct path silently becomes the only one tested.
-- A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means or it scores
-  a skip as a FAILURE — the binary prints `1 skipped` while ctest prints `***Failed` for
-  the same run (#499). A false RED: essentially every skip site is
-  environment-conditional, so they fire on a constrained runner and report a regression
-  that is not there, and whoever meets it deletes the SKIP rather than suspecting the
-  registration. (This said "all seven"; the tree held 39 at #1128's merge base, and the
-  figure moved by one mid-ticket — the rule file states the pattern, and the argument
-  never rested on the count.)
-  **And the mechanism that fixes that RED is itself broken, which is #1128.** Catch2's
-  exit code **is** its failed-assertion count clamped at 255, so `SKIP_RETURN_CODE 4`
-  scores a case failing exactly four assertions as *skipped* — and a case that skips one
-  `SECTION` and fails four in another. Genuinely failing tests, silent, inside
-  `100% tests passed`, in all five binaries. **The repair for one state collapse was the
-  site of the next, inside the mechanism chosen to prevent state collapse.** It is still
-  what the tree carries, because **all three alternative channels were measured and every
-  one is worse**: the exit status is fully occupied (every value in 1..255 is a reachable
-  assertion count); the OUTPUT is a substring search over text the SUBJECT controls, so a
-  case that only fails but mentions the summary text is scored skipped, and anchoring it
-  is impossible because `^` is `cmd.exe`'s escape character while a literal newline
-  **arrives EMPTY** through cmd — which makes an empty pattern that matches every line,
-  so the remedy degrades into every failing test scoring as skipped, silently, at exit
-  zero; and `FAIL_REGULAR_EXPRESSION` does **not** outrank `SKIP_RETURN_CODE`, so the two
-  cannot be composed. A `catch_discover_tests` property value is a **wire format with
-  three parsers in it** — a literal `|` killed every Windows leg at the DISCOVERY step
-  before anything linked (#1146) — and **no Linux gate can reproduce any of that.** The
-  fix is a change of MECHANISM, open as #1152; `catch-skip-exit-collision` asserts the
-  premises so the record cannot rot into a false rule, and `src/tests/CatchSkipCanary.cpp`
-  carries the shapes a replacement must survive. **Adding shapes cannot make a pattern
-  safe**: every shape is one you thought of, and the channel is shared with an author who
-  thinks of others. Not `WILL_FAIL` anywhere either — a skipped test carrying it is not
-  scored a failure, so such a canary is green under the very defect it guards. And the
-  list is written at BUILD time, so a reconfigure alone leaves a stale one that reads
+- A DUPLICATED case name registers two ctest entries that each run BOTH cases. Nothing is skipped —
+  what breaks is ATTRIBUTION, so it reads as harmless: one defect surfaces as two reds naming
+  neither case, and `ctest -R "^<name>$"` cannot select one of the pair. `test-name-hygiene` refuses
+  duplicates, its exemption rows carry a REASON, and a row that has stopped describing a duplicate
+  is refused as STALE.
+- **A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG.** Catch2 unwinds, so the
+  failure skips the stop and `~jthread` joins a loop nobody stopped: the timeout does not name the
+  assertion, and a timeout and a wedge look identical. It concentrates in TEARDOWN tests, whose
+  author is thinking about the subject's ordering rather than the harness's. `CHECK` does not unwind
+  and is not this. Fix by stopping BEFORE asserting, or by RAII — where **declaration order is half
+  of it**, the fake outliving the thread that touches it, or the hang becomes a use-after-free.
+  **Not soundly mechanizable**, so no check is written, deliberately: a textual scan is approximate
+  in both directions and would refuse legitimate raw threads on arrival, and a check that fails on
+  arrival gets disabled.
+- A fixture states which PATH it exercised. A synthetic tree is not a git repository, so a check
+  deriving its file set from `git ls-files` with a directory-walk fallback had six green self-test
+  cases exercising the FALLBACK while CI exercised GIT. **The mode under test was not the mode in
+  use**, which is a guard passing because it is testing something else. So the mode is part of the
+  OUTPUT and asserted on both sides.
+- A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means or it scores a skip as a
+  FAILURE — a false RED, and whoever meets it deletes the SKIP rather than suspecting the
+  registration. **And the mechanism that fixes that RED is itself broken**: Catch2's exit code **is**
+  its failed-assertion count clamped at 255, so `SKIP_RETURN_CODE 4` scores a case failing exactly
+  four assertions as *skipped*. Genuinely failing tests, silent, inside `100% tests passed`. **The
+  repair for one state collapse was the site of the next, inside the mechanism chosen to prevent
+  state collapse.** It is still what the tree carries, because **all three alternative channels were
+  measured and every one is worse** — the exit status is fully occupied, the OUTPUT is a substring
+  search over text the SUBJECT controls and cannot be anchored through `cmd.exe`, and
+  `FAIL_REGULAR_EXPRESSION` does not outrank `SKIP_RETURN_CODE`. A `catch_discover_tests` property
+  value is a **wire format with three parsers in it**, and **no Linux gate can reproduce any of
+  that.** The fix is a change of MECHANISM, open as #1152; `catch-skip-exit-collision` asserts the
+  premises and `src/tests/CatchSkipCanary.cpp` carries the shapes a replacement must survive.
+  **Adding shapes cannot make a pattern safe.** Not `WILL_FAIL` anywhere either — a skipped test
+  carrying it is not scored a failure, so such a canary is green under the very defect it guards.
+  And the list is written at BUILD time, so a reconfigure alone leaves a stale one that reads
   exactly like a current one.
-- The converse, and the direction nobody investigates: `SUCCEED` is right when a case
-  RAN and had nothing to assert, and wrong when the case could not run — where it stands
-  in for a skip it reports a PASS for a property nothing established (#685). Twenty-one
-  sites did, all environment-conditional (no loopback, no IPv6, no symlink privilege,
-  root, a bound port), so the green arrived exactly on the runs where coverage is
-  thinnest. "Covered by another test" is a reason to SKIP, never to pass. It spread by
-  IMITATION out of `DirectManifest_test.cpp`, under a comment that was already correct —
-  so the guard is a check (`succeed-not-skip`, shown failing by
-  `succeed-not-skip-selftest`) on two signals, a bail-out `return` after the `SUCCEED`
-  and a table of skip vocabulary in its message. What it cannot see is stated rather
-  than papered over, and a `SUCCEED` it cannot read is refused, not cleared.
-- A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process
-  counter is not unique — `catch_discover_tests` gives every case its own
-  process, and the suite runs in parallel.
-- A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. Three private
-  copies of one scripted `ISocket` carried the same `WriteVectored` defect in two of
-  them, found a day apart — a fake nothing exercises does not report its own bugs.
-- And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a
-  suspension protocol, however correct its assertions — nothing is wrong with the fake,
-  which is what makes this the harder half of the rule above. `InMemorySocket::WaitReadable`
-  resolves immediately and says why it should; every property defined by parking is
-  therefore vacuous over it, and #710 and #755 both sat behind that green. The survey of
-  which such properties have a real-socket case, and which have none, is in
-  [`.agent/rules/testing.md`](.agent/rules/testing.md) (#778).
-- So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp` (#649).
-  Four cases in two binaries each hand-rolled a stored value carrying a generation this
-  build does not implement — three lines, no collaborator, nothing that looks like it
-  wants a helper. They fail SILENTLY, which is what makes them worth consolidating: every
-  one asserts a REFUSAL and a value damaged another way is refused too, so a generation
-  moving off byte 0 leaves each copy stamping a different field while every case goes on
-  passing under a name for what it no longer builds. An assertion review finds none of
-  them, because every assertion is correct. Two facts live in the helper alone: WHICH
-  byte carries the generation (a violated precondition throws, naming both numbers), and
-  WHICH generation is foreign — DERIVED, never `CompileValueVersion + 1`, which stops
-  being right at the top of the reserved range and would build a `NotACompileValue`
-  (#552) in four cases named for the opposite. A hand-built FRAME this build could never
-  have encoded is a different subject and must not be routed through it.
-- The POSIX shell fixtures share `scripts/lib/e2e-common.sh`, tested by
-  `ctest -R e2e-helpers-selftest`. It was seven copies that had already diverged three
-  ways, one of them a `wait_for_port` with no liveness check at all. A wait's bound is
-  read from a **clock** and its timeout reports the **measured** elapsed: `100 x 0.2s`
-  is not 20s, and `timed out after $((WAIT_TICKS / 10))s` was a duration nobody ever
-  observed — the one reading that says whether the machine was slow, derived from
-  assuming it was fast. A bespoke condition is a predicate passed to `wait_until`,
-  never a new loop. And `fail` signals the top-level shell unconditionally rather than
-  testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2 — **every**
-  script under `scripts/`, since the scan that enforces that read only the library for
-  two tickets while `launcher-replay-e2e.sh` carried the banned guard under a comment
-  arguing it was correct (#627). The file set is WALKED, refuses when it matches
-  nothing and when the token table empties, and a tracked `*.sh` outside `scripts/` is
-  refused by name rather than quietly excluded — ONE enumeration for all three scans in
-  that file, since the `timeout` scan's own glob could not read the file defining the
-  `run_bounded` its failure message names. A file that matches its own scan by
-  construction exempts a REGION (`# bash32-scan: data-begin`), never itself: a
-  whole-file row would blind the scan to the 1700-line script ctest runs on macOS, and a
-  planted `local -n` proves the difference. `BASHPID` is one of three doors to
-  *inside a `want-fail` assertion, any failure to run is indistinguishable from the
-  rule firing* — a mode bit is #723, an empty array under `set -u` is #793/#794 — and
-  the empty array is deliberately NOT scanned: measured ~110 sites across 22 scripts,
-  essentially all never-empty, and no regex can tell the two apart.
-- **A background helper in these scripts runs the fixture's CLEANUP until you have watched
-  it not.** Anything forked into the background inherits the shell's traps, and in a
-  fixture the EXIT trap IS the cleanup — so a helper signalled catchably `rm -rf`s the
-  workdir of the run still using it, and nothing in the failure names a trap, a timer or a
-  cleanup (`node-ready-waits-for-marker`, a third of runs, reported as *"cannot arm a 15s
-  deadline: not a directory"* — the SECOND wait refusing because the FIRST wait's timer had
-  deleted the directory). `trap - EXIT TERM INT HUP` first in the subshell is the fix
-  everybody reaches for and is **insufficient**: it covers a subshell that has STARTED, and
-  the window that fires is the one BEFORE that, because the disarm follows the arm by
-  microseconds and an inherited `trap 'exit 1' TERM` goes straight to the inherited EXIT
-  trap. Measured interleaved and order-alternated, `trap -` alone is 10/2 against an
-  unfixed 9/3 — indistinguishable — while `kill -KILL` is 12/0 against 7/5. BOTH guards
-  stay, each naming the window it closes, or the redundant-looking one is deleted. It is
-  also VERSION-DEPENDENT: on bash 5.2 a background subshell runs no inherited EXIT trap and
-  the shape does not reproduce at all, so this lives on macOS's 3.2 and a green Linux run
-  is not evidence. Two standalone probes reproduced none of it — the first having sent the
-  subshell's output to `/dev/null`, which is where its evidence went.
-- A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose
-  `OnCompile` places the interleaving rather than waiting for one. It is in
-  `src/tests/` and not beside `RaftClusterHarness`, because a fleet spans the library
-  AND the apps, and `src/FastCache/` must not include an app header. A harness earns
-  its place only by a property shown RED when its rule is removed — and prove it with
-  a case that stays GREEN under the same break, or the suite is measuring nothing.
-- A leader-pinned **mutating** command is put to whoever leads NOW, re-derived, never
-  to an endpoint an earlier section recorded — leadership moves, and the fixture then
-  reports "ask somebody else" as the cluster refusing something legitimate. The retry
-  keys on the answer the caller ASSERTS, never on a recognised refusal wording: that
-  refusal has TWO spellings, so a fixture matching them stops retrying the day either
-  is reworded. Which is also what lets one helper assert a REFUSAL — the typo'd
-  setting's substring is the typo. `submit_setting` WAS this rule, correct in both
-  halves, at line 778 of the same file — 117 lines above one call site that lacked it
-  and 212 above the other (#117, #172): a helper implementing a rule does not spread
-  it, only a call site using it does.
-- A first failure MASKS its identical siblings. `--cluster-forget` was never once
-  observed failing, not because it was sound but because the byte-identical
-  `--cluster-admit` one section earlier failed first and the run never reached it.
-  Fixing only the OBSERVED site relocates the flake rather than removing it, and the
-  relocated one then presents as a regression introduced by the fix — no failure
-  history, first seen in the run after the change. Which is the argument for the
-  audit: nothing about the sibling looked suspicious, and instinct would not have
-  found it (#172).
+- The converse, and the direction nobody investigates: `SUCCEED` is right when a case RAN and had
+  nothing to assert, and wrong when the case could not run — where it stands in for a skip it
+  reports a PASS for a property nothing established. The twenty-one sites were all
+  environment-conditional, so the green arrived exactly on the runs where coverage is thinnest.
+  "Covered by another test" is a reason to SKIP, never to pass. It spread by IMITATION under a
+  comment that was already correct, so the guard is a check on two signals — a bail-out `return`
+  after the `SUCCEED`, and a table of skip vocabulary in its message. A `SUCCEED` it cannot read is
+  refused, not cleared.
+- A scratch directory comes from `src/tests/ScratchPath.hpp`. A per-process counter is not unique —
+  `catch_discover_tests` gives every case its own process, and the suite runs in parallel.
+- A test FAKE is a shared helper too: `src/tests/ScriptedSocket.hpp`. A fake nothing exercises does
+  not report its own bugs.
+- And a fake that resolves SYNCHRONOUSLY what production SUSPENDS on cannot exercise a suspension
+  protocol, however correct its assertions — nothing is wrong with the fake, which is what makes
+  this the harder half of the rule above. Every property defined by parking is vacuous over
+  `InMemorySocket`. The survey of which such properties have a real-socket case, and which have
+  none, is in the rules file.
+- So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp`. Hand-rolled copies
+  fail SILENTLY, because every one asserts a REFUSAL and a value damaged another way is refused too
+  — so a field moving leaves each copy stamping something different while every case goes on passing
+  under a name for what it no longer builds. An assertion review finds none of them. Two facts live
+  in the helper alone: WHICH byte carries the generation, and WHICH generation is foreign — DERIVED,
+  never `CompileValueVersion + 1`, which stops being right at the top of the reserved range. A
+  hand-built FRAME this build could never have encoded is a different subject and must not be routed
+  through it.
+- The POSIX shell fixtures share `scripts/lib/e2e-common.sh`, tested by `ctest -R
+  e2e-helpers-selftest`. A wait's bound is read from a **clock** and its timeout reports the
+  **measured** elapsed — a duration nobody ever observed, derived from assuming the machine was
+  fast, is the one reading that says whether it was slow. A bespoke condition is a predicate passed
+  to `wait_until`, never a new loop. And `fail` signals the top-level shell unconditionally rather
+  than testing `BASHPID`, which is bash 4.0+ and silently inert on macOS's 3.2 — across **every**
+  script under `scripts/`, since a scan that read only the library missed a script arguing in a
+  comment that its banned guard was correct. The file set is WALKED, refuses when it matches
+  nothing and when the token table empties, and a tracked `*.sh` outside `scripts/` is refused by
+  name rather than quietly excluded. A file that matches its own scan by construction exempts a
+  REGION, never itself.
+- **A background helper in these scripts runs the fixture's CLEANUP until you have watched it not.**
+  Anything forked into the background inherits the shell's traps, and in a fixture the EXIT trap IS
+  the cleanup — so a helper signalled catchably deletes the workdir of the run still using it, and
+  nothing in the failure names a trap, a timer or a cleanup. `trap - EXIT TERM INT HUP` first in the
+  subshell is the fix everybody reaches for and is **insufficient**: it covers a subshell that has
+  STARTED, and the window that fires is the one BEFORE that. Measured, `trap -` alone is
+  indistinguishable from unfixed while `kill -KILL` is decisive. BOTH guards stay, each naming the
+  window it closes, or the redundant-looking one is deleted. It is also VERSION-DEPENDENT and does
+  not reproduce on bash 5.2, so a green Linux run is not evidence. Two standalone probes reproduced
+  none of it — the first having sent the subshell's output to `/dev/null`, which is where its
+  evidence went.
+- A fleet property that spans two machines needs `src/tests/FleetHarness.hpp`, whose `OnCompile`
+  places the interleaving rather than waiting for one. It is in `src/tests/` and not beside
+  `RaftClusterHarness`, because a fleet spans the library AND the apps, and `src/FastCache/` must
+  not include an app header. A harness earns its place only by a property shown RED when its rule is
+  removed — and prove it with a case that stays GREEN under the same break, or the suite is
+  measuring nothing.
+- A leader-pinned **mutating** command is put to whoever leads NOW, re-derived, never to an endpoint
+  an earlier section recorded. The retry keys on the answer the caller ASSERTS, never on a
+  recognised refusal wording: that refusal has TWO spellings, so a fixture matching them stops
+  retrying the day either is reworded. Which is also what lets one helper assert a REFUSAL. **A
+  helper implementing a rule does not spread it, only a call site using it does** — this exact rule
+  sat correct in both halves, in the same file, above two call sites that lacked it.
+- A first failure MASKS its identical siblings: one site was never observed failing, not because it
+  was sound but because a byte-identical one earlier failed first and the run never reached it.
+  Fixing only the OBSERVED site relocates the flake rather than removing it, and the relocated one
+  then presents as a regression introduced by the fix — no failure history, first seen in the run
+  after the change. Which is the argument for the audit: nothing about the sibling looked
+  suspicious, and instinct would not have found it.
 
 ## Issues and pull requests
 
