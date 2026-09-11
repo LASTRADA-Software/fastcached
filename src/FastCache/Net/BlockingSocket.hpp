@@ -403,7 +403,45 @@ class BlockingListener final: public IListener
     BlockingListener& operator=(BlockingListener&&) = delete;
     ~BlockingListener() override;
 
+    /// Accept one connection, blocking this thread until one arrives or the poll
+    /// armed by `SetTimeouts` expires.
+    ///
+    /// **Single-threaded by contract, and `Close()` is the other half of it** — see
+    /// the note there before calling either from two threads.
+    /// @return The accepted socket, or the error that ended the wait.
     [[nodiscard]] AcceptAwaitable Accept() override;
+
+    /// Close the listening socket.
+    ///
+    /// **This class is NOT thread-safe, and the one arrangement that keeps finding
+    /// its way back is closing while another thread is inside `Accept()`**
+    /// ([#1207](https://github.com/LASTRADA-Software/fastcached/issues/1207), and
+    /// [#260](https://github.com/LASTRADA-Software/fastcached/issues/260) one layer
+    /// up). `_native` is a plain descriptor: this writes it, `Accept()` reads it as
+    /// its first act and again at the `poll()` and the `accept()`, and nothing orders
+    /// the two. ThreadSanitizer reports it at this function.
+    ///
+    /// So: **ask the accept loop to stop, JOIN it, and only then close.**
+    /// `AdminEndpoint::~AdminEndpoint` is that order written out with its reasoning,
+    /// and it is the shape every caller wants.
+    ///
+    /// **Closing early buys nothing, which is what makes the rule cost-free.** POSIX
+    /// does not unblock a parked `accept()` when another thread closes the socket —
+    /// that is precisely why `SetTimeouts` exists — so a close cannot shorten the
+    /// wait. The loop leaves on its own within one poll interval of its stop flag,
+    /// and the join costs at most that.
+    ///
+    /// **An atomic `_native` is NOT the fix and must not be reached for.** It would
+    /// silence the report while leaving the hazard: the descriptor can still be
+    /// closed and its number reused between the load and the `accept()`, so the
+    /// accept would then operate on an unrelated file. That trades a race the
+    /// sanitizer can see for one it cannot, which is the worse direction.
+    ///
+    /// **There is deliberately no in-flight assertion here.** Tracking "an accept is
+    /// running" would catch a caller that closes while the loop is parked and miss
+    /// the one that closes between two iterations — a partial guard whose silence
+    /// reads as coverage. The obligation is on the caller and is *do something*
+    /// (join), which no state on this object can express.
     void Close() noexcept override;
 
     /// Enable bounded shutdown + slowloris protection (off by default).

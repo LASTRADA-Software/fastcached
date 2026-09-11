@@ -348,6 +348,8 @@ TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise"
         // asked to stop -- `AdminHttpServer::Run` leaves only on the shutdown flag, and
         // the lambda takes no stop token for `request_stop` to reach. The case would
         // HANG on the one path this diagnosis exists to serve.
+        server.RequestStop();
+        serverThread.join();
         server.Shutdown();
         FAIL("the admin server never answered /healthz, measured over "
              << live.waited.count() << " ms. A TCP connect to its port "
@@ -363,6 +365,20 @@ TEST_CASE("HttpHealthProbe succeeds against a live /healthz and fails otherwise"
     // that answered true for everything would pass the line above.
     CHECK_FALSE(HttpHealthProbe("127.0.0.1", Port, "/nope"));
 
+    // Ask, JOIN, then close — and this is the site the ThreadSanitizer report in
+    // [#1207](https://github.com/LASTRADA-Software/fastcached/issues/1207) actually
+    // names, which is worth saying because it is not the one it looks like.
+    // `Shutdown()` closes the listener, and `~jthread` joins only at scope exit, so a
+    // bare `Shutdown()` writes `_native` while this case's own server thread is
+    // reading it inside `Accept()`.
+    //
+    // `RequestStop()` exists for exactly this and says so in its own Doxygen — *"call
+    // this, join the accept thread, and only then call `Shutdown()`"* — so what failed
+    // here was not a missing contract but an unenforced one. The join is bounded by
+    // the 100 ms accept poll armed above; closing could never have shortened it,
+    // because POSIX does not unblock a parked `accept()` from another thread.
+    server.RequestStop();
+    serverThread.join();
     server.Shutdown();
 }
 
@@ -440,7 +456,16 @@ TEST_CASE("HttpHealthProbe rejects a non-200 response whose body contains \" 200
     INFO("waited " << served.waited.count() << " ms for the responder to report writing its 500");
     CHECK(served.ready);
 
+    // Ask, JOIN, then close -- the order is the fix
+    // ([#1207](https://github.com/LASTRADA-Software/fastcached/issues/1207)). Closing
+    // wrote `_native` while this acceptor was reading it inside `Accept()`, which
+    // ThreadSanitizer reports at `BlockingListener::Close`. The join costs at most one
+    // 100 ms accept poll -- the one `SetTimeouts` armed above -- because a close cannot
+    // shorten the wait: POSIX does not unblock a parked `accept()` when another thread
+    // closes the socket. `AdminEndpoint::~AdminEndpoint` is the same three lines with
+    // the argument written out, from #260.
     acceptor.request_stop();
+    acceptor.join();
     listener->Close();
 }
 
@@ -511,6 +536,13 @@ TEST_CASE("HttpHealthProbe times out (not hangs) against an accept-but-silent pe
     INFO("waited " << took.waited.count() << " ms for the acceptor to report taking the connection");
     CHECK(took.ready);
 
+    // Ask, JOIN, then close -- #1207, the sibling of the site above. This one was never
+    // observed failing, and that is the reason to fix it in the same change rather than
+    // only the site the report named: it is byte-for-byte the same arrangement, and a
+    // first failure masks its identical siblings until the day the fix relocates it.
+    // The join is bounded by the acceptor's own 50 ms sleep, not by the accept poll,
+    // because by here it is holding `taken` rather than parked in `Accept()`.
     acceptor.request_stop();
+    acceptor.join();
     listener->Close();
 }

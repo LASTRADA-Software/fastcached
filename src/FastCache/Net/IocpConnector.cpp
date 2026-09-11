@@ -7,6 +7,7 @@
     #include <FastCache/Async/Task.hpp>
     #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ConnectFlow.hpp>
+    #include <FastCache/Net/IocpDial.hpp>
     #include <FastCache/Net/IocpSocket.hpp>
     #include <FastCache/Net/IocpStatus.hpp>
     #include <FastCache/Net/KeepAlive.hpp>
@@ -28,86 +29,38 @@ namespace FastCache
 namespace
 {
 
-    /// One dial in flight.
+    /// The dial op this connector instantiates.
     ///
-    /// `completion` is FIRST because the reactor reinterpret_casts the
-    /// `lpOverlapped` it dequeues back to an `IocpCompletion*` and then to the
-    /// enclosing op -- the same layout contract `IocpSocket::Impl::Op` relies on.
-    /// It lives in the dialling coroutine's frame, so its address is stable for
-    /// exactly as long as the port can reach it.
-    ///
-    /// **That last sentence is the invariant, and it is why this type carries no
-    /// `inFlight` reference the way `IocpSocket::Impl::Op` and
-    /// `IocpListener::Impl::AcceptOp` do. Do not "make it consistent" with them.**
-    ///
-    /// The op outlives the operation because the OWNER IS SUSPENDED ON IT: the
-    /// coroutine cannot leave the frame holding this struct without the
-    /// completion having arrived, since `co_await ConnectPark { &op }` is resumed
-    /// only by `OnConnectComplete`. Even the timeout path below cancels and then
-    /// keeps waiting, precisely because `CancelIoEx` makes the completion arrive
-    /// rather than retracting it.
-    ///
-    /// The socket and the listener cannot use this shape: they are owned by
-    /// whoever holds their `unique_ptr`, and a destructor is not a coroutine and
-    /// cannot suspend until a completion lands. That asymmetry is the whole of
-    /// #465 -- removing this comment and adding a reference count here would be
-    /// harmless, but removing the *waiting* on the belief that a reference count
-    /// replaces it would reintroduce the defect in the one place that never had
-    /// it.
-    struct ConnectOp
-    {
-        IocpCompletion completion {};
-        IocpReactor* reactor { nullptr };
-        ParkedWork waiter {};
-        SOCKET socket { INVALID_SOCKET };
-        DWORD error { 0 };
-        bool settled { false };
-        bool timedOut { false };
-    };
-
-    /// Suspends until the completion arrives.
-    struct ConnectPark
-    {
-        ConnectOp* op { nullptr };
-
-        [[nodiscard]] bool await_ready() const noexcept
-        {
-            return op->settled;
-        }
-
-        /// Templated on the promise for `ResumeOn`'s reason: the completion below
-        /// posts this chain to a reactor that may be destroyed before it dequeues
-        /// it, and only the parking coroutine's own promise type knows whether
-        /// anything else can free it
-        /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
-        /// By the time the completion runs the handle is erased, so this is the
-        /// last place the question can be asked.
-        /// @tparam Promise The suspending coroutine's promise type.
-        /// @param handle The suspended dial.
-        /// @return true to stay suspended; false when the dial settled first.
-        template <typename Promise>
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> handle) const noexcept
-        {
-            if (op->settled)
-                return false;
-            op->waiter = Detail::ParkedWorkFor(handle);
-            return true;
-        }
-
-        void await_resume() const noexcept {}
-    };
+    /// `ConnectOp`, `ConnectPark` and the hand-back they exist for used to live in
+    /// this anonymous namespace, which is why nothing outside this translation unit
+    /// could reach the `Submit` site
+    /// ([#1138](https://github.com/LASTRADA-Software/fastcached/issues/1138)). They
+    /// are in `Net/IocpDial.hpp` now, the way `ReactorDial.hpp` already holds the
+    /// readiness half, and this alias is the one instantiation production uses.
+    using IocpConnectOp = Detail::ConnectOp<IocpReactor>;
 
     /// Reactor callback: the port has an answer for this dial.
     ///
     /// The completion is the SINGLE writer of the outcome, which is why the
     /// deadline below cancels the operation rather than settling the op itself.
     /// That removes the two-writer race the readiness path has to guard against.
+    ///
+    /// It decides only WHAT happened; `Detail::SettleConnect` does the hand-back.
+    /// The split is what makes the hand-back reachable from a test at all, and it
+    /// mirrors the readiness path, where the platform callbacks likewise only
+    /// decide an outcome and `SettleDial` posts the chain.
+    /// @param base The completion the port dequeued, which is this op's first member.
+    /// @param status What the port reported.
     void OnConnectComplete(IocpCompletion* base, DWORD /*bytes*/, IocpStatus status)
     {
-        auto* const op = reinterpret_cast<ConnectOp*>(base);
+        auto* const op = reinterpret_cast<IocpConnectOp*>(base);
+
+        // Asked HERE as well as inside `SettleConnect`, and the duplication is
+        // deliberate rather than a leftover: the conversion below is an ARGUMENT, so
+        // it would run on an already-settled op before the settle could refuse it --
+        // and it reads a SOCKET a settled op may no longer own.
         if (op->settled)
             return;
-        op->settled = true;
 
         // The NTSTATUS the reactor read is not a WSA code: 0xC0000236 (connection
         // refused) matches no `WSAE*` row and lands on `SystemError`, which is useless
@@ -117,10 +70,7 @@ namespace
         // one of which is `IocpSocket` and had the same defect for as long. The
         // conversion now lives in one place and the `dispatch` signature no longer
         // offers a `DWORD` to forget to convert.
-        op->error = Detail::WsaErrorOf(op->socket, op->completion, status);
-
-        if (auto waiter = std::exchange(op->waiter, ParkedWork {}); waiter.resume)
-            op->reactor->Submit(waiter);
+        Detail::SettleConnect(*op, Detail::WsaErrorOf(op->socket, op->completion, status));
     }
 
     /// The wildcard address for a family, which `ConnectEx` requires the socket
@@ -243,7 +193,7 @@ namespace
                                                  .systemCode = 0,
                                                  .context = "could not associate the dialling socket with the port" });
 
-        ConnectOp op;
+        IocpConnectOp op;
         op.reactor = context.reactor;
         op.socket = socket;
         op.completion.dispatch = &OnConnectComplete;
@@ -275,7 +225,7 @@ namespace
             DeadlineTimer const timer { *context.reactor,
                                         deadline,
                                         [](void* timedOut) {
-                                            auto& pendingOp = *static_cast<ConnectOp*>(timedOut);
+                                            auto& pendingOp = *static_cast<IocpConnectOp*>(timedOut);
                                             if (pendingOp.settled)
                                                 return;
                                             pendingOp.timedOut = true;
@@ -287,7 +237,7 @@ namespace
                                         },
                                         &op };
 
-            co_await ConnectPark { .op = &op };
+            co_await Detail::ConnectPark<IocpConnectOp> { .op = &op };
         }
 
         if (op.error != 0)

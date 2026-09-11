@@ -10,10 +10,16 @@
 // `IReactor&` -- so a reactor destroyed before the post is dequeued freed nothing.
 //
 // **This file covers the POSIX site only, and says so rather than implying more.**
-// `ReactorDial.hpp`'s `SettleDial` is the epoll and kqueue half.
-// `IocpConnector.cpp:116` is a second, separate `Submit` in an anonymous namespace
-// inside that translation unit, and nothing here reaches it -- see the `#else` at
-// the foot of this file for what covers it and what does not.
+// `ReactorDial.hpp`'s `SettleDial` is the epoll and kqueue half;
+// `IocpDial.hpp`'s `Detail::SettleConnect` is the IOCP one, and it has cases of
+// its own in `IocpConnector_test.cpp` since
+// [#1138](https://github.com/LASTRADA-Software/fastcached/issues/1138). See the
+// `#else` at the foot of this file.
+//
+// Named by SYMBOL and not by line. This paragraph cited `IocpConnector.cpp:116`
+// for as long as #1138 was open, and by the time it was closed the `Submit` had
+// moved to line 123 -- three citations in two files, all stale, none wrong when
+// written.
 #if defined(__linux__) || defined(__APPLE__)
 
     #include <FastCache/Async/IReactor.hpp>
@@ -439,16 +445,22 @@ TEST_CASE("A dial some Task owns is left alone by the reactor", "[net][connect][
 // `ReactorDial.hpp` is epoll and kqueue only, so this translation unit is empty on
 // Windows -- and that is stated rather than left as an accident of the `#if`.
 //
-// **`IocpConnector.cpp:116` is covered by nothing here**, and the missing
-// demonstration is
-// [#1138](https://github.com/LASTRADA-Software/fastcached/issues/1138). It is a
-// second `Submit` with the same defect, inside an anonymous namespace in that
-// translation unit, so neither the traits seam above nor any test outside that file
-// can reach its `ConnectOp`. What covers it is the compile-time evidence recorded on the pull
-// request -- with the sites converted and `IReactor`'s owning overload still
-// hidden, the build failed `no viable conversion` at that site among the others --
-// plus the propagation being verified on the POSIX side, since Windows runs the
-// same `ConnectFlow` and the same `Task` chain. That is an argument, not a
-// measurement, and it is written down as one.
+// **The IOCP `Submit` is covered, and it is covered somewhere else.**
+// `Detail::SettleConnect` in `Net/IocpDial.hpp` has its own red-under-mutation
+// pair in `IocpConnector_test.cpp`
+// ([#1138](https://github.com/LASTRADA-Software/fastcached/issues/1138)). Until
+// then it was covered by an ARGUMENT and this comment said so: the compile-time
+// evidence that the site bound to the borrowing overload before #1041, plus the
+// propagation measured on the POSIX side. Both still hold and neither is a
+// measurement of the site, which is why the ticket stayed open.
+//
+// What made it demonstrable was moving the op, the awaitable and the hand-back out
+// of an anonymous namespace and splitting the settle away from the completion
+// callback -- so the thing left in the `.cpp` decides only WHAT happened, exactly
+// as the readiness callbacks above do. **That is a change to production structure
+// for a test's benefit and it is stated rather than slid in.** The alternative
+// considered and rejected was driving `IocpReactor` directly with a
+// `KeyResumeCoroutine` and a `KeyStop` in a controlled order: that measures the
+// reactor's side-table reconciliation, which is a different property.
 
 #endif // __linux__ || __APPLE__

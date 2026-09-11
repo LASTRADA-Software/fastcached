@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/EpollReactor.hpp>
+#include <FastCache/Async/ReactorTeardown.hpp>
 
 #if defined(__linux__)
 
@@ -211,6 +212,19 @@ void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
 {
     if (!handler)
         return;
+
+    // **The rule, asked in the frame the report names**
+    // ([#1208](https://github.com/LASTRADA-Software/fastcached/issues/1208)). This walks
+    // `_batch`, which `RunLoop` clears between polls, so running it from any thread but
+    // the reactor's while `Run()` has not returned is a data race on the batch --
+    // ThreadSanitizer reports it here. `TeardownIsSerialisedWithDispatch()` existed for
+    // exactly this and no caller on this path ever asked it, because a watchdog calling
+    // `Server::Shutdown()` is not a teardown site anybody had classified as one.
+    //
+    // Asked HERE rather than at each socket and listener `Close()`: this is where the
+    // batch is touched, so a future caller reaching `Detach` by a route nobody has
+    // thought of is covered without that route having to remember anything.
+    Detail::AssertTeardownIsSerialisedWithDispatch(*this);
 
     if (handler->fd >= 0 && _epollFd >= 0)
     {
