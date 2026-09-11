@@ -1733,13 +1733,11 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         return CountAt(snapshot, GrantedLeaseIndex) == 0 && totals.inFlight == 0 && snapshot.liveLeases == 0;
     }
 
-    /// A figure or the dash, at one decimal place with a unit.
-    [[nodiscard]] std::string FigureOr(std::optional<double> value, int decimals)
-    {
-        if (!value.has_value())
-            return std::string { AbsentText };
-        return decimals == 0 ? std::format("{:.0f}", *value) : std::format("{:.1f}", *value);
-    }
+    // `FigureOr` stood here and formatted a figure or the dash for the strip. Every one
+    // of its callers now produces a CELL instead and the page formats it through
+    // `CellAsText`, so it is removed rather than left for a reader to wonder which of
+    // two spellings is the live one -- superseded code goes out, it does not get a
+    // deprecation.
 
     KpiReadout KpiDispatched(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
