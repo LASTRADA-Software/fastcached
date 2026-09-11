@@ -762,6 +762,71 @@ FailTarget() {
     fatal "$@"
 }
 
+# What a finished Catch2 run REPORTED, read off its log. A pure function over a
+# file, so `--self-test` can drive every arm without staging a build -- the shape
+# `CanaryVerdict` was given for the same reason (#257): the DECISION a guard makes
+# is what needs testing, and the acquisition around it is what makes the decision
+# unreachable in a test.
+#
+# **CATCH2 HAS TWO SUMMARY FORMS, and the caller below knew one.** With nothing
+# skipped or failed it prints
+#
+#     All tests passed (3843 assertions in 716 test cases)
+#
+# and with ANYTHING skipped it prints the table instead, and no `All tests passed`
+# line appears anywhere in the output:
+#
+#     test cases:  716 |  715 passed | 1 skipped
+#     assertions: 3843 | 3843 passed
+#
+# A single grep for `assertions in` therefore reads a perfectly healthy run with
+# one skip as a run that REPORTED NOTHING, and the gate refuses to call it clean.
+# A false RED, and a deterministic one rather than a flake: `fastcache-cc-tests`
+# skips one case on every host with no MSVC-family driver, which is every Linux
+# runner, so the third row of TARGETS could not go green on the platform this job
+# runs on. The two rows before it happen to skip nothing, which is why the defect
+# waited for a third (#1209). Essentially every skip site in this tree is
+# environment-conditional, so what this bites is the constrained runner where
+# coverage is already thinnest.
+#
+# TWO QUESTIONS, and they are answered separately because they are fixed in
+# different places. Whether a summary was printed AT ALL says whether the binary
+# ran to completion; whether it counts an assertion says whether it tested
+# anything. Folded into one `-n` test they were indistinguishable, and the message
+# named the second while firing for neither.
+#
+# @param 1 path to the run's log
+# stdout: `no-summary`, or `<assertionCount> <all-passed|table>`
+CatchRunSummary() {
+    local log="$1" catchAll catchTable catchCases
+    local reAllCount='\(([0-9]+) assertions'
+    local reTableCount='^assertions:[[:space:]]+([0-9]+)'
+
+    catchAll="$(grep -E 'All tests passed \([0-9]+ assertions in' "$log" || true)"
+    catchTable="$(grep -E '^assertions: ' "$log" || true)"
+    catchCases="$(grep -E '^test cases: ' "$log" || true)"
+
+    if [[ -z "$catchAll" && -z "$catchTable" && -z "$catchCases" ]]; then
+        printf 'no-summary\n'
+        return 0
+    fi
+
+    if [[ -n "$catchAll" && "$catchAll" =~ $reAllCount ]]; then
+        printf '%s all-passed\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ -n "$catchTable" && "$catchTable" =~ $reTableCount ]]; then
+        printf '%s table\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # A summary line exists and no count could be read from it. `assertions: -
+    # none -` is the real instance: cases ran and asserted nothing. Reported as a
+    # zero COUNT rather than as `no-summary`, because the binary did finish and
+    # those are the two different diagnoses above.
+    printf '0 table\n'
+}
+
 RunTarget() {
     local name="$1" tags="$2" path rc=0 log summary outcome
     # Claimed BEFORE anything can fail, so a target killed mid-run renders as
@@ -847,10 +912,29 @@ RunTarget() {
     # that drift is visible here; until this line they claimed it of output the
     # gate did not print. An entry that has gone DEAD is the same blind spot from
     # the other side, and a dead suppression is a rule that has stopped applying.
+    #
+    # The two guards below are `CatchRunSummary`'s two answers; its header carries
+    # why there are two and what a single `-n` test could not tell apart.
     if [[ "$rc" -eq 0 ]]; then
-        summary="$(grep -E 'assertions in|Matched [0-9]+ suppressions|^[0-9]+ [a-z_]+:' "$log" || true)"
-        [[ -n "$summary" ]] \
-            || FailTarget "$name" "${name}: exited 0 but reported no assertions; refusing to call that clean."
+        local runSummary assertionCount
+        runSummary="$(CatchRunSummary "$log")"
+
+        if [[ "$runSummary" == "no-summary" ]]; then
+            FailTarget "$name" "${name}: exited 0 and printed no Catch2 summary at all; refusing to call that clean.
+    Catch2 prints one of its two summaries on every run that reaches its end, so a run with neither did not finish. Read ${log}."
+        fi
+
+        assertionCount="${runSummary%% *}"
+        if [[ "$assertionCount" -eq 0 ]]; then
+            FailTarget "$name" "${name}: exited 0 but reported no assertions; refusing to call that clean.
+    A Catch2 summary WAS printed, so the binary ran to its end -- it asserted nothing. Read ${log}."
+        fi
+
+        # The `test cases:` line is echoed, and that is not padding: it is the only
+        # place a SKIP is visible. A sanitized case that did not run is a state
+        # beside clean and failed, and it was invisible here because the line it
+        # appears on was not printed.
+        summary="$(grep -E 'All tests passed \([0-9]+ assertions in|^test cases: |^assertions: |Matched [0-9]+ suppressions|^[0-9]+ [a-z_]+:' "$log" || true)"
         echo "$summary"
         note "${name}: clean"
         # Recorded where `clean` is DECLARED, not by the caller. RunTarget has
@@ -1326,6 +1410,83 @@ STUB
     else
         echo "  ok   verdict-unknown-target-is-refused"
     fi
+
+    # -- what a finished Catch2 run reported, driven over staged LOGS -----------
+    #
+    # `CatchRunSummary` is a pure function over a file for exactly this reason: the
+    # decision is reachable without a build, a sanitizer or a test binary. The
+    # defect it was extracted for -- a healthy run with one skip read as a run that
+    # reported nothing -- was live in CI and invisible to every case above, because
+    # every case above stops at whether the ARTEFACT is instrumented.
+    #
+    # The PAIR is the content here. A reader that knows only `All tests passed` and
+    # a reader that knows only the table each pass one of the first two cases, and
+    # only both together separate them.
+    echo ""
+    echo "== what a finished Catch2 run reported, against staged logs"
+
+    # @param 1 case name, @param 2 expected stdout, @param 3.. log lines
+    CatchSummaryCase() {
+        local name="$1" want="$2"; shift 2
+        local logFile got
+        # `mkdir -p` rather than trusting `$scratch` to still be there: earlier
+        # sections stage and tear down inside it, and a redirect into a directory
+        # that has gone reports as a shell error mid-case, which inside a
+        # want-fail assertion is indistinguishable from the rule firing.
+        mkdir -p "${scratch}/catch-summary"
+        logFile="${scratch}/catch-summary/$RANDOM$RANDOM.log"
+        printf '%s\n' "$@" > "$logFile"
+        got="$(CatchRunSummary "$logFile")"
+        ran=$(( ran + 1 ))
+        if [[ "$got" == "$want" ]]; then
+            echo "  ok   ${name}"
+        else
+            echo "  FAIL ${name}: read '${got}', expected '${want}'" >&2
+            sed 's/^/       | /' "$logFile" >&2
+            failures=$(( failures + 1 ))
+        fi
+    }
+
+    CatchSummaryCase "catch-summary-all-passed" "3843 all-passed" \
+        "Filters: [compile-job]" \
+        "===============================================================================" \
+        "All tests passed (3843 assertions in 716 test cases)"
+
+    CatchSummaryCase "catch-summary-table-when-a-case-skips" "3843 table" \
+        "===============================================================================" \
+        "test cases:  716 |  715 passed | 1 skipped" \
+        "assertions: 3843 | 3843 passed"
+
+    # The table also appears when something FAILED, and a failing run reaches this
+    # function only when the process exited 0 -- which Catch2 does not do with a
+    # failed assertion. Staged anyway: the reader must not depend on the word
+    # `passed` sitting where a skip put it.
+    CatchSummaryCase "catch-summary-table-when-a-case-fails" "12 table" \
+        "test cases:   3 |   2 passed | 1 failed" \
+        "assertions:  12 |  11 passed | 1 failed"
+
+    # Cases ran and asserted nothing. A zero COUNT, not `no-summary`: the binary
+    # finished, and those two are diagnosed in different places.
+    CatchSummaryCase "catch-summary-no-assertions-is-a-zero-count" "0 table" \
+        "test cases:   1 |   1 passed" \
+        "assertions: - none -"
+
+    # Nothing Catch2 prints at either end. This is the run that did not finish, and
+    # it must not be reported as the run that asserted nothing.
+    CatchSummaryCase "catch-summary-a-log-with-no-summary" "no-summary" \
+        "Filters: [compile-job]" \
+        "some output and then the process was killed"
+
+    # An empty log is the same answer and is worth its own case: it is what a
+    # target that could not start leaves behind, and `grep` over an empty file
+    # succeeds at finding nothing, which is not an error.
+    CatchSummaryCase "catch-summary-an-empty-log" "no-summary" ""
+
+    # The gate's OWN wording must not be mistaken for Catch2's. This log holds the
+    # phrase `assertions in` inside prose, without the `All tests passed (` prefix
+    # -- a reader anchored on the loose substring reports a count from a sentence.
+    CatchSummaryCase "catch-summary-prose-mentioning-assertions-is-not-a-summary" "no-summary" \
+        "note: this target reported 99 assertions in an earlier run"
 
     echo "tsan-gate --self-test: ${ran} cases ran, ${failures} failed"
     [[ "$failures" -eq 0 ]] || exit 1
