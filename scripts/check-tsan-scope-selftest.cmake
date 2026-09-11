@@ -170,8 +170,15 @@ function(FastCachedSelftestCase which tree expect needle)
     string(REGEX REPLACE "[\r\n]+" " " flat "${childOut} ${childErr}")
     string(REGEX REPLACE " +" " " flat "${flat}")
 
+    # The failure signal is TWO words, and this harness reads the sub-run's
+    # output ITSELF -- ctest never sees it -- so it has to spell the whole
+    # pattern. Matching `CMake Error` alone scores a sub-run that merely WARNS
+    # as a clean pass here while ctest's FAIL_REGULAR_EXPRESSION refuses it,
+    # which makes this harness MORE PERMISSIVE than the thing it stands for.
+    # `message(WARNING)` exits 0 on every CMake, so the status arm cannot cover
+    # it either. Both words on one line, because the scan reads a line at a time.
     set(verdict "pass")
-    if(NOT childStatus EQUAL 0 OR flat MATCHES "CMake Error")
+    if(NOT childStatus EQUAL 0 OR flat MATCHES "CMake Error|CMake Warning")
         set(verdict "refuse")
     endif()
 
