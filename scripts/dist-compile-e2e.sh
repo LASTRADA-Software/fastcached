@@ -746,6 +746,90 @@ if [[ "$mode" == "membership" ]]; then
         # assertion, and gets copied into a fixture where the ordering does not hold.
     }
 
+    # A COMPLETE `/metrics` body, or WHICH of three things stopped it (#1184).
+    #
+    # This leg failed on macOS with *the refusing worker exports no
+    # fastcache_worker_jobs_refused_not_a_member_total series*, on the BEFORE
+    # reading, one poll after the admin port began listening. That sentence is a
+    # claim about the EXPORTER, and it was the only sentence the fixture could
+    # produce -- so it made that claim for a scrape that never arrived, for a
+    # response that was not a metrics body, and for a body that was cut short,
+    # all three alike.
+    #
+    # It is very unlikely to be the claim it makes, because the exporter cannot
+    # omit that row. `RenderPrometheus` walks `CounterTable` unconditionally --
+    # "every counter the sink knows, without exception" -- and appends
+    # `fastcached_uptime_seconds` AFTER the loop. So the terminator is a
+    # completeness test that needs nothing from the HTTP layer: a body carrying
+    # that gauge carried the whole counter table ahead of it, and a body without
+    # it was cut short whatever the transport thinks.
+    #
+    # The acquisition cannot report this for itself today, which is why the test
+    # is here rather than there. `http_get` returns 0 for a response its own read
+    # bound truncated -- it documents only *returns 1 if the connection was
+    # refused* -- and on macOS's bash 3.2 the drain cannot classify it either:
+    # `_e2e_read_ended_at_bound` needs the sticky-EOF probe to tell a timeout from
+    # a close, and `_http_drain_fd3` takes that probe ONLY when the body is empty.
+    # A partial body therefore reports `peer`, which means *the server answered*.
+    # Measured and reported rather than fixed in place: `scripts/lib/e2e-common.sh`
+    # is shared by seven fixtures and a change there is not this ticket.
+    #
+    # BOUNDED and retried, because a scrape that did not complete is a failure of
+    # the instrument rather than evidence about the worker -- and the findings say
+    # how many attempts were made and what the last one looked like, because a
+    # retry that hides its own failures is how this class of defect stays
+    # invisible.
+    E2eMetricsBody=""
+    scrape_metrics() {
+        local host="$1" port="$2" what="$3" pid="$4" logfile="$5"
+        local seconds="${6:-15}"
+        local attempts=0 lastOutcome="nothing was attempted" lastBytes=0 lastSeries=0
+
+        E2eMetricsBody=""
+
+        _metrics_body_ready() {
+            local body="" statusLine=""
+            attempts=$(( attempts + 1 ))
+            if ! body="$(http_get "$host" "$port" /metrics 2>/dev/null)"; then
+                lastOutcome="the connection was refused"
+                return 1
+            fi
+            lastBytes=${#body}
+            if [ "$lastBytes" -eq 0 ]; then
+                lastOutcome="the endpoint accepted the connection and said nothing"
+                return 1
+            fi
+            statusLine="$(sed -n '1s/\r$//p' <<< "$body")"
+            case "$statusLine" in
+                *" 200 "*) ;;
+                *)
+                    lastOutcome="the endpoint answered '${statusLine}' rather than 200"
+                    return 1
+                    ;;
+            esac
+            # `|| true`: `grep -c` exits 1 on a count of zero, and this file runs
+            # under `set -e` with `pipefail`. A herestring, never a pipe.
+            lastSeries="$(grep -a -c '^fastcache' <<< "$body" || true)"
+            if ! grep -q '^fastcached_uptime_seconds ' <<< "$body"; then
+                lastOutcome="the body stopped before its last line (${lastBytes} bytes, ${lastSeries} series, no fastcached_uptime_seconds), so it was CUT SHORT rather than short of a counter"
+                return 1
+            fi
+            E2eMetricsBody="$body"
+            return 0
+        }
+        _metrics_body_findings() {
+            echo "   METRICS: ${attempts} scrape attempt(s); the last one: ${lastOutcome}"
+            echo "            A complete body ends with fastcached_uptime_seconds, because"
+            echo "            RenderPrometheus appends it after the whole counter table. Not"
+            echo "            reaching that line says the SCRAPE did not finish, which is not"
+            echo "            a statement about any counter."
+        }
+
+        wait_until _metrics_body_ready "${what} to answer a COMPLETE /metrics body" \
+            "$pid" "$logfile" "$seconds" "" _metrics_body_findings
+        lastOutcome="a complete 200 body, ${lastBytes} bytes, ${lastSeries} series, after ${attempts} attempt(s)"
+    }
+
     # --- leg 1: the address is a member, and the compile is served ---------------
     echo "== membership leg 1: ${lan_address} listed as a member"
     admit_dispatch_port="$(free_port)"
@@ -796,13 +880,13 @@ if [[ "$mode" == "membership" ]]; then
     wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
         "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log"
     admit_completed="$E2eCounterReading"
-    admit_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
-        || fail "the admitting worker's admin endpoint refused a /metrics request"
+    scrape_metrics 127.0.0.1 "$admit_admin_port" "the admitting worker" "$admit_worker_pid" "${workdir}/mem-admit-worker.log"
+    admit_metrics="$E2eMetricsBody"
     admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
     # Absent is not zero, and here it would read as one: an empty string compares
     # unequal to "0" and the failure would name a count nobody exported.
     [[ -n "$admit_refused" ]] \
-        || fail "the admitting worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
+        || fail "the admitting worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_refused_not_a_member_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
     [[ "$admit_refused" == "0" ]] \
         || fail "the admitting worker refused ${admit_refused} caller(s) as not-a-member"
     echo "   dispatched and served: ${admit_completed} job(s), 0 refused"
@@ -882,14 +966,14 @@ if [[ "$mode" == "membership" ]]; then
     wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_node_cache_hits_total 1 \
         "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log"
     tier_hits="$E2eCounterReading"
-    tier_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
-        || fail "the admitting worker's admin endpoint refused a /metrics request"
+    scrape_metrics 127.0.0.1 "$admit_admin_port" "the admitting worker" "$admit_worker_pid" "${workdir}/mem-admit-worker.log"
+    tier_metrics="$E2eMetricsBody"
     tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
     # Absent is not zero. A worker with no tier exports no such series, and an empty
     # string would compare unequal to "0" and fail naming a count nobody published --
     # which is also the check that catches leg 1 losing its `--cache-memory`.
     [[ -n "$tier_refused" ]] \
-        || fail "the admitting worker exports no fastcache_node_cache_requests_refused_not_local_total series"
+        || fail "the admitting worker answered a COMPLETE /metrics body that carries no fastcache_node_cache_requests_refused_not_local_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
     [[ "$tier_refused" == "0" ]] \
         || fail "the worker refused ${tier_refused} cache request(s) from ${lan_address} as not-local"
     echo "   its tier served ${lan_address} ${tier_hits} hit(s), refusing 0 as not-local"
@@ -935,13 +1019,13 @@ if [[ "$mode" == "membership" ]]; then
     # exactly as the old 1 -> 2 did. The baseline is ASSERTED to be zero rather than
     # merely recorded: a worker already refusing this address for some other reason
     # would otherwise be indistinguishable from one refusing the compile.
-    refuse_metrics_before="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
-        || fail "the refusing worker's admin endpoint refused a /metrics request"
+    scrape_metrics 127.0.0.1 "$refuse_admin_port" "the refusing worker" "$refuse_worker_pid" "${workdir}/mem-refuse-worker.log"
+    refuse_metrics_before="$E2eMetricsBody"
     refuse_before="$(metric_value "$refuse_metrics_before" fastcache_worker_jobs_refused_not_a_member_total)"
     # Absent is not zero: an unexported series would read as an empty string here and
     # make the delta below compare against nothing.
     [[ -n "$refuse_before" ]] \
-        || fail "the refusing worker exports no fastcache_worker_jobs_refused_not_a_member_total series"
+        || fail "the refusing worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_refused_not_a_member_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
     [[ "$refuse_before" == "0" ]] \
         || fail "the refusing worker had already refused ${refuse_before} caller(s) before the compile"
 
@@ -984,11 +1068,11 @@ if [[ "$mode" == "membership" ]]; then
         "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
         "${workdir}/mem-refuse-worker.log"
     refuse_after="$E2eCounterReading"
-    refuse_metrics="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
-        || fail "the refusing worker's admin endpoint refused a /metrics request"
+    scrape_metrics 127.0.0.1 "$refuse_admin_port" "the refusing worker" "$refuse_worker_pid" "${workdir}/mem-refuse-worker.log"
+    refuse_metrics="$E2eMetricsBody"
     refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"
     [[ -n "$refuse_completed" ]] \
-        || fail "the refusing worker exports no fastcache_worker_jobs_completed_total series"
+        || fail "the refusing worker answered a COMPLETE /metrics body that carries no fastcache_worker_jobs_completed_total series. The body reached its last line, so this is the EXPORTER and not the scrape: RenderPrometheus walks CounterTable without exception, so a row it does not emit is a defect in the catalogue rather than a counter that has not moved."
     [[ "$refuse_completed" == "0" ]] \
         || fail "a worker that refused the caller still completed ${refuse_completed} job(s)"
     echo "   refused as not-a-member (counter ${refuse_before} -> ${refuse_after}), and the build compiled locally"
@@ -1646,6 +1730,25 @@ write_source "${proj}/twelve.cpp" "casetwelve"
     || fail "the case 12 reference compile failed"
 
 dead_cache_port="$(free_port)"
+
+# The precondition this case RESTS on, asserted rather than assumed (#1085).
+#
+# Everything below is a statement about what the launcher does when the cache
+# REFUSES the connect. `free_port` draws a port nothing answered on at the moment
+# of the draw and remembers it in a per-fixture ledger; neither covers another
+# PROCESS binding it a moment later, and this repository routinely runs several
+# fixtures at once across worktrees. If anything is listening here the connect is
+# ANSWERED rather than refused, the condition this case exists to arrange was
+# never arranged, and case 12 then fails on one of the four assertions below --
+# naming the launcher's reporting for a state nobody set up.
+#
+# It is not a guarantee and does not pretend to be: a listener arriving after this
+# line is exactly the case it cannot see, which is why this is one `port_answers`
+# and not a loop. What it buys is that ONE of the ways case 12 can go red now says
+# so by name, where #1085 records a failure whose assertion nobody can identify.
+if port_answers 127.0.0.1 "$dead_cache_port"; then
+    fail "case 12 needs ${dead_cache_port} to REFUSE a connect and something is answering on it, so the unreachable cache this case is about was never arranged and nothing below would be a statement about the launcher"
+fi
 (
     export FASTCACHE_ADDR="127.0.0.1:${dead_cache_port}"
     export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"

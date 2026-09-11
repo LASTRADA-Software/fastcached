@@ -2110,3 +2110,24 @@ green Linux run is not evidence about it.
   CMake trees and runs a real suite, so converting it cannot be verified in the
   session that does it, and this is the fixture whose first run anywhere died on
   the first line that starts a process.
+- **[#1257](https://github.com/LASTRADA-Software/fastcached/issues/1257)** — a
+  truncated HTTP response is indistinguishable from a complete one in
+  `lib/e2e-common.sh`, and on macOS's bash 3.2 the drain answers the WRONG way
+  rather than merely declining to answer. Measured three ways: `http_get` returns
+  **0** for a response its own read bound cut short (staged both arms against a
+  real listener) while documenting only *returns 1 if the connection was refused*;
+  `_http_drain_ended` is set correctly on bash 5.2 and cannot reach a caller,
+  because every caller captures the body through `$( )` and a subshell's variable
+  does not come back — the drain's own comment says so about itself; and
+  `_e2e_read_ended_at_bound(1, "-")` answers `peer`, where `1` is what bash 3.2
+  reports for a timeout AND for EOF and the sticky-EOF probe that separates them is
+  taken only when the body is EMPTY. So a partial body there reads as *the server
+  answered*. Reachable rather than theoretical: a compile node's `/metrics` is
+  **41,637 bytes and 133 series**, drained line by line. `dist-compile-e2e.sh`'s
+  membership legs work around it by testing the body for its own terminator
+  (`RenderPrometheus` appends `fastcached_uptime_seconds` after the counter table),
+  and the finding is written at that site. A fix must carry the third outcome in
+  the EXIT STATUS, since that is the only channel that survives a command
+  substitution, and must be watched classifying a held-open socket as truncated —
+  a scan nobody has seen refuse is a scan reporting PASS over a set in which
+  nothing could fail.
