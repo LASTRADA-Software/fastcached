@@ -4776,6 +4776,96 @@ TEST_CASE("The compression settings parse, and each names its own flag", "[node]
     CHECK(bad.error().field == "--memory-compression");
 }
 
+TEST_CASE("A compression setting that reaches no tier refuses the node", "[node][config][compression]")
+{
+    // A flag that configures a half this node does not build is inert, and inert is
+    // invisible: the startup line drops the codec along with the half, so the one
+    // surface that reports a codec says nothing at all about the one that was typed.
+    // Same shape as `--dashboard-token-file` without `--dashboard`, and refused the
+    // same way.
+    auto startable = [] {
+        auto cfg = Installable();
+        cfg.cacheMemoryBytes = 8ULL * 1024 * 1024;
+        return cfg;
+    };
+
+    SECTION("the memory trio with --cache-memory=0")
+    {
+        // Each of the three separately, because a rule written as one `||` chain and
+        // a rule that reads only the codec are the same test otherwise -- and the
+        // level and min-bytes flags are the ones a value comparison could never see,
+        // their defaults being 3 and 4096 rather than anything falsy.
+        for (auto const& [name, bit]: std::vector<std::pair<std::string_view, bool NodeConfig::*>> {
+                 { "--memory-compression", &NodeConfig::memoryCompressionExplicit },
+                 { "--memory-compression-level", &NodeConfig::memoryCompressionLevelExplicit },
+                 { "--memory-compression-min-bytes", &NodeConfig::memoryCompressionMinBytesExplicit } })
+        {
+            INFO("flag: " << name);
+            auto cfg = startable();
+            cfg.cacheMemoryBytes = 0;
+            cfg.*bit = true;
+
+            auto const refusal = StartupPolicyRejection(cfg);
+            REQUIRE(refusal.has_value());
+            CHECK(Unwrap(refusal).contains("--cache-memory"));
+        }
+    }
+
+    SECTION("the disk trio with no --cache-dir")
+    {
+        for (auto const& [name, bit]: std::vector<std::pair<std::string_view, bool NodeConfig::*>> {
+                 { "--compression", &NodeConfig::compressionExplicit },
+                 { "--compression-level", &NodeConfig::compressionLevelExplicit },
+                 { "--compression-min-bytes", &NodeConfig::compressionMinBytesExplicit } })
+        {
+            INFO("flag: " << name);
+            auto cfg = startable();
+            cfg.cacheDir.clear();
+            cfg.*bit = true;
+
+            auto const refusal = StartupPolicyRejection(cfg);
+            REQUIRE(refusal.has_value());
+            CHECK(Unwrap(refusal).contains("--cache-dir"));
+        }
+    }
+
+    SECTION("the same flags with the half they configure ARE accepted")
+    {
+        // The control. Without it "a named codec with no tier is refused" and "a
+        // named codec is refused" are one passing test, and the second would refuse
+        // every node that compresses anything.
+        Testing::ScratchDirectory const scratch { "node-compression-reaches-a-tier" };
+
+        auto cfg = startable();
+        cfg.cacheDir = scratch.Path();
+        cfg.memoryCompressionExplicit = true;
+        cfg.memoryCompressionLevelExplicit = true;
+        cfg.memoryCompressionMinBytesExplicit = true;
+        cfg.compressionExplicit = true;
+        cfg.compressionLevelExplicit = true;
+        cfg.compressionMinBytesExplicit = true;
+
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a DEFAULT nobody typed starts a node that asked for nothing")
+    {
+        // The other control, and the one the rule would be wrong without: all six
+        // settings carry a default, the disk codec's being `zstd`, so a rule asking
+        // what the VALUE is rather than whether an operator NAMED it would refuse the
+        // ordinary memory-only worker at every boot.
+        auto cfg = startable();
+        cfg.cacheDir.clear();
+        REQUIRE(cfg.compression == CompressionCodec::Zstd);
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        auto memoryOff = startable();
+        memoryOff.cacheMemoryBytes = 0;
+        memoryOff.cacheDir.clear();
+        CHECK_FALSE(StartupPolicyRejection(memoryOff).has_value());
+    }
+}
+
 TEST_CASE("The compression level is range-checked at both ends", "[node][config][compression]")
 {
     for (auto const* good: { "--compression-level=1", "--compression-level=22" })

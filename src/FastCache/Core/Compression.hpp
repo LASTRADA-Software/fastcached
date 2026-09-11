@@ -55,6 +55,44 @@ class Compression
     /// @return True if the codec is compiled in and selectable.
     [[nodiscard]] static bool IsAvailable(CompressionCodec codec) noexcept;
 
+    /// The codec a store configured with @p configured will ACTUALLY use.
+    ///
+    /// **Configured and effective are two different facts, and only one of them is
+    /// true about a running store.** A codec this build lacks is not an error at the
+    /// encode path -- `CowTreeStorage` and `InMemoryLruStorage` each fall back to
+    /// storing verbatim rather than dropping data -- so a value configured `zstd` on
+    /// a `FASTCACHED_ENABLE_COMPRESSION=OFF` build is stored, tagged and read back
+    /// under `Identity`. Config validation refuses a codec an operator NAMES, which
+    /// leaves exactly one route in: a DEFAULT, which nobody typed and nothing
+    /// validates.
+    ///
+    /// So anything that REPORTS a codec resolves it through here, and anything that
+    /// CONFIGURES a store resolves it through here too -- one function, so the report
+    /// and the store cannot disagree about a build. Reporting the configured value
+    /// made the worker's startup line say `disk 10G zstd` over a tier holding
+    /// plaintext, on the one surface that reports a codec at all.
+    ///
+    /// The storage layers keep their own fallback: this makes their guard redundant
+    /// for a caller that resolves, and a caller that does not is still safe.
+    /// @param configured What the configuration asks for.
+    /// @return @p configured when this build can use it, `Identity` otherwise.
+    [[nodiscard]] static CompressionCodec EffectiveCodec(CompressionCodec configured) noexcept;
+
+    /// The same decision with the build's answer supplied, for a test that cannot
+    /// rebuild the tree.
+    ///
+    /// The one-argument form asks the BUILD, so on a machine that has zstd it can
+    /// only ever answer @p configured and a test over it is vacuous in the one
+    /// direction that matters. This takes that answer as data, so both directions
+    /// are reachable wherever the suite runs.
+    /// @param configured What the configuration asks for.
+    /// @param available Whether that codec is usable.
+    /// @return @p configured when @p available, `Identity` otherwise.
+    [[nodiscard]] static constexpr CompressionCodec EffectiveCodec(CompressionCodec configured, bool available) noexcept
+    {
+        return available ? configured : CompressionCodec::Identity;
+    }
+
     /// Lower-case textual name of a codec (`"none"`, `"lz4"`, `"zstd"`). Used
     /// by the CLI/YAML/banner. `Identity` maps to `"none"`.
     /// @param codec Codec to name.

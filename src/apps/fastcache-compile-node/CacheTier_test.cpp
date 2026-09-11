@@ -367,9 +367,17 @@ TEST_CASE("MemoryCompressionOf carries what the node was told", "[node][cache-ti
     cfg.memoryCompressionMinBytes = 1234;
 
     auto const options = MemoryCompressionOf(cfg);
-    CHECK(options.codec == CompressionCodec::Zstd);
     CHECK(options.level == 9);
     CHECK(options.minBytes == 1234);
+
+    // The codec is the EFFECTIVE one, so this is not `== Zstd`: on a build without
+    // `FASTCACHED_ENABLE_COMPRESSION` the tier stores plaintext and an assertion
+    // naming the configured value would fail there for being right. The level and
+    // the floor above are carried verbatim, which is why they are spelled as
+    // literals and this is not.
+    CHECK(options.codec == Compression::EffectiveCodec(CompressionCodec::Zstd));
+    CHECK(options.codec
+          == (Compression::IsAvailable(CompressionCodec::Zstd) ? CompressionCodec::Zstd : CompressionCodec::Identity));
 
     // The default is OFF, stated here rather than assumed: turning it on by default
     // would change the CPU cost of every existing deployment on upgrade.
@@ -495,21 +503,110 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
     CHECK(packed < plain / 2);
 }
 
-TEST_CASE("The startup line names each tier codec", "[node][cache-tier][compression]")
+TEST_CASE("The startup line names a present tier's codec and an absent tier's nothing", "[node][cache-tier][compression]")
 {
     // Nothing else reports it -- no metric, no fleet.json field -- so without this an
     // operator cannot tell a compressed tier from an uncompressed one.
+    //
+    // Both halves present, so BOTH `NameOf` calls run. The first version of this case
+    // left the disk half off and pinned the memory codec to its default, so it
+    // asserted `memory 8M none` and `disk off` -- text a build with the codec dropped
+    // from either arm produces just as happily. Assert what tells the two apart.
+    Testing::ScratchDirectory const scratch { "node-startup-line-codecs" };
+
     Fixture fixture;
     auto cfg = Fixture::BaseConfig();
     cfg.cacheMemoryBytes = 8 * 1024 * 1024;
-    cfg.memoryCompression = CompressionCodec::Identity;
+    cfg.cacheDir = scratch.Path();
+    cfg.cacheDiskBytes = 16 * 1024 * 1024;
 
     auto started = fixture.Start(cfg);
     REQUIRE(started.has_value());
     REQUIRE(*started != nullptr);
 
+    // The disk arm renders a codec beside its size and path. Deleting
+    // `Compression::NameOf` from that arm leaves `16M at <path>`, which this refuses.
+    CHECK(Logged(fixture.logger,
+                 std::format("disk 16M {} at {}",
+                             Compression::NameOf(Compression::EffectiveCodec(cfg.compression)),
+                             scratch.Path().string())));
     CHECK(Logged(fixture.logger, "memory 8M none"));
-    // The disk half is absent, and an absent tier gets no codec: "off zstd" would
-    // describe a tier this node does not run.
-    CHECK(Logged(fixture.logger, "disk off"));
+}
+
+TEST_CASE("The startup line names each half's OWN codec", "[node][cache-tier][compression]")
+{
+    // Two different codecs, so a literal, a swap and a dropped call each fail. One
+    // codec in both halves passes under a line that reads either half twice, which is
+    // exactly the mistake a format string with two identical-looking arms invites.
+    if (!Compression::IsAvailable(CompressionCodec::Zstd) || !Compression::IsAvailable(CompressionCodec::Lz4))
+        SKIP("this build has no lz4/zstd, so the two halves cannot be given different codecs");
+
+    Testing::ScratchDirectory const scratch { "node-startup-line-two-codecs" };
+
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+    cfg.memoryCompression = CompressionCodec::Zstd;
+    cfg.cacheDir = scratch.Path();
+    cfg.cacheDiskBytes = 16 * 1024 * 1024;
+    cfg.compression = CompressionCodec::Lz4;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, "memory 8M zstd"));
+    CHECK(Logged(fixture.logger, "disk 16M lz4 at"));
+
+    // And neither half wandered into the other's. `contains` is a substring test, so
+    // the two checks above both pass on a line naming one codec twice.
+    CHECK_FALSE(Logged(fixture.logger, "memory 8M lz4"));
+    CHECK_FALSE(Logged(fixture.logger, "disk 16M zstd"));
+}
+
+TEST_CASE("An absent tier is named without a codec", "[node][cache-tier][compression]")
+{
+    // "off zstd" would describe a tier this node does not run. Its own case rather
+    // than an assertion tacked onto a present-tier one, because it is the only thing
+    // here that a build with no codecs at all can still tell apart.
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, "disk off,"));
+    CHECK_FALSE(Logged(fixture.logger, "disk off none"));
+}
+
+TEST_CASE("The startup line reports the codec the tier was BUILT with", "[node][cache-tier][compression]")
+{
+    // The report and the store read one function, so they cannot disagree about a
+    // build. That is the property; what makes it worth a case is that the failure it
+    // prevents is invisible everywhere else -- on a build without
+    // `FASTCACHED_ENABLE_COMPRESSION` the tier stores plaintext and a report taken
+    // from the configuration says `zstd`, with every counter normal and every object
+    // correct.
+    //
+    // Asserted against `MemoryCompressionOf`, which is what `BuildStorage` hands the
+    // tier. A literal here would be this case authoring a second answer, which is the
+    // defect rather than the test for it.
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+    cfg.memoryCompression = CompressionCodec::Zstd;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, std::format("memory 8M {}", Compression::NameOf(MemoryCompressionOf(cfg).codec))));
+
+    // And on a build that HAS zstd the effective codec is zstd, so the line above is
+    // not quietly asserting `none` against `none`. On a build without it, both sides
+    // read `none` and the case still says something true.
+    CHECK(MemoryCompressionOf(cfg).codec
+          == (Compression::IsAvailable(CompressionCodec::Zstd) ? CompressionCodec::Zstd : CompressionCodec::Identity));
 }

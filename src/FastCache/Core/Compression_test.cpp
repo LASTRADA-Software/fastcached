@@ -67,6 +67,33 @@ TEST_CASE("Compression: Identity is always available", "[compression]")
     CHECK(Compression::IsAvailable(CompressionCodec::Identity));
 }
 
+TEST_CASE("Compression: the effective codec is one this build can actually use", "[compression]")
+{
+    // The property, asked of the BUILD. It is the whole reason the function exists:
+    // `CowTreeStorage` and `InMemoryLruStorage` fall back to storing plaintext when a
+    // codec is missing, so a caller that reports the CONFIGURED value describes a
+    // store that is not there. Vacuous where every codec is present -- which is every
+    // build CI makes -- and the one assertion that bites on
+    // `FASTCACHED_ENABLE_COMPRESSION=OFF`, where it is the difference between
+    // reporting `zstd` and reporting the truth.
+    for (auto const codec: AllCodecs)
+        CHECK(Compression::IsAvailable(Compression::EffectiveCodec(codec)));
+
+    // And the decision itself, with the build's answer supplied rather than asked, so
+    // BOTH directions run wherever the suite does. Without this pair the case above
+    // passes on every machine here with the resolution deleted.
+    for (auto const codec: AllCodecs)
+    {
+        CHECK(Compression::EffectiveCodec(codec, true) == codec);
+        CHECK(Compression::EffectiveCodec(codec, false) == CompressionCodec::Identity);
+    }
+
+    // Identity is unchanged either way: it is always available, so "not available"
+    // is not a state it has, and a resolution that mapped it anywhere else would be
+    // rewriting the one answer that is always right.
+    CHECK(Compression::EffectiveCodec(CompressionCodec::Identity) == CompressionCodec::Identity);
+}
+
 TEST_CASE("Compression: round-trips every available codec", "[compression]")
 {
     std::vector<std::vector<std::byte>> const inputs {

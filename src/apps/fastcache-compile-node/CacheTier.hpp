@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace FastCache::Node
 {
@@ -155,6 +156,51 @@ class CacheTier
     CacheResponder _responder;
 };
 
+/// What the on-disk half's B+tree is called inside `--cache-dir`.
+///
+/// A file inside the directory rather than the directory itself, because the
+/// operator named a place to keep a cache and this tier is entitled to put more than
+/// one thing there later. It also keeps `--cache-dir` safe to point at a path that
+/// does not exist yet, which is what an operator will do.
+///
+/// Named in the header rather than kept private to the tier because a test that
+/// measures the store FILE has to open it: a second spelling of the name is a test
+/// that survives a rename by failing with a message about a missing path rather than
+/// about the rename.
+constexpr std::string_view DiskStoreFileName = "objects.cow";
+
+/// The in-memory codec settings this configuration produces.
+///
+/// Its own function, and public, for two reasons. It is the ONE place a memory
+/// tier's codec is decided, so a second tier cannot be built without it -- the
+/// daemon learned that as `MakeL1`, whose comment says every L1 goes through it
+/// "so the memory-compression settings cannot be applied to some shards and
+/// silently missed on others". And it is a pure mapping from configuration to
+/// options, so a test can assert the wiring without a filesystem, a socket or a
+/// started tier -- which matters because a flag that reaches no tier is inert and
+/// looks, from every other surface, exactly like one that works.
+///
+/// **`codec` is the EFFECTIVE one**, resolved through `Compression::EffectiveCodec`:
+/// what this tier will store under, never what the configuration asked for. Being
+/// the one place the decision is made is what lets the startup line read its report
+/// from here instead of authoring a second answer that disagrees on a build without
+/// `FASTCACHED_ENABLE_COMPRESSION`.
+/// @param cfg The node configuration.
+/// @return The options to hand `InMemoryLruStorage::SetCompression`.
+[[nodiscard]] InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg);
+
+/// Resident bytes this node's caches would spend on their key indexes with the whole
+/// store loaded (#175).
+///
+/// Passed to `NodeCapacityOf` as its own argument rather than added to
+/// `NodeCacheCapacity`, which is ON THE WIRE: a new field there would be a frame-shape
+/// change, and `MinSupportedVersion == CurrentVersion` makes that a flag day for the
+/// fleet (#998). `reservedMemoryBytes` already travels, so the figure reaches the
+/// leader through a field that exists.
+/// @param tier This node's cache tier, or nullptr when it runs none.
+/// @return Bytes to hold back, or 0 without a tier.
+[[nodiscard]] std::uint64_t IndexReserveBytesOf(CacheTier const* tier);
+
 /// What @p tier is configured to hold, in the vocabulary the fleet speaks.
 ///
 /// Read off the tier that was actually built rather than off the configuration
@@ -166,32 +212,6 @@ class CacheTier
 /// A registration fact, because a budget does not move while the process runs.
 /// @param tier The node's cache, or null when it has none.
 /// @return The per-tier budgets; every tier absent when @p tier is null.
-/// Resident bytes this node's caches would spend on their key indexes with the whole
-/// store loaded (#175).
-///
-/// Passed to `NodeCapacityOf` as its own argument rather than added to
-/// `NodeCacheCapacity`, which is ON THE WIRE: a new field there would be a frame-shape
-/// change, and `MinSupportedVersion == CurrentVersion` makes that a flag day for the
-/// fleet (#998). `reservedMemoryBytes` already travels, so the figure reaches the
-/// leader through a field that exists.
-/// @param tier This node's cache tier, or nullptr when it runs none.
-/// @return Bytes to hold back, or 0 without a tier.
-/// The in-memory codec settings this configuration asks for.
-///
-/// Its own function, and public, for two reasons. It is the ONE place a memory
-/// tier's codec is decided, so a second tier cannot be built without it -- the
-/// daemon learned that as `MakeL1`, whose comment says every L1 goes through it
-/// "so the memory-compression settings cannot be applied to some shards and
-/// silently missed on others". And it is a pure mapping from configuration to
-/// options, so a test can assert the wiring without a filesystem, a socket or a
-/// started tier -- which matters because a flag that reaches no tier is inert and
-/// looks, from every other surface, exactly like one that works.
-/// @param cfg The node configuration.
-/// @return The options to hand `InMemoryLruStorage::SetCompression`.
-[[nodiscard]] InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg);
-
-[[nodiscard]] std::uint64_t IndexReserveBytesOf(CacheTier const* tier);
-
 [[nodiscard]] Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier);
 
 /// What @p tier holds right now, in the vocabulary the fleet speaks.

@@ -190,6 +190,11 @@ bool Compression::IsAvailable(CompressionCodec codec) noexcept
     return row != nullptr && row->available;
 }
 
+CompressionCodec Compression::EffectiveCodec(CompressionCodec configured) noexcept
+{
+    return EffectiveCodec(configured, IsAvailable(configured));
+}
+
 std::string_view Compression::NameOf(CompressionCodec codec) noexcept
 {
     auto const* row = Find(codec);

@@ -66,14 +66,6 @@ namespace
     /// issues far more than one cache operation per thirty seconds.
     constexpr std::chrono::milliseconds UpstreamAddressRefreshInterval { 30'000 };
 
-    /// What the on-disk tier's B+tree is called inside `--cache-dir`.
-    ///
-    /// A file inside the directory rather than the directory itself, because the
-    /// operator named a place to keep a cache and this tier is entitled to put more
-    /// than one thing there later. It also keeps `--cache-dir` safe to point at a
-    /// path that does not exist yet, which is what an operator will do.
-    constexpr std::string_view DiskStoreFileName = "objects.cow";
-
     /// Largest single object the on-disk tier accepts.
     ///
     /// `CowTreeStorage`'s own default is 1 MiB, which is right for the memcached
@@ -108,7 +100,13 @@ namespace
         options.path = cfg.cacheDir / DiskStoreFileName;
         options.maxBytes = static_cast<std::size_t>(cfg.cacheDiskBytes);
         options.maxValueBytes = DiskMaxValueBytes;
-        options.compression = cfg.compression;
+        // The EFFECTIVE codec, never the configured one. A build without
+        // `FASTCACHED_ENABLE_COMPRESSION` cannot use the default `zstd` -- and a
+        // default is the one route past `ParseCompressionCodec`, which refuses a
+        // codec an operator NAMES -- so the store would fall back to plaintext
+        // while `options.compression` went on saying otherwise to everything that
+        // reads it back, the startup line included.
+        options.compression = Compression::EffectiveCodec(cfg.compression);
         options.compressionLevel = cfg.compressionLevel;
         options.compressionMinBytes = cfg.compressionMinBytes;
         auto opened = CowTreeStorage::Open(options);
@@ -261,18 +259,50 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     // and no other log line reports which codec a tier holds, so without this an
     // operator cannot tell a compressed tier from an uncompressed one, and a setting
     // that silently reached nothing would look exactly like one that worked.
+    //
+    // **The EFFECTIVE codec, through the same call the tier was built with.** A
+    // report resolved separately from the store would be a second author of one
+    // fact, and the two answer differently on a build without
+    // `FASTCACHED_ENABLE_COMPRESSION`: the store falls back to plaintext and the
+    // configuration goes on saying `zstd`. Reporting the configured value there is
+    // a confident wrong signal on the only surface that carries this at all.
+    auto const memoryCodec = MemoryCompressionOf(cfg).codec;
+    auto const diskCodec = Compression::EffectiveCodec(cfg.compression);
+
+    // Said out loud, once, rather than left to be inferred from a line that now
+    // reads "none". An operator who configured a codec and got plaintext is owed the
+    // reason, and it is not one they can reach from their own configuration: the
+    // build made this choice, so the remedy names the build. Only for a half that
+    // exists, and only when the answer actually changed -- a node that asked for
+    // nothing is not told about a codec it never wanted.
+    // Comparing the two values already derived rather than re-asking, so the warning
+    // and the line below cannot describe different resolutions of one setting.
+    auto const reportFallback = [&logger](std::string_view half, CompressionCodec configured, CompressionCodec effective) {
+        if (effective == configured)
+            return;
+        logger.Logf(LogLevel::Warn,
+                    "{} compression is configured {} and this build has no such codec, so that tier stores "
+                    "plaintext; rebuild with FASTCACHED_ENABLE_COMPRESSION or set the codec to none",
+                    half,
+                    Compression::NameOf(configured));
+    };
+    if (cfg.cacheMemoryBytes != 0)
+        reportFallback("memory", cfg.memoryCompression, memoryCodec);
+    if (!cfg.cacheDir.empty())
+        reportFallback("disk", cfg.compression, diskCodec);
+
     logger.Logf(LogLevel::Info,
                 "local cache tier (memory {}, disk {}, upstream {})",
                 cfg.cacheMemoryBytes == 0 ? std::string { "off" }
                                           : std::format("{} {}",
                                                         FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
-                                                        Compression::NameOf(cfg.memoryCompression)),
+                                                        Compression::NameOf(memoryCodec)),
                 cfg.cacheDir.empty()
                     ? std::string { "off" }
                     : std::format("{} {} at {}",
                                   cfg.cacheDiskBytes == 0 ? std::string { "unbounded" }
                                                           : FormatByteSize(static_cast<std::size_t>(cfg.cacheDiskBytes)),
-                                  Compression::NameOf(cfg.compression),
+                                  Compression::NameOf(diskCodec),
                                   cfg.cacheDir.string()),
                 cfg.upstream.empty() ? std::string { "none" } : cfg.upstream);
     return tier;
@@ -280,7 +310,11 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
 
 InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg)
 {
-    return { .codec = cfg.memoryCompression,
+    // Resolved here rather than reported raw, for the reason `OpenDiskTier` gives
+    // about its own half: this is the one place a memory tier's codec is decided, so
+    // it is also the one place that can make what is REPORTED and what is STORED the
+    // same fact.
+    return { .codec = Compression::EffectiveCodec(cfg.memoryCompression),
              .level = cfg.memoryCompressionLevel,
              .minBytes = cfg.memoryCompressionMinBytes };
 }

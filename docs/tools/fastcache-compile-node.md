@@ -632,46 +632,41 @@ the codec it was written under, so reads keep decoding correctly and only later
 writes follow the new setting. A store written by a mixed sequence of settings is
 readable throughout.
 
-A codec this build was compiled without is refused by name at startup rather than
-silently ignored — `none` is always available, `lz4` and `zstd` depend on
-`FASTCACHED_ENABLE_COMPRESSION`. All six settings are read once at startup and are
-**not** reloadable: the tiers are built as the node starts and nothing can reach
-them afterwards, so a reload that appeared to change a codec would be a
-configuration claiming something about a live tier that is not true.
+`none` is always available; `lz4` and `zstd` depend on
+`FASTCACHED_ENABLE_COMPRESSION`, and **which half of that rule you meet depends on
+whether you named the codec or inherited it.** A codec you *name* is refused by name
+at startup:
+
+```
+--memory-compression=zstd: codec 'zstd' is not available in this build
+(rebuild with FASTCACHED_ENABLE_COMPRESSION)
+```
+
+The disk half's **default** is `zstd`, and a default is typed by nobody and validated
+by nothing — so on a build without those codecs it is not refused. The tier falls
+back to storing plaintext, the startup line reports `none` rather than the `zstd` that
+was configured, and a warning says why. That is deliberate: refusing would stop a
+build that never asked for compression from running at all.
+
+A codec configured for a half this node does not build **is** refused, because a
+setting that reaches nothing looks from every surface exactly like one that works:
+`--memory-compression*` with `--cache-memory=0`, and `--compression*` with no
+`--cache-dir`, each name their remedy and stop the node. A default you did not type
+never triggers this.
+
+All six settings are read once at startup and are **not** reloadable: the tiers are
+built as the node starts and nothing can reach them afterwards, so a reload that
+appeared to change a codec would be a configuration claiming something about a live
+tier that is not true.
 
 Which codec each tier actually holds is on the startup line, because nothing else
-reports it:
+reports it — and it is the **effective** codec, not the configured one, so a build
+without the codec reads `none` here rather than claiming a compression it is not
+doing:
 
 ```console
 local cache tier (memory 36G zstd, disk 36G zstd at /var/cache/fastcache-node, upstream none)
 ```
-
-
-!!! note "One node per `--cache-dir`, and the store enforces it"
-
-    The store claims its file exclusively for the life of the process, so a
-    second node pointed at one directory refuses to start and says so:
-
-    ```
-    --cache-dir cannot open /var/cache/fastcache-node/objects.cow: another process
-    already has this cache open. A --cache-dir belongs to one node; give this one a
-    path of its own.
-    ```
-
-    If a machine runs several nodes — one per toolchain is a common shape — give
-    each its own path. Nothing is written to the file to do this, so a store is
-    readable by any build either way.
-
-    Some filesystems cannot enforce this — network mounts and user-mode
-    filesystems that either refuse to lock or accept a share mode and ignore it.
-    The node checks rather than assumes, starts anyway, and warns that nothing
-    is stopping a second one. That is the only case where the rule is still
-    yours to keep.
-
-Its reads and writes happen on the reactor thread the node's framed surfaces
-share, so a large store can briefly delay other connections on it
-([#136](https://github.com/LASTRADA-Software/fastcached/issues/136)). Worth
-knowing before profiling a node that feels slow under load.
 
 ### `--upstream` may be empty
 
