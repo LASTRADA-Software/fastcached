@@ -4824,6 +4824,146 @@ Three rules fall out, each generalising past this change:
   TABLE keyed on the driver NAME, never a sniff for a leading `/` -- on POSIX that starts
   a path, which is the compile-cache rule arriving from the other direction.
 
+## What the TSan scope covers, and the three ways it has been wrong
+
+The scope is **one Catch2 tag expression**, living in `scripts/tsan-gate.sh`'s `TARGETS`
+table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than restating it —
+a second copy is not a cross-check, it is a second thing to be wrong, which is the rule
+the section on that check's first draft already makes. `ctest -R tsan-scope-hygiene`, in
+the **default** set, fails when a test CASE in a scoped location carries no tag that
+expression selects.
+
+Both halves of the scope have been wrong once, and the binary set was wrong for the whole
+life of one binary. They are recorded together because they are three levels of the same
+question — *what does this gate actually run under the sanitizer* — and each was invisible
+from the level above it.
+
+**The TAGS were wrong first.** Three of them looked complete and excluded six of ten
+`Async/` files. That is what the check was written for.
+
+**Then the SCOPE was wrong.** It named three directories. A `std::thread` census over
+`FastCacheTest`'s own sources finds **nineteen** threaded files with **eleven** in no row
+and under no tag — every threaded `Net/` test among them, which is `BlockingListener`'s
+module and so the module the tree's one observed race (#260) came out of, reached only
+because the node binary is run whole (#316).
+
+So a row is now a directory **OR a FILE**, and *the file row IS the exemption mechanism*:
+a mostly single-threaded directory is scoped one file at a time, so the check never forces
+an unrelated tag onto a case. What it still cannot check is whether the table names every
+threaded FILE. That census is a **proxy** — a helper spawns the thread, a comment names
+one — so promoting it to a check would refuse correct files and miss incorrect ones. It is
+left as a proxy deliberately, and said so here rather than left silent.
+
+### The BINARY half is not a proxy, and it IS checked
+
+`ctest -R tsan-binaries` ([#1209](https://github.com/LASTRADA-Software/fastcached/issues/1209)).
+`fastcache-cc-tests` was in no row for its whole life and **no tag could have put it
+there**: the launcher does not link the library, so it is a separate binary the other rows
+cannot contain. A tag expression selects cases *within* the binaries the gate builds, and
+says nothing about which binaries those are — which is why the level above could be
+correct and complete while this one was neither.
+
+The set is DERIVED from the `catch_discover_tests(` registrations, and each member is
+either a `TARGETS` row or carries a **written exemption**. Three shapes are refused: an
+empty reason, a row naming a binary nothing registers, and a row that is also a `TARGETS`
+row.
+
+#1209's own hand census listed **four** test binaries where the tree registers **six**.
+That is why this is a check and not a review item: the person writing the ticket, looking
+directly at the thing, miscounted it.
+
+Adding a row is **TWO edits** — the `TARGETS` table and the `clang-tsan` job's build step —
+and the ticket's rule stands: **run the binary under TSan before adding its row**, or the
+job goes red for the next person.
+
+### And it proves a CASE, not a FILE
+
+One selected tag ANYWHERE in a file used to cover every case in it. So a 28th case tagged
+`[fleetchart]` in a file of 27 `[distributed]` ones left the sanitized scope with the check
+reporting covered — the defect the file was written for, one level down
+([#317](https://github.com/LASTRADA-Software/fastcached/issues/317)).
+
+Reading a case's tags correctly is most of the work, and every part of it has a wrong
+answer that looks right:
+
+- A case's tag string is the **LAST** string literal of its header, never the second.
+  Three cases here spell a long name as two adjacent literals, so "second" reads half a
+  NAME as tags.
+- **489 cases tree-wide carry NO tag string.** That is caught by ARITY rather than by
+  pattern, because a name is free to contain `[async]` and must not talk its way in.
+- A header may span lines — 28 in scope do — and may hold an unmatched `(` in a name, so
+  the reader strips the literals **BEFORE** counting parenthesis depth. A reader that does
+  not still closes a matched pair and passes such a case *for the wrong reason*, which is
+  the failure mode that survives review.
+
+Every way of losing the question is a **REFUSAL**: a header that never closes, one past a
+line bound, a scope holding no case at all.
+
+`scripts/check-tsan-scope-selftest.cmake` drives 20 cases over trees staged from the REAL
+scope table and copies of the REAL gate and root `CMakeLists.txt`. It `include()`s the
+check for its table rather than keeping one. It is a sibling script rather than a `-D`
+mode because that is what every other `cmake -P` check here does, and because
+`check-selftest-registered` reads argument dispatch — a `-D` mode is invisible to it.
+
+Ten mutations each redden exactly the case that names them. Reverting to file-level
+matching reddens eleven and leaves the nine that cannot see the difference green.
+
+### A workaround with an expiry date is WIRED to fire
+
+Never written down where only its own file's reader will meet it.
+
+The scope is a tag expression rather than `ctest -L` because `catch_discover_tests` exports
+tags as labels only from Catch2 **3.8.0** (`ADD_TAGS_AS_LABELS`). This tree pins 3.6.0,
+whose `extras/Catch.cmake` carries **zero** occurrences of it — measured, against
+`catch_discover_tests`'s 11 in the same file as the positive control.
+
+The reason lived in `tsan-gate.sh`'s header, which whoever bumps the CPM block never opens
+([#312](https://github.com/LASTRADA-Software/fastcached/issues/312)). So
+`check-tsan-scope.cmake` now READS the declared version and refuses past a **WATERMARK**.
+
+The watermark is a **pinned CONDITION** and must not be made to track `CMakeLists.txt`:
+point it at its own subject and the comparison becomes `x > x`, false forever, the tripwire
+silently gone. That mutation is a self-test case, because it is the tidy that suggests
+itself — the same shape as every other cleanup in this file that removed a guard while
+looking like housekeeping.
+
+The refusal also names what must survive the move regardless of where the scope ends up:
+**a scope selecting NOTHING is a refusal**, since a typo runs zero cases while every other
+signal says clean.
+
+## A gate that fails CLOSED and UNCONDITIONALLY can sit for days
+
+Every entry in *A retry makes every one of these disappear* is the gate reporting on the
+WRONG TREE. This is the other shape, and it is not in that list: the gate refusing EVERY
+tree, at its first leg, with a confidently worded false cause.
+
+**A red gate reads as "my branch is bad", never as "the gate is broken."** So nobody files
+it. [#1031](https://github.com/LASTRADA-Software/fastcached/issues/1031) shipped inside the
+change that added the guard (#926) and stood for two days. `run_preset` read `$dir`, which
+is `local` to `configure_reason` and unbound there, and the `*)` arm reported
+
+```
+the resolved C++ compiler IS  (a compiler cache)
+```
+
+**All THREE conditions are needed for that to be quiet:**
+
+- `-u`, making the unbound expansion an error;
+- the **ABSENCE of `-e`**, so the error killed only the command substitution's subshell and
+  the caller carried on with `""`;
+- a default arm that ACCEPTS the empty result.
+
+Remove any one and it is a loud failure naming the variable. Two lanes hit it and worked
+around it by hand before anybody suspected the instrument.
+
+Its `none` arm had, on the evidence, **never once been observed answering**. Which is the
+lesson the wrong-tree list does not carry and the reason this has its own section:
+
+**A guard nobody has watched ACCEPT is not known to work.** Assert the passing direction,
+not only the refusing one. The same sentence is made from the other side in
+`.agent/rules/wire-and-protocol.md`, where `write-slot-guard-canary` drives an ordinary
+sequential pair of writes and requires the acceptance marker before it double-arms.
+
 ## Open work
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
