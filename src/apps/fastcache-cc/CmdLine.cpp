@@ -205,6 +205,35 @@ namespace
     };
     constexpr std::array<std::string_view, 4> GnuDrop { "-c", "-MD", "-MMD", "-MP" };
 
+    /// Warnings-as-errors, dropped from the KEY PROBE only.
+    ///
+    /// The probe exists to produce text to hash. Whether a warning is fatal is a
+    /// property of the real compile and has no bearing on that text -- measured:
+    /// the `/EP` output is byte-identical with `/WX` present, absent, or replaced
+    /// by `/wd<n>`. What `/WX` does on the probe line is turn any diagnostic at
+    /// all into a hard failure, and a probe that fails takes the cache out of
+    /// every compile of that file with no build failure to notice it by.
+    ///
+    /// #688 was one route to that: a stray `-c` the driver warned about. Dropping
+    /// the flag it warned about fixed that instance and left the mechanism intact.
+    /// The second route needs no stray flag — a source-level
+    /// `#pragma warning(disable: 4005)` is honoured by the compiler but NOT by the
+    /// preprocess-only pass, so the warning fires on the probe, `/WX` promotes it
+    /// to `error C2220`, and four translation units of one MFC codebase were
+    /// permanently uncacheable on every machine. There is no third thing to drop:
+    /// the general fix is that the probe does not treat warnings as errors.
+    ///
+    /// This is deliberately NOT a row in MsvcDrop/GnuDrop. Those are consulted
+    /// through the shared MatchDroppedFlag, which DispatchPreprocessCommand and
+    /// RemoteCompileArgs also use -- and `/WX` must keep reaching a dispatched
+    /// compile, or a remote build stops failing on warnings the local one fails
+    /// on. Only PreprocessCommand reads this table.
+    ///
+    /// `/WX-` is the documented opt-out and must survive: matching is exact or
+    /// joined-with-a-value (MatchesFlag), never a prefix, so it does.
+    constexpr std::array<std::string_view, 2> MsvcProbeDrop { "/WX", "-WX" };
+    constexpr std::array<std::string_view, 1> GnuProbeDrop { "-Werror" };
+
     /// How each driver is asked to report dependencies during the preprocess
     /// probe. `-MD` rather than `-MMD` on purpose: the key's dependency set must
     /// not depend on which of the two the build happened to ask for, or on whether
@@ -263,6 +292,7 @@ namespace
           .dispatchPreprocessFlags = {},
           .preprocessedInput = {},
           .preprocessDropFlags = {},
+          .probeDropFlags = {},
           .dependencyProbeFlags = {},
           .usesDepfile = false,
           .includeDiscovery = IncludeDiscovery::None,
@@ -279,6 +309,7 @@ namespace
           .dispatchPreprocessFlags = MsvcDispatchPreprocess,
           .preprocessedInput = MsvcPreprocessedInput,
           .preprocessDropFlags = MsvcDrop,
+          .probeDropFlags = MsvcProbeDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
           // Layout rather than environment, because a Windows SERVICE inherits no
@@ -302,6 +333,7 @@ namespace
           .dispatchPreprocessFlags = MsvcDispatchPreprocess,
           .preprocessedInput = MsvcPreprocessedInput,
           .preprocessDropFlags = MsvcDrop,
+          .probeDropFlags = MsvcProbeDrop,
           .dependencyProbeFlags = MsvcDependencyProbe,
           .usesDepfile = false,
           // Asked for its OWN resource directory, not handed `INCLUDE` and not
@@ -324,6 +356,7 @@ namespace
           .dispatchPreprocessFlags = GnuDispatchPreprocess,
           .preprocessedInput = GnuPreprocessedInput,
           .preprocessDropFlags = GnuDrop,
+          .probeDropFlags = GnuProbeDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true,
           .includeDiscovery = IncludeDiscovery::GnuVerbose,
@@ -344,6 +377,7 @@ namespace
           .dispatchPreprocessFlags = GnuDispatchPreprocess,
           .preprocessedInput = GnuPreprocessedInput,
           .preprocessDropFlags = GnuDrop,
+          .probeDropFlags = GnuProbeDrop,
           .dependencyProbeFlags = GnuDependencyProbe,
           .usesDepfile = true,
           .includeDiscovery = IncludeDiscovery::GnuVerbose,
@@ -1506,6 +1540,10 @@ std::vector<std::string> PreprocessCommand(ParsedCommand const& cmd,
                 skipUntil = i + 2;
             continue;
         }
+        // Warnings-as-errors, dropped here and NOWHERE else -- see probeDropFlags.
+        // These carry no value, so there is no successor to consume.
+        if (std::ranges::contains(driver.probeDropFlags, a))
+            continue;
         out.emplace_back(a);
     }
     return out;

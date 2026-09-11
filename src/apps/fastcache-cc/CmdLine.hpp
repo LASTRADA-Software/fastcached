@@ -517,6 +517,19 @@ struct DriverSpec
     /// output and the depfile options go without being spelled a second time.
     /// This list is only what has no path value to speak of.
     std::span<std::string_view const> preprocessDropFlags;
+    /// Flags dropped from the KEY PROBE line only: warnings-as-errors.
+    ///
+    /// Separate from `preprocessDropFlags` because the two have different
+    /// audiences. That one is read through `MatchDroppedFlag`, which
+    /// `DispatchPreprocessCommand` and `RemoteCompileArgs` share -- so a spelling
+    /// added there also stops reaching a dispatched compile. `/WX` must keep
+    /// reaching one, or a remote build stops failing on warnings the local build
+    /// fails on. Only `PreprocessCommand` consults this span.
+    ///
+    /// The probe's job is to emit text to hash; warning severity does not change
+    /// that text, and making warnings fatal there converts any diagnostic into a
+    /// silently dead cache. See the table definition for the two instances.
+    std::span<std::string_view const> probeDropFlags;
     /// Flags appended to the preprocess line so the same probe ALSO reports the
     /// translation unit's dependencies, which are folded into the cache key.
     ///
