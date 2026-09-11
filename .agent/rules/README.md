@@ -103,15 +103,30 @@ the split. Link them as plain markdown.
   Only the last section is exposed, since no `^## ` falls between two links, which
   is why every other row survived unchanged and the error hid in the total.
 
-  **The tell was there and was nearly missed.** A second reader over the same file
-  reported 348 top-level against this one's 350 — near-agreement — while the
-  per-file figures differed by twenty. *Totals that nearly agree while their parts
-  do not* is a contradiction, not a rounding difference, and pulling on it is what
-  found the missing bound. The two readers are still **not reconciled and neither
-  number is restated as a range**: only these were taken with the pattern above,
-  and quoting someone else's figure beside your own turns a relayed claim into a
-  measurement it never was. None of it touches the conclusion, which rests on the
-  shape rather than on any of these numbers.
+  **The tell was there and was nearly missed, and it is the reusable part.** A
+  second reader over the same file reported **348** top-level against this one's
+  350 — near-agreement — while the per-file figures differed by **twenty**, 57
+  against 77 for `distributed-compilation.md`. *Totals that nearly agree while
+  their parts do not* is a **contradiction, not a rounding difference**: two
+  patterns merely differing move the total by roughly the sum of the per-file
+  differences, so two errors cancelling means something is being **attributed** to
+  the wrong file rather than merely counted differently. Both readers wrote it off
+  as "two reasonable walkers" before either pulled on it.
+
+  It resolved completely, and the resolution is better than the tell. The other
+  walker also lacked the `^## ` bound, which is where its 77 came from; and its 348
+  was **every top-level bullet in `AGENT.md`** — 312 inside rules-file sections
+  plus **the same 36 outside them** that this walker's unbounded last section had
+  swallowed. Two different defects converging on one block of 36 bullets from
+  opposite ends of the file, one of them a wrong SUBJECT rather than a wrong
+  pattern.
+
+  What remains is **314 here against 312 there — two bullets, one each in two
+  files — and that is left unreconciled deliberately**, because its shape IS what
+  two patterns differing looks like. That is the test worth carrying away: a
+  disagreement whose shape the patterns explain is a difference; one they do not is
+  a defect. None of it touches the conclusion, which rests on the shape rather than
+  on any of these numbers.
 
   <!-- table-total: none -->
 
