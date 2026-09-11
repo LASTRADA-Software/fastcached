@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -108,7 +109,7 @@ constexpr auto DiskIndex = static_cast<std::size_t>(StorageTier::Disk);
 
 } // namespace
 
-TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed][fleetview]")
+TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distributed][fleetview]")
 {
     // Asserted over the TABLES rather than against a list of expected columns
     // written out beside them -- that list is the thing that goes stale, and it
@@ -135,14 +136,20 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
     auto const json = RenderFleetJson(snapshot);
+    // The third walk over the same tables (#1300). Asserted HERE beside the other
+    // two rather than in a case of its own: the property is that one table feeds
+    // all three, and three separate cases could each pass while the renderings
+    // named different columns.
+    auto const text = RenderFleetText(snapshot, std::nullopt);
 
-    // Column names are one spelling serving both consumers, so a header and a key
-    // cannot drift apart.
+    // Column names are one spelling serving all three consumers, so a header, a key
+    // and a text column cannot drift apart.
     for (auto const& name: { "id", "raft-endpoint", "scheduler-endpoint" })
     {
         INFO("member column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
+        CHECK(text.contains(name));
     }
     for (auto const& name: { "endpoint",
                              "toolchains",
@@ -158,6 +165,7 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         INFO("node column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
+        CHECK(text.contains(name));
     }
     for (auto const& name: { "slots",
                              "in-flight",
@@ -172,12 +180,14 @@ TEST_CASE("Every fleet column reaches both the page and the JSON", "[distributed
         INFO("worker column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
+        CHECK(text.contains(name));
     }
     for (auto const& name: { "key", "worker", "age" })
     {
         INFO("lease column " << name);
         CHECK(html.contains(std::string { ">" } + name + "</th>"));
         CHECK(json.contains(std::string { "\"" } + name + "\":"));
+        CHECK(text.contains(name));
     }
     // And every lease outcome, by the key its row carries.
     for (auto const& row: LeaseOutcomeTable)
@@ -1370,4 +1380,221 @@ TEST_CASE("A fleet with no registered worker reports no never-picked figure at a
     CHECK(html.contains(KpiSub("no worker registered")));
     CHECK_FALSE(
         html.contains(R"(<span class="kpi-label">Never picked</span><span class="kpi-value">0<small></small></span>)"));
+}
+
+// ---------------------------------------------------------------------------
+// #1300: the same tables, for a reader with no JSON parser.
+//
+// `jq` is not on a Windows build box and `fastcache-cli` has no JSON parser -- it
+// only emits -- so before `/fleet.txt` every one of these tables was reachable from
+// a browser and from nowhere else.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// The header line of a rendered section -- the first line, up to the newline.
+///
+/// A helper because every case below wants it and `substr(0, find('\n'))` spelled
+/// four times is four chances to write `find('\t')`.
+/// @param rendered A single-section rendering.
+/// @return Its first line, without the newline.
+[[nodiscard]] std::string_view HeaderLine(std::string_view rendered)
+{
+    return rendered.substr(0, rendered.find('\n'));
+}
+
+/// How many lines a rendering carries, counting the trailing newline as a terminator.
+/// @param rendered The rendering.
+/// @return The count.
+[[nodiscard]] std::size_t LineCount(std::string_view rendered)
+{
+    return static_cast<std::size_t>(std::ranges::count(rendered, '\n'));
+}
+
+} // namespace
+
+TEST_CASE("A named section renders its table alone, with no marker to skip", "[distributed][fleetview][fleettsv]")
+{
+    auto snapshot = LeadingSnapshot();
+    snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 1'000 }) };
+
+    auto const workers = RenderFleetText(snapshot, FleetSection::Workers);
+
+    // A header and one row, and nothing else: this is the form a reader pipes
+    // straight into `cut`, so a marker line would be one more thing every consumer
+    // has to know to skip.
+    CHECK(LineCount(workers) == 2);
+    CHECK_FALSE(workers.contains("# workers"));
+    CHECK(HeaderLine(workers).starts_with("id\ttoolchain"));
+    CHECK(workers.contains("w1\t"));
+    // And it is THAT table rather than the whole document: a machines column that
+    // no worker row carries must not appear.
+    CHECK_FALSE(workers.contains("cache-hit-rate"));
+}
+
+TEST_CASE("Asking for no section renders every one behind a marker naming it", "[distributed][fleetview][fleettsv]")
+{
+    // The self-describing form, which is what makes the accepted keys discoverable
+    // by asking for none -- a reader who guessed a section wrong does not have to
+    // find the documentation to learn the right spelling.
+    auto const whole = RenderFleetText(LeadingSnapshot(), std::nullopt);
+
+    for (auto const& row: FleetSectionTable)
+    {
+        INFO("section " << row.key);
+        CHECK(whole.contains(std::string { "# " } + std::string { row.key } + "\n"));
+    }
+}
+
+TEST_CASE("An absent cell in the text rendering is a dash, never a blank and never a zero",
+          "[distributed][fleetview][fleettsv]")
+{
+    // The rule this whole page is built on, at the one renderer that had no spelling
+    // for it yet. A BLANK is the tempting choice and is the worst one: a value that
+    // genuinely is the empty string renders identically, so a reader cannot tell
+    // "nobody reported this" from "this is empty" -- and `0` is worse still, because
+    // it is a claim about the world.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes[0].load = Busy(1); // no cpu, no memory, no scratch reading
+    snapshot.nodes[0].displayName = {};
+
+    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const rows = machines.substr(machines.find('\n') + 1);
+
+    CHECK(rows.contains("\t-\t"));
+    // Two tabs with nothing between them is the blank this must never emit.
+    CHECK_FALSE(rows.contains("\t\t"));
+}
+
+TEST_CASE("A tab a peer put in its own name cannot break the row it sits in", "[distributed][fleetview][fleettsv]")
+{
+    // The finding this renderer had to answer before it could ship. A display name,
+    // a version and a fingerprint are text a PEER chose, and the only gate they pass
+    // is `IsValidUtf8` -- which says nothing about control characters, because a tab
+    // IS valid UTF-8 and is legal XML `Char` besides. Nothing upstream rejects it.
+    //
+    // So one worker registering with a tab in its name would shift every later
+    // column of that row for whoever is reading, and a newline would invent a row --
+    // one peer corrupting the document for everybody, which is the shape of the rule
+    // that one bad byte must not make `/fleet.json` unparseable for the whole fleet.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes[0].displayName = "build\tnode\nthree";
+
+    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+
+    // A header and exactly ONE row. Unescaped, the newline alone would make three.
+    CHECK(LineCount(machines) == 2);
+    // The bytes are spelled out rather than dropped, so the name is still readable
+    // and the escape is reversible.
+    CHECK(machines.contains(R"(build\tnode\nthree)"));
+    // And the column count of the row still matches the header's, which is the
+    // property a reader's `cut -f7` actually depends on.
+    auto const header = HeaderLine(machines);
+    auto const row = std::string_view { machines }.substr(header.size() + 1);
+    CHECK(std::ranges::count(header, '\t') == std::ranges::count(row.substr(0, row.find('\n')), '\t'));
+}
+
+TEST_CASE("A backslash a peer sent survives the round trip it would otherwise forge", "[distributed][fleetview][fleettsv]")
+{
+    // The escape is only reversible if the escape CHARACTER is escaped too. A display
+    // name containing a literal backslash-t would otherwise come back out of any
+    // reader that unescapes as a TAB -- a value forging a column boundary without
+    // ever containing one, which is the same corruption arriving by the door the fix
+    // opened. Not a question of which arm runs first: the escaper is one pass over
+    // each byte, so what this pins is that the `\\` row exists at all.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes[0].displayName = R"(build\tnode)";
+
+    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+
+    CHECK(machines.contains(R"(build\\tnode)"));
+    CHECK(LineCount(machines) == 2);
+}
+
+TEST_CASE("The text rendering carries raw numbers, as the JSON does and the page does not",
+          "[distributed][fleetview][fleettsv]")
+{
+    // A page wants `64.0 GiB` and this wants `68719476736`, for the reason the JSON
+    // does: it is read by `awk`, and a humanised figure would have to be parsed back
+    // before it could be compared or summed. Asserted against the PAGE as well as
+    // for itself, so "both render the same way" cannot pass by accident.
+    auto const snapshot = LeadingSnapshot();
+
+    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
+
+    CHECK(machines.contains("68719476736"));
+    CHECK_FALSE(machines.contains("GiB"));
+    CHECK(html.contains("GiB"));
+}
+
+TEST_CASE("A tier no member runs contributes no column to the text rendering", "[distributed][fleetview][fleettsv]")
+{
+    // "Absent is not zero" at COLUMN granularity, which is the granularity a table
+    // has: a tier nobody runs gets no column at all, rather than a column of
+    // dashes that reads as a tier standing empty.
+    auto snapshot = LeadingSnapshot();
+    snapshot.tiersPresent[MemoryIndex] = true;
+    snapshot.tiersPresent[DiskIndex] = false;
+
+    auto const header = HeaderLine(RenderFleetText(snapshot, FleetSection::Tiers));
+
+    CHECK(header.contains("memory-"));
+    CHECK_FALSE(header.contains("disk-"));
+}
+
+TEST_CASE("A fleet with no rows still renders the header its reader needs", "[distributed][fleetview][fleettsv]")
+{
+    // An empty document would not say whether the fleet is empty or the section is
+    // one this build does not serve, and a reader piping into `cut -f3` needs the
+    // shape either way. The header is the only thing that can carry that.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes = {};
+    snapshot.workers = {};
+
+    auto const workers = RenderFleetText(snapshot, FleetSection::Workers);
+    CHECK(LineCount(workers) == 1);
+    CHECK(HeaderLine(workers).starts_with("id\t"));
+}
+
+TEST_CASE("A node that does not lead renders no table at all, and names the leader", "[distributed][fleetview][fleettsv]")
+{
+    // The half `statusFor` cannot supply. A 503 says "not me"; only the document can
+    // say "and here is who", and until it did, a follower answered over its own
+    // partial registry formatted as though it were the fleet.
+    auto snapshot = LeadingSnapshot();
+    snapshot.role = SchedulerRole::Follower;
+    snapshot.leaderEndpoint = "10.0.0.9:6676";
+
+    auto const whole = RenderFleetText(snapshot, std::nullopt);
+
+    CHECK(whole.contains("10.0.0.9:6676"));
+    // No tab anywhere is no TABLE anywhere: every table this renders, header included,
+    // separates its columns with one. Asserting on the absence of a row would pass on
+    // a follower whose registry merely happens to be empty, which is the state this
+    // must not be confused with.
+    CHECK_FALSE(whole.contains('\t'));
+    // And a named section is refused the same way, rather than being the one door a
+    // follower's partial table still gets out through.
+    CHECK_FALSE(RenderFleetText(snapshot, FleetSection::Workers).contains('\t'));
+    CHECK(RenderFleetText(snapshot, FleetSection::Workers).contains("10.0.0.9:6676"));
+}
+
+TEST_CASE("A follower with no leader yet says an election is on rather than naming nobody",
+          "[distributed][fleetview][fleettsv]")
+{
+    // `leaderEndpoint` empty is a different fact from a leader whose address is the
+    // empty string, and the JSON spells it `null` for exactly that reason. Text has no
+    // `null`, so it says the thing in words -- what it must not do is render
+    // `# leader: ` and leave a reader to read that as an address.
+    auto snapshot = LeadingSnapshot();
+    snapshot.role = SchedulerRole::Follower;
+    snapshot.leaderEndpoint = {};
+
+    auto const whole = RenderFleetText(snapshot, std::nullopt);
+
+    CHECK(whole.contains("election"));
+    CHECK_FALSE(whole.contains("# leader: --"));
+    CHECK_FALSE(whole.contains('\t'));
 }

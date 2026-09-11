@@ -186,13 +186,19 @@ namespace
         return {};
     }
 
-    /// A range this surface does not serve.
+    /// A query parameter naming something this surface does not serve.
     ///
-    /// Refused rather than defaulted, deliberately, and it is the one place these
-    /// routes are stricter than the theme parameter: a range quietly substituted
-    /// puts a reader on a different axis than the one they asked for, with nothing
-    /// on the page saying so. A theme quietly substituted costs them nothing.
-    [[nodiscard]] AdminResponse BadRange(std::string_view contentType, std::string body)
+    /// Refused rather than defaulted, deliberately, and these routes draw that line
+    /// one way: refuse where a silent substitution would mislead, default where it
+    /// cannot. A `range` quietly substituted puts a reader on a different axis than
+    /// the one they asked for, and a `section` hands them a different table -- with
+    /// nothing on the page, and nothing at all in a tab-separated document, to say
+    /// so. A `theme` quietly substituted costs them nothing, so it has a default.
+    ///
+    /// Named for the answer rather than for one of the parameters that reach it: the
+    /// name was `BadRange` while `range` was the only caller, which left whoever
+    /// added the second one deciding whether reusing it was a shortcut or a mistake.
+    [[nodiscard]] AdminResponse RefusedParameter(std::string_view contentType, std::string body)
     {
         return AdminResponse { .status = "400 Bad Request", .contentType = contentType, .body = std::move(body) };
     }
@@ -213,6 +219,26 @@ namespace
                 out += ", ";
             out += row.key;
         }
+        return out;
+    }
+
+    /// Every `/fleet.txt` section this build serves, one per line with what it holds.
+    ///
+    /// Walked out of the table for the reason `KnownRangeKeys` is: a refusal that
+    /// hand-lists what it accepts goes stale the first time a section is added, in
+    /// the one place a reader who just guessed wrong is looking.
+    ///
+    /// The summary travels with the key because that reader usually guessed the WORD
+    /// and not the table -- given five bare nouns they are choosing again, with the
+    /// same information they got it wrong with the first time. It is also the only
+    /// thing that reads `FleetSectionRow::summary`, which is the point: a field
+    /// nothing reads cannot be wrong, so nothing keeps it true.
+    /// @return One indented `<key> <summary>` line per section, in document order.
+    [[nodiscard]] std::string KnownSections()
+    {
+        std::string out;
+        for (auto const& row: Distributed::FleetSectionTable)
+            out += std::format("  {:<9} {}\n", row.key, row.summary);
         return out;
     }
 
@@ -365,10 +391,10 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                                              AdminRequest const& request) -> AdminResponse {
                 auto const range = rangeAsked(request.query);
                 if (!range.has_value())
-                    return BadRange("text/html; charset=utf-8",
-                                    std::format("<!doctype html><title>fastcache fleet</title>"
-                                                "<p>Unknown <code>range</code>. Try one of: <code>{}</code>.</p>",
-                                                KnownRangeKeys()));
+                    return RefusedParameter("text/html; charset=utf-8",
+                                            std::format("<!doctype html><title>fastcache fleet</title>"
+                                                        "<p>Unknown <code>range</code>. Try one of: <code>{}</code>.</p>",
+                                                        KnownRangeKeys()));
                 return AdminResponse { .status = statusFor(snapshot),
                                        .contentType = "text/html; charset=utf-8",
                                        .body = Distributed::RenderFleetHtml(snapshot, viewFor(*range), refreshSeconds) };
@@ -385,6 +411,34 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                          }),
     });
 
+    // The same tables again, for a reader with no JSON parser (#1300). `jq` is not on
+    // a Windows build box and `fastcache-cli` has no JSON *parser* -- it only emits --
+    // so until this route existed every fleet table was reachable from a browser and
+    // from nowhere else.
+    //
+    // `?section=` is REFUSED rather than defaulted when it names nothing, which is the
+    // same asymmetry the `range` parameter above draws and for the same reason: a
+    // section quietly substituted hands a reader a different table than the one they
+    // asked for, with nothing in a tab-separated document to say so. Asking for NO
+    // section is not a guess and gets every section, each behind a marker naming it --
+    // which is also how the accepted keys are discoverable without reading the docs.
+    routes.push_back(AdminRoute {
+        .path = "/fleet.txt",
+        .handler =
+            gated([] { return Unauthorised("text/plain; charset=utf-8", "credential required\n"); },
+                  [statusFor](Distributed::FleetSnapshot const& snapshot, AdminRequest const& request) -> AdminResponse {
+                      auto const asked = QueryValue(request.query, "section");
+                      auto const section = asked.empty() ? std::optional<Distributed::FleetSection> { std::nullopt }
+                                                         : Distributed::FleetSectionFromKey(asked);
+                      if (!asked.empty() && !section.has_value())
+                          return RefusedParameter("text/plain; charset=utf-8",
+                                                  std::format("unknown section; this build serves:\n{}", KnownSections()));
+                      return AdminResponse { .status = statusFor(snapshot),
+                                             .contentType = "text/plain; charset=utf-8",
+                                             .body = Distributed::RenderFleetText(snapshot, section) };
+                  }),
+    });
+
     routes.push_back(AdminRoute {
         .path = std::string_view { Distributed::FleetSeriesPath },
         .handler = gated(
@@ -393,8 +447,8 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
                                                       AdminRequest const& request) -> AdminResponse {
                 auto const range = rangeAsked(request.query);
                 if (!range.has_value())
-                    return BadRange("application/json",
-                                    std::format(R"({{"error":"unknown range","known":"{}"}})", KnownRangeKeys()));
+                    return RefusedParameter("application/json",
+                                            std::format(R"({{"error":"unknown range","known":"{}"}})", KnownRangeKeys()));
                 auto const view = viewFor(*range);
                 return Conditional(request,
                                    history,
@@ -408,39 +462,39 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
 
     routes.push_back(AdminRoute {
         .path = std::string_view { Distributed::FleetChartPrefix },
-        .handler = gated([] { return Unauthorised("text/plain", "credential required\n"); },
-                         [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
-                                                                   AdminRequest const& request) -> AdminResponse {
-                             constexpr std::string_view Extension = ".svg";
-                             auto tail = request.path.substr(Distributed::FleetChartPrefix.size());
-                             if (!tail.ends_with(Extension))
-                                 return NoSuchChart();
-                             tail.remove_suffix(Extension.size());
-                             auto const chart = Distributed::FleetChartFromKey(tail);
-                             if (!chart.has_value())
-                                 return NoSuchChart();
+        .handler =
+            gated([] { return Unauthorised("text/plain", "credential required\n"); },
+                  [history, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                            AdminRequest const& request) -> AdminResponse {
+                      constexpr std::string_view Extension = ".svg";
+                      auto tail = request.path.substr(Distributed::FleetChartPrefix.size());
+                      if (!tail.ends_with(Extension))
+                          return NoSuchChart();
+                      tail.remove_suffix(Extension.size());
+                      auto const chart = Distributed::FleetChartFromKey(tail);
+                      if (!chart.has_value())
+                          return NoSuchChart();
 
-                             auto const range = rangeAsked(request.query);
-                             if (!range.has_value())
-                                 return BadRange("text/plain", std::format("unknown range; known: {}\n", KnownRangeKeys()));
-                             auto const theme = Distributed::FleetThemeFromKey(QueryValue(request.query, "theme"));
-                             auto const& row = Distributed::FleetChartTable[static_cast<std::size_t>(*chart)];
+                      auto const range = rangeAsked(request.query);
+                      if (!range.has_value())
+                          return RefusedParameter("text/plain", std::format("unknown range; known: {}\n", KnownRangeKeys()));
+                      auto const theme = Distributed::FleetThemeFromKey(QueryValue(request.query, "theme"));
+                      auto const& row = Distributed::FleetChartTable[static_cast<std::size_t>(*chart)];
 
-                             auto const view = viewFor(*range);
-                             return Conditional(
-                                 request,
-                                 history,
-                                 *range,
-                                 std::format("{}-{}-{}",
-                                             row.key,
-                                             Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key,
-                                             Distributed::FleetThemeKey(theme)),
-                                 statusFor(snapshot),
-                                 "image/svg+xml",
-                                 [&row, &view, &range, theme] {
-                                     return Distributed::RenderChartSvg(row, view.buckets, *range, theme);
-                                 });
-                         }),
+                      auto const view = viewFor(*range);
+                      return Conditional(request,
+                                         history,
+                                         *range,
+                                         std::format("{}-{}-{}",
+                                                     row.key,
+                                                     Distributed::FleetRangeTable[static_cast<std::size_t>(*range)].key,
+                                                     Distributed::FleetThemeKey(theme)),
+                                         statusFor(snapshot),
+                                         "image/svg+xml",
+                                         [&row, &view, &range, theme] {
+                                             return Distributed::RenderChartSvg(row, view.buckets, *range, theme);
+                                         });
+                  }),
         // A prefix route, so one row here covers every chart the table names: a
         // route per chart would put the chart table's contents in a second place.
         .match = AdminRouteMatch::Prefix,
