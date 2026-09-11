@@ -3,6 +3,7 @@
 #include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1510,6 +1511,8 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .reason-k { font:500 10.5px/1.3 ui-monospace,monospace; letter-spacing:.07em;
             text-transform:uppercase; color:var(--muted); margin-top:.1rem; }
 .reason-d { font-size:12px; color:var(--muted); margin:.4rem 0 0; line-height:1.45; }
+.reason-m { display:block; font:400 10.5px/1.4 ui-monospace,monospace; color:var(--muted);
+            margin-top:.45rem; word-break:break-all; opacity:.85; }
 .range { display:inline-flex; border:1px solid var(--line); border-radius:3px; overflow:hidden;
          background:var(--surface); }
 .range a { display:block; padding:.25rem .6rem; font:600 10.5px/1.5 ui-monospace,monospace;
@@ -2378,12 +2381,25 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
     for (auto const index: std::views::iota(std::size_t { 0 }, LeaseOutcomeTable.size()))
     {
         auto const& row = LeaseOutcomeTable[index];
+        // **The series name, so the page and the counters are one vocabulary.** A tile
+        // and its counter are the same fact under two names, and the mapping was
+        // derivable but never stated -- an operator reading `no capacity` here had to
+        // guess `fastcached_dispatch_leases_no_capacity_total` before they could grep
+        // for it. Worth noting that #1306 itself guessed that name wrong (it wrote
+        // `fastcache_`, which is in no tree), which is the argument for the change
+        // made by the person making it.
+        //
+        // Read through `DescriptorOf` rather than stored beside the row: the typed
+        // `counter` already IS the fact, and the header's static_assert is what makes
+        // this dereference safe without a runtime check.
         out += std::format(R"(<div class="reason reason--{}"><div class="reason-n">{}</div>)"
-                           R"(<div class="reason-k">{}</div><p class="reason-d">{}</p></div>)",
+                           R"(<div class="reason-k">{}</div><p class="reason-d">{}</p>)"
+                           R"(<code class="reason-m">{}</code></div>)",
                            EscapeHtml(row.key),
                            CountAt(snapshot, index),
                            EscapeHtml(row.label),
-                           EscapeHtml(row.meaning));
+                           EscapeHtml(row.meaning),
+                           EscapeHtml(DescriptorOf(row.counter)->prometheusName));
     }
     out += "</div>";
     out += std::format(R"(<p class="note">{}</p></section>)", EscapeHtml(LeaseNote));

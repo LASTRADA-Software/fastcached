@@ -6,6 +6,7 @@
 #include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodeLoadTestUtils.hpp>
+#include <FastCache/Metrics/MetricsCatalog.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1790,4 +1791,75 @@ TEST_CASE("A follower with no leader yet says an election is on rather than nami
     CHECK(whole.contains("election"));
     CHECK_FALSE(whole.contains("# leader: --"));
     CHECK_FALSE(whole.contains('\t'));
+}
+
+TEST_CASE("Each refusal tile names the counter it renders, in its own tile", "[distributed][fleetview]")
+{
+    // #1306: the tile and its counter are one fact under two names, and the mapping
+    // was derivable and never stated -- so an operator moving from the page to
+    // `node-metrics` had to guess the series name.
+    //
+    // **Asserted per TILE rather than per page.** `html.contains(name)` passes on a
+    // build that renders all five names against the wrong five tiles, which is the
+    // one way this change can be wrong and still look right. So each tile's fragment
+    // is cut out and the name is required INSIDE it.
+    //
+    // The expectation is DERIVED from the catalogue, never a literal list: a test
+    // spelling `fastcached_dispatch_leases_no_capacity_total` by hand would be the
+    // second source of truth this change exists to avoid -- and #1306's own body
+    // spelled it `fastcache_...`, which is in no tree.
+    // **One assertion for the whole table, deliberately.** Catch2 spends its exit
+    // status on the failed-assertion COUNT, and ctest is told `SKIP_RETURN_CODE 4`
+    // (#1128, open as #1152) -- so a case that naturally fails exactly four is scored
+    // SKIPPED rather than failed. Five rows checked individually did exactly that when
+    // this fix was neutered: four red, reported as a skip. Folding them into one
+    // comparison keeps the failure count at one and puts every mismatch in the message.
+    auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 10);
+
+    std::string detail;
+    std::size_t seen = 0;
+    for (auto const& row: LeaseOutcomeTable)
+    {
+        auto const* const descriptor = DescriptorOf(row.counter);
+        REQUIRE(descriptor != nullptr);
+
+        auto const opener = std::format(R"(<div class="reason reason--{}">)", row.key);
+        auto const start = html.find(opener);
+        REQUIRE(start != std::string::npos);
+        // To the start of the NEXT tile, or the end of the block -- so the name found
+        // is one this tile rendered rather than its neighbour's. The block's own end
+        // bounds it as well, because the LAST row has no next tile: cut to the end of
+        // the document instead and its slice carries every later section, so a build
+        // that dropped the last tile's name but printed it somewhere below would pass
+        // for exactly the row nothing else covers. `npos` is the maximum, so `min`
+        // picks whichever boundary comes first and keeps "neither found" as `npos`.
+        // No special case for that: both searches start at or after `start`, so the
+        // length cannot underflow, and `substr` clips a count that overruns to the
+        // rest of the string, which is exactly what an explicit `npos` would ask for.
+        auto const next = html.find(R"(<div class="reason reason--)", start + opener.size());
+        auto const blockEnd = html.find(R"(<p class="note">)", start);
+        auto const stop = std::min(next, blockEnd);
+        auto const tile = html.substr(start, stop - start);
+
+        ++seen;
+        if (!tile.contains(descriptor->prometheusName))
+        {
+            if (!detail.empty())
+                detail += "; ";
+            detail += std::format("{} wanted {}", row.key, descriptor->prometheusName);
+        }
+    }
+
+    // **One INFO, built before the assertion rather than one per miss inside the loop.**
+    // A Catch2 scoped message lives as long as its enclosing block, so `INFO` written in
+    // the loop above is destroyed at the end of its own iteration and reaches no failure
+    // report -- measured against a shifted-by-one renderer, which printed `mispaired: 5`
+    // and named none of them. The whole point of folding the five rows into one assertion
+    // is that the message carries every mismatch, so the text is accumulated by the loop
+    // and read after it.
+    INFO("tiles checked: " << seen << " of " << LeaseOutcomeTable.size());
+    INFO("mispaired: " << (detail.empty() ? std::string { "none" } : detail));
+    // The count is part of the assertion: a loop that ran zero times would otherwise
+    // report no mismatches and pass.
+    CHECK((detail.empty() && seen == LeaseOutcomeTable.size()));
 }

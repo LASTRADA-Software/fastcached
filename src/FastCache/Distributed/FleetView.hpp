@@ -48,6 +48,21 @@ struct LeaseOutcomeRow
 /// `PickError`s at all. A grant is not a refusal, and a duplicate is refused
 /// *before* a worker is ever picked -- so a table indexed by that enum would have
 /// to leave them out, and they are half of what an operator reads.
+///
+/// The tile renders each row's counter **series name**, so an operator can move from
+/// the page to `/metrics` or `node-metrics` without guessing it -- derived through
+/// `DescriptorOf` rather than restated as a sixth column, since a string beside the
+/// typed `counter` would be a second source of truth for one fact, free to drift from
+/// the catalogue while both claimed to be current.
+///
+/// **`DescriptorOf` is total here, and no assertion is added saying so.** The first
+/// version of this carried a `static_assert` that every row resolves; it could not
+/// fire. `CounterTable` is an `EnumTable` over `IMetricsSink::Counter` already
+/// guarded by `RowsInEnumeratorOrder`, so it has a row per enumerator and
+/// `DescriptorOf` answers null only past `Last` -- which no `LeaseOutcomeRow::counter`
+/// can hold. A counter added without a catalogue row fails at `CounterTable`'s own
+/// assertion first, so the second one was the shape AGENT.md names: a guard that
+/// fires only when nothing is wrong. One guard, cited, rather than two.
 inline constexpr std::array<LeaseOutcomeRow, 5> LeaseOutcomeTable {
     LeaseOutcomeRow { .counter = IMetricsSink::Counter::DispatchLeasesGranted,
                       .key = "granted",
