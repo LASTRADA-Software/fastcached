@@ -725,6 +725,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - On disk a read may not reclaim and a write must: `Get`/`Peek` can hold a shared lock, every
   write verb holds the exclusive one. Reporting without erasing is worse than neither — the
   record stays and fires `expired` again.
+
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
 `packaging/`.
@@ -798,6 +799,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - The shipped reference configuration is checked against the table
   (`ctest -R node-config-reference`) — nothing else connects them, and that check fails when
   either scan matches nothing, because two empty lists agree perfectly.
+
 **[`.agent/rules/storage.md`](.agent/rules/storage.md)** — the on-disk format and
 converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - An old store is `UnsupportedFormatVersion`, never `Corrupt` — the code is what monitoring
@@ -830,6 +832,7 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   violated. Fourth of a family where state describing the STORE was populated only by touch;
   this one could not be closed by finding a durable SOURCE for a number, because eviction needs
   a VICTIM rather than a figure.
+
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
 - A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every enumerator; the
@@ -945,6 +948,7 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - A generated certificate encrypts but does not identify: its fingerprint is logged because that
   is all an operator can compare, and its subject names decide whether any client accepts it at
   all.
+
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,
 `cmake/Version.cmake`, the release job.
@@ -961,6 +965,7 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   at once — and none of those contexts is required, so it lands on whoever cuts the release.
   Three `--target` lines in `build.yml`, the macOS redistributable loop (a different list:
   payload, not symlinks) and `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
+
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare path**.
@@ -1358,6 +1363,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
   keyed on the driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
   report clean over a member it could not cover. Knowing a rule and having just applied it is not
   protection: the ENOEXEC was the same author's own fix from three hours earlier.
+
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
 - `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as
@@ -1631,6 +1637,7 @@ developers — the lane ownership, rebase and merge protocol, review gates and t
 type-label check's cancelled-versus-failed distinction are in
 [`.agent/guides/team-run.md`](.agent/guides/team-run.md). It carries no board state by
 design; what is done and what is left lives in the issues.
+
 ## Design Patterns & Principles
 
 ### Error handling: `std::expected<T, E>`
