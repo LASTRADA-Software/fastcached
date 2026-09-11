@@ -4211,6 +4211,29 @@ if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fast
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()
     if(WIN32)
+        # The readiness waits, and what a green run here CANNOT show (#1213).
+        #
+        # All six waits in that fixture are on the readiness MARKER rather than on
+        # the bind: a socket that is bound is not one that is accepting, and
+        # neither is one that is serving.
+        #
+        # **A passing run of this test is not evidence for that change.** The port
+        # answers throughout and the process does eventually log, so a wait on the
+        # bind -- or one matching any string at all -- passes this suite exactly
+        # as the correct one does. The argument is `claude/batch-node`'s
+        # `6ce7ed7f`: two lanes implemented #1213 independently and reached that
+        # sentence separately, which is why it belongs in the tree rather than in
+        # either transcript.
+        #
+        # The discriminating evidence is in `-SelfTest`, where the decision is
+        # driven against a real listener and staged logs: a node waited on with
+        # the DAEMON marker must REFUSE while its port answers, and neutering the
+        # wait to return at the bind reddens exactly those cases and no others.
+        #
+        # An end-to-end run is still worth having -- it says the fixture is not
+        # broken -- and one was taken: `dist-compile E2E PASSED` against
+        # `out/build/clangcl-release`, 2026-09-11. It is simply not the evidence
+        # the change rests on.
         add_test(
             NAME "dist-compile-e2e"
             COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
@@ -5613,3 +5636,43 @@ set_tests_properties("macro-bare-parameters-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# The suite runner's verdict table (#1212).
+#
+# `scripts/run-suite.sh` exists because a test binary that CRASHES reports zero
+# failures in every summary format there is, so a mutation harness reading the
+# count scores a crash as *the mutation was caught* -- indistinguishable from a
+# real result and pointing the wrong way. Its answer is drawn from three readings
+# at once: the exit status, whether the report is COMPLETE, and how many cases it
+# carries.
+#
+# What is registered here is the DECISION and not the acquisition. The
+# acquisition needs a built binary and a crash that happens a few times in
+# twelve, which is exactly the population a verdict table must not be reachable
+# only from -- the same split `tidy-sweep.sh --self-test` and
+# `node-scratch-isolation-e2e-selftest` record for themselves.
+#
+# Two of its ten cases are the reason the table has three inputs rather than one:
+# `139 failing assertions with a complete report` and `killed by SIGSEGV with a
+# truncated one` carry the SAME exit status, because Catch2 spends its status on
+# the failure count, and only completeness tells them apart.
+#
+# `if(NOT WIN32)` for the reason `e2e-helpers-selftest` carries it: the script is
+# POSIX, and a Windows counterpart would be a translation rather than new
+# coverage. The property is platform-independent and the Linux and macOS jobs run
+# it.
+#
+# APPENDED at the end of this file rather than beside a sibling: several lanes
+# add registrations here at once, and an append-only conflict resolves by keeping
+# both blocks, which is a resolution anybody can perform correctly.
+if(NOT WIN32)
+    add_test(
+        NAME "run-suite-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/run-suite.sh" --self-test
+    )
+    set_tests_properties("run-suite-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()

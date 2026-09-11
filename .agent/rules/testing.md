@@ -1945,6 +1945,68 @@ the other direction (#1128, above); it is still the least-bad option available.
   naming what git said. The scratch directory is also the root rather than a directory
   inside it, which is one long path component fewer.
 
+## A CRASHED run is a fifth state, and a mutation harness reading a count scores it as caught
+
+A test binary that crashes reports **zero failures in every summary format there
+is**. A mutation harness asks one question — *was this mutation caught?* — and
+answers it from a failure count, so a run that died partway through arrives as
+*0 of 482 cases failed* and is scored **caught**: indistinguishable from a real
+result, and pointing the wrong way, toward believing the guard works.
+
+This is the four states above with one more on the same axis, arriving where the
+previous entry warns it will — *the repair for one collapse is the prime site for
+the next*. Crashed, not-caught and caught are three states; the harness that
+surfaced this had two (#1212).
+
+**A mutation verdict is drawn from (exit status, completeness, failure count),
+never from the count alone.** Each of the three is insufficient by itself, and
+the reasons are different:
+
+- **The count** cannot see a crash at all. Measured: a truncated JUnit document
+  still carries `failures="0" errors="0"` on the elements it did emit, and the
+  console reporter prints no summary line whatsoever.
+- **The exit status** collides with itself. **Catch2 spends its exit status on
+  the failure count**, clamped at 255 — the same fact that gives #1128 its
+  `SKIP_RETURN_CODE 4` collision — so a run killed by SIGSEGV (128 + 11 = 139)
+  and a run with 139 failing assertions are *the same number*. And a short run
+  can exit **0**: measured in #1211 across six runs, exits `0 / 139 / 0 / 0 /
+  139 / 139` against element counts `551 / 507 / 551 / 551 / 518 / 518`.
+- **Completeness** is what separates them, so it is asked FIRST and the status
+  only refines it. It is read from the report's own terminator — `</testsuites>`
+  for JUnit, one of `All tests passed`, a `test cases:` block or `No tests ran`
+  for the console — never from a phrase the subject chooses.
+
+**And a filter that matched nothing is a sixth reading, not a pass.** Catch2
+exits **2** and prints `No tests ran`, which to a count-reader is another zero.
+It is a mutation harness's likeliest failure of all, because an anchor that has
+stopped matching is how a mutated arm silently measures nothing — and that has
+happened here, in a mutation matrix that re-used a stale copy after its anchor
+drifted.
+
+`scripts/run-suite.sh` is the shared implementation and `run-suite-selftest`
+drives its verdict table, including the 139-versus-139 pair that is the whole
+argument for reading three inputs. **It is a helper, and helpers do not travel:**
+harnesses are written fresh for each mutation campaign, which is the population
+this entry reaches and a script does not.
+
+**A crash is RETRIED and the retry is NAMED.** Scoring it is the defect; hiding
+it behind a silent re-run is the other one — a retry makes an instrument's own
+failures disappear without fixing them, and this repository keeps a list of the
+times that has happened. Only a crash is retried, never a failure.
+
+**Not a grep for the crash's signature.** `malloc(): invalid size` is what
+#1211's crash happens to print; the next one aborts somewhere else. A guard built
+on the signature passes the day the signature changes, silently, in the
+direction that reads as *caught*.
+
+What made this invisible for as long as it was: `subprocess.run(...)` read only
+`.stdout`, the one `returncode` check covered the BUILD rather than the test run,
+and a companion probe used `2>/dev/null`, discarding the line that would have
+given it away on the first run. **It was caught by a denominator that MOVED —
+482 / 496 / 530 — not by a verdict that looked wrong.** A crash that dies at a
+stable point produces a stable, entirely wrong number and has no tell at all,
+which is why this is a rule rather than a habit of reading carefully.
+
 ## A leader-pinned command goes to whoever leads NOW
 
 `$leader_endpoint` is derived by whichever section of `cluster-e2e.sh` needed it

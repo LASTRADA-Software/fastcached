@@ -122,9 +122,32 @@ port_answers 127.0.0.1 6674 && default_port_was_taken="yes"
 # which is why assertion 3 looks at it rather than trusting the log line alone.
 readonly DEFAULT_NODE_PORT=6674
 
-# Long enough for a cold include-tree walk on a contended runner, which is what the
-# node does before it reports ready -- the same cost `fleet-dashboard-e2e` measured and
-# the reason its own bound is minutes rather than seconds.
+# 240 s, and the NUMBER is deliberately not what this comment is about (#1098).
+#
+# What stood here said the node walks the include tree before reporting ready. It
+# does not, and has not since #365 moved the walk onto the heartbeat thread's
+# first round. `compile node ready` is `ReadinessFact::Serving` in
+# `Core/ReadinessMarker.hpp`: the 0xFC surface accepting and the heartbeat thread
+# running -- later than the bind, later than the accept start, and EARLIER than
+# the toolchain survey. Read that row rather than a paraphrase of it; the whole
+# reason `fact` and `meaning` are columns is that this line has been re-meant once
+# already while every fixture went on matching the string.
+#
+# Not "bound" either. That is the word two rulebook files reached for and the one
+# that row exists to correct -- the fact is strictly stronger than a bind and
+# strictly weaker than a survey.
+#
+# So the budget protects nothing this fixture asserts. Its three assertions are
+# socket adoption, the default 6674 staying free and the advertised port, none of
+# which need a completed survey, and there is no `wait_for_registration` and no
+# toolchain marker anywhere in this file. The number is left at 240 anyway:
+# nobody has watched this wait expire, and tightening a bound on reasoning alone
+# is the same move #354 refuses in the other direction.
+#
+# And it no longer offers itself as corroboration for `fleet-dashboard-e2e`'s
+# bound. That was the expensive half of the stale reason rather than the seconds:
+# a second fixture's budget could be argued from this comment, which reads as two
+# independent sources agreeing when it is one dead fact quoted twice.
 readonly READY_SECONDS=240
 
 # The packaged configuration: a scheduler that is not there (the worker must still come
