@@ -149,8 +149,14 @@ registry holds whatever registered against *it*, so it replies `503` naming the 
 and that is relayed too rather than reported as an unreachable fleet.
 
 Cells arrive as the leader escaped them. A display name holding a tab is `\t` here and
-not a real tab — text a peer chose cannot be allowed to forge a column boundary, and
-this tool's own `--format=tsv` would carry a real one straight through.
+not a real tab — text a peer chose cannot be allowed to forge a column boundary.
+
+They are **not** unescaped on the way through, and the reason is that this tool is a
+relay rather than a second author of the rule: what the leader wrote is the leader's
+statement about its own fleet, and re-deriving it here would be the same convention
+spelled twice, in two binaries, free to drift. Unescaping would also put a real tab back
+into a cell that `--format=csv` carries through raw and that the human format prints
+into its own aligned columns.
 
 ### The cluster verbs
 
@@ -388,6 +394,21 @@ value that parses and lies.
     `IFS=$'\t' read` does not work when a field can be absent: tab is IFS
     whitespace, so an empty field collapses and shifts every field after it. Use
     `--absent` to name a placeholder, or prefer `csv` or `json`.
+
+### TSV escapes what it cannot carry
+
+A cell in `--format=tsv` has `\t`, `\n`, `\r` and `\` spelled out. Values are not all
+ours — a hostname is chosen by the machine that registered it — and a raw tab would
+shift every later column while a raw newline would invent a row, both silently, since
+the output stays well-formed TSV and only describes different values than it holds.
+
+It is the same convention, in the same spelling, as the node's `/fleet.txt`, so one
+script can read both. The backslash is escaped along with the other three so the
+mapping can be inverted: without it a name containing a literal `\t` and one containing
+a tab would arrive identical.
+
+**CSV is unaffected**, and deliberately: a tab is not special in RFC 4180, so
+`--format=csv` carries one through raw and quotes only `,` `"` CR and LF.
 
 ### Values that are not text
 

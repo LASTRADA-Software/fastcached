@@ -113,4 +113,29 @@ struct RenderOptions
 /// @return The field, quoted if it needs to be.
 [[nodiscard]] std::string QuoteCsvField(std::string_view field);
 
+/// Escape one field for TSV, by the rule `/fleet.txt` states.
+///
+/// `\t`, `\n`, `\r` and `\` are spelled out; nothing else is touched, and nothing is
+/// quoted. TSV has no RFC 4180 to point at, so the reasoning for that rule -- and for
+/// escaping rather than quoting -- is not restated here: it lives in the `/fleet.txt`
+/// section of `docs/tools/fastcache-compile-node.md`, and this function takes the same
+/// four in the same spelling. **Two products, one format, one spelling**: the node
+/// serves those tables and this client renders `--format=tsv`, and an operator pipes
+/// both into the same script, so a second convention here would be the one-spelling
+/// rule broken across a process boundary -- where nothing in the build can catch it.
+///
+/// **The backslash is load-bearing rather than tidy.** Without it the escaping is not
+/// injective: a value holding a literal `\t` and one holding an actual tab would both
+/// render `\t`, and no reader could tell which it had. That is a different defect
+/// wearing this one's fix as clothes. What carries the property is the row being
+/// PRESENT, never where it sits: every byte is looked up once, in one pass, so row
+/// order cannot matter -- and a reader who thinks it does will preserve an ordering
+/// nothing depends on.
+///
+/// Exposed for the same reason `QuoteCsvField` is -- a rule that is easy to get subtly
+/// wrong is tested directly rather than only through a whole document.
+/// @param field The raw field text.
+/// @return The field with those four characters spelled out.
+[[nodiscard]] std::string EscapeTsvField(std::string_view field);
+
 } // namespace FastCache::Cli

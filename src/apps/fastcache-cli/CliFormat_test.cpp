@@ -2,9 +2,11 @@
 #include "CliFormat.hpp"
 
 #include <FastCache/Cli/UsageTestUtils.hpp>
+#include <FastCache/Distributed/FleetText.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -218,4 +220,104 @@ TEST_CASE("no human line ends in whitespace", "[cli][format]")
     auto const human = RenderValue(table, RenderOptions { .format = OutputFormat::Human });
     for (auto const& line: UsageLines(human))
         CHECK((line.empty() || line.back() != ' '));
+}
+
+TEST_CASE("TSV spells out the four characters it cannot carry raw", "[cli][format][tsv]")
+{
+    // The same four `/fleet.txt` spells out, in the same spelling: the node serves those
+    // tables and this client renders `--format=tsv`, and an operator pipes both into one
+    // script.
+    CHECK(EscapeTsvField("plain") == "plain");
+    CHECK(EscapeTsvField("has\ttab") == "has\\ttab");
+    CHECK(EscapeTsvField("has\nnewline") == "has\\nnewline");
+    CHECK(EscapeTsvField("has\rreturn") == "has\\rreturn");
+    CHECK(EscapeTsvField("has\\backslash") == "has\\\\backslash");
+    CHECK(EscapeTsvField("").empty());
+
+    // One pass, so the escape character introduced for the tab is not escaped again by
+    // a second: `\\t` here would be a two-pass implementation announcing itself.
+    CHECK(EscapeTsvField("\t") == "\\t");
+}
+
+TEST_CASE("a tab inside a cell leaves the TSV row's column count unchanged", "[cli][format][tsv]")
+{
+    // **This is the assertion that distinguishes.** A case over ordinary cells passes
+    // under the bug -- the healthy and the broken renderer emit identical bytes for a
+    // field with no separator in it -- so what is asserted is the COUNT of separators
+    // on the row, which is what a consumer cutting on `\t` reads.
+    auto const record = RecordValue({
+        Field { .name = "host", .value = TextCell("left\tright") },
+    });
+    auto const lines = UsageLines(Render(record, OutputFormat::Tsv));
+    REQUIRE(lines.size() >= 2);
+
+    auto const& header = lines[0];
+    auto const& row = lines[1];
+    CHECK(std::ranges::count(header, '\t') == 1);
+    CHECK(std::ranges::count(row, '\t') == 1);
+    CHECK(row == "host\tleft\\tright");
+
+    // A newline is the other half: raw, it does not shift a column, it invents a whole
+    // row -- so the row count is what says it was carried.
+    auto const withNewline = RecordValue({
+        Field { .name = "host", .value = TextCell("top\nbottom") },
+    });
+    CHECK(UsageLines(Render(withNewline, OutputFormat::Tsv)).size() == 2);
+}
+
+TEST_CASE("TSV escaping is invertible, so a literal backslash-t and a tab do not collide", "[cli][format][tsv]")
+{
+    // Drop the backslash from the table and both of these render `a\tb`: the output
+    // stays well-formed and stops being a function of the input, which is the same
+    // defect this fix exists to remove, one layer down. No reader is invented to prove
+    // it -- distinctness is the whole property, and it is asserted directly.
+    auto const realTab = EscapeTsvField("a\tb");
+    auto const literalEscape = EscapeTsvField("a\\tb");
+
+    CHECK(realTab == "a\\tb");
+    CHECK(literalEscape == "a\\\\tb");
+    CHECK(realTab != literalEscape);
+}
+
+TEST_CASE("the TSV rule agrees with the one /fleet.txt writes", "[cli][format][tsv]")
+{
+    // **The one-spelling property, made checkable.** The doc comment says this takes the
+    // same four in the same spelling as the node's `/fleet.txt`, and a claim in prose is
+    // exactly what drifts: two encoders in two binaries, agreeing today because somebody
+    // read both. Asserted against the node's own escaper, so a row changed on either
+    // side reddens here rather than being discovered by an operator whose script reads
+    // both streams.
+    for (auto const* text: { "plain", "a\tb", "a\nb", "a\rb", "a\\b", "\\\t\r\n", "" })
+    {
+        CAPTURE(text);
+        CHECK(EscapeTsvField(text) == Distributed::EscapeDelimited(text));
+    }
+
+    // And where they legitimately DIVERGE, said out loud rather than left for somebody
+    // to trip over: `/fleet.txt` is read by a terminal, so it also spells out control
+    // bytes and replaces invalid UTF-8. This client's TSV carries a cached value that a
+    // terminal never sees, so it touches only the four. Narrowing the assertion above to
+    // inputs free of both is what keeps it exact instead of approximately true.
+    auto const control = std::string { "a\x01"
+                                       "b" };
+    CHECK(EscapeTsvField(control) == control);
+    CHECK(Distributed::EscapeDelimited(control) != control);
+}
+
+TEST_CASE("the CSV path is untouched by the TSV rule", "[cli][format][tsv]")
+{
+    // A tab is not a CSV special (RFC 4180 names `,` `"` CR and LF), so CSV carries it
+    // raw and unquoted -- and must go on doing so. The control is here rather than
+    // implied: the cheap way to write the TSV fix is one shared quoter, and that would
+    // change the format that was already correct without any case objecting.
+    CHECK(QuoteCsvField("left\tright") == "left\tright");
+
+    auto const record = RecordValue({
+        Field { .name = "host", .value = TextCell("left\tright") },
+    });
+    CHECK(Render(record, OutputFormat::Csv).contains("host,left\tright"));
+
+    // And the reverse direction: the TSV escaper is not a CSV quoter either.
+    CHECK(EscapeTsvField("has,comma") == "has,comma");
+    CHECK(EscapeTsvField("has\"quote") == "has\"quote");
 }
