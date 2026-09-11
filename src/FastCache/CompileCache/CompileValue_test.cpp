@@ -6,6 +6,8 @@
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
+#include <tests/RetiredGenerations.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -966,11 +968,13 @@ constexpr std::array ConformanceCorpus {
 /// whose FIRST BYTE is `CompileValueVersion`, so comparing across generations is
 /// unequal by construction. What catches a bump being put back is structural and
 /// lives in the case below.
-struct StoredValueGeneration
-{
-    std::string_view digest; ///< What the corpus of its day yielded under that generation.
-    std::uint8_t version;    ///< The `CompileValueVersion` it was written under.
-};
+/// A generation of the stored-value contract, keyed on its `CompileValueVersion`.
+///
+/// The shape and its guards are shared with the key space's schema-tag table through
+/// `<tests/RetiredGenerations.hpp>` (#548). The two tables assert DIFFERENTLY and the
+/// header says why: a retired digest is only re-derivable while the digested inputs
+/// are frozen, and this corpus grows.
+using StoredValueGeneration = FastCache::Testing::Generation<std::uint8_t>;
 
 /// Every generation of the stored-value contract this build knows about.
 ///
@@ -979,19 +983,19 @@ struct StoredValueGeneration
 constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
     // producer side and doubled its separator on the consumer side.
-    StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
+    StoredValueGeneration { .key = 1, .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c" },
     // Generation 2 is RETIRED (#879, #891): `Grammar::ShowIncludes` matched only the
     // literal English marker, at column zero, so a localized `cl` and an indented
     // note both canonicalized to nothing and their regions kept the producing
     // checkout's absolute paths.
-    StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
+    StoredValueGeneration { .key = 2, .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4" },
     // Generation 3 is RETIRED (#202): stderr was tagged `Grammar::ShowIncludes`, a
     // grammar that cannot see a diagnostic's path, so a replayed warning named the
     // checkout that STORED it -- on a machine with several checkouts, a path that
     // resolves to a different tree at a different revision, so the line number
     // lands on unrelated code.
-    StoredValueGeneration { .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e", .version = 3 },
-    StoredValueGeneration { .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf", .version = 4 },
+    StoredValueGeneration { .key = 3, .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e" },
+    StoredValueGeneration { .key = 4, .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf" },
 };
 
 /// Digest the whole stored-value contract over the conformance corpus.
@@ -1048,8 +1052,9 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 {
     auto const& rows = StoredValueGenerations;
     // An emptied table would pass every check below vacuously, and read exactly like
-    // one that found nothing wrong.
-    REQUIRE_FALSE(rows.empty());
+    // one that found nothing wrong. Each shared assertion re-asks this for itself, so
+    // it holds even for a case that reaches only one of them.
+    FastCache::Testing::RequireGenerationsPopulated<std::uint8_t>(rows);
 
     auto const live = ConformanceDigest();
 
@@ -1057,7 +1062,7 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // on libstdc++ and libc++ and a class type on MSVC's, so the spelling the
     // analyser asks for on one host does not compile on another. That argument is
     // the helper's own, which is why this calls it instead of restating it.
-    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::version);
+    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::key);
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
@@ -1105,18 +1110,8 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // The structure carries it instead, and structure is what the reverting author
     // actually has to defeat. A bump ADDS a row, so the live byte names the LAST one;
     // putting the byte back names an earlier row however good its digest is.
-    for (auto const i: std::views::iota(std::size_t { 1 }, rows.size()))
-    {
-        INFO("StoredValueGenerations is out of order at row " << i << ": generations are unique and ascending, so a "
-                                                              << "bump appends");
-        REQUIRE(rows[i].version > rows[i - 1].version);
-    }
-
-    INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion) << " but the newest generation in "
-                                   << "the table is " << static_cast<unsigned>(rows.back().version)
-                                   << ". A bump appends a row, so the live byte is the last one -- naming an earlier "
-                                   << "generation is a bump that was reverted, whatever digest was pasted with it.");
-    CHECK(CompileValueVersion == rows.back().version);
+    FastCache::Testing::RequireGenerationsAscending<std::uint8_t>(rows);
+    FastCache::Testing::RequireLiveGenerationIsLast<std::uint8_t>(CompileValueVersion, rows);
 }
 
 namespace
