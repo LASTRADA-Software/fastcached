@@ -182,6 +182,18 @@ struct ConfigShape
 /// distinguish them.
 constexpr ToolchainReading UnwiredSentinel { .state = Wire::ToolchainState::Serving, .served = 99, .discovered = 99 };
 
+/// The sources a case wires DIRECTLY, as opposed to the one the fixture owns.
+///
+/// Separate from the fixture's own `NodeRuntimeState` because these two are read LIVE
+/// rather than published into, and a case that wires them owns them: a `CompileCapacity`
+/// needs a logger and a `SchedulerService` needs four collaborators, none of which a
+/// fixture should be inventing on a case's behalf.
+struct DirectSources
+{
+    CompileCapacity const* capacity { nullptr };                ///< Live slot accounting.
+    Distributed::SchedulerService const* scheduler { nullptr }; ///< Role and known leader.
+};
+
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
 ///
 /// Held together deliberately, and this fixture is a FINDING rather than a convenience.
@@ -199,10 +211,12 @@ struct Fixture
     /// @param initial What the worker has published, or nothing to leave the runtime
     ///        source UNWIRED -- which is a node that publishes no such facts, not one
     ///        that publishes empty ones.
+    /// @param direct Sources this case owns and the fixture only points at.
     Fixture(ConfigShape const& shape,
             IClock const& clock,
             NodeComponents components = {},
-            std::optional<ToolchainReading> initial = std::nullopt):
+            std::optional<ToolchainReading> initial = std::nullopt,
+            DirectSources direct = {}):
         cfg { NodeConfigOf(shape) },
         runtime { initial.value_or(UnwiredSentinel) },
         status { cfg,
@@ -211,7 +225,9 @@ struct Fixture
                  "1.2.3",
                  "node-a",
                  components,
-                 NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr } }
+                 NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr,
+                                      .capacity = direct.capacity,
+                                      .scheduler = direct.scheduler } }
     {
     }
 
@@ -478,6 +494,167 @@ TEST_CASE("The toolchain reading is re-read per call, not captured once", "[node
     fixture.runtime.PublishToolchains({ .state = Wire::ToolchainState::NothingToServe, .served = 0, .discovered = 3 });
     CHECK(state() == std::optional { Wire::ToolchainState::NothingToServe });
     CHECK(served() == 0);
+}
+
+TEST_CASE("A node reports the compile slots it offers and the ones in use", "[node][node-status][capacity]")
+{
+    // Read LIVE rather than published, so the discriminating assertion is that the
+    // in-flight figure MOVES between two calls on one status object. A snapshot taken at
+    // construction reports a constant that every single-call check agrees with.
+    ManualClock clock;
+    NullLogger logger;
+    CompileCapacity capacity { 4, 1U << 20U, std::chrono::seconds { 1 }, logger };
+    Fixture const fixture { {}, clock, { .worker = true }, std::nullopt, DirectSources { .capacity = &capacity } };
+
+    CHECK(fixture.status.Describe().runtime.compileSlots == std::optional<std::uint32_t> { 4 });
+    CHECK(fixture.status.Describe().runtime.compilesInFlight == std::optional<std::uint32_t> { 0 });
+
+    REQUIRE(capacity.TryTakeSlot());
+    REQUIRE(capacity.TryTakeSlot());
+    CHECK(fixture.status.Describe().runtime.compilesInFlight == std::optional<std::uint32_t> { 2 });
+    // The cap does not move with the load, which is the other half of reporting both.
+    CHECK(fixture.status.Describe().runtime.compileSlots == std::optional<std::uint32_t> { 4 });
+
+    capacity.ReleaseSlot();
+    CHECK(fixture.status.Describe().runtime.compilesInFlight == std::optional<std::uint32_t> { 1 });
+}
+
+TEST_CASE("A node with no compile accounting reports no slots, rather than none free", "[node][node-status][capacity]")
+{
+    // **Absent is not zero, and here the zero is a real reading for a different node.**
+    // An idle worker reports `0` in flight; a node running no worker tier must not, or
+    // the two are one answer -- and `0 of 0` reads as a machine busy doing nothing
+    // rather than one that was never going to compile anything.
+    ManualClock clock;
+    Fixture const fixture { {}, clock, { .cacheTier = true } };
+    auto const fields = fixture.status.Describe();
+
+    CHECK_FALSE(fields.runtime.compileSlots.has_value());
+    CHECK_FALSE(fields.runtime.compilesInFlight.has_value());
+}
+
+TEST_CASE("Registration has three states, and the middle one is not silence", "[node][node-status][registration]")
+{
+    // Nothing publishes / nothing published YET / published and registered NOWHERE. The
+    // third is the one an operator acts on -- a `--scheduler` nobody answers -- and it is
+    // the one a two-state model reports as the first.
+    ManualClock clock;
+
+    SECTION("nothing publishes runtime facts at all")
+    {
+        Fixture const fixture { {}, clock, { .worker = true } };
+        CHECK_FALSE(fixture.status.Describe().runtime.registrarsRegistered.has_value());
+    }
+
+    SECTION("a publisher that has not reported a round yet says nothing")
+    {
+        // The toolchain reading exists from construction; the registration one cannot,
+        // because the registrars do not exist when the status object is built.
+        Fixture const fixture { {}, clock, { .worker = true }, ToolchainReading {} };
+        CHECK_FALSE(fixture.status.Describe().runtime.registrarsRegistered.has_value());
+    }
+
+    SECTION("a node registered nowhere reports zero of N, which is a reading")
+    {
+        Fixture fixture { {}, clock, { .worker = true }, ToolchainReading {} };
+        fixture.runtime.PublishRegistration(0, 3, std::nullopt);
+        auto const fields = fixture.status.Describe();
+
+        CHECK(fields.runtime.registrarsRegistered == std::optional<std::uint32_t> { 0 });
+        CHECK(fields.runtime.registrarsTotal == std::optional<std::uint32_t> { 3 });
+        // And it has never got through, which is ABSENT rather than a large number.
+        CHECK_FALSE(fields.runtime.lastRegistrationSecondsAgo.has_value());
+    }
+}
+
+TEST_CASE("A round that accepted nothing does not erase when this node last registered", "[node][node-status][registration]")
+{
+    // **The discriminating case for `PublishRegistration`'s keep rule.** An
+    // implementation that stores whatever the round handed it reports *never registered*
+    // the first time a scheduler is unreachable -- which is the exact moment an operator
+    // asks, and the answer that sends them to the wrong half of the fleet. `registered`
+    // correctly drops to zero; the INSTANT must survive.
+    ManualClock clock;
+    Fixture fixture { {}, clock, { .worker = true }, ToolchainReading {} };
+
+    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
+
+    clock.Advance(30s);
+    fixture.runtime.PublishRegistration(0, 3, std::nullopt);
+
+    auto const fields = fixture.status.Describe();
+    CHECK(fields.runtime.registrarsRegistered == std::optional<std::uint32_t> { 0 });
+    CHECK(fields.runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 30 });
+
+    // And it keeps ageing without being republished -- a duration computed per call
+    // rather than a number stamped once.
+    clock.Advance(45s);
+    CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 75 });
+
+    // A round that DOES accept resets it.
+    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
+}
+
+TEST_CASE("A node running no scheduler reports NO role, which is not `undecided`", "[node][node-status][scheduler-role]")
+{
+    // **A conjunction, and each half alone passes under the defect.** `Undecided` is a
+    // real reading -- an election is in progress and this node is in it -- so reporting
+    // it for a node that runs no scheduler at all claims participation in something that
+    // is not happening. The absent case must be absent AND the undecided case must be
+    // present, or the two have been collapsed.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    ManualWallClock wallClock;
+
+    Fixture const none { {}, clock, { .worker = true } };
+    CHECK_FALSE(none.status.Describe().runtime.schedulerRole.has_value());
+
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    Fixture const electing { {}, clock, { .scheduler = true }, std::nullopt, DirectSources { .scheduler = &scheduler } };
+    CHECK(electing.status.Describe().runtime.schedulerRole == std::optional { Wire::WireSchedulerRole::Undecided });
+}
+
+TEST_CASE("Each scheduler role crosses the wire as its own tag, with the leader it knows",
+          "[node][node-status][scheduler-role]")
+{
+    // Driven over all three: a mapping that collapses two roles is invisible in any case
+    // that names only one, and the pair a fleet most needs separated -- leader and
+    // follower -- renders identically in the component mask today.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    Fixture const fixture { {}, clock, { .scheduler = true }, std::nullopt, DirectSources { .scheduler = &scheduler } };
+
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    CHECK(fixture.status.Describe().runtime.schedulerRole == std::optional { Wire::WireSchedulerRole::Leader });
+
+    scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676", Distributed::StandaloneSchedulerTerm);
+    auto const following = fixture.status.Describe();
+    CHECK(following.runtime.schedulerRole == std::optional { Wire::WireSchedulerRole::Follower });
+    // The whole point of reporting a follower: it names where to ask instead.
+    CHECK(following.runtime.leaderEndpoint == "10.0.0.9:6676");
+
+    scheduler.SetRole(Distributed::SchedulerRole::Undecided, {}, Distributed::StandaloneSchedulerTerm);
+    auto const undecided = fixture.status.Describe();
+    CHECK(undecided.runtime.schedulerRole == std::optional { Wire::WireSchedulerRole::Undecided });
+    // Empty is the READING -- no leader is known -- and the role beside it is what says
+    // this node was in a position to know.
+    CHECK(undecided.runtime.leaderEndpoint.empty());
+}
+
+TEST_CASE("ToolchainStateFor maps a served count onto the two states it decides", "[node][node-status][toolchains]")
+{
+    // The one rule every publication site shares. `Surveying` is deliberately not
+    // reachable through it: that state is the ABSENCE of a concluded survey rather than a
+    // function of the count, and a caller holding a count has already concluded one.
+    STATIC_REQUIRE(ToolchainStateFor(0) == Wire::ToolchainState::NothingToServe);
+    STATIC_REQUIRE(ToolchainStateFor(1) == Wire::ToolchainState::Serving);
+    STATIC_REQUIRE(ToolchainStateFor(64) == Wire::ToolchainState::Serving);
 }
 
 TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-status]")

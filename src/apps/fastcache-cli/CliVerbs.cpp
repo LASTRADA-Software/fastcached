@@ -938,6 +938,40 @@ namespace
         return "unknown";
     }
 
+    /// What to call one scheduler role.
+    /// @param role The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfSchedulerRole(CompileCacheWire::WireSchedulerRole role) noexcept
+    {
+        switch (role)
+        {
+            case CompileCacheWire::WireSchedulerRole::Follower:
+                return "follower";
+            case CompileCacheWire::WireSchedulerRole::Undecided:
+                return "undecided";
+            case CompileCacheWire::WireSchedulerRole::Leader:
+                return "leader";
+        }
+        // Unreachable for `NameOfSurface`'s reason: `DecodeNodeRuntime` leaves a role
+        // this build has no name for disengaged rather than passing it through.
+        return "unknown";
+    }
+
+    /// Add an optional unsigned field, or nothing at all when the node did not say.
+    ///
+    /// **A helper rather than four copies of the same `if`.** Each of these is a fact a
+    /// node may legitimately not have -- no worker tier, no scheduler, no heartbeat yet
+    /// -- and *absent is not zero* has to hold for every one of them. Written once, a
+    /// later field cannot be the one that renders a `0` for a fact nobody stated.
+    /// @param record Where the field is appended.
+    /// @param name What to call it.
+    /// @param value The fact, or nothing.
+    void AddOptionalNumber(std::vector<Field>& record, std::string_view name, std::optional<std::uint32_t> value)
+    {
+        if (value.has_value())
+            record.push_back({ .name = std::string { name }, .value = NumberCell(static_cast<std::uint64_t>(*value)) });
+    }
+
     /// Turn a decoded node status into the reported record.
     ///
     /// Pure, and separate from the handler, so the reported SHAPE is testable without a
@@ -975,6 +1009,40 @@ namespace
                                .value = NumberCell(static_cast<std::uint64_t>(fields.runtime.toolchainsServed)) });
             record.push_back({ .name = "toolchains-discovered",
                                .value = NumberCell(static_cast<std::uint64_t>(fields.runtime.toolchainsDiscovered)) });
+        }
+
+        // What this node's worker is offering and spending. Both or neither: a slot
+        // count with no in-flight figure invites the reading that the node is idle.
+        AddOptionalNumber(record, "compile-slots", fields.runtime.compileSlots);
+        AddOptionalNumber(record, "compiles-in-flight", fields.runtime.compilesInFlight);
+
+        // Whether this node is getting through to a scheduler. `2 of 3` is ordinary
+        // mid-survey and alarming an hour later, which is why both numbers are reported
+        // rather than a ratio or a bare bool.
+        AddOptionalNumber(record, "registrars-registered", fields.runtime.registrarsRegistered);
+        AddOptionalNumber(record, "registrars-total", fields.runtime.registrarsTotal);
+
+        // **Absent means NEVER, and that is not a long time ago.** A node whose
+        // `--scheduler` has never answered and one that registered an hour ago are the
+        // two states an operator is separating; rendering a `0` or a `-1` for the first
+        // reports the healthy answer for both.
+        if (fields.runtime.lastRegistrationSecondsAgo.has_value())
+            record.push_back({ .name = "last-registration-seconds-ago",
+                               .value = NumberCell(*fields.runtime.lastRegistrationSecondsAgo) });
+
+        // A leading scheduler and a following one both report `scheduler` in the
+        // component mask, and a follower's registry is empty and reads exactly like an
+        // idle fleet. A node running no scheduler reports no role at all, which is what
+        // keeps `undecided` meaning *an election is in progress*.
+        if (fields.runtime.schedulerRole.has_value())
+        {
+            record.push_back({ .name = "scheduler-role",
+                               .value = TextCell(std::string { NameOfSchedulerRole(*fields.runtime.schedulerRole) }) });
+            // Empty is a READING here -- no leader is known -- so the field is present
+            // and ABSENT rather than missing, which would say this node could not tell.
+            record.push_back(
+                { .name = "leader",
+                  .value = fields.runtime.leaderEndpoint.empty() ? AbsentCell() : TextCell(fields.runtime.leaderEndpoint) });
         }
 
         // One field per surface the node actually opened. A surface it does not run gets

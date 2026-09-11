@@ -661,6 +661,17 @@ first completed round it runs a worker that can honour nothing. `toolchains`
 reports `surveying`, `serving` or `nothing-to-serve` with the counts beside it; the
 component mask cannot, because its `worker` bit is a constant on this binary.
 
+Beside it they report **what that worker is offering** (`compile-slots`,
+`compiles-in-flight`), **whether a scheduler knows about it** (`registrars-registered`
+of `registrars-total`, and `last-registration-seconds-ago`, which is **absent** when
+none ever has), and **this node's consensus role** (`scheduler-role`, plus the `leader`
+it would redirect to). The last one closes the gap the dashboard already covers and the
+CLI did not: a leading scheduler and a following one are identical in the component
+mask, and a follower's registry is empty and reads exactly like an idle fleet.
+
+Together that is the first ten seconds of diagnosing a node with no `--admin-listen`,
+over a port that is up by definition and gated on fleet membership.
+
 They are gated on membership rather than on a credential, and that is deliberate:
 the credential on this listener belongs to the scheduler, so a node running none has
 none to check, and demanding one would leave these permanently unanswerable on a

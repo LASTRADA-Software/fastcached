@@ -244,6 +244,92 @@ TEST_CASE("`node` renders a node that published no runtime facts as ABSENT field
     CHECK(RequiredCell(answer, "components").lexical == "worker");
 }
 
+TEST_CASE("`node` reports capacity, registration and consensus role", "[cli][node][verbs]")
+{
+    // The three facts #1294 is for, rendered together because that is how an operator
+    // reads them: a follower with full slots and no registrations is a different fault
+    // from a leader with none free.
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 60,
+                                                .surfaces = {},
+                                                .components = Cc::NodeComponentBit::Worker | Cc::NodeComponentBit::Scheduler,
+                                                .runtime = { .toolchains = Cc::ToolchainState::Serving,
+                                                             .toolchainsServed = 2,
+                                                             .toolchainsDiscovered = 2,
+                                                             .compileSlots = 8,
+                                                             .compilesInFlight = 3,
+                                                             .schedulerRole = Cc::WireSchedulerRole::Follower,
+                                                             .leaderEndpoint = "10.0.0.9:6676",
+                                                             .registrarsRegistered = 2,
+                                                             .registrarsTotal = 3,
+                                                             .lastRegistrationSecondsAgo = 41 } }) } };
+
+    auto const answer = RunNodeVerb("node", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    CHECK(RequiredCell(answer, "compile-slots").lexical == "8");
+    CHECK(RequiredCell(answer, "compiles-in-flight").lexical == "3");
+    CHECK(RequiredCell(answer, "registrars-registered").lexical == "2");
+    CHECK(RequiredCell(answer, "registrars-total").lexical == "3");
+    CHECK(RequiredCell(answer, "last-registration-seconds-ago").lexical == "41");
+    CHECK(RequiredCell(answer, "scheduler-role").lexical == "follower");
+    CHECK(RequiredCell(answer, "leader").lexical == "10.0.0.9:6676");
+}
+
+TEST_CASE("`node` renders a never-registered node and an election as ABSENT, not as zero", "[cli][node][verbs]")
+{
+    // **Two absences that a number would report as readings.** A node that has never
+    // reached a scheduler is not one that registered zero seconds ago, and a cluster
+    // mid-election has no leader rather than one called "". Both are the shape that
+    // sends an operator to the wrong machine.
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = {},
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = Cc::NodeComponentBit::Scheduler,
+                                                .runtime = { .schedulerRole = Cc::WireSchedulerRole::Undecided,
+                                                             .registrarsRegistered = 0,
+                                                             .registrarsTotal = 3 } }) } };
+
+    auto const answer = RunNodeVerb("node", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    // Registered nowhere is a READING -- zero of three -- and is reported as one.
+    CHECK(RequiredCell(answer, "registrars-registered").lexical == "0");
+    CHECK(RequiredCell(answer, "registrars-total").lexical == "3");
+    // Never having got through is not a duration, so there is no field at all.
+    CHECK(CellOf(answer, "last-registration-seconds-ago") == nullptr);
+
+    // The role is present and the leader it would name is absent AT THE CELL: the field
+    // exists, because this node was in a position to know, and it holds no value.
+    CHECK(RequiredCell(answer, "scheduler-role").lexical == "undecided");
+    CHECK(RequiredCell(answer, "leader").kind == CellKind::Absent);
+
+    // A node running no worker tier offers no slots, which is not zero slots free.
+    CHECK(CellOf(answer, "compile-slots") == nullptr);
+    CHECK(CellOf(answer, "compiles-in-flight") == nullptr);
+}
+
+TEST_CASE("`node` omits the scheduler fields entirely on a node that runs none", "[cli][node][verbs]")
+{
+    // The distinction the case above cannot make on its own: `undecided` with an absent
+    // leader is a node IN an election, and a plain worker is not in one. If the role
+    // field appeared here at all, those two would render alike.
+    ScriptedNodeExchange node { { StatusReply(
+        { .version = "1.2.3",
+          .nodeId = {},
+          .uptimeSeconds = 5,
+          .surfaces = {},
+          .components = Cc::NodeComponentBit::Worker,
+          .runtime = { .toolchains = Cc::ToolchainState::Serving, .toolchainsServed = 1, .toolchainsDiscovered = 1 } }) } };
+
+    auto const answer = RunNodeVerb("node", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(CellOf(answer, "scheduler-role") == nullptr);
+    CHECK(CellOf(answer, "leader") == nullptr);
+}
+
 TEST_CASE("`node` reports a component bit this client has no name for", "[cli][node][verbs]")
 {
     // An older client meeting a newer node must say *there is something here I do not

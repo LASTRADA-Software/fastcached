@@ -3747,6 +3747,27 @@ enum class ToolchainState : std::uint8_t
     NothingToServe = 0x03,
 };
 
+/// What a node's scheduler role is, as the WIRE names it.
+///
+/// **Deliberately its own enum rather than `Distributed::SchedulerRole`**, for the
+/// reason `WireSurface` is not `NodeSurface`: that one is an in-process enum whose
+/// order is already load-bearing for two `EnumTable`s, and transmitting it would
+/// silently make its declaration order a wire contract as well. The node maps its
+/// enumerator onto this one, so a reorder there is a compile error at the mapping.
+///
+/// It carries no `Undecided`-means-absent subtlety: a node running no scheduler reports
+/// no role at all (the field is disengaged), while `Undecided` is a real reading -- an
+/// election is in progress and this node is participating in it. Those are different
+/// facts and a client acts on them differently.
+///
+/// Explicit values because these bytes are transmitted.
+enum class WireSchedulerRole : std::uint8_t
+{
+    Follower = 0x01,  ///< Not the leader; a known leader is at `leaderEndpoint`.
+    Undecided = 0x02, ///< No leader is known -- an election is in progress.
+    Leader = 0x03,    ///< This node leads and may hand out capacity.
+};
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -3782,7 +3803,119 @@ struct NodeRuntimeFields
     /// and not asserted to be: the two are sampled together but describe different
     /// phases, and refusing a reading is not this decoder's job.
     std::uint32_t toolchainsDiscovered { 0 };
+
+    /// How many concurrent compiles this node offers, or disengaged on one that runs no
+    /// compile accounting.
+    ///
+    /// **Not accompanied by a "limited by" field, and that is a decision.** The
+    /// vocabulary for *which ceiling bound this number* is `Distributed::SlotLimit`, and
+    /// it is the SCHEDULER's conclusion about a worker -- derived on the leader from what
+    /// the worker reported plus its live load. A worker does not compute it, and having
+    /// it do so would be a second spelling of the scheduler's arithmetic that can
+    /// disagree with the first. What the node owns is the two numbers below.
+    std::optional<std::uint32_t> compileSlots {};
+
+    /// How many of those slots are in use right now.
+    ///
+    /// Disengaged and zero are different answers: a node with no compile accounting says
+    /// nothing, a node with an idle worker says zero.
+    std::optional<std::uint32_t> compilesInFlight {};
+
+    /// This node's scheduler role, or disengaged on a node that runs no scheduler.
+    ///
+    /// The question a `components` mask cannot answer: a leading scheduler and a
+    /// following one both report `scheduler`, and a follower's registry is empty and
+    /// reads exactly like an idle fleet.
+    std::optional<WireSchedulerRole> schedulerRole {};
+
+    /// Where the leader answers, or empty when no leader is known.
+    ///
+    /// Empty is a READING rather than an absence here -- it is what `Undecided` looks
+    /// like from outside, and the role beside it is what says whether this node is in a
+    /// position to know. A node running no scheduler reports no role, which is what
+    /// makes this field's emptiness unambiguous.
+    std::string leaderEndpoint {};
+
+    /// How many of this node's registrations a scheduler has accepted.
+    ///
+    /// One per toolchain served, so it is read beside `registrarsTotal`: *2 of 3* is a
+    /// partially registered node, which is an ordinary state mid-survey and an alarming
+    /// one an hour later.
+    std::optional<std::uint32_t> registrarsRegistered {};
+
+    /// How many registrations this node is trying to hold.
+    std::optional<std::uint32_t> registrarsTotal {};
+
+    /// How long ago a scheduler last accepted a registration from this node.
+    ///
+    /// **Disengaged means NEVER, and zero means just now.** Collapsing those is the
+    /// whole reason this is an optional: a worker that has never reached its scheduler
+    /// and one that registered this second are the two states an operator is trying to
+    /// tell apart, and a bare `0` reports the healthy one for both.
+    ///
+    /// A duration rather than an instant, for the reason a heartbeat age is: a raw
+    /// `TimePoint` on the wire invites the receiver to difference it against its OWN
+    /// clock, which is a different clock.
+    std::optional<std::uint64_t> lastRegistrationSecondsAgo {};
 };
+
+namespace Detail
+{
+    /// Bytes for an engaged optional integral, or NOTHING for a disengaged one.
+    ///
+    /// The one place *absent travels as a zero-length field* is spelled, so a record
+    /// full of optionals cannot acquire a member that emits a zero value instead. A
+    /// zero-length field and a field holding zero are different facts on this wire, and
+    /// which one a reader gets decides whether it believes a node said something.
+    /// @param value The fact, or nothing.
+    /// @return Its big-endian bytes, or an empty vector.
+    template <typename T>
+    [[nodiscard]] inline std::vector<std::byte> OptionalBigEndian(std::optional<T> const& value)
+    {
+        if (!value.has_value())
+            return {};
+        auto const bytes = WireFields::ToBigEndian<T>(*value);
+        return std::vector<std::byte> { bytes.begin(), bytes.end() };
+    }
+
+    /// Bytes for an engaged optional single-byte enum, or NOTHING for a disengaged one.
+    /// @param value The enumerator, or nothing.
+    /// @return Its one byte, or an empty vector.
+    template <typename E>
+    [[nodiscard]] inline std::vector<std::byte> OptionalEnumByte(std::optional<E> const& value)
+    {
+        if (!value.has_value())
+            return {};
+        return std::vector<std::byte> { static_cast<std::byte>(static_cast<std::uint8_t>(*value)) };
+    }
+
+    /// Read an optional integral field out of a nested record.
+    ///
+    /// Holds the whole of the record's tolerance rule in one place: an EMPTY field is
+    /// *did not say* and leaves @p out alone, and a field of the wrong WIDTH is refused
+    /// rather than read -- that is a sender speaking a shape this build does not know,
+    /// and reading its first bytes would invent a plausible number. Written once because
+    /// the alternative is the same three lines per field, where one relaxed copy is a
+    /// silent wrong reading nothing else would catch.
+    /// @param field The field's bytes, possibly empty.
+    /// @param out Set only when the field carried a value.
+    /// @return False when the field was present and malformed.
+    template <typename T>
+    [[nodiscard]] inline bool ReadOptionalBigEndian(std::span<std::byte const> field, std::optional<T>& out)
+    {
+        if (field.empty())
+            return true;
+        auto const value = WireFields::FromBigEndian<T>(field);
+        if (!value.has_value())
+            return false;
+        // Assigned as the OPTIONAL rather than dereferenced into one: the round trip
+        // through the value is what `bugprone-optional-value-conversion` objects to, and
+        // it is right -- the two spellings differ only in offering a dereference that a
+        // later edit could move above the check.
+        out = value;
+        return true;
+    }
+} // namespace Detail
 
 /// Frame a runtime record as one nested field list.
 ///
@@ -3793,13 +3926,33 @@ struct NodeRuntimeFields
 /// @return The nested record's bytes, to be carried as a single `NodeStatus` field.
 [[nodiscard]] inline std::vector<std::byte> EncodeNodeRuntime(NodeRuntimeFields const& runtime)
 {
-    auto const stateByte = std::array { static_cast<std::byte>(
-        runtime.toolchains.has_value() ? static_cast<std::uint8_t>(*runtime.toolchains) : std::uint8_t { 0 }) };
-    auto const state =
-        runtime.toolchains.has_value() ? std::span<std::byte const> { stateByte } : std::span<std::byte const> {};
+    // Owned locals, every one of them: the spans handed to `Encode` below view these,
+    // and a temporary would be gone before the call. The two helpers exist because this
+    // record is mostly optionals and the *absent travels as zero length* dance would
+    // otherwise be written out seven times -- seven chances to emit a zero VALUE for a
+    // fact nobody stated, which is the one mistake this record is shaped to prevent.
+    auto const state = Detail::OptionalEnumByte(runtime.toolchains);
     auto const served = WireFields::ToBigEndian<std::uint32_t>(runtime.toolchainsServed);
     auto const discovered = WireFields::ToBigEndian<std::uint32_t>(runtime.toolchainsDiscovered);
-    return WireFields::Encode({ state, std::span<std::byte const> { served }, std::span<std::byte const> { discovered } });
+    auto const slots = Detail::OptionalBigEndian(runtime.compileSlots);
+    auto const inFlight = Detail::OptionalBigEndian(runtime.compilesInFlight);
+    auto const role = Detail::OptionalEnumByte(runtime.schedulerRole);
+    auto const registered = Detail::OptionalBigEndian(runtime.registrarsRegistered);
+    auto const total = Detail::OptionalBigEndian(runtime.registrarsTotal);
+    auto const lastRegistration = Detail::OptionalBigEndian(runtime.lastRegistrationSecondsAgo);
+
+    // Positional, so the ORDER here is the wire contract for this record. Append only:
+    // an insertion shifts every later field and every peer decodes one fact as the next.
+    return WireFields::Encode({ state,
+                                std::span<std::byte const> { served },
+                                std::span<std::byte const> { discovered },
+                                slots,
+                                inFlight,
+                                role,
+                                AsBytes(runtime.leaderEndpoint),
+                                registered,
+                                total,
+                                lastRegistration });
 }
 
 /// Read a runtime record back.
@@ -3860,6 +4013,40 @@ struct NodeRuntimeFields
             return std::nullopt;
         out.toolchainsDiscovered = *value;
     }
+
+    // The optional half of the record. `ReadOptionalBigEndian` holds the *empty is did
+    // not say, wrong width is refused* rule so these cannot drift apart one field at a
+    // time -- a relaxed copy would be a silent wrong number rather than a refusal.
+    if (!Detail::ReadOptionalBigEndian(at(3), out.compileSlots)
+        || !Detail::ReadOptionalBigEndian(at(4), out.compilesInFlight)
+        || !Detail::ReadOptionalBigEndian(at(7), out.registrarsRegistered)
+        || !Detail::ReadOptionalBigEndian(at(8), out.registrarsTotal)
+        || !Detail::ReadOptionalBigEndian(at(9), out.lastRegistrationSecondsAgo))
+        return std::nullopt;
+
+    if (auto const role = at(5); !role.empty())
+    {
+        if (role.size() != 1)
+            return std::nullopt;
+        // Skipped rather than refused when unnamed, the same rule the toolchain state
+        // above and `WireSurface` one level up both hold: an older client meeting a
+        // newer node reports what it understands rather than declining the whole reply.
+        switch (static_cast<WireSchedulerRole>(role[0]))
+        {
+            case WireSchedulerRole::Follower:
+            case WireSchedulerRole::Undecided:
+            case WireSchedulerRole::Leader:
+                out.schedulerRole = static_cast<WireSchedulerRole>(role[0]);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // No width to check and nothing to refuse: empty IS the reading here, and it means
+    // no leader is known. See the member.
+    out.leaderEndpoint = std::string { AsStringView(at(6)) };
+
     return out;
 }
 

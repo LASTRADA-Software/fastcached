@@ -44,6 +44,29 @@ namespace
         return WireFields::Encode(WireFields::FieldList { views });
     }
 
+    /// One row of `WireRoles`.
+    struct WireRoleRow
+    {
+        Distributed::SchedulerRole role;         ///< What this node calls it.
+        CompileCacheWire::WireSchedulerRole tag; ///< What the wire calls it.
+    };
+
+    /// Which wire tag each scheduler role travels as.
+    ///
+    /// A table rather than a switch for the reason the surface mapping above is one: the
+    /// node's own enum is free to be reordered -- two `EnumTable`s already key on it --
+    /// and transmitting it directly would silently make its declaration order a wire
+    /// contract. Mapping here means a reorder is a compile error at this table rather
+    /// than a client reading `Leader` where the node meant `Follower`.
+    constexpr EnumTable<Distributed::SchedulerRole, WireRoleRow> WireRoles { {
+        { .role = Distributed::SchedulerRole::Follower, .tag = CompileCacheWire::WireSchedulerRole::Follower },
+        { .role = Distributed::SchedulerRole::Undecided, .tag = CompileCacheWire::WireSchedulerRole::Undecided },
+        { .role = Distributed::SchedulerRole::Leader, .tag = CompileCacheWire::WireSchedulerRole::Leader },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(WireRoles, &WireRoleRow::role),
+                  "WireRoles must hold one row per SchedulerRole, in enumerator order");
+
     /// What this surface does about one refusal it may be asked to answer.
     ///
     /// **Exactly one of the two is set**, checked per row rather than described: a
@@ -343,6 +366,49 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         fields.runtime.toolchains = reading.state;
         fields.runtime.toolchainsServed = reading.served;
         fields.runtime.toolchainsDiscovered = reading.discovered;
+
+        // **Three states, not two.** No source wired is *nothing publishes this*; a
+        // source with no reading yet is *the first heartbeat round has not reported*;
+        // and an engaged reading whose `registered` is zero is *this node has tried and
+        // is registered nowhere*, which is the one an operator acts on.
+        if (auto const registration = _sources.runtime->Registration(); registration.has_value())
+        {
+            fields.runtime.registrarsRegistered = registration->registered;
+            fields.runtime.registrarsTotal = registration->total;
+
+            // A DURATION on the wire, differenced here against the clock that stamped
+            // it. An instant would be differenced by the receiver against its own clock,
+            // which is a different clock -- the rule a heartbeat age already holds.
+            // Absent when nothing has ever been accepted: *never* is not *a long time
+            // ago*, and zero would report the healthy answer for both.
+            if (registration->lastAccepted.has_value())
+                fields.runtime.lastRegistrationSecondsAgo = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - *registration->lastAccepted).count());
+        }
+    }
+
+    // Read live rather than published: this accounting is already thread-safe and
+    // already exact at the instant it is asked, so a publisher would only make it
+    // staler. Both numbers or neither -- a slot count with no in-flight figure invites
+    // the reading that the node is idle.
+    if (_sources.capacity != nullptr)
+    {
+        fields.runtime.compileSlots = static_cast<std::uint32_t>(_sources.capacity->Slots());
+        fields.runtime.compilesInFlight = static_cast<std::uint32_t>(_sources.capacity->InFlight());
+    }
+
+    // The question `components` cannot answer: a leading scheduler and a following one
+    // both report `scheduler`, and a follower's registry is empty and reads exactly like
+    // an idle fleet. Absent on a node running no scheduler, which is why `Undecided` is
+    // safe to report as itself -- it means an election, not a missing component.
+    //
+    // Role and endpoint are read separately and deliberately are not atomic together:
+    // `SchedulerService` says so itself, because a lock spanning both would buy an
+    // atomicity the fleet does not have anyway.
+    if (_sources.scheduler != nullptr)
+    {
+        fields.runtime.schedulerRole = WireRoles[static_cast<std::size_t>(_sources.scheduler->Role())].tag;
+        fields.runtime.leaderEndpoint = _sources.scheduler->LeaderEndpoint();
     }
 
     for (auto const& mapping: mappings)

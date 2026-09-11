@@ -1457,6 +1457,19 @@ TEST_CASE("A runtime field of the wrong width is refused rather than read", "[wi
     // A one-byte state is the only width that byte may have, for the same reason.
     auto const wideState = std::array { std::byte { 0 }, static_cast<std::byte>(ToolchainState::Serving) };
     CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode({ std::span<std::byte const> { wideState } })).has_value());
+
+    // **And the same rule for an OPTIONAL field, which is a different decoder.** The
+    // narrow field above sits at index 1, `toolchainsServed`, which is read inline --
+    // so relaxing `ReadOptionalBigEndian`, which owns the width rule for every optional
+    // field in this record, reddened nothing at all. Measured, by mutation. This arm
+    // puts the narrow field at index 3, `compileSlots`, where that decoder is reached.
+    auto const okState = std::array { static_cast<std::byte>(ToolchainState::Serving) };
+    auto const count = WireFields::ToBigEndian<std::uint32_t>(1);
+    CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode({ std::span<std::byte const> { okState },
+                                                       std::span<std::byte const> { count },
+                                                       std::span<std::byte const> { count },
+                                                       std::span<std::byte const> { narrow } }))
+                    .has_value());
 }
 
 TEST_CASE("A NodeStatus body at the previous arity is refused, not read short", "[wire][node-status]")
@@ -1475,6 +1488,98 @@ TEST_CASE("A NodeStatus body at the previous arity is refused, not read short", 
                                                     std::span<std::byte const> { surfaces } });
 
     CHECK_FALSE(DecodeNodeStatus(fiveFieldBody).has_value());
+}
+
+TEST_CASE("A runtime record round-trips what a node is doing, not only what it runs", "[wire][node-status]")
+{
+    NodeRuntimeFields const sent { .toolchains = ToolchainState::Serving,
+                                   .toolchainsServed = 2,
+                                   .toolchainsDiscovered = 2,
+                                   .compileSlots = 8,
+                                   .compilesInFlight = 3,
+                                   .schedulerRole = WireSchedulerRole::Follower,
+                                   .leaderEndpoint = "10.0.0.9:6676",
+                                   .registrarsRegistered = 2,
+                                   .registrarsTotal = 3,
+                                   .lastRegistrationSecondsAgo = 41 };
+
+    auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+    REQUIRE(back.has_value());
+    auto const& got = Unwrap(back);
+
+    CHECK(got.compileSlots == std::optional<std::uint32_t> { 8 });
+    CHECK(got.compilesInFlight == std::optional<std::uint32_t> { 3 });
+    CHECK(got.schedulerRole == std::optional { WireSchedulerRole::Follower });
+    CHECK(got.leaderEndpoint == "10.0.0.9:6676");
+    CHECK(got.registrarsRegistered == std::optional<std::uint32_t> { 2 });
+    CHECK(got.registrarsTotal == std::optional<std::uint32_t> { 3 });
+    CHECK(got.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 41 });
+    // The fields that were already there are unmoved by the ones appended after them,
+    // which is the property a POSITIONAL record can silently lose.
+    CHECK(got.toolchains == std::optional { ToolchainState::Serving });
+    CHECK(got.toolchainsServed == 2);
+}
+
+TEST_CASE("An absent runtime fact and a zero one survive as different answers", "[wire][node-status]")
+{
+    // **The discriminating pair, and neither half alone is one.** An encoder that writes
+    // a zero VALUE for a disengaged optional passes any round trip that only sends
+    // engaged ones; a decoder that engages every field it sees passes any that only
+    // sends absent ones. Sent together, one record must come back saying nothing and the
+    // other must come back saying zero.
+    NodeRuntimeFields silent {};
+    NodeRuntimeFields stated {};
+    stated.compileSlots = 0;
+    stated.compilesInFlight = 0;
+    stated.registrarsRegistered = 0;
+    stated.lastRegistrationSecondsAgo = 0;
+
+    auto const quiet = DecodeNodeRuntime(EncodeNodeRuntime(silent));
+    auto const loud = DecodeNodeRuntime(EncodeNodeRuntime(stated));
+    REQUIRE(quiet.has_value());
+    REQUIRE(loud.has_value());
+
+    // **`REQUIRE` and not `CHECK`, and the reason is the harness rather than the
+    // subject.** Catch2's exit code IS its failed-assertion count, and this project
+    // registers `SKIP_RETURN_CODE 4`, so a case that fails exactly FOUR assertions is
+    // scored SKIPPED rather than failed -- #1128, whose repair is a change of mechanism
+    // tracked as #1152. These four fail together under exactly the defect the case
+    // exists to catch, so as `CHECK`s the case reported `***Skipped` while genuinely
+    // red: measured, during the mutation run for this change. `REQUIRE` aborts at the
+    // first failure, so the case can only ever report ONE -- which is deterministic and
+    // is not 4. The cost is that a real failure names one field instead of four, and
+    // they are one family that moves together.
+    REQUIRE_FALSE(Unwrap(quiet).compileSlots.has_value());
+    REQUIRE_FALSE(Unwrap(quiet).compilesInFlight.has_value());
+    REQUIRE_FALSE(Unwrap(quiet).registrarsRegistered.has_value());
+    REQUIRE_FALSE(Unwrap(quiet).lastRegistrationSecondsAgo.has_value());
+
+    REQUIRE(Unwrap(loud).compileSlots == std::optional<std::uint32_t> { 0 });
+    REQUIRE(Unwrap(loud).compilesInFlight == std::optional<std::uint32_t> { 0 });
+    REQUIRE(Unwrap(loud).registrarsRegistered == std::optional<std::uint32_t> { 0 });
+    REQUIRE(Unwrap(loud).lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
+}
+
+TEST_CASE("A scheduler role this build cannot name is skipped rather than refused", "[wire][node-status]")
+{
+    // The same rule the toolchain state holds, and worth its own case because it is a
+    // second enum in one record: an unnamed byte must not cost a reader the rest of the
+    // record, or one added enumerator blinds every older tool to a node's slots and
+    // registrations as well.
+    NodeRuntimeFields sent {};
+    sent.compileSlots = 5;
+    auto record = EncodeNodeRuntime(sent);
+
+    // Rebuilt by hand with an unnamed role, because no encoder in this build emits one.
+    auto const role = std::array { std::byte { 0x6E } };
+    auto const slots = WireFields::ToBigEndian<std::uint32_t>(5);
+    record =
+        WireFields::Encode({ {}, {}, {}, std::span<std::byte const> { slots }, {}, std::span<std::byte const> { role } });
+
+    auto const back = DecodeNodeRuntime(record);
+    REQUIRE(back.has_value());
+    CHECK_FALSE(Unwrap(back).schedulerRole.has_value());
+    CHECK(Unwrap(back).compileSlots == std::optional<std::uint32_t> { 5 });
 }
 
 TEST_CASE("A verb's ceiling never exceeds what the operator configured", "[wire][prepayload]")
