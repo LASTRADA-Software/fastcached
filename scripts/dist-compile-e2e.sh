@@ -1646,6 +1646,25 @@ write_source "${proj}/twelve.cpp" "casetwelve"
     || fail "the case 12 reference compile failed"
 
 dead_cache_port="$(free_port)"
+
+# The precondition this case RESTS on, asserted rather than assumed (#1085).
+#
+# Everything below is a statement about what the launcher does when the cache
+# REFUSES the connect. `free_port` draws a port nothing answered on at the moment
+# of the draw and remembers it in a per-fixture ledger; neither covers another
+# PROCESS binding it a moment later, and this repository routinely runs several
+# fixtures at once across worktrees. If anything is listening here the connect is
+# ANSWERED rather than refused, the condition this case exists to arrange was
+# never arranged, and case 12 then fails on one of the four assertions below --
+# naming the launcher's reporting for a state nobody set up.
+#
+# It is not a guarantee and does not pretend to be: a listener arriving after this
+# line is exactly the case it cannot see, which is why this is one `port_answers`
+# and not a loop. What it buys is that ONE of the ways case 12 can go red now says
+# so by name, where #1085 records a failure whose assertion nobody can identify.
+if port_answers 127.0.0.1 "$dead_cache_port"; then
+    fail "case 12 needs ${dead_cache_port} to REFUSE a connect and something is answering on it, so the unreachable cache this case is about was never arranged and nothing below would be a statement about the launcher"
+fi
 (
     export FASTCACHE_ADDR="127.0.0.1:${dead_cache_port}"
     export FASTCACHE_SCHEDULER="127.0.0.1:${dispatch_port}"
