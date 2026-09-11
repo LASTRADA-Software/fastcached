@@ -15,6 +15,8 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/Unwrap.hpp>
+
 using namespace FastCache;
 using namespace FastCache::Cli;
 using namespace FastCache::Testing;
@@ -925,8 +927,13 @@ TEST_CASE("the help prints each wire's heading above that wire's own verbs", "[c
             INFO("verb: " << verb->name);
             auto const row = RowOf(commands, *verb);
             REQUIRE(row.has_value());
-            CHECK(*row > headingAt);
-            previousRow = std::max(previousRow, *row);
+
+            // `Unwrap` rather than a bare `*row`: clang-tidy's optional analysis cannot
+            // see a `has_value()` guard through Catch2's `REQUIRE`, and with
+            // `WarningsAsErrors` that is a build failure rather than a review comment.
+            auto const at = Unwrap(row);
+            CHECK(at > headingAt);
+            previousRow = std::max(previousRow, at);
         }
     }
 }
@@ -953,13 +960,14 @@ TEST_CASE("grouping the commands leaves every description in one column", "[cli]
 
         auto const row = RowOf(commands, verb);
         REQUIRE(row.has_value());
+        auto const at = Unwrap(row);
 
         auto const term = std::format("{}{}", verb.name, verb.operands);
-        auto const termAt = commands.find(term, *row);
+        auto const termAt = commands.find(term, at);
         REQUIRE(termAt != std::string_view::npos);
         auto const description = commands.find_first_not_of(' ', termAt + term.size());
         REQUIRE(description != std::string_view::npos);
-        columns.push_back(description - *row);
+        columns.push_back(description - at);
     }
 
     REQUIRE_FALSE(columns.empty());
