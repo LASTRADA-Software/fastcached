@@ -46,17 +46,19 @@ namespace
 TEST_CASE("The wire constants have their specified byte values")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
-    // Version 6 puts the lease's lifetime on the LEASE grant (#522), so a client can
-    // bound its wait by what the fleet actually agreed rather than by a constant it
-    // compiled in. Version 5 added COMPILE's source-root pair (#883).
+    // Version 7 gives the NODE-STATUS reply a nested runtime record, so a node with no
+    // `--admin-listen` can say what it is DOING rather than only what it was configured
+    // as (#1294, #1295). Version 6 put the lease's lifetime on the LEASE grant (#522);
+    // version 5 added COMPILE's source-root pair (#883).
     //
-    // Both move together, for the reason every bump here has: the arity is exact.
-    // `DecodeLeaseGrant` splits four fields now, so a version-5 grant is not a
-    // version-6 grant with one missing -- it is a payload this build cannot read, and
-    // tolerating it would mean falling back to the constant, which is the silent wrong
-    // answer #522 exists to remove.
-    CHECK(CurrentVersion == 6);
-    CHECK(MinSupportedVersion == 6);
+    // Both move together, and version 7's reason is NOT the one the earlier bumps had
+    // -- `MinSupportedVersion` carries the argument in full. In short: the failure here
+    // is already loud (exact arity, so a version-6 client cannot decode the body and
+    // says so), and the floor moves anyway because leaving it would have this build
+    // ACCEPT a version it has no way to answer correctly. `EncodeNodeStatus` emits one
+    // shape and takes no version.
+    CHECK(CurrentVersion == 7);
+    CHECK(MinSupportedVersion == 7);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -96,7 +98,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x06,                   // version
+        0x07,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -115,7 +117,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x06,                               // version
+        0x07,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -455,7 +457,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x06, 0x03,       // magic, version, op=Auth
+        0xFC, 0x07, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -1346,6 +1348,133 @@ TEST_CASE("Every verb refuses at its own declared ceiling, not the listener's", 
             CHECK(cap == SessionCap);
         }
     }
+}
+
+// --- the node's runtime record (#1294, #1295) --------------------------------
+
+TEST_CASE("A node's runtime record round-trips every toolchain state it can report", "[wire][node-status]")
+{
+    // Driven over all three rather than one, and with a DIFFERENT count per state,
+    // because the failures worth catching both survive a single-state check: an encoder
+    // that drops the state decodes disengaged and one that hard-codes a state agrees
+    // with whichever case happens to name it. Neither can pass all three.
+    struct Row
+    {
+        ToolchainState state;
+        std::uint32_t served;
+        std::uint32_t discovered;
+    };
+    constexpr std::array Rows {
+        Row { .state = ToolchainState::Surveying, .served = 0, .discovered = 7 },
+        Row { .state = ToolchainState::Serving, .served = 3, .discovered = 4 },
+        Row { .state = ToolchainState::NothingToServe, .served = 0, .discovered = 2 },
+    };
+
+    for (auto const& row: Rows)
+    {
+        INFO("state " << static_cast<int>(row.state));
+        NodeStatusFields const sent {
+            .version = "9.9.9",
+            .nodeId = {},
+            .uptimeSeconds = 11,
+            .surfaces = {},
+            .components = NodeComponentBit::Worker,
+            .runtime = { .toolchains = row.state, .toolchainsServed = row.served, .toolchainsDiscovered = row.discovered }
+        };
+
+        auto const back = DecodeNodeStatus(EncodeNodeStatus(sent));
+        REQUIRE(back.has_value());
+        auto const& runtime = Unwrap(back).runtime;
+        CHECK(runtime.toolchains == std::optional { row.state });
+        CHECK(runtime.toolchainsServed == row.served);
+        CHECK(runtime.toolchainsDiscovered == row.discovered);
+
+        // The record travels INSIDE `NodeStatus` rather than beside it, so the fields
+        // that were already there must survive its arrival.
+        CHECK(Unwrap(back).version == "9.9.9");
+        CHECK(Unwrap(back).components == NodeComponentBit::Worker);
+    }
+}
+
+TEST_CASE("A runtime record nobody sent decodes ABSENT, never as a reading", "[wire][node-status]")
+{
+    // **The discriminating assertion is `has_value()`, not the counts.** An
+    // implementation defaulting the state to `Surveying` reports zero served and zero
+    // discovered too, so a case that only checks the numbers passes under exactly the
+    // collapse this record exists to prevent: *this node said nothing* and *this node is
+    // surveying nothing* are different facts.
+    auto const empty = DecodeNodeRuntime({});
+    REQUIRE(empty.has_value());
+    CHECK_FALSE(Unwrap(empty).toolchains.has_value());
+    CHECK(Unwrap(empty).toolchainsServed == 0);
+    CHECK(Unwrap(empty).toolchainsDiscovered == 0);
+}
+
+TEST_CASE("A toolchain state this build cannot name is skipped rather than refused", "[wire][node-status]")
+{
+    // An older client meeting a newer node reports what it understands rather than
+    // declining to report anything -- the rule `DecodeNodeStatus` already holds for an
+    // unknown `WireSurface`. The discriminating half is that the record still DECODES:
+    // an implementation refusing the unknown byte returns nullopt and takes the whole
+    // reply with it, which is how one added enumerator would blind every older operator
+    // tool to a node's version, uptime and ports as well.
+    auto const unknownState = std::array { std::byte { 0x7F } };
+    auto const served = WireFields::ToBigEndian<std::uint32_t>(5);
+    auto const record =
+        WireFields::Encode({ std::span<std::byte const> { unknownState }, std::span<std::byte const> { served }, {} });
+
+    auto const back = DecodeNodeRuntime(record);
+    REQUIRE(back.has_value());
+    CHECK_FALSE(Unwrap(back).toolchains.has_value());
+    // And the fields it DID understand are still reported.
+    CHECK(Unwrap(back).toolchainsServed == 5);
+}
+
+TEST_CASE("A runtime record shorter than this build expects keeps its defaults", "[wire][node-status]")
+{
+    // The variable-arity half of the contract: a sender that named only the state is a
+    // peer this build can still read, and the facts it did not send are "did not say"
+    // rather than a refusal.
+    auto const stateOnly = std::array { static_cast<std::byte>(ToolchainState::Serving) };
+    auto const back = DecodeNodeRuntime(WireFields::Encode({ std::span<std::byte const> { stateOnly } }));
+
+    REQUIRE(back.has_value());
+    CHECK(Unwrap(back).toolchains == std::optional { ToolchainState::Serving });
+    CHECK(Unwrap(back).toolchainsServed == 0);
+}
+
+TEST_CASE("A runtime field of the wrong width is refused rather than read", "[wire][node-status]")
+{
+    // The one thing variable arity does NOT tolerate. A three-byte count is a sender
+    // speaking a shape this build does not know, and reading its first bytes would
+    // invent a number -- which is worse than refusing, because it is a plausible one.
+    auto const state = std::array { static_cast<std::byte>(ToolchainState::Serving) };
+    auto const narrow = std::array { std::byte { 0 }, std::byte { 0 }, std::byte { 1 } };
+    CHECK_FALSE(DecodeNodeRuntime(
+                    WireFields::Encode({ std::span<std::byte const> { state }, std::span<std::byte const> { narrow } }))
+                    .has_value());
+
+    // A one-byte state is the only width that byte may have, for the same reason.
+    auto const wideState = std::array { std::byte { 0 }, static_cast<std::byte>(ToolchainState::Serving) };
+    CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode({ std::span<std::byte const> { wideState } })).has_value());
+}
+
+TEST_CASE("A NodeStatus body at the previous arity is refused, not read short", "[wire][node-status]")
+{
+    // What the version bump to 7 is FOR. `SplitFields` is exact, so the five-field body
+    // a version-6 node emits is not a version-7 body missing its last field -- it is a
+    // payload this build declines to read, loudly. Written out by hand because no
+    // encoder in this build can produce it any more, which is the point.
+    auto const surfaces = WireFields::Encode(WireFields::FieldList { std::vector<std::span<std::byte const>> {} });
+    auto const uptime = EncodeU64Field(1);
+    auto const components = EncodeU32Field(0);
+    auto const fiveFieldBody = WireFields::Encode({ AsBytes(std::string_view { "1.2.3" }),
+                                                    {},
+                                                    std::span<std::byte const> { uptime },
+                                                    std::span<std::byte const> { components },
+                                                    std::span<std::byte const> { surfaces } });
+
+    CHECK_FALSE(DecodeNodeStatus(fiveFieldBody).has_value());
 }
 
 TEST_CASE("A verb's ceiling never exceeds what the operator configured", "[wire][prepayload]")

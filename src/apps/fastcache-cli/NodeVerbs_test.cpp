@@ -171,6 +171,79 @@ TEST_CASE("`node` renders an absent surface as an absent FIELD, never a zero por
     }
 }
 
+TEST_CASE("`node` says what the worker is DOING, which the component bits cannot", "[cli][node][verbs]")
+{
+    // **The rendered half of #1295.** `components` carries a `worker` bit that is a
+    // constant on the node binary, so it reads the same whether that worker is still
+    // walking its include trees or is serving compiles. These three cells are what
+    // separate them, and the case drives all three states because an implementation that
+    // hard-codes one agrees with whichever arm happens to name it.
+    struct Row
+    {
+        Cc::ToolchainState state;
+        std::string_view rendered;
+        std::uint32_t served;
+    };
+    auto const rows = std::array {
+        Row { .state = Cc::ToolchainState::Surveying, .rendered = "surveying", .served = 0 },
+        Row { .state = Cc::ToolchainState::Serving, .rendered = "serving", .served = 4 },
+        Row { .state = Cc::ToolchainState::NothingToServe, .rendered = "nothing-to-serve", .served = 0 },
+    };
+
+    for (auto const& row: rows)
+    {
+        INFO("state " << row.rendered);
+        ScriptedNodeExchange node { { StatusReply(
+            { .version = "1.2.3",
+              .nodeId = {},
+              .uptimeSeconds = 5,
+              .surfaces = {},
+              .components = Cc::NodeComponentBit::Worker,
+              .runtime = { .toolchains = row.state, .toolchainsServed = row.served, .toolchainsDiscovered = 4 } }) } };
+
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "toolchains").lexical == row.rendered);
+        CHECK(RequiredCell(answer, "toolchains-served").lexical == std::to_string(row.served));
+        CHECK(RequiredCell(answer, "toolchains-discovered").lexical == "4");
+
+        // Numbers rather than text, because this record is also rendered as JSON and
+        // CSV: a consumer compares two figures instead of parsing `4 of 4` back out of a
+        // sentence. The state is the only one of the three that is a name.
+        CHECK(RequiredCell(answer, "toolchains-served").kind == CellKind::Number);
+        CHECK(RequiredCell(answer, "toolchains-discovered").kind == CellKind::Number);
+        CHECK(RequiredCell(answer, "toolchains").kind == CellKind::Text);
+
+        // And the bit that could not answer this is unchanged across all three.
+        CHECK(RequiredCell(answer, "components").lexical == "worker");
+    }
+}
+
+TEST_CASE("`node` renders a node that published no runtime facts as ABSENT fields", "[cli][node][verbs]")
+{
+    // **Absent is not zero, and here all three cells go together.** A node too old to
+    // carry the record, or one running no worker, said nothing -- and `surveying, 0 of 0`
+    // is a reading an operator would act on. The discriminating assertion is that the
+    // fields are MISSING; one that rendered zeroes passes any check that only reads
+    // numbers.
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = {},
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = Cc::NodeComponentBit::Worker }) } };
+
+    auto const answer = RunNodeVerb("node", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(CellOf(answer, "toolchains") == nullptr);
+    CHECK(CellOf(answer, "toolchains-served") == nullptr);
+    CHECK(CellOf(answer, "toolchains-discovered") == nullptr);
+
+    // The rest of the record is unaffected: a missing runtime record must not cost an
+    // operator the facts the node DID send, which is what refusing the reply would do.
+    CHECK(RequiredCell(answer, "version").lexical == "1.2.3");
+    CHECK(RequiredCell(answer, "components").lexical == "worker");
+}
+
 TEST_CASE("`node` reports a component bit this client has no name for", "[cli][node][verbs]")
 {
     // An older client meeting a newer node must say *there is something here I do not

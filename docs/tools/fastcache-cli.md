@@ -165,12 +165,15 @@ would discard it silently.
 
 ```console
 $ fastcache-cli node
-version         0.2.0-125-g6ba32b30
-node-id         -
-uptime-seconds  15
-components      cache-tier, worker
-admin-port      36742
-admin-tls       false
+version                0.2.0-125-g6ba32b30
+node-id                -
+uptime-seconds         15
+components             cache-tier, worker
+toolchains             surveying
+toolchains-served      0
+toolchains-discovered  3
+admin-port             36742
+admin-tls              false
 ```
 
 A surface the node does not run gets **no field at all** rather than a zero port —
@@ -184,6 +187,25 @@ absent. A component bit this client has no name for is reported as
 `unknown(0x…)` beside the ones it does know — an older client meeting a newer node
 says *there is something here I do not understand* instead of quietly
 under-reporting.
+
+`toolchains` is what `components` **cannot** tell you. That mask carries a `worker`
+bit which is a constant on the node binary — it compiles, that is what it is for —
+so it reads identically whether the worker is still identifying its toolchains or
+is serving compiles. A node *serves while it identifies them*, and that walk has
+been observed running past 300 s on a cold machine, so the state an operator most
+often needs is exactly the one the bit could not express:
+
+- **`surveying`** — the first survey has not finished, and `toolchains-served` of
+  `toolchains-discovered` is how far it has got.
+- **`serving`** — a survey finished and this node serves `toolchains-served`
+  toolchains.
+- **`nothing-to-serve`** — a survey finished and this node serves none, so it
+  accepts no compiles until a later one finds a compiler. The node stays up and
+  keeps looking; its log says why.
+
+The three go together or not at all. A node that published none of them — one too
+old to carry the record — reports all three **absent** rather than
+`surveying, 0 of 0`, which is a reading somebody would act on.
 
 `node-metrics` reports every counter the endpoint's build carries, **zeroes
 included**. A counter is a tally, so zero is the truth about events that never

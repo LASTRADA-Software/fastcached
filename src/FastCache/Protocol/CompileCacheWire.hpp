@@ -119,7 +119,18 @@ using WireVersion = std::uint8_t;
 /// replicated setting, so the number a client must bound its wait by is no longer a
 /// constant both ends compile in -- it has to travel
 /// ([#522](https://github.com/LASTRADA-Software/fastcached/issues/522)).
-inline constexpr WireVersion CurrentVersion = 6;
+///
+/// **7 gave the NODE-STATUS reply a runtime record**, so a node with the default
+/// configuration -- no `--admin-listen`, therefore no `/metrics` and no dashboard --
+/// can say what it is DOING and not only what it was configured as
+/// ([#1294](https://github.com/LASTRADA-Software/fastcached/issues/1294),
+/// [#1295](https://github.com/LASTRADA-Software/fastcached/issues/1295)).
+///
+/// It is one new top-level field and it is intended to be the LAST one: what it
+/// carries is a nested variable-arity record, for the reason `EncodeCapacity` is
+/// nested inside REGISTER. So this arity moves once, here, and every later runtime
+/// fact costs no version at all.
+inline constexpr WireVersion CurrentVersion = 7;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -182,7 +193,36 @@ inline constexpr WireVersion CurrentVersion = 6;
 /// back to the constant -- is precisely the silent wrong answer #522 exists to
 /// remove, reintroduced as a compatibility shim. A client that cannot learn the
 /// fleet's lifetime must not guess it.
-inline constexpr WireVersion MinSupportedVersion = 6;
+///
+/// **And again for version 7 -- on a DIFFERENT argument from every one above, which
+/// is why it is spelled out rather than filed under "the floor always moves".** The
+/// three bumps above all rest on the failure being SILENT: a version-3 worker misreads
+/// a version-4 REGISTER reply as a worker id, a pre-#245 launcher abandons a compile
+/// minutes in. Version 7's does not. `NodeStatusFields` grew a sixth top-level field
+/// and `SplitFields` is exact about arity, so a version-6 client fails to decode the
+/// body at all and says so by name -- *"answered node-status with a body this client
+/// cannot read"*. On the usual argument that would be a reason to LEAVE the floor at 6
+/// and let older clients keep every verb whose shape did not move, which is most of
+/// them.
+///
+/// The floor moves anyway, because of what leaving it would ADVERTISE. A window is
+/// only real if this build can still SERVE the older version, and it cannot:
+/// `EncodeNodeStatus` emits one shape and takes no version, so a floor of 6 would have
+/// this build ACCEPT a version-6 request and answer it with bytes no version-6 client
+/// can read. That is a supported version by advertisement and an unsupported one in
+/// fact -- the version-4 paragraph's own defect one level up, since
+/// `UnsupportedVersion` names the range (*"this server speaks 7..7"*), which
+/// `docs/tools/fastcache-cc.md` documents as meaning a mixed install, while a decode
+/// failure names no version and reads as a corrupt reply or a protocol bug. Refusing
+/// by name is the more actionable of two loud failures.
+///
+/// Serving both shapes is the only other honest option and buys nothing here:
+/// `docs/operations/upgrading-a-fleet.md` already documents the stop-upgrade-start
+/// procedure, both binaries ship together, and this node has one installation
+/// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)), so the cost
+/// of the flag day is one local rebuild. Opening a real window is the work that page
+/// describes and is not owed yet.
+inline constexpr WireVersion MinSupportedVersion = 7;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -3660,6 +3700,169 @@ struct SurfaceReport
     bool tls { false };
 };
 
+/// How far a node's worker has got in identifying the toolchains it will serve.
+///
+/// **A tri-state, because the question has three answers and a `bool` reports two of
+/// them identically.** A node SERVES while it identifies its toolchains -- the walk
+/// moved to the heartbeat thread's first round and has been observed running past
+/// 300 s cold -- so *still looking* and *looked, found nothing* are the two states an
+/// operator most needs separated, and they are exactly the two that a "does this node
+/// run a worker" bit collapses
+/// ([#1295](https://github.com/LASTRADA-Software/fastcached/issues/1295)).
+///
+/// **Three and not four, and the next reader will want to make it four.** The node's
+/// own `Node::SurveyOutcome` names `Served`, `NothingToServe`, `NoneCouldBeAsked` and
+/// `Cancelled`, and
+/// [#1060](https://github.com/LASTRADA-Software/fastcached/issues/1060) paid
+/// specifically to separate the middle two -- a machine that is misconfigured and
+/// stays so, against one that may be fine a beat later. Mirroring that here is the
+/// obvious improvement and it is wrong, for two independent reasons:
+///
+/// 1. **Only the FIRST survey has an outcome.** The periodic re-survey answers
+///    `Node::ToolchainRefresh`, which carries `changed` and `served` and no outcome at
+///    all -- so a fourth enumerator could be filled honestly once, at startup, and
+///    would be guessed on every beat after it. That is a model more permissive than
+///    the thing it stands for, which is the shape this tree has paid for repeatedly.
+/// 2. **The misconfigured arm is not observable anyway**, because it exits:
+///    `SurveyOutcome::NothingToServe` sets `surveyFoundNothing` and requests a stop, so
+///    a node still answering `NodeStatus` in `NothingToServe` is always the recoverable
+///    kind. A wire state nothing can reach is a state nobody can act on.
+///
+/// So the counts below carry the detail and the node's own log carries the cause.
+///
+/// Explicit values because these bytes are transmitted.
+enum class ToolchainState : std::uint8_t
+{
+    /// No survey has finished yet. `toolchainsServed` is what is ready so far and
+    /// `toolchainsDiscovered` is what the cheap half found to walk -- the *n of m* an
+    /// operator watches during a cold start.
+    Surveying = 0x01,
+
+    /// A survey finished and this node serves `toolchainsServed` toolchains, which is
+    /// at least one.
+    Serving = 0x02,
+
+    /// A survey finished and this node serves none, so it accepts no compiles until a
+    /// later survey finds one. Recoverable by construction -- see the note above.
+    NothingToServe = 0x03,
+};
+
+/// What a node's live components report about themselves, as opposed to what its
+/// configuration asked for.
+///
+/// **Nested inside one `NodeStatus` field rather than spread across several, and that
+/// is the extensibility decision rather than a tidiness one.** `SplitFields` is exact
+/// about arity by design -- the property that makes a fixed message self-describing --
+/// so every fact added at `NodeStatusFields`' top level would move its arity and make
+/// two builds of this fleet unable to speak at all. This is the same answer
+/// `EncodeCapacity` gives inside REGISTER, for the same reason, and it is why version
+/// 7 is intended to be the last `NodeStatus` arity change: a fact this build has not
+/// heard of is skipped, and one it expects but was not sent keeps its default, which
+/// is *did not say*.
+///
+/// Every member is therefore an `optional` or has a documented "did not say" value.
+/// **Absent is not zero**: a node running no worker must be distinguishable from one
+/// whose worker serves nothing, and a `0` renders as a real reading in every format
+/// that carries it.
+struct NodeRuntimeFields
+{
+    /// How far the toolchain survey has got, or disengaged on a sender that runs no
+    /// worker or is too old to say.
+    std::optional<ToolchainState> toolchains {};
+
+    /// How many toolchains this node serves right now.
+    ///
+    /// Meaningful only beside `toolchains`: on its own a `0` is the collapse the
+    /// tri-state exists to end.
+    std::uint32_t toolchainsServed { 0 };
+
+    /// How many candidates the cheap half of the survey found to walk.
+    ///
+    /// The *m* of *n of m*. Never smaller than `toolchainsServed` on a healthy node,
+    /// and not asserted to be: the two are sampled together but describe different
+    /// phases, and refusing a reading is not this decoder's job.
+    std::uint32_t toolchainsDiscovered { 0 };
+};
+
+/// Frame a runtime record as one nested field list.
+///
+/// Absent facts travel as ZERO-LENGTH fields rather than as zero values, exactly as
+/// `EncodeCapacity`'s reserve does: they mean different things, and a wire that could
+/// not tell them apart would put the whole distinction back on the sender.
+/// @param runtime The facts to encode.
+/// @return The nested record's bytes, to be carried as a single `NodeStatus` field.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeRuntime(NodeRuntimeFields const& runtime)
+{
+    auto const stateByte = std::array { static_cast<std::byte>(
+        runtime.toolchains.has_value() ? static_cast<std::uint8_t>(*runtime.toolchains) : std::uint8_t { 0 }) };
+    auto const state =
+        runtime.toolchains.has_value() ? std::span<std::byte const> { stateByte } : std::span<std::byte const> {};
+    auto const served = WireFields::ToBigEndian<std::uint32_t>(runtime.toolchainsServed);
+    auto const discovered = WireFields::ToBigEndian<std::uint32_t>(runtime.toolchainsDiscovered);
+    return WireFields::Encode({ state, std::span<std::byte const> { served }, std::span<std::byte const> { discovered } });
+}
+
+/// Read a runtime record back.
+///
+/// A record holding fewer fields than this build expects is accepted with the rest
+/// left at "did not say", and one holding more is accepted with the surplus ignored.
+/// What is NOT tolerated is a field of the wrong width -- that is a sender speaking a
+/// shape this build does not know, and reading its first bytes would invent a number.
+///
+/// A `toolchains` byte this build has no name for is left DISENGAGED rather than
+/// refused, which is `DecodeNodeStatus`' rule for an unknown `WireSurface` one level
+/// up: an older client meeting a newer node reports what it understands rather than
+/// declining to report anything.
+/// @param field The nested record's bytes.
+/// @return The facts, or nullopt when the record itself is malformed.
+[[nodiscard]] inline std::optional<NodeRuntimeFields> DecodeNodeRuntime(std::span<std::byte const> field)
+{
+    // An absent record is not a malformed one: a peer that predates this field, or one
+    // that had nothing to say, is answered rather than refused.
+    if (field.empty())
+        return NodeRuntimeFields {};
+
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value())
+        return std::nullopt;
+
+    NodeRuntimeFields out {};
+    auto const at = [&](std::size_t index) {
+        return index < parts->size() ? (*parts)[index] : std::span<std::byte const> {};
+    };
+
+    if (auto const state = at(0); !state.empty())
+    {
+        if (state.size() != 1)
+            return std::nullopt;
+        switch (static_cast<ToolchainState>(state[0]))
+        {
+            case ToolchainState::Surveying:
+            case ToolchainState::Serving:
+            case ToolchainState::NothingToServe:
+                out.toolchains = static_cast<ToolchainState>(state[0]);
+                break;
+            default:
+                break;
+        }
+    }
+    if (auto const served = at(1); !served.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint32_t>(served);
+        if (!value.has_value())
+            return std::nullopt;
+        out.toolchainsServed = *value;
+    }
+    if (auto const discovered = at(2); !discovered.empty())
+    {
+        auto const value = WireFields::FromBigEndian<std::uint32_t>(discovered);
+        if (!value.has_value())
+            return std::nullopt;
+        out.toolchainsDiscovered = *value;
+    }
+    return out;
+}
+
 /// What a node answers `NodeStatus` with.
 struct NodeStatusFields
 {
@@ -3669,6 +3872,11 @@ struct NodeStatusFields
     std::vector<SurfaceReport> surfaces; ///< Every surface it actually opened.
     /// Which components it runs, as a bitmask -- see `NodeComponentBit`.
     std::uint32_t components { 0 };
+    /// What those components are DOING, as opposed to which of them started.
+    ///
+    /// The one extensible field: see `NodeRuntimeFields` for why every later runtime
+    /// fact belongs in here rather than beside it.
+    NodeRuntimeFields runtime {};
 };
 
 /// Bits of `NodeStatusFields::components`.
@@ -3724,12 +3932,16 @@ namespace NodeComponentBit
     for (auto const& row: surfaceRows)
         surfaceViews.emplace_back(row);
     auto const surfaces = WireFields::Encode(WireFields::FieldList { surfaceViews });
+    // Named rather than spelled inline, because it must outlive the span that views it
+    // -- the surfaces above are held the same way for the same reason.
+    auto const runtime = EncodeNodeRuntime(fields.runtime);
 
     return WireFields::Encode({ AsBytes(fields.version),
                                 AsBytes(fields.nodeId),
                                 std::span<std::byte const> { EncodeU64Field(fields.uptimeSeconds) },
                                 std::span<std::byte const> { EncodeU32Field(fields.components) },
-                                std::span<std::byte const> { surfaces } });
+                                std::span<std::byte const> { surfaces },
+                                std::span<std::byte const> { runtime } });
 }
 
 /// Decode a `NodeStatus` reply body.
@@ -3737,7 +3949,10 @@ namespace NodeComponentBit
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<NodeStatusFields> DecodeNodeStatus(std::span<std::byte const> payload)
 {
-    auto const outer = SplitFields(payload, 5);
+    // Exact at SIX, and it stays exact: the sixth field is the nested record that makes
+    // every later runtime fact free, so this number is not expected to move again. See
+    // `NodeRuntimeFields`.
+    auto const outer = SplitFields(payload, 6);
     if (!outer.has_value())
         return std::nullopt;
     auto const uptime = DecodeU64Field((*outer)[2]);
@@ -3749,11 +3964,16 @@ namespace NodeComponentBit
     if (!rows.has_value())
         return std::nullopt;
 
+    auto const runtime = DecodeNodeRuntime((*outer)[5]);
+    if (!runtime.has_value())
+        return std::nullopt;
+
     NodeStatusFields fields { .version = std::string { AsStringView((*outer)[0]) },
                               .nodeId = std::string { AsStringView((*outer)[1]) },
                               .uptimeSeconds = *uptime,
                               .surfaces = {},
-                              .components = *components };
+                              .components = *components,
+                              .runtime = *runtime };
     fields.surfaces.reserve(rows->size());
     for (auto const& row: *rows)
     {

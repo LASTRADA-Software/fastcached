@@ -172,6 +172,16 @@ struct ConfigShape
     return cfg;
 }
 
+/// What the unwired arm parks in the state object nothing is supposed to read.
+///
+/// **Deliberately a reading nobody could mistake for silence.** The *absent* case below
+/// asserts that a null `NodeRuntimeSources::runtime` is honoured, and parking a DEFAULT
+/// reading there would let an implementation that ignores the null pass by coincidence:
+/// `Surveying`, zero of zero is exactly what "this node reported nothing" looks like
+/// from outside, so the two states would be indistinguishable in the one case written to
+/// distinguish them.
+constexpr ToolchainReading UnwiredSentinel { .state = Wire::ToolchainState::Serving, .served = 99, .discovered = 99 };
+
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
 ///
 /// Held together deliberately, and this fixture is a FINDING rather than a convenience.
@@ -186,9 +196,22 @@ struct Fixture
     /// @param shape Which surfaces to resolve.
     /// @param clock Where uptime comes from; must outlive this.
     /// @param components What this node is to report running.
-    Fixture(ConfigShape const& shape, IClock const& clock, NodeComponents components = {}):
+    /// @param initial What the worker has published, or nothing to leave the runtime
+    ///        source UNWIRED -- which is a node that publishes no such facts, not one
+    ///        that publishes empty ones.
+    Fixture(ConfigShape const& shape,
+            IClock const& clock,
+            NodeComponents components = {},
+            std::optional<ToolchainReading> initial = std::nullopt):
         cfg { NodeConfigOf(shape) },
-        status { cfg, clock, clock.Now(), "1.2.3", "node-a", components }
+        runtime { initial.value_or(UnwiredSentinel) },
+        status { cfg,
+                 clock,
+                 clock.Now(),
+                 "1.2.3",
+                 "node-a",
+                 components,
+                 NodeRuntimeSources { .runtime = initial.has_value() ? &runtime : nullptr } }
     {
     }
 
@@ -198,8 +221,10 @@ struct Fixture
     Fixture& operator=(Fixture&&) = delete;
     ~Fixture() = default;
 
-    // Declaration order IS construction order, and `status` below binds `cfg` above it.
+    // Declaration order IS construction order, and `status` below binds both `cfg` and
+    // `runtime` above it.
     NodeConfig cfg;              ///< What the operator asked for.
+    NodeRuntimeState runtime;    ///< Where the worker publishes; read only when wired.
     ConfiguredNodeStatus status; ///< What the node answers with.
 };
 
@@ -322,6 +347,137 @@ TEST_CASE("Component bits report what started, one bit each", "[node][node-statu
     CHECK(bitsFor({}) == 0U);
     CHECK(bitsFor({ .cacheTier = true, .worker = true, .scheduler = true, .consensus = true })
           == (Bits::CacheTier | Bits::Worker | Bits::Scheduler | Bits::Consensus));
+}
+
+TEST_CASE("A node reports which of the three toolchain states its worker is in", "[node][node-status][toolchains]")
+{
+    // Driven over all three with a DIFFERENT count each, because the failures worth
+    // catching survive a single-state check: an implementation that drops the state
+    // reports absent, and one that hard-codes a state agrees with whichever case names
+    // it. Neither passes all three.
+    ManualClock clock;
+
+    auto reported = [&clock](ToolchainReading reading) {
+        Fixture const fixture { {}, clock, { .worker = true }, reading };
+        return fixture.status.Describe().runtime;
+    };
+
+    auto const surveying = reported({ .state = Wire::ToolchainState::Surveying, .served = 0, .discovered = 5 });
+    auto const serving = reported({ .state = Wire::ToolchainState::Serving, .served = 2, .discovered = 5 });
+    auto const barren = reported({ .state = Wire::ToolchainState::NothingToServe, .served = 0, .discovered = 5 });
+
+    // Compared as OPTIONALS rather than dereferenced, which asserts engagement and
+    // value in one -- and is forced anyway: `Unwrap` value-initializes on its failure
+    // path and this enum has no zero enumerator, for the reason `ReplyShape::code`
+    // above is an optional too.
+    CHECK(surveying.toolchains == std::optional { Wire::ToolchainState::Surveying });
+    CHECK(serving.toolchains == std::optional { Wire::ToolchainState::Serving });
+    CHECK(barren.toolchains == std::optional { Wire::ToolchainState::NothingToServe });
+
+    // The counts travel WITH the state. `Surveying` and `NothingToServe` both serve
+    // zero, so the count alone cannot separate them and the state alone cannot say how
+    // far a survey has got -- which is why neither is reported without the other.
+    CHECK(surveying.toolchainsServed == 0);
+    CHECK(serving.toolchainsServed == 2);
+    CHECK(barren.toolchainsServed == 0);
+    CHECK(surveying.toolchainsDiscovered == 5);
+}
+
+TEST_CASE("The worker component BIT and the toolchain state answer different questions", "[node][node-status][toolchains]")
+{
+    // **This is the whole of #1295.** `NodeComponents::worker` is a literal `true` on
+    // this binary -- it compiles, that is what it is for -- so the bit is a compile-time
+    // constant that cannot distinguish a node still walking its include trees from one
+    // serving compiles. The fix is not to make the bit conditional; it is that the two
+    // questions stopped sharing one bool.
+    //
+    // The discriminating shape is a CONJUNCTION, and each half alone is passed by the
+    // defect: the bit must be identical across the two nodes (so it is shown to carry no
+    // information) AND the state must differ (so something else does).
+    ManualClock clock;
+    namespace Bits = Wire::NodeComponentBit;
+
+    Fixture const walking { {},
+                            clock,
+                            { .worker = true },
+                            ToolchainReading { .state = Wire::ToolchainState::Surveying, .served = 0, .discovered = 4 } };
+    Fixture const ready { {},
+                          clock,
+                          { .worker = true },
+                          ToolchainReading { .state = Wire::ToolchainState::Serving, .served = 4, .discovered = 4 } };
+
+    auto const walkingFields = walking.status.Describe();
+    auto const readyFields = ready.status.Describe();
+
+    // Identical by the old answer...
+    CHECK(walkingFields.components == readyFields.components);
+    CHECK((walkingFields.components & Bits::Worker) != 0U);
+    CHECK((readyFields.components & Bits::Worker) != 0U);
+
+    // ...and different by the new one.
+    REQUIRE(walkingFields.runtime.toolchains.has_value());
+    REQUIRE(readyFields.runtime.toolchains.has_value());
+    CHECK(walkingFields.runtime.toolchains != readyFields.runtime.toolchains);
+}
+
+TEST_CASE("A node that publishes no runtime facts reports them ABSENT, not as zeroes", "[node][node-status][toolchains]")
+{
+    // **Absent is not zero, and the discriminating assertion is `has_value()`.** A node
+    // whose worker publishes nothing must be distinguishable from one whose worker
+    // surveys nothing, and `Surveying 0 of 0` is a real reading that a client renders as
+    // a dialable-looking fact.
+    //
+    // The fixture parks `UnwiredSentinel` in the state object precisely so this case
+    // cannot pass by coincidence: an implementation that reads the source without
+    // checking the null reports `Serving`, 99 of 99, which no assertion below tolerates.
+    ManualClock clock;
+    Fixture const fixture { {}, clock, { .worker = true } };
+    auto const fields = fixture.status.Describe();
+
+    CHECK_FALSE(fields.runtime.toolchains.has_value());
+    CHECK(fields.runtime.toolchainsServed == 0);
+    CHECK(fields.runtime.toolchainsDiscovered == 0);
+}
+
+TEST_CASE("The toolchain reading is re-read per call, not captured once", "[node][node-status][toolchains]")
+{
+    // The same property `Describe()`'s own doc comment claims and that the uptime case
+    // pins for the clock -- and it is the one that matters most here, because the state
+    // this reports is by construction one that CHANGES after the status object is built:
+    // the survey runs on the heartbeat thread's first round, minutes later on a cold
+    // machine. A snapshot taken at construction would report `Surveying` forever, and
+    // every single-call test above would still agree with it.
+    ManualClock clock;
+    // NOT `const`: this case publishes into the fixture, which is what production's
+    // heartbeat thread does and what the whole property is about.
+    Fixture fixture { {},
+                      clock,
+                      { .worker = true },
+                      ToolchainReading { .state = Wire::ToolchainState::Surveying, .served = 0, .discovered = 3 } };
+
+    // Returns the OPTIONAL, so every comparison below asserts engagement and value
+    // together. `Unwrap` is unusable here: it value-initializes on its failure path
+    // and this enum has no zero enumerator.
+    auto const state = [&fixture] {
+        return fixture.status.Describe().runtime.toolchains;
+    };
+    auto const served = [&fixture] {
+        return fixture.status.Describe().runtime.toolchainsServed;
+    };
+
+    CHECK(state() == std::optional { Wire::ToolchainState::Surveying });
+    CHECK(served() == 0);
+
+    fixture.runtime.PublishToolchains({ .state = Wire::ToolchainState::Serving, .served = 3, .discovered = 3 });
+
+    CHECK(state() == std::optional { Wire::ToolchainState::Serving });
+    CHECK(served() == 3);
+
+    // And a machine that loses its last compiler while serving goes back, which is the
+    // transition the periodic re-survey actually produces.
+    fixture.runtime.PublishToolchains({ .state = Wire::ToolchainState::NothingToServe, .served = 0, .discovered = 3 });
+    CHECK(state() == std::optional { Wire::ToolchainState::NothingToServe });
+    CHECK(served() == 0);
 }
 
 TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-status]")

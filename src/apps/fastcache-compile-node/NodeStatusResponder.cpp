@@ -273,13 +273,15 @@ ConfiguredNodeStatus::ConfiguredNodeStatus(NodeConfig const& cfg,
                                            TimePoint startedAt,
                                            std::string version,
                                            std::string nodeId,
-                                           NodeComponents components) noexcept:
+                                           NodeComponents components,
+                                           NodeRuntimeSources sources) noexcept:
     _cfg { cfg },
     _clock { clock },
     _startedAt { startedAt },
     _version { std::move(version) },
     _nodeId { std::move(nodeId) },
-    _components { components }
+    _components { components },
+    _sources { sources }
 {
 }
 
@@ -319,6 +321,29 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     namespace Bits = CompileCacheWire::NodeComponentBit;
     fields.components = (_components.cacheTier ? Bits::CacheTier : 0U) | (_components.worker ? Bits::Worker : 0U)
                         | (_components.scheduler ? Bits::Scheduler : 0U) | (_components.consensus ? Bits::Consensus : 0U);
+
+    // **The `Worker` bit above and this reading answer DIFFERENT questions, and that is
+    // the whole of #1295 rather than a nuance.** The bit says *this node has a worker
+    // component*, which on this binary is a constant and a true one -- it compiles, that
+    // is what it is for. This says *is that worker serving yet*, which is not a constant
+    // at all: a node serves while it identifies its toolchains, so between start and the
+    // heartbeat thread's first completed round it runs a worker that can honour nothing.
+    // One `bool` reported both, so the state an operator most needs to see was the one
+    // it could not express.
+    //
+    // Read through the seam, never from the served map itself: the map has exactly one
+    // writer and `Describe()` runs on a reactor thread. See `NodeRuntimeState`.
+    //
+    // A null source leaves the field DISENGAGED rather than reporting `Surveying` with
+    // zero of zero -- absent is not zero, and a caller that wired nothing has not
+    // observed a node with nothing to serve.
+    if (_sources.runtime != nullptr)
+    {
+        auto const reading = _sources.runtime->Toolchains();
+        fields.runtime.toolchains = reading.state;
+        fields.runtime.toolchainsServed = reading.served;
+        fields.runtime.toolchainsDiscovered = reading.discovered;
+    }
 
     for (auto const& mapping: mappings)
     {

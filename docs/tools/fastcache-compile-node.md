@@ -650,8 +650,16 @@ Eight counters on `/metrics`, and the splits are the point:
 `node-status` and `node-metrics` are answered over the `0xFC` port to **fleet
 members**, and `fastcache-cli node` / `fastcache-cli node-metrics` are what read
 them. They report what this process is — version, minted identity, uptime, the
-components it actually started, and the ports it opened — and every counter this
-build carries.
+components it actually started, the ports it opened, and **how far its worker has
+got in identifying the toolchains it will serve** — and every counter this build
+carries.
+
+That last one is the answer to *why is this node not taking any work*, and it is
+the reason these verbs are worth reaching for on a default install: a node serves
+while it identifies its toolchains, so between start and the heartbeat thread's
+first completed round it runs a worker that can honour nothing. `toolchains`
+reports `surveying`, `serving` or `nothing-to-serve` with the counts beside it; the
+component mask cannot, because its `worker` bit is a constant on this binary.
 
 They are gated on membership rather than on a credential, and that is deliberate:
 the credential on this listener belongs to the scheduler, so a node running none has

@@ -949,11 +949,32 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // is what it is for, and `compileResponder` above is unconditional. A predicate here
     // would be one nothing could make false.
     //
+    // **That was the whole complaint in #1295, and the fix is NOT to make this bit
+    // conditional.** The bit answers *does this node have a worker component*, and
+    // `true` is the correct answer to it. The question it was being read for is *is that
+    // worker serving anything yet*, which is a different question with three answers, and
+    // it is now `runtimeState` below rather than a fourth reading of this bool.
+    //
     // `consensus` is the exception, and it is the STRONGER answer rather than a weaker
     // one: the tier is constructed BELOW this point, so there is no pointer to read, and
     // `RunsConsensus` is the one predicate `StartConsensusOrExplain` itself asks (#1022,
     // #613). Reporting it cannot disagree with whether a tier gets built, which a second
     // spelling of the same question could.
+    // Where the heartbeat thread publishes what the survey has concluded, and the ONLY
+    // thing `Describe()` reads it through. The served map a few hundred lines below has
+    // exactly one writer and no lock; these verbs are answered per request on a reactor
+    // thread, so the map is not reachable from here and must not be made reachable.
+    //
+    // Seeded rather than defaulted, which is why `NodeRuntimeState` has no default
+    // constructor: the honest first reading already exists at this point. The cheap half
+    // of the survey has run -- `discoveredToolchains` is what it found -- and the
+    // expensive walk has not, so this node is `Surveying` 0 of however many candidates
+    // there are. A zero denominator here would be a reading nobody took.
+    Node::NodeRuntimeState runtimeState { Node::ToolchainReading {
+        .state = CompileCacheWire::ToolchainState::Surveying,
+        .served = 0,
+        .discovered = static_cast<std::uint32_t>(discoveredToolchains.entries.size()) } };
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -964,6 +985,7 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                .worker = true,
                                .scheduler = schedulerTier != nullptr,
                                .consensus = Node::RunsConsensus(cfg) },
+        Node::NodeRuntimeSources { .runtime = &runtimeState },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1216,6 +1238,25 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     // Read from the DISCOVERED set, which this thread owns and no other touches.
     auto const startupToolchainCount = discoveredToolchains.entries.size();
 
+    // Tell `node-status` what the survey concluded, in the vocabulary it reports.
+    //
+    // **One helper rather than a spelling per arm**, because the mapping from *how many
+    // are served* to the tri-state is one rule and four copies of it would be four
+    // chances to publish `Serving` beside a zero -- the exact collapse the tri-state
+    // exists to end.
+    //
+    // The denominator stays `startupToolchainCount` on a re-survey as well.
+    // `RefreshToolchains` reports `changed` and `served` and no candidate count, so the
+    // alternative is to invent one; this is the same number, from the same set, that the
+    // ready line already reports, and it is the only one this thread can state honestly.
+    auto const publishToolchains = [&runtimeState, startupToolchainCount](std::size_t served) {
+        runtimeState.PublishToolchains(
+            Node::ToolchainReading { .state = served > 0 ? CompileCacheWire::ToolchainState::Serving
+                                                         : CompileCacheWire::ToolchainState::NothingToServe,
+                                     .served = static_cast<std::uint32_t>(served),
+                                     .discovered = static_cast<std::uint32_t>(startupToolchainCount) });
+    };
+
     // One sampler for the whole loop, not one per heartbeat. CPU utilization is a
     // difference between two readings, so a sampler constructed per iteration would
     // have no earlier reading to difference against and would report nothing,
@@ -1336,8 +1377,17 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // into the serving state rather than two.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
                 Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
+                // AFTER the two calls above, never before: this says the worker is
+                // serving, and it must not say so while the compile port still holds the
+                // previous answer.
+                publishToolchains(toolchains.size());
                 break;
             case Node::SurveyOutcome::NothingToServe:
+                // Published even though the process is on its way out. The stop is not
+                // instant -- the watcher below has to notice it -- and this is exactly
+                // the window in which an operator asking *what is wrong with that node*
+                // gets a real answer instead of `Surveying` forever.
+                publishToolchains(0);
                 surveyFoundNothing = true;
                 DaemonControls::Instance().RequestStop();
                 return;
@@ -1360,6 +1410,15 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 //
                 // `FingerprintToolchains` has already said so at Warn, naming the
                 // count, so nothing is logged twice here.
+                //
+                // It DOES publish, and this arm is the one that most needed a verb:
+                // the node stays up serving nothing, which read from outside as a
+                // healthy worker with an idle fleet. `NothingToServe` on the wire
+                // rather than a fourth state naming this cause -- the re-survey below
+                // cannot tell the two empty surveys apart, so a state only the first
+                // survey could fill would be guessed on every beat after it. See
+                // `CompileCacheWire::ToolchainState`.
+                publishToolchains(0);
                 break;
             case Node::SurveyOutcome::Cancelled:
                 // Already stopping, and `surveyFoundNothing` stays false: this node
@@ -1455,6 +1514,11 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                 // open for a whole heartbeat.
                 jobs.ReplaceToolchains(compilersOf(toolchains));
                 Node::AdoptRegistrars(registrarsFor(toolchains), toolchains, registrars, withdrawals);
+                // Same order and the same reason as the first survey's `Served` arm.
+                // Inside `changed` deliberately: an unchanged sweep concluded nothing
+                // new, and republishing on every beat would make a reading that has not
+                // moved look like one that was re-taken.
+                publishToolchains(toolchains.size());
 
                 // A worker that ends up serving nothing keeps running and keeps
                 // saying nothing, rather than exiting: the compiler may come back

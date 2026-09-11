@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -269,6 +270,107 @@ struct NodeComponents
     bool consensus { false }; ///< This node participates in Raft.
 };
 
+/// What one reading says about this worker's toolchain survey.
+///
+/// **The three travel together or they lie.** Read separately, a reader can catch
+/// `Serving` beside a count from the previous publication -- and the count is the whole
+/// of what `Surveying` means (*n of m*), so a torn pair is not a slightly stale reading
+/// but a sentence with two subjects.
+struct ToolchainReading
+{
+    /// How far the survey has got.
+    CompileCacheWire::ToolchainState state { CompileCacheWire::ToolchainState::Surveying };
+
+    /// How many toolchains are served under that state.
+    std::uint32_t served { 0 };
+
+    /// How many candidates the cheap half of the survey found to walk.
+    std::uint32_t discovered { 0 };
+};
+
+/// Where the worker publishes what it is doing, for a reader on another thread.
+///
+/// **A publication seam, and it is not an incidental one.** The served-toolchain map is
+/// a `WorkerBody` local (`main.cpp`) written by the heartbeat thread under **no lock at
+/// all**, and that one-writer discipline is load-bearing and documented where it lives:
+/// a dedicated survey thread "would be a second writer to all three and would need a
+/// lock that the re-survey path has never needed". `NodeStatusResponder` answers **per
+/// request**, on a reactor thread, so reaching into that map -- or bolting a mutex onto
+/// it at the call site -- would make every `node-status` request a second reader of
+/// state whose safety rests on there being exactly one.
+///
+/// So the heartbeat thread PUSHES a reading here when it has one, and `Describe()` reads
+/// only what was pushed. Nothing on a reactor thread ever touches the map, the map keeps
+/// its single writer, and the two threads share exactly one small object whose whole
+/// contract is being shared.
+///
+/// **No default constructor**, for `Cc::ToolchainSurvey`'s reason: a defaulted value
+/// would answer the question by omission, and the answer it would give -- some count,
+/// some state -- is a reading nobody took. The first honest reading exists before this
+/// object does, because the cheap half of the survey has already run by then, so there
+/// is no moment this has to invent one.
+class NodeRuntimeState
+{
+  public:
+    /// @param initial What is true before any survey has finished -- ordinarily
+    ///        `Surveying`, with `discovered` naming what the cheap half found.
+    explicit NodeRuntimeState(ToolchainReading initial) noexcept:
+        _toolchains { initial }
+    {
+    }
+
+    NodeRuntimeState() = delete;
+    NodeRuntimeState(NodeRuntimeState const&) = delete;
+    NodeRuntimeState(NodeRuntimeState&&) = delete;
+    NodeRuntimeState& operator=(NodeRuntimeState const&) = delete;
+    NodeRuntimeState& operator=(NodeRuntimeState&&) = delete;
+    ~NodeRuntimeState() = default;
+
+    /// Record what the survey now says.
+    ///
+    /// Called from the heartbeat thread, once per survey that concluded something.
+    /// @param reading The three facts, as one publication.
+    void PublishToolchains(ToolchainReading reading)
+    {
+        std::scoped_lock const guard { _mutex };
+        _toolchains = reading;
+    }
+
+    /// @return The last published reading, whole.
+    [[nodiscard]] ToolchainReading Toolchains() const
+    {
+        std::scoped_lock const guard { _mutex };
+        return _toolchains;
+    }
+
+  private:
+    /// Guards `_toolchains`, and `mutable` for the reason
+    /// `SchedulerService::LeaderEndpoint` is: the read is `const` and the lock is not
+    /// part of what the caller is asking about. A mutex rather than atomics because the
+    /// three facts must be published and read as ONE -- and because this is a cold path
+    /// on both sides: one write per survey, one read per `node-status` request.
+    mutable std::mutex _mutex;
+
+    ToolchainReading _toolchains;
+};
+
+/// Where `ConfiguredNodeStatus` reads this node's LIVE facts from.
+///
+/// A record rather than loose constructor parameters, for `NodeComponents`' reason: a
+/// call site that learns a further source adds a named field instead of another pointer
+/// nobody can tell from its neighbours. It is expected to grow -- everything a node
+/// reports about what it is *doing* arrives through here.
+///
+/// **Every member is nullable and null means ABSENT, never zero.** A node that publishes
+/// no runtime facts must be distinguishable from one whose worker serves nothing, and
+/// the wire models that with a disengaged field rather than a `0` that renders as a real
+/// reading.
+struct NodeRuntimeSources
+{
+    /// What the worker publishes about its toolchain survey; null when nothing does.
+    NodeRuntimeState const* runtime { nullptr };
+};
+
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.
 ///
 /// Its own type rather than a lambda in `main`, for the reason `main` holds nothing
@@ -289,12 +391,18 @@ class ConfiguredNodeStatus final: public INodeStatusSource
     ///        which is the same rule `NodeCapacityOf` holds: a `--cache-dir` that would
     ///        not open has already stopped startup, and a tier a flag asked for but that
     ///        does not exist would be reported as running.
+    /// @param sources Where the LIVE facts are read from, per call. Each member must
+    ///        outlive this. Defaulted to nothing wired, which reports every runtime
+    ///        field ABSENT rather than inventing a reading -- that is the honest answer
+    ///        for a caller that publishes none, and it is what makes *nothing was wired*
+    ///        distinguishable from *the worker serves nothing*.
     ConfiguredNodeStatus(NodeConfig const& cfg,
                          IClock const& clock,
                          TimePoint startedAt,
                          std::string version,
                          std::string nodeId,
-                         NodeComponents components) noexcept;
+                         NodeComponents components,
+                         NodeRuntimeSources sources = {}) noexcept;
 
     /// @copydoc INodeStatusSource::Describe
     [[nodiscard]] CompileCacheWire::NodeStatusFields Describe() const override;
@@ -306,6 +414,7 @@ class ConfiguredNodeStatus final: public INodeStatusSource
     std::string _version;
     std::string _nodeId;
     NodeComponents _components;
+    NodeRuntimeSources _sources;
 };
 
 } // namespace FastCache::Node
