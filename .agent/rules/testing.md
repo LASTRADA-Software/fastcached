@@ -1016,6 +1016,63 @@ could **not** be made to fail and were rewritten — a forty-draw port test that
 deleted ledger passed fifteen runs in sixteen, and a `( fail )` subshell case that
 `set -e` was quietly rescuing.
 
+**A background process a fixture starts is bounded by TWO independent arms, and the
+one that can be reopened by omission is the one that has to be structural.** #839
+measured what a missing arm costs: **1368 orphan `perl` listeners holding loopback
+ports, the oldest 30.5 hours old.** The ports were the expensive half rather than the
+load — these fixtures draw from below the ephemeral range, so the next run meets a
+port held by a process nobody knows about and fails somewhere else entirely, which is
+the worst available shape. The arms are `exec` (so the pid a caller holds is the
+PROGRAM and not the subshell bash forks for a backgrounded function — three
+`kill "$listener"` calls here had never worked) and a self-imposed lifetime (because
+no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled CI job, and this
+fixture is in the DEFAULT set on every platform). **Each alone drives a survivor
+count to zero, for a different reason, so a COUNT cannot tell you whether either
+works** — ask the process tree.
+
+`exec` fails LOUDLY when it is forgotten, since the existing `kill` stops working.
+The lifetime does not, so it rides on the thing every stand-in must do anyway:
+`_selftest_bounded_perl <seconds> '<program>' <args...>` owns both, injecting the
+bound as its own `perl -e` chunk so the bodies stay textually distinct — they model
+different things, and concatenating perl program text as strings is the hazard, not
+the fix. There is no argument to pass an unbounded program to, and a bound of `0` is
+refused by name because `alarm 0` is perl's spelling of *cancel*, which would be an
+escape hatch wearing the shape of the guard. This is the `Refuse`-takes-a-row idiom
+(#1214).
+
+**Nothing makes a NEW stand-in go through that door, so the rule is a scan and not a
+comment** (#843). That is #970's finding arriving here: a rule stated in the files
+that obey it reaches no file that does not — and it is not hypothetical, since PR
+#834 added an unbounded listener *while* the ticket about bounds was open with its
+diagnosis written down. `perl-bounds-scan` walks every `*.sh` under `scripts/` and
+refuses any `perl` command position outside the injector, unless the line states
+`# perl-lifetime: <reason>`. Two spellings, two claims, and the marked ones are
+TALLIED and printed on every run, or *decided* and *forgot* are one spelling again.
+It refuses at zero as well: a scan whose subject has left the tree reports every file
+clean, which reads identically to complete coverage. Do not write the naive version —
+`alarm 30` appears in prose in that file, so a token grep is satisfied by a comment;
+it reads through the same declared-region filter the `bash32` and `seconds` scans use,
+and a file that matches its own scan by construction exempts a REGION, never itself.
+And the DOOR is asserted behaviourally in both directions, by exit STATUS and never by
+timing: a 60-second program under a 2-second bound must exit **142** (128 + SIGALRM),
+and a short program under a 30-second bound must exit 0 with its `@ARGV` intact — a
+door that armed nothing would pass the scan, and one that killed everything would pass
+the refusing half alone.
+
+**A cleanup reaps `jobs -pr`, never a pid ledger the call sites append to** (#845).
+A ledger is per-site, so the next background site reopens the leak by forgetting one
+line; there is nothing to forget in the shell's own job table. Two things a conversion
+may not assume, and both are checked by ENUMERATING the background sites rather than
+by argument: `jobs -pr` is per-shell and cannot see a process started *inside* a
+`( ... )` subshell — a backgrounded subshell is itself a job and is fine, its
+grandchildren are not, measured — and `$!` for a backgrounded shell FUNCTION is the
+wrapper. A ledger may still exist for ADDRESSING (`cluster-e2e.sh` keeps a slot-indexed
+one so a case can stop one named node); what it must stop being is the thing cleanup
+depends on. The escalation those fixtures need stays: TERM every job, one shared grace,
+then KILL the survivors. It must never call `fail` and never `wait` before the KILL —
+`fail` re-enters the EXIT trap already firing, and a bare `wait` in cleanup is
+unbounded against exactly the TERM-ignoring child these suites stage on purpose.
+
 ## An in-process fleet, and what a harness has to earn
 
 `tests/FleetHarness.hpp` runs a compile fleet in one process: N `SchedulerService`
