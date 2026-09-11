@@ -2189,17 +2189,17 @@ What it shows, and why each part is split the way it is:
 
 | Section | What it answers |
 |---|---|
-| The readouts | Six figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, and the **oldest** heartbeat in the fleet. The oldest and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. |
+| The readouts | The figures across the top: compiles dispatched over the selected range (with a sparkline), compiling now, cache hit rate, the share of dispatch decisions refused, leases outstanding, the **oldest** heartbeat in the fleet, and how many toolchains have **never been picked**. The oldest heartbeat and not the mean — one machine that stopped answering an hour ago is the fact worth surfacing, and an average over a healthy fleet buries it. Never picked counts distinct toolchains rather than registry entries, so one compiler served by four machines and reached through any of them counts as reached; a fleet with nothing registered shows `–` rather than `0`, because zero here means *every toolchain is being reached* and an empty fleet cannot claim it. |
 | Fleet capacity | One meter over every registered slot, split three ways: compiling, free, and **withheld** by a ceiling. The third is the one to read first — slots a ceiling withdrew are not this fleet being busy, so buying machines does not return them. A fleet that has never been dispatched to says *that* instead, because the same three numbers mean something else there — see below. |
 | Machines | One row **per machine**, not per toolchain: the software version it is running, cores, memory, free scratch, class and reserve, cache hit rate, heartbeat age. |
-| Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. The `compiler` column says what the toolchain **is** (`cl 19.44.35207`); the `toolchain` fingerprint beside it is what actually decides a match, and a row shows `–` when the node did not say, which a pinned `--toolchain=<fingerprint>=<compiler>` override never does. |
+| Workers | One row per `(toolchain, endpoint)` registry entry: slots, in flight, available — and *which* limit withdrew the difference. The `compiler` column says what the toolchain **is** (`cl 19.44.35207`); the `toolchain` fingerprint beside it is what actually decides a match, and a row shows `–` when the node did not say, which a pinned `--toolchain=<fingerprint>=<compiler>` override never does. `registered-age` and `last-picked-age` are read together: the second is `–` when the scheduler has never chosen that entry, and that is a finding beside a registration age of forty minutes and says nothing beside one of a second. |
 | Leases outstanding | One row per lease the scheduler has handed out and not yet seen resolved: the object key, the worker it went to, that worker's endpoint, and how long it has been held. **Oldest first, and bounded** — the header says `the 50 oldest of 900` when there are more, so a truncated table is not read as the whole fleet's work. A client hands its lease back when the job ends however it ended, so a row that has been there for minutes is a client that died mid-build, and the endpoint is where its work was going. A row with no endpoint is a lease against a worker that is no longer registered. |
 | Why requests were refused | Granted, and refused split four ways, each with what it tells you to do. |
 | Cache tiers | Items, bytes, budget, evictions and index RAM **per tier**. A tier no member runs has no column at all, and a fleet where nobody runs one says so rather than showing an empty table. `index-ram` is what the tier's key index costs in memory: always RAM, even for a disk tier whose budget is bytes on a filesystem, so the two are not comparable and must not be added. |
 | Over time | Four charts over 24 hours or 7 days: compiles dispatched, refusals stacked four ways, offerable capacity against jobs in flight, and cache hit rate per bucket. |
 | Members | Who the cluster has agreed on, and where each answers. A member that has never led shows no scheduler endpoint, because it has not said. |
 
-Three of those distinctions cost real debugging time when they are collapsed:
+These distinctions cost real debugging time when they are collapsed:
 
 - **A machine is not a worker.** A node started with two `--toolchain` flags is
   two registry entries carrying one machine's cores. The Machines table is the
@@ -2213,6 +2213,28 @@ Three of those distinctions cost real debugging time when they are collapsed:
   `no-capacity` says buy more machines, `withdrawn` says your machines are busy
   with something else, and `duplicate` says it is already being built. A total
   hides all four.
+- **A worker that is never *picked* looks exactly like a healthy one.** It
+  registered, it heartbeats, and every refusal counter on both machines reads
+  zero — because nothing ever arrives to be refused. That is what one compiler
+  family fingerprinting differently from your clients' looks like from here, and
+  `last-picked-age` is the only column that can see it. Read it beside
+  `registered-age`, and note that `in-flight` cannot answer the question: a job
+  occupies the **machine**, so a node serving two toolchains shows work against
+  both the moment either one runs a compile.
+
+Expect the never-picked readout to be non-zero for a while after a leadership
+change, and do not chase it. The record is the **current leader's**, so a
+scheduler that has just taken over has chosen nobody yet however long the fleet
+has been up; the same goes for a machine that dropped out of the fleet long
+enough to be expired and has just come back. Both drain as soon as one compile
+goes to each toolchain. A count that **persists** while the fleet is building is
+the finding.
+
+An ordinary re-registration is *not* one of those cases, deliberately: a node
+falls through to registering again after any refused heartbeat — a busy endpoint,
+or an election — without having gone anywhere, so neither its registration age nor
+its last-picked age restarts. Otherwise a transient would erase the forty minutes
+of evidence that make a never-picked row worth reading.
 
 A value nobody reported renders as `–` on the page and `null` in the JSON, never
 as `0` — a zero is a claim, and "this cache holds nothing" is a different fact
