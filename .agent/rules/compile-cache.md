@@ -2219,12 +2219,19 @@ with current truth at the moment the staleness would otherwise have done harm.
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
   DIAGNOSTIC can also end in a known dependency path.
-- **[#188](https://github.com/LASTRADA-Software/fastcached/issues/188)** — the
+- **[#1237](https://github.com/LASTRADA-Software/fastcached/issues/1237)** — the
   target-triple probe costs a driver spawn per translation unit on clang and
-  clang-cl, hits included, because its answer is a cache key input. Memoizing it
-  under the fingerprint's stamp is unsound: that stamp does not cover the MSVC
-  install the answer depends on, so a stale value would be a wrong hit rather than
-  a miss.
+  clang-cl, hits included, because its answer is a cache key input. What is open is
+  taking the banner and the triple from ONE `-###` spawn on `ClangDriverLine`
+  drivers: GCC's `-###` does not lead with the banner and `cl` has neither flag, so
+  both keep two spawns, and `cc`/`c++` resolve provisionally to GCC so they keep them
+  too. **That is not a cache, and the distinction is the whole reason it is the open
+  route**: nothing is remembered, so no staleness is introduced. Memoizing IS unsound
+  — the launcher is one process per translation unit, so a within-process memo has
+  nothing to hit, and a cross-process one keyed on the compiler binary cannot cover
+  `clang-cl`, whose triple moves when the MSVC beside it is upgraded, making a stale
+  value a wrong hit rather than a miss. #188 established that and is closed as
+  investigated; only the spawn count is still open.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

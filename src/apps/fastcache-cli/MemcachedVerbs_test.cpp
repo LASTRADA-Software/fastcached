@@ -230,7 +230,7 @@ TEST_CASE("a cas token that is not a whole number is refused before anything is 
     CHECK(exchange.Sent().empty());
 }
 
-TEST_CASE("--ttl reaches the storage verbs that honour it", "[cli][verbs][memcached]")
+TEST_CASE("Naming --ttl reaches the storage verbs that honour it", "[cli][verbs][memcached]")
 {
     auto exchange = ScriptedMemcachedExchange { { "STORED\r\n" } };
     auto const answer = Run("add", { "k", "v" }, exchange, VerbOptions { .ttlSeconds = 90 });
