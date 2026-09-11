@@ -385,3 +385,99 @@ TEST_CASE("every outcome has a distinct exit code", "[cli][command]")
     CHECK(ExitCodeOf(Outcome::Affirmative) == 0);
     CHECK(ExitCodeOf(Outcome::Usage) == 2);
 }
+
+TEST_CASE("`help` is the word people type, and it answers rather than refusing", "[cli][command][help]")
+{
+    // It used to be an *unknown command*: exit 2, the text on stderr where a pipe eats
+    // it, and uncoloured, because the usage-error path is deliberately plain. The help
+    // text appearing anyway is what made it look like it had worked.
+    auto const command = Parse({ "help" });
+    CHECK(command.action == Action::ShowHelp);
+
+    // Asserting the ACTION rather than the absence of an error: `UsageError` also
+    // prints the help, so "the help was printed" is true under the defect too.
+    CHECK(command.action != Action::UsageError);
+    CHECK(command.diagnostic.empty());
+}
+
+TEST_CASE("a bare word only asks a flag's question in the COMMAND position", "[cli][command][help]")
+{
+    // **The control that makes the alias safe.** A cache stores arbitrary bytes, so
+    // `help` is an ordinary key and an ordinary value. A table consulted anywhere but
+    // the command position would turn `get help` into a help screen and lose somebody's
+    // key -- silently, because the help text looks like success.
+    SECTION("as an operand it stays an operand")
+    {
+        auto const command = Parse({ "get", "help" });
+        CHECK(command.action == Action::RunVerb);
+        CHECK(command.verb == "get");
+        REQUIRE(command.operands.size() == 1);
+        CHECK(command.operands[0] == "help");
+    }
+
+    SECTION("and as a VALUE it stays a value")
+    {
+        auto const command = Parse({ "set", "k", "help" });
+        CHECK(command.action == Action::RunVerb);
+        REQUIRE(command.operands.size() == 2);
+        CHECK(command.operands[1] == "help");
+    }
+
+    SECTION("a word that is not an alias is still an unknown command")
+    {
+        auto const command = Parse({ "halp" });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains("halp"));
+    }
+}
+
+TEST_CASE("a settled action still reads how it should be RENDERED", "[cli][command][help]")
+{
+    // `--help` says nothing that follows may change the ANSWER, which is right. It used
+    // to discard how the answer is DRAWN as well, so `--color=always --help` coloured
+    // and `--help --color=always` did not -- one flag, two positions, opposite results,
+    // no diagnostic either way.
+    SECTION("--color is honoured on both sides of --help")
+    {
+        CHECK(Parse({ "--color=always", "--help" }).color == ColorChoice::Always);
+        CHECK(Parse({ "--help", "--color=always" }).color == ColorChoice::Always);
+    }
+
+    SECTION("and on both sides of the bare word")
+    {
+        CHECK(Parse({ "--color=always", "help" }).color == ColorChoice::Always);
+        CHECK(Parse({ "help", "--color=always" }).color == ColorChoice::Always);
+    }
+
+    SECTION("both spellings still select the same action")
+    {
+        CHECK(Parse({ "--help", "--color=always" }).action == Action::ShowHelp);
+        CHECK(Parse({ "help", "--color=always" }).action == Action::ShowHelp);
+    }
+}
+
+TEST_CASE("nothing after a settled action can turn it into an error", "[cli][command][help]")
+{
+    // Before this change the parse loop RETURNED at `--help`, so a bad flag after it was
+    // never read. That behaviour is preserved deliberately rather than by accident: a
+    // question about this binary has been answered, and replacing the answer with a
+    // complaint about a flag nobody will now use helps no one.
+    SECTION("an unknown flag is ignored")
+    {
+        CHECK(Parse({ "--help", "--no-such-flag" }).action == Action::ShowHelp);
+        CHECK(Parse({ "help", "--no-such-flag" }).action == Action::ShowHelp);
+    }
+
+    SECTION("a trailing word is not taken as a verb")
+    {
+        auto const command = Parse({ "--help", "get" });
+        CHECK(command.action == Action::ShowHelp);
+        CHECK(command.verb.empty());
+    }
+
+    SECTION("and --version is settled the same way")
+    {
+        CHECK(Parse({ "--version", "--no-such-flag" }).action == Action::ShowVersion);
+        CHECK(Parse({ "--version", "get" }).action == Action::ShowVersion);
+    }
+}

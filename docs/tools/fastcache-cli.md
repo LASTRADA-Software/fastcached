@@ -16,6 +16,20 @@ $ fastcache-cli stats --format=json | jq .keyspace_hits
 it is never out of date with what the binary accepts. This page carries the parts
 a table cannot: why the output and the exit codes are shaped the way they are.
 
+`fastcache-cli help` is accepted as well and does the same thing — exit `0`, on
+stdout, coloured when the terminal takes colour. It is the word people type, and
+answering it with *unknown command* while printing the help text anyway was the
+worst of both: the text appearing looked like success while the exit code was `2`
+and the output went to stderr, where a pipe swallows it. The word is only a help
+request in the **command** position: `get help` reads a key called `help`, and
+`set k help` stores that value, because a cache stores arbitrary bytes.
+
+Nothing after `--help` or `--version` can change *what* they answer — that is
+what makes them questions about this binary rather than about the command line —
+but `--color` still says how the answer is drawn, on either side of them. An
+unknown flag after them is ignored rather than replacing the answer with a
+complaint about a flag you are no longer going to use.
+
 ## Where it connects
 
 | | |
