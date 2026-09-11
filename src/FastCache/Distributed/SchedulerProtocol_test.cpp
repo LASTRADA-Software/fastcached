@@ -20,11 +20,21 @@
 
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Distributed;
 
 using FastCache::Testing::Unwrap;
+
+// The three reply readers are shared rather than spelled here. They had five private
+// copies across three suites, byte-identical to these once the `Wire` alias is expanded
+// -- and a copy that stops matching `DecodeReplyHeader`'s contract goes GREEN rather
+// than red, so the next change to the reply header would have to be found in four files
+// and three of them would not fail if it were missed.
+using FastCache::Testing::ErrorOf;
+using FastCache::Testing::PayloadOf;
+using FastCache::Testing::StatusOf;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -54,27 +64,6 @@ struct Fixture
     SchedulerProtocol protocol { service, metrics };
 };
 
-/// The status byte of a reply, or nullopt when the reply is unreadable.
-[[nodiscard]] std::optional<Wire::Status> StatusOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    return header.has_value() ? std::optional { header->status } : std::nullopt;
-}
-
-/// The error code of a refusal, or nullopt when the reply is not one.
-[[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    if (!header.has_value() || header->status != Wire::Status::Error || header->payloadLength == 0)
-        return std::nullopt;
-    return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
-}
-
-/// The payload of a reply, as bytes.
-[[nodiscard]] std::span<std::byte const> PayloadOf(std::span<std::byte const> reply)
-{
-    return reply.subspan(Wire::ReplyHeaderSize);
-}
 } // namespace
 
 TEST_CASE("A scheduler answers its own verbs and nothing else", "[distributed][scheduler][protocol]")

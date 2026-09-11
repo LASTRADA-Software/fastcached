@@ -48,10 +48,17 @@
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
+
+// Shared rather than spelled here: this was one of five private copies of the same
+// reply readers, byte-identical once the `Wire` alias is expanded. `MessageOf` below
+// stays local -- it reads the error payload's TEXT, which is a different question the
+// shared header deliberately does not answer.
+using FastCache::Testing::ErrorOf;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -259,17 +266,6 @@ class NamedResponder final: public IFrameResponder
         return {};
     auto const text = reply.subspan(Wire::ReplyHeaderSize + 1, header->payloadLength - 1);
     return std::string { reinterpret_cast<char const*>(text.data()), text.size() };
-}
-
-/// The error code an error reply carries.
-/// @param reply An encoded reply frame.
-/// @return Its code, or nullopt when it is not an error.
-[[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    if (!header.has_value() || header->status != Wire::Status::Error || header->payloadLength == 0)
-        return std::nullopt;
-    return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
 }
 
 /// One request header with no payload.
