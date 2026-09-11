@@ -58,7 +58,12 @@
 #   a target exits 0 with no assertions   -> "refusing to call that clean"
 #   a target runs past its deadline       -> "did not finish within"
 #   a target cannot be executed           -> "ran no cases at all"
-#   an unsuppressed race                  -> "reported an unsuppressed data race"
+#   an unsuppressed TSan finding          -> "reported an unsuppressed ThreadSanitizer finding"
+#
+# That last row said "reported an unsuppressed data race" while the code emitted
+# it for EVERY warning kind. It is the right-hand column that makes this table
+# worth having, so a row naming a phrase the code no longer prints is worse than
+# no row: it is a grep that comes back empty on a run that did refuse (#1251).
 #
 # The right-hand column is what a reader GREPS the output for, so each phrase is
 # contiguous in the message it names -- a phrase the code only emits across a
@@ -337,7 +342,34 @@ RenderTargetVerdicts() {
 # whose whole subject is not relying on unexercised behaviour, an `export` that
 # is unambiguous on every shell is worth more than a shorter line. It reaches
 # `nm` and `find` too, which read none of it.
-export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}"
+# `detect_deadlocks=0` turns off TSan's LOCK-ORDER detector, and only that. The
+# race detector -- this gate's whole subject -- is untouched, which is asserted
+# rather than hoped: the canary still dies with exit 66 under this flag.
+#
+# It is off because the detector is UNSOUND in the arrangement this gate uses.
+# TSan identifies a mutex by its ADDRESS and never forgets one that has been
+# destroyed, and running hundreds of cases in ONE process recycles stack
+# addresses between them -- so two cases whose nested mutexes land on the same
+# two addresses in swapped roles produce `lock-order-inversion (potential
+# deadlock)` for objects that never coexisted. Measured on one pair here
+# (`TestReactor::_mutex` then `ManualClock::_mutex`, an order the source never
+# inverts): 9/40 and 11/40 in two samples with ASLR on, and 0/40 under
+# `setarch -R`, which is what makes ASLR the confirmed variable rather than a
+# story that fits. Reproduced standalone in 40 lines with no deadlock possible.
+#
+# NOT a `deadlock:` suppression, and that is the whole argument: a suppression
+# names a FUNCTION while the colliding pair is a property of STACK LAYOUT, so
+# the next collision is a different pair in different files and no finite list
+# closes it -- while each entry would also blind that function to a real
+# inversion. See #1251.
+#
+# What this does NOT say: that deadlock detection is worthless, or that master
+# is unaffected. Master's `clang-tsan` has been green at job level over the runs
+# checked, and the pair found here needs `[server]`, which only the widened
+# scope selects -- but nobody has measured whether a pair inside the narrower
+# expression collides, and that gap is recorded rather than read as safety.
+# Per-case `ctest` runs do not recycle addresses and keep the detector.
+export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 detect_deadlocks=0 suppressions=${SUPPRESSIONS}"
 
 # Every wait is bounded, which is this repository's oldest testing rule. Running
 # the binaries directly rather than through `ctest` loses ctest's own per-test
@@ -792,9 +824,27 @@ RunTarget() {
     # passed" even when the process exits 66, so the exit code is what decides and
     # the output is only ever an explanation.
     if grep -q 'WARNING: ThreadSanitizer' "$log"; then
-        FailTarget "$name" "${name} reported an unsuppressed data race (exit ${rc}).
-    If this is a NEW race, it is its own issue -- file it. If it is a known one,
-    it belongs in .tsan-suppressions with its issue number, not deleted from here."
+        # NAME WHAT TSAN REPORTED, rather than calling every warning a race.
+        # TSan reports several kinds and this said "data race" for all of them:
+        # #1251 was a `lock-order-inversion`, and the message sent its reader
+        # hunting a race nobody had claimed, in a run where every Catch2 case
+        # had passed. Read from the log; an unparsable line says so instead of
+        # guessing, because a confidently wrong cause is what this whole script
+        # is written to avoid.
+        # CAPTURED, then first-lined without a pipe. `sed ... | head -1` is the
+        # SIGPIPE shape this repository keeps paying for: `head` leaves after one
+        # line, `sed` dies writing to a closed pipe, and under `pipefail` the
+        # pipeline reports SED's status -- 141 -- which `set -e` would then turn
+        # into the gate vanishing on its own failure path, where a reader is least
+        # able to tell what happened.
+        local kind kinds
+        kinds="$(sed -n 's/.*WARNING: ThreadSanitizer: \([a-z][a-z-]*\).*/\1/p' "$log")"
+        kind="${kinds%%$'\n'*}"
+        FailTarget "$name" "${name} reported an unsuppressed ThreadSanitizer finding (exit ${rc}): ${kind:-<the WARNING line did not parse; read the log>}.
+    If this is a NEW finding, it is its own issue -- file it. If it is a known
+    RACE, it belongs in .tsan-suppressions with its issue number, not deleted
+    from here. A finding that is not a race may not be a defect at all and may
+    not be suppressible by name: #1251 is the worked example."
     fi
     FailTarget "$name" "${name} failed (exit ${rc}) without a ThreadSanitizer report."
 }
