@@ -439,6 +439,9 @@ Render() {
 }
 
 # ---------------------------------------------------------------------------
+# selftest-offer: this script offers no self-test of its own. The token below names
+# `check-pr-required.sh --self-test`, which is where every verdict in this file is
+# driven from -- a reference to ANOTHER script's mode, not an offer of one here.
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") --pr <number> | --record <file>" >&2
     echo "       $(basename "${BASH_SOURCE[0]}") --listing-verdict <total_count> <rows-read>" >&2

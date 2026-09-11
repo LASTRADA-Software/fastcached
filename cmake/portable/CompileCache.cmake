@@ -1577,6 +1577,63 @@ if(_fc_cache_chosen)
     # mapping somewhere else computes a different key and misses rather than
     # mis-serving (`PathValueRole::PrefixMap`).
     #
+    # --- what this flag costs the FALLBACK launchers, per launcher (#816) ------
+    #
+    # `fastcache-cc` is unaffected, for the reason in the paragraph above. `ccache`
+    # and `sccache` hash the command line, so the roots below appear in their keys
+    # and cross-checkout reuse is at stake. The answer is NOT the same for the two,
+    # so it is recorded per launcher rather than as one sentence about "the
+    # fallbacks".
+    #
+    # Measured 2026-09-10, ccache 4.9.1 / sccache 0.7.7, clang++ 22.1.8, ext4 under
+    # WSL2 Ubuntu-24.04. Conditions pinned rather than pointed at: they describe one
+    # host at one instant and must not silently start describing another. Every arm
+    # carries BOTH controls -- an identical recompile that must HIT and an `-O0` to
+    # `-O2` change that must MISS -- because a MISS means nothing from a harness that
+    # cannot be seen to hit, and a HIT means nothing from one that cannot be seen to
+    # miss. An earlier run of this measurement used `-DX=1` as its must-miss control
+    # on a source that never mentions `X`; ccache's preprocessed mode hashed
+    # identical text and hit, correctly, and the control was the thing that was wrong.
+    #
+    #   arrangement                              ccache 4.9.1      sccache 0.7.7
+    #   two build dirs, ONE source tree          HIT (as shipped)  MISS
+    #   two WORKTREES, as shipped                MISS              MISS
+    #   two WORKTREES, CCACHE_BASEDIR set        HIT               n/a
+    #
+    # So: **ccache has a lever and sccache has none.** `CCACHE_BASEDIR`, pointed at a
+    # directory containing the worktrees, rewrites the absolute paths -- these roots
+    # included -- to CWD-relative form before hashing, and cross-worktree reuse then
+    # works. It is a CLIENT setting (the environment variable, or `base_dir` in
+    # ccache.conf) and cannot be set from here: a compile line cannot configure the
+    # cache that is about to read it. `hash_dir=false` was measured alongside and
+    # added nothing once `base_dir` was set.
+    #
+    # `sccache` 0.7.7 exposes no equivalent -- nothing in `--help` rewrites, relativises
+    # or bases paths -- so for sccache this IS an accepted cost: **the prefix-map makes
+    # cross-checkout reuse impossible, and that is the price of an object that names no
+    # checkout.** Written down here because an accepted cost that is recorded is a
+    # decision and one that is not is a defect waiting to be rediscovered. CI's fallback
+    # is sccache and CI builds each preset in its own directory, so this caps CI's hit
+    # rate structurally rather than by tuning.
+    #
+    # Removing the flag to buy hit rate is NOT the trade (#319, #506, and the
+    # `comp_dir` work): it exists so a replayed object names no checkout.
+    #
+    # And the reuse that ccache does give is SOUND rather than merely fast, which was
+    # checked rather than assumed -- the hazard being a hit that serves an object
+    # naming the producing worktree, which is #660's shape. Read out of the served
+    # object with `readelf --debug-dump=info`, never by comparing bytes:
+    #
+    #   w1 cold, stores           DW_AT_name ../src/u.cpp   comp_dir .
+    #   w2 served cross-worktree  DW_AT_name ../src/u.cpp   comp_dir .
+    #
+    # Zero occurrences of the producing worktree's name in the served object. Note
+    # that a cache-OFF build of the same source records `./u.cpp` instead, because
+    # `base_dir` hands the compiler a relative input path: both spellings are
+    # checkout-independent and neither leaks a tree, but objects built under
+    # `CCACHE_BASEDIR` are not byte-identical to objects built without it. Compare
+    # cold against warm, never control against warm.
+    #
     # Never fatal, per this file's contract. `check_<lang>_compiler_flag` is stock
     # CMake and reports rather than refuses, which matters because a bad flag left
     # in CMAKE_<LANG>_FLAGS fails the compiler ABI check and takes the whole
@@ -1641,6 +1698,25 @@ if(_fc_cache_chosen)
         if(NOT _fc_source_mapped)
             message(STATUS "[cache] The source root is NOT mapped: the build tree lies outside it, so the "
                            "relative path back would carry the checkout's own path")
+        endif()
+        # #816: these roots are in ccache's and sccache's keys, because both hash the
+        # command line. ccache has a lever and sccache has none -- the measurement and
+        # the reasoning are in the long comment beside the flag above.
+        #
+        # Said HERE and only when it is ACTIONABLE, which means when ccache is the
+        # launcher that actually won AND the setting it needs is absent. A line printed
+        # unconditionally would be advice for sccache users who cannot act on it and for
+        # `fastcache-cc` users who never had the problem, and a caveat that does not
+        # apply to the reader is one the reader learns to skip.
+        #
+        # STATUS rather than WARNING: nothing is wrong. A build directory that never
+        # shares with another checkout loses nothing by leaving it unset, and this file
+        # may not fail a configure in any case.
+        if(_fc_cache_chosen STREQUAL "ccache" AND NOT DEFINED ENV{CCACHE_BASEDIR})
+            message(STATUS "[cache] ccache will not reuse these objects across checkouts: the roots above are "
+                           "in its key. Set CCACHE_BASEDIR to a directory containing your worktrees to "
+                           "recover that (measured on ccache 4.9.1); it is a client setting, so a compile "
+                           "line cannot set it here")
         endif()
     endif()
     if(_fc_prefix_map_skipped)

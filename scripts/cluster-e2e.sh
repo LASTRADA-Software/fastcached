@@ -102,21 +102,20 @@ cleanup() {
     # shutdown would hang cleanup forever, and cleanup runs on EVERY exit path
     # including the failing ones. That turns "one assertion failed" into "the suite
     # timed out with no output", which this repository has already paid for once.
-    for pid in ${pids+"${pids[@]}"}; do
-        kill "$pid" >/dev/null 2>&1 || true
-    done
-    for pid in ${pids+"${pids[@]}"}; do
-        for _ in $(seq 1 25); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.2
-        done
-        kill -9 "$pid" >/dev/null 2>&1 || true
-        wait "$pid" 2>/dev/null || true
-    done
+    #
+    # It reaps `jobs -pr` and NOT the `pids` array below, which is #845: a ledger
+    # is per-site, so the next background site reopens the leak by forgetting one
+    # line. `pids` stays -- but only for ADDRESSING, since sections 5 and 7 stop
+    # one named node and read its status, which a job table cannot answer. What it
+    # has stopped being is the thing cleanup depends on.
+    #
+    # Checked rather than assumed, because `jobs -pr` cannot see a process started
+    # INSIDE a `( ... )`: this fixture has exactly ONE background site, the launch
+    # in `launch_node`, which is a function called from the top level, so its job
+    # belongs to this shell.
+    reap_background_jobs 5
     rm -rf "$workdir"
 }
-trap cleanup EXIT
-
 # Every node's log, on the way out of any failure.
 #
 # The alternative is what this fixture shipped with: one line naming the
@@ -137,6 +136,14 @@ dump_logs() {
 # `free_port` in `lib/e2e-common.sh`, in full rather than in each fixture's own
 # abbreviation of it.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+# The EXIT trap is armed AFTER the source, which is the order the library's own
+# caller contract states and which this file did not follow: `cleanup` calls
+# `reap_background_jobs` since #845, so a trap armed above the source would name a
+# function that does not exist yet. Nothing ran in that window -- comments and one
+# function definition -- so this is closing a shape rather than a live defect, and
+# `e2e_begin` still comes after the trap for the reason it always did: the TERM
+# trap it installs exists to let this one run.
+trap cleanup EXIT
 e2e_begin "cluster E2E" "$workdir"
 
 # Every failure dumps every node's log first. A consensus defect that reproduces

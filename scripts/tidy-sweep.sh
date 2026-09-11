@@ -537,6 +537,43 @@ ProducedCode() {
 # not in the database, which the caller reads as `unknown`: "we could not tell" must
 # never render as a verdict.
 #
+# Split one plan row into its THREE fields, or refuse it (#605).
+#
+# `file="${unit#*$'\t'}"` -- strip through the FIRST tab and keep the rest -- was
+# what stood here, and it folds a third column into the filename. Silently: the
+# lookup then misses, the unit is classified from a command that is not its own,
+# and nothing reports. The row format is load-bearing and was undefended, so a
+# column added to `PlanUnits` would have been a silent mis-attribution rather than
+# an error.
+#
+# A FIXED field count, checked. Not `IFS=$'\t' read`, which cannot do this job: a
+# tab is IFS *whitespace*, so runs of tabs collapse and an empty field shifts every
+# field after it -- the empty-`file` row would read as a two-field row and pass.
+#
+# Sets globals and returns a status rather than echoing, because the loop runs this
+# once per unit and a command substitution is a FORK per unit. `local -n` is bash
+# 4.0 and this script runs on macOS's 3.2.
+#
+# @param 1 The raw plan row.
+# @return 0 with PLAN_DB/PLAN_FILE/PLAN_DBFILE set; 1 with PLAN_BAD naming the fault.
+PlanRowFields() {
+    local row="$1" rest
+    PLAN_DB=""; PLAN_FILE=""; PLAN_DBFILE=""; PLAN_BAD=""
+    if [[ "$row" != *$'\t'*$'\t'* ]]; then
+        PLAN_BAD="expected 3 tab-separated fields, found fewer"
+        return 1
+    fi
+    PLAN_DB="${row%%$'\t'*}"
+    rest="${row#*$'\t'}"
+    PLAN_FILE="${rest%%$'\t'*}"
+    PLAN_DBFILE="${rest#*$'\t'}"
+    if [[ "$PLAN_DBFILE" == *$'\t'* ]]; then
+        PLAN_BAD="expected 3 tab-separated fields, found more"
+        return 1
+    fi
+    return 0
+}
+
 # A cl-style driver spells all three differently -- `/c`, `/Fo<obj>`, and `/E` -- so
 # a clang-cl database run through the GNU spellings keeps `/c` and `/Fo`, and the
 # preprocessed text lands in the OBJECT FILE while stdout stays empty. That is not
@@ -550,9 +587,37 @@ ProducedCode() {
 # reason kept), which is the direction to be wrong in.
 #
 # @param 1 Directory holding compile_commands.json.
-# @param 2 Repo-relative path of the unit.
+# @param 2 The entry's own `file` string, as `PlanUnits` emitted it (#605).
+#          NOT a repo-relative path: this is the key the entry is found by, and
+#          it is matched exactly and verbatim so that this function and
+#          `PlanUnits` cannot hold two rules about which command belongs to a
+#          file.
 PreprocessArgv() {
-    python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
+    # The two arguments want OPPOSITE treatment at the shell boundary, and on Git
+    # Bash they do not both get it. MSYS rewrites anything argument-shaped that
+    # looks like a POSIX path before a native `python3` sees it, so a target of
+    # `/repo/src/Bar.cpp` arrives as `C:/Program Files/Git/repo/src/Bar.cpp` --
+    # but $1 is a path python must OPEN (it has to be host-native) while $2 is a
+    # key it COMPARES verbatim against the database. Rewritten, the exact-match
+    # lookup below matches nothing and the unit reads `unknown` with no reason
+    # kept: silent, and in the direction that looks like a clean sweep.
+    #
+    # Conversion is per-SPAWN and all-or-nothing, so $1 is converted HERE and the
+    # spawn is then left alone. Measured on this leg, one spawn, four channels:
+    # `MSYS_NO_PATHCONV=1` suppresses it for arguments AND for the environment,
+    # `MSYS2_ARG_CONV_EXCL='*'` for arguments ONLY -- an environment variable
+    # still arrives rewritten under it, which is why passing the target that way
+    # is not the fix it looks like. Both are set because they are read by
+    # different spawn paths; `cygpath` exists only where the mangling does, so
+    # every other host takes the argument unchanged.
+    #
+    # Only a Windows leg can see this. The two Linux legs of the local gate pass
+    # in both directions, so a green gate is no evidence about this line.
+    local db="$1/compile_commands.json"
+    if command -v cygpath >/dev/null 2>&1; then
+        db="$(cygpath -m "$db")"
+    fi
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' python3 - "$db" "$2" <<'PYARGV'
 import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
 
@@ -632,10 +697,24 @@ try:
     entries = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     sys.exit(1)
-target = sys.argv[2].replace("\\", "/")
+# The entry's own `file` string, handed over by `PlanUnits` (#605), matched
+# EXACTLY and verbatim.
+#
+# This used to accept any entry whose path ENDED with a repo-relative target,
+# while `PlanUnits` anchored on the repo root and matched exactly -- a second,
+# looser author of one fact, winning silently wherever the two disagreed. An
+# `endswith` rule matches `/other/checkout/src/Bar.cpp` for a target of
+# `src/Bar.cpp`, so a database naming a second tree, a vendored copy, or a
+# generated mirror could serve a unit the compile command of a different file.
+# Nothing compared them and nothing would have reported it.
+#
+# No normalisation on either side: the string is compared against the one it was
+# read from. Normalising here would be a rule the other end has to apply
+# identically, which is the divergence again in a smaller box.
+target = sys.argv[2]
 for entry in entries:
-    path = entry.get("file", "").replace("\\", "/")
-    if path == target or path.endswith("/" + target):
+    path = entry.get("file", "")
+    if path == target:
         # `arguments` first: it is already a list, so nothing has to be re-parsed.
         # CMake's Ninja generator writes `command`, so the split below is the usual
         # path -- but when a generator does provide `arguments`, splitting a string
@@ -706,9 +785,12 @@ UnknownUnit() {
 # @param 1 Directory holding compile_commands.json.
 # @param 2 Repo-relative path of the unit.
 # @param 3 Slot prefix; `<slot>.unknown` is written with the reason when it fires.
+# @param 4 The entry's own `file` string, which is what the lookup matches on.
+#          `$2` stays the repo-relative path because that is what a reader of a
+#          `.unknown` marker needs to see; the two are different questions.
 UnitContribution() {
     local words directory verdict=""
-    words="$(PreprocessArgv "$1" "$2" 2>/dev/null)"
+    words="$(PreprocessArgv "$1" "$4" 2>/dev/null)"
     if [[ -z "$words" ]]; then
         UnknownUnit "$2" "$3" "no compile command in the database"
         echo unknown
@@ -905,11 +987,11 @@ SelfTest() {
     # passes under that bug.
     Expect "a Windows database keeps its path separators and its quoted spaces" \
            "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"-IC:\\Program Files\\OpenSSL\\include"$'\n'"D:\\a\\proj\\src\\N\\W.cpp"$'\n'"/E" \
-           "$(PreprocessArgv "$scratch/wdb" src/N/W.cpp)"
+           "$(PreprocessArgv "$scratch/wdb" 'D:\a\proj\src\N\W.cpp')"
 
     Expect "a POSIX database is unchanged by the Windows rule" \
            "/home/u/build"$'\n'"/usr/bin/clang++"$'\n'"/home/u/src/N/P.cpp"$'\n'"-E" \
-           "$(PreprocessArgv "$scratch/pdb" src/N/P.cpp)"
+           "$(PreprocessArgv "$scratch/pdb" /home/u/src/N/P.cpp)"
 
     # CMake emits `--` before the source file, and `--` means "everything after
     # this is an INPUT FILE". A preprocess flag APPENDED lands after it and is read
@@ -922,7 +1004,55 @@ SelfTest() {
         > "$scratch/sepdb/compile_commands.json"
     Expect "the preprocess flag goes BEFORE a -- separator, never after it" \
            "D:\\a\\proj\\build"$'\n'"C:\\LLVM\\clang-cl.exe"$'\n'"/nologo"$'\n'"/E"$'\n'"--"$'\n'"D:\\a\\proj\\src\\N\\W.cpp" \
-           "$(PreprocessArgv "$scratch/sepdb" src/N/W.cpp)"
+           "$(PreprocessArgv "$scratch/sepdb" 'D:\a\proj\src\N\W.cpp')"
+    # #605, the divergence made visible. Two entries whose paths differ only in a
+    # LEADING directory -- a second checkout, a vendored copy, a generated mirror --
+    # and the one we ask for is the SECOND. The retired rule accepted any entry
+    # whose path ended with the repo-relative target and broke at the first match,
+    # so it served the OTHER tree's compile command; the exact rule cannot.
+    #
+    # This is the case that discriminates, which is why the fixture has two entries.
+    # A single-entry fixture passes under both rules and would have asserted nothing.
+    mkdir -p "$scratch/twodb"
+    printf '%s' '[{"directory":"/other/build","command":"/usr/bin/clang++ -DWRONG -c -o x.o /other/checkout/src/Bar.cpp","file":"/other/checkout/src/Bar.cpp"},{"directory":"/repo/build","command":"/usr/bin/clang++ -DRIGHT -c -o x.o /repo/src/Bar.cpp","file":"/repo/src/Bar.cpp"}]'         > "$scratch/twodb/compile_commands.json"
+    Expect "a suffix-matching entry from another tree is NOT served"            "/repo/build"$'
+'"/usr/bin/clang++"$'
+'"-DRIGHT"$'
+'"/repo/src/Bar.cpp"$'
+'"-E"            "$(PreprocessArgv "$scratch/twodb" /repo/src/Bar.cpp)"
+    # And the other tree's entry is still reachable BY ITS OWN KEY, or the rule
+    # would be narrow rather than exact -- a lookup that serves nothing is not an
+    # improvement on one that serves the wrong thing.
+    Expect "the other tree's entry is reachable by its own key"            "/other/build"$'
+'"/usr/bin/clang++"$'
+'"-DWRONG"$'
+'"/other/checkout/src/Bar.cpp"$'
+'"-E"            "$(PreprocessArgv "$scratch/twodb" /other/checkout/src/Bar.cpp)"
+
+    # #605, the plan row's field count. `${unit#*$'	'}` folded a third column into
+    # the filename silently; these are the arms that must be seen to REFUSE, and the
+    # one that must be seen to ACCEPT -- a guard nobody has watched accept is not
+    # known to work.
+    PlanRowFields "db"$'	'"src/A.cpp"$'	'"/repo/src/A.cpp"
+    Expect "a three-field row parses into its three fields"            "db|src/A.cpp|/repo/src/A.cpp" "${PLAN_DB}|${PLAN_FILE}|${PLAN_DBFILE}"
+    if PlanRowFields "db"$'	'"src/A.cpp"$'	'"/repo/src/A.cpp"$'	'"extra"; then
+        Expect "a FOUR-field row is refused" "refused" "accepted"
+    else
+        Expect "a FOUR-field row is refused" "refused" "refused"
+        Expect "and the refusal says which way it is wrong"                "expected 3 tab-separated fields, found more" "$PLAN_BAD"
+    fi
+    if PlanRowFields "db"$'	'"src/A.cpp"; then
+        Expect "a TWO-field row is refused" "refused" "accepted"
+    else
+        Expect "a TWO-field row is refused" "refused" "refused"
+        Expect "and a short row says so rather than reading as a long one"                "expected 3 tab-separated fields, found fewer" "$PLAN_BAD"
+    fi
+    # An EMPTY third field is a real row -- a database entry with no `file` -- and
+    # must parse as three fields rather than collapsing to two. This is the case
+    # `IFS=$'	' read` cannot express, because a tab is IFS whitespace.
+    PlanRowFields "db"$'	'"src/A.cpp"$'	'
+    Expect "an empty third field still parses as three fields"            "db|src/A.cpp||ok" "${PLAN_DB}|${PLAN_FILE}|${PLAN_DBFILE}|${PLAN_BAD:-ok}"
+
     # A header two levels down still reaches the translation unit at the top --
     # and a `.c` unit is one of them, which is the assertion that stops the
     # translation-unit table from silently drifting back to "only `.cpp`".
@@ -1116,14 +1246,14 @@ STUB
         > "$scratch/db/compile_commands.json"
 
     Expect "a unit whose compiler emits its own lines is produced" \
-           "produced" "$(UnitContribution "$scratch/db" "src/Has.cpp" "$scratch/slotA")"
+           "produced" "$(UnitContribution "$scratch/db" "src/Has.cpp" "$scratch/slotA" "$scratch/tree/src/Has.cpp")"
     Expect "a unit whose compiler emits only header lines is empty" \
-           "empty" "$(UnitContribution "$scratch/db" "src/None.cpp" "$scratch/slotB")"
+           "empty" "$(UnitContribution "$scratch/db" "src/None.cpp" "$scratch/slotB" "$scratch/tree/src/None.cpp")"
     # The state that was unreachable. A compiler that FAILS has told us nothing;
     # reporting that as `empty` is an absence of evidence rendered as evidence of
     # absence, which is this ticket's own defect one level down.
     Expect "a unit whose compiler fails is unknown, never empty" \
-           "unknown" "$(UnitContribution "$scratch/db" "src/Broken.cpp" "$scratch/slotC")"
+           "unknown" "$(UnitContribution "$scratch/db" "src/Broken.cpp" "$scratch/slotC" "$scratch/tree/src/Broken.cpp")"
     # Grepped for the REASON, not `-s`: a marker holding only its filename line is
     # non-empty, so `-s` passed whether or not the reason was ever written.
     Expect "and the reason it failed is kept, not discarded" \
@@ -1132,7 +1262,7 @@ STUB
     # A file the database does not describe is also unknown, and for the same
     # reason: nothing was learned. It must not read as "contributed nothing".
     Expect "a unit absent from the database is unknown" \
-           "unknown" "$(UnitContribution "$scratch/db" "src/Absent.cpp" "$scratch/slotD")"
+           "unknown" "$(UnitContribution "$scratch/db" "src/Absent.cpp" "$scratch/slotD" "$scratch/tree/src/Absent.cpp")"
     Expect "and that unknown records why as well" \
            "yes" \
            "$( grep -q 'no compile command' "$scratch/slotD.unknown" 2>/dev/null && echo yes || echo no )"
@@ -1147,7 +1277,7 @@ STUB
         "$scratch" "$scratch/tree" "$scratch/tree" > "$scratch/cldb/compile_commands.json"
     Expect "a clang-cl command loses /c, /Fo and /Fd and gains /E" \
            "C:/LLVM/bin/clang-cl.exe /nologo /TP ${scratch}/tree/src/Has.cpp /E" \
-           "$(PreprocessArgv "$scratch/cldb" src/Has.cpp | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
+           "$(PreprocessArgv "$scratch/cldb" "$scratch/tree/src/Has.cpp" | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
     # And the direction that keeps the driver test from being a licence: a GNU
     # driver's `/`-spelled argument is a PATH, not an option, so nothing is dropped
     # and `-E` is what gets appended.
@@ -1156,7 +1286,7 @@ STUB
         "$scratch" "$scratch/tree" "$scratch/tree" > "$scratch/gnudb/compile_commands.json"
     Expect "a GNU command keeps a /-spelled path and gains -E" \
            "/usr/bin/g++ -DX /opt/include/forced.h ${scratch}/tree/src/Has.cpp -E" \
-           "$(PreprocessArgv "$scratch/gnudb" src/Has.cpp | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
+           "$(PreprocessArgv "$scratch/gnudb" "$scratch/tree/src/Has.cpp" | tail -n +2 | tr '\n' ' ' | sed 's/ $//')"
 
     # `--only` may not print a clean verdict over files it could not cover (#858).
     # The caller NAMED this set, so `empty` and `unknown` both mean the sweep read
@@ -1444,10 +1574,31 @@ if selection is not None:
 # one command. A file with several is served only by single-entry databases, one
 # per command -- the shared database would analyse all of them in one invocation
 # and the per-command ones would then repeat every single analysis.
+
+# THREE fields: the database directory, the repo-relative path, and the entry's
+# own `file` string VERBATIM (#605).
+#
+# The third one exists so nothing downstream has to find the entry again. It used
+# to, with a rule of its own -- `PreprocessArgv` accepted any entry whose path
+# ENDED with the repo-relative target, where this function anchors on the repo
+# root and matches exactly. Two authors of one fact, and where they disagreed the
+# looser one won silently, classifying a unit from a compile command that is not
+# its own. Handing over the string this function already has in its hand leaves
+# one rule instead of agreeing to disagree.
+#
+# Verbatim rather than normalised: `PreprocessArgv` compares it against the same
+# key it was read from, so any transformation here is one both sides would have to
+# apply identically -- which is the divergence again in a smaller box.
+#
+# A tab inside a path would break the row, and that is DELIBERATELY left to the
+# reader rather than escaped here: the consumer refuses a row whose field count is
+# not three, loudly and by name, so such a path stops the sweep instead of
+# silently shifting every field after it.
 slot = 0
 for path, commands in byFile.items():
     if len(commands) == 1:
-        print(dbDir + "\t" + path)
+        entry = next(iter(commands.values()))
+        print(dbDir + "\t" + path + "\t" + entry.get("file", ""))
         continue
     for entry in commands.values():
         slot += 1
@@ -1456,7 +1607,7 @@ for path, commands in byFile.items():
         with open(os.path.join(directory, "compile_commands.json"), "w",
                   encoding="utf-8") as handle:
             json.dump([entry], handle)
-        print(directory + "\t" + path)
+        print(directory + "\t" + path + "\t" + entry.get("file", ""))
 PLAN
 }
 
@@ -1614,8 +1765,12 @@ Canary
 # @param 1 The database directory holding this unit's compile command.
 # @param 2 The file to check.
 # @param 3 Slot prefix under $scratch.
+# @param 4 The entry's own `file` string, from the plan's third column (#605).
+#          Carried rather than re-derived: it is the key `PreprocessArgv` looks
+#          the compile command up by, and deriving it a second time is what gave
+#          this script two lookup rules that could disagree.
 TidyOne() {
-    local database="$1" file="$2" slot="$3" out rc hits contribution
+    local database="$1" file="$2" slot="$3" dbfile="$4" out rc hits contribution
     # Asked BEFORE the analysis, and recorded whatever the analysis then says: a
     # unit that contributes nothing is not evidence about its file even when
     # clang-tidy reports cleanly on it -- that clean report is the defect (#466).
@@ -1624,7 +1779,7 @@ TidyOne() {
     # the cheapest units, because those are the empty ones -- and 5% of a whole
     # sweep's wall clock, which is the number an operator actually feels. Quote the
     # sweep figure; the per-unit ratio is a spread and has no floor worth citing.
-    contribution="$(UnitContribution "$database" "$file" "$slot")"
+    contribution="$(UnitContribution "$database" "$file" "$slot" "$dbfile")"
     case "$contribution" in
         produced|empty) printf '%s\n' "$file" > "${slot}.${contribution}" ;;
         unknown)        : ;;  # `UnknownUnit` wrote the marker and the reason
@@ -1646,12 +1801,20 @@ TidyOne() {
     fi
 }
 
+
 index=0
 running=0
 declare -a skipped=()
 for unit in "${plan[@]}"; do
-    database="${unit%%$'\t'*}"
-    file="${unit#*$'\t'}"
+    # Refuses rather than mis-attributes. A row this loop cannot read is a change
+    # to `PlanUnits` that nothing else would have reported, and continuing would
+    # sweep a unit against another unit's compile command.
+    if ! PlanRowFields "$unit"; then
+        fatal "unreadable plan row (${PLAN_BAD}): ${unit}"
+    fi
+    database="$PLAN_DB"
+    file="$PLAN_FILE"
+    dbfile="$PLAN_DBFILE"
     # A unit the database names and the tree does not have -- a source deleted
     # since the database was generated. Recorded rather than passed over: a count
     # that silently disagrees with the plan is the one thing this script must not
@@ -1661,7 +1824,7 @@ for unit in "${plan[@]}"; do
         continue
     fi
     index=$((index + 1))
-    TidyOne "$database" "$file" "$(printf '%s/%05d' "$scratch" "$index")" &
+    TidyOne "$database" "$file" "$(printf '%s/%05d' "$scratch" "$index")" "$dbfile" &
     # A counter rather than `jobs -rp | wc -l`, which forks twice per unit just
     # to count children.
     running=$((running + 1))

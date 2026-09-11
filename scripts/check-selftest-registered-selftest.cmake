@@ -193,17 +193,47 @@ file(WRITE "${commentDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
 ExpectVerdict("case 5: a comment mentioning the flag is not an offer" "${commentDir}" "pass" "")
 
 # ---------------------------------------------------------------------------
-# Case 6 -- nor is a STRING LITERAL staging somebody else's command line. Not hypothetical:
-# `check-tidy-blind-spots-selftest.sh` printf's a fake workflow containing
-# `bash scripts/tidy-sweep.sh --self-test`, and reading that as an offer refuses a correct
-# tree. Case 5 does not cover it -- the line is code, not a comment.
+# Case 6 -- a STRING LITERAL staging somebody else's command line is not an offer, and
+# until #1220 it was silently NOT COUNTED, which is the same number as "does not offer".
+# It is now REFUSED and named. Not hypothetical: `check-tidy-blind-spots-selftest.sh`
+# printf's a fake workflow containing `bash scripts/tidy-sweep.sh --self-test`. Case 5
+# does not cover it -- that line is a comment, and this one is code.
 NewTree("fixture" fixtureDir)
 file(WRITE "${fixtureDir}/scripts/check-arm.sh" "${ARM_BODY}")
 file(WRITE "${fixtureDir}/scripts/check-stage.sh"
     "printf 'jobs:\n  - run: bash scripts/other.sh --self-test\n' > fixture.yml
 ")
 file(WRITE "${fixtureDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
-ExpectVerdict("case 6: a staged fixture string is not an offer" "${fixtureDir}" "pass" "")
+ExpectVerdict("case 6: an unexplained staged command line is REFUSED, not ignored"
+    "${fixtureDir}" "refuse" "check-stage.sh")
+
+# ---------------------------------------------------------------------------
+# Case 6b -- and the same file is ACCEPTED once it says why. This is the direction that
+# goes unwatched: a refusal with no accepting counterpart is a rule nobody can satisfy,
+# and #1031 stood for two days because a guard's passing direction had never been seen.
+NewTree("fixture-marked" markedDir)
+file(WRITE "${markedDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${markedDir}/scripts/check-stage.sh"
+    "# selftest-offer: this stages ANOTHER script's command line into a fixture
+printf 'jobs:\n  - run: bash scripts/other.sh --self-test\n' > fixture.yml
+")
+file(WRITE "${markedDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 6b: a staged command line with a stated reason is accepted"
+    "${markedDir}" "pass" "")
+
+# ---------------------------------------------------------------------------
+# Case 6c -- a marker with no reason is refused. The reason is the forcing function:
+# without one the marker is a way to spell "forgot" that reads as "decided", which is
+# the distinction `RefuseWithoutCounter` exists to keep.
+NewTree("fixture-blank" blankDir)
+file(WRITE "${blankDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${blankDir}/scripts/check-stage.sh"
+    "# selftest-offer:
+printf 'jobs:\n  - run: bash scripts/other.sh --self-test\n' > fixture.yml
+")
+file(WRITE "${blankDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 6c: a marker stating no reason is refused"
+    "${blankDir}" "refuse" "states no reason")
 
 # ---------------------------------------------------------------------------
 # Case 9 -- a registration that has been COMMENTED OUT does not count.
@@ -237,6 +267,106 @@ NewTree("empty" emptyDir)
 file(WRITE "${emptyDir}/src/tests/CMakeLists.txt" "# nothing
 ")
 ExpectVerdict("case 8: an empty scripts directory is refused" "${emptyDir}" "refuse" "pass vacuously")
+
+# ---------------------------------------------------------------------------
+# Case 6d -- the SECOND way a spelling goes unread, and it is a different reachability
+# state from case 6 rather than a second example of it.
+#
+# Case 6's staged line is rejected by the whole-file pre-filter, which never sees a
+# dispatch shape in that file at all. This one PASSES the pre-filter -- a usage banner
+# quotes the flag, so `"--self-test"` is present -- and then no line matches, because
+# nothing compares it against a positional parameter. The two filters disagree, which is
+# exactly the state a NEW dispatch spelling arrives in.
+#
+# It exists because the mutation matrix found the branch unreached: deleting that whole
+# refusal changed no verdict, and a property whose removal costs nothing is either dead
+# code or a case nobody wrote. It was the second.
+NewTree("usage-banner" bannerDir)
+file(WRITE "${bannerDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${bannerDir}/scripts/check-usage.sh"
+    "echo \"usage: pass '--self-test' to drive the cases\"
+")
+file(WRITE "${bannerDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 6d: a quoted flag with no dispatch is REFUSED, not ignored"
+    "${bannerDir}" "refuse" "check-usage.sh")
+
+# ---------------------------------------------------------------------------
+# Case 14 -- the walk reads a WHOLE line, however long, and this is the case that would
+# fail if anyone bounded it to a window.
+#
+# #1168 anticipated a window bound and the check deliberately has none; the line is
+# recovered by an exact REVERSE find rather than by looking back a fixed distance. The
+# two halves of the `positional-comparison` shape are put 3,000 characters apart on ONE
+# line, so recognising it requires the whole line and no part of it.
+#
+# The corpus cannot catch this: 38,188 lines across the scanned scripts, longest 950
+# characters, six over 500 and none over 1,000 -- so any window above about 1 KB would
+# have looked perfect today and been a silent cliff for whoever first wrote a longer
+# line. That is what makes a staged 3,000-character line worth more than the real tree.
+string(REPEAT "x" 3000 longPad)
+NewTree("long-line" longLineDir)
+file(WRITE "${longLineDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${longLineDir}/scripts/check-long.sh"
+    "[ \"\${1:-}\" = \"\$mode\" ] && : \"${longPad}\" && mode=\"--self-test\"
+")
+file(WRITE "${longLineDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"long\" COMMAND bash \"scripts/check-long.sh\" --self-test)
+")
+ExpectVerdict("case 14: a dispatch 3,000 characters into a line is still read"
+    "${longLineDir}" "pass" "")
+
+# ---------------------------------------------------------------------------
+# Case 10 -- a `.cmake` self-test offers by its NAME, and a `-P` registration runs it.
+# This whole family was outside the scan until #1220: it globbed `*.sh` and `*.ps1`
+# only, so 23 `*-selftest.cmake` files -- including this check's own -- were never asked
+# to register. All 23 happened to be registered, which is exactly why the gap was
+# invisible: the check reported clean and was right by luck rather than by reading.
+NewTree("cmake-ok" cmakeOkDir)
+file(WRITE "${cmakeOkDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${cmakeOkDir}/scripts/check-thing-selftest.cmake" "message(STATUS \"x\")
+")
+file(WRITE "${cmakeOkDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"thing\" COMMAND cmake -P \"scripts/check-thing-selftest.cmake\")
+")
+ExpectVerdict("case 10: a registered .cmake self-test is accepted" "${cmakeOkDir}" "pass" "")
+
+# ---------------------------------------------------------------------------
+# Case 11 -- and an unregistered one is refused AND NAMED. This is the case the check
+# could not see at all before #1220.
+NewTree("cmake-missing" cmakeMissingDir)
+file(WRITE "${cmakeMissingDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${cmakeMissingDir}/scripts/check-thing-selftest.cmake" "message(STATUS \"x\")
+")
+file(WRITE "${cmakeMissingDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 11: an unregistered .cmake self-test is refused and NAMED"
+    "${cmakeMissingDir}" "refuse" "check-thing-selftest.cmake")
+
+# ---------------------------------------------------------------------------
+# Case 12 -- naming the file is not running it. The `-P` is the `.cmake` analogue of
+# requiring a shell registration to PASS the flag (case 4): a registration that merely
+# mentions the script satisfies #596's weaker wording and executes nothing.
+NewTree("cmake-noflag" cmakeNoFlagDir)
+file(WRITE "${cmakeNoFlagDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${cmakeNoFlagDir}/scripts/check-thing-selftest.cmake" "message(STATUS \"x\")
+")
+file(WRITE "${cmakeNoFlagDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"thing\" COMMAND cmake \"scripts/check-thing-selftest.cmake\")
+")
+ExpectVerdict("case 12: a .cmake self-test named without -P does not count"
+    "${cmakeNoFlagDir}" "refuse" "check-thing-selftest.cmake")
+
+# ---------------------------------------------------------------------------
+# Case 13 -- the glob-breakage cross-check. The table runs a `*-selftest.cmake` with
+# `-P` and the glob finds none, so two independent sources disagree about whether this
+# tree has any and the GLOB is what broke.
+#
+# It is a cross-check and not a bare "no .cmake self-tests found", because a tree with
+# none is an ordinary tree -- every other case here is one. The first version of this
+# guard required all three populations to be non-empty, which is true of the repository
+# and false of every fixture in this file, and it refused all nine of them.
+NewTree("cmake-glob-broke" cmakeGlobDir)
+file(WRITE "${cmakeGlobDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${cmakeGlobDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"gone\" COMMAND cmake -P \"scripts/check-gone-selftest.cmake\")
+")
+ExpectVerdict("case 13: a table naming .cmake self-tests the glob cannot find is refused"
+    "${cmakeGlobDir}" "refuse" "disagree")
 
 # ---------------------------------------------------------------------------
 if(failures)

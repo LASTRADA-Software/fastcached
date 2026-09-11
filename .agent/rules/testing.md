@@ -796,6 +796,54 @@ sits where everything needing it can include from -- and a fake nobody exercises
 does not report its own bugs, so copies of one drift silently and the drift is
 found by whichever case walks into it.
 
+### A fake that RESOLVES what production SUSPENDS on makes every test over it vacuous
+
+The entry above is about a fake carrying its own bugs into every consumer. This one is
+worse and has the opposite tell: **there is nothing wrong with the fake.** #778.
+
+`InMemorySocket::WaitReadable` resolves immediately in all three directions -- error when
+closed, `0` at EOF, `1` otherwise -- and its header says why, in as many words: *"so no
+caller gains a suspension point it did not have"*. That is a correct in-memory transport
+and a deliberate decision. It simply never enters the state the protocol under test is
+DEFINED by, so every assertion written over it holds for a reason unrelated to the
+property being claimed, **and the suite is green whether the protocol is implemented or
+not.** #710 (`RunBlockingRead` re-arming per iteration) and #755 (a watcher surviving the
+transition out of subscribe mode) both sat behind exactly that green.
+
+So the question to ask of a fake is not *is it correct* but **can it reach the state the
+case is about**. Where it cannot, the case needs a real socket -- `PlatformReactor` /
+`PlatformListener`, cross-platform rather than three copies under three `#if`s, because a
+per-platform test is the shape that cannot see the platforms disagreeing.
+
+**Checked-and-present must not render the same as not-checked**, so the survey records
+both. Suspension-defined properties, and where each is exercised:
+
+<!-- table-total: none -->
+| Property | Real-socket case |
+|---|---|
+| `WaitReadable`: EOF vs data vs error | `Net/WaitReadable_test.cpp`, `PlatformReactor` |
+| Read-slot exclusivity (#663) | `tests/ReadSlotGuardCanary.cpp`, must-die |
+| Reactor frees parked frames at `Stop` | `Async/ParkedWork_test.cpp` |
+| Teardown serialised with dispatch | `tests/ReactorTeardownCanary.cpp` |
+| `Read` refuses an empty buffer (#838) | **deliberately `InMemorySocket`** -- a canary aborts at the FIRST violation, so the other five sites are covered by the `read-buffer-guard` scan instead |
+| `CancelRead` retrieves a parked read | `Net/CancelRead_test.cpp` -- **added by #778; before it, Windows only** |
+
+The last row is what the survey was for. `EpollSocket::CancelRead` and
+`KqueueSocket::CancelRead` are real overrides sharing one `Detail::RetireParkedRead`, and
+their only coverage was `Net/IocpSocket_test.cpp` (Windows) and `Testing::ParkingReadableSocket`
+-- a fake built precisely because the shared one will not park. Neither runs on the legs the
+local gate runs.
+
+**And the fake being more permissive is not the only way this bites -- the real transport can
+be less predictable than the contract's wording.** `CancelRead` is documented *idempotent*,
+which invites *call it twice, the second does nothing*. On epoll and kqueue a completion
+resumes the awaiting coroutine INLINE, so the first call's resumption runs that coroutine on
+to its next `Read` and arms it before the second call executes -- and the second cancels the
+new read. Measured while writing the case above: the read after a double cancel came back
+`Cancelled` rather than its bytes. On IOCP the completion is marshalled to a later turn, so
+the same two lines behave differently again. What is idempotent is a cancel with **nothing
+parked**, which is the arrangement the contract is about.
+
 ### A value from another generation is BUILT by the shared helper, never by hand
 
 `tests/ForeignGenerationValue.hpp` (#649). Four cases across two test binaries need a
@@ -967,6 +1015,63 @@ defects, each shown red at the case that names it. Two of the first drafts' case
 could **not** be made to fail and were rewritten — a forty-draw port test that a
 deleted ledger passed fifteen runs in sixteen, and a `( fail )` subshell case that
 `set -e` was quietly rescuing.
+
+**A background process a fixture starts is bounded by TWO independent arms, and the
+one that can be reopened by omission is the one that has to be structural.** #839
+measured what a missing arm costs: **1368 orphan `perl` listeners holding loopback
+ports, the oldest 30.5 hours old.** The ports were the expensive half rather than the
+load — these fixtures draw from below the ephemeral range, so the next run meets a
+port held by a process nobody knows about and fails somewhere else entirely, which is
+the worst available shape. The arms are `exec` (so the pid a caller holds is the
+PROGRAM and not the subshell bash forks for a backgrounded function — three
+`kill "$listener"` calls here had never worked) and a self-imposed lifetime (because
+no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled CI job, and this
+fixture is in the DEFAULT set on every platform). **Each alone drives a survivor
+count to zero, for a different reason, so a COUNT cannot tell you whether either
+works** — ask the process tree.
+
+`exec` fails LOUDLY when it is forgotten, since the existing `kill` stops working.
+The lifetime does not, so it rides on the thing every stand-in must do anyway:
+`_selftest_bounded_perl <seconds> '<program>' <args...>` owns both, injecting the
+bound as its own `perl -e` chunk so the bodies stay textually distinct — they model
+different things, and concatenating perl program text as strings is the hazard, not
+the fix. There is no argument to pass an unbounded program to, and a bound of `0` is
+refused by name because `alarm 0` is perl's spelling of *cancel*, which would be an
+escape hatch wearing the shape of the guard. This is the `Refuse`-takes-a-row idiom
+(#1214).
+
+**Nothing makes a NEW stand-in go through that door, so the rule is a scan and not a
+comment** (#843). That is #970's finding arriving here: a rule stated in the files
+that obey it reaches no file that does not — and it is not hypothetical, since PR
+#834 added an unbounded listener *while* the ticket about bounds was open with its
+diagnosis written down. `perl-bounds-scan` walks every `*.sh` under `scripts/` and
+refuses any `perl` command position outside the injector, unless the line states
+`# perl-lifetime: <reason>`. Two spellings, two claims, and the marked ones are
+TALLIED and printed on every run, or *decided* and *forgot* are one spelling again.
+It refuses at zero as well: a scan whose subject has left the tree reports every file
+clean, which reads identically to complete coverage. Do not write the naive version —
+`alarm 30` appears in prose in that file, so a token grep is satisfied by a comment;
+it reads through the same declared-region filter the `bash32` and `seconds` scans use,
+and a file that matches its own scan by construction exempts a REGION, never itself.
+And the DOOR is asserted behaviourally in both directions, by exit STATUS and never by
+timing: a 60-second program under a 2-second bound must exit **142** (128 + SIGALRM),
+and a short program under a 30-second bound must exit 0 with its `@ARGV` intact — a
+door that armed nothing would pass the scan, and one that killed everything would pass
+the refusing half alone.
+
+**A cleanup reaps `jobs -pr`, never a pid ledger the call sites append to** (#845).
+A ledger is per-site, so the next background site reopens the leak by forgetting one
+line; there is nothing to forget in the shell's own job table. Two things a conversion
+may not assume, and both are checked by ENUMERATING the background sites rather than
+by argument: `jobs -pr` is per-shell and cannot see a process started *inside* a
+`( ... )` subshell — a backgrounded subshell is itself a job and is fine, its
+grandchildren are not, measured — and `$!` for a backgrounded shell FUNCTION is the
+wrapper. A ledger may still exist for ADDRESSING (`cluster-e2e.sh` keeps a slot-indexed
+one so a case can stop one named node); what it must stop being is the thing cleanup
+depends on. The escalation those fixtures need stays: TERM every job, one shared grace,
+then KILL the survivors. It must never call `fail` and never `wait` before the KILL —
+`fail` re-enters the EXIT trap already firing, and a bare `wait` in cleanup is
+unbounded against exactly the TERM-ignoring child these suites stage on purpose.
 
 ## An in-process fleet, and what a harness has to earn
 
@@ -2101,15 +2206,6 @@ green Linux run is not evidence about it.
   class, and the mechanism adds ~3500 spawns. `src/tests/CatchSkipCanary.cpp` carries
   the shapes it must survive; `catch-skip-exit-collision` asserts the premises so this
   entry cannot rot into a false rule.
-- **[#813](https://github.com/LASTRADA-Software/fastcached/issues/813)** —
-  `launcher-replay-e2e.sh` is the last POSIX fixture that does not source
-  `lib/e2e-common.sh` at all, so its `fail`, `skip` and `note` are private copies.
-  The DEFECT in that `fail` is gone — #627 made the signal unconditional — and
-  what is left is the duplication and the allowlist row in `check-e2e-helpers.sh`
-  that goes with it. Deliberately not folded into #627: the fixture builds three
-  CMake trees and runs a real suite, so converting it cannot be verified in the
-  session that does it, and this is the fixture whose first run anywhere died on
-  the first line that starts a process.
 - **[#1257](https://github.com/LASTRADA-Software/fastcached/issues/1257)** — a
   truncated HTTP response is indistinguishable from a complete one in
   `lib/e2e-common.sh`, and on macOS's bash 3.2 the drain answers the WRONG way
