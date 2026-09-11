@@ -184,6 +184,49 @@ WRAP
 chmod +x "$launcher_wrapper"
 
 # ---------------------------------------------------------------------------
+# The one line of a Catch2 run that says what it did, or a REFUSAL.
+#
+# ## This was two empty strings comparing equal
+#
+# The control suite and the replayed suite are required to agree, and that is the
+# only assertion tying the cache-off build to the cache-on one. It read
+#
+#     grep -E "All tests passed|assertions in" ... | tail -1
+#
+# and **Catch2 prints `All tests passed (N assertions in M test cases)` only when
+# nothing was skipped.** `fastcache-cc-tests` skips one case on any host with no
+# MSVC-family driver -- which is every Linux runner, including the one CI runs
+# this fixture on -- and Catch2 then prints a two-line table instead:
+#
+#     test cases:  708 |  707 passed | 1 skipped
+#     assertions: 3813 | 3813 passed
+#
+# Neither line carries either needle. So both summaries were EMPTY, the note read
+# `control suite: ` with nothing after it, and `[ "" = "" ]` passed. Measured
+# here, on a full run of this fixture: 708 cases, 3813 assertions, one skip, both
+# summaries blank, the agreement announced. The guard could not have failed for
+# the reason it exists, on the platform it runs on, for as long as that skip has
+# been there -- which is this repository's own `two empty lists agree perfectly`,
+# and its own rule that a test asserting what BOTH sides produce is no test.
+#
+# `assertions` is the needle because it is in both shapes and in the failing one
+# (`assertions: N | M passed | K failed`), and the emptiness is REFUSED rather
+# than compared: a summary nobody could read is not an agreement, and that
+# refusal is what stops the next Catch2 output change putting it back.
+#
+# @param 1 the captured suite output
+# @param 2 which build it was, for the refusal
+suite_summary() {
+    local file="$1" which="$2" line=""
+    line="$(grep -E 'assertions' "$file" | tail -1)"
+    [ -n "$line" ] || {
+        tail -20 "$file" >&2
+        fail "the ${which} suite printed no line this fixture can read as a summary, so the agreement between the cached and uncached builds would have been two empty strings comparing equal"
+    }
+    printf '%s' "$line"
+}
+
+# ---------------------------------------------------------------------------
 # One place that knows how to configure and build, so the three builds cannot
 # drift apart in anything but the one variable under test.
 configure_and_build() {
@@ -214,7 +257,7 @@ echo "== control: the same target with no launcher at all"
  configure_and_build "${workdir}/control" OFF "${workdir}/control.build")
 grep -q "LAUNCHER = " "${workdir}/control/build.ninja" \
     && fail "the control build has a compiler launcher configured; it is not a control"
-note "control built, and build.ninja confirms no launcher"
+e2e_note "control built, and build.ninja confirms no launcher"
 
 control_bin="${workdir}/control/target/${target}"
 if [ ! -x "$control_bin" ]; then
@@ -224,8 +267,8 @@ fi
 [ -n "$control_bin" ] && [ -x "$control_bin" ] || fail "the control build produced no ${target} binary"
 "$control_bin" > "${workdir}/control.tests" 2>&1 \
     || { tail -30 "${workdir}/control.tests" >&2; fail "the control suite failed; the source itself is not good"; }
-control_summary="$(grep -E "All tests passed|assertions in" "${workdir}/control.tests" | tail -1)"
-note "control suite: ${control_summary}"
+control_summary="$(suite_summary "${workdir}/control.tests" "control")"
+e2e_note "control suite: ${control_summary}"
 
 echo "== cold: every unit misses, so every object is really compiled and stored"
 configure_and_build "${workdir}/cold" ON "${workdir}/cold.build"
@@ -324,12 +367,12 @@ fi
 [ -n "$warm_bin" ] && [ -x "$warm_bin" ] || fail "the warm build produced no ${target} binary"
 "$warm_bin" > "${workdir}/warm.tests" 2>&1 \
     || { tail -40 "${workdir}/warm.tests" >&2; fail "the suite FAILED on replayed objects while passing on freshly compiled ones -- this is the #319 shape"; }
-warm_summary="$(grep -E "All tests passed|assertions in" "${workdir}/warm.tests" | tail -1)"
-note "replayed suite: ${warm_summary}"
+warm_summary="$(suite_summary "${workdir}/warm.tests" "replayed")"
+e2e_note "replayed suite: ${warm_summary}"
 
 [ "$control_summary" = "$warm_summary" ] \
     || fail "the cached and uncached builds do not agree: control '${control_summary}' vs replayed '${warm_summary}'"
-note "the cached and uncached builds agree"
+e2e_note "the cached and uncached builds agree"
 
 # ---------------------------------------------------------------------------
 if [ "$canary" = "1" ]; then
