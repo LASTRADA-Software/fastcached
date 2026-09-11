@@ -747,7 +747,7 @@ std::vector<std::string> VersionProbeCommand(std::string const& compiler)
     return probe;
 }
 
-std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
+DriverIdentityProbe ProbeDriverIdentity(IProcessRunner& runner, std::string const& compiler)
 {
     auto const probe = VersionProbeCommand(compiler);
 
@@ -806,6 +806,53 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     std::array<EnvironmentAssignment, 1> const english { {
         { .name = "VSLANG", .value = "1033" },
     } };
+
+    // ONE spawn where the driver allows it (#1237): `-###` prints the version line
+    // first and the `-cc1` line below it, so the banner and the target triple come
+    // out of a single call. Measured byte-identical to `--version`'s first line on
+    // clang++-22, clang-22 and clang++-20 -- three builds across two major versions
+    // -- with `-###` exiting 0 on all of them, which matters because a zero exit is
+    // required below and an empty banner IS an identity.
+    //
+    // Keyed on the STEM classification, and that is what makes it sound rather than
+    // merely convenient. `ClassifyCompilerFromBanner` moves a flavour in ONE
+    // direction only, `Gcc` to `Clang`, on positive evidence -- so a driver whose
+    // NAME already says clang cannot be reclassified, and the row read here is the
+    // row the caller reads after the correction. For any other stem the two can
+    // differ, and a triple parsed from the wrong row is a wrong cache key.
+    //
+    // THE CARVE-OUT, deliberate rather than an oversight: `cc` and `c++` name a
+    // policy rather than a product -- on macOS that policy is Apple clang -- so they
+    // classify as `Gcc` here and are corrected only once the banner is in hand. They
+    // therefore keep BOTH spawns, as do `gcc` and `g++`, whose `-###` leads with
+    // `Using built-in specs.` rather than a banner (measured, g++ 14.2.0) and could
+    // not take this path in any case. The optimisation covers the drivers a build
+    // system names explicitly and misses the two policy names.
+    //
+    // `cl` is untouched: its row has no `-###` and no `--version`, because bare `cl`
+    // IS its probe (#195, #200). Driver-awareness must not turn that empty row into
+    // a gap somebody later fills.
+    //
+    // Split capture rather than combined, because `-###` writes all of it to stderr
+    // and stdout stays empty -- the same stream `DiscoverTargetTriple` reads, so what
+    // is handed back is what that function would have gathered itself.
+    if (auto const& driver = DriverOf(ClassifyCompiler(compiler));
+        driver.targetDiscovery == TargetDiscovery::ClangDriverLine)
+    {
+        auto const merged = runner.RunCaptureSplit(ProbeArgv(compiler, driver.targetProbeFlags), english);
+        if (merged.exitCode == 0 && !merged.err.empty())
+        {
+            auto line = merged.err.substr(0, merged.err.find('\n'));
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (!line.empty())
+                return { .banner = std::move(line), .driverOutput = merged.err };
+        }
+        // Falls through to `--version` rather than to the basename: a driver that
+        // would not answer `-###` has said nothing about the question this function
+        // is actually for.
+    }
+
     auto const run = runner.RunCaptureCombined(probe, english);
     if (run.exitCode == 0 && !run.out.empty())
     {
@@ -818,7 +865,7 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
         // and nothing else.
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        return line;
+        return { .banner = std::move(line), .driverOutput = {} };
     }
 
     // NORMALIZED, not the basename as spelled -- and that is the whole point of
@@ -837,7 +884,12 @@ std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
     //
     // Lowercased and de-suffixed exactly as `ClassifyCompiler` does, so "which
     // driver is this" and "what do we call it" cannot disagree about `CL.EXE`.
-    return NormalizedCompilerName(compiler);
+    return { .banner = NormalizedCompilerName(compiler), .driverOutput = {} };
+}
+
+std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler)
+{
+    return ProbeDriverIdentity(runner, compiler).banner;
 }
 
 std::string ToolchainLabel(std::string_view compiler, std::string_view banner)
@@ -1078,7 +1130,7 @@ std::string ParseDriverTargetHeader(std::string_view driverOutput)
     });
 }
 
-std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
+std::string TargetTripleFromDriverOutput(DriverSpec const& spec, std::string_view driverOutput)
 {
     // No `default:`, so a mechanism added to the table fails to compile here rather
     // than silently returning nothing -- which would present as a cache key that had
@@ -1088,24 +1140,36 @@ std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& comp
         case TargetDiscovery::None:
             return {};
 
-        case TargetDiscovery::ClangDriverLine: {
-            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
-            // Read from STDERR, which is where `-###` prints all of it; stdout stays
-            // empty. The exit code is deliberately not consulted, for the reason the
-            // include probe gives: the frontend line is printed before anything that
-            // could fail, and parsing is what decides whether the output is usable.
-            return ParseDriverTargetTriple(run.err);
-        }
+        // Read from whatever the driver printed; the caller says WHERE it came from.
+        // Only which LINE is authoritative differs between these two, and that is the
+        // table's answer rather than this function's.
+        case TargetDiscovery::ClangDriverLine:
+            return ParseDriverTargetTriple(driverOutput);
 
-        case TargetDiscovery::GnuTargetLine: {
-            // The same spawn and the same stream as above; only which line is
-            // authoritative differs, and that is the table's answer rather than this
-            // function's. GCC writes its header to stderr exactly as clang does.
-            auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
-            return ParseDriverTargetHeader(run.err);
-        }
+        case TargetDiscovery::GnuTargetLine:
+            return ParseDriverTargetHeader(driverOutput);
     }
     return {};
+}
+
+std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec)
+{
+    // A driver with no target to state is not spawned at all -- asked BEFORE the
+    // run, because the point of the row is that there is nothing to ask.
+    if (spec.targetDiscovery == TargetDiscovery::None)
+        return {};
+
+    // STDERR, which is where `-###` prints all of it; stdout stays empty. The exit
+    // code is deliberately not consulted, for the reason the include probe gives:
+    // the frontend line is printed before anything that could fail, and parsing is
+    // what decides whether the output is usable.
+    //
+    // The parse is `TargetTripleFromDriverOutput`, so a caller that already holds
+    // this output -- `ProbeDriverIdentity`'s merged probe (#1237) -- reaches the same
+    // answer without a second spawn, and there is no second place deciding which
+    // line is the target.
+    auto const run = runner.RunCaptureSplit(ProbeArgv(compiler, spec.targetProbeFlags));
+    return TargetTripleFromDriverOutput(spec, run.err);
 }
 
 IncludeSearchRoots DiscoverIncludePaths(IProcessRunner& runner,

@@ -5404,3 +5404,77 @@ if(NOT WIN32)
         TIMEOUT 120
     )
 endif()
+
+# The launcher's merged identity probe (#1237): `-###`'s first line must be
+# byte-identical to `--version`'s, on every driver this machine has that the
+# launcher would merge for.
+#
+# **This is what makes a fingerprint bump unnecessary, so it is not a test of
+# #1237's diff and it does not retire with that ticket.** The banner is folded into
+# the cache key and into the toolchain fingerprint a worker advertises, so a driver
+# whose two spellings disagree stops every client matching every worker with no
+# counter moving -- #226's failure mode. The alternative was to bump the fingerprint
+# unconditionally, discarding every stored object to record a change that, if the
+# lines really are identical, did not happen. Checking the property costs a few
+# spawns; assuming it costs a fleet, and paying for it costs every stored object.
+#
+# NO `FAIL_REGULAR_EXPRESSION`, and that is the decision rather than an omission:
+# the verdict channel differs by RUNNER. A `cmake -P` check is judged by its OUTPUT
+# and must carry one; a script behind `run-check.sh` is judged by its EXIT STATUS
+# and must not. Adding one here would make a refusal depend on wording.
+#
+# `SKIP_RETURN_CODE 77` is load-bearing. A host with no such driver cannot answer
+# the question, and that is a third outcome beside pass and fail -- without this
+# property ctest scores the skip as a FAILURE, which is #499's false red. It is the
+# script-driven 77 convention and not the Catch2 `SKIP_RETURN_CODE 4` collision
+# (#1128): a shell script chooses its own exit code, where a Catch2 binary spends
+# its status on the failed-assertion count.
+#
+# TIMEOUT 300 against a measured 3.0 s (WSL2 Ubuntu, 8 clang drivers and 6 GCC scope
+# controls) and 3.4 s (Git Bash, 3 drivers), both 2026-09-11. The margin is for a
+# loaded hosted runner, not for the work.
+#
+# Not guarded by `if(NOT WIN32)`, unlike its POSIX-script neighbours, and that is
+# deliberate: `clang-cl` is one of the two flavors the launcher merges for and it
+# exists essentially only on Windows. Skipping this leg there would take the
+# ClangCl arm out of every run of the check, on the one platform where it lives.
+add_test(
+    NAME "banner-probe-identity"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-banner-probe-identity.sh"
+)
+set_tests_properties("banner-probe-identity" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+
+# The check's own verdicts, driven over staged records, plus its acquisition control.
+#
+# The split exists because ACQUISITION cannot be staged: finding drivers, spawning
+# them and capturing two streams needs a machine with compilers on it, so a check
+# whose verdict logic were reachable only that way would be tested only where it was
+# already going to run. That is `tidy-sweep.sh`'s `CanaryVerdict` argument (#257).
+#
+# Four verdict families, both directions each: the comparison, the name
+# classification (a faithful copy of `ClassifyCompilerImpl`, asserted to accept
+# `clang-format` exactly as production's rule does), this file's own narrower
+# spawn-candidate rule, and the three-state run verdict -- where `RunVerdict 0 0` is
+# `skip` and never `pass`, which is the arm no machine here would ever exercise.
+#
+# And the ACQUISITION CONTROL runs in both modes: two stand-in drivers, one whose
+# spellings differ and one whose spellings agree, through the same capture function
+# the real drivers use. Both arms are needed and they fail in opposite directions.
+# It is not decoration -- the first version of this check word-split driver paths on
+# spaces, spawned twelve nonexistent programs on a box with three compilers,
+# captured two identical "No such file" messages and reported
+# `12 driver(s) checked, 0 differing`. Every arm agreed perfectly, which is what a
+# broken instrument looks like as well as what a real pattern looks like.
+add_test(
+    NAME "banner-probe-identity-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-banner-probe-identity.sh" --self-test
+)
+set_tests_properties("banner-probe-identity-selftest" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)

@@ -183,6 +183,146 @@ struct ToolchainFileScan
 /// @return The banner line, or the basename.
 [[nodiscard]] std::string CompilerBanner(IProcessRunner& runner, std::string const& compiler);
 
+/// What one identity probe learned, so a caller need not spawn the driver twice.
+///
+/// The banner and the target triple are two questions with ONE answer on a clang
+/// driver: `-###` prints the version line first and the `-cc1` line below it. Asking
+/// `--version` and then `-###` is a second spawn per translation unit -- and the
+/// launcher is one process per unit, so that is a second spawn per unit of the whole
+/// build (#1237).
+///
+/// `driverOutput` is empty exactly when the merged probe was NOT taken, which is the
+/// signal a caller needs: it must then discover the target the ordinary way. It is
+/// not a `bool` beside the string, because two fields that can disagree are two
+/// states nothing could describe.
+struct DriverIdentityProbe
+{
+    std::string banner;       ///< The identity line, or the basename fallback.
+    std::string driverOutput; ///< The `-###` output the banner came from; empty otherwise.
+};
+
+/// Ask a driver who it is, in as few spawns as that driver allows.
+///
+/// `CompilerBanner` is this function's `banner` and nothing else, so both ends of the
+/// fleet move together: the compile node folds that same string into its fingerprint,
+/// and two spellings would put every worker permanently out of agreement with every
+/// client -- silently, as a scheduler that simply never matches.
+///
+/// ## Why the saving is worth a branch at all
+///
+/// The launcher is ONE PROCESS PER TRANSLATION UNIT, so a second spawn here is a
+/// second spawn per unit of the whole build rather than a one-off. Measured rather
+/// than assumed: a 5-unit project built through a real `fastcache-cc` produced 5
+/// records in its `invocations.log`, with a positive control on the launcher being
+/// wired (5 `LAUNCHER =` bindings in `build.ninja`; zero would have voided the run).
+/// That is also why memoizing the triple buys nothing -- a within-process memo has
+/// nothing to hit -- and a cross-process one is unsound, `clang-cl` taking
+/// `-fms-compatibility-version` from an MSVC install that can be upgraded beside a
+/// byte-identical driver. This is not a cache: nothing is remembered.
+///
+/// ## What it actually buys, measured end to end on both platforms
+///
+/// Measured 2026-09-11 by running a launcher built BEFORE this change and one built
+/// after against the same translation unit and the same daemon, interleaved A/B so a
+/// drift in machine load cannot be attributed to the change, `time.monotonic`, min
+/// and median of 20 pairs (15 for clang-cl). Pinned rather than pointed at: these
+/// are two machines at one instant.
+///
+///   platform / driver              before      after      saved
+///   ---------------------------- --------- ---------- ----------
+///   Windows 11 NTFS, clang++       34.2 ms    22.4 ms    11.8 ms   (34%)
+///   Windows 11 NTFS, clang-cl      51.8 ms    40.1 ms    11.8 ms   (23%)
+///   WSL2 on DrvFs, clang++ [SLOW] 133.3 ms   112.5 ms    20.8 ms   (16%)
+///
+/// **The third row is a SLOW PATH and must not be differenced against the first
+/// two.** It is a Linux VM reaching a Windows filesystem over DrvFs, where every
+/// per-file operation costs an order of magnitude more than native
+/// (`.agent/rules/`'s DrvFs measurements say 11x-104x), so its absolute numbers
+/// describe that arrangement and nothing else. Read each row against ITSELF: the
+/// saving is one driver spawn on every row, and the rows differ in what a spawn
+/// costs there. Subtracting 22.4 from 112.5 measures the filesystem.
+///
+/// The mechanism is confirmed by COUNT rather than inferred from the clock: a
+/// logging wrapper standing in for the driver recorded **4 compiler spawns before
+/// and 3 after** -- `--version`, the target probe, the preprocess and the compile,
+/// with the first of those gone.
+///
+/// Against ~679 compile edges in this repository's own tree, that DERIVES (not
+/// measures) roughly 8 s per Windows build and 14 s per Linux one.
+///
+/// **#1237 inferred about 20 s per Windows build, and that figure is too high.** It
+/// came from #188's ~40 ms, which is the cost of the target probe rather than of the
+/// `--version` spawn this removes; the removed spawn measures 8.7 ms in isolation
+/// here and ~12 ms inside the launcher. The prize is real and it is about half what
+/// the ticket projected.
+///
+/// One arrangement note, because it cost a wrong answer first: with
+/// `FASTCACHE_ADDR`/`SOURCE_DIR`/`BINARY_DIR` unset the launcher declines before it
+/// probes anything, so both binaries run one spawn and the measured saving is
+/// exactly zero. A timing run that does not set them is measuring a path on which
+/// this code never executes.
+///
+/// ## Why keying on the STEM is sound rather than merely convenient
+///
+/// `ClassifyCompilerFromBanner` moves a flavour in ONE direction only -- `Gcc` to
+/// `Clang`, on positive evidence. So a driver whose NAME already says clang cannot be
+/// reclassified, and the row read here, before the banner is known, is the row the
+/// caller reads after the correction. A triple parsed from the wrong row is a wrong
+/// cache key, and that one-directional property is what rules it out.
+///
+/// It is also what GENERATES the `cc`/`c++` carve-out, rather than that being a
+/// separate rule to remember: those two name a policy rather than a product -- on
+/// macOS, Apple clang -- so they classify as `Gcc` here and keep both spawns. `gcc`
+/// and `g++` keep them too, their `-###` leading with `Using built-in specs.` rather
+/// than a banner (measured, g++ 14.2.0). `cl` has neither flag and is untouched.
+///
+/// ## The identity is CHECKED, which is why no fingerprint bump rides with this
+///
+/// Measured 2026-09-11 byte-identical to `--version`'s first line on seven drivers
+/// over two hosts and three clang builds -- clang, clang++ and clang-cl from VS 18's
+/// LLVM 22.1.3; clang and clang++ from Ubuntu's 20.1.2; clang-22 and clang++-22 from
+/// Ubuntu's 22.1.8 -- with `-###` exiting 0 on all seven, which is load-bearing
+/// because the fallback below requires a zero exit and an empty banner IS an
+/// identity. GCC discriminates the measurement rather than passing it: g++ 14.2.0's
+/// `-###` leads with `Using built-in specs.`, so a comparison that could not tell the
+/// two apart would have been visible.
+///
+/// Asserted ACROSS THE CHANGE as well, which is the question the comparison above
+/// does not answer: the launcher's own `--print-toolchain-fingerprint`, run from a
+/// binary built before this change and one built after, over 11 drivers on one host
+/// (2026-09-11, Release, `USE_COMPILER_CACHE=OFF`, both binaries from the same
+/// tree). **11 identical, 0 differing** -- 8 clang-family and, as the arm that must
+/// not move because it takes no merged path at all, gcc, g++ and gcc-13.
+///
+/// Three controls, because that table is worthless if the measurement cannot see a
+/// difference:
+///
+///   * DETERMINISM -- the before binary against itself, twice per driver: stable.
+///   * DISCRIMINATION -- the 11 rows carry 5 distinct fingerprints, so the
+///     comparison is not reporting one constant.
+///   * SENSITIVITY TO THE BANNER, which is the one that matters. A stand-in that is
+///     `clang-22` in every respect except that it doctors the first line of
+///     `--version`, passing `-###` through: the BEFORE binary moves from
+///     `347f188d...` to `368004917...`, so the banner really is folded into the
+///     fingerprint; the AFTER binary reads `-###` and answers `347f188d...`, the
+///     real one. That third reading is also the failure mode drawn in miniature --
+///     when the two spellings disagree, the fingerprint moves.
+///
+/// Eleven drivers on one host is not a fleet, so the property is not left as an
+/// assumption. `scripts/check-banner-probe-identity.sh` asks it of every merged-path
+/// driver on whatever machine runs the suite, skipping-and-naming where there is
+/// none. **That check is what stands in for the bump.** Bumping unconditionally
+/// would discard every stored object to record a change that -- if the lines really
+/// are identical -- did not happen; the check costs a few spawns and turns the
+/// remaining doubt into a red build on the first platform that breaks it. A driver
+/// found disagreeing is the finding that reopens the bump question, and it goes to
+/// whoever owns the fleet rather than being absorbed by adjusting the check.
+///
+/// @param runner Process-spawning seam.
+/// @param compiler The compiler to ask.
+/// @return The banner, and the driver output it came from when the two were merged.
+[[nodiscard]] DriverIdentityProbe ProbeDriverIdentity(IProcessRunner& runner, std::string const& compiler);
+
 /// A short, readable name for a compiler: what it is, and which version.
 ///
 /// The fingerprint is the right IDENTITY and the wrong label. It stopped being
@@ -421,6 +561,18 @@ struct IncludeSearchRoots
 /// @return Its target triple; empty when this driver has none to state or would not
 ///         say.
 [[nodiscard]] std::string DiscoverTargetTriple(IProcessRunner& runner, std::string const& compiler, DriverSpec const& spec);
+
+/// Read a target triple out of driver output already in hand.
+///
+/// The half of `DiscoverTargetTriple` that does not spawn, so a caller holding the
+/// `-###` output from `ProbeDriverIdentity` reaches the same answer without asking
+/// the driver a second time. Which line is authoritative stays the TABLE's answer
+/// rather than the caller's -- there is no second place that decides it.
+///
+/// @param spec The driver's table row.
+/// @param driverOutput What the driver printed, as `DriverIdentityProbe::driverOutput`.
+/// @return Its target triple; empty when this driver has none to state.
+[[nodiscard]] std::string TargetTripleFromDriverOutput(DriverSpec const& spec, std::string_view driverOutput);
 
 /// Ask a driver where it searches for system headers.
 ///

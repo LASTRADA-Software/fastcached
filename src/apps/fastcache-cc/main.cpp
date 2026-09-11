@@ -2426,7 +2426,14 @@ void RecordManifest(InvocationRecord const& record,
         Cc::RelativizeArgs(argv.subspan(1), cfg.srcRoot, cfg.buildTree, [&reconciler](std::string_view path) {
             return reconciler.Directory(path);
         });
-    auto const compilerBanner = CompilerId(cmd.compiler);
+    // ONE probe for two questions where the driver allows it (#1237). The banner
+    // and the target triple both come out of a clang driver's `-###`, and this is
+    // a process per translation unit, so a second spawn here is a second spawn per
+    // unit of the whole build. `driverOutput` is empty when the merge did not
+    // happen -- `cc`, `c++`, `gcc`, `g++`, `cl` -- and the target is then
+    // discovered the ordinary way below.
+    auto const identity = Cc::ProbeDriverIdentity(ProcessRunner(), cmd.compiler);
+    auto const compilerBanner = identity.banner;
 
     // `cc` and `c++` name a policy rather than a product, and on macOS that policy
     // resolves to Apple clang -- CMake's default C++ compiler there. Classified by
@@ -2455,7 +2462,15 @@ void RecordManifest(InvocationRecord const& record,
     // triple goes stale in the one direction that yields a WRONG HIT rather than a
     // miss. Only a driver with no target at all (`cl`) is left unspawned; `gcc` pays
     // it too, because its target is keyed even though it can never be stated.
-    auto const targetTriple = Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, driver);
+    // Reused rather than re-spawned when the identity probe already gathered it.
+    // Sound because the row cannot have moved: `ClassifyCompilerFromBanner` only
+    // ever promotes `Gcc` to `Clang`, so a driver classified clang by NAME -- the
+    // only kind that takes the merged probe -- reads the same row before and after
+    // the correction. `TargetTripleFromDriverOutput` takes the row rather than
+    // assuming one, so the table stays the authority either way.
+    auto const targetTriple = identity.driverOutput.empty()
+                                  ? Cc::DiscoverTargetTriple(ProcessRunner(), cmd.compiler, driver)
+                                  : Cc::TargetTripleFromDriverOutput(driver, identity.driverOutput);
 
     // Said out loud, because the failing-open story has a hole and this is the only
     // place it is visible. An empty answer on ONE end is a miss -- the two sides key

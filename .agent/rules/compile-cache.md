@@ -196,6 +196,38 @@ same on both — the same defect with no MSVC anywhere near it.
   the flavour *after* the line is parsed is safe only because the `gcc` and `clang`
   rows agree on every column the parse reads; a test asserts that, and if it ever
   fails the correction has to move above `ParseCommand`.
+- **The banner and the triple come from ONE `-###` spawn on a `ClangDriverLine`
+  driver, and that is safe only because a CHECK says so.** The launcher is one
+  process per translation unit, so the second probe was a second spawn per unit of
+  the whole build — measured 34.2 ms down to 22.4 ms per unit on Windows/clang++
+  and 51.8 to 40.1 on clang-cl, both native NTFS; 133.3 to 112.5 on WSL2 over
+  **DrvFs, which is a SLOW PATH and must not be differenced against the NTFS rows**
+  — every per-file operation there costs an order of magnitude more, so read each
+  row against itself. The saving is one driver spawn everywhere; what differs is
+  what a spawn costs. Confirmed by COUNT (4 compiler spawns before, 3 after) rather
+  than left to a clock, which matters on a host that steps its wall clock. It is not a
+  cache: nothing is remembered, so no staleness enters. GCC keeps both spawns (its
+  `-###` leads with `Using built-in specs.`), `cl` has neither flag, and `cc`/`c++`
+  classify as `Gcc` BY NAME so they keep both too — `ProbeDriverIdentity` dispatches
+  before any banner exists to correct it with, which is the same ordering the bullet
+  above turns on.
+  - **No fingerprint bump rides with it, and `banner-probe-identity` is what pays
+    for that.** The banner reaches `ComputeKey`, `ComputeManifestKey` and
+    `ComputeToolchainFingerprint`, so a driver whose `-###` first line is not its
+    `--version` first line puts every client permanently out of agreement with every
+    worker — #226's failure mode, silent, no counter moving. Bumping unconditionally
+    would discard every stored object to record a change that, if the lines are
+    identical, did not happen; so the property is CHECKED on every machine that runs
+    the suite instead, skipped-and-named where no such driver exists. **Deleting that
+    check does not simplify anything — it reopens the bump question in silence.** A
+    driver found disagreeing is a finding for whoever owns the fleet, never something
+    to absorb by adjusting the check.
+  - Its candidate rule is NARROWER than `ClassifyCompilerImpl`'s, deliberately and
+    with a stated cost: an exact stem plus a `-<digit>` suffix. Production's rule
+    accepts anything after a `-`, which classifies `clang-format` and `clang-tidy` as
+    Clang — measured, both exit 1 on `-###` while every real driver exits 0, so the
+    merge condition excludes them anyway. What the narrowing gives up is a real
+    merged-path driver under an unguessable name; `clang-cpp` is the in-tree example.
 - **The two halves are framed, not concatenated.** `("ab", "c")` and `("a", "bc")`
   would otherwise key alike. A newline separates them because a banner is one line
   by construction and a triple is `[A-Za-z0-9._-]`, so neither half can contain it.
@@ -2219,19 +2251,6 @@ with current truth at the moment the staleness would otherwise have done harm.
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
   DIAGNOSTIC can also end in a known dependency path.
-- **[#1237](https://github.com/LASTRADA-Software/fastcached/issues/1237)** — the
-  target-triple probe costs a driver spawn per translation unit on clang and
-  clang-cl, hits included, because its answer is a cache key input. What is open is
-  taking the banner and the triple from ONE `-###` spawn on `ClangDriverLine`
-  drivers: GCC's `-###` does not lead with the banner and `cl` has neither flag, so
-  both keep two spawns, and `cc`/`c++` resolve provisionally to GCC so they keep them
-  too. **That is not a cache, and the distinction is the whole reason it is the open
-  route**: nothing is remembered, so no staleness is introduced. Memoizing IS unsound
-  — the launcher is one process per translation unit, so a within-process memo has
-  nothing to hit, and a cross-process one keyed on the compiler binary cannot cover
-  `clang-cl`, whose triple moves when the MSVC beside it is upgraded, making a stale
-  value a wrong hit rather than a miss. #188 established that and is closed as
-  investigated; only the spawn count is still open.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

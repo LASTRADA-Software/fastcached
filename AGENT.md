@@ -225,6 +225,15 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - `cc` and `c++` name a policy, not a product — on macOS that is Apple clang — so
   the banner corrects the name. It must never reclassify `clang-cl`, whose banner
   is plain clang's.
+- The banner and the target triple come from ONE `-###` spawn on a `ClangDriverLine`
+  driver (one process per TU, so the second probe cost a spawn per unit: 34.2 ms to
+  22.4 on Windows/clang++, confirmed by count, 4 spawns to 3). GCC keeps both — its
+  `-###` leads with `Using built-in specs.` — `cl` has neither flag, and `cc`/`c++`
+  keep both because they classify as `Gcc` BY NAME and the probe dispatches before a
+  banner exists to correct that. **No fingerprint bump rides with it because
+  `ctest -R banner-probe-identity` asserts the two spellings are byte-identical on
+  every driver the machine has; deleting that check reopens the bump question in
+  silence**, and a driver found disagreeing is a finding, not a check to adjust.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in
   the console output code page. Decoded at `RootReconciler::Path`, or the compile is
   not cached.
