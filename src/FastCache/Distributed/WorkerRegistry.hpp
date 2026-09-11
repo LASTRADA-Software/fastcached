@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -124,6 +125,44 @@ struct WorkerReport
 {
     WorkerInfo info;                           ///< What the worker said about itself.
     std::chrono::milliseconds heartbeatAge {}; ///< Since it registered or last heartbeat.
+
+    /// Since this entry ENTERED the registry.
+    ///
+    /// Not the same question as `heartbeatAge`, which a live worker keeps small by
+    /// definition -- that one says "is it still there", and this one says "how long
+    /// has it been there". It exists for `lastPickedAge` below: an entry nothing has
+    /// ever been sent to is a **finding** at forty minutes and says nothing at all at
+    /// one second, and without this the two render identically.
+    ///
+    /// A re-registration does **not** restart it, which is deliberate and is the
+    /// opposite of what `Register` does to `inFlight` and `load`. Re-registering is
+    /// not a restart: a node falls through to it after any refused heartbeat, so
+    /// restarting this clock would destroy the forty minutes of evidence on a
+    /// transient. An entry that genuinely lapses is erased and returns as a new one
+    /// with this fresh, which is the distinction the registry can actually make.
+    std::chrono::milliseconds registeredAge {};
+
+    /// Since the scheduler last chose this entry, or absent if it never has.
+    ///
+    /// **Absent is not zero**, and here the two are opposite claims: zero says a job
+    /// went to this worker just now, and a worker nothing has ever been sent to has
+    /// no such instant to report. That is the whole signal
+    /// ([#1297](https://github.com/LASTRADA-Software/fastcached/issues/1297)) -- a
+    /// worker whose toolchain the scheduler never selects registers, heartbeats and
+    /// reads healthy from every angle, because nothing arrives to be refused and so
+    /// no counter on either machine moves. Rendered as an absence at the CELL rather
+    /// than flattened, for the reason every `optional` on `NodeLoad` is.
+    ///
+    /// Per ENTRY, which is the point rather than an implementation detail: the
+    /// failure being reported is one toolchain never being selected, and a machine
+    /// serving two is two entries. A machine-wide record -- what `JobStarted` keeps,
+    /// deliberately -- would mark the unused toolchain as picked the moment a job ran
+    /// on the used one, which is precisely the state this must be able to see.
+    ///
+    /// A duration rather than the `TimePoint` it came from, for the reason stated on
+    /// this struct: handed an instant, a consumer subtracts `steady_clock::now()`,
+    /// which is right in production and silently wrong under every `ManualClock`.
+    std::optional<std::chrono::milliseconds> lastPickedAge {};
 };
 
 /// One live MACHINE, grouped as an operator means "node".
@@ -331,12 +370,28 @@ class WorkerRegistry
     /// Pick the least-loaded live worker whose fingerprint matches exactly.
     ///
     /// Does **not** reserve the slot: the caller pairs this with a lease, and the
-    /// lease is what accounts for the slot. Separating them keeps this function a
-    /// pure query over the fleet, and keeps the accounting in the one place that
-    /// also knows how to expire it.
+    /// lease is what accounts for the slot. Separating them keeps the accounting in
+    /// the one place that also knows how to expire it.
+    ///
+    /// **Not a pure query, and that is deliberate.** It stamps the chosen entry's
+    /// `lastPickedAt`, which is the one record of the fleet's selection behaviour
+    /// this registry keeps
+    /// ([#1297](https://github.com/LASTRADA-Software/fastcached/issues/1297)). It is
+    /// folded into the selection rather than left beside it -- in the scheduler's
+    /// lease path, say -- so that a second caller of `Pick` cannot record nothing by
+    /// omission: there is no separate line to forget. The guard rides on something
+    /// the operation must do anyway, which is the shape `ClaimReadSlot` already uses
+    /// one layer down.
+    ///
+    /// A REFUSAL stamps nothing, on any of the three arms. It has to be that way or
+    /// the field answers a different question than its name: a fingerprint every
+    /// worker refused for want of capacity would read as picked, and the toolchain
+    /// nobody ever asks for -- the one case this exists to find -- would still be the
+    /// only absence. What is recorded is *this entry was chosen*, never *somebody
+    /// asked about this toolchain*.
     /// @param fingerprint The toolchain the client is compiling with.
     /// @return The chosen worker, or why none could be chosen.
-    [[nodiscard]] std::expected<WorkerInfo, PickError> Pick(std::string_view fingerprint) const;
+    [[nodiscard]] std::expected<WorkerInfo, PickError> Pick(std::string_view fingerprint);
 
     /// Note that a job has been dispatched to a worker.
     ///
@@ -439,6 +494,21 @@ class WorkerRegistry
     {
         WorkerInfo info;
         TimePoint lastSeen {};
+        /// When this entry entered the registry. See `WorkerReport::registeredAge`.
+        ///
+        /// Written once, at insertion. `Register` does not refresh it on an entry it
+        /// finds, because that path is not a restart -- see the comment there.
+        TimePoint registeredAt {};
+        /// When `Pick` last chose it; disengaged until it has been chosen once.
+        ///
+        /// Survives a re-registration: it is the LEADER's record of its own choices,
+        /// and nothing a worker does changes what the scheduler did.
+        ///
+        /// An `optional` rather than a sentinel instant, because *never* is a state
+        /// and not an old reading: a default-constructed `TimePoint` under a
+        /// `ManualClock` that has not been advanced is indistinguishable from "picked
+        /// at the very start", and the two say opposite things.
+        std::optional<TimePoint> lastPickedAt {};
     };
 
     /// Whether `entry` has been heard from recently enough to dispatch to.

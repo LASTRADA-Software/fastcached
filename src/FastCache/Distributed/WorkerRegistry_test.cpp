@@ -761,3 +761,220 @@ TEST_CASE("A node too old to report a version leaves it empty", "[distributed][r
     // for it is the renderer's decision, and it renders as the page's dash.
     CHECK(reports[0].version.empty());
 }
+
+// ---------------------------------------------------------------------------
+// #1297: a worker that registered and is never chosen has no signal anywhere.
+//
+// The shape is #226's: one driver family fingerprints differently from the
+// clients', so the scheduler never selects it, so NOTHING ARRIVES to be refused --
+// and a refusal is the only thing either machine counts. Every reading on both ends
+// stays healthy. The registry is the one place that knows a selection happened, so
+// it is the one place the absence of one can be recorded.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A registry whose workers do not expire while a case advances the clock by minutes.
+///
+/// `Fixture` above times a worker out after one second, which is right for the
+/// expiry cases it was written for and wrong for these: the fact under test is an
+/// entry that has been sitting registered and unchosen for a long time, and it has to
+/// still be IN the registry to report anything at all. Under the shorter timeout
+/// these cases do not fail at the property -- the reports come back EMPTY and the
+/// assertions are about a worker that is no longer there.
+struct AgeFixture
+{
+    ManualClock clock;
+    WorkerRegistry registry { clock, std::chrono::hours { 1 } };
+};
+
+} // namespace
+
+TEST_CASE("A worker nothing has been sent to reports no last-picked age", "[distributed][registry][lastpicked]")
+{
+    AgeFixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    fix.clock.Advance(std::chrono::milliseconds { 2'400'000 });
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    // ABSENT, never zero. The two are opposite claims: zero says a job went here a
+    // moment ago, which is the healthiest reading there is, and it would be printed
+    // for the worker in the worst state in the fleet.
+    CHECK_FALSE(reports[0].lastPickedAge.has_value());
+    // The other half of the one-line answer. Without it an absence above cannot be
+    // told from a node that came up a second ago, and "registered 40 minutes, never
+    // picked" is the sentence this pair exists to render.
+    CHECK(reports[0].registeredAge == std::chrono::milliseconds { 2'400'000 });
+}
+
+TEST_CASE("Picking a worker records when it was picked", "[distributed][registry][lastpicked]")
+{
+    AgeFixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    REQUIRE(fix.registry.Pick(Gcc13).has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 2'000 });
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    REQUIRE(reports[0].lastPickedAge.has_value());
+    // The VALUE, not merely that one arrived: measured from the pick rather than
+    // from the registration five seconds before it. An age anchored on the wrong
+    // instant is present, plausible and wrong, which is the failure a
+    // `has_value()`-only assertion cannot see.
+    CHECK(Unwrap(reports[0].lastPickedAge) == std::chrono::milliseconds { 2'000 });
+    CHECK(reports[0].registeredAge == std::chrono::milliseconds { 7'000 });
+}
+
+TEST_CASE("Choosing one of a machine's toolchains leaves the other never picked", "[distributed][registry][lastpicked]")
+{
+    // The case the whole grain exists for, and the one that separates a per-ENTRY
+    // record from the tempting per-machine one. `JobStarted` deliberately moves
+    // every entry sharing an endpoint, because a job occupies the machine -- so a
+    // pick recorded there, or recorded across siblings here, would mark the unused
+    // toolchain as reached the instant a job ran on the used one. That is exactly
+    // the state #1297 exists to make visible, so it would be erased by the fix.
+    AgeFixture fix;
+    auto const used = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    auto const unused = fix.registry.Register(Announce(Gcc14, "10.0.0.1:6676", 4));
+
+    fix.clock.Advance(std::chrono::milliseconds { 1'000 });
+    auto const picked = fix.registry.Pick(Gcc13);
+    REQUIRE(picked.has_value());
+    CHECK(picked->id == used);
+    // Exactly what the scheduler does next, so the machine-wide accounting is live
+    // rather than assumed absent: if it touched the pick record this would pass for
+    // the wrong reason and the assertion below would be vacuous.
+    fix.registry.JobStarted(picked->id);
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 2);
+    std::optional<std::chrono::milliseconds> usedAge;
+    std::optional<std::chrono::milliseconds> unusedAge;
+    bool sawUsed = false;
+    bool sawUnused = false;
+    for (auto const& report: reports)
+    {
+        if (report.info.id == used)
+        {
+            sawUsed = true;
+            usedAge = report.lastPickedAge;
+        }
+        if (report.info.id == unused)
+        {
+            sawUnused = true;
+            unusedAge = report.lastPickedAge;
+        }
+    }
+    REQUIRE(sawUsed);
+    REQUIRE(sawUnused);
+    CHECK(usedAge.has_value());
+    CHECK_FALSE(unusedAge.has_value());
+    // And the machine-wide count DID move on both, which is what makes the split
+    // above a real one rather than an artefact of nothing having happened.
+    for (auto const& report: reports)
+        CHECK(report.info.inFlight == 1);
+}
+
+TEST_CASE("A refusal records no pick on anybody", "[distributed][registry][lastpicked]")
+{
+    // What is recorded is *this entry was chosen*, never *somebody asked about this
+    // toolchain*. Stamping on the way in would make a fingerprint every worker
+    // refused read as picked, and leave the toolchain nobody ever asks for -- the
+    // one case this exists to find -- as the only absence left.
+    AgeFixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 1));
+    // Full, so the fleet has this toolchain and cannot take the job.
+    CHECK(fix.registry.Heartbeat(id, Busy(1)).has_value());
+
+    CHECK(fix.registry.Pick(Gcc13).error() == PickError::NoCapacity);
+    CHECK(fix.registry.Pick(Gcc14).error() == PickError::NoWorker);
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    CHECK_FALSE(reports[0].lastPickedAge.has_value());
+}
+
+TEST_CASE("Re-registering keeps a worker's pick record and its registration age", "[distributed][registry][lastpicked]")
+{
+    // Re-registration is NOT a restart, which is the whole reason this case exists.
+    // `NodeAnnounce::AnnounceOnce` falls through from a failed `Heartbeat` straight
+    // to `Register` in the same round, so any refused heartbeat -- `EndpointBusy`, or
+    // `NotLeader` during an election -- takes this path on a machine that never went
+    // away. `SchedulerService::Register` already says so where it declines to release
+    // leases on this path.
+    //
+    // Clearing here would therefore destroy the finding on a transient: an entry
+    // reading "registered 40 minutes, never picked" would drop to "registered 0
+    // seconds, never picked", which says nothing, and every entry that HAD been
+    // picked would momentarily read never-picked and push the fleet count above zero
+    // on a healthy building fleet. `inFlight` and `load` are reset on this path
+    // because the next heartbeat corrects them; these two have no corrective.
+    AgeFixture fix;
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    REQUIRE(fix.registry.Pick(Gcc13).has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 3'000 });
+
+    auto const before = fix.registry.LiveWorkerReports();
+    REQUIRE(before.size() == 1);
+    // A control: the record IS populated, so the assertions below are about it
+    // SURVIVING rather than about a field that was never written.
+    REQUIRE(Unwrap(before[0].lastPickedAge) == std::chrono::milliseconds { 3'000 });
+    REQUIRE(before[0].registeredAge == std::chrono::milliseconds { 3'000 });
+
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    fix.clock.Advance(std::chrono::milliseconds { 1'000 });
+
+    auto const after = fix.registry.LiveWorkerReports();
+    REQUIRE(after.size() == 1);
+    // Both keep counting from where they were, rather than from the re-registration.
+    REQUIRE(after[0].lastPickedAge.has_value());
+    CHECK(Unwrap(after[0].lastPickedAge) == std::chrono::milliseconds { 4'000 });
+    CHECK(after[0].registeredAge == std::chrono::milliseconds { 4'000 });
+    // And the fields that SHOULD be reset on this path still are, so this case
+    // pins the difference between the two groups rather than freezing the whole
+    // re-registration path.
+    CHECK(after[0].info.inFlight == 0);
+}
+
+TEST_CASE("An entry that expires and comes back is a new registration", "[distributed][registry][lastpicked]")
+{
+    // The other half of the rule above, and what makes keeping the record safe: the
+    // registry does draw the restart distinction, on the one piece of evidence it
+    // has. An entry that lapses is ERASED, so what returns is genuinely new and
+    // starts with no pick recorded and a registration age of zero.
+    Fixture fix; // The short heartbeat timeout, because this case is about expiry.
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    REQUIRE(fix.registry.Pick(Gcc13).has_value());
+
+    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    CHECK(fix.registry.ExpireStale().size() == 1);
+
+    (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    CHECK_FALSE(reports[0].lastPickedAge.has_value());
+    CHECK(reports[0].registeredAge == std::chrono::milliseconds { 0 });
+}
+
+TEST_CASE("A registration age counts from the registration, not from the last heartbeat",
+          "[distributed][registry][lastpicked]")
+{
+    // The two ages answer different questions and a live worker keeps the heartbeat
+    // one small by definition, so deriving this from `lastSeen` would make it agree
+    // with `heartbeatAge` forever -- present, plausible, and unable to say whether
+    // an entry has been sitting unpicked for forty minutes or forty milliseconds.
+    AgeFixture fix;
+    auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
+    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    CHECK(fix.registry.Heartbeat(id, Busy(0)).has_value());
+    fix.clock.Advance(std::chrono::milliseconds { 900 });
+
+    auto const reports = fix.registry.LiveWorkerReports();
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].heartbeatAge == std::chrono::milliseconds { 900 });
+    CHECK(reports[0].registeredAge == std::chrono::milliseconds { 5'900 });
+}
