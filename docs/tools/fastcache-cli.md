@@ -139,10 +139,16 @@ running no admin surface, one serving it over TLS this client cannot speak, and 
 naming the port already being talked `0xFC` to are each refused **by name** — none of
 them is "the fleet is down".
 
+`kpi` is one of the sections, and it is the one that is not a row table: the page's
+headline strip, one line per figure, keyed by a name rather than by a page label. What
+it carries is the number and its scale — never `/ 32 slots`, which a reader would have
+to parse a figure back out of.
+
 The section is required, and the reason is the unit: this verb's answer is one table,
-and the whole document is five of them behind markers. A default would silently pick
-one of the five. A wrong guess is refused by the leader with the accepted keys and what
-each holds, and that refusal is relayed verbatim:
+and the whole document is every section behind a marker. A default would silently pick
+one of them. (No count is written here on purpose — the set grew by one at `kpi` and a
+number in this paragraph would now be wrong.) A wrong guess is refused by the leader
+with the accepted keys and what each holds, and that refusal is relayed verbatim:
 
 ```console
 $ fastcache-cli fleet worker --addr=10.0.0.7:6674

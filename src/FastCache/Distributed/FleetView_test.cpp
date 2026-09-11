@@ -159,12 +159,12 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     snapshot.tiersPresent[MemoryIndex] = true;
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     // The third walk over the same tables (#1300). Asserted HERE beside the other
     // two rather than in a case of its own: the property is that one table feeds
     // all three, and three separate cases could each pass while the renderings
     // named different columns.
-    auto const text = RenderFleetText(snapshot, std::nullopt);
+    auto const text = RenderFleetText(snapshot, NoHistory(), std::nullopt);
 
     // Derived from the tables through `FleetColumnNames`, never written out. The four
     // braced lists that used to stand here sat directly under the paragraph above
@@ -179,6 +179,7 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     // complete coverage.
     REQUIRE_FALSE(FleetSectionTable.empty());
     std::size_t checked = 0;
+    std::size_t tabularSections = 0;
     std::map<std::string, std::size_t> sectionsNaming;
     for (auto const& row: FleetSectionTable)
     {
@@ -192,16 +193,25 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
         // The section's OWN text, not the whole document. Attribution is half the
         // property: `endpoint` is a column of four different sections, so a
         // whole-document search says one of them carries it and cannot say which.
-        auto const sectionText = RenderFleetText(snapshot, row.section);
+        auto const sectionText = RenderFleetText(snapshot, NoHistory(), row.section);
 
         for (auto const& name: names)
         {
             INFO("column " << name);
             CHECK(sectionText.contains(name));
             CHECK(text.contains(name));
-            ++sectionsNaming[name];
+            // Only a TABULAR section's column names are also page headers and JSON
+            // keys. `kpi` is one value per named figure: the page draws a strip with
+            // no `<th>` anywhere and the JSON keys by figure, so its four text columns
+            // are real and reach neither. Read off the table rather than special-cased
+            // here, so a section wrongly marked is caught by the two assertions below
+            // rather than waved through by a name this loop happens to skip.
+            if (row.tabular)
+                ++sectionsNaming[name];
             ++checked;
         }
+        if (row.tabular)
+            ++tabularSections;
     }
 
     // The page and the JSON are ONE document each, with no per-section door to render
@@ -212,10 +222,19 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     // emits its own.
     for (auto const& [name, sections]: sectionsNaming)
     {
-        INFO("column " << name << " is named by " << sections << " section(s)");
+        INFO("column " << name << " is named by " << sections << " tabular section(s)");
         CHECK(CountOccurrences(html, std::string { ">" } + name + "</th>") >= sections);
         CHECK(CountOccurrences(json, std::string { "\"" } + name + "\":") >= sections);
     }
+
+    // Both directions of the `tabular` column, because a `false` that should be `true`
+    // would silently drop a whole section out of the two loops above -- the exemption
+    // reading as coverage, one level up from what this case is about. There is at
+    // least one of each, and the strip is the one that is not a table.
+    CHECK(tabularSections > 0);
+    CHECK(tabularSections < FleetSectionTable.size());
+    CHECK_FALSE(FleetSectionTable[static_cast<std::size_t>(FleetSection::Kpi)].tabular);
+    CHECK(FleetSectionTable[static_cast<std::size_t>(FleetSection::Machines)].tabular);
 
     // Stated so a run says how much it covered: a derivation that started returning
     // nothing would satisfy every assertion above by making none.
@@ -254,7 +273,7 @@ TEST_CASE("Outstanding leases are listed, and the truncation is visible", "[dist
                                                   .age = std::chrono::milliseconds { 1000 } } };
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
 
     CHECK(html.contains("Leases outstanding"));
     CHECK(html.contains("the 2 oldest of 200"));
@@ -292,7 +311,7 @@ TEST_CASE("A lease whose worker has gone renders an absence, not a blank", "[dis
     snapshot.outstandingLeases = { LeaseHolding {
         .key = "orphan", .workerId = "w9", .workerEndpoint = {}, .age = std::chrono::milliseconds { 1000 } } };
 
-    CHECK(RenderFleetJson(snapshot).contains(R"("endpoint":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("endpoint":null)"));
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains("&ndash;"));
 }
 
@@ -303,7 +322,7 @@ TEST_CASE("A fleet holding no leases renders an empty table, not a broken one", 
     snapshot.outstandingLeases = {};
 
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 10).contains("(none)"));
-    CHECK(RenderFleetJson(snapshot).contains(R"("leases-outstanding-oldest":[])"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("leases-outstanding-oldest":[])"));
 }
 
 TEST_CASE("A lease age is not a heartbeat age, and is not coloured like one", "[distributed][fleetview]")
@@ -352,7 +371,7 @@ TEST_CASE("A number nobody reported renders as an absence, never as a zero", "[d
     snapshot.nodes[0].load = Busy(1); // no CPU, no memory, no scratch reading
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
 
     CHECK(json.contains(R"("cores":null)"));
     CHECK(json.contains(R"("memory":null)"));
@@ -372,11 +391,11 @@ TEST_CASE("A cache serving no reads has no hit rate rather than a rate of zero",
     auto snapshot = LeadingSnapshot();
     snapshot.nodes[0].load.cache.hits = 0;
     snapshot.nodes[0].load.cache.misses = 0;
-    CHECK(RenderFleetJson(snapshot).contains(R"("cache-hit-rate":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":null)"));
 
     snapshot.nodes[0].load.cache.hits = 750;
     snapshot.nodes[0].load.cache.misses = 250;
-    CHECK(RenderFleetJson(snapshot).contains(R"("cache-hit-rate":750)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("cache-hit-rate":750)"));
 }
 
 TEST_CASE("A tier's key index is reported as the RAM it is", "[distributed][fleetview][storage-tier]")
@@ -392,7 +411,7 @@ TEST_CASE("A tier's key index is reported as the RAM it is", "[distributed][flee
     snapshot.tiersPresent[DiskIndex] = true;
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
 
     // One spelling serving as header and JSON key, like every other column.
     CHECK(html.contains("disk-index-ram"));
@@ -417,7 +436,7 @@ TEST_CASE("A tier no member runs contributes no column at all", "[distributed][f
     snapshot.tiersPresent[DiskIndex] = false;
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
 
     CHECK(html.contains("memory-items"));
     CHECK(json.contains(R"("memory-items":900)"));
@@ -437,13 +456,13 @@ TEST_CASE("An absent tier budget and an unbounded one are different claims", "[d
     snapshot.nodes[0].capacity.cache.tierBytesLimit[MemoryIndex] = 0; // unbounded
     snapshot.nodes[0].load.cache.tiers[MemoryIndex] = CacheTierUsage {};
 
-    CHECK(RenderFleetJson(snapshot).contains(R"("memory-budget":"unbounded")"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("memory-budget":"unbounded")"));
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("unbounded"));
 
     snapshot.nodes[0].capacity.cache.tierBytesLimit[MemoryIndex] = std::nullopt;
     snapshot.nodes[0].load.cache.tiers[MemoryIndex] = std::nullopt;
     snapshot.tiersPresent[MemoryIndex] = true; // some other node has one
-    CHECK(RenderFleetJson(snapshot).contains(R"("memory-budget":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("memory-budget":null)"));
 }
 
 TEST_CASE("A node serving two toolchains is one machine row and two worker rows", "[distributed][fleetview]")
@@ -474,7 +493,7 @@ TEST_CASE("A node serving two toolchains is one machine row and two worker rows"
                        .heartbeatAge = std::chrono::milliseconds { 20 } },
     };
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     // Two toolchains named on one machine row.
     CHECK(json.contains(R"("toolchains":2)"));
     // And both worker ids present, because a lease is per toolchain.
@@ -498,7 +517,7 @@ TEST_CASE("A worker held back names the limit that did it", "[distributed][fleet
                              .codecs = {} },
         .heartbeatAge = std::chrono::milliseconds { 5 } } };
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("available":4)"));
     CHECK(json.contains(R"("limited-by":"scratch")"));
 }
@@ -523,8 +542,8 @@ TEST_CASE("A follower answers with a page naming the leader, and never a redirec
     // And it says what the address it printed actually is.
     CHECK(html.contains("scheduler"));
 
-    CHECK(RenderFleetJson(snapshot).contains(R"("role":"follower")"));
-    CHECK(RenderFleetJson(snapshot).contains(R"("leader":"10.0.0.9:6676")"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("role":"follower")"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("leader":"10.0.0.9:6676")"));
 }
 
 TEST_CASE("An election in progress names nobody rather than guessing", "[distributed][fleetview]")
@@ -536,7 +555,7 @@ TEST_CASE("An election in progress names nobody rather than guessing", "[distrib
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK(html.contains("election"));
-    CHECK(RenderFleetJson(snapshot).contains(R"("leader":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("leader":null)"));
 }
 
 TEST_CASE("A node running no cluster reports no members rather than an empty cluster", "[distributed][fleetview]")
@@ -545,11 +564,11 @@ TEST_CASE("A node running no cluster reports no members rather than an empty clu
     // leads itself and has no replicated state for anybody to read.
     auto snapshot = LeadingSnapshot();
     CHECK_FALSE(snapshot.cluster.has_value());
-    CHECK(RenderFleetJson(snapshot).contains(R"("members":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("members":null)"));
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("runs no cluster"));
 
     snapshot.cluster = Cluster::ClusterState {};
-    CHECK(RenderFleetJson(snapshot).contains(R"("members":[])"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("members":[])"));
 }
 
 TEST_CASE("A hostile fingerprint cannot escape the page or the document", "[distributed][fleetview][security]")
@@ -572,7 +591,7 @@ TEST_CASE("A hostile fingerprint cannot escape the page or the document", "[dist
     CHECK(html.contains("&lt;script&gt;"));
     CHECK(html.contains("&quot;"));
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"(\"b&c<d)"));
 }
 
@@ -601,7 +620,7 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
     auto snapshot = LeadingSnapshot();
     snapshot.leases = { 100, 7, 5, 3, 2 };
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("granted":100)"));
     CHECK(json.contains(R"("no-worker":7)"));
     CHECK(json.contains(R"("no-capacity":5)"));
@@ -983,6 +1002,130 @@ namespace
 
 } // namespace
 
+TEST_CASE("Every headline figure reaches both machine-readable surfaces under its own key", "[distributed][fleetview][kpi]")
+{
+    // The strip shipped browser-only: a consumer wanting Dispatched or Oldest heartbeat
+    // had to re-derive all seven from the rows, and two implementations of one headline
+    // figure that disagree discredit both surfaces (#1302).
+    auto const snapshot = LeadingSnapshot();
+    auto const history = SomeHistory();
+    auto const html = RenderFleetHtml(snapshot, history, 0);
+    auto const json = RenderFleetJson(snapshot, history);
+    auto const kpiText = RenderFleetText(snapshot, history, FleetSection::Kpi);
+
+    // Over the TABLE, with no expected-key list beside it. A list here is the defect
+    // the case above this file's column coverage exists to record.
+    REQUIRE_FALSE(FleetKpiKeys().empty());
+    for (auto const key: FleetKpiKeys())
+    {
+        INFO("kpi " << key);
+        CHECK(json.contains(std::string { "\"" } + std::string { key } + R"(":{"value":)"));
+        CHECK(kpiText.contains(key));
+    }
+
+    // The page carries the same figures under LABELS rather than keys -- one row, two
+    // spellings -- so what ties the two together is the COUNT: as many tiles as rows.
+    // A tile dropped from the strip alone would leave every assertion above green.
+    CHECK(CountOccurrences(html, R"(<div class="kpi">)") == FleetKpiKeys().size());
+    CHECK(CountOccurrences(kpiText, "\n") == FleetKpiKeys().size() + 1); // the header row
+}
+
+TEST_CASE("The headline figures travel as numbers rather than as the page's labels", "[distributed][fleetview][kpi]")
+{
+    auto const snapshot = LeadingSnapshot();
+    auto const history = SomeHistory();
+    auto const html = RenderFleetHtml(snapshot, history, 0);
+    auto const json = RenderFleetJson(snapshot, history);
+    auto const kpiText = RenderFleetText(snapshot, history, FleetSection::Kpi);
+
+    // What DISTINGUISHES: a case checking that a tile's value renders at all passes
+    // just as happily when the page's display triple rides along with it. The unit and
+    // the sub-line are prose about a figure the machine already has, and a consumer
+    // handed `/ 32 slots` would have to parse `32` back out of a label -- a receiver
+    // recomputing by string-scraping, which is worse than the recomputation the
+    // one-spelling rule exists to prevent.
+    CHECK(html.contains("slots"));
+    CHECK_FALSE(json.contains("slots"));
+    CHECK_FALSE(kpiText.contains("slots"));
+
+    CHECK(html.contains("this fleet&#39;s own work"));
+    CHECK_FALSE(json.contains("own work"));
+    CHECK_FALSE(kpiText.contains("own work"));
+
+    // And the denominator IS carried, as its own number rather than inside a label.
+    CHECK(json.contains(R"("compiling-now":{"value":)"));
+    CHECK(json.contains(R"("of":)"));
+    // The scale travels too: the key alone cannot say whether a hit rate of 853 is a
+    // count or eight-hundred-and-fifty-three thousandths.
+    CHECK(json.contains(R"("unit":"permille")"));
+    CHECK(json.contains(R"("unit":"milliseconds")"));
+}
+
+TEST_CASE("One derivation feeds all three renderings of a headline figure", "[distributed][fleetview][kpi]")
+{
+    // The whole of #1302 in one case. Every other case here asserts that a figure is
+    // PRESENT, and presence is exactly what a second implementation also produces --
+    // so what distinguishes one derivation from two is the VALUE, and a value only
+    // distinguishes when the arithmetic has more than one plausible answer.
+    //
+    // Two machines an order of magnitude apart, so `oldest` is not the mean, not the
+    // newest, and not a constant. A re-deriver reaching for a mean would get 30500
+    // here and it would look entirely reasonable.
+    auto snapshot = LeadingSnapshot();
+    snapshot.nodes = { Machine("10.0.0.2:7100", 32), Machine("10.0.0.3:7100", 32) };
+    snapshot.nodes[0].heartbeatAge = std::chrono::milliseconds { 1000 };
+    snapshot.nodes[1].heartbeatAge = std::chrono::milliseconds { 60'000 };
+
+    auto const history = SomeHistory();
+    auto const json = RenderFleetJson(snapshot, history);
+    auto const kpiText = RenderFleetText(snapshot, history, FleetSection::Kpi);
+    auto const html = RenderFleetHtml(snapshot, history, 0);
+
+    CHECK(json.contains(R"("oldest-heartbeat":{"value":60000)"));
+    CHECK(kpiText.contains("oldest-heartbeat\t60000\t"));
+    // Neither the mean nor the newest, named so a failure says which wrong answer
+    // arrived rather than only that the right one did not.
+    CHECK_FALSE(json.contains(R"("oldest-heartbeat":{"value":30500)"));
+    CHECK_FALSE(json.contains(R"("oldest-heartbeat":{"value":1000)"));
+
+    // The page carries the same figure humanised rather than raw, so it cannot be
+    // compared byte for byte -- what it can say is that the tile is not the dash,
+    // which is what a page fed a broken projection would show.
+    CHECK(html.contains("Oldest heartbeat"));
+    CHECK_FALSE(html.contains(R"(<span class="kpi-value">-<small></small></span><span class="kpi-sub">across)"));
+}
+
+TEST_CASE("A headline figure nobody sampled is absent rather than zero", "[distributed][fleetview][kpi]")
+{
+    auto const snapshot = LeadingSnapshot();
+
+    // Three of the seven read the history, so a document rendered without one cannot
+    // answer them -- and *cannot answer* is not *the answer is zero*. A fleet nobody
+    // sampled has not dispatched nothing; it has not said.
+    auto const blind = RenderFleetJson(snapshot, NoHistory());
+    CHECK(blind.contains(R"("dispatched":{"value":null)"));
+    CHECK(blind.contains(R"("cache-hit-rate":{"value":null)"));
+    CHECK(blind.contains(R"("refused":{"value":null)"));
+    CHECK_FALSE(blind.contains(R"("dispatched":{"value":0)"));
+
+    // The ACCEPTING direction beside it, because "renders absent" is satisfied in full
+    // by a renderer that renders every figure absent -- a guard nobody has watched
+    // accept is not known to work.
+    auto const seeing = RenderFleetJson(snapshot, SomeHistory());
+    CHECK_FALSE(seeing.contains(R"("dispatched":{"value":null)"));
+
+    // A snapshot figure is answerable either way, which is what says the absence above
+    // is about the HISTORY rather than about the document.
+    CHECK_FALSE(blind.contains(R"("leases-outstanding":{"value":null)"));
+
+    // And the same in the text form, where absent is the dash this document already
+    // spells everywhere else rather than an empty field.
+    auto const blindText = RenderFleetText(snapshot, NoHistory(), FleetSection::Kpi);
+    CHECK(blindText.contains("dispatched\t-\t"));
+    auto const seeingText = RenderFleetText(snapshot, SomeHistory(), FleetSection::Kpi);
+    CHECK_FALSE(seeingText.contains("dispatched\t-\t"));
+}
+
 TEST_CASE("The readouts are the strip's table, in its order", "[distributed][fleetview][kpi]")
 {
     auto const html = RenderFleetHtml(LeadingSnapshot(), SomeHistory(), 0);
@@ -1154,7 +1297,7 @@ TEST_CASE("Each machine's software version reaches the page and the JSON", "[dis
 
     // One table drives both renderers, so the JSON gets it for free -- and the test
     // asserts that rather than trusting it.
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("version":"1.5.0")"));
     CHECK(json.contains(R"("version":"1.4.2")"));
 }
@@ -1172,7 +1315,7 @@ TEST_CASE("A machine too old to report a version renders an absence, not a blank
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
     CHECK(html.contains("&ndash;"));
     CHECK_FALSE(html.contains("<td></td>"));
-    CHECK(RenderFleetJson(snapshot).contains(R"("version":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("version":null)"));
 }
 
 TEST_CASE("A worker row names its compiler beside the fingerprint", "[distributed][fleetview][toolchain]")
@@ -1192,7 +1335,7 @@ TEST_CASE("A worker row names its compiler beside the fingerprint", "[distribute
                                         .heartbeatAge = std::chrono::milliseconds { 30 } } };
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 0);
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
 
     CHECK(html.contains("cl 19.44.35207"));
     CHECK(json.contains(R"("compiler":"cl 19.44.35207")"));
@@ -1219,7 +1362,7 @@ TEST_CASE("A worker that did not say what its compiler is renders absent", "[dis
                                                              .codecs = {} },
                                         .heartbeatAge = std::chrono::milliseconds { 30 } } };
 
-    CHECK(RenderFleetJson(snapshot).contains(R"("compiler":null)"));
+    CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("compiler":null)"));
     CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("&ndash;"));
 }
 
@@ -1276,7 +1419,7 @@ TEST_CASE("A peer that got its bytes past the door cannot make the whole fleet's
 
     // Both surfaces, because each has an encoding its consumer enforces: JSON must
     // be UTF-8, and the page is served as UTF-8 and embeds SVG, which is XML.
-    CHECK(IsValidUtf8(RenderFleetJson(snapshot)));
+    CHECK(IsValidUtf8(RenderFleetJson(snapshot, NoHistory())));
     CHECK(IsValidUtf8(RenderFleetHtml(snapshot, NoHistory(), 10)));
 }
 
@@ -1323,7 +1466,7 @@ TEST_CASE("A worker the scheduler has chosen renders how long ago", "[distribute
     auto snapshot = LeadingSnapshot();
     snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 90'000 }) };
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("last-picked-age":90000)"));
     // The half that makes the absence below readable: forty minutes registered is
     // what turns "never picked" from a fresh node into a finding.
@@ -1341,7 +1484,7 @@ TEST_CASE("A worker nothing has been sent to renders an absence, never a zero", 
     auto snapshot = LeadingSnapshot();
     snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::nullopt) };
 
-    auto const json = RenderFleetJson(snapshot);
+    auto const json = RenderFleetJson(snapshot, NoHistory());
     CHECK(json.contains(R"("last-picked-age":null)"));
     CHECK_FALSE(json.contains(R"("last-picked-age":0)"));
 
@@ -1465,7 +1608,7 @@ TEST_CASE("A named section renders its table alone, with no marker to skip", "[d
     auto snapshot = LeadingSnapshot();
     snapshot.workers = { Entry("w1", "gcc-13-abcdef", "10.0.0.2:7100", std::chrono::milliseconds { 1'000 }) };
 
-    auto const workers = RenderFleetText(snapshot, FleetSection::Workers);
+    auto const workers = RenderFleetText(snapshot, NoHistory(), FleetSection::Workers);
 
     // A header and one row, and nothing else: this is the form a reader pipes
     // straight into `cut`, so a marker line would be one more thing every consumer
@@ -1484,7 +1627,7 @@ TEST_CASE("Asking for no section renders every one behind a marker naming it", "
     // The self-describing form, which is what makes the accepted keys discoverable
     // by asking for none -- a reader who guessed a section wrong does not have to
     // find the documentation to learn the right spelling.
-    auto const whole = RenderFleetText(LeadingSnapshot(), std::nullopt);
+    auto const whole = RenderFleetText(LeadingSnapshot(), NoHistory(), std::nullopt);
 
     for (auto const& row: FleetSectionTable)
     {
@@ -1505,7 +1648,7 @@ TEST_CASE("An absent cell in the text rendering is a dash, never a blank and nev
     snapshot.nodes[0].load = Busy(1); // no cpu, no memory, no scratch reading
     snapshot.nodes[0].displayName = {};
 
-    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const machines = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
     auto const rows = machines.substr(machines.find('\n') + 1);
 
     CHECK(rows.contains("\t-\t"));
@@ -1527,7 +1670,7 @@ TEST_CASE("A tab a peer put in its own name cannot break the row it sits in", "[
     auto snapshot = LeadingSnapshot();
     snapshot.nodes[0].displayName = "build\tnode\nthree";
 
-    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const machines = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
 
     // A header and exactly ONE row. Unescaped, the newline alone would make three.
     CHECK(LineCount(machines) == 2);
@@ -1552,7 +1695,7 @@ TEST_CASE("A backslash a peer sent survives the round trip it would otherwise fo
     auto snapshot = LeadingSnapshot();
     snapshot.nodes[0].displayName = R"(build\tnode)";
 
-    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const machines = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
 
     CHECK(machines.contains(R"(build\\tnode)"));
     CHECK(LineCount(machines) == 2);
@@ -1567,7 +1710,7 @@ TEST_CASE("The text rendering carries raw numbers, as the JSON does and the page
     // for itself, so "both render the same way" cannot pass by accident.
     auto const snapshot = LeadingSnapshot();
 
-    auto const machines = RenderFleetText(snapshot, FleetSection::Machines);
+    auto const machines = RenderFleetText(snapshot, NoHistory(), FleetSection::Machines);
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
 
     CHECK(machines.contains("68719476736"));
@@ -1587,7 +1730,7 @@ TEST_CASE("A tier no member runs contributes no column to the text rendering", "
     // Named, so the document outlives the view into it. Spelled out rather than
     // folded into the CHECKs because the deleted overload below makes the folded form
     // uncompilable, and a reader meeting that error should find the answer here.
-    auto const tiers = RenderFleetText(snapshot, FleetSection::Tiers);
+    auto const tiers = RenderFleetText(snapshot, NoHistory(), FleetSection::Tiers);
     auto const header = HeaderLine(tiers);
 
     CHECK(header.contains("memory-"));
@@ -1603,7 +1746,7 @@ TEST_CASE("A fleet with no rows still renders the header its reader needs", "[di
     snapshot.nodes = {};
     snapshot.workers = {};
 
-    auto const workers = RenderFleetText(snapshot, FleetSection::Workers);
+    auto const workers = RenderFleetText(snapshot, NoHistory(), FleetSection::Workers);
     CHECK(LineCount(workers) == 1);
     CHECK(HeaderLine(workers).starts_with("id\t"));
 }
@@ -1617,7 +1760,7 @@ TEST_CASE("A node that does not lead renders no table at all, and names the lead
     snapshot.role = SchedulerRole::Follower;
     snapshot.leaderEndpoint = "10.0.0.9:6676";
 
-    auto const whole = RenderFleetText(snapshot, std::nullopt);
+    auto const whole = RenderFleetText(snapshot, NoHistory(), std::nullopt);
 
     CHECK(whole.contains("10.0.0.9:6676"));
     // No tab anywhere is no TABLE anywhere: every table this renders, header included,
@@ -1627,8 +1770,8 @@ TEST_CASE("A node that does not lead renders no table at all, and names the lead
     CHECK_FALSE(whole.contains('\t'));
     // And a named section is refused the same way, rather than being the one door a
     // follower's partial table still gets out through.
-    CHECK_FALSE(RenderFleetText(snapshot, FleetSection::Workers).contains('\t'));
-    CHECK(RenderFleetText(snapshot, FleetSection::Workers).contains("10.0.0.9:6676"));
+    CHECK_FALSE(RenderFleetText(snapshot, NoHistory(), FleetSection::Workers).contains('\t'));
+    CHECK(RenderFleetText(snapshot, NoHistory(), FleetSection::Workers).contains("10.0.0.9:6676"));
 }
 
 TEST_CASE("A follower with no leader yet says an election is on rather than naming nobody",
@@ -1642,7 +1785,7 @@ TEST_CASE("A follower with no leader yet says an election is on rather than nami
     snapshot.role = SchedulerRole::Follower;
     snapshot.leaderEndpoint = {};
 
-    auto const whole = RenderFleetText(snapshot, std::nullopt);
+    auto const whole = RenderFleetText(snapshot, NoHistory(), std::nullopt);
 
     CHECK(whole.contains("election"));
     CHECK_FALSE(whole.contains("# leader: --"));

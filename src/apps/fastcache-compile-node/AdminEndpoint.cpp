@@ -401,13 +401,28 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
             }),
     });
 
+    // `range` is accepted here for the same reason the page accepts it (#1302): three
+    // of the headline figures are history-derived, so the document answers FOR a
+    // window -- and a machine-readable surface pinned to one window while the page
+    // takes a parameter is the same fleet reporting two different Dispatched figures
+    // depending on who asked, which is the disagreement this key exists to prevent.
+    //
+    // REFUSED when it names nothing, never defaulted, exactly as on `/fleet`: a window
+    // quietly substituted hands a reader figures for a period they did not ask about,
+    // with nothing in the document to say so.
     routes.push_back(AdminRoute {
         .path = "/fleet.json",
         .handler = gated([] { return Unauthorised("application/json", R"({"error":"credential required"})"); },
-                         [statusFor](Distributed::FleetSnapshot const& snapshot, AdminRequest const&) {
+                         [statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                          AdminRequest const& request) -> AdminResponse {
+                             auto const range = rangeAsked(request.query);
+                             if (!range.has_value())
+                                 return RefusedParameter(
+                                     "application/json",
+                                     std::format(R"({{"error":"unknown range","accepted":"{}"}})", KnownRangeKeys()));
                              return AdminResponse { .status = statusFor(snapshot),
                                                     .contentType = "application/json",
-                                                    .body = Distributed::RenderFleetJson(snapshot) };
+                                                    .body = Distributed::RenderFleetJson(snapshot, viewFor(*range)) };
                          }),
     });
 
@@ -426,16 +441,26 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
         .path = "/fleet.txt",
         .handler =
             gated([] { return Unauthorised("text/plain; charset=utf-8", "credential required\n"); },
-                  [statusFor](Distributed::FleetSnapshot const& snapshot, AdminRequest const& request) -> AdminResponse {
+                  [statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
+                                                   AdminRequest const& request) -> AdminResponse {
                       auto const asked = QueryValue(request.query, "section");
                       auto const section = asked.empty() ? std::optional<Distributed::FleetSection> { std::nullopt }
                                                          : Distributed::FleetSectionFromKey(asked);
                       if (!asked.empty() && !section.has_value())
                           return RefusedParameter("text/plain; charset=utf-8",
                                                   std::format("unknown section; this build serves:\n{}", KnownSections()));
+                      // `range` for the `kpi` section's history-derived figures; see
+                      // the note on `/fleet.json`. Refused rather than defaulted, and
+                      // asked for even when a section that ignores it was named --
+                      // a parameter accepted on one section and silently dropped on
+                      // another is a worse answer than refusing it everywhere.
+                      auto const range = rangeAsked(request.query);
+                      if (!range.has_value())
+                          return RefusedParameter("text/plain; charset=utf-8",
+                                                  std::format("unknown range; this build serves: {}\n", KnownRangeKeys()));
                       return AdminResponse { .status = statusFor(snapshot),
                                              .contentType = "text/plain; charset=utf-8",
-                                             .body = Distributed::RenderFleetText(snapshot, section) };
+                                             .body = Distributed::RenderFleetText(snapshot, viewFor(*range), section) };
                   }),
     });
 

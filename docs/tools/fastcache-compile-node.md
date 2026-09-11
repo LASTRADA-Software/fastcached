@@ -2328,6 +2328,36 @@ empty document rather than a partial one. That matters more here than on the pag
 page has room for a sentence, while a table holding a fraction of the fleet is shaped
 exactly like one holding all of it by the time it reaches `cut`.
 
+### The headline figures, computed once
+
+The page's strip — Dispatched, Compiling now, Cache hit rate, Refused, Leases
+outstanding, Oldest heartbeat, Never picked — used to be drawn and nowhere else, so a
+consumer wanting any of the seven had to re-derive it from the rows. Two
+implementations of one headline figure that disagree discredit both surfaces, and
+*Oldest heartbeat* is the sharpest: a re-deriver reaching for a mean gets a plausible
+number answering a different question.
+
+They are a `kpi` key on `/fleet.json` and a `kpi` section on `/fleet.txt` now, keyed by
+a name each carries rather than by its page label — so a tile can be reworded without
+breaking a scraper:
+
+```sh
+curl -s -u ":$TOKEN" localhost:6677/fleet.json | jq '.kpi["cache-hit-rate"]'
+# { "value": 853, "unit": "permille", "of": null }
+curl -s -u ":$TOKEN" "localhost:6677/fleet.txt?section=kpi" | cut -f1,2
+```
+
+What travels is the **number and its scale**, never the page's `/ 32 slots` or its
+sub-line: a consumer handed those would have to parse the figure back out of a label.
+`unit` says which scale the integer is in, because the key alone cannot tell a count
+from thousandths — `853` is 85.3%. `of` is the denominator as its own number for the
+two figures that have one (`compiling-now`, `never-picked`) and `null` for the rest.
+
+Three of the seven are derived from the **history** rather than the snapshot, so both
+surfaces take `range` exactly as the page does, and refuse an unknown one for the same
+reason. A figure the range cannot answer is `null` / `-` and **never `0`**: a fleet
+nobody sampled has not dispatched nothing, it has not said.
+
 Ask for no section and it is the whole document: each table behind a `# <key>`
 marker naming it, blank-line separated — which is also how the keys `section`
 accepts are discoverable without reading this page. Ask for one and it is that

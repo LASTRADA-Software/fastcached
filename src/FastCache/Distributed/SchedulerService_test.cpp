@@ -1185,7 +1185,7 @@ TEST_CASE("A machine's display name reaches the fleet page and decides nothing",
         // nobody reads -- the two are one table walked twice, so this is what pins the
         // walk rather than the row.
         CHECK(RenderFleetHtml(snapshot, FleetHistoryView {}, 0).contains("buildnode-3"));
-        CHECK(RenderFleetJson(snapshot).contains("buildnode-3"));
+        CHECK(RenderFleetJson(snapshot, FleetHistoryView {}).contains("buildnode-3"));
     }
 
     SECTION("a node that says nothing renders as absent, not as blank")
@@ -1200,7 +1200,7 @@ TEST_CASE("A machine's display name reaches the fleet page and decides nothing",
             CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
         REQUIRE(snapshot.nodes.size() == 1);
         CHECK(snapshot.nodes.front().displayName.empty());
-        CHECK(RenderFleetJson(snapshot).contains("\"name\":null"));
+        CHECK(RenderFleetJson(snapshot, FleetHistoryView {}).contains("\"name\":null"));
     }
 
     SECTION("nothing decides from it")

@@ -1722,7 +1722,13 @@ namespace
           .wire = Wire::Node,
           .minOperands = 1,
           .maxOperands = 1,
-          .operands = " <machines|workers|leases|members|tiers>",
+          // Spelled out rather than joined from `FleetSectionTable`, because this is a
+          // `constexpr` table and the join would be a compile-time string built into a
+          // buffer -- more machinery than the fact is worth. What keeps it honest is
+          // `the fleet verb offers every section the server serves` in
+          // `CliVerbs_test.cpp`, which walks that table: a section added and not
+          // spelled here reddens rather than going quietly missing from the help.
+          .operands = " <kpi|machines|workers|leases|members|tiers>",
           .summary = "one of the leader's fleet tables, read over the node's\n"
                      "own admin surface -- no browser and no JSON parser",
           .protocolCommand = "node-status",

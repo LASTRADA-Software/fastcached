@@ -71,7 +71,15 @@ namespace
         }
     };
 
-    /// How a page renders a number. The JSON ignores it and writes the integer.
+    /// How a page renders a number, and what SCALE the integer beside it is in.
+    ///
+    /// The page reads it to dress a cell. A machine-readable surface ignores it for a
+    /// column -- a column's scale is a property of the column name, which a consumer
+    /// already has -- and NAMES it for a headline figure, where the name alone cannot
+    /// say whether `853` is a count or eight-hundred-and-fifty-three thousandths.
+    ///
+    /// Private to this file, so the enumerator values bind nothing; the explicit `= 0`
+    /// is `EnumTable`'s anchor rather than a contract.
     enum class CellFormat : std::uint8_t
     {
         Count = 0,
@@ -79,7 +87,29 @@ namespace
         Permille,
         Millis,
         Text,
+        Last,
     };
+
+    /// What a scale is called where a machine has to read it.
+    struct CellFormatRow
+    {
+        CellFormat format;     ///< The enumerator this row describes.
+        std::string_view name; ///< Its machine spelling.
+    };
+
+    /// One spelling per scale, so the word a consumer parses and the arm that renders
+    /// it cannot be attached to different formats.
+    constexpr EnumTable<CellFormat, CellFormatRow> CellFormatTable {
+        CellFormatRow { .format = CellFormat::Count, .name = "count" },
+        CellFormatRow { .format = CellFormat::Bytes, .name = "bytes" },
+        // Thousandths, not percent: the cell carries an integer, so a percentage with
+        // one decimal has to be scaled somewhere and the name is where a reader finds
+        // out which. `853` is 85.3%.
+        CellFormatRow { .format = CellFormat::Permille, .name = "permille" },
+        CellFormatRow { .format = CellFormat::Millis, .name = "milliseconds" },
+        CellFormatRow { .format = CellFormat::Text, .name = "text" },
+    };
+    static_assert(RowsInEnumeratorOrder(CellFormatTable, &CellFormatRow::format));
 
     /// How the PAGE dresses a cell. The JSON ignores it entirely: a chip and a
     /// freshness pill are a reader's shorthand for a value the machine-readable
@@ -102,6 +132,18 @@ namespace
         /// every row amber and the colour would stop meaning anything at all.
         LeaseAge,
     };
+
+    /// Append the headline figures as a table, and the same for the JSON object.
+    ///
+    /// DEFINED below, beside `KpiTable`: the two machine-readable renderers are laid
+    /// out above the strip's projections in this file, and a forward declaration is
+    /// cheaper than moving either block past the other. Every unnamed-namespace block
+    /// in a translation unit is the same namespace, so this is the same entity.
+    /// @param out Appended to.
+    /// @param snapshot What to read.
+    /// @param history The window the history-derived figures answer for.
+    void AppendKpiText(std::string& out, FleetSnapshot const& snapshot, FleetHistoryView const& history);
+    void AppendKpiJson(std::string& out, FleetSnapshot const& snapshot, FleetHistoryView const& history);
 
     /// One column: what it is called, and how to read it off one subject.
     ///
@@ -224,6 +266,7 @@ namespace
                 return HumanMillis(cell.number);
             case CellFormat::Count:
             case CellFormat::Text:
+            case CellFormat::Last:
                 break;
         }
         return std::format("{}", cell.number);
@@ -1008,7 +1051,7 @@ namespace
     }
 } // namespace
 
-std::string RenderFleetJson(FleetSnapshot const& snapshot)
+std::string RenderFleetJson(FleetSnapshot const& snapshot, FleetHistoryView const& history)
 {
     std::string out;
     out.reserve(4096);
@@ -1027,6 +1070,26 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
         out += "null";
     else
         AppendJsonString(out, snapshot.leaderEndpoint);
+
+    // The headline figures, keyed by the name each `KpiTable` row carries (#1302).
+    //
+    // An OBJECT rather than an array, because these are one value per named figure
+    // rather than rows of one shape: `.kpi["cache-hit-rate"].value` is what a scraper
+    // wants, and a list would make it search for the element whose key matches.
+    //
+    // What travels is the NUMBER and its scale, never the page's `unit` and `sub`. A
+    // consumer handed `"12"` and `"/ 32 slots"` has to parse the figure back out of a
+    // label -- a receiver recomputing by string-scraping, in a vocabulary this
+    // document does not otherwise speak. `of` is the denominator as its own number for
+    // the two tiles that have one, and `null` for the five that do not.
+    //
+    // This is the one-spelling rule, not a deviation from *nothing a receiver can
+    // recompute travels*: what must not be re-implemented is the DERIVATION -- the
+    // hit-rate arithmetic, the oldest-heartbeat fold, which a re-deriver reaching for
+    // a mean gets plausibly and differently wrong -- rather than the arithmetic being
+    // hidden. One derivation, three renderings.
+    out += ',';
+    AppendKpiJson(out, snapshot, history);
 
     out += ',';
     AppendJsonString(out, "members");
@@ -1160,6 +1223,14 @@ namespace
         }
     }
 
+    /// The `kpi` section's column names, which are the only ones not from a table.
+    ///
+    /// The headline figures are one value per NAME rather than rows of one shape, so
+    /// the text form is the key/value table that shape implies. Spelled once and read
+    /// by both the header row and `FleetColumnNames`, so what a reader is told to
+    /// expect and what the renderer emits cannot part company.
+    constexpr std::array<std::string_view, 4> KpiTextColumns { "kpi", "value", "unit", "of" };
+
     /// Append one named section's table.
     ///
     /// A `switch` over the enum with no default arm, so a section added to
@@ -1168,11 +1239,18 @@ namespace
     /// answer an empty document, which reads exactly like a fleet with nothing in it.
     /// @param out Appended to.
     /// @param snapshot What to render.
+    /// @param history The window the `kpi` section answers for.
     /// @param section Which table.
-    void AppendSectionText(std::string& out, FleetSnapshot const& snapshot, FleetSection section)
+    void AppendSectionText(std::string& out,
+                           FleetSnapshot const& snapshot,
+                           FleetHistoryView const& history,
+                           FleetSection section)
     {
         switch (section)
         {
+            case FleetSection::Kpi:
+                AppendKpiText(out, snapshot, history);
+                return;
             case FleetSection::Machines:
                 AppendTextRows(out, NodeColumns, snapshot.nodes);
                 return;
@@ -1217,6 +1295,12 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
     // defect this function exists to remove rather than relocate.
     switch (section)
     {
+        case FleetSection::Kpi:
+            // A key/value table rather than rows of one shape, so its four columns are
+            // its own rather than a `FleetColumn` set -- and its `tabular` column says
+            // so, which is what lets the coverage case assert that in both directions
+            // instead of carrying a silent exception.
+            return { KpiTextColumns.begin(), KpiTextColumns.end() };
         case FleetSection::Machines:
             return namesOf(NodeColumns);
         case FleetSection::Workers:
@@ -1246,7 +1330,9 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
     return {};
 }
 
-std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSection> section)
+std::string RenderFleetText(FleetSnapshot const& snapshot,
+                            FleetHistoryView const& history,
+                            std::optional<FleetSection> section)
 {
     std::string out;
     out.reserve(2048);
@@ -1281,7 +1367,7 @@ std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSe
     // would be one more thing every consumer has to know to skip.
     if (section.has_value())
     {
-        AppendSectionText(out, snapshot, *section);
+        AppendSectionText(out, snapshot, history, *section);
         return out;
     }
 
@@ -1294,7 +1380,7 @@ std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSe
         if (!std::exchange(firstSection, false))
             out += '\n';
         out += std::format("# {}\n", row.key);
-        AppendSectionText(out, snapshot, row.section);
+        AppendSectionText(out, snapshot, history, row.section);
     }
     return out;
 }
@@ -1565,14 +1651,53 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
     /// What one readout on the strip says.
     ///
-    /// `value` is already safe to interpolate: every projector below produces either
-    /// a number it formatted itself or `AbsentText`, and neither can carry markup.
+    /// **A NUMBER and its scale, never the formatted text** (#1302). This used to be
+    /// three display strings -- `"12"`, `"/ 32 slots"`, `"this fleet's own work"` --
+    /// which is fine for the one surface that had them and useless to the two that
+    /// now do: a consumer handed `"12"` and `"/ 32 slots"` has to parse the figure
+    /// back out of a label, which is a receiver recomputing by string-scraping. What
+    /// must not be re-implemented is the DERIVATION -- the hit-rate arithmetic, the
+    /// oldest-heartbeat fold -- and not the formatting, so one projection feeds three
+    /// renderings and the page keeps its own dressing.
+    ///
+    /// `sub` and `unit` are the PAGE's alone and reach no machine-readable surface.
+    /// They are prose about a figure the machine already has.
     struct KpiReadout
     {
-        std::string value; ///< The figure, or the dash.
-        std::string unit;  ///< The small suffix beside it; empty for none.
-        std::string sub;   ///< The line under it.
+        FleetCell value;   ///< The figure a machine reads; `Nothing()` when unanswerable.
+        FleetCell of;      ///< Its denominator, or `Nothing()` for a tile that has none.
+        CellFormat format; ///< The scale `value` is in.
+        std::string unit;  ///< The small suffix the PAGE puts beside it; empty for none.
+        std::string sub;   ///< The line the PAGE puts under it.
     };
+
+    /// A folded series as a counting cell.
+    ///
+    /// Rounded rather than truncated: the series is a sum of readings, so a fold that
+    /// lands on `122.9999` is a 123 that floating point walked back, and truncating it
+    /// reports one fewer compile than happened.
+    /// @param value The folded series, absent when the window carries none.
+    /// @return The cell.
+    [[nodiscard]] FleetCell CountCell(std::optional<double> value)
+    {
+        if (!value.has_value())
+            return FleetCell::Nothing();
+        return FleetCell::Of(static_cast<std::uint64_t>(std::llround(*value)));
+    }
+
+    /// A percentage as a per-mille cell.
+    ///
+    /// The cell carries an integer, so a share with one decimal has to be scaled: 85.3%
+    /// travels as `853` under `CellFormat::Permille`, which is the same shape every
+    /// percentage COLUMN on this page already uses rather than a second convention.
+    /// @param share The share as a percentage, absent when it cannot be computed.
+    /// @return The cell.
+    [[nodiscard]] FleetCell PermilleCell(std::optional<double> share)
+    {
+        if (!share.has_value())
+            return FleetCell::Nothing();
+        return FleetCell::Of(static_cast<std::uint64_t>(std::llround(*share * 10.0)));
+    }
 
     /// Whether this fleet has been asked to compile nothing at all.
     ///
@@ -1618,7 +1743,9 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
     KpiReadout KpiDispatched(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
-        return KpiReadout { .value = FigureOr(FoldedSeries("dispatched", history), 0),
+        return KpiReadout { .value = CountCell(FoldedSeries("dispatched", history)),
+                            .of = FleetCell::Nothing(),
+                            .format = CellFormat::Count,
                             .unit = {},
                             .sub = std::format("compiles in the last {}", RangeKeyOf(history)) };
     }
@@ -1629,24 +1756,34 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         // The sub-line names WHICH zero this is. "This fleet's own work" over a 0
         // reads as an idle fleet, and on a node nothing dispatches to it is the
         // tile an operator stares at while their build saturates the machine.
-        return KpiReadout { .value = std::to_string(totals.inFlight),
+        return KpiReadout { .value = FleetCell::Of(totals.inFlight),
+                            // The denominator is a NUMBER of its own rather than text
+                            // inside the unit: `/ 32 slots` is a label a machine would
+                            // have to take `32` back out of.
+                            .of = FleetCell::Of(totals.registered),
+                            .format = CellFormat::Count,
                             .unit = std::format("/ {} slots", totals.registered),
                             .sub = NeverDispatched(snapshot, totals) ? "nothing dispatched yet" : "this fleet's own work" };
     }
 
     KpiReadout KpiHitRate(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
-        auto const share = FoldedSeries("hit-rate", history);
-        return KpiReadout { .value = FigureOr(share, 1),
-                            .unit = share.has_value() ? "%" : "",
+        // The `%` moved out of the page's `<small>` and into the cell, because
+        // `CellAsText` already renders a per-mille cell as `85.3%` and two places
+        // spelling one suffix is the drift this table exists to prevent.
+        return KpiReadout { .value = PermilleCell(FoldedSeries("hit-rate", history)),
+                            .of = FleetCell::Nothing(),
+                            .format = CellFormat::Permille,
+                            .unit = {},
                             .sub = std::format("over the last {}", RangeKeyOf(history)) };
     }
 
     KpiReadout KpiRefused(FleetSnapshot const& /*snapshot*/, FleetHistoryView const& history)
     {
-        auto const share = RefusedShare(history);
-        return KpiReadout { .value = FigureOr(share, 1),
-                            .unit = share.has_value() ? "%" : "",
+        return KpiReadout { .value = PermilleCell(RefusedShare(history)),
+                            .of = FleetCell::Nothing(),
+                            .format = CellFormat::Permille,
+                            .unit = {},
                             .sub = "of dispatch decisions" };
     }
 
@@ -1657,17 +1794,31 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
         // ten minutes after the job it named had finished, so on a busy fleet it
         // read as a backlog that did not exist. A client now hands its lease back
         // when its job ends (#212), which is what makes this a live number.
-        return KpiReadout { .value = std::to_string(snapshot.liveLeases), .unit = {}, .sub = "granted, not yet resolved" };
+        return KpiReadout { .value = FleetCell::Of(snapshot.liveLeases),
+                            .of = FleetCell::Nothing(),
+                            .format = CellFormat::Count,
+                            .unit = {},
+                            .sub = "granted, not yet resolved" };
     }
 
     KpiReadout KpiOldestHeartbeat(FleetSnapshot const& snapshot, FleetHistoryView const& /*history*/)
     {
         if (snapshot.nodes.empty())
-            return KpiReadout { .value = std::string { AbsentText }, .unit = {}, .sub = "no machine registered" };
+            // Absent, never zero. A fleet with no machine has no oldest heartbeat, and
+            // a `0` there reads as every machine answering this instant.
+            return KpiReadout { .value = FleetCell::Nothing(),
+                                .of = FleetCell::Nothing(),
+                                .format = CellFormat::Millis,
+                                .unit = {},
+                                .sub = "no machine registered" };
         auto const oldest = std::ranges::max(snapshot.nodes, {}, &NodeReport::heartbeatAge).heartbeatAge;
         // The *oldest*, not the mean: one machine that stopped answering an hour ago
         // is the fact worth surfacing, and an average over a healthy fleet buries it.
-        return KpiReadout { .value = HumanMillis(static_cast<std::uint64_t>(oldest.count())),
+        // Which is also why the DERIVATION has to travel rather than the reading: a
+        // consumer handed the rows and left to re-derive reaches for a mean.
+        return KpiReadout { .value = FleetCell::Of(static_cast<std::uint64_t>(oldest.count())),
+                            .of = FleetCell::Nothing(),
+                            .format = CellFormat::Millis,
                             .unit = {},
                             .sub = std::format("across {} machine(s)", snapshot.nodes.size()) };
     }
@@ -1695,8 +1846,14 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     {
         auto const coverage = PickCoverageFor(snapshot);
         if (!coverage.has_value())
-            return KpiReadout { .value = std::string { AbsentText }, .unit = {}, .sub = "no worker registered" };
-        return KpiReadout { .value = std::to_string(coverage->neverPicked),
+            return KpiReadout { .value = FleetCell::Nothing(),
+                                .of = FleetCell::Nothing(),
+                                .format = CellFormat::Count,
+                                .unit = {},
+                                .sub = "no worker registered" };
+        return KpiReadout { .value = FleetCell::Of(coverage->neverPicked),
+                            .of = FleetCell::Of(coverage->toolchains),
+                            .format = CellFormat::Count,
                             .unit = {},
                             .sub = std::format("of {} toolchain(s) registered", coverage->toolchains) };
     }
@@ -1708,7 +1865,21 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     /// case, absent spelling and order are checked by nothing.
     struct KpiRow
     {
-        std::string_view label;                                               ///< What the tile is called.
+        std::string_view label; ///< What the tile is called on the page.
+
+        /// What a machine-readable surface calls it.
+        ///
+        /// A SECOND column rather than one spelling doing both, unlike `FleetColumn`,
+        /// and the reason is the label: *Cache hit rate* is a heading with spaces and
+        /// a capital, which is a poor JSON key, and `cache-hit-rate` is a poor heading.
+        /// What the one-spelling rule buys is that they cannot be attached to
+        /// DIFFERENT tiles -- they are two fields of one row, so a tile renamed on the
+        /// page and a key left behind is one edit rather than two files.
+        ///
+        /// Stable across a relabelling: this is what a scraper keys on, and the label
+        /// above is what a reader sees, so the page is free to be reworded.
+        std::string_view key;
+
         KpiReadout (*project)(FleetSnapshot const&, FleetHistoryView const&); ///< What it reads.
         bool sparkline;                                                       ///< Whether it carries one.
     };
@@ -1718,14 +1889,104 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
     /// reader of this page already knows, and an insertion would move six tiles to
     /// place one.
     constexpr std::array<KpiRow, 7> KpiTable {
-        KpiRow { .label = "Dispatched", .project = KpiDispatched, .sparkline = true },
-        KpiRow { .label = "Compiling now", .project = KpiCompilingNow, .sparkline = false },
-        KpiRow { .label = "Cache hit rate", .project = KpiHitRate, .sparkline = false },
-        KpiRow { .label = "Refused", .project = KpiRefused, .sparkline = false },
-        KpiRow { .label = "Leases outstanding", .project = KpiLeases, .sparkline = false },
-        KpiRow { .label = "Oldest heartbeat", .project = KpiOldestHeartbeat, .sparkline = false },
-        KpiRow { .label = "Never picked", .project = KpiNeverPicked, .sparkline = false },
+        KpiRow { .label = "Dispatched", .key = "dispatched", .project = KpiDispatched, .sparkline = true },
+        KpiRow { .label = "Compiling now", .key = "compiling-now", .project = KpiCompilingNow, .sparkline = false },
+        KpiRow { .label = "Cache hit rate", .key = "cache-hit-rate", .project = KpiHitRate, .sparkline = false },
+        KpiRow { .label = "Refused", .key = "refused", .project = KpiRefused, .sparkline = false },
+        KpiRow { .label = "Leases outstanding", .key = "leases-outstanding", .project = KpiLeases, .sparkline = false },
+        KpiRow { .label = "Oldest heartbeat", .key = "oldest-heartbeat", .project = KpiOldestHeartbeat, .sparkline = false },
+        KpiRow { .label = "Never picked", .key = "never-picked", .project = KpiNeverPicked, .sparkline = false },
     };
+
+    /// Every tile states a key, and no two share one.
+    ///
+    /// A row that forgets `key` is still a row, at the right position, with a label --
+    /// it just renders a machine-readable figure under an empty name, which collides
+    /// with the next row that forgets one. Neither `RowsInEnumeratorOrder` nor any
+    /// render-time check can see that, and there is no reason a tile could have for
+    /// being unnamed, so the type system answers it.
+    /// @return True when every key is non-empty and distinct.
+    [[nodiscard]] consteval bool EveryKpiIsKeyed()
+    {
+        return std::ranges::all_of(std::views::iota(std::size_t { 0 }, KpiTable.size()), [](std::size_t outer) {
+            if (KpiTable[outer].key.empty())
+                return false;
+            return std::ranges::none_of(std::views::iota(outer + 1, KpiTable.size()),
+                                        [outer](std::size_t inner) { return KpiTable[outer].key == KpiTable[inner].key; });
+        });
+    }
+    static_assert(EveryKpiIsKeyed(), "every KpiTable row needs its own non-empty machine key");
+
+    /// The keys alone, so `FleetKpiKeys` can hand out a view of something static.
+    constexpr auto KpiKeys = [] {
+        std::array<std::string_view, KpiTable.size()> keys {};
+        for (auto const index: std::views::iota(std::size_t { 0 }, KpiTable.size()))
+            keys[index] = KpiTable[index].key;
+        return keys;
+    }();
+
+    /// Append the headline figures as a table.
+    ///
+    /// One row per `KpiTable` row, under the key its own row names. The page's `unit`
+    /// and `sub` do NOT appear: they are prose about a figure this table already
+    /// carries, and a reader piping into `cut` wants the number.
+    /// @param out Appended to.
+    /// @param snapshot What to read.
+    /// @param history The window the history-derived figures answer for.
+    void AppendKpiJson(std::string& out, FleetSnapshot const& snapshot, FleetHistoryView const& history)
+    {
+        AppendJsonString(out, "kpi");
+        out += ":{";
+        bool firstKpi = true;
+        for (auto const& row: KpiTable)
+        {
+            if (!std::exchange(firstKpi, false))
+                out += ',';
+            auto const readout = row.project(snapshot, history);
+            AppendJsonString(out, row.key);
+            out += ":{";
+            AppendJsonString(out, "value");
+            out += ':';
+            AppendCellAsJson(out, readout.value);
+            out += ',';
+            // The scale, because the key alone cannot say whether 853 is a count or
+            // eight-hundred-and-fifty-three thousandths.
+            AppendJsonString(out, "unit");
+            out += ':';
+            AppendJsonString(out, CellFormatTable[static_cast<std::size_t>(readout.format)].name);
+            out += ',';
+            AppendJsonString(out, "of");
+            out += ':';
+            AppendCellAsJson(out, readout.of);
+            out += '}';
+        }
+        out += '}';
+    }
+
+    void AppendKpiText(std::string& out, FleetSnapshot const& snapshot, FleetHistoryView const& history)
+    {
+        bool firstColumn = true;
+        for (auto const name: KpiTextColumns)
+        {
+            if (!std::exchange(firstColumn, false))
+                out += '\t';
+            out += name;
+        }
+        out += '\n';
+
+        for (auto const& row: KpiTable)
+        {
+            auto const readout = row.project(snapshot, history);
+            out += EscapeDelimited(row.key);
+            out += '\t';
+            AppendCellAsText(out, readout.value);
+            out += '\t';
+            out += EscapeDelimited(CellFormatTable[static_cast<std::size_t>(readout.format)].name);
+            out += '\t';
+            AppendCellAsText(out, readout.of);
+            out += '\n';
+        }
+    }
 
     /// The sentence a split of numbers needs beside it.
     constexpr std::string_view LeaseNote =
@@ -1941,6 +2202,11 @@ footer { margin-top:2.4rem; padding-top:1rem; border-top:1px solid var(--line);
 
 } // namespace
 
+std::span<std::string_view const> FleetKpiKeys() noexcept
+{
+    return KpiKeys;
+}
+
 std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
 {
     std::string out;
@@ -2003,10 +2269,14 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
     for (auto const& row: KpiTable)
     {
         auto const readout = row.project(snapshot, history);
+        // `CellAsText` rather than a preformatted string: the projection carries a
+        // number and its scale now, so the page dresses it the same way it dresses
+        // every other cell and an absent figure renders the same dash as an absent
+        // column does.
         out += std::format(R"(<div class="kpi"><span class="kpi-label">{}</span>)"
                            R"(<span class="kpi-value">{}<small>{}</small></span>)",
                            EscapeHtml(row.label),
-                           readout.value,
+                           CellAsText(readout.value, readout.format),
                            EscapeHtml(readout.unit));
         // Inlined rather than a seventh request: it is part of the tile's layout at
         // roughly two hundred bytes, and being inside the page is also what lets it
