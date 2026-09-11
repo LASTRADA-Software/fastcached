@@ -7,6 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+// For `std::llround`, which the KPI cells round with. MSVC pulls this in
+// transitively and libstdc++ does not, so its absence is a GCC/Clang-only build
+// failure that a green Windows build says nothing about -- measured, thirteen red
+// Linux legs against a clean MSVC tree.
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
