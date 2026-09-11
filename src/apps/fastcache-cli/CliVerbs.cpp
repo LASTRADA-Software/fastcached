@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliVerbs.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -1054,6 +1056,185 @@ namespace
         return Answered(std::move(*record));
     }
 
+    // -----------------------------------------------------------------------------
+    // The cluster verbs.
+    //
+    // Four verbs on the wire (`ClusterStatus`, `ClusterSet`, `ClusterForget`,
+    // `ClusterAdmit`), served on the node's ONE `0xFC` port since #290 -- so these need
+    // no new flag, no new address and no new transport. The working client that existed
+    // before them lives inside `fastcache-compile-node`, which is the problem: the
+    // natural way to run cluster admin on machines 2..40 is from the machine being
+    // provisioned, and `RunClusterAdmin` needs `--scheduler`, which is ALSO a startup
+    // flag -- so getting it into the unit file once points that node at one scheduler
+    // forever, because a registration replays its command line. A `--fleet-member`
+    // client (a laptop, a CI runner) has no node binary at all and could never ask.
+    //
+    // **Lifted, not duplicated, and the lift is smaller than it looks.** The encoders
+    // are already `CompileCacheWire`'s and the decoder is already `Cluster::`, both of
+    // them the single source of truth; the only rule that had two authors was reading a
+    // `NotLeader`, which is `LeaderRedirectTarget` now and is asked in `ExplainRefusal`
+    // so every node verb gets one spelling. `RenderClusterState` is deliberately NOT
+    // lifted: it is a fixed plain-text report for a person, and this tool's entire
+    // reason to exist is `--format=json|tsv|csv` and a cell that can say ABSENT. Two
+    // presentations of one wire is not duplication; two encodings would be.
+
+    /// The agreed members, as a table.
+    ///
+    /// Pure and separate from the handler so the reported SHAPE -- the column names an
+    /// operator greps for, which are a contract -- is testable without a socket.
+    /// @param state What the cluster has agreed.
+    /// @return The table.
+    [[nodiscard]] Value ClusterMembersTable(Cluster::ClusterState const& state)
+    {
+        std::vector<std::vector<Cell>> rows;
+        rows.reserve(state.members.size());
+        for (auto const& member: state.members)
+            // **Absent, not empty.** An empty `schedulerEndpoint` is the ORDINARY state
+            // of every member that has never led -- a leader announces its own record on
+            // election -- so it is a member that has not said, never a member reachable
+            // at the empty string. A blank cell would read as a rendering fault, and a
+            // zero would be a claim.
+            rows.push_back({ TextCell(member.id),
+                             TextCell(member.raftEndpoint),
+                             member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint) });
+
+        return TableValue({ "id", "raft", "scheduler" }, std::move(rows));
+    }
+
+    /// Every setting this build knows, with what the cluster has agreed for it.
+    ///
+    /// **Both questions in one table**, because an operator's real question is usually
+    /// *what CAN I set* and a report listing only what somebody had already set answers
+    /// it wrongly by omission -- which is the reasoning `RenderClusterState` records for
+    /// printing its own `known settings:` section.
+    ///
+    /// A setting the cluster has agreed and this build does not KNOW still gets a row,
+    /// with no summary. That is the state a fleet mid-upgrade is in -- a leader running
+    /// a newer build -- and dropping the row would hide a live fact because the reader
+    /// is the older binary.
+    /// @param state What the cluster has agreed.
+    /// @return The table.
+    [[nodiscard]] Value ClusterSettingsTable(Cluster::ClusterState const& state)
+    {
+        auto const agreed = [&state](std::string_view name) -> Cell {
+            auto const at = std::ranges::find(state.settings, name, &Cluster::Setting::name);
+            // Absent means *the cluster has agreed nothing for this*, which is a
+            // different fact from a value that happens to be empty.
+            return at == state.settings.end() ? AbsentCell() : TextCell(at->value);
+        };
+
+        std::vector<std::vector<Cell>> rows;
+        // An upper bound, and an exact one whenever the leader agrees nothing this build
+        // does not know -- which is every fleet that is not mid-upgrade.
+        rows.reserve(Cluster::SettingTable.size() + state.settings.size());
+        for (auto const& row: Cluster::SettingTable)
+            rows.push_back({ TextCell(std::string { row.name }), agreed(row.name), TextCell(std::string { row.summary }) });
+
+        for (auto const& setting: state.settings)
+        {
+            if (std::ranges::any_of(Cluster::SettingTable, [&setting](auto const& row) { return row.name == setting.name; }))
+                continue;
+            rows.push_back({ TextCell(setting.name), TextCell(setting.value), AbsentCell() });
+        }
+
+        return TableValue({ "name", "value", "summary" }, std::move(rows));
+    }
+
+    /// Ask the endpoint for the agreed cluster state.
+    ///
+    /// One door for both read verbs, so a refusal is worded once and the *format this
+    /// build cannot read* refusal cannot be spelled two ways.
+    /// @param context What to run against.
+    /// @return The state, or the answer to give instead.
+    [[nodiscard]] std::expected<Cluster::ClusterState, Answer> AskClusterState(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeClusterStatus());
+        if (!reply.has_value())
+            return std::unexpected(reply.error());
+
+        auto state = Cluster::DecodeState(reply->payload);
+        if (!state.has_value())
+            // A leader running a build whose state format this one does not know.
+            // REFUSED rather than rendered as an empty cluster: a partial read looks
+            // exactly like a fleet that admits nobody, and that would be read as a fact.
+            return std::unexpected(Concluded(
+                Outcome::Protocol,
+                std::format("{} answered cluster-status with a body this client cannot read", context.node->Address())));
+
+        return std::move(*state);
+    }
+
+    /// `cluster-members` -- who the cluster has agreed is in it.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ClusterMembers(VerbContext const& context)
+    {
+        auto const state = AskClusterState(context);
+        if (!state.has_value())
+            return state.error();
+        return Answered(ClusterMembersTable(*state));
+    }
+
+    /// `cluster-settings` -- what every member must agree on.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ClusterSettings(VerbContext const& context)
+    {
+        auto const state = AskClusterState(context);
+        if (!state.has_value())
+            return state.error();
+        return Answered(ClusterSettingsTable(*state));
+    }
+
+    /// What to report for a cluster change the leader accepted.
+    ///
+    /// **Appended, not committed, and the wording says so.** The leader cannot know the
+    /// difference until a majority answers, and a tool claiming otherwise is the one
+    /// thing a report like this must not do.
+    /// @return The record.
+    [[nodiscard]] Value ClusterChangeAccepted()
+    {
+        return RecordValue({ Field { .name = "accepted", .value = BooleanCell(true) },
+                             Field { .name = "state", .value = TextCell("replicating") } });
+    }
+
+    /// `cluster-set <name> <value>` -- change a replicated setting.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ClusterSet(VerbContext const& context)
+    {
+        auto const reply = AskNode(context,
+                                   CompileCacheWire::EncodeClusterSet(CompileCacheWire::ClusterSetRequest {
+                                       .name = context.operands[0], .value = context.operands[1] }));
+        if (!reply.has_value())
+            return reply.error();
+        return Answered(ClusterChangeAccepted());
+    }
+
+    /// `cluster-forget <id>` -- remove a member.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ClusterForget(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeClusterForget(context.operands[0]));
+        if (!reply.has_value())
+            return reply.error();
+        return Answered(ClusterChangeAccepted());
+    }
+
+    /// `cluster-admit <id> <raft-endpoint>` -- add a member, or move one.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ClusterAdmit(VerbContext const& context)
+    {
+        auto const reply = AskNode(context,
+                                   CompileCacheWire::EncodeClusterAdmit(CompileCacheWire::ClusterAdmitRequest {
+                                       .memberId = context.operands[0], .raftEndpoint = context.operands[1] }));
+        if (!reply.has_value())
+            return reply.error();
+        return Answered(ClusterChangeAccepted());
+    }
+
     /// The verbs, in the order `--help` documents them.
     constexpr auto VerbTable = std::to_array<VerbSpec>({
         { .name = "get",
@@ -1270,6 +1451,67 @@ namespace
           .protocolCommand = "node-metrics",
           .modifiers = Modifier::None,
           .handler = &NodeMetrics,
+          .nodeFallback = nullptr },
+
+        // The cluster verbs. FIVE rows over FOUR wire verbs, because `ClusterStatus`
+        // answers two questions an operator asks separately -- who is in the cluster,
+        // and what it has agreed -- and this tool's unit is a table that `--format=json`
+        // can carry. One verb returning a members table and a settings table would have
+        // to nest one inside the other, which `Field::value` is a `Cell` precisely to
+        // forbid; one verb returning a union of both would need a discriminating column
+        // nobody wants to filter on.
+        { .name = "cluster-members",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "who the cluster has agreed is a member, and where each\n"
+                     "answers; a member that has never led shows no scheduler",
+          .protocolCommand = "cluster-status",
+          .modifiers = Modifier::None,
+          .handler = &ClusterMembers,
+          .nodeFallback = nullptr },
+        { .name = "cluster-settings",
+          .wire = Wire::Node,
+          .minOperands = 0,
+          .maxOperands = 0,
+          .operands = "",
+          .summary = "every setting this build knows and what the cluster has\n"
+                     "agreed for it; absent means nothing has been agreed",
+          .protocolCommand = "cluster-status",
+          .modifiers = Modifier::None,
+          .handler = &ClusterSettings,
+          .nodeFallback = nullptr },
+        { .name = "cluster-set",
+          .wire = Wire::Node,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <name> <value>",
+          .summary = "change a replicated setting; the leader refuses a name\n"
+                     "it does not know rather than agreeing to nothing",
+          .protocolCommand = "cluster-set",
+          .modifiers = Modifier::None,
+          .handler = &ClusterSet,
+          .nodeFallback = nullptr },
+        { .name = "cluster-forget",
+          .wire = Wire::Node,
+          .minOperands = 1,
+          .maxOperands = 1,
+          .operands = " <member-id>",
+          .summary = "remove a member from the agreed set",
+          .protocolCommand = "cluster-forget",
+          .modifiers = Modifier::None,
+          .handler = &ClusterForget,
+          .nodeFallback = nullptr },
+        { .name = "cluster-admit",
+          .wire = Wire::Node,
+          .minOperands = 2,
+          .maxOperands = 2,
+          .operands = " <member-id> <raft-endpoint>",
+          .summary = "add a member, or record that one has moved",
+          .protocolCommand = "cluster-admit",
+          .modifiers = Modifier::None,
+          .handler = &ClusterAdmit,
           .nodeFallback = nullptr },
 
         // The memcached text verbs. Everything below this line is unavailable against a

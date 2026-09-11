@@ -2,6 +2,8 @@
 #include "CliVerbs.hpp"
 #include "ScriptedExchange.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -310,7 +312,12 @@ TEST_CASE("Every node verb declares the 0xFC wire and needs only that connection
     // The positive half, and it is not decoration: every `CHECK` in the loop below is
     // vacuous over an empty set, so a renamed enumerator would leave this case green and
     // testing nothing.
-    CHECK(nodeVerbs.size() == 2);
+    //
+    // NOT a count. It was `== 2`, which is a hand-kept census of a DERIVED set and is a
+    // second claim about the verb table rather than a check on it -- it went red the
+    // moment the cluster verbs arrived, having found nothing wrong. Non-emptiness is the
+    // whole of what the vacuity argument needs.
+    CHECK_FALSE(nodeVerbs.empty());
 
     auto const& row = WireTable[static_cast<std::size_t>(Wire::Node)];
     CHECK(row.needsNode);
@@ -324,10 +331,24 @@ TEST_CASE("Every node verb declares the 0xFC wire and needs only that connection
 
     for (auto const* const verb: nodeVerbs)
     {
+        INFO("verb: " << verb->name);
+
+        // `--ttl`, `--nx`, `--xx`, `--raw` and `--all` are keyspace concepts and a node
+        // holds no keyspace, so a node verb honouring one would be a flag the parser
+        // accepts and the handler cannot act on.
         CHECK(verb->modifiers == Modifier::None);
-        CHECK(verb->minOperands == 0);
-        CHECK(verb->maxOperands == 0);
+
+        // Every node verb names the `0xFC` verb it sends. It is what the per-verb help
+        // renders and what a reader matches against `CompileCacheWire`'s own table.
         CHECK_FALSE(verb->protocolCommand.empty());
+
+        // The arity was pinned at `0, 0` here, which was true of the two verbs that
+        // existed and was never a property of the wire: `cluster-set` takes a name and a
+        // value. What IS a property is that the bounds describe a range -- a row whose
+        // minimum exceeds its maximum accepts nothing at all, and `OperandCountAccepted`
+        // would refuse every invocation of it with a message naming an arity no operand
+        // count can satisfy.
+        CHECK(verb->minOperands <= verb->maxOperands);
     }
 }
 
@@ -491,4 +512,242 @@ TEST_CASE("Exactly one verb carries a 0xFC fallback today, and it is `version`",
     // And the control that says the census could have found more: every node verb was
     // examined, so an empty `Verbs()` would fail here rather than passing vacuously.
     CHECK(Verbs().size() > 20);
+}
+
+// ---------------------------------------------------------------------------------
+// The cluster verbs
+// ---------------------------------------------------------------------------------
+
+namespace
+{
+
+/// A framed `ClusterStatus` reply carrying @p state.
+/// @param state What the cluster has agreed.
+/// @return The reply frame.
+[[nodiscard]] std::vector<std::byte> ClusterStatusReply(Cluster::ClusterState const& state)
+{
+    return Cc::EncodeReply(Cc::Status::Ok, Cluster::Encode(state));
+}
+
+/// The rows of a table answer.
+/// @param answer The answer.
+/// @return Its rows; empty when it is not a table.
+[[nodiscard]] std::vector<std::vector<Cell>> const& RowsOf(Answer const& answer)
+{
+    REQUIRE(answer.value.shape == Shape::Table);
+    return answer.value.rows;
+}
+
+/// The index of @p column in a table answer.
+/// @param answer The answer.
+/// @param column The column name.
+/// @return Its index.
+[[nodiscard]] std::size_t ColumnOf(Answer const& answer, std::string_view column)
+{
+    REQUIRE(answer.value.shape == Shape::Table);
+    auto const at = std::ranges::find(answer.value.columns, column);
+    INFO("column: " << column);
+    REQUIRE(at != answer.value.columns.end());
+    return static_cast<std::size_t>(std::ranges::distance(answer.value.columns.begin(), at));
+}
+
+/// Every advisory joined, for a `contains` check.
+///
+/// A refusal's sentence is an ADVISORY here rather than a field of `Answer` -- remarks
+/// go to stderr in every format so stdout stays parseable -- and which advisory carries
+/// it is not a property worth pinning.
+/// @param answer The answer.
+/// @return The advisories, newline separated.
+[[nodiscard]] std::string AdvisoryText(Answer const& answer)
+{
+    std::string out;
+    for (auto const& advisory: answer.advisories)
+    {
+        out += advisory;
+        out.push_back('\n');
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("cluster-members reports who the cluster agreed on, and an unled member as ABSENT", "[cli][node][cluster]")
+{
+    // The two states a `schedulerEndpoint` has, side by side in one reply. A member that
+    // has never led carries none -- a leader announces its own record on election -- so
+    // the empty string is the ORDINARY case and rendering it as a value would hand an
+    // operator an address to paste that reaches nothing.
+    ScriptedNodeExchange node { { ClusterStatusReply(
+        { .members = { { .id = "node-a", .raftEndpoint = "10.0.0.7:6675", .schedulerEndpoint = "10.0.0.7:6674" },
+                       { .id = "node-b", .raftEndpoint = "10.0.0.8:6675", .schedulerEndpoint = {} } },
+          .settings = {} }) } };
+
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 2);
+
+    auto const id = ColumnOf(answer, "id");
+    auto const raft = ColumnOf(answer, "raft");
+    auto const scheduler = ColumnOf(answer, "scheduler");
+
+    CHECK(rows[0][id].lexical == "node-a");
+    CHECK(rows[0][raft].lexical == "10.0.0.7:6675");
+    CHECK_FALSE(rows[0][scheduler].kind == CellKind::Absent);
+    CHECK(rows[0][scheduler].lexical == "10.0.0.7:6674");
+
+    // The discrimination. Asserting only that the cell is empty would pass under a
+    // renderer that dropped the absent marker, which is the bug worth catching: an empty
+    // TSV field collapses under `IFS=$'\t' read` and shifts every field after it.
+    CHECK(rows[1][id].lexical == "node-b");
+    CHECK(rows[1][scheduler].kind == CellKind::Absent);
+}
+
+TEST_CASE("cluster-settings names every key this build knows, set or not", "[cli][node][cluster]")
+{
+    // An operator's real question is usually *what CAN I set*, and a report listing only
+    // what somebody already set answers it wrongly by omission.
+    REQUIRE_FALSE(Cluster::SettingTable.empty());
+    auto const known = std::string { Cluster::SettingTable[0].name };
+
+    ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {} }) } };
+
+    auto const answer = RunNodeVerb("cluster-settings", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    auto const name = ColumnOf(answer, "name");
+    auto const value = ColumnOf(answer, "value");
+
+    // Every row of the build's table is present although the cluster agreed nothing.
+    CHECK(rows.size() >= Cluster::SettingTable.size());
+    auto const row = std::ranges::find(rows, known, [name](auto const& r) { return r[name].lexical; });
+    REQUIRE(row != rows.end());
+
+    // ABSENT, not empty: *the cluster has agreed nothing for this* is a different fact
+    // from a setting whose agreed value happens to be the empty string.
+    CHECK((*row)[value].kind == CellKind::Absent);
+}
+
+TEST_CASE("cluster-settings keeps a setting this build does not know", "[cli][node][cluster]")
+{
+    // A fleet is permanently mid-upgrade, so the leader may have agreed a key this
+    // client's table has never heard of. Dropping the row would hide a live fact
+    // because the READER is the older binary -- and the operator would be told the
+    // cluster agrees something it does not.
+    ScriptedNodeExchange node { { ClusterStatusReply(
+        { .members = {}, .settings = { { .name = "a-key-from-a-newer-build", .value = "7" } } }) } };
+
+    auto const answer = RunNodeVerb("cluster-settings", node);
+    CHECK(answer.outcome == Outcome::Affirmative);
+
+    auto const& rows = RowsOf(answer);
+    auto const name = ColumnOf(answer, "name");
+    auto const value = ColumnOf(answer, "value");
+    auto const summary = ColumnOf(answer, "summary");
+
+    auto const row = std::ranges::find(rows, std::string_view { "a-key-from-a-newer-build" }, [name](auto const& r) {
+        return std::string_view { r[name].lexical };
+    });
+    REQUIRE(row != rows.end());
+    CHECK((*row)[value].lexical == "7");
+    // No summary, because this build genuinely has none. Absent rather than invented.
+    CHECK((*row)[summary].kind == CellKind::Absent);
+}
+
+TEST_CASE("a cluster change reports ACCEPTED, never committed", "[cli][node][cluster]")
+{
+    // The leader cannot know whether a change committed until a majority answers, so a
+    // tool claiming it did is the one thing a report like this must not do.
+    for (auto const& spec:
+         { std::pair { std::string_view { "cluster-set" }, std::vector<std::string> { "fleet-open", "1" } },
+           std::pair { std::string_view { "cluster-forget" }, std::vector<std::string> { "node-b" } },
+           std::pair { std::string_view { "cluster-admit" }, std::vector<std::string> { "node-c", "10.0.0.9:6675" } } })
+    {
+        INFO("verb: " << spec.first);
+        // A typed empty payload: `{}` is ambiguous against `std::span`, and these three
+        // verbs are acknowledged with a reply that carries no body at all.
+        std::vector<std::byte> const noPayload;
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+        auto const answer = RunNodeVerb(spec.first, node, spec.second);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "state").lexical == "replicating");
+    }
+}
+
+TEST_CASE("NotLeader is followed to the endpoint it names, and separated from an election", "[cli][node][cluster]")
+{
+    // ONE code, TWO opposite facts, and only *does this message parse as an address*
+    // separates them -- an empty message never reaches the wire, being replaced by the
+    // error table's default sentence, so testing for empty gets neither.
+    SECTION("a message that parses names where to ask instead")
+    {
+        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::NotLeader, "10.0.0.9:6674") } };
+        auto const answer = RunNodeVerb("cluster-members", node);
+        CHECK(answer.outcome == Outcome::Refused);
+        CHECK(AdvisoryText(answer).contains("10.0.0.9:6674"));
+        CHECK(AdvisoryText(answer).contains("does not lead"));
+    }
+
+    SECTION("a message that does not parse is an election, and offers no address")
+    {
+        // **Splitting is not parsing.** `SplitHostPort` takes the LAST colon, so this
+        // sentence splits into a host and a port of ` try again` -- and a client that
+        // dialled it would spend a hop the real leader never hears. The assertion is
+        // that no address is offered, which is what separates the two arms; asserting
+        // only that the diagnostic mentions the leader passes under both.
+        ScriptedNodeExchange node { { RefusalReply(Cc::ErrorCode::NotLeader, "no leader: try again") } };
+        auto const answer = RunNodeVerb("cluster-members", node);
+        CHECK(answer.outcome == Outcome::Refused);
+        CHECK(AdvisoryText(answer).contains("no leader is known"));
+        CHECK_FALSE(AdvisoryText(answer).contains("ask "));
+    }
+}
+
+TEST_CASE("a cluster reply this build cannot read is REFUSED, not rendered as an empty cluster", "[cli][node][cluster]")
+{
+    // A partial read looks exactly like a fleet that admits nobody, and that would be
+    // read as a fact rather than as a failure to decode.
+    std::vector<std::byte> const notAClusterState { std::byte { 0xFF }, std::byte { 0xFE } };
+    ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, notAClusterState) } };
+
+    auto const answer = RunNodeVerb("cluster-members", node);
+    CHECK(answer.outcome == Outcome::Protocol);
+    CHECK(AdvisoryText(answer).contains("cannot read"));
+}
+
+TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node][cluster]")
+{
+    // The bytes, not only the outcome: a verb that parsed, dialled and sent the WRONG
+    // opcode is answered by the leader and does something else entirely -- and every
+    // assertion about the rendered answer passes, because the reply is scripted.
+    struct Expectation
+    {
+        std::string_view verb;
+        std::vector<std::string> operands;
+        Cc::Op op;
+    };
+
+    for (auto const& expectation:
+         { Expectation { .verb = "cluster-members", .operands = {}, .op = Cc::Op::ClusterStatus },
+           Expectation { .verb = "cluster-settings", .operands = {}, .op = Cc::Op::ClusterStatus },
+           Expectation { .verb = "cluster-set", .operands = { "fleet-open", "1" }, .op = Cc::Op::ClusterSet },
+           Expectation { .verb = "cluster-forget", .operands = { "node-b" }, .op = Cc::Op::ClusterForget },
+           Expectation { .verb = "cluster-admit", .operands = { "node-c", "10.0.0.9:6675" }, .op = Cc::Op::ClusterAdmit } })
+    {
+        INFO("verb: " << expectation.verb);
+        ScriptedNodeExchange node { { ClusterStatusReply({ .members = {}, .settings = {} }) } };
+        (void) RunNodeVerb(expectation.verb, node, expectation.operands);
+
+        REQUIRE(node.Sent().size() == 1);
+        auto const header = Cc::DecodeRequestHeader(node.Sent()[0]);
+        REQUIRE(header.has_value());
+        // `opRaw` and not an `Op`: the header decoder deliberately hands back the BYTE,
+        // unvalidated against `OpTable`, so a verb this build does not carry is still
+        // readable. Compared against the enumerator's value, which pins the byte as well
+        // as the name -- a wire constant has two facts and a symbol both ends spell can
+        // only test the first.
+        CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(expectation.op));
+    }
 }

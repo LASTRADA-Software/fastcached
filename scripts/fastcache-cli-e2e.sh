@@ -158,6 +158,15 @@ expect_stderr() {
     }
 }
 
+# Assert the last run's stderr does NOT contain a fixed string.
+# $1 the string, $2 what was being checked.
+refute_stderr() {
+    if grep -qF -- "$1" "$WORK/err"; then
+        e2e_note "stderr: $(cat "$WORK/err")"
+        fail "$2: stderr unexpectedly contains '$1'"
+    fi
+}
+
 # ---------------------------------------------------------------------------------
 # case 1: the daemon answers at all
 # ---------------------------------------------------------------------------------
@@ -605,6 +614,39 @@ else
     # client that dropped zeroes would report almost nothing here and still exit 0 --
     # which is the failure a check for one non-zero counter cannot see.
     expect_stdout_line "_total +0\$" "a counter that never moved is reported as 0"
+
+    echo "==> case 11b: a cluster verb against a node that runs no scheduler"
+
+    # This node was started with no `--serve-scheduler` and no `--listen-raft`, so it
+    # runs neither the scheduler tier nor consensus and cannot answer a cluster verb.
+    # **The point is that it says so.** A verb the endpoint does not implement is
+    # refused BY NAME, which is the whole of what `fastcache-cli` gained in #1275 -- a
+    # client that reported *the server closed the connection without answering* was
+    # describing what happened rather than what to do.
+    #
+    # Exit 4 and not 5: bytes this client understood perfectly came back, so the
+    # endpoint was REACHED. A script reads the exit code and nothing else, and telling
+    # it the port is dead is this enum's own state collapse surviving in the half
+    # nobody looks at.
+    run_node cluster-members
+    expect_status 4 "a cluster verb against a non-scheduler node is refused, not unreachable"
+    expect_stderr "cluster-members" "the refusal names the verb that was asked"
+    expect_stderr "127.0.0.1:$nodePort" "and the endpoint that refused it"
+    refute_stderr "closed the connection" "it is a refusal, not a silent close"
+
+    # Every one of the five reaches the wire and comes back named. Asserting one would
+    # leave four able to send an opcode the node answers differently -- and a scripted
+    # reply cannot catch that, because the script answers whatever it is asked.
+    for clusterVerb in cluster-settings cluster-set cluster-forget cluster-admit; do
+        case "$clusterVerb" in
+            cluster-set) run_node "$clusterVerb" fleet-open 1 ;;
+            cluster-forget) run_node "$clusterVerb" node-z ;;
+            cluster-admit) run_node "$clusterVerb" node-z 127.0.0.1:1 ;;
+            *) run_node "$clusterVerb" ;;
+        esac
+        expect_status 4 "$clusterVerb is refused by name"
+        expect_stderr "$clusterVerb" "$clusterVerb names itself in its refusal"
+    done
 
     echo "==> case 12: version is ANSWERED by a node, not merely explained"
 

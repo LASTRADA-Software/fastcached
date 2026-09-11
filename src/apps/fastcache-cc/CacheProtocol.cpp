@@ -4,6 +4,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/TcpClient.hpp>
+#include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <format>
 #include <utility>
@@ -271,21 +272,15 @@ Task<CacheOutcome> ExchangeFramed(ISocket* client,
 
 std::optional<std::string> RedirectTarget(CacheOutcome const& outcome)
 {
-    if (outcome.kind != CacheOutcomeKind::Rejected || outcome.code != Wire::ErrorCode::NotLeader)
+    // The KIND is this layer's question -- only a `Rejected` outcome carries a code at
+    // all -- and what the code and the message MEAN is `LeaderRedirectTarget`'s, which
+    // three binaries now ask rather than two answering separately (#237).
+    if (outcome.kind != CacheOutcomeKind::Rejected)
         return std::nullopt;
-    // `ParseDialEndpoint`, which is where the reasoning lives: splitting is not
-    // parsing, an empty host names nobody, and a bare port would send the client
-    // back to itself. Asked through that helper rather than re-derived here because
-    // it is also what `DialEndpoint` asks of this very string a moment later -- two
-    // spellings of "is this an address" would eventually disagree, and the hop is
-    // wasted either way round.
-    //
-    // The message itself is returned rather than the parse: the endpoint travels on
-    // to `DialEndpoint`, which splits it again, and handing back a re-joined form
-    // would be this layer normalising text the scheduler chose.
-    if (!ParseDialEndpoint(outcome.message).has_value())
+    auto const target = LeaderRedirectTarget(outcome.code, outcome.message);
+    if (!target.has_value())
         return std::nullopt;
-    return outcome.message;
+    return std::string { *target };
 }
 
 std::string DescribeOutcome(CacheOutcome const& outcome)
