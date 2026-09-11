@@ -5676,3 +5676,58 @@ if(NOT WIN32)
         TIMEOUT 60
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Every Catch2 test BINARY is sanitized or exempt with a written reason (#1209).
+#
+# `tsan-scope-hygiene` above asks whether a scoped test CASE carries a tag the
+# gate selects. That is a question about cases inside binaries the gate already
+# runs, so it could not see `fastcache-cc-tests`, which was in no row at all: the
+# launcher does not link the FastCache library, so no tag expression could ever
+# have reached it.
+#
+# Derived, not tabulated. The set comes from the `catch_discover_tests(`
+# registrations under `src/`, and the covered set from the gate's own `TARGETS`
+# table read through `check-tsan-scope.cmake` -- so this check holds a copy of
+# neither. That matters because #1209's own hand census listed four test binaries
+# where the tree registers six.
+#
+# In the default set: it reads twelve CMakeLists.txt files and spawns nothing.
+add_test(
+    NAME "tsan-binaries"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-binaries.cmake"
+)
+set_tests_properties("tsan-binaries" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# That check's own decisions, driven over synthetic trees.
+#
+# `tsan-binaries` runs it against THIS tree, where a green run is equally
+# consistent with the check working and with its reader having quietly stopped
+# matching -- and the subject IS a binary nobody noticed, so those two produce the
+# same clean line. The comment-stripping pair is the sharp case: a reader that
+# strips nothing and a reader that strips everything both pass the refusing arm,
+# and only the accepting twin separates them.
+#
+# The trees are staged from the shipped exemption rows and from the real
+# `scripts/tsan-gate.sh`, including one case that DELETES a gate row and requires
+# the binary it named to go uncovered -- which is what proves the check reads the
+# gate rather than carrying its own idea of what runs.
+add_test(
+    NAME "tsan-binaries-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/tsan-binaries-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-binaries-selftest.cmake"
+)
+set_tests_properties("tsan-binaries-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)

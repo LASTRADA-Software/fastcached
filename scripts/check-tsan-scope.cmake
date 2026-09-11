@@ -217,6 +217,50 @@ if(NOT sawTable OR inTable)
         "${CMAKE_CURRENT_LIST_FILE}.")
 endif()
 
+# The row's NAME, beside its tags. `check-tsan-binaries.cmake` needs the set of
+# binaries the gate RUNS and must not keep a copy of it: this is the one place
+# the table is parsed, and it is parsed above the definitions-only return so an
+# includer gets both halves from one reader. A second parser is a second thing to
+# be wrong, and one that had drifted would agree with itself perfectly every run.
+#
+# Sliced by POSITION rather than matched with a regex naming a quote character,
+# for the same reason the table is walked with FIND/SUBSTRING above: this reader
+# stays free of the escaping the surrounding file argues against, and a row is
+# `"name|tagExpression"` by construction -- the parser refuses the table outright
+# if it is not.
+set(FastCachedTsanGateTargets "")
+foreach(row IN LISTS targetRows)
+    string(LENGTH "${row}" rowLength)
+    if(rowLength LESS 3)
+        message(FATAL_ERROR
+            "check-tsan-scope: the TARGETS table in ${FastCachedTsanGate} holds "
+            "an empty row.\n"
+            "Every row is `\"name|tagExpression\"`; an empty one is a row that "
+            "names no binary, which would silently shrink the sanitized scope. "
+            "The rule lives in ${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
+    math(EXPR rowInnerLength "${rowLength} - 2")
+    string(SUBSTRING "${row}" 1 ${rowInnerLength} rowName)
+    string(FIND "${rowName}" "|" rowBar)
+    if(rowBar EQUAL -1)
+        message(FATAL_ERROR
+            "check-tsan-scope: the TARGETS row ${row} carries no `|`.\n"
+            "A row is `\"name|tagExpression\"` and the separator is what tells a "
+            "binary name from a tag expression -- a row without one would be read "
+            "as a target called `${rowName}` run with no tags, which is a "
+            "different and much wider scope than whoever wrote it meant. The rule "
+            "lives in ${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
+    string(SUBSTRING "${rowName}" 0 ${rowBar} rowName)
+    if(rowName STREQUAL "")
+        message(FATAL_ERROR
+            "check-tsan-scope: the TARGETS row ${row} names no binary before its "
+            "`|`.\n"
+            "The rule lives in ${CMAKE_CURRENT_LIST_FILE}.")
+    endif()
+    list(APPEND FastCachedTsanGateTargets "${rowName}")
+endforeach()
+
 set(FastCachedTsanScopeTags "")
 foreach(row IN LISTS targetRows)
     # "name|[a],[b]" -> [a],[b] -> a;b

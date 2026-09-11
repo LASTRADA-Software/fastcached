@@ -216,9 +216,40 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # -- two are `CliParser: --tls captures cert and key paths` and a `Server:` TLS
 # metrics case -- so `[tls]` reaches a little outside the directory it is named
 # for. This paragraph said "three `TlsContext` cases" until it was asked.
+# THE THIRD ROW, and why it is run whole (#1209). `fastcache-cc-tests` was in no
+# row: the launcher does not link the FastCache library, so it is a separate
+# binary that the two rows above cannot reach however the tags are written. Its
+# concurrency is one file, `src/apps/fastcache-cc/CompileJob_test.cpp` -- jthreads
+# over `OverlappingEchoRunner::Overlap` behind a `std::latch`, and a toolchain
+# replacement landing mid-compile against a dangling iterator -- so a tag
+# expression would buy nothing here: the whole binary is 3 s sanitized, measured
+# three times, against 18.8 s for the two rows above. A tag scope is what you
+# reach for when running everything is expensive, and here it is not.
+#
+# MEASURED BEFORE THE ROW WAS ADDED, which is what #1209 asks for -- a row added
+# blind turns this job red for the next person. On 9a01737b, Linux, clang-22,
+# `-DFASTCACHED_ENABLE_TLS=ON`, `detect_deadlocks=0`:
+#
+#     objects carrying an undefined `__tsan_init`   82 of 82
+#     whole binary, gate's own TSAN_OPTIONS         exit 0, 716 cases, 0 warnings
+#     40 runs of `[compile-job]`                    40 clean, 0 findings
+#
+# **That last line is a bound, not an absence.** Zero findings in forty runs puts
+# the per-run rate under roughly 7% at 95%; it does not say there is no race, and
+# a latch-driven window is exactly the shape that hides below such a bound. #1209
+# predicted this first sanitized run would report races the way widening the tag
+# scope did (#1207, #1208). It did not, and that is worth stating as a measurement
+# rather than as a conclusion about the code.
+#
+# The instrumentation figure is the one that cannot be read off the binary: the
+# link pulls in the sanitizer runtime whole, so `__tsan_init` is present in an
+# executable whose translation units carried no `-fsanitize=` at all (#472). It is
+# the OBJECTS that answer, and the reading was controlled in both directions -- a
+# plain TU compiled without the flag reads 0 and the same TU with it reads 1.
 TARGETS=(
     "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]"
     "fastcache-compile-node-tests|"
+    "fastcache-cc-tests|"
 )
 
 # What this gate DID, one entry per row of TARGETS above.
