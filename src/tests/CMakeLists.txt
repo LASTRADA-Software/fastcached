@@ -2598,6 +2598,28 @@ set_tests_properties("tsan-scope-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# The scope check's own decisions, driven over synthetic trees. `tsan-scope-hygiene`
+# above runs it against THIS tree, where a green run is equally consistent with the
+# check working and with the check having quietly stopped reading -- #317 is exactly
+# that, a file-level match reporting COVERED over a case that had left the scope.
+#
+# The trees are staged from the check's own `FastCachedTsanScope` and copies of the
+# real `scripts/tsan-gate.sh` and root `CMakeLists.txt`, so the cases drive the
+# shipped table and the shipped tag expression rather than a second copy of either.
+add_test(
+    NAME "tsan-scope-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/tsan-scope-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-scope-selftest.cmake"
+)
+set_tests_properties("tsan-scope-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # CI scope classification. `scripts/ci-scope.sh` decides whether a pull request
 # compiles anything at all: the `changes` job in .github/workflows/build.yml reads
 # its `code=` output, and every heavy job is gated on it.

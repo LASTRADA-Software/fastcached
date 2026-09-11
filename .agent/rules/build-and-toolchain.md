@@ -4908,33 +4908,15 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#316](https://github.com/LASTRADA-Software/fastcached/issues/316)** — the TSan
-  gate **does not scan the module the race it knew about actually lived in.** Its
-  scope is three directories (`Async`, `Consensus`, `Distributed`), and the race
-  was in `BlockingListener::Close` — a `Net/` class. It reached the gate at all
-  only because the node binary happens to be run whole.
-  **`.tsan-suppressions` no longer carries it**, and no longer carries anything:
-  #260 fixed the race and deleting its entry was part of closing it, so the
-  original wording here — that the gate carries a suppression naming the very
-  thing that could break — has gone false. The SCOPE argument has not: a
-  regression reached through a `Net/` unit test in `FastCacheTest` is still
-  selected by no tag this gate uses. `Net/` and
-  `Cache/` also spawn threads in `ThreadedAddressResolver_test.cpp`,
-  `HealthProbe_test.cpp`, `EpollSocket_test.cpp`, `ShardedStorage_test.cpp`
-  (`[sharded][concurrency][stress]`, the tree's one explicit concurrency stress
-  case) and `Core/Clock_test.cpp` — none selected by the gate's tags, none in
-  `FastCachedTsanScopeDirs`, so `check-tsan-scope` does not flag them either.
-- **[#317](https://github.com/LASTRADA-Software/fastcached/issues/317)** —
-  `scripts/check-tsan-scope.cmake` proves a FILE is in scope, not a test CASE: one
-  selected tag anywhere in a file covers it, so a case added to
-  `Distributed/FleetHistory_test.cpp` tagged only `[fleetchart]` leaves the
-  sanitized scope while the check reports covered. Same shape as the bug the file
-  exists for, one level down. Closing it means matching each
-  `TEST_CASE`/`TEST_CASE_METHOD`/`SCENARIO` tag string, which
-  `check-test-names.cmake` already has the macro pattern for — with the wrinkle
-  that the tag string is usually on the line *after* the macro.
-- **[#312](https://github.com/LASTRADA-Software/fastcached/issues/312)** — the TSan
-  scope is a bash tag table (`TARGETS` in `scripts/tsan-gate.sh`, cross-checked by
-  `scripts/check-tsan-scope.cmake`) rather than a `ctest -L` selection, because this
-  project's Catch2 (3.6) predates `ADD_TAGS_AS_LABELS` and so exports no tag to
-  CTest. When Catch2 moves, both collapse into a label filter.
+- **[#1209](https://github.com/LASTRADA-Software/fastcached/issues/1209)** — the TSan
+  gate's `TARGETS` table names two of this tree's Catch2 test binaries, and
+  `fastcache-cc-tests` is not one of them. `src/apps/fastcache-cc/CompileJob_test.cpp`
+  spawns threads deliberately — a latch-synchronised overlap case, and a
+  `ReplaceToolchains` landing mid-compile whose own comment says the obvious
+  arrangement "would pass against the dangling iterator too" — and has never run under
+  ThreadSanitizer. Left out of #316 rather than folded into it because it costs a
+  `TARGETS` row AND a build target in the `clang-tsan` job, which that job's comment
+  accounts for as deliberately skipped. Expect to file races rather than to flip a
+  switch: #316's own widening surfaced #1207 and #1208 on its first run, neither of
+  them new code. `check-tsan-scope.cmake` cannot see this — it enforces that scoped
+  CASES carry a selected tag and says nothing about which BINARIES run.

@@ -58,7 +58,12 @@
 #   a target exits 0 with no assertions   -> "refusing to call that clean"
 #   a target runs past its deadline       -> "did not finish within"
 #   a target cannot be executed           -> "ran no cases at all"
-#   an unsuppressed race                  -> "reported an unsuppressed data race"
+#   an unsuppressed TSan finding          -> "reported an unsuppressed ThreadSanitizer finding"
+#
+# That last row said "reported an unsuppressed data race" while the code emitted
+# it for EVERY warning kind. It is the right-hand column that makes this table
+# worth having, so a row naming a phrase the code no longer prints is worse than
+# no row: it is a grep that comes back empty on a run that did refuse (#1251).
 #
 # The right-hand column is what a reader GREPS the output for, so each phrase is
 # contiguous in the message it names -- a phrase the code only emits across a
@@ -83,25 +88,51 @@
 # TARGETS table below runs zero cases, and every other signal in the run says
 # clean.
 #
-# **The suite is scoped, and `ctest` has no vocabulary for the scope.** The
-# concurrency in this tree is in `Async`, `Consensus`, `Distributed` and the node.
+# **The suite is scoped, and `ctest` has no vocabulary for the scope.**
 # `catch_discover_tests` registers cases by NAME and this project's Catch2 (3.6)
 # predates `ADD_TAGS_AS_LABELS`, so there is no ctest label to select on and the
 # scope has to be a Catch2 tag expression (issue #312). Running the two binaries
 # directly also collapses ~700 sanitized processes into two: measured at 1.2s and
 # 17.6s against several minutes of per-process runtime startup.
 #
-# The tag list is NOT self-evidently the right one, and an earlier version of it
-# was wrong: `[async],[consensus],[distributed]` looks complete and silently
-# excluded six of ten `Async/` test files, because the reactor and coroutine tests
-# are tagged `[reactor]` and `[task]` and carry no `[async]`. It matched 511 cases
-# and they passed. Nothing in the run could have said otherwise.
+# Those two figures are from BEFORE #316 widened the tag list, when the filter
+# matched the smaller scope whose count is recorded beside TARGETS below --
+# stated once, there, because a figure written twice in one file is two things to
+# be wrong and they drift. They are kept because what they are cited for is the
+# COLLAPSE, which a scope around two-fifths larger does not undo, and they are
+# deliberately NOT restated as today's cost. Nobody has re-measured this on a
+# quiet host, and a figure taken on a box running three other builds would be a
+# worse claim than a stale one that says which scope it was taken at.
+#
+# The tag list is NOT self-evidently the right one, and it has been wrong twice.
+#
+# The first version, `[async],[consensus],[distributed]`, looks complete and
+# silently excluded six of ten `Async/` test files, because the reactor and
+# coroutine tests are tagged `[reactor]` and `[task]` and carry no `[async]`. It
+# matched 511 cases and they passed. Nothing in the run could have said otherwise.
+#
+# The second, which those five tags fixed, was wrong about WHERE THE THREADS ARE
+# rather than about how a directory is spelled -- so the check written to enforce
+# the first correction could not see it (#316). `Async`, `Consensus` and
+# `Distributed` are not the only places this tree spawns one: a census of
+# `std::thread`/`std::jthread`/`std::async` over `FastCacheTest`'s own sources
+# names NINETEEN files, and ELEVEN of them were selected by no tag here and sat
+# in no directory `check-tsan-scope.cmake` scanned -- among them every threaded `Net/`
+# test, which is the module `BlockingListener` lives in and therefore the module
+# the one real race this gate has ever seen (#260) came out of. That race reached
+# the gate only because `fastcache-compile-node-tests` is run whole; a regression
+# of it reached through a `Net/` unit test in `FastCacheTest` was selected by
+# nothing. The scope now names those files, and the tags below are what SELECTS
+# them.
 #
 # So the tag list is not trusted here. `scripts/check-tsan-scope.cmake` runs in the
-# default ctest set and fails when a test file in one of those directories carries
-# no tag this expression selects. It reads the expression out of the TARGETS table
-# below rather than restating it, so the two cannot drift apart: a tag removed
-# from that table is a tag that check stops accepting, on its next run.
+# default ctest set and fails when a test in one of the scoped locations carries
+# no tag this expression selects. It reads the expression out of the
+# TARGETS table below rather than restating it, so the two cannot drift apart: a
+# tag removed from that table is a tag that check stops accepting, on its next
+# run. The two halves are independent and both are needed -- this table decides
+# what RUNS, that file decides what is CLAIMED, and a claim with no matching tag
+# is a case nobody sanitizes.
 #
 # **Known-open races need somewhere to live.** `.tsan-suppressions` is that place
 # and every entry names an issue; see the header of that file for why an entry is
@@ -137,8 +168,56 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # `scripts/check-tsan-scope.cmake` PARSES this table -- keep the
 # `"name|tagExpression"` shape, or that check fails by name rather than silently
 # enforcing an empty scope.
+#
+# Which tag reaches which threaded file, so that a tag removed here is removed
+# knowing what stops being sanitized (#316). Every `Net/` test file carries
+# `[net]`, which is what lets the scope name that whole directory rather than
+# picking threaded files out of it. The rest are per-file: `[sharded]` for
+# `Cache/ShardedStorage_test.cpp` (the tree's one explicit concurrency stress
+# case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`, `[clock]` for
+# `Core/Clock_test.cpp`, `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
+# `[server]` for the two threaded `Server/` files.
+#
+# MEASURED 2026-09-11 on 9c5cc374, Linux, with `-DFASTCACHED_ENABLE_TLS=ON` --
+# what the clang-tsan job passes, and the condition that decides the number:
+# without it the same commit builds 830 rather than 848, so counts taken at the
+# two settings were never comparable. Read from Catch2's OWN trailing
+# `N test cases` line:
+#
+#     before this widening   608
+#     after                  848      about two-fifths more
+#     [net] 134, [tls] 19, union 139  (14 carry both; 5 carry `[tls]` alone)
+#
+# The conditions are PINNED here rather than pointed at. They are one tree at one
+# instant, so a comment that tracked its source would one day claim this
+# measurement had been taken under conditions nobody measured it under.
+#
+# WHICH QUANTITY, as well as which conditions -- this comment previously said
+# "612 cases selected before, 871 after", in the language of selection, and those
+# were STATIC counts over the sources rather than what any binary selects. 612
+# still reproduces exactly that way; 871 reproduces neither way (the static count
+# is 861 today). A source count and a binary count answer different questions --
+# platform-guarded cases exist in one and not the other -- so a figure that does
+# not say which it is invites exactly the reconciliation that cannot succeed, and
+# one was attempted against these across two platforms before they were re-taken.
+#
+# NOT counted by counting indented `--list-tests` lines. That reports about
+# DOUBLE the figures above, because each case prints a name line and a tag line.
+# A lane that measured it that way undercounted its UNFILTERED total by exactly
+# the untagged cases while every FILTERED figure came out right, so the error hid
+# in precisely the numbers being used and showed only in the total.
+#
+# Two things the obvious reading of the above gets wrong, both measured rather
+# than reasoned. `Net/` holds 152 TEST_CASE-family macros in SOURCE, more than
+# the union above selects: the difference is cases behind platform guards this
+# Linux build does not compile, so the gap is two different questions rather than
+# an error, and a reader reconciling the two numbers should expect it.
+# And the five `[tls]`-only cases are neither all `TlsContext` nor all in `Net/`
+# -- two are `CliParser: --tls captures cert and key paths` and a `Server:` TLS
+# metrics case -- so `[tls]` reaches a little outside the directory it is named
+# for. This paragraph said "three `TlsContext` cases" until it was asked.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task]"
+    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]"
     "fastcache-compile-node-tests|"
 )
 
@@ -263,7 +342,34 @@ RenderTargetVerdicts() {
 # whose whole subject is not relying on unexercised behaviour, an `export` that
 # is unambiguous on every shell is worth more than a shorter line. It reaches
 # `nm` and `find` too, which read none of it.
-export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 suppressions=${SUPPRESSIONS}"
+# `detect_deadlocks=0` turns off TSan's LOCK-ORDER detector, and only that. The
+# race detector -- this gate's whole subject -- is untouched, which is asserted
+# rather than hoped: the canary still dies with exit 66 under this flag.
+#
+# It is off because the detector is UNSOUND in the arrangement this gate uses.
+# TSan identifies a mutex by its ADDRESS and never forgets one that has been
+# destroyed, and running hundreds of cases in ONE process recycles stack
+# addresses between them -- so two cases whose nested mutexes land on the same
+# two addresses in swapped roles produce `lock-order-inversion (potential
+# deadlock)` for objects that never coexisted. Measured on one pair here
+# (`TestReactor::_mutex` then `ManualClock::_mutex`, an order the source never
+# inverts): 9/40 and 11/40 in two samples with ASLR on, and 0/40 under
+# `setarch -R`, which is what makes ASLR the confirmed variable rather than a
+# story that fits. Reproduced standalone in 40 lines with no deadlock possible.
+#
+# NOT a `deadlock:` suppression, and that is the whole argument: a suppression
+# names a FUNCTION while the colliding pair is a property of STACK LAYOUT, so
+# the next collision is a different pair in different files and no finite list
+# closes it -- while each entry would also blind that function to a real
+# inversion. See #1251.
+#
+# What this does NOT say: that deadlock detection is worthless, or that master
+# is unaffected. Master's `clang-tsan` has been green at job level over the runs
+# checked, and the pair found here needs `[server]`, which only the widened
+# scope selects -- but nobody has measured whether a pair inside the narrower
+# expression collides, and that gap is recorded rather than read as safety.
+# Per-case `ctest` runs do not recycle addresses and keep the detector.
+export TSAN_OPTIONS="halt_on_error=0 exitcode=66 print_suppressions=1 detect_deadlocks=0 suppressions=${SUPPRESSIONS}"
 
 # Every wait is bounded, which is this repository's oldest testing rule. Running
 # the binaries directly rather than through `ctest` loses ctest's own per-test
@@ -718,9 +824,27 @@ RunTarget() {
     # passed" even when the process exits 66, so the exit code is what decides and
     # the output is only ever an explanation.
     if grep -q 'WARNING: ThreadSanitizer' "$log"; then
-        FailTarget "$name" "${name} reported an unsuppressed data race (exit ${rc}).
-    If this is a NEW race, it is its own issue -- file it. If it is a known one,
-    it belongs in .tsan-suppressions with its issue number, not deleted from here."
+        # NAME WHAT TSAN REPORTED, rather than calling every warning a race.
+        # TSan reports several kinds and this said "data race" for all of them:
+        # #1251 was a `lock-order-inversion`, and the message sent its reader
+        # hunting a race nobody had claimed, in a run where every Catch2 case
+        # had passed. Read from the log; an unparsable line says so instead of
+        # guessing, because a confidently wrong cause is what this whole script
+        # is written to avoid.
+        # CAPTURED, then first-lined without a pipe. `sed ... | head -1` is the
+        # SIGPIPE shape this repository keeps paying for: `head` leaves after one
+        # line, `sed` dies writing to a closed pipe, and under `pipefail` the
+        # pipeline reports SED's status -- 141 -- which `set -e` would then turn
+        # into the gate vanishing on its own failure path, where a reader is least
+        # able to tell what happened.
+        local kind kinds
+        kinds="$(sed -n 's/.*WARNING: ThreadSanitizer: \([a-z][a-z-]*\).*/\1/p' "$log")"
+        kind="${kinds%%$'\n'*}"
+        FailTarget "$name" "${name} reported an unsuppressed ThreadSanitizer finding (exit ${rc}): ${kind:-<the WARNING line did not parse; read the log>}.
+    If this is a NEW finding, it is its own issue -- file it. If it is a known
+    RACE, it belongs in .tsan-suppressions with its issue number, not deleted
+    from here. A finding that is not a race may not be a defect at all and may
+    not be suppressible by name: #1251 is the worked example."
     fi
     FailTarget "$name" "${name} failed (exit ${rc}) without a ThreadSanitizer report."
 }
@@ -1190,6 +1314,56 @@ command -v nm >/dev/null || fatal "nm is required to verify instrumentation"
     Move the checkout, or set TSAN_OPTIONS yourself and run the binaries by hand."
 
 note "build directory: ${BUILD_DIR}"
+
+# What this gate HANDS DOWN, which is not what it sets: it sets nothing. An
+# ignored signal disposition is inherited across fork and exec, and this gate
+# EXECS the suite where ctest would have spawned it -- ctest uses libuv, which
+# resets every disposition to the default in the child. #1229 was one case
+# asserting the absolute SIGPIPE disposition, failing here and passing four
+# other Linux legs on the same commit, with nothing in this log saying which
+# disposition the binaries had been handed. This is that line.
+#
+# Read with the shell's OWN `read`, forking nothing. `/proc/self/status` is the
+# READER's status, so an external tool reports on the tool: measured on one
+# host, GNU awk 5.2.1 answers `0000000000001000` for a shell whose real answer
+# is `0000000000000000`, because awk ignores SIGPIPE for itself. grep, sed, cat
+# and this loop all agree with the shell.
+#
+# A note and never a refusal. An inherited ignore is the environment's business,
+# the suite now asserts a delta rather than an absolute, and a gate that refused
+# to run here would be unrunnable from any such shell.
+ReportInheritedSigPipe() {
+    local line ignored="" low bits
+
+    if [[ ! -r /proc/self/status ]]; then
+        note "SIGPIPE handed to the sanitized binaries: not readable on this platform"
+        return 0
+    fi
+
+    while read -r line; do
+        case "$line" in
+            SigIgn:*) set -- $line; ignored="$2" ;;
+        esac
+    done < /proc/self/status
+
+    # Four hex digits carry signals 1..16, and SIGPIPE is 13 -> bit 12 -> 0x1000.
+    # The `if` is what makes the arithmetic below safe under `set -e`: `(( 0 ))`
+    # exits 1, so the same expression as a bare statement would end the gate on
+    # the ordinary answer.
+    low="${ignored: -4}"
+    if [[ -z "$low" || "$low" != [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F] ]]; then
+        note "SIGPIPE handed to the sanitized binaries: unreadable (SigIgn=${ignored:-<absent>})"
+        return 0
+    fi
+
+    bits=$(( 16#$low ))
+    if (( bits & 0x1000 )); then
+        note "SIGPIPE handed to the sanitized binaries: SIG_IGN, inherited from this gate's own ancestry (SigIgn=${ignored}). See #1229."
+    else
+        note "SIGPIPE handed to the sanitized binaries: SIG_DFL (SigIgn=${ignored})"
+    fi
+}
+ReportInheritedSigPipe
 
 # A build that dropped `add_compile_options` and kept `add_link_options` is the
 # shape of the defect `cmake/portable/Sanitizers.cmake` records, and this is the

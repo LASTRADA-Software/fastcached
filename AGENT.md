@@ -1815,8 +1815,53 @@ what differs between compilers, standard libraries, hosts and tool versions.
   table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
   restating it — a second copy is not a cross-check, it is a second thing to be
   wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
-  test file in `Async`, `Consensus` or `Distributed` carries no tag that
-  expression selects.
+  test CASE in a scoped location carries no tag that expression selects. Both
+  halves have been wrong once. The tags were: three of them looked complete and
+  excluded six of ten `Async/` files, which is what the check was written for.
+  Then the SCOPE was: it named three directories, and a `std::thread` census over
+  `FastCacheTest`'s own sources finds **nineteen** threaded files with **eleven** in no row and
+  under no tag — every threaded `Net/` test among them, which is `BlockingListener`'s
+  module and so the module the tree's one observed race (#260) came out of, reached
+  only because the node binary is run whole (#316). A row is now a directory OR a
+  FILE, and the file row IS the exemption mechanism — a mostly single-threaded
+  directory is scoped one file at a time, so the check never forces an unrelated tag
+  onto a case. What it still cannot check is whether the table is COMPLETE: the
+  census is a proxy (a helper spawns the thread; a comment names one) so promoting it
+  to a check would refuse correct files and miss incorrect ones.
+- And it proves a CASE, not a FILE. One selected tag ANYWHERE in a file used to cover
+  every case in it, so a 28th case tagged `[fleetchart]` in a file of 27
+  `[distributed]` ones left the sanitized scope with the check reporting covered —
+  the defect the file was written for, one level down (#317). A case's tag string is
+  the **LAST** string literal of its header, never the second: three cases here spell
+  a long name as two adjacent literals, so "second" reads half a NAME as tags, and
+  489 cases tree-wide carry NO tag string, which is caught by ARITY rather than by
+  pattern because a name is free to contain `[async]` and must not talk its way in.
+  A header may span lines (28 in scope do) and may hold an unmatched `(` in a name,
+  so the reader strips the literals BEFORE counting parenthesis depth — a reader that
+  does not still closes a matched pair and passes such a case for the wrong reason.
+  Every way of losing the question is a REFUSAL: a header that never closes, one past
+  a line bound, a scope holding no case at all. `scripts/check-tsan-scope-selftest.cmake`
+  drives 20 cases over trees staged from the REAL scope table and copies of the REAL
+  gate and root `CMakeLists.txt` — it `include()`s the check for its table rather than
+  keeping one, and it is a sibling script rather than a `-D` mode because that is what
+  every other `cmake -P` check here does and because `check-selftest-registered` reads
+  argument dispatch, so a `-D` mode is invisible to it. Ten mutations each redden
+  exactly the case that names them; reverting to file-level matching reddens eleven and
+  leaves the nine that cannot see the difference green.
+- **A workaround with an expiry date is WIRED to fire, never written down where only
+  its own file's reader will meet it.** The scope is a tag expression rather than
+  `ctest -L` because `catch_discover_tests` exports tags as labels only from Catch2
+  **3.8.0** (`ADD_TAGS_AS_LABELS`); this tree pins 3.6.0, whose `extras/Catch.cmake`
+  carries zero occurrences of it — measured, against `catch_discover_tests`'s 11 in
+  the same file as the positive control. The reason lived in `tsan-gate.sh`'s header,
+  which whoever bumps the CPM block never opens (#312), so `check-tsan-scope.cmake`
+  now READS the declared version and refuses past a WATERMARK. The watermark is a
+  pinned CONDITION and must not be made to track `CMakeLists.txt` — point it at its
+  own subject and the comparison is `x > x`, false forever, the tripwire silently
+  gone. That mutation is a self-test case, because it is the tidy that suggests
+  itself. The refusal names what must survive the move regardless of where the scope
+  ends up: **a scope selecting NOTHING is a refusal**, since a typo runs zero cases
+  while every other signal says clean.
 - A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
   request unmergeable, not fast: the workflow never triggers, so no check run is
   created and the required context never reports. Master is guarded by a *ruleset*,
