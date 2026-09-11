@@ -4921,15 +4921,3 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#1209](https://github.com/LASTRADA-Software/fastcached/issues/1209)** — the TSan
-  gate's `TARGETS` table names two of this tree's Catch2 test binaries, and
-  `fastcache-cc-tests` is not one of them. `src/apps/fastcache-cc/CompileJob_test.cpp`
-  spawns threads deliberately — a latch-synchronised overlap case, and a
-  `ReplaceToolchains` landing mid-compile whose own comment says the obvious
-  arrangement "would pass against the dangling iterator too" — and has never run under
-  ThreadSanitizer. Left out of #316 rather than folded into it because it costs a
-  `TARGETS` row AND a build target in the `clang-tsan` job, which that job's comment
-  accounts for as deliberately skipped. Expect to file races rather than to flip a
-  switch: #316's own widening surfaced #1207 and #1208 on its first run, neither of
-  them new code. `check-tsan-scope.cmake` cannot see this — it enforces that scoped
-  CASES carry a selected tag and says nothing about which BINARIES run.
