@@ -4,6 +4,7 @@
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -98,10 +99,10 @@ struct SettingSpec
     /// A COLUMN rather than an arm of `Validate`'s switch, because the switch is
     /// per-verb and this is per-setting: a second constrained setting would otherwise
     /// grow a second `if` inside `SetSetting`'s arm, and adding a setting stops being
-    /// adding a row. Null is the honest spelling for `upstream` and `fleet-open`,
-    /// whose values this build does not constrain, rather than a function that
-    /// accepts everything -- one says *nothing to check*, the other says *checked and
-    /// fine*, and only the first is true.
+    /// adding a row. Null is the honest spelling for `fleet-open`, whose value this
+    /// build does not constrain, rather than a function that accepts everything --
+    /// one says *nothing to check*, the other says *checked and fine*, and only the
+    /// first is true.
     ///
     /// Runs on the LEADER before the append, so an operator gets an error rather than
     /// an entry replicated to every node. It REFUSES and never repairs: a clamped
@@ -112,7 +113,64 @@ struct SettingSpec
     /// @param value The value as the operator typed it.
     /// @return Why it may not be set, or nullopt when it may.
     std::optional<std::string> (*refuse)(std::string_view value) = nullptr;
+
+    /// Where the value is READ BACK, or empty when nothing reads it.
+    ///
+    /// `Class::Function`, never a line number: a citation carrying a line rots at the
+    /// next edit above it and sends a reader somewhere arbitrary.
+    ///
+    /// A CLAIM a reader can check, and deliberately not a mechanism (#1124). The scan
+    /// that would mechanise it is the weakest option available, and the ticket says
+    /// why: a row's name is a string literal, one of them is a named constant, and
+    /// `upstream`'s name collided with a per-node FLAG spelled the same way -- so the
+    /// natural grep reported the deadest row in the table as wired. A check with a
+    /// false negative built into it is worse than a claim somebody has to write down.
+    std::string_view readBy {};
+
+    /// Why NOTHING reads this row yet, naming the issue that will -- or empty.
+    ///
+    /// The opt-out, and a separate COLUMN rather than an empty `readBy`, for
+    /// `RefuseWithoutCounter`'s reason in the metrics rules: *nobody has wired this*
+    /// must not be spelled the way *forgot the column* is, or a placeholder says
+    /// `forgot` in the vocabulary of `decided`. Exactly one of the two is set --
+    /// neither and both are the same refusal, since both mean nobody has decided.
+    std::string_view unreadBecause {};
 };
+
+/// Whether every row of @p table says what reads it.
+///
+/// **The failure this closes is the one `SettingTable`'s own header describes, for the
+/// key an operator spells CORRECTLY** (#1124). `FindSetting` refuses a typo; nothing
+/// refused a row that was accepted, replicated, snapshotted and carried across
+/// restarts while being read by nobody -- and two of the three rows were in that state
+/// at once, which is a pattern rather than luck. `fleet-open` was closed by wiring it
+/// (#1112) and `upstream` by removing it (#1123); this is the guard each of those
+/// instances left standing.
+///
+/// MANDATORY with an explicit opt-out rather than opt-in, because opt-in is silent
+/// about the row that never opted in -- #492's argument inside a table. It takes the
+/// table as a PARAMETER rather than reading `SettingTable` directly, and that is what
+/// lets a test drive it in the REFUSING direction: a guard nobody has watched refuse
+/// is not a guard, and one nobody has watched accept is not known to work (#1031).
+///
+/// `consteval`, so it cannot be called at runtime and mistaken for a test -- a runtime
+/// check of it could not fail in a translation unit that compiled.
+///
+/// @param table The rows to check.
+/// @return True when every row names a reader, or names the issue that will add one.
+[[nodiscard]] consteval bool RowsCarryAConsumer(std::span<SettingSpec const> table) noexcept
+{
+    return std::ranges::all_of(table, [](SettingSpec const& row) {
+        // Neither is the omission this exists to catch; BOTH is a row saying that a
+        // reader exists and also that none does. One condition, because they are one
+        // fact: nobody has decided.
+        if (row.readBy.empty() == row.unreadBecause.empty())
+            return false;
+        // An opt-out names the issue that will close it, exactly as `RefuseUntriaged`
+        // does, or *nobody has decided yet* reads as *decided against*.
+        return !row.readBy.empty() || row.unreadBecause.contains('#');
+    });
+}
 
 /// The key naming how long a lease -- and therefore a dispatched compile -- may live.
 ///
@@ -166,14 +224,21 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// can differ per machine because the machines differ. `--slots` is the counter-
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
-inline constexpr std::array<SettingSpec, 3> SettingTable {
-    SettingSpec { .name = "upstream", .summary = "host:port of the shared fastcached every member reads through to" },
-    SettingSpec { .name = FleetOpenSetting, .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+inline constexpr std::array<SettingSpec, 2> SettingTable {
+    SettingSpec { .name = FleetOpenSetting,
+                  .summary = R"('1' to admit every caller to the fleet, '0' for members only)",
+                  .readBy = "NodeMembership::AgreedOpenness" },
     SettingSpec { .name = LeaseLifetimeSetting,
                   .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
                              "compile, and the object coming back -- not how long a compiler may run",
-                  .refuse = &RefuseLeaseLifetime },
+                  .refuse = &RefuseLeaseLifetime,
+                  .readBy = "SchedulerService::AgreedLeaseLifetime" },
 };
+
+static_assert(RowsCarryAConsumer(SettingTable),
+              "every SettingTable row must name what READS it, or name the issue that will wire it: a row "
+              "nothing reads is accepted, replicated, snapshotted and carried across restarts while the thing "
+              "the operator configured does not happen, and a correctly spelled key reaches no other guard");
 
 /// Whether `name` is a setting this cluster replicates.
 /// @param name The key.
@@ -185,6 +250,72 @@ inline constexpr std::array<SettingSpec, 3> SettingTable {
             return &row;
     return nullptr;
 }
+
+/// A key this cluster refuses to replicate, and what an operator should do instead.
+///
+/// A refusal by ROW rather than by ABSENCE, which is the `--allow-compile-arg`
+/// argument in `.agent/rules/distributed-compilation.md` one surface along: absence
+/// and a row are the same answer only while nothing else is consulted, and here the
+/// OPERATOR is. A key this build never had and a key it deliberately stopped
+/// replicating both come out of `FindSetting` as a null pointer, so both would be
+/// answered *no such cluster setting* -- which reads as a typo or as a node too old,
+/// and sends somebody to upgrade a machine over a decision. The row is what lets the
+/// answer say WHY and name the flag that does the job.
+///
+/// No named constant for the key, deliberately, and `LeaseLifetimeSetting`'s reason is
+/// why: a constant exists because several surfaces spell one string and drift apart.
+/// A refused key has no reader by construction -- that is what refused means -- so it
+/// is spelled once here, and the test spells its own literal, which is what lets the
+/// test catch this row naming the wrong key.
+struct RefusedSettingSpec
+{
+    std::string_view name;   ///< The key as an operator writes it.
+    std::string_view reason; ///< Why this cluster will not agree on it, and what to do instead.
+};
+
+/// Every key this cluster refuses to replicate, in one place.
+///
+/// **A replicated setting must not decide where a node sends a credential.** That is
+/// the property, stated ahead of the row it was drawn from, because the next candidate
+/// will not be an address: anything a majority can commit which every node then
+/// presents a secret to has this shape.
+///
+/// `upstream` was a `SettingTable` row until #1123, and the LOSING reading is worth
+/// recording because it is what put the row here. An address looks inert beside
+/// #1112's `fleet-open`, which decides ADMISSION: replicating one reads as telling
+/// every member where the shared cache moved to. What that misses is that a node does
+/// not merely dial it. `CacheTier.cpp:227`/`:228` construct the `RemoteUpstream` from
+/// `cfg.upstream` AND this node's `ICredentialSource`, and `RemoteUpstream.cpp:135`
+/// and `:175` present `_credential.Current()` on every `CacheFetch` and every
+/// `CacheStore`. The address and the secret are then governed by different mechanisms
+/// -- `--requirepass` is per machine and reloadable one node at a time, a setting is
+/// committed by a majority -- so wiring the row would have let one committed entry
+/// redirect every member's `--requirepass` to an address of the committer's choosing,
+/// each node presenting it on its next fetch.
+///
+/// Nothing read the row, so removing it takes no behaviour with it: the per-node
+/// `--upstream` flag has always been what decides this, and the refusal names it.
+inline constexpr std::array<RefusedSettingSpec, 1> RefusedSettingTable { {
+    RefusedSettingSpec { .name = "upstream",
+                         .reason = "it decides where a node presents its --requirepass credential, so it is "
+                                   "per-machine configuration -- set --upstream on the node that reads through" },
+} };
+
+/// Whether `name` is a key this cluster refuses to replicate.
+/// @param name The key.
+/// @return Its row, or nullptr when this build has no opinion about the name.
+[[nodiscard]] constexpr RefusedSettingSpec const* FindRefusedSetting(std::string_view name) noexcept
+{
+    for (auto const& row: RefusedSettingTable)
+        if (row.name == name)
+            return &row;
+    return nullptr;
+}
+
+static_assert(std::ranges::none_of(RefusedSettingTable,
+                                   [](RefusedSettingSpec const& row) { return FindSetting(row.name) != nullptr; }),
+              "a refused key must not also be a SettingTable row: a refusal must not be escapable by a row "
+              "arriving later and shadowing it, and this is what makes the order the two are asked in irrelevant");
 
 /// One replicated setting and its value.
 struct Setting

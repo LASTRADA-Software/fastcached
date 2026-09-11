@@ -351,6 +351,48 @@ TEST_CASE("StreamCodec: a declared count is bounded by the bytes actually left",
     CHECK(out.entries.empty());
 }
 
+TEST_CASE("StreamCodec: a reservation is capped, so a peer's count cannot size it", "[cache][stream][security]")
+{
+    // #310's bound, asserted in BOTH directions -- one arm alone passes under the
+    // opposite defect. A blob is built whose entry count is achievable (so the count
+    // guard admits it) but whose FIRST entry then declares an impossible field count,
+    // so the walk refuses before a single `push_back`. Whatever capacity the vector
+    // has is therefore the reserve and nothing else, which is what makes it readable.
+    auto const hostileFirstEntry = [](std::uint32_t claimed) {
+        return StreamHeader()
+            .U32(claimed)
+            .U64(0)
+            .U64(0)                                   // the first entry's id
+            .U32(FastCache::Testing::ImpossibleCount) // ... and its field count
+            .Pad((claimed * StreamCodec::detail::MinEntryBytes) - StreamCodec::detail::MinEntryBytes);
+    };
+
+    SECTION("below the cap the reserve still happens")
+    {
+        // The arm that fails if the five reserves are deleted again, which is the
+        // state #309 left and #310 is about: with no reserve the capacity is 0.
+        Stream out;
+        auto const blob = hostileFirstEntry(8);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+        CHECK(out.entries.empty()); // nothing was decoded, so nothing GREW it
+        CHECK(out.entries.capacity() >= 8);
+    }
+
+    SECTION("above the cap the peer's number is not what is reserved")
+    {
+        // The arm that fails if `reserve(count)` is restored: the claim is 4096 and
+        // the reservation must not follow it. Bracketed rather than compared to the
+        // cap exactly -- `reserve` promises a lower bound on capacity and no upper
+        // one -- so this reads as *the cap was applied* and *the claim was not*.
+        Stream out;
+        auto const blob = hostileFirstEntry(4096);
+        CHECK_FALSE(StreamCodec::Decode(blob.Bytes(), out));
+        CHECK(out.entries.empty());
+        CHECK(out.entries.capacity() >= StreamCodec::detail::ReserveCap);
+        CHECK(out.entries.capacity() < 4096);
+    }
+}
+
 TEST_CASE("StreamCodec: the per-element minimums track the encoder", "[cache][stream]")
 {
     // Each minimum is a security bound derived by hand from `Encode`. This pins every

@@ -6,6 +6,7 @@
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -215,6 +216,49 @@ namespace detail
     /// consumer name.
     constexpr std::size_t MinPendingBytes = IdBytes + (2 * sizeof(std::uint64_t)) + WireFields::FieldPrefixSize;
 
+    /// The most elements any counted run reserves for, whatever a blob claims.
+    ///
+    /// A FLAT bound, and that is the whole property: #309 deleted this decoder's five
+    /// `reserve(count)` calls because sizing an allocation from a peer's number is what
+    /// the #241/#267/#269/#271 family is about, and a cap gives the reservation back
+    /// without giving the peer a lever. `ReadCount` has already refused a count the
+    /// remaining bytes cannot supply, so the reservation is under BOTH bounds -- but only
+    /// the cap is independent of the blob, which is what the ticket asked for.
+    ///
+    /// **Why 64 and why a cap at all**, measured rather than argued (#310). Decoding a
+    /// 2000-entry stream of 4 short fields each, all inside libstdc++'s 15-char SSO
+    /// buffer, on a 32-core box under WSL2, clang Release, `-DUSE_COMPILER_CACHE=OFF`,
+    /// load 2.9-10.3, medians of repeated runs with the outliers (205.7, 128.5, 128.3 us)
+    /// named rather than dropped:
+    ///
+    ///   no reserve                   155.4 us
+    ///   reserve(count)              ~104   us   (33.2% recovered)
+    ///   reserve(min(count, 64))     ~109.5 us   (29.5% recovered)
+    ///
+    /// So the cap buys 89% of the available win with the bound independent of the peer's
+    /// number entirely. That is the ticket's own prediction about the mechanism confirmed
+    /// -- the cost is repeated geometric growth at SMALL sizes, not the final capacity --
+    /// which is what makes a cap principled here rather than a compromise. Those figures
+    /// are pinned deliberately and must not be replaced by a pointer at whatever the
+    /// benchmark prints today: they are the state of one machine at one instant, and a
+    /// figure that tracked its source would silently claim it was measured under
+    /// conditions nobody checked.
+    ///
+    /// The fixture is `src/apps/fastcache-bench/StreamCodecBench.cpp`, and it exercises
+    /// the entry and field runs -- 2 of the 5 -- so this is a claim about the dominant
+    /// path rather than about all five.
+    constexpr std::uint32_t ReserveCap = 64;
+
+    /// Reserve for a counted run without sizing the allocation from the peer's count.
+    ///
+    /// @param out   The run being decoded into.
+    /// @param count What the blob claims, already bounded by `ByteCursor::ReadCount`.
+    template <typename T>
+    void ReserveCapped(std::vector<T>& out, std::uint32_t count)
+    {
+        out.reserve(static_cast<std::size_t>(std::min(count, ReserveCap)));
+    }
+
 } // namespace detail
 
 /// Encode a decoded stream into its value blob.
@@ -300,6 +344,10 @@ namespace detail
     std::uint32_t entryCount = 0;
     if (!r.ReadCount(entryCount, detail::MinEntryBytes))
         return malformed("entry count claims more entries than the remaining bytes could hold");
+    // Capped, never `reserve(entryCount)`: the bound is flat and the peer's number
+    // cannot move it. All five counted runs below reserve the same way, and the
+    // argument -- with the measurement that picked the cap -- is on `ReserveCapped`.
+    detail::ReserveCapped(out.entries, entryCount);
     for (auto i = std::uint32_t { 0 }; i < entryCount; ++i)
     {
         StreamEntry entry;
@@ -308,6 +356,7 @@ namespace detail
         std::uint32_t fieldCount = 0;
         if (!r.ReadCount(fieldCount, detail::MinFieldBytes))
             return malformed("field count claims more fields than the remaining bytes could hold");
+        detail::ReserveCapped(entry.fields, fieldCount);
         for (auto f = std::uint32_t { 0 }; f < fieldCount; ++f)
         {
             std::string name;
@@ -321,6 +370,7 @@ namespace detail
     std::uint32_t groupCount = 0;
     if (!r.ReadCount(groupCount, detail::MinGroupBytes))
         return malformed("group count claims more groups than the remaining bytes could hold");
+    detail::ReserveCapped(out.groups, groupCount);
     for (auto g = std::uint32_t { 0 }; g < groupCount; ++g)
     {
         ConsumerGroup group;
@@ -329,6 +379,7 @@ namespace detail
         std::uint32_t consumerCount = 0;
         if (!r.ReadCount(consumerCount, detail::MinConsumerBytes))
             return malformed("consumer count claims more consumers than the remaining bytes could hold");
+        detail::ReserveCapped(group.consumers, consumerCount);
         for (auto c = std::uint32_t { 0 }; c < consumerCount; ++c)
         {
             std::string consumer;
@@ -339,6 +390,7 @@ namespace detail
         std::uint32_t pelCount = 0;
         if (!r.ReadCount(pelCount, detail::MinPendingBytes))
             return malformed("pending count claims more entries than the remaining bytes could hold");
+        detail::ReserveCapped(group.pel, pelCount);
         for (auto p = std::uint32_t { 0 }; p < pelCount; ++p)
         {
             PendingEntry pending;

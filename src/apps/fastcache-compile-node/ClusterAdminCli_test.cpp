@@ -154,7 +154,7 @@ struct Fixture
     Cluster::ClusterState state;
     Apply(state, Cmd(Cluster::CommandKind::AddMember, "n1", "10.0.0.1:6680", "10.0.0.1:6675"));
     Apply(state, Cmd(Cluster::CommandKind::AddMember, "n2", "10.0.0.2:6680"));
-    Apply(state, Cmd(Cluster::CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    Apply(state, Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "1200000"));
     return state;
 }
 } // namespace
@@ -192,10 +192,10 @@ TEST_CASE("Each cluster flag selects its action and carries its operand", "[node
     // to a second row nobody would remember to add.
     CHECK(ParsedFrom({ "--cluster-status" }).cluster.action == ClusterAction::Status);
 
-    auto const set = ParsedFrom({ "--cluster-set=upstream=cache:6674" });
+    auto const set = ParsedFrom({ "--cluster-set=lease-lifetime=1200000" });
     CHECK(set.cluster.action == ClusterAction::Set);
-    CHECK(set.cluster.key == "upstream");
-    CHECK(set.cluster.value == "cache:6674");
+    CHECK(set.cluster.key == "lease-lifetime");
+    CHECK(set.cluster.value == "1200000");
 
     auto const forget = ParsedFrom({ "--cluster-forget=n3" });
     CHECK(forget.cluster.action == ClusterAction::Forget);
@@ -210,7 +210,7 @@ TEST_CASE("A malformed cluster assignment is refused at the command line", "[nod
     // Refused where the operator is watching rather than sent to a leader that would
     // refuse it as an unknown setting -- a message that names the wrong problem.
     NodeConfig cfg;
-    std::vector<char const*> const bad { "--cluster-set=upstream" };
+    std::vector<char const*> const bad { "--cluster-set=lease-lifetime" };
     CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { bad }, cfg).has_value());
 
     NodeConfig other;
@@ -240,7 +240,7 @@ TEST_CASE("A status request round-trips through the real protocol", "[node][clus
     CHECK(rendered->contains("n1"));
     CHECK(rendered->contains("10.0.0.1:6675"));
     CHECK(rendered->contains("scheduler=-"));
-    CHECK(rendered->contains("cache.internal:6674"));
+    CHECK(rendered->contains("1200000"));
     CHECK(rendered->contains("fleet-open"));
 }
 
@@ -250,12 +250,30 @@ TEST_CASE("A change reaches the cluster as the command it names", "[node][cluste
     FakeCluster cluster;
     fixture.service.AdministerWith(cluster);
 
-    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "upstream", "cache.internal:6674"))) == Wire::Status::Ok);
+    CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Set, "lease-lifetime", "1200000"))) == Wire::Status::Ok);
     CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Forget, "n3"))) == Wire::Status::Ok);
 
     REQUIRE(cluster.proposed.size() == 2);
-    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "1200000"));
     CHECK(cluster.proposed[1] == Cmd(Cluster::CommandKind::RemoveMember, "n3"));
+}
+
+TEST_CASE("A key this cluster refuses never reaches the log", "[node][clusteradmin]")
+{
+    // #1123 at the door an operator types through. Two things, and the second is the
+    // one a message assertion cannot give: the refusal names the flag that does the
+    // job, and NOTHING was proposed -- refused on the leader before the append, which
+    // is the whole reason a key nobody can act on is refused here rather than ignored
+    // by each applier.
+    Fixture fixture;
+    FakeCluster cluster;
+    fixture.service.AdministerWith(cluster);
+
+    auto const refused = fixture.Ask(Ask(ClusterAction::Set, "upstream", "cache.internal:6674"));
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK(MessageOf(refused).contains("--upstream"));
+    CHECK(MessageOf(refused).contains("--requirepass"));
+    CHECK(cluster.proposed.empty());
 }
 
 TEST_CASE("The operator's door refuses a member it could not name, and forgets one anyway", "[node][clusteradmin]")

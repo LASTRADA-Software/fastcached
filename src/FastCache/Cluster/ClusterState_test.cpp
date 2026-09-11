@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -72,7 +73,7 @@ TEST_CASE("A member the cluster records has to be one it can name", "[cluster][s
     // And a setting's value, which is free-form and therefore the likeliest of the
     // lot to carry something surprising. Its NAME needs no rule of its own: a key
     // this build does not know is already refused whatever its bytes are.
-    CHECK(Refused(Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674\x80")).contains("setting's value"));
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "lease-lifetime", "600000\x80")).contains("setting's value"));
 
     // Encoding, not ASCII -- an id is opaque to consensus, which matches it byte for
     // byte.
@@ -104,7 +105,7 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
     // A key nobody knows would otherwise be replicated to every node, snapshotted and
     // carried across restarts while doing nothing -- and the only symptom would be
     // that the thing the operator configured did not happen.
-    CHECK(Validate(Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674")).has_value());
+    CHECK(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000")).has_value());
     CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "1")).has_value());
 
     CHECK(Refused(Cmd(CommandKind::SetSetting, "upsteam", "typo")).contains("upsteam"));
@@ -113,6 +114,100 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
     // that describes ONE machine is not one -- replicating `--slots` would impose one
     // host's size on all of them.
     CHECK(FindSetting("slots") == nullptr);
+}
+
+namespace ConsumerGuard
+{
+// Synthetic tables, so the guard can be watched REFUSING and ACCEPTING. They are at
+// namespace scope because `RowsCarryAConsumer` is `consteval`: a span over a block
+// local is not a constant expression, and a runtime call is not available to fall
+// back on -- deliberately, since a runtime `CHECK` of a `consteval` predicate cannot
+// fail in a translation unit that compiled and would read as a guarantee while
+// asserting nothing.
+
+/// The omission the guard exists for: a row that says nothing about who reads it.
+constexpr std::array<SettingSpec, 1> SaysNothing { SettingSpec { .name = "x", .summary = "y" } };
+
+/// A row claiming BOTH that something reads it and that nothing does.
+constexpr std::array<SettingSpec, 1> SaysBoth { SettingSpec {
+    .name = "x", .summary = "y", .readBy = "Thing::Reader", .unreadBecause = "nothing yet, #1" } };
+
+/// An opt-out that names no issue -- `forgot` in the vocabulary of `decided`.
+constexpr std::array<SettingSpec, 1> OptOutWithNoIssue { SettingSpec {
+    .name = "x", .summary = "y", .unreadBecause = "we will get to it" } };
+
+/// A row that names a reader.
+constexpr std::array<SettingSpec, 1> NamesAReader { SettingSpec { .name = "x", .summary = "y", .readBy = "Thing::Reader" } };
+
+/// An opt-out spelled properly.
+constexpr std::array<SettingSpec, 1> OptOutWithAnIssue { SettingSpec {
+    .name = "x", .summary = "y", .unreadBecause = "nothing reads it until #4242 wires the scheduler" } };
+} // namespace ConsumerGuard
+
+TEST_CASE("Every replicated setting says what reads it", "[cluster][state]")
+{
+    // #1124. `SettingTable`'s header names the failure it exists to prevent -- a
+    // setting accepted, replicated, snapshotted and carried across restarts while
+    // doing nothing -- and `FindSetting` closes it only for a MISSPELLED key. Two of
+    // the three rows were write-only at once under a correctly spelled name.
+    //
+    // Both directions, because one alone establishes nothing: a guard nobody has
+    // watched refuse is not a guard, and one nobody has watched accept is not known
+    // to work (#1031). These are `static_assert`s rather than `CHECK`s, so a broken
+    // guard fails the BUILD of this file; the case then exists to name the property
+    // and to carry the runtime half below.
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::SaysNothing), "a row saying nothing must be refused");
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::SaysBoth), "a row saying both must be refused");
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::OptOutWithNoIssue), "an opt-out must name its issue");
+    static_assert(RowsCarryAConsumer(ConsumerGuard::NamesAReader), "a row naming a reader must be accepted");
+    static_assert(RowsCarryAConsumer(ConsumerGuard::OptOutWithAnIssue), "a stated opt-out must be accepted");
+    static_assert(RowsCarryAConsumer(SettingTable), "and the table this build ships");
+
+    // The runtime half, and it is not a restatement of the line above: the guard
+    // accepts an opt-out, so a table where every row had opted out would satisfy it
+    // completely. This is the tally -- `RefuseUntriaged`'s argument in the metrics
+    // rules -- and it NAMES the rows rather than counting them, because a count
+    // cannot be acted on. Adding a legitimate opt-out is expected to fail this and to
+    // be acknowledged here; that is the visibility, not an obstacle.
+    std::string optedOut;
+    for (auto const& row: SettingTable)
+        if (row.readBy.empty())
+            optedOut += std::string { row.name } + " (" + std::string { row.unreadBecause } + ") ";
+    CHECK(optedOut.empty());
+
+    // And every reader named is a real one. A claim is only as good as somebody
+    // checking it, so the two live rows are spelled out here: the guard cannot tell a
+    // true `Class::Function` from a plausible one, and this is where a rename that
+    // left the column behind shows up.
+    REQUIRE(SettingTable.size() == 2);
+    CHECK(FindSetting(FleetOpenSetting)->readBy == "NodeMembership::AgreedOpenness");
+    CHECK(FindSetting(LeaseLifetimeSetting)->readBy == "SchedulerService::AgreedLeaseLifetime");
+}
+
+TEST_CASE("A key this cluster refuses to replicate is refused BY NAME", "[cluster][state]")
+{
+    // The whole subject is the DIFFERENCE between two refusals, so asserting that the
+    // key appears in the message would pass under both -- `no such cluster setting:
+    // upstream` names it too. What has to be asserted is the answer only the row can
+    // give: why this cluster will not agree on it, and which flag does the job.
+    auto const refused = Refused(Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    CHECK(refused.contains("upstream is not a replicated setting"));
+    CHECK(refused.contains("--requirepass"));
+    CHECK(refused.contains("--upstream"));
+
+    // The control, and the reason this case exists: a genuine typo must go on getting
+    // the typo answer. Transposed rather than doubled, so `upstream` is not a
+    // substring of it and a contains-assertion cannot pass for the wrong reason.
+    auto const typo = Refused(Cmd(CommandKind::SetSetting, "upstrean", "cache.internal:6674"));
+    CHECK(typo.contains("no such cluster setting"));
+    CHECK_FALSE(typo.contains("--requirepass"));
+
+    // And it is refused rather than shadowed by a row. Re-adding the row fails the
+    // BUILD on the `static_assert` beside `RefusedSettingTable`, which is the real
+    // guard; this is what still fails if somebody drops that assert in the same edit.
+    CHECK(FindSetting("upstream") == nullptr);
+    CHECK(FindRefusedSetting("upstream") != nullptr);
+    CHECK(FindRefusedSetting("lease-lifetime") == nullptr);
 }
 
 TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster][state]")
@@ -150,7 +245,7 @@ TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster]
 TEST_CASE("A command round-trips, and an unknown verb is refused", "[cluster][state][wire]")
 {
     // Every field a different value, so a transposition cannot survive.
-    auto const original = Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674");
+    auto const original = Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000");
     auto const decoded = DecodeCommand(Encode(original));
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded) == original);
@@ -177,7 +272,7 @@ TEST_CASE("A whole state round-trips, members and settings apart", "[cluster][st
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
-    Apply(state, Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000"));
 
     auto const restored = DecodeState(Encode(state));
     REQUIRE(restored.has_value());
@@ -272,7 +367,7 @@ TEST_CASE("A verb that has no scheduler endpoint may not carry one", "[cluster][
     // the proposer because that is the only place anything can be refused.
     CHECK(Validate(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).has_value());
     CHECK_FALSE(Validate(Cmd(CommandKind::RemoveMember, "n1", {}, "10.0.0.1:7000")).has_value());
-    CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "upstream", "c:1", "10.0.0.1:7000")).has_value());
+    CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000", "10.0.0.1:7000")).has_value());
 }
 
 TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state][wire]")
@@ -284,7 +379,7 @@ TEST_CASE("A member's two endpoints survive a snapshot apart", "[cluster][state]
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
-    Apply(state, Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"));
+    Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000"));
     Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "1"));
 
     auto const restored = DecodeState(Encode(state));
@@ -433,9 +528,10 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
     SECTION("the settings this build constrains nothing about are unaffected")
     {
         // The control for the column itself: a `refuse` wired to the wrong row, or run
-        // for every row, would refuse these -- and every assertion above would still
-        // pass.
-        CHECK(Validate(Cmd(CommandKind::SetSetting, "upstream", "not-a-number")).has_value());
-        CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "1")).has_value());
+        // for every row, would refuse this -- and every assertion above would still
+        // pass. One unconstrained row rather than two since #1123, so the control is
+        // thinner than it was; it is still the only thing here that fails when the
+        // column is run unconditionally.
+        CHECK(Validate(Cmd(CommandKind::SetSetting, "fleet-open", "not-a-number")).has_value());
     }
 }

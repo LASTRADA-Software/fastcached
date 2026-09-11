@@ -84,7 +84,7 @@ TEST_CASE("Re-applying a prefix reaches the same state", "[cluster][statemachine
 
     std::vector const log {
         Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"),
-        Cmd(CommandKind::SetSetting, "upstream", "cache.internal:6674"),
+        Cmd(CommandKind::SetSetting, "lease-lifetime", "1200000"),
         Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"),
         Cmd(CommandKind::RemoveMember, "n1"),
     };

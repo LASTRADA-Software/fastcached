@@ -953,7 +953,7 @@ commit_setting() {
         fail "${what}: ${key}=${value} was accepted and never became visible within ${ReplicationSeconds}s ($(probe_summary "$mark"))"
 }
 
-commit_setting upstream cache.example:6674 "a setting accepted by the leader never became visible on it"
+commit_setting lease-lifetime 1200000 "a setting accepted by the leader never became visible on it"
 echo "cluster E2E: a setting replicates"
 
 # A setting nobody has heard of is refused where the operator is watching, rather
@@ -964,6 +964,15 @@ echo "cluster E2E: a setting replicates"
 # point it does not test.
 ask_leader "--cluster-set=upsteam=typo" "upsteam" "a typo'd setting was not refused by name"
 echo "cluster E2E: an unknown setting is refused by name"
+
+# And a key this cluster REFUSES to replicate gets a different answer from a typo,
+# which is the whole of #1123 on the path an operator is actually on. Asserted on
+# the remedy rather than on the key: `no such cluster setting: upstream` names the
+# key too, so a case matching the key would pass under the refusal this one exists
+# to distinguish it from.
+ask_leader "--cluster-set=upstream=cache.example:6674" "--upstream" \
+    "a key this cluster refuses to replicate was not refused with the per-node flag that replaces it"
+echo "cluster E2E: a refused setting names the flag that does the job"
 
 # --- 4. a machine joins the running cluster ----------------------------------
 
@@ -1271,7 +1280,7 @@ find_leader "the one-member cluster with a DERIVED identity to lead itself"
     fail "the one-member cluster is led from ${leader_endpoint}, which is not the only node in it"
 echo "cluster E2E: one node derives its own identity, bootstraps a cluster of itself and leads it"
 
-commit_setting upstream alone.example:6674 "a one-member cluster cannot commit"
+commit_setting lease-lifetime 1500000 "a one-member cluster cannot commit"
 echo "cluster E2E: a one-member cluster commits alone"
 
 # The mistake `--raft-join` exists to prevent, made on purpose.
@@ -1406,7 +1415,7 @@ echo "cluster E2E: the second member is replicated to, and names ${leader_endpoi
 # visible only once a majority of TWO holds it, which is both nodes. A cluster whose
 # second member was admitted and cannot be reached fails exactly here, and passes
 # everything above.
-commit_setting upstream quorum2.example:6674 "the cluster stopped committing when its quorum grew from one to two"
+commit_setting lease-lifetime 1800000 "the cluster stopped committing when its quorum grew from one to two"
 echo "cluster E2E: the cluster still commits with two members, so the quorum moved from 1 to 2 without stalling"
 
 # What the probing actually cost, on the SUCCESS path.

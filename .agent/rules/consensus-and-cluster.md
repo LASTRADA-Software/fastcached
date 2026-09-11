@@ -244,14 +244,19 @@ and it is recorded here because the question will be asked again.
   the only way to configure a fleet was still `--upstream` on every machine, which is
   the file-editing the log exists to replace. `Op::ClusterStatus` / `ClusterSet` /
   `ClusterForget` on the scheduler's port close that, and four things about their
-  shape are load-bearing:
+  shape are load-bearing. (**`upstream` is the wrong example now** and is left standing
+  as the history it is: the verbs were built for a table that held it, and #1123 then
+  took that row out for the reason in the next bullet. The argument is unchanged for
+  the rows that remain.)
   - **They go through the same `Gate()` as the dispatch verbs, the READ included.** A
     follower's copy of the state is valid and merely older, so `ClusterStatus` could
     have been answered anywhere; one rule for the whole surface is what makes "a verb
     added without the gate" impossible, and it sends an operator to the node they
     would need anyway to change anything. The refusal for a non-member is not about
-    capacity here: a stranger who could set `upstream` would point the whole fleet's
-    cache at a host of their choosing.
+    capacity here: a stranger who could set `fleet-open` would admit every caller on
+    the network to the fleet. That named `upstream` until #1123, which closed that one
+    at the TABLE rather than at the gate — the gate is still what stands between a
+    stranger and the rows that remain.
   - **`NoCluster` is distinct from `NotLeader`, because the operator does something
     different.** `NotLeader` names somewhere else to ask; `NoCluster` says the
     question does not apply here at all — a single node started without `--node-id`
@@ -269,6 +274,27 @@ and it is recorded here because the question will be asked again.
     `IClusterAdmin` is the seam the scheduler reaches all of this through, which is
     what lets the whole verb surface be tested against a fake that records what it was
     asked to propose, with no log, no threads and no cluster.
+
+- **A replicated setting must not decide where a node sends a CREDENTIAL.** `upstream`
+  was such a row and is [#1123](https://github.com/LASTRADA-Software/fastcached/issues/1123).
+  It looked inert beside #1112's `fleet-open`, which decides ADMISSION: replicating an
+  address reads as telling every member where the shared cache moved to. What that
+  misses is that a node does not merely dial it — `CacheTier.cpp:227`/`:228` construct
+  the `RemoteUpstream` from `cfg.upstream` AND this node's `ICredentialSource`, and
+  `RemoteUpstream.cpp:135`/`:175` present `_credential.Current()` on every `CacheFetch`
+  and every `CacheStore`. The address and the secret are then governed by different
+  mechanisms — `--requirepass` is per machine and reloadable one node at a time, a
+  setting is committed by a majority — so wiring the row would have let ONE committed
+  entry redirect every member's `--requirepass` to an address of the committer's
+  choosing, each node presenting it on its next fetch. Nothing read the row, exactly as
+  nothing read `fleet-open` before #1112, so the two tickets are the two answers to one
+  shape and **what the value would DECIDE is what picks between them** — never whether
+  the key looks harmless. And it is refused **BY NAME**: a key this build deliberately
+  stopped replicating and a key nobody ever heard of both come out of `FindSetting` as a
+  null pointer, and *no such cluster setting* reads as a typo or as a node too old, which
+  sends an operator to upgrade a machine over a decision. `RefusedSettingTable` is the
+  row that lets the answer say why and name `--upstream`; a `static_assert` refuses a key
+  that is in both tables, so the refusal cannot be shadowed by a row arriving later.
 
 - **Absent is not empty, and a membership proposal is where that pays.**
   `Cluster::DesiredMember` carries `std::optional<std::string> schedulerEndpoint`
