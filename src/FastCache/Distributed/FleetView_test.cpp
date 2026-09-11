@@ -1404,6 +1404,15 @@ namespace
     return rendered.substr(0, rendered.find('\n'));
 }
 
+/// Refused: the view would outlive the string it points into.
+///
+/// `HeaderLine(RenderFleetText(...))` compiled and read freed memory -- the temporary
+/// dies at the end of the declaration and the view is read on the next line. Deleting
+/// the rvalue overload turns that from a fault `clang-tsan` has to catch into one the
+/// compiler refuses, which is the difference between a rule every call site can forget
+/// and one none of them can.
+std::string_view HeaderLine(std::string&&) = delete;
+
 /// How many lines a rendering carries, counting the trailing newline as a terminator.
 /// @param rendered The rendering.
 /// @return The count.
@@ -1538,7 +1547,11 @@ TEST_CASE("A tier no member runs contributes no column to the text rendering", "
     snapshot.tiersPresent[MemoryIndex] = true;
     snapshot.tiersPresent[DiskIndex] = false;
 
-    auto const header = HeaderLine(RenderFleetText(snapshot, FleetSection::Tiers));
+    // Named, so the document outlives the view into it. Spelled out rather than
+    // folded into the CHECKs because the deleted overload below makes the folded form
+    // uncompilable, and a reader meeting that error should find the answer here.
+    auto const tiers = RenderFleetText(snapshot, FleetSection::Tiers);
+    auto const header = HeaderLine(tiers);
 
     CHECK(header.contains("memory-"));
     CHECK_FALSE(header.contains("disk-"));

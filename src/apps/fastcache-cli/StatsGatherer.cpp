@@ -116,6 +116,36 @@ std::expected<Endpoint, std::string> LadderGatherer::ResolveAdmin()
     return Endpoint { .host = _cache.host, .port = port };
 }
 
+std::expected<std::string, AdminError> LadderGatherer::FetchAdmin(std::string_view path)
+{
+    // Nowhere to ask: no surface reported, a TLS one this client cannot speak, a port
+    // that is the one already dialled, or no override. `ResolveAdmin` already says
+    // which in words; what it cannot say is that none of them is the server declining.
+    auto const admin = ResolveAdmin();
+    if (!admin.has_value())
+        return std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = admin.error() });
+
+    auto const response = HttpGet(*admin, path, _timeouts, _bearer);
+    if (!response.has_value())
+        return std::unexpected(AdminError { .kind = AdminFailure::Unreachable, .detail = response.error().detail });
+
+    // The STATUS is carried into the message rather than collapsed into "failed",
+    // because these codes are different diagnoses and only one of them is about this
+    // client: 401 is a credential the operator can supply, 503 is a node that is not
+    // the leader and says so in its body, and 400 is a request this build does not
+    // serve. Reporting them alike would send all three to the same wrong place.
+    if (response->status != 200)
+        return std::unexpected(
+            AdminError { .kind = AdminFailure::Refused,
+                         .detail = std::format("{} answered HTTP {}: {}",
+                                               path,
+                                               response->status,
+                                               response->body.empty() ? std::string_view { "(no body)" }
+                                                                      : std::string_view { response->body }) });
+
+    return response->body;
+}
+
 StatsAttempt LadderGatherer::AskMetrics()
 {
     StatsAttempt attempt { .origin = StatsOrigin::Metrics };

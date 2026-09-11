@@ -1344,6 +1344,107 @@ namespace
         return Answered(ClusterChangeAccepted());
     }
 
+    /// One `/fleet.txt` section, as a table.
+    ///
+    /// The header line names the columns and every later line is a row, which is the
+    /// whole grammar -- there is no column list here, and there must not be: the
+    /// leader decided them from `FleetColumn`, and a second list in this binary would
+    /// be a place for the two to disagree.
+    ///
+    /// A cell of `-` becomes the real `Absent`, so `--absent` and the JSON `null`
+    /// behave as they do for every other verb rather than a dash being text that
+    /// happens to look absent. Everything else stays TEXT, escaping included: this
+    /// client has no model of which columns are numbers, and inventing one would be a
+    /// second description of the same columns.
+    /// @param document One section's rendering.
+    /// @return The table.
+    [[nodiscard]] Value FleetTable(std::string_view document)
+    {
+        std::vector<std::string> columns;
+        std::vector<std::vector<Cell>> rows;
+
+        auto const split = [](std::string_view line) {
+            std::vector<std::string_view> fields;
+            while (true)
+            {
+                auto const at = line.find('\t');
+                if (at == std::string_view::npos)
+                    break;
+                fields.push_back(line.substr(0, at));
+                line.remove_prefix(at + 1);
+            }
+            fields.push_back(line);
+            return fields;
+        };
+
+        bool header = true;
+        while (!document.empty())
+        {
+            auto const end = document.find('\n');
+            auto const line = document.substr(0, end);
+            document = end == std::string_view::npos ? std::string_view {} : document.substr(end + 1);
+
+            // A trailing newline leaves an empty tail, which is not a row of one empty
+            // cell. Skipped rather than rendered, or every table gains a blank row.
+            if (line.empty())
+                continue;
+
+            if (header)
+            {
+                for (auto const& field: split(line))
+                    columns.emplace_back(field);
+                header = false;
+                continue;
+            }
+
+            std::vector<Cell> row;
+            row.reserve(columns.size());
+            for (auto const& field: split(line))
+                row.push_back(field == "-" ? AbsentCell() : TextCell(std::string { field }));
+            rows.push_back(std::move(row));
+        }
+
+        return TableValue(std::move(columns), std::move(rows));
+    }
+
+    /// `fleet <section>` -- one of the leader's fleet tables, in a terminal.
+    ///
+    /// The admin surface is reached through the seam rather than dialled here, so
+    /// WHERE it is stays one decision (`IAdminDocument`) and this verb stays about
+    /// what to do with the document.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer Fleet(VerbContext const& context)
+    {
+        // Not a failure to reach anything -- nothing was CONFIGURED to reach. Saying
+        // "could not reach the admin surface" would send an operator to check a
+        // listener nothing dialled, which is the three-state rule the stats ladder
+        // already keeps.
+        if (context.admin == nullptr)
+            return Concluded(Outcome::Usage, "no admin surface is available to this invocation");
+
+        auto const document = context.admin->FetchAdmin(std::format("/fleet.txt?section={}", context.operands[0]));
+        if (!document.has_value())
+        {
+            // WHICH kind of failure decides the exit code, and they are not the same
+            // question: nothing answered, or the leader answered and declined -- the
+            // second carries the server's own words, including the list of sections
+            // when the guess was wrong and the leader's address when this node is not
+            // it.
+            switch (document.error().kind)
+            {
+                case AdminFailure::Refused:
+                    return Concluded(Outcome::Refused, document.error().detail);
+                case AdminFailure::Unreachable:
+                case AdminFailure::Last:
+                    break;
+            }
+            return Concluded(Outcome::Unreachable, document.error().detail);
+        }
+
+        return Answered(FleetTable(*document));
+    }
+
     /// The verbs, in the order `--help` documents them.
     constexpr auto VerbTable = std::to_array<VerbSpec>({
         { .name = "get",
@@ -1549,6 +1650,20 @@ namespace
           .protocolCommand = "node-status",
           .modifiers = Modifier::None,
           .handler = &NodeStatus,
+          .nodeFallback = nullptr },
+        { .name = "fleet",
+          .wire = Wire::Node,
+          .minOperands = 1,
+          .maxOperands = 1,
+          .operands = " <machines|workers|leases|members|tiers>",
+          .summary = "one of the leader's fleet tables, read over the node's\n"
+                     "own admin surface -- no browser and no JSON parser",
+          .protocolCommand = "node-status",
+          .modifiers = Modifier::None,
+          .handler = &Fleet,
+          // The 0xFC wire is what DISCOVERS the admin port, so the verb needs that
+          // connection even though the table arrives over HTTP. No fallback: an
+          // endpoint that is not a node has no fleet to report.
           .nodeFallback = nullptr },
         { .name = "node-metrics",
           .wire = Wire::Node,

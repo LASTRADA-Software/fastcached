@@ -233,7 +233,11 @@ void ReportAdvisories(Answer const& answer, bool quiet)
                                        .resp = resp.get(),
                                        .memcached = memcached.get(),
                                        .node = node.get(),
-                                       .stats = &gatherer };
+                                       .stats = &gatherer,
+                                       // The same object twice, deliberately: it holds the one cached
+                                       // answer to "what is this endpoint", which both the stats ladder
+                                       // and any verb reaching the admin surface are asking about.
+                                       .admin = &gatherer };
 
     auto answer = RunVerb(verb, context);
 

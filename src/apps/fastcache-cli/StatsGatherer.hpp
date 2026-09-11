@@ -17,7 +17,7 @@ namespace FastCache::Cli
 /// The impure half of the ladder, kept apart from `StatsSource.hpp`'s decision so that
 /// `ChooseStats` -- which is where all the interesting behaviour is -- needs no socket
 /// to test. This class does the opposite: it is all socket and no decision.
-class LadderGatherer final: public IStatsGatherer
+class LadderGatherer final: public IStatsGatherer, public IAdminDocument
 {
   public:
     /// @param admin Where `/metrics` is; an unconfigured endpoint means *do not ask*,
@@ -42,6 +42,16 @@ class LadderGatherer final: public IStatsGatherer
                    INodeExchange* node) noexcept;
 
     [[nodiscard]] std::vector<StatsAttempt> Gather() override;
+
+    /// Fetch one document from the admin surface this endpoint reported.
+    ///
+    /// Public because a VERB needs it, where `ResolveAdmin` below stays private: the
+    /// address is this class's business and the document is the caller's. It reuses
+    /// the identity `Identify()` already cached, so a verb pays no second `NodeStatus`
+    /// round trip for asking.
+    /// @param path An absolute path, query string included.
+    /// @return The body, or why there is none.
+    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override;
 
   private:
     /// What the endpoint is, asked ONCE and remembered.

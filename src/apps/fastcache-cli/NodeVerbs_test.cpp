@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "ScriptedExchange.hpp"
 
@@ -909,4 +910,153 @@ TEST_CASE("the cluster verbs send the opcodes the wire table names", "[cli][node
         // only test the first.
         CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(expectation.op));
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1300: `fleet` relays one of the leader's tables into a terminal.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// An admin surface that answers one scripted document.
+///
+/// A fake rather than a real one because the verb's subject is the DOCUMENT: where the
+/// surface is, whether it is TLS and whether the port collides are `ResolveAdmin`'s
+/// questions and are tested where they are decided.
+class ScriptedAdmin final: public IAdminDocument
+{
+  public:
+    /// @param answer What `FetchAdmin` returns, whatever it is asked for.
+    explicit ScriptedAdmin(std::expected<std::string, AdminError> answer):
+        _answer { std::move(answer) }
+    {
+    }
+
+    [[nodiscard]] std::expected<std::string, AdminError> FetchAdmin(std::string_view path) override
+    {
+        _asked.emplace_back(path);
+        return _answer;
+    }
+
+    /// Every path this was asked for, in order.
+    [[nodiscard]] std::vector<std::string> const& Asked() const noexcept
+    {
+        return _asked;
+    }
+
+  private:
+    std::expected<std::string, AdminError> _answer;
+    std::vector<std::string> _asked;
+};
+
+/// Run `fleet` against a scripted admin surface.
+/// @param admin What the surface answers.
+/// @param operands The positional arguments.
+/// @return The answer.
+[[nodiscard]] Answer RunFleet(IAdminDocument* admin, std::vector<std::string> const& operands)
+{
+    auto const* const verb = FindVerb("fleet");
+    REQUIRE(verb != nullptr);
+    // A node connection the verb never sends on: the wire column requires one to be
+    // OPEN, because that is what discovers the admin port in production, and the
+    // discovery itself lives behind the seam this fake replaces.
+    ScriptedNodeExchange node { {} };
+    return RunVerb(*verb, VerbContext { .operands = operands, .node = &node, .admin = admin });
+}
+
+} // namespace
+
+TEST_CASE("fleet renders the section the leader sent, with the leader's own columns", "[cli][node][fleet]")
+{
+    // The columns come off the document and are never named here: they are
+    // `FleetColumn`'s, decided on the leader, and a list in this binary would be a
+    // second place for them to be spelled.
+    ScriptedAdmin admin { std::string { "id\ttoolchain\tslots\nw1\tgcc-13-abcdef\t8\n" } };
+
+    auto const answer = RunFleet(&admin, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Affirmative);
+    // The section reaches the surface as a query parameter rather than being filtered
+    // here -- filtering client-side would need this binary to know which columns belong
+    // to which section, which is the mapping it is deliberately without.
+    REQUIRE(admin.Asked().size() == 1);
+    CHECK(admin.Asked()[0] == "/fleet.txt?section=workers");
+
+    auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(rendered.contains("toolchain"));
+    CHECK(rendered.contains("gcc-13-abcdef"));
+}
+
+TEST_CASE("fleet turns the leader's dash into a real absent cell", "[cli][node][fleet]")
+{
+    // Not text that happens to look absent: `--absent` and JSON `null` have to behave
+    // here as they do for every other verb, and a `-` left as text would render as the
+    // string "-" in JSON where every other absence is `null`.
+    ScriptedAdmin admin { std::string { "id\tlast-picked-age\nw1\t-\n" } };
+
+    auto const answer = RunFleet(&admin, { "workers" });
+
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(rendered.contains("null"));
+    // And the dash is GONE rather than both present -- otherwise this passes against a
+    // renderer that emitted the text and a null side by side.
+    CHECK_FALSE(rendered.contains("\"-\""));
+}
+
+TEST_CASE("fleet keeps the escaping the leader applied", "[cli][node][fleet]")
+{
+    // A tab a peer put in its own display name arrives spelled, and stays spelled.
+    // Unescaping here would put a real tab into a cell, and this tool's own
+    // `--format=tsv` writer quotes nothing -- so the corruption the renderer just
+    // closed would reopen one layer up, in the format an operator pipes.
+    ScriptedAdmin admin { std::string { "endpoint\tname\n10.0.0.2:7100\tbuild\\tnode\n" } };
+
+    auto const answer = RunFleet(&admin, { "machines" });
+
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Tsv });
+    // Two characters, not one: the row still has exactly as many columns as its header.
+    CHECK(rendered.contains("build\\tnode"));
+    CHECK(std::ranges::count(rendered, '\t') == std::ranges::count(std::string_view { "endpoint\tname" }, '\t') * 2);
+}
+
+TEST_CASE("fleet relays a refusal as a refusal, not as an unreachable fleet", "[cli][node][fleet]")
+{
+    // The discrimination this verb exists to keep: a leader that ANSWERED and declined
+    // is a different exit code from nothing answering, and the server's words carry the
+    // accepted keys. Reported as unreachable, an operator goes to check a listener that
+    // is running perfectly and never reads the sentence naming their typo.
+    ScriptedAdmin admin { std::unexpected(
+        AdminError { .kind = AdminFailure::Refused,
+                     .detail = "/fleet.txt?section=worker answered HTTP 400: unknown section; this build serves:" }) };
+
+    auto const answer = RunFleet(&admin, { "worker" });
+
+    CHECK(answer.outcome == Outcome::Refused);
+    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("unknown section"); }));
+}
+
+TEST_CASE("fleet reports a surface it could not reach as unreachable", "[cli][node][fleet]")
+{
+    // The other half of the same discrimination, asserted separately: without this the
+    // case above passes against a verb that answers `Refused` for everything.
+    ScriptedAdmin admin { std::unexpected(
+        AdminError { .kind = AdminFailure::Unreachable, .detail = "10.0.0.7:6674 runs no admin surface" }) };
+
+    auto const answer = RunFleet(&admin, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Unreachable);
+    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("no admin surface"); }));
+}
+
+TEST_CASE("fleet with no admin surface available says so rather than dialling nothing", "[cli][node][fleet]")
+{
+    // Nothing was CONFIGURED to ask, which is not the same as asking and failing -- the
+    // three-state rule the stats ladder already keeps, at a verb that could otherwise
+    // dereference a null.
+    auto const answer = RunFleet(nullptr, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Usage);
 }

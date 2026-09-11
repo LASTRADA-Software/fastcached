@@ -5,6 +5,7 @@
 #include "MemcachedClient.hpp"
 #include "NodeClient.hpp"
 #include "RespClient.hpp"
+#include "SocketExchange.hpp"
 #include "StatsSource.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -140,6 +141,7 @@ struct VerbContext
     IMemcachedExchange* memcached { nullptr }; ///< The memcached-text connection, or null.
     INodeExchange* node { nullptr };           ///< The `0xFC` connection, or null.
     IStatsGatherer* stats { nullptr };         ///< The stats ladder, or null.
+    IAdminDocument* admin { nullptr };         ///< The endpoint's admin surface, or null.
 };
 
 /// The wires, one row per enumerator, in enumerator order.

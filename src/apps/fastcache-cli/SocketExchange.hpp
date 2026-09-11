@@ -209,6 +209,54 @@ struct HttpResponse
     std::string body {}; ///< Everything after the head.
 };
 
+/// Which way an admin fetch produced no document.
+///
+/// TWO states rather than one message, because an operator does different things with
+/// them: nothing was reached, so go and look at a listener; or the surface answered
+/// and declined, so go and read what it said. Collapsed into one string, a verb has to
+/// pick an exit code and is wrong about half the traffic -- the same shape as an
+/// absence counted as a failed attempt.
+enum class AdminFailure : std::uint8_t
+{
+    Unreachable, ///< Nowhere to ask, or nothing answered.
+    Refused,     ///< The surface answered and declined; the detail carries its words.
+    Last,        ///< Not a failure: the length of a table keyed by one.
+};
+
+/// Why an admin fetch produced no document.
+struct AdminError
+{
+    AdminFailure kind { AdminFailure::Unreachable }; ///< Which way it failed.
+    std::string detail;                              ///< What to tell the operator.
+};
+
+/// Fetch one document from the endpoint's own admin surface.
+///
+/// The seam a verb reaches the admin surface through, so that WHERE that surface is
+/// stays one decision. Finding it is not one question but four -- did the operator
+/// override it, did the node report one at all, is it TLS this client cannot speak,
+/// and is the port the one already being talked 0xFC to -- each with its own named
+/// refusal, and each wrong in a way that reads as the surface being down. A verb that
+/// resolved the address itself would be a second copy of all four.
+///
+/// Injected rather than reached for, like every other collaborator here: a verb that
+/// opened its own socket could not be tested without one.
+class IAdminDocument
+{
+  public:
+    IAdminDocument() = default;
+    IAdminDocument(IAdminDocument const&) = delete;
+    IAdminDocument(IAdminDocument&&) = delete;
+    IAdminDocument& operator=(IAdminDocument const&) = delete;
+    IAdminDocument& operator=(IAdminDocument&&) = delete;
+    virtual ~IAdminDocument() = default;
+
+    /// Fetch @p path from the admin surface.
+    /// @param path An absolute path, query string included.
+    /// @return The body, or what went wrong and which KIND of wrong it was.
+    [[nodiscard]] virtual std::expected<std::string, AdminError> FetchAdmin(std::string_view path) = 0;
+};
+
 /// Issue one `GET` and read the whole response.
 ///
 /// Written here rather than reusing a client from the tree because there is none --
