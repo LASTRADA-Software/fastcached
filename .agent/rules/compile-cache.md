@@ -2251,6 +2251,34 @@ with current truth at the moment the staleness would otherwise have done harm.
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
   DIAGNOSTIC can also end in a known dependency path.
+  **The "we do not have the machine" half is now MEASURED rather than assumed**, which
+  the ticket's own acceptance names as a legitimate finding. Measured 2026-09-11 on
+  Windows 11 Pro 10.0.26200, Visual Studio 18 Community: both installed toolsets
+  (14.44.35207 and 14.51.36231) carry exactly ONE resource directory, `1033`, and
+  `VSLANG` at 1033/1031/1041/2052 gives byte-identical English from both the banner and
+  the note prefix, on both toolsets. **`VSLANG` selects among INSTALLED language packs
+  and cannot conjure one**, so it cannot be run backwards to synthesise the case: a
+  localized `cl` is an INSTALLER choice, not an environment variable. Whoever picks this
+  up needs a host with a non-English pack installed, and no arrangement of this one will
+  substitute.
+  Both hazards were then measured anyway, because neither is localization-dependent and
+  a stub was never needed for either.
+  **The indent is AFTER the marker, not before it.** Measured on both toolsets at depths
+  1 to 6: the marker sits at column zero every time and `cl` pads between it and the
+  path by one blank per level of inclusion depth. The ticket's shape
+  `<marker><indent><path>` is exactly right and so is its consequence — a derivation of
+  *line minus the known path* learns `Note: including file:` plus a DEPTH-DEPENDENT run
+  of blanks, so the prefix it discovers depends on which note it happened to learn from.
+  A discovery must therefore trim trailing blanks from what it learns, and
+  `IncludeNoteMarker` is spelled without a trailing space for the matching reason.
+  **A line ending in a known path needs no localization to exist.**
+  `#pragma message("see C:\ci\deep\src\a.h")` emits exactly `see C:\ci\deep\src\a.h` on
+  the same stream — a line ending in a real dependency-shaped path, carrying no marker
+  at all, from which a *line ending in a known path* heuristic learns the prefix
+  `see `. Measured on an English `cl`. What that settles is narrower than it looks and
+  the narrow reading is the useful one: the hazard is real for a discovery run over the
+  USER's compile output and absent for one run over a probe TU the launcher wrote
+  itself, so it is a design constraint on the fix rather than an argument against it.
 - **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
   RETIRED generation's conformance digest is a dated record and nothing can
   re-derive it: it describes the corpus as that generation met it, and #547 retired

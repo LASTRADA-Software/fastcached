@@ -47,6 +47,7 @@
 //
 // Contains no project-specific data; it compiles whatever it is pointed at.
 
+#include "CacheDecision.hpp"
 #include "CacheKey.hpp"
 #include "CacheProtocol.hpp"
 #include "CmdLine.hpp"
@@ -1547,17 +1548,10 @@ void StoreRaw(InvocationRecord const& record,
 
 /// What became of a cache hit we tried to honour.
 ///
-/// Three outcomes rather than a bool, because the two failures want opposite
-/// responses: a value whose dependency record no longer holds must be RECOMPILED
-/// AND RE-STORED (which repairs the entry), while a value we simply could not
-/// write to disk means the cache is not usable here and the compile should run
-/// plainly, uncached.
-enum class HitDisposition : std::uint8_t
-{
-    Served,   ///< Object and depfile written, streams replayed.
-    Stale,    ///< A replayed dependency is missing here; recompile and re-store.
-    Unusable, ///< The object or depfile could not be written; abandon the cache.
-};
+/// Moved to `CacheDecision.hpp` by #909, with everything that reads it: this file is
+/// in no test target, so an enumerator declared here is one no case can name. The
+/// three-outcomes-not-a-bool reasoning travelled with it.
+using Cc::HitDisposition;
 
 /// A hit after it has been examined and, if it held up, materialized.
 ///
@@ -2739,9 +2733,20 @@ void RecordManifest(InvocationRecord const& record,
                 // dependencies for this TU and stop rebuilding it when they change.
                 auto const materialized =
                     MaterializeHit(record, cmd, *decoded, layout, workingDirectory, cfg.showIncludesMarker);
-                if (materialized.disposition == HitDisposition::Unusable)
-                    return Warn(record, "could not write object on hit");
-                if (materialized.disposition == HitDisposition::Served)
+
+                // What happens next is read from `CacheDecisionTable` rather than
+                // spelled here, and that is the whole of #909: this file is in no test
+                // target, so a three-way branch written out here is one no case can
+                // reach. The table is exercised at every state by
+                // `CacheDecision_test.cpp`; what is left in this file is the call.
+                //
+                // Not a `switch` with a `default` either -- on this decision the
+                // default that reads as safest is `CompileWithoutStoring`, which is the
+                // permanently-dead-cache behaviour a generation bump would hit.
+                auto const action = Cc::DecideCacheAction(
+                    Cc::ObserveFetch(fetchKind, /*isHit=*/true, /*decoded=*/true, materialized.disposition));
+
+                if (!Cc::CompilesForReal(action))
                 {
                     record.valueBytes = decoded->objectBlob.size();
                     record.cacheMs = MsSince(cacheStarted);
@@ -2777,6 +2782,15 @@ void RecordManifest(InvocationRecord const& record,
                     ReportVerification(record, VerifyServedObject(cmd, argv, key, cfg.verifyRate), key);
                     TraceOutcome(record, "HIT", key);
                     return 0;
+                }
+                if (!Cc::StoresResult(action))
+                {
+                    // The cache is not usable on this machine: the object could not be
+                    // written, and a STORE would fail the same way. `Warn` returns
+                    // nullopt, which reaches `RunPassthrough` -- a plain compile with no
+                    // store, which is correct HERE and catastrophic one branch up, where
+                    // the value is merely of a generation this build cannot read.
+                    return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable));
                 }
                 // Stale: the object is fine but the dependency record it carries is not
                 // true here, so fall through and compile for real. The STORE that follows

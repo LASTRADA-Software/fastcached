@@ -38,6 +38,47 @@
 # Record the output on #825, including the toolchain version and whether a language pack
 # is installed: the answer may differ for a localized `cl`, which is the case #700 is
 # about, and a reading taken on an en-US install does not settle a localized one.
+#
+# ## Recorded result -- a SECOND, independent reading (#825)
+#
+# #825 was already settled on CI's `Windows-cl-debug` (`windows-2025`, MSVC toolset
+# 14.44) and the answer is in `.agent/rules/compile-cache.md`. #878's body still says
+# the channel is "unmeasured and stated two ways in the tree", and that sentence is
+# STALE -- checked against the rulebook rather than believed, which is the only reason
+# this block does not claim to have settled anything.
+#
+# What it adds is a second reading on a DIFFERENT toolset and a different host, which
+# is worth more than a re-run on the same one: the first reading could not tell a
+# property of `cl` from a property of 14.44 or of a hosted runner. It agrees exactly.
+#
+# The conditions are PINNED here rather than pointed at, because they are the state of
+# one machine at one instant and must not silently track anything that later changes.
+#
+#     Measured 2026-09-11, Windows 11 Pro 10.0.26200, Visual Studio 18 Community
+#     cl 19.51.36252 for x64 (toolset 14.51.36231)
+#     clang-cl 22.1.3 (llvm-project e9846648fd6183ee6d8cbdb4502213fcf902a211)
+#     Language packs: NONE beyond en-US -- both installed toolsets carry exactly one
+#     resource directory, 1033, and no other.
+#
+#     invocation      stdout   stderr   channel   CI's 14.44 reading
+#     cl /c              1        0     stdout    stdout
+#     cl /EP             0        1     stderr    stderr
+#     clang-cl /c        1        0     stdout    stdout   <- control, agrees with D46394
+#     clang-cl /EP       0        1     stderr    stderr   <- control, agrees with D46394
+#
+# Four rows, four agreements. Both controls agree with D46394, so the `cl` rows are
+# believable by this probe's own stated standard.
+#
+# The rule the rulebook draws from this -- the channel follows the FLAG, not the driver
+# -- now rests on two toolsets rather than one, which is the half a single reading could
+# not support: 14.44 alone could not tell a property of `cl` from a property of 14.44.
+#
+# The #878 arm answered too, and negatively: `VSLANG=1031` produces byte-identical
+# English output here, so the localized case is not exercisable on this machine. That
+# is a property of the INSTALL rather than of the environment -- `VSLANG` selects among
+# installed language packs and cannot conjure one. Measured separately at four values
+# (1033, 1031, 1041, 2052) against both the banner and the note prefix, and on both
+# toolsets. See the #878 entry in `.agent/rules/compile-cache.md`.
 
 $ErrorActionPreference = 'Stop'
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("showincludes-" + [guid]::NewGuid())

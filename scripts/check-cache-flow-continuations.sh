@@ -35,11 +35,20 @@ Subject="src/apps/fastcache-cc/main.cpp"
 # The reason string is the anchor because it is what the operator sees and what
 # `--show-stats` ranks; a line number moves with every edit.
 #
+# EXCEPT where the reason is no longer IN this file. #909 moved the hit branch's
+# decision into `CacheDecision.hpp`'s table, so the site now reads
+# `Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable))` and the
+# sentence an operator sees is a `constexpr` lookup away. A scan of `main.cpp`
+# cannot see text that is not in `main.cpp`, so that row anchors on the OBSERVATION
+# enumerator instead: stable, spelled at the site, and naming the exact state whose
+# `why` the table carries. The preference is unchanged and the reason for it holds
+# — anchor on meaning, never on a line number.
+#
 # cache-flow-scan: data-begin
 Table='
 missing FASTCACHE_ADDR|Warn|cache not configured: nothing was reached, so nothing to replace
 preprocess failed|Warn|no preprocessed text means no key, so nothing to replace
-could not write object on hit|Warn|the STORED entry is good; the local write failed
+FetchObservation::HitUnusable|Warn|the STORED entry is good; the local write failed
 DescribeOutcome|WarnAndCarryOn|the daemon refused: carry on so a MISS can store
 fetch exchange failed|WarnAndCarryOn|unreached: carry on so a MISS can store
 DecodeFailureReason|WarnAndCarryOn|an UNUSABLE value sits under this key and must be overwritten
@@ -75,6 +84,18 @@ classify() {
     done
 }
 
+stale_rows() {
+    # $1 = the scan's output, one "<spelling>|<line>|<body>" per call site.
+    # Prints the anchor of every table row that classifies none of them.
+    #
+    # Searched over the whole blob rather than per body, which is the same question
+    # asked once: a row is stale exactly when no scanned line carries its anchor.
+    printf '%s\n' "$Table" | while IFS='|' read -r anchor expected why; do
+        [ -z "${anchor:-}" ] && continue
+        case "$1" in *"$anchor"*) ;; *) printf '%s\n' "$anchor" ;; esac
+    done
+}
+
 run_scan() {
     local tree="$1" rc=0 seen=0 found
     if [ ! -f "$tree/$Subject" ]; then
@@ -107,6 +128,29 @@ EOF
         echo "         renamed or the scan has stopped seeing them, and it is now guarding nothing"
         return 2
     fi
+
+    # The MIRROR failure, and it was silent until #909 produced the first one. A row
+    # classifying nothing is a classification of a site nobody writes: harmless on its
+    # own, and harmful the moment somebody meets an UNCLASSIFIED finding, since adding
+    # a second row is a complete fix by the check's own report while the dead row stays
+    # behind claiming to cover the site that moved. Then the table says two things about
+    # one call site and the check agrees with both.
+    #
+    # It is the same argument as the table's own "mandatory rather than opt-in" header,
+    # pointed the other way: a row is exact about the site it knows and says nothing
+    # about having stopped matching it.
+    local stale
+    stale="$(stale_rows "$found")"
+    if [ -n "$stale" ]; then
+        printf '%s\n' "$stale" | while IFS= read -r anchor; do
+            [ -z "$anchor" ] && continue
+            echo "  STALE ROW     $anchor"
+            echo "                classifies no call site in $Subject. Either the site moved and"
+            echo "                the anchor must follow it, or the site is gone and so is the row"
+        done
+        rc=1
+    fi
+
     if [ "$rc" -eq 0 ]; then
         echo "  $seen call site(s), all classified"
     else
@@ -120,38 +164,50 @@ if [ "$selftest" -eq 1 ]; then
     fail=0; cases=0
     stage() { mkdir -p "$tmp/$1/$(dirname "$Subject")"; cat > "$tmp/$1/$Subject"; }
 
-    stage good <<'SRC'
-return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
-return Warn("preprocess failed");
-return Warn("could not write object on hit");
-WarnAndCarryOn(Cc::DescribeOutcome(outcome));
-WarnAndCarryOn("fetch exchange failed");
-WarnAndCarryOn(DecodeFailureReason(decoded.error()));
+    # Every fixture carries the WHOLE classified set, because a row that classifies
+    # nothing is now a refusal in its own right. A partial fixture would refuse for
+    # THAT reason rather than the one its case is about, and each case would then pass
+    # for the wrong reason -- green, and testing the wrong rule. One baseline, so a row
+    # added to the table above fails these cases until it is staged here too.
+    baseline() {
+        cat <<'SRC'
+return Warn(record, "missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
+return Warn(record, "preprocess failed");
+return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable));
+WarnAndCarryOn(record, Cc::DescribeOutcome(outcome));
+WarnAndCarryOn(record, "fetch exchange failed");
+WarnAndCarryOn(record, DecodeFailureReason(decoded.error()));
 SRC
+    }
+
+    baseline | stage good
     cases=$((cases+1))
     if run_scan "$tmp/good" >/dev/null 2>&1; then echo "  case 1 (all classified)        PASS"; else echo "  case 1 (all classified)        FAIL"; fail=1; fi
 
-    stage newsite <<'SRC'
-return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
-return Warn("a brand new outcome nobody classified");
-SRC
+    { baseline; echo 'return Warn(record, "a brand new outcome nobody classified");'; } | stage newsite
     cases=$((cases+1))
     if run_scan "$tmp/newsite" >/dev/null 2>&1; then echo "  case 2 (new site refused)      FAIL -- not caught"; fail=1; else echo "  case 2 (new site refused)      PASS"; fi
 
-    # The defect itself: the undecodable arm choosing no-STORE.
-    stage backwards <<'SRC'
-return Warn("missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
-return Warn(DecodeFailureReason(decoded.error()));
-SRC
+    # The defect itself: the undecodable arm choosing no-STORE. Its own row's site is
+    # replaced rather than added to, so the table is fully matched and the ONLY thing
+    # left to object to is the spelling.
+    { baseline | grep -v DecodeFailureReason
+      echo 'return Warn(record, DecodeFailureReason(decoded.error()));'; } | stage backwards
     cases=$((cases+1))
     if run_scan "$tmp/backwards" >/dev/null 2>&1; then echo "  case 3 (wrong continuation)    FAIL -- not caught"; fail=1; else echo "  case 3 (wrong continuation)    PASS"; fi
 
-    stage comment <<'SRC'
-// return Warn("a brand new outcome nobody classified");
-return Warn("preprocess failed");
-SRC
+    { echo '// return Warn(record, "a brand new outcome nobody classified");'; baseline; } | stage comment
     cases=$((cases+1))
     if run_scan "$tmp/comment" >/dev/null 2>&1; then echo "  case 4 (comment ignored)       PASS"; else echo "  case 4 (comment ignored)       FAIL"; fail=1; fi
+
+    # A row whose site has MOVED, which is what #909 produced: the reason it anchors on
+    # left `main.cpp` for `CacheDecision.hpp`, so the row went on reading as coverage of
+    # a site nothing writes. Refused. Case 1 is this rule's accepting direction and is
+    # not decoration -- a stale-row test with no full-table case passes on a check that
+    # calls every row stale.
+    baseline | grep -v 'fetch exchange failed' | stage staleRow
+    cases=$((cases+1))
+    if run_scan "$tmp/staleRow" >/dev/null 2>&1; then echo "  case 8 (stale row refused)     FAIL -- not caught"; fail=1; else echo "  case 8 (stale row refused)     PASS"; fi
 
     # The DEFINITIONS, which are not call sites. Six cases stood here without one,
     # so the exclusion had never been watched accepting anything -- and when #60
@@ -159,7 +215,7 @@ SRC
     # direction, reporting two findings against a correct tree. Both helpers are
     # staged with a real call site, so a rule that stopped excluding definitions
     # fails this case rather than the repository.
-    stage definitions <<'SRC'
+    { cat <<'SRC'
 [[nodiscard]] std::optional<int> Warn(InvocationRecord& record, std::string_view reason)
 {
     RecordFallback(record, Fallback::Unavailable, reason);
@@ -169,8 +225,8 @@ void WarnAndCarryOn(InvocationRecord& record, std::string_view reason)
 {
     RecordFallback(record, Fallback::UnavailableCarryOn, reason);
 }
-return Warn(record, "preprocess failed");
 SRC
+      baseline; } | stage definitions
     cases=$((cases+1))
     if run_scan "$tmp/definitions" >/dev/null 2>&1; then echo "  case 7 (definitions ignored)   PASS"; else echo "  case 7 (definitions ignored)   FAIL"; fail=1; fi
 
