@@ -1670,10 +1670,18 @@ jobs:
           path: bin
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
-      - name: "Install sccache + a C++ compiler"
+      # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
+      # it `./bin/fastcached` dies at dynamic-link time before it binds anything. The
+      # two jobs that omitted it were not merely fragile -- they were GREEN, because
+      # sccache fell back to its own local disk cache and hit itself on the second
+      # compile, satisfying `Cache hits [1-9]` with no daemon in the picture at all
+      # (measured on #1315: `Cache location Local disk` on these two legs against
+      # `Cache location memcached` on the leg that installs this package). The
+      # bounded readiness wait is what surfaced it; #1318 is the vacuous assertion.
+      - name: "Install sccache + a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
-          sudo apt-get install -y sccache g++-14
+          sudo apt-get install -y sccache g++-14 libyaml-cpp0.8
       - name: "Smoke"
         run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
 
@@ -1726,10 +1734,18 @@ jobs:
           path: bin
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
-      - name: "Install sccache + a C++ compiler"
+      # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
+      # it `./bin/fastcached` dies at dynamic-link time before it binds anything. The
+      # two jobs that omitted it were not merely fragile -- they were GREEN, because
+      # sccache fell back to its own local disk cache and hit itself on the second
+      # compile, satisfying `Cache hits [1-9]` with no daemon in the picture at all
+      # (measured on #1315: `Cache location Local disk` on these two legs against
+      # `Cache location memcached` on the leg that installs this package). The
+      # bounded readiness wait is what surfaced it; #1318 is the vacuous assertion.
+      - name: "Install sccache + a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
-          sudo apt-get install -y sccache g++-14
+          sudo apt-get install -y sccache g++-14 libyaml-cpp0.8
       - name: "Smoke"
         run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol redis --port 11611 --compiler g++-14
 
