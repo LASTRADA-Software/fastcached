@@ -1412,6 +1412,66 @@ log sitting at zero bytes for slightly too long, an output file containing a sin
 backslash, an exit code disagreeing with its own log's last line, a finding
 reappearing that had supposedly been closed.
 
+
+### Four more, all from `wsl.exe`, and none settled by an exit status or a log
+
+These arrived in one evening from four lanes, and the property that ties them is that
+**NEITHER the wrapper's exit status NOR the presence of a log settles whether the gate
+ran**: two produce exit 0 with no work done, one produces no artefact at all, and one
+produces a status about the wrong process.
+
+- **A BACKGROUND LAUNCH that started nothing and said so in the affirmative.**
+  `A && B && nohup C & echo STARTED` binds the `&` to the WHOLE `&&` list, so the marker
+  is printed by the launcher before anything it describes could have failed. Under
+  `wsl.exe` the detached job then dies with the invocation that started it whether or not
+  `setsid` and `nohup` are spelled. The tell was that the log file did not EXIST — never
+  the exit status.
+- **Its sharpest form: `nohup` inside `wsl.exe -e bash -lc`**, where the child dies with
+  the WSL session and the log is never CREATED. Not stale, not truncated, **absent** — so
+  there is no artefact to examine or date, and absence is exactly what a lane reads as
+  *still running*.
+- **`GATE_EXIT=$?` inside a `wsl.exe` string is the OUTER shell's**, reporting `0` over a
+  run that had just printed `TSAN GATE FAILED`.
+- **`setsid` FORKS when the caller is already a process-group leader**, so the parent
+  returned instantly and `GATE EXIT=$?` recorded **0 before the gate ran a step**, which a
+  waiter keyed on that string then believed. It was caught because the line sat ABOVE the
+  gate's own `LOCAL GATE STARTED` marker: an **ORDERING** check, where every value check
+  agreed with it.
+
+So the wrapper writes an artefact **BEFORE** the gate starts, naming the commit it is
+about, which makes *the wrapper ran* checkable independently of *the gate produced output*
+— and the verdict itself is read from the tool's own terminal text, never from a status.
+
+**`pgrep -f local-gate.sh` cannot settle which gate is whose.** It found three gates, none
+of them the asking lane's, and every one matched the same pattern; `readlink
+/proc/<pid>/cwd` per pid is what named them.
+
+### A killed run has told you nothing, which is not the same as telling you the tree is fine
+
+Two full gates ran concurrently on one host, swap went to 7G of 7G with no OOM kill logged,
+and one died mid-build with exit **144**. **A nonzero exit from a KILLED gate is not a red
+tree** — 144 turned up twice that day in unrelated contexts, so it means *something killed
+this* and never *the tree is bad*. Discard the run rather than reading it.
+
+### Serialise the gate across lanes with a LOCK, and a poll-for-zero is not one
+
+*"Wait until no other `local-gate.sh` is running, then start"* reads as mutual exclusion and
+behaves like it **only while there is a single waiter**, which is the condition it is
+invariably tested under. With N waiters it fails twice:
+
+- **It STARVES.** It waits for zero rather than for the set running when you arrived, so
+  every later arrival extends your wait. Measured on this box: a lane queued at 5:35 was
+  still waiting at 15:57 while one that arrived ten minutes later started and finished first.
+- **It is a THUNDERING HERD.** When the running set drains, every waiter's next poll sees
+  zero and they all start at once — which is the concurrent-gate storm the rule exists to
+  prevent, arriving at the moment adoption is complete and looking exactly like nobody
+  following the rule.
+
+`flock` on a lock file, never `fcntl`, for the reason the storage and scratch-root rules
+already give: an `fcntl` lock is per PROCESS, so two gates inside one shell would both take
+it and succeed. It is not FIFO, so a lane can be unlucky; unlucky-and-bounded is not
+starving and cannot stampede, and it **must not be "improved" into a queue**.
+
 ## A count that OVERSTATES what is wrong is the same defect as one that understates it
 
 Everything above is about an instrument reporting **fewer** things than are wrong, or
