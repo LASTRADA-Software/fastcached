@@ -10,6 +10,7 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Net/SocketAddress.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -22,9 +23,12 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace FastCache;
@@ -323,3 +327,118 @@ TEST_CASE("Suppression is either armed on the socket or carried in the send flag
     #endif
 }
 #endif
+
+// -- Detail::AcceptRaw / Detail::CloseNativeSocket -------------------------
+
+TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says which", "[net][socket][listener]")
+{
+    // `Detail::CloseNativeSocket`'s contract -- *"e.g. the listening socket, to unblock
+    // a thread parked in AcceptRaw()"* -- and `AcceptRaw`'s from the other side, *"a
+    // NetError (Cancelled-like when the listening socket was closed to unblock the
+    // accept)"*. **Nothing asserted either of them.** `AcceptRaw` had no test anywhere,
+    // so the one mechanism `RunMultiReactorWindows`' `stopAll` uses to end its acceptor
+    // threads was a sentence in one header, checked by nobody
+    // ([#1238](https://github.com/LASTRADA-Software/fastcached/issues/1238)).
+    //
+    // That absence is what makes the shape read as a defect. #1238 suspected
+    // close-under-accept there, by analogy with
+    // [#1207](https://github.com/LASTRADA-Software/fastcached/issues/1207), whose remedy
+    // is *stop, JOIN, then close*. **The analogy does not transfer, and the measurements
+    // are why.** #1207 rests on POSIX not waking a parked `accept()`, so closing early
+    // buys nothing there; here the close is the ONLY thing that ends a thread inside a
+    // blocking `::accept`, and joining first would hang forever. The POSIX sibling
+    // (`RunMultiReactorPosix`) can join-then-close only because its acceptors are
+    // reactor-driven `PlatformListener`s rather than threads in a bare syscall.
+    //
+    // So the arrangement is deliberate, and this pins it rather than changing it.
+    //
+    // **What makes this a test and not a smoke check is the SECOND arm.** A close that
+    // merely made the accept *fail* would be satisfied by the thread never having parked
+    // at all -- the accept called a moment AFTER the close, which is a different fact
+    // and one the loop also produces. Measured on Windows 11 / clang-cl, 3 runs each and
+    // identical every time:
+    //
+    //   - parked, then closed underneath -> `WSAEINTR` (10004) -> `NetErrorCode::Cancelled`
+    //   - called on an already-closed handle -> `WSAENOTSOCK` (10038) -> `BadFileHandle`
+    //
+    // Two different codes, so the pair DISCRIMINATES. Asserting only "it returned an
+    // error" would assert what both sides produce, which is no assertion at all.
+    //
+    // **POSIX skips, and the skip is the finding.** Measured on Linux (WSL2, glibc), 3
+    // runs: a thread in `accept()` was STILL PARKED 12.5 s after `close()` on its
+    // listening fd. So the contract quoted above holds on Windows and is false here --
+    // which costs nothing today, because `AcceptRaw`'s only caller is inside
+    // `#if defined(_WIN32)`, and the header now says so. A `SKIP` rather than a
+    // `SUCCEED`: the case did not run, and reporting a pass for a property nothing
+    // established is #685. It is deliberately NOT `#if`-compiled away, so the body goes
+    // on being compiled on the platform the local gate runs -- a platform arm that ships
+    // uncompiled is one nobody has built.
+#if !defined(_WIN32)
+    SKIP("close() does not unblock a parked accept() on this platform -- measured, still parked "
+         "12.5s later, 3/3 on Linux -- and AcceptRaw has no caller outside _WIN32");
+#endif
+
+    // The production spelling: `RunMultiReactorWindows` binds through exactly this call
+    // with exactly this resolver. A fixture that bound its own socket by hand would be
+    // testing a socket, not the seam.
+    auto bound = Detail::BindAndListen(DefaultAddressResolver(), "127.0.0.1", 0, /*backlog*/ 4, /*extraTypeFlags*/ 0);
+    if (!bound.has_value())
+        SKIP("this platform would not bind a loopback listener: " + bound.error());
+
+    SECTION("a parked accept is cancelled, not merely failed")
+    {
+        auto const listenSock = bound->socket;
+
+        // Nothing ever dials this port, so the accept genuinely parks rather than
+        // racing a pending connection -- which is the arrangement `stopAll` meets.
+        std::promise<NetError> outcome;
+        auto answered = outcome.get_future();
+        std::thread acceptor { [listenSock, &outcome] {
+            auto accepted = Detail::AcceptRaw(listenSock);
+            if (accepted.has_value())
+            {
+                Detail::CloseNativeSocket(*accepted);
+                outcome.set_value(NetError { .code = NetErrorCode::Ok, .systemCode = 0, .context = "accept SUCCEEDED" });
+                return;
+            }
+            outcome.set_value(std::move(accepted.error()));
+        } };
+
+        // Long enough that the acceptor is inside the syscall. If it were not, the close
+        // would land first and the code below would read `BadFileHandle` -- which is why
+        // the assertion is on WHICH error, not on the fact of one: a too-short pause
+        // fails this case instead of passing it quietly.
+        std::this_thread::sleep_for(250ms);
+        Detail::CloseNativeSocket(listenSock);
+
+        if (answered.wait_for(10s) != std::future_status::ready)
+        {
+            // Detach rather than join: the thread is in a syscall nothing remaining can
+            // end, so joining would hang the whole binary instead of failing this case
+            // -- and a hang under `catch_discover_tests` is a timeout that names nothing.
+            acceptor.detach();
+            FAIL("AcceptRaw was still parked 10s after its listening socket was closed, so the mechanism "
+                 "RunMultiReactorWindows' stopAll depends on does not hold on this platform (#1238)");
+        }
+        acceptor.join();
+
+        auto const err = answered.get();
+        INFO("AcceptRaw returned " << err.ToString());
+        CHECK(err.code == NetErrorCode::Cancelled);
+    }
+
+    SECTION("an accept CALLED after the close reports the other code")
+    {
+        // The control that makes the section above mean something. Same close, same
+        // helper, no parked thread -- and it must NOT answer `Cancelled`, or the two
+        // states this pair exists to separate are one state and the assertion is empty.
+        auto const listenSock = bound->socket;
+        Detail::CloseNativeSocket(listenSock);
+
+        auto const accepted = Detail::AcceptRaw(listenSock);
+        REQUIRE_FALSE(accepted.has_value());
+        INFO("AcceptRaw returned " << accepted.error().ToString());
+        CHECK(accepted.error().code == NetErrorCode::BadFileHandle);
+        CHECK(accepted.error().code != NetErrorCode::Cancelled);
+    }
+}

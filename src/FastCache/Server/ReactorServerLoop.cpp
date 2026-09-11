@@ -415,6 +415,31 @@ namespace
         // happened to receive the same numeric value. test_and_set is
         // atomic and idempotent — exactly one stopAll path actually runs
         // the teardown.
+        //
+        // **Closing these while an acceptor thread is parked in `AcceptRaw` is
+        // deliberate, and it is the only thing that ends those threads.** The comment
+        // above addresses double-close and says nothing about close-under-accept, which
+        // reads like the second hazard went unexamined — it was
+        // ([#1238](https://github.com/LASTRADA-Software/fastcached/issues/1238)), and
+        // this paragraph is here because the next reader will arrive at the same
+        // suspicion from the same comment.
+        //
+        // Measured on Windows, 3 runs: `closesocket` under a parked `::accept` returns
+        // `WSAEINTR` → `NetErrorCode::Cancelled`, the acceptor's `!raw.has_value()`
+        // breaks its loop, and `~jthread` joins. It is NOT the hazard #1207 fixed on
+        // `BlockingListener`: that remedy is *stop, JOIN, then close*, and it rests on
+        // POSIX NOT waking a parked `accept` (measured: still parked 12.5 s after the
+        // close), so closing early buys nothing there. Here the close is the wakeup, so
+        // joining first would hang forever. The POSIX sibling below can join-then-close
+        // only because its acceptors are reactor-driven `PlatformListener`s. Pinned by
+        // `ctest -R AcceptRaw`, which had no equivalent when #1238 was filed.
+        //
+        // What is NOT closed by this: an acceptor that has just passed its `stopping`
+        // check can still call `AcceptRaw` on a handle `stopAll` closed a moment later.
+        // No flag can remove that window — there is always a gap between the check and
+        // the syscall — which is why the close, not the flag, is the stop mechanism;
+        // the flag only saves a doomed syscall. The outcome there is `WSAENOTSOCK` →
+        // `BadFileHandle`, so the loop breaks anyway, which is the intended end.
         std::atomic_flag stopRun = ATOMIC_FLAG_INIT;
         auto stopAll = [&] {
             if (stopRun.test_and_set(std::memory_order_acq_rel))
@@ -460,8 +485,10 @@ namespace
         // externally closed), the watchdog quits via watchdogQuit without
         // ever invoking onStop — leaving listenSocks open and the acceptor
         // jthreads blocked in AcceptRaw forever. Calling stopAll() here
-        // closes the sockets so AcceptRaw returns WSAEINTR/EBADF and the
-        // acceptor lambdas exit; ~jthread joins cleanly.
+        // closes the sockets so AcceptRaw returns WSAEINTR and the acceptor
+        // lambdas exit; ~jthread joins cleanly. (This said `WSAEINTR/EBADF`;
+        // the POSIX half describes neither this block, which is Windows-only,
+        // nor a parked accept, which POSIX does not wake at all — #1238.)
         stopAll();
         watchdogQuit.store(true, std::memory_order_release);
         logger.Logf(LogLevel::Info, "served {} connection(s)", accepted.load(std::memory_order_relaxed));
