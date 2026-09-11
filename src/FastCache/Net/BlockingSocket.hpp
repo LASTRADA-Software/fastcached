@@ -204,13 +204,43 @@ namespace Detail
     /// the multi-reactor server loop: a single acceptor accepts here, then
     /// hands the raw handle to one reactor which wraps it. The handle is NOT
     /// associated with any reactor yet.
+    ///
+    /// **This is a bare blocking `::accept`, and the ONLY way to end one is to close
+    /// the listening socket underneath it — which works on Windows and does NOT work
+    /// on POSIX.** Stated here as a platform split because it used to be stated as a
+    /// portable fact, and the portable-sounding half is false
+    /// ([#1238](https://github.com/LASTRADA-Software/fastcached/issues/1238)).
+    /// Measured, 3 runs each, identical every time:
+    ///
+    /// - **Windows**: `closesocket` on the listening socket wakes the parked `accept`
+    ///   with `WSAEINTR`, which maps to `NetErrorCode::Cancelled`. An `accept` CALLED
+    ///   on an already-closed handle answers `WSAENOTSOCK` → `BadFileHandle`, so the
+    ///   two situations are told apart by the code rather than guessed at.
+    /// - **POSIX (Linux/glibc)**: `close` on the listening fd does not wake the parked
+    ///   `accept` at all — the thread was still parked 12.5 s later. There is no
+    ///   cancellation here, so a POSIX caller that closes to stop an acceptor gets a
+    ///   thread that never returns.
+    ///
+    /// Nothing is broken by that today because the only caller is
+    /// `RunMultiReactorWindows`, inside `#if defined(_WIN32)`; the POSIX server loop
+    /// uses reactor-driven `PlatformListener`s, which ARE cancellable, and joins its
+    /// acceptors before closing anything. **A new POSIX caller may not use the close as
+    /// a stop mechanism** — give it a cancellable listener, or a self-pipe/`poll` loop.
+    /// `ctest -R AcceptRaw` pins both halves: it asserts the Windows behaviour and
+    /// SKIPs, saying why, everywhere else.
+    ///
     /// @param listenSocket A bound, listening socket.
-    /// @return The accepted socket handle, or a NetError (Cancelled-like when
-    ///         the listening socket was closed to unblock the accept).
+    /// @return The accepted socket handle, or a NetError — `Cancelled` when a PARKED
+    ///         accept was interrupted by the listening socket being closed (Windows),
+    ///         `BadFileHandle` when the handle was already closed before the call.
     [[nodiscard]] std::expected<NativeSocket, NetError> AcceptRaw(NativeSocket listenSocket) noexcept;
 
-    /// Close a raw native socket handle — e.g. the listening socket, to unblock
-    /// a thread parked in AcceptRaw().
+    /// Close a raw native socket handle — e.g. the listening socket.
+    ///
+    /// On **Windows** this doubles as the way to unblock a thread parked in
+    /// `AcceptRaw()`, and `RunMultiReactorWindows` relies on exactly that. It is NOT
+    /// that on POSIX, where a parked `accept` ignores the close — see `AcceptRaw`
+    /// above for the measurements and for what a POSIX caller must do instead (#1238).
     /// @param socket The handle to close.
     void CloseNativeSocket(NativeSocket socket) noexcept;
 

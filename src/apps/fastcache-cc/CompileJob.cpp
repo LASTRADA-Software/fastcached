@@ -1055,6 +1055,22 @@ std::optional<std::string> WorkerSourceNameRule(std::string_view scratchSourcePa
     if (!SpellableInRule(scratchSourcePath, *row))
         return std::nullopt;
 
+    // **The client's value goes in RAW, and that is the point rather than an oversight.**
+    // The left-hand side is `scratchSourcePath`, the sanitized path this compile is
+    // actually handed; the right-hand side is what the object should RECORD, which is the
+    // client's own spelling and therefore a PATH (#800).
+    //
+    // **Do not route it through `SafeSourceName`.** That is the plausible wrong repair --
+    // the header next door described this field as a base name long after #800 stopped it
+    // being one (#907) -- and it fails silently: `SafeSourceName` strips to the last
+    // separator, so the object would record `tu.cpp` rather than the client's path, with
+    // every test that checks the on-disk FILE NAME still green. The two uses of one value
+    // are sanitized differently on purpose.
+    //
+    // What bounds this half is `SpellableInRule` above plus the payload cap. That is the
+    // right SHAPE of defence here because the value never names a file the worker opens:
+    // it reaches a command line and then a debug record, where a character restriction is
+    // what matters and a path-component check would only destroy the answer.
     return PrefixMapRule(*row, scratchSourcePath, clientSourceName);
 }
 
