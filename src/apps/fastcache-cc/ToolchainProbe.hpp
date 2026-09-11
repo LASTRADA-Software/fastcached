@@ -220,6 +220,40 @@ struct DriverIdentityProbe
 /// `-fms-compatibility-version` from an MSVC install that can be upgraded beside a
 /// byte-identical driver. This is not a cache: nothing is remembered.
 ///
+/// ## What it actually buys, measured end to end on both platforms
+///
+/// Measured 2026-09-11 by running a launcher built BEFORE this change and one built
+/// after against the same translation unit and the same daemon, interleaved A/B so a
+/// drift in machine load cannot be attributed to the change, `time.monotonic`, min
+/// and median of 20 pairs (15 for clang-cl). Pinned rather than pointed at: these
+/// are two machines at one instant.
+///
+///   platform / driver              before      after      saved
+///   ---------------------------- --------- ---------- ----------
+///   Windows 11 NTFS, clang++       34.2 ms    22.4 ms    11.8 ms   (34%)
+///   Windows 11 NTFS, clang-cl      51.8 ms    40.1 ms    11.8 ms   (23%)
+///   WSL2 Ubuntu on DrvFs, clang++ 133.3 ms   112.5 ms    20.8 ms   (16%)
+///
+/// The mechanism is confirmed by COUNT rather than inferred from the clock: a
+/// logging wrapper standing in for the driver recorded **4 compiler spawns before
+/// and 3 after** -- `--version`, the target probe, the preprocess and the compile,
+/// with the first of those gone.
+///
+/// Against ~679 compile edges in this repository's own tree, that DERIVES (not
+/// measures) roughly 8 s per Windows build and 14 s per Linux one.
+///
+/// **#1237 inferred about 20 s per Windows build, and that figure is too high.** It
+/// came from #188's ~40 ms, which is the cost of the target probe rather than of the
+/// `--version` spawn this removes; the removed spawn measures 8.7 ms in isolation
+/// here and ~12 ms inside the launcher. The prize is real and it is about half what
+/// the ticket projected.
+///
+/// One arrangement note, because it cost a wrong answer first: with
+/// `FASTCACHE_ADDR`/`SOURCE_DIR`/`BINARY_DIR` unset the launcher declines before it
+/// probes anything, so both binaries run one spawn and the measured saving is
+/// exactly zero. A timing run that does not set them is measuring a path on which
+/// this code never executes.
+///
 /// ## Why keying on the STEM is sound rather than merely convenient
 ///
 /// `ClassifyCompilerFromBanner` moves a flavour in ONE direction only -- `Gcc` to
