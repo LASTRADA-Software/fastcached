@@ -1828,6 +1828,25 @@ were open to breaking it, and neither needed anybody's install to be stale.
     could not fail. And a retired digest is a dated record besides — it describes the
     corpus as that generation met it, which the next corpus row invalidates
     ([#583](https://github.com/LASTRADA-Software/fastcached/issues/583)).
+  - **A bump's claim is checkable from generation 4 forward, and the aggregate digest
+    could never have carried it** (#583). The digest is a FOLD, so it answers *the
+    behaviour moved* and cannot answer WHICH rows moved — which is the only claim a
+    bump actually makes. `Generation4Rows` freezes the corpus PER ROW, and a second
+    frozen generation without a `GenerationBumps` row naming what it moved fails the
+    **build**, not a test: this is a *do something* obligation, so it belongs to the
+    type system. The ticket asked instead for a frozen corpus so a retired digest
+    could be **re-derived**, and that cannot be built at all: `ConformanceDigest`
+    folds the outputs of PRODUCTION functions, so the digest is a function of the
+    corpus AND of current behaviour, and a bump moves the behaviour half by
+    definition. Freezing the inputs alone yields today's behaviour over old inputs —
+    a number that is neither the retired digest nor anything a reader can interpret,
+    and worse than none because it would look like a re-derivation. So generations 1
+    to 3 stay DATED RECORDS by decision rather than by omission: recovering them needs
+    their behaviour, which is gone, and that is an accepted cost rather than open
+    work. Two frozen rows sharing a digest is the canonicalization WORKING — the two
+    bare-drive-root rows differ only on the producer side and erasing that difference
+    is the whole point — so equal-today is not redundant, and deleting one is the
+    available mistake.
   - **Measured, because a guard nobody has watched refuse is not a guard**: an edit to
     `JoinLocalized` — which changes what every consumer replays — is refused by
     **exactly one** case in the whole suite, the pin. Stated that way on purpose: the
@@ -2289,13 +2308,3 @@ with current truth at the moment the staleness would otherwise have done harm.
   the narrow reading is the useful one: the hazard is real for a discovery run over the
   USER's compile output and absent for one run over a probe TU the launcher wrote
   itself, so it is a design constraint on the fix rather than an argument against it.
-- **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
-  RETIRED generation's conformance digest is a dated record and nothing can
-  re-derive it: it describes the corpus as that generation met it, and #547 retired
-  generation 1 while adding three corpus rows in the same commit. The live row is
-  guarded, and a reverted bump is caught structurally (unique ascending versions,
-  the live byte naming the last row) — what is missing is any assertion that a bump
-  changed what it SAID it changed, which needs a per-generation frozen corpus. The key
-  side's retired rows have the same property, and both tables now assert through one
-  shared helper (`src/tests/RetiredGenerations.hpp`, #548), so a frozen corpus has one
-  place to land rather than two.
