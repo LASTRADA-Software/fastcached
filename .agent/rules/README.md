@@ -79,3 +79,85 @@ without anything saying so. The reasoning is in
 An `@`-prefixed reference to a file in this directory, anywhere in `AGENT.md`,
 would pull every one of them back into every session and undo the entire point of
 the split. Link them as plain markdown.
+
+## Open work
+
+- **[#876](https://github.com/LASTRADA-Software/fastcached/issues/876)** — nothing
+  checks that a rule here has a tripwire in `AGENT.md`, and a rule with no tripwire
+  is, for most sessions, a rule that does not exist. **The ticket asks for a check
+  over a unit this tree does not have, and that is the finding rather than a
+  caveat** — a check built against it would assert the wrong correspondence, and
+  assert it confidently, in the file every session reads first.
+
+  Measured 2026-09-11 on `abb530ed`, each figure with the pattern that produced it,
+  because a census states its pattern and not only its number. `^## ` over
+  `.agent/rules/*.md` excluding `README.md`: **112** headings. `^- ` over `AGENT.md`
+  between one `**[`.agent/rules/X.md`]**` link and the next: **350** top-level
+  bullets, **358** counting the eight nested `  - ` ones.
+
+  A second reader over the same file reported different per-file figures — 77 where
+  this one gives 57. That disagreement is **not reconciled here and neither number
+  is restated as a range**, because only these were taken with the pattern above:
+  quoting someone else's figure beside your own turns a relayed claim into a
+  measurement it never was. Two counts of one artefact disagreeing is a finding
+  about the walkers, and it does not touch the conclusion, which rests on the shape.
+
+  <!-- table-total: none -->
+
+  | file | `##` headings | top-level tripwire bullets |
+  |---|--:|--:|
+  | `distributed-compilation.md` | 1 (`Open work`) | 57 |
+  | `build-and-toolchain.md` | 29 | 72 |
+  | `testing.md` | 33 | 71 |
+  | `packaging-and-release.md` | 4 | 6 |
+
+  A file with ONE heading carries dozens of tripwires. Most rules here are bullets
+  and prose; a `##` entry is a subset, so there is no 1:1 structure to derive a
+  correspondence from. The three rows are a sample chosen to show the SHAPE, not a
+  census — the totals above the table are the census.
+
+  **Four things a reader reaching for this should know before designing anything.**
+
+  *The cited instance is repaired.* #876 names `e12a4c9a` as adding *"A green local
+  gate says NOTHING when the subject under test is the build environment"* with no
+  tripwire. `AGENT.md` now carries one — *"When the SUBJECT under test is the build
+  environment, a green local gate is not weak evidence — it is none."* The ticket's
+  substance stands; its example does not, so do not go hunting a live gap.
+
+  *The correspondence cannot be heading text.* That very pair is the worked
+  example: same fact, no matchable text. Any fuzzy rule refuses correct entries and
+  misses incorrect ones — the ticket's own objection to the threaded-source census,
+  turned on the ticket.
+
+  *A tripwire may live under ANOTHER file's link, and may be a nested bullet.*
+  `compile-cache.md`'s `## Two servers on one wire are two VERSIONS on one wire` is
+  tripwired at `AGENT.md:580`, a `  - ` sub-bullet under **`distributed-compilation.md`**
+  — correctly, because the rule spans both and that is where a reader of the fleet
+  section needs it. So "a bullet under that file's link" would refuse a correct
+  tree, and any reader keyed on `^- ` misses it silently.
+
+  *The rule this file states is already CONDITIONAL.* "Adding a rule" above says to
+  add a tripwire *if the rule is one a reader could plausibly break without
+  noticing*. #876 asks to enforce something stronger than the rulebook asks for, so
+  a check written to its acceptance clause would refuse entries this file says need
+  no tripwire.
+
+  **The design that survives all four**, recorded so it is not re-derived: a marker
+  in the RULES file under each `##` heading, mandatory, either naming a distinctive
+  phrase from its `AGENT.md` bullet or spelling `none` with a reason — the
+  `table-total: none` idiom, so opt-in silence is impossible. The check verifies the
+  quoted phrase appears in `AGENT.md`, which makes *yes* a claim somebody can be
+  wrong about rather than a box ticked. `AGENT.md` is only READ, which is the
+  property that makes it affordable in a file several sessions edit at once. What
+  it costs is ~112 markers and a human decision per entry, against a unit the
+  tree does not use — which is why it is recorded here rather than built.
+
+  **The sizing ruler is not trustworthy and is not a check.** Word overlap between
+  a heading and a file's whole `AGENT.md` section says a tripwire is PLAUSIBLE,
+  never that one exists. Its first version reported **0 of 104** matched, including
+  the one instance already confirmed by hand — its section walker cleared its
+  current file on any line starting at column zero, and these sections carry
+  blockquotes and paragraphs that do. Fixed, it reports 66 plausible and 18
+  needing a human decision; by hand most of the 18 are covered by a bullet sharing
+  no vocabulary. **18 is the number that decides the cost and it is the one least
+  worth betting on.**
