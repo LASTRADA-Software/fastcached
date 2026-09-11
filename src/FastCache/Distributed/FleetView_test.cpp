@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -98,6 +99,24 @@ constexpr auto DiskIndex = static_cast<std::size_t>(StorageTier::Disk);
     return std::format(R"(<span class="kpi-sub">{}</span>)", text);
 }
 
+/// How many times @p needle occurs in @p haystack, non-overlapping.
+///
+/// A COUNT rather than a `contains`, because the page and the JSON are one document
+/// each: a column name several sections carry is present in the document however many
+/// of them actually rendered it, so presence cannot say which did.
+/// @param haystack The rendered document.
+/// @param needle What to look for.
+/// @return The number of occurrences.
+[[nodiscard]] std::size_t CountOccurrences(std::string_view haystack, std::string_view needle)
+{
+    if (needle.empty())
+        return 0;
+    std::size_t count = 0;
+    for (auto at = haystack.find(needle); at != std::string_view::npos; at = haystack.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
 /// A history nobody has sampled yet, for a case that is not about the charts.
 ///
 /// Empty rather than fabricated: most cases here are about the snapshot, and a
@@ -133,6 +152,11 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
                                                   .workerId = "w1",
                                                   .workerEndpoint = "10.0.0.2:7100",
                                                   .age = std::chrono::milliseconds { 4000 } } };
+    // A tier is turned on because the tier section's columns are COMPOSED rather than
+    // tabled -- `StorageTierTable` crossed with the suffixes, for present tiers only --
+    // so on a snapshot running none it comes back holding its endpoint column alone and
+    // this case would cover the section by asserting almost nothing about it.
+    snapshot.tiersPresent[MemoryIndex] = true;
 
     auto const html = RenderFleetHtml(snapshot, NoHistory(), 10);
     auto const json = RenderFleetJson(snapshot);
@@ -142,53 +166,66 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
     // named different columns.
     auto const text = RenderFleetText(snapshot, std::nullopt);
 
-    // Column names are one spelling serving all three consumers, so a header, a key
-    // and a text column cannot drift apart.
-    for (auto const& name: { "id", "raft-endpoint", "scheduler-endpoint" })
+    // Derived from the tables through `FleetColumnNames`, never written out. The four
+    // braced lists that used to stand here sat directly under the paragraph above
+    // saying they did not exist, and they were short: `name` and `version` were in
+    // `NodeColumns` and in no list, and the `tiers` section was absent altogether. A
+    // column added to a table joined the blind spot SILENTLY -- the case passed, and
+    // its own prose told the next reader the coverage was structural, which is what
+    // retired the suspicion that would have found the gap (#1320).
+    //
+    // Do not reintroduce a list here to "document" the columns. A list is exact about
+    // what it knows and silent about what it does not, and silence reads identically to
+    // complete coverage.
+    REQUIRE_FALSE(FleetSectionTable.empty());
+    std::size_t checked = 0;
+    std::map<std::string, std::size_t> sectionsNaming;
+    for (auto const& row: FleetSectionTable)
     {
-        INFO("member column " << name);
-        CHECK(html.contains(std::string { ">" } + name + "</th>"));
-        CHECK(json.contains(std::string { "\"" } + name + "\":"));
-        CHECK(text.contains(name));
+        auto const names = FleetColumnNames(row.section, snapshot);
+        INFO("section " << row.key);
+        // A section that reports no columns at all would pass every loop below without
+        // running one, which is the vacuous-coverage shape one level up. Every section
+        // this snapshot carries has columns, so there is nothing to excuse.
+        REQUIRE_FALSE(names.empty());
+
+        // The section's OWN text, not the whole document. Attribution is half the
+        // property: `endpoint` is a column of four different sections, so a
+        // whole-document search says one of them carries it and cannot say which.
+        auto const sectionText = RenderFleetText(snapshot, row.section);
+
+        for (auto const& name: names)
+        {
+            INFO("column " << name);
+            CHECK(sectionText.contains(name));
+            CHECK(text.contains(name));
+            ++sectionsNaming[name];
+            ++checked;
+        }
     }
-    for (auto const& name: { "endpoint",
-                             "toolchains",
-                             "cores",
-                             "memory",
-                             "class",
-                             "cpu-busy",
-                             "memory-available",
-                             "scratch-free",
-                             "cache-hit-rate",
-                             "heartbeat-age" })
+
+    // The page and the JSON are ONE document each, with no per-section door to render
+    // through -- so attribution there is a COUNT, derived from the same walk. A name
+    // four sections carry must appear four times, and dropping it from three of them
+    // leaves a document that still *contains* it. Measured: dropping `endpoint` from
+    // every row table passed a whole-document `contains`, because the tier block
+    // emits its own.
+    for (auto const& [name, sections]: sectionsNaming)
     {
-        INFO("node column " << name);
-        CHECK(html.contains(std::string { ">" } + name + "</th>"));
-        CHECK(json.contains(std::string { "\"" } + name + "\":"));
-        CHECK(text.contains(name));
+        INFO("column " << name << " is named by " << sections << " section(s)");
+        CHECK(CountOccurrences(html, std::string { ">" } + name + "</th>") >= sections);
+        CHECK(CountOccurrences(json, std::string { "\"" } + name + "\":") >= sections);
     }
-    for (auto const& name: { "slots",
-                             "in-flight",
-                             "available",
-                             "limited-by",
-                             "toolchain",
-                             "compiler",
-                             "heartbeat-age",
-                             "registered-age",
-                             "last-picked-age" })
-    {
-        INFO("worker column " << name);
-        CHECK(html.contains(std::string { ">" } + name + "</th>"));
-        CHECK(json.contains(std::string { "\"" } + name + "\":"));
-        CHECK(text.contains(name));
-    }
-    for (auto const& name: { "key", "worker", "age" })
-    {
-        INFO("lease column " << name);
-        CHECK(html.contains(std::string { ">" } + name + "</th>"));
-        CHECK(json.contains(std::string { "\"" } + name + "\":"));
-        CHECK(text.contains(name));
-    }
+
+    // Stated so a run says how much it covered: a derivation that started returning
+    // nothing would satisfy every assertion above by making none.
+    INFO("columns checked: " << checked);
+    CHECK(checked > FleetSectionTable.size());
+
+    // And the tier section specifically, for the reason the snapshot turns a tier on:
+    // it is the one section whose column set can collapse to its endpoint column while
+    // every loop above still runs and passes.
+    CHECK(FleetColumnNames(FleetSection::Tiers, snapshot).size() > 1);
     // And every lease outcome, by the key its row carries.
     for (auto const& row: LeaseOutcomeTable)
     {

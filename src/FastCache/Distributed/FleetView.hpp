@@ -308,6 +308,37 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// @return The section, or absent when nothing is called that.
 [[nodiscard]] std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept;
 
+/// Every column name @p section renders for @p snapshot, in the order all three
+/// surfaces walk them.
+///
+/// Here so the coverage test can be **derived** rather than written out. It used to
+/// iterate four braced lists of column-name literals under a comment saying it walked
+/// the tables, which is [#492](https://github.com/LASTRADA-Software/fastcached/issues/492)'s
+/// rule one axis over: a column added to a table joined the test's blind spot silently,
+/// the case still passed, and the prose retired the suspicion that would have found the
+/// gap. Two node columns and the whole tier section were uncovered that way.
+///
+/// **Only the NAMES come out; the tables stay file-local.** A `FleetColumn` row carries
+/// a projector over the row type it reads, so publishing the rows would put
+/// `NodeReport`, `WorkerReport`, `LeaseHolding` and `ClusterMember` projections in this
+/// header for no production reader. The column SET is the contract between the page, the
+/// JSON and the text — the projectors are not.
+///
+/// **It takes the snapshot, because one section's column set is not static.** The tier
+/// columns are `StorageTierTable` crossed with the per-tier suffixes and *a tier no
+/// member runs gets no column*, so a fixed list for `Tiers` would name columns the
+/// document does not carry. Composed through the same `TierColumnName` the three
+/// renderers use, so there is no second spelling to disagree with.
+///
+/// A `switch` with no default arm, exactly as `AppendSectionText` has none: a section
+/// added to `FleetSectionTable` is a BUILD failure here rather than one that quietly
+/// reports no columns — which reads identically to a section nothing needs to check.
+///
+/// @param section Which section.
+/// @param snapshot The document the names are being asked about.
+/// @return The names, in render order; empty only for `FleetSection::Last`.
+[[nodiscard]] std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot const& snapshot);
+
 /// Render a fleet snapshot as tab-separated text.
 ///
 /// The **third** walk over the same `FleetColumn` tables the page and the JSON walk,

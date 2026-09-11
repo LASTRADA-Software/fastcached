@@ -615,6 +615,15 @@ namespace
         return std::format("{}-{}", StorageTierTable[static_cast<std::size_t>(tier)].name, suffix);
     }
 
+    /// What the tier table's first column is called.
+    ///
+    /// The tier section is the one whose columns are composed rather than tabled, so
+    /// its leading column is the only name here with no row to come from. Spelled once:
+    /// it was a literal in the three renderers, and `FleetColumnNames` would have made
+    /// it a fourth -- at which point the name a caller is told to expect and the name a
+    /// renderer emits are different strings that happen to agree.
+    constexpr std::string_view TierEndpointColumn = "endpoint";
+
     /// Whether any member reports this tier.
     [[nodiscard]] bool AnyNodeHasTier(std::vector<NodeReport> const& nodes, StorageTier tier)
     {
@@ -1043,7 +1052,7 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
         if (!std::exchange(firstNode, false))
             out += ',';
         out += '{';
-        AppendJsonString(out, "endpoint");
+        AppendJsonString(out, TierEndpointColumn);
         out += ':';
         AppendJsonString(out, node.endpoint);
         for (auto const& tier: StorageTierTable)
@@ -1124,7 +1133,7 @@ namespace
     /// @param snapshot What to render.
     void AppendTierText(std::string& out, FleetSnapshot const& snapshot)
     {
-        out += "endpoint";
+        out += TierEndpointColumn;
         for (auto const& tier: StorageTierTable)
         {
             if (!snapshot.tiersPresent[static_cast<std::size_t>(tier.tier)])
@@ -1191,6 +1200,51 @@ namespace
         }
     }
 } // namespace
+
+std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot const& snapshot)
+{
+    auto const namesOf = [](auto const& columns) {
+        std::vector<std::string> names;
+        names.reserve(columns.size());
+        for (auto const& column: columns)
+            names.emplace_back(column.name);
+        return names;
+    };
+
+    // The same `switch` shape as `AppendSectionText`, with no default arm and the same
+    // table per section. A section whose names came from one table while its rows came
+    // from another would report perfect coverage of a set nothing renders, which is the
+    // defect this function exists to remove rather than relocate.
+    switch (section)
+    {
+        case FleetSection::Machines:
+            return namesOf(NodeColumns);
+        case FleetSection::Workers:
+            return namesOf(WorkerColumns);
+        case FleetSection::Leases:
+            return namesOf(LeaseColumns);
+        case FleetSection::Members:
+            return namesOf(MemberColumns);
+        case FleetSection::Tiers: {
+            // Laid down exactly as `AppendTierText` lays them: the endpoint column, then
+            // every present tier crossed with every suffix. `tiersPresent` is what makes
+            // this snapshot-dependent -- a tier no member runs gets no column, so naming
+            // one here would tell a caller to look for a column that is correctly absent.
+            std::vector<std::string> names { std::string { TierEndpointColumn } };
+            for (auto const& tier: StorageTierTable)
+            {
+                if (!snapshot.tiersPresent[static_cast<std::size_t>(tier.tier)])
+                    continue;
+                for (auto const& column: TierColumns)
+                    names.push_back(TierColumnName(tier.tier, column.suffix));
+            }
+            return names;
+        }
+        case FleetSection::Last:
+            break;
+    }
+    return {};
+}
 
 std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSection> section)
 {
@@ -2071,7 +2125,7 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
     });
     if (anyTier)
     {
-        out += R"(<div class="panel wrap"><table><thead><tr><th>endpoint</th>)";
+        out += std::format(R"(<div class="panel wrap"><table><thead><tr><th>{}</th>)", TierEndpointColumn);
         for (auto const& tier: StorageTierTable)
         {
             if (!snapshot.tiersPresent[static_cast<std::size_t>(tier.tier)])
