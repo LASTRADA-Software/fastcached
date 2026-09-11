@@ -265,8 +265,21 @@ namespace
 [[nodiscard]] std::vector<std::byte> CompileFrameFor(std::string_view fingerprint)
 {
     std::array<std::byte, 4> const source { std::byte { 1 }, std::byte { 2 }, std::byte { 3 }, std::byte { 4 } };
-    return Wire::EncodeCompile(Wire::CompileRequest {
-        .leaseToken = "a-token", .fingerprint = fingerprint, .args = {}, .source = std::span<std::byte const> { source } });
+    // EVERY field named, the empty ones included. clang treats
+    // `missing-designated-field-initializers` as an error under `-Werror` while GCC
+    // accepts the partial form, so the short spelling builds on a GCC lane and fails
+    // the clang-debug gate leg. It did, which is what "one configuration is not the
+    // gate" means when it happens to you.
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "a-token",
+                                                      .fingerprint = fingerprint,
+                                                      .args = {},
+                                                      .source = std::span<std::byte const> { source },
+                                                      .acceptedCodecs = {},
+                                                      .sourceName = {},
+                                                      .compileDir = {},
+                                                      .compileDirReplacement = {},
+                                                      .sourceRoot = {},
+                                                      .sourceRootReplacement = {} });
 }
 } // namespace
 
