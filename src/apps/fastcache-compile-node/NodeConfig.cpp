@@ -1424,17 +1424,50 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                   "a new Reloadable::Yes row must be listed in AdvertisedReloadableFlags or LocalReloadableFlags");
 
     // And the converse, which is what makes `AdvertisedClaimsDiffer` safe to write as
-    // a table walk: every name on that list is a real row AND carries a comparator.
+    // a table walk: every name on either list is a real row AND carries a comparator.
     // Without this a listed flag that no row answers to would compare nothing and
     // report "unchanged" forever, and one whose row had no `same` would be a null call
     // on the reload path -- both silent, both at run time.
-    static_assert(std::ranges::all_of(AdvertisedReloadableFlags,
-                                      [](std::string_view flag) {
-                                          return std::ranges::any_of(options, [flag](OptionSpec<NodeConfig> const& spec) {
-                                              return spec.primary == flag && spec.same != nullptr;
+    //
+    // **Walked over `ReloadableFlagLists` rather than over one list by name.** This
+    // guard was written for `AdvertisedReloadableFlags` alone, with that reasoning
+    // beside it, while `LocalReloadableFlags` -- declared three lines below it -- got
+    // nothing; every word of the reasoning applied to both. Naming the lists here
+    // instead of deriving them is what let that happen, and would let it happen again
+    // for the third list (#1027).
+    //
+    // A `LocalReloadableFlags` entry naming no row is inert TODAY, because that list is
+    // only ever asked `contains` -- which is a property of the current consumers rather
+    // than of the list, and is exactly the silence that reads identically to coverage.
+    // The next consumer that WALKS it inherits a dead entry with no signal.
+    static_assert(std::ranges::all_of(ReloadableFlagLists,
+                                      [](std::span<std::string_view const> list) {
+                                          return std::ranges::all_of(list, [](std::string_view flag) {
+                                              return std::ranges::any_of(
+                                                  options, [flag](OptionSpec<NodeConfig> const& spec) {
+                                                      return spec.primary == flag && spec.same != nullptr;
+                                                  });
                                           });
                                       }),
-                  "every AdvertisedReloadableFlags entry must name a row that carries a FieldEq comparator");
+                  "every reloadable-flag list entry must name a row that carries a FieldEq comparator");
+
+    // And the direction neither list had at all: a listed flag whose row is
+    // `Reloadable::No`. The row and the list then disagree about the one fact both
+    // exist to state -- and `AdvertisedClaimsDiffer` walks that list, so a
+    // `Reloadable::No` row named there is compared and re-advertised on every reload,
+    // which is the setting being treated as reloadable by the code while the table says
+    // it is not. Neither list violates this today; both facts were compile-time
+    // checkable and left uncheckable, in a table that has taken four new rows recently.
+    static_assert(std::ranges::all_of(ReloadableFlagLists,
+                                      [](std::span<std::string_view const> list) {
+                                          return std::ranges::all_of(list, [](std::string_view flag) {
+                                              return std::ranges::any_of(
+                                                  options, [flag](OptionSpec<NodeConfig> const& spec) {
+                                                      return spec.primary == flag && spec.reloadable == Reloadable::Yes;
+                                                  });
+                                          });
+                                      }),
+                  "every reloadable-flag list entry must name a row that is Reloadable::Yes");
 
     return options;
 }
