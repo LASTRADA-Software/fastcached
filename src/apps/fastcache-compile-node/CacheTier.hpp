@@ -9,6 +9,7 @@
 #include "Responders.hpp"
 
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -175,6 +176,20 @@ class CacheTier
 /// leader through a field that exists.
 /// @param tier This node's cache tier, or nullptr when it runs none.
 /// @return Bytes to hold back, or 0 without a tier.
+/// The in-memory codec settings this configuration asks for.
+///
+/// Its own function, and public, for two reasons. It is the ONE place a memory
+/// tier's codec is decided, so a second tier cannot be built without it -- the
+/// daemon learned that as `MakeL1`, whose comment says every L1 goes through it
+/// "so the memory-compression settings cannot be applied to some shards and
+/// silently missed on others". And it is a pure mapping from configuration to
+/// options, so a test can assert the wiring without a filesystem, a socket or a
+/// started tier -- which matters because a flag that reaches no tier is inert and
+/// looks, from every other surface, exactly like one that works.
+/// @param cfg The node configuration.
+/// @return The options to hand `InMemoryLruStorage::SetCompression`.
+[[nodiscard]] InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg);
+
 [[nodiscard]] std::uint64_t IndexReserveBytesOf(CacheTier const* tier);
 
 [[nodiscard]] Distributed::NodeCacheCapacity CacheCapacityOf(CacheTier const* tier);

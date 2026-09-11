@@ -10,6 +10,7 @@
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Core/Compression.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -107,6 +108,9 @@ namespace
         options.path = cfg.cacheDir / DiskStoreFileName;
         options.maxBytes = static_cast<std::size_t>(cfg.cacheDiskBytes);
         options.maxValueBytes = DiskMaxValueBytes;
+        options.compression = cfg.compression;
+        options.compressionLevel = cfg.compressionLevel;
+        options.compressionMinBytes = cfg.compressionMinBytes;
         auto opened = CowTreeStorage::Open(options);
         if (!opened.has_value())
         {
@@ -164,6 +168,7 @@ namespace
         if (cfg.cacheMemoryBytes != 0)
         {
             auto memory = std::make_unique<InMemoryLruStorage>(static_cast<std::size_t>(cfg.cacheMemoryBytes));
+            memory->SetCompression(MemoryCompressionOf(cfg));
             storage = storage == nullptr ? std::unique_ptr<IStorage> { std::move(memory) }
                                          : std::make_unique<LayeredStorage>(std::move(memory), std::move(storage));
         }
@@ -249,18 +254,35 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
     // Each half named separately, and an absent one said out loud. "256m in
     // memory, no disk" and "no memory, 10g on disk" are different deployments and
     // an operator reading one startup line has to be able to tell which they got.
+    //
+    // The codec rides on the half it belongs to, and only where that half EXISTS --
+    // naming a codec beside "off" would describe a tier this node does not run. It
+    // is said at all because nothing else says it: no metric, no `/fleet.json` field
+    // and no other log line reports which codec a tier holds, so without this an
+    // operator cannot tell a compressed tier from an uncompressed one, and a setting
+    // that silently reached nothing would look exactly like one that worked.
     logger.Logf(LogLevel::Info,
                 "local cache tier (memory {}, disk {}, upstream {})",
                 cfg.cacheMemoryBytes == 0 ? std::string { "off" }
-                                          : FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
+                                          : std::format("{} {}",
+                                                        FormatByteSize(static_cast<std::size_t>(cfg.cacheMemoryBytes)),
+                                                        Compression::NameOf(cfg.memoryCompression)),
                 cfg.cacheDir.empty()
                     ? std::string { "off" }
-                    : std::format("{} at {}",
+                    : std::format("{} {} at {}",
                                   cfg.cacheDiskBytes == 0 ? std::string { "unbounded" }
                                                           : FormatByteSize(static_cast<std::size_t>(cfg.cacheDiskBytes)),
+                                  Compression::NameOf(cfg.compression),
                                   cfg.cacheDir.string()),
                 cfg.upstream.empty() ? std::string { "none" } : cfg.upstream);
     return tier;
+}
+
+InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg)
+{
+    return { .codec = cfg.memoryCompression,
+             .level = cfg.memoryCompressionLevel,
+             .minBytes = cfg.memoryCompressionMinBytes };
 }
 
 std::uint64_t IndexReserveBytesOf(CacheTier const* tier)

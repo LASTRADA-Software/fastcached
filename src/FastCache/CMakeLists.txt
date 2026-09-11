@@ -28,6 +28,7 @@ target_sources(FastCache
         CompileCache/PathCanon.cpp
         Config/ByteSize.cpp
         Config/CliParser.cpp
+        Config/CompressionValues.cpp
         Config/ConfigMerge.cpp
         Config/ConfigReloader.cpp
         Config/DefaultConfigPath.cpp

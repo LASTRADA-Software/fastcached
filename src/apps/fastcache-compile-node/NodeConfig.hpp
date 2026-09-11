@@ -6,6 +6,7 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
@@ -278,6 +279,29 @@ struct NodeConfig
     /// to keep what it has -- but a node runs on somebody's workstation, so this
     /// is the flag that exists because that default is not always the right one.
     std::uint64_t cacheDiskBytes { 0 };
+
+    /// Codec effort for the on-disk tier, and for the in-memory one.
+    ///
+    /// Both default to 3, zstd's speed/ratio knee and the value
+    /// `CowTreeStorage::Options` already uses -- so a node that names neither
+    /// behaves exactly as it did before these settings existed.
+    int compressionLevel { 3 };
+
+    /// Effort for `memoryCompression`. See `compressionLevel`.
+    int memoryCompressionLevel { 3 };
+
+    /// Values below this are written to disk uncompressed.
+    ///
+    /// 256 bytes, matching `CowTreeStorage::Options`' own default: below it the CPU
+    /// rarely pays for itself and a codec can make a small record LARGER.
+    std::size_t compressionMinBytes { 256 };
+
+    /// Values below this are kept in memory uncompressed.
+    ///
+    /// 4096 rather than the disk tier's 256, matching `InMemoryLruStorage`'s own
+    /// default. The two differ on purpose: an in-memory read pays the decompress on
+    /// every hit, where a disk read has already paid for the I/O it saves.
+    std::size_t memoryCompressionMinBytes { 4096 };
 
     /// Where this node serves cache verbs to its local clients; empty turns it off.
     ///
@@ -585,6 +609,35 @@ struct NodeConfig
     bool upstreamExplicit { false };
     bool drainTimeoutSecondsExplicit { false };
     bool logLevelExplicit { false };
+    bool compressionExplicit { false };
+    bool compressionLevelExplicit { false };
+    bool compressionMinBytesExplicit { false };
+    bool memoryCompressionExplicit { false };
+    bool memoryCompressionLevelExplicit { false };
+    bool memoryCompressionMinBytesExplicit { false };
+
+    /// Codec for values this node writes to its on-disk cache tier.
+    ///
+    /// `Zstd` because that is what `CowTreeStorage::Options` has always defaulted to
+    /// and this flag only exposes it: any other default here would silently re-encode
+    /// every existing node's disk tier on upgrade. Changing it is safe on a store
+    /// already written -- each record carries its own codec tag, so reads decode by
+    /// what they were written with and only later writes follow the new setting.
+    ///
+    /// Byte-wide, so it lives in this run rather than beside `cacheDir`; see the note
+    /// above `logLevel`.
+    CompressionCodec compression { CompressionCodec::Zstd };
+
+    /// Codec for values held in this node's in-memory cache tier.
+    ///
+    /// `Identity` -- off -- because the tier has never compressed and turning it on
+    /// by default would change the CPU cost of every existing deployment on upgrade.
+    /// Worth naming when the working set exceeds the budget: `InMemoryLruStorage`
+    /// charges its budget in STORED bytes, so a codec makes `--cache-memory` hold
+    /// materially more, at a decompress per read.
+    ///
+    /// Independent of `compression`, which is the on-disk one.
+    CompressionCodec memoryCompression { CompressionCodec::Identity };
 
     /// Whether the admin surface also serves the fleet dashboard.
     ///

@@ -7,6 +7,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
@@ -1094,6 +1095,97 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "cache_dir",
             .same = FieldEq<&NodeConfig::cacheDir>(),
         },
+        // The six compression settings, in the daemon's spelling and with the daemon's
+        // defaults. One concept, one name across both binaries: an operator moving
+        // between a `fastcached` and a worker types the same flag, and the shipped
+        // reference blocks read the same in both files.
+        //
+        // All six are `Reloadable::No`, and DELIBERATELY rather than by inheritance
+        // (#756 asked for the distinction to be stated where the next reader finds it).
+        // The reason is reach, not safety: a value is decodable whatever the setting
+        // later becomes, because every entry is stamped with the codec it was written
+        // under -- but `SetCompression` is an unsynchronised member write, the L1
+        // instances are built inside `ShardedStorage`/`LayeredStorage` with no handle
+        // that outlives `BuildStorage`, and the disk codec is fixed at
+        // `CowTreeStorage::Open`. Publishing a new value that reached no tier would be
+        // a configuration claiming something about a live object that is not true.
+        {
+            .primary = "--compression",
+            .arity = Arity::Value,
+            .operand = "=<codec>",
+            .apply = AssignFrom<&NodeConfig::compression, ParseCompressionCodec>(),
+            .explicitBit = &NodeConfig::compressionExplicit,
+            .description = "on-disk value codec for --cache-dir:\n"
+                           "none|lz4|zstd (default zstd). Reads always return\n"
+                           "plaintext and each record decodes by its own tag,\n"
+                           "so changing this needs no migration.",
+            .yamlKey = "compression",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compression>(),
+        },
+        {
+            .primary = "--compression-level",
+            .arity = Arity::Value,
+            .operand = "=<N>",
+            .apply = AssignFrom<&NodeConfig::compressionLevel, ParseCompressionLevel>(),
+            .explicitBit = &NodeConfig::compressionLevelExplicit,
+            .description = "codec effort level for --compression\n"
+                           "(1..22; default 3, zstd).",
+            .yamlKey = "compression_level",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compressionLevel>(),
+        },
+        {
+            .primary = "--compression-min-bytes",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compressionMinBytes, ParseCompressionMinBytes>(),
+            .explicitBit = &NodeConfig::compressionMinBytesExplicit,
+            .description = "skip on-disk compression for values smaller than\n"
+                           "this; k/m/g accepted (default 256).",
+            .yamlKey = "compression_min_bytes",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compressionMinBytes>(),
+        },
+        {
+            .primary = "--memory-compression",
+            .arity = Arity::Value,
+            .operand = "=<codec>",
+            .apply = AssignFrom<&NodeConfig::memoryCompression, ParseCompressionCodec>(),
+            .explicitBit = &NodeConfig::memoryCompressionExplicit,
+            .description = "in-memory value codec for --cache-memory:\n"
+                           "none|lz4|zstd (default none). Independent of\n"
+                           "--compression, which is the on-disk one. The budget\n"
+                           "counts COMPRESSED bytes, so a codec makes the tier\n"
+                           "hold more, at a decompress on every read.",
+            .yamlKey = "memory_compression",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompression>(),
+        },
+        {
+            .primary = "--memory-compression-level",
+            .arity = Arity::Value,
+            .operand = "=<N>",
+            .apply = AssignFrom<&NodeConfig::memoryCompressionLevel, ParseCompressionLevel>(),
+            .explicitBit = &NodeConfig::memoryCompressionLevelExplicit,
+            .description = "codec effort level for --memory-compression\n"
+                           "(1..22; default 3, zstd).",
+            .yamlKey = "memory_compression_level",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompressionLevel>(),
+        },
+        {
+            .primary = "--memory-compression-min-bytes",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::memoryCompressionMinBytes, ParseCompressionMinBytes>(),
+            .explicitBit = &NodeConfig::memoryCompressionMinBytesExplicit,
+            .description = "keep in-memory values smaller than this\n"
+                           "uncompressed; k/m/g accepted (default 4096).",
+            .yamlKey = "memory_compression_min_bytes",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompressionMinBytes>(),
+        },
         {
             .primary = "--listen-node",
             .arity = Arity::Value,
@@ -1809,6 +1901,15 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--serve-scheduler");
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
+    // Codecs by NAME: `emitIfExplicit` formats its value, and a `CompressionCodec`
+    // is a byte-wide enum, so the registration would otherwise bake in `2` -- which
+    // the next start's own parser refuses.
+    emitIfExplicit("compression", Compression::NameOf(cfg.compression), cfg.compressionExplicit);
+    emitIfExplicit("compression-level", cfg.compressionLevel, cfg.compressionLevelExplicit);
+    emitIfExplicit("compression-min-bytes", cfg.compressionMinBytes, cfg.compressionMinBytesExplicit);
+    emitIfExplicit("memory-compression", Compression::NameOf(cfg.memoryCompression), cfg.memoryCompressionExplicit);
+    emitIfExplicit("memory-compression-level", cfg.memoryCompressionLevel, cfg.memoryCompressionLevelExplicit);
+    emitIfExplicit("memory-compression-min-bytes", cfg.memoryCompressionMinBytes, cfg.memoryCompressionMinBytesExplicit);
     emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
     // **The one flag emitted on VALUE rather than on provenance, and NOT through a
     // general-purpose emitter.** The provenance rule is not being broken here so much

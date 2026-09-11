@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
@@ -163,36 +164,26 @@ namespace
             ConfigErrorCode::OutOfRange, "cpu-affinity", std::format("unknown mode (expect none|per-core): {}", sv)));
     }
 
-    [[nodiscard]] std::expected<CompressionCodec, ConfigError> ParseCompression(std::string_view sv)
+    // The three compression value parsers live in `Config/CompressionValues.hpp`:
+    // twelve settings across two binaries ask the same three questions, and a copy
+    // per table is how `YamlReader.cpp` came to hold a second one. These wrappers add
+    // only what is true of argv and of nothing else -- the source -- and deliberately
+    // set no `field`, so `ApplyOneOption` stamps the row's own spelling. The copy this
+    // replaced hard-coded `compression`, which named the wrong flag for every
+    // `--memory-compression` refusal.
+    [[nodiscard]] std::expected<CompressionCodec, ConfigError> ParseCompressionArgv(std::string_view sv)
     {
-        auto const codec = Compression::CodecFromName(sv);
-        if (!codec.has_value())
-            return std::unexpected(ArgvError(ConfigErrorCode::OutOfRange,
-                                             "compression",
-                                             std::format("unknown codec (expect {}): {}", Compression::NameList(), sv)));
-        if (!Compression::IsAvailable(*codec))
-            return std::unexpected(ArgvError(
-                ConfigErrorCode::OutOfRange,
-                "compression",
-                std::format("codec '{}' is not available in this build (rebuild with FASTCACHED_ENABLE_COMPRESSION)", sv)));
-        return *codec;
+        return ParseCompressionCodec(sv).transform_error(WithArgvSource);
     }
 
-    [[nodiscard]] std::expected<int, ConfigError> ParseCompressionLevel(std::string_view sv)
+    [[nodiscard]] std::expected<int, ConfigError> ParseCompressionLevelArgv(std::string_view sv)
     {
-        // zstd accepts roughly 1..22; keep a generous, codec-agnostic 1..22
-        // guard so an absurd value is rejected up front.
-        return ParsePositiveInt(sv, "compression-level").and_then([](std::size_t value) -> std::expected<int, ConfigError> {
-            if (value == 0 || value > 22)
-                return std::unexpected(ArgvError(
-                    ConfigErrorCode::OutOfRange, "compression-level", std::format("out of range (1..22): {}", value)));
-            return static_cast<int>(value);
-        });
+        return ParseCompressionLevel(sv).transform_error(WithArgvSource);
     }
 
-    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseCompressionMinBytes(std::string_view sv)
+    [[nodiscard]] std::expected<std::size_t, ConfigError> ParseCompressionMinBytesArgv(std::string_view sv)
     {
-        return ParseByteSize(sv, "compression-min-bytes").transform_error(WithArgvSource);
+        return ParseCompressionMinBytes(sv).transform_error(WithArgvSource);
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv)
@@ -516,7 +507,7 @@ namespace
         { .primary = "--compression",
           .arity = Arity::Value,
           .operand = "=<codec>",
-          .apply = AssignFrom<&Config::compression, ParseCompression>(),
+          .apply = AssignFrom<&Config::compression, ParseCompressionArgv>(),
           .explicitBit = &CliResult::compressionExplicit,
           .description = "on-disk value codec for --storage: none|lz4|zstd (default zstd)\n"
                          "reads always return plaintext; each record decodes by its own tag",
@@ -525,7 +516,7 @@ namespace
         { .primary = "--compression-level",
           .arity = Arity::Value,
           .operand = "=<N>",
-          .apply = AssignFrom<&Config::compressionLevel, ParseCompressionLevel>(),
+          .apply = AssignFrom<&Config::compressionLevel, ParseCompressionLevelArgv>(),
           .explicitBit = &CliResult::compressionLevelExplicit,
           .description = "codec effort level for --compression (1..22; default 3, zstd)",
           .yamlKey = "compression_level",
@@ -533,7 +524,7 @@ namespace
         { .primary = "--compression-min-bytes",
           .arity = Arity::Value,
           .operand = "=<size>",
-          .apply = AssignFrom<&Config::compressionMinBytes, ParseCompressionMinBytes>(),
+          .apply = AssignFrom<&Config::compressionMinBytes, ParseCompressionMinBytesArgv>(),
           .explicitBit = &CliResult::compressionMinBytesExplicit,
           .description = "skip compression for values smaller than this; k/m/g accepted (default 256)",
           .yamlKey = "compression_min_bytes",
@@ -578,7 +569,7 @@ namespace
         { .primary = "--memory-compression",
           .arity = Arity::Value,
           .operand = "=<codec>",
-          .apply = AssignFrom<&Config::memoryCompression, ParseCompression>(),
+          .apply = AssignFrom<&Config::memoryCompression, ParseCompressionArgv>(),
           .explicitBit = &CliResult::memoryCompressionExplicit,
           .description = "in-memory value codec for the L1 tier: none|lz4|zstd (default none)\n"
                          "independent of --compression, which is the on-disk one",
@@ -589,7 +580,7 @@ namespace
         { .primary = "--memory-compression-level",
           .arity = Arity::Value,
           .operand = "=<N>",
-          .apply = AssignFrom<&Config::memoryCompressionLevel, ParseCompressionLevel>(),
+          .apply = AssignFrom<&Config::memoryCompressionLevel, ParseCompressionLevelArgv>(),
           .explicitBit = &CliResult::memoryCompressionLevelExplicit,
           .description = "codec effort level for --memory-compression (1..22; default 3, zstd)",
           .yamlKey = "memory_compression_level",
@@ -599,7 +590,7 @@ namespace
         { .primary = "--memory-compression-min-bytes",
           .arity = Arity::Value,
           .operand = "=<size>",
-          .apply = AssignFrom<&Config::memoryCompressionMinBytes, ParseCompressionMinBytes>(),
+          .apply = AssignFrom<&Config::memoryCompressionMinBytes, ParseCompressionMinBytesArgv>(),
           .explicitBit = &CliResult::memoryCompressionMinBytesExplicit,
           .description = "keep in-memory values smaller than this uncompressed; k/m/g accepted\n"
                          "(default 4096)",

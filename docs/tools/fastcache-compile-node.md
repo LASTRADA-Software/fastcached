@@ -9,7 +9,7 @@ about one of them:
 
 | Role | What switches it on | Default |
 |---|---|---|
-| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory |
+| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir`, `--memory-compression` | on, 25% of RAM in memory, uncompressed |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft` | **off** — a lone node leads itself |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
@@ -597,6 +597,55 @@ fraction safe at both ends — a small laptop still gets a cache worth having, a
 `--cache-disk` caps the on-disk half, which is otherwise allowed to grow as
 needed — the same default `--storage-max-disk` has on the daemon. On a build
 server that is usually right; on somebody's workstation it usually is not.
+
+### Compressing what each tier holds
+
+Both halves take a codec, spelled exactly as `fastcached` spells it, and the two are
+independent:
+
+| Flag | Applies to | Default |
+|---|---|---|
+| `--compression`, `--compression-level`, `--compression-min-bytes` | the `--cache-dir` half | `zstd`, level `3`, above `256` bytes |
+| `--memory-compression`, `--memory-compression-level`, `--memory-compression-min-bytes` | the `--cache-memory` half | **off**, level `3`, above `4096` bytes |
+
+The disk half has always compressed with zstd; these flags only give you the dial
+that was already turning. The memory half has never compressed, and still does not
+unless you say so — turning it on by default would change the CPU cost of every
+existing node on upgrade.
+
+**Naming a codec for the memory tier makes `--cache-memory` hold more, not less.**
+The in-memory budget counts the bytes a value actually occupies, so compressing them
+is what lets a given budget hold more entries — compile-cache objects with debug
+information compress well. What it costs is a decompress on every read, paid on the
+hit path. That trade is worth making when the working set is larger than the budget
+and not when it fits comfortably inside it.
+
+**The two budgets are denominated differently, and it is worth knowing which.**
+`--cache-memory` bounds *compressed* bytes — what the tier occupies in RAM.
+`--cache-disk` bounds *logical* bytes: the store accounts a value at its
+pre-compression size, so a compressed disk tier reaches its cap holding that much
+original data while occupying less than that on the filesystem. `--cache-disk=36g`
+with zstd is therefore 36 GB of objects, not 36 GB of file.
+
+Changing a codec needs no migration and no `--migrate-cache`: every record carries
+the codec it was written under, so reads keep decoding correctly and only later
+writes follow the new setting. A store written by a mixed sequence of settings is
+readable throughout.
+
+A codec this build was compiled without is refused by name at startup rather than
+silently ignored — `none` is always available, `lz4` and `zstd` depend on
+`FASTCACHED_ENABLE_COMPRESSION`. All six settings are read once at startup and are
+**not** reloadable: the tiers are built as the node starts and nothing can reach
+them afterwards, so a reload that appeared to change a codec would be a
+configuration claiming something about a live tier that is not true.
+
+Which codec each tier actually holds is on the startup line, because nothing else
+reports it:
+
+```console
+local cache tier (memory 36G zstd, disk 36G zstd at /var/cache/fastcache-node, upstream none)
+```
+
 
 !!! note "One node per `--cache-dir`, and the store enforces it"
 

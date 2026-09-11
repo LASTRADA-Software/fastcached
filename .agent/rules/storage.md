@@ -234,6 +234,31 @@ in `ShardedStorage` and nothing else. A counter that is exported and can never r
 is the shape the metrics rules already name, so anything written about reacting to
 damage says which binary it is about.
 
+## What a tier's byte figures are denominated in
+
+**The two tiers count different bytes, and neither is wrong.**
+`InMemoryLruStorage` charges its budget the STORED size — `_bytesUsed += storedSize`
+in `InsertNew`, where `storedSize` is whatever `EncodeForStorage` returned, so a
+compressed value is charged what it actually occupies in RAM. `CowTreeStorage`
+charges `originalLen` (`CowTreeStorage.cpp:1337`), the size before the codec ran.
+
+So the same object under the same codec moves `bytesUsed` by different amounts in
+the two halves, and the operator-facing consequence is that `--cache-memory` bounds
+**resident** bytes while `--cache-disk` bounds **logical** ones: a compressed disk
+tier reaches its cap holding that much pre-compression data and occupying less than
+that on the filesystem.
+
+**A test that asserts compression through the disk tier's `bytesUsed` therefore
+cannot fail.** That is how it was found: the case compared 65536 with 65536 and read
+as *the codec did nothing*, which is a true observation carrying a false claim — the
+tier was compressing correctly the whole time. Measure the STORE FILE for the disk
+half, and `bytesUsed` for the memory half; `ctest -R fastcache-compile-node-tests`
+covers both under `[compression]`.
+
+Neither figure is the RAM a tier costs. `indexBytes` is the key index and is resident
+for both halves, which is why it is reported separately and must not be added to
+either (#175).
+
 ## Converting a store
 
 **A format is convertible exactly as long as its reader is in
