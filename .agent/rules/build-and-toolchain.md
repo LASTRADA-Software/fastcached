@@ -3195,7 +3195,9 @@ carriage return, so such a script does not misbehave — it fails to start at al
     no new check is proposed.** Measured against the real scan in four arms: the defect
     in an **untracked** `.sh` inside `scripts/` is **caught**; the same file tracked is
     caught; a tracked `.sh` **outside** `scripts/` is invisible to the `grep -q` scan,
-    but `bash32-scope` **refuses the tree by name**, so it cannot happen silently. The
+    but `shell-walk-scope` **refuses the tree by name**, so it cannot happen silently
+    (it was `bash32-scope` until #843 gave the walk more readers than that one scan
+    and the name stopped describing what it answers for). The
     one blind spot is a script outside the repository -- a scratchpad file, which is
     where that rebase gate lived -- and no enumeration can reach it: untracked, outside
     every walk, gone by the next session. Widening the scan there is unsound rather

@@ -3206,6 +3206,95 @@ _shell_scripts() {
     find "${source_dir}/scripts" -type f -name '*.sh' 2>/dev/null | LC_ALL=C sort
 }
 
+# ---------------------------------------------------------------------------
+# Declared data regions, for the scans that have to read THIS file
+# ---------------------------------------------------------------------------
+#
+# What of a file a scan may read: everything except full-line comments and any
+# region the file declared as DATA for that scan, with blanks substituted so
+# `grep -n` keeps reporting real line numbers.
+#
+# Three scans need this, because this file holds the very text three of them look
+# for -- in a token table, in canary fixtures and in failure messages -- so a scan
+# without the filter matches itself. AGENT.md's rule and #492's shape: a file that
+# matches its own scan by construction exempts a REGION, never itself. A whole-file
+# allowlist row would blind the scan to the 4000-line script ctest runs on macOS,
+# which is where the stand-ins it guards actually live.
+#
+# The MARKER is a parameter and not a constant, and that is the load-bearing part
+# rather than a tidy-up: a region says which SCAN its text is data FOR. `bash32`
+# and `seconds` each had their own copy of this awk, and `_seconds_readable`'s
+# comment argued -- correctly -- that it must not simply call the bash32 one,
+# because sharing a marker would blank this file's `seconds` implementation for the
+# bash-3.2 check as well, exempting it from a check it needs. That argument is for
+# a PARAMETER; two copies of it were the second-best reading, and a third copy for
+# the perl scan is where it stops being defensible.
+#
+# @param 1 the scan's marker, e.g. `bash32-scan`
+# @param 2 the file
+_readable_dropping_regions() {
+    awk -v m="$1" '
+        $0 ~ ("^[[:space:]]*# " m ": data-begin[[:space:]]*$") { skip = 1; print ""; next }
+        $0 ~ ("^[[:space:]]*# " m ": data-end[[:space:]]*$")   { skip = 0; print ""; next }
+        skip                                                   { print ""; next }
+        /^[[:space:]]*#/                                       { print ""; next }
+        { print }
+    ' "$2"
+}
+
+# The fault in one file's regions for one scan, as text; nothing when well formed.
+#
+# A STATE MACHINE, and it has to be, because the reader above is one. Counting the
+# two markers and comparing totals is the obvious spelling and it is wrong in the
+# direction that HIDES things: a `data-end` sitting above the first `data-begin` is
+# a no-op for the reader and leaves a region open to EOF, while the counts come out
+# 1 and 1 and the file reads as balanced. Measured -- staged into this very file,
+# the whole run's output was byte-identical to a clean one, census line included,
+# with a `mapfile` hidden after the stray marker.
+#
+# So it asks the same questions the reader does, in the same order: a close with
+# nothing open, a second open inside one, and anything still open at the end.
+#
+# @param 1 the scan's marker
+# @param 2 the file
+# @return 0 when a fault was printed, 1 when the file is well formed
+_region_fault() {
+    awk -v m="$1" '
+        $0 ~ ("^[[:space:]]*# " m ": data-begin[[:space:]]*$") {
+            if (open) { print "line " NR ": a data-begin inside a region opened at line " at; exit }
+            open = 1; at = NR; next
+        }
+        $0 ~ ("^[[:space:]]*# " m ": data-end[[:space:]]*$") {
+            if (!open) { print "line " NR ": a data-end with no region open"; exit }
+            open = 0; next
+        }
+        END { if (open) print "the region opened at line " at " is never closed" }
+    ' "$2" | grep . || return 1
+}
+
+# One refusal, spelled once, for every scan that reads through a declared region.
+# A region opened and never closed blanks the rest of the file for that scan, and
+# nothing about the output says so -- which is this mechanism's own way of becoming
+# an exemption. So the fault is a REFUSAL and the file is not scanned on a fault:
+# reading it anyway would report on a file half of which was silently invisible.
+#
+# @param 1 the scan's name, as note_failure records it
+# @param 2 the scan's marker
+# @param 3 the file
+# @param 4 the file's basename
+# @return 0 when the file is safe to scan
+_region_ok() {
+    local fault=""
+    fault="$(_region_fault "$2" "$3")" && {
+        echo "FAIL $1: ${4} declares a malformed '$2' data region, so part of it is" >&2
+        echo "     invisible to this scan and the file 'passes' whatever is in there." >&2
+        printf '%s\n' "$fault" | sed 's/^/     | /' >&2
+        note_failure "$1"
+        return 1
+    }
+    return 0
+}
+
 _scan_exempt() {
     local base="$1" row=""
     while IFS= read -r row; do
@@ -4035,15 +4124,7 @@ done
 # refused below rather than tolerated, and the number of regions is REPORTED --
 # a region nobody can see added is this mechanism's own way of becoming an
 # exemption.
-_bash32_readable() {
-    awk '
-        /^[[:space:]]*# bash32-scan: data-begin[[:space:]]*$/ { skip = 1; print ""; next }
-        /^[[:space:]]*# bash32-scan: data-end[[:space:]]*$/   { skip = 0; print ""; next }
-        skip                                                 { print ""; next }
-        /^[[:space:]]*#/                                     { print ""; next }
-        { print }
-    ' "$1"
-}
+_bash32_readable() { _readable_dropping_regions "bash32-scan" "$1"; }
 
 # Every hit in one file, as `<table index> <lineno>:<text>`. The INDEX rather than
 # the token, because three of the tokens contain a space and a caller splitting on
@@ -4079,32 +4160,12 @@ _bash32_hits() {
     return 0
 }
 
-# A malformed region, in any scanned file. Prints what is wrong and returns 0
-# when there is a fault; returns 1 when the file is well formed.
-#
-# A STATE MACHINE, and it has to be, because `_bash32_readable` is one. Counting
-# the two markers and comparing totals is the obvious spelling and it is wrong in
-# the direction that hides things: a `data-end` sitting ABOVE the first
-# `data-begin` is a no-op for the reader and leaves a region open to EOF, while
-# the counts come out 1 and 1 and the file reads as balanced. Measured -- staged
-# into this very file, the whole run's output was byte-identical to a clean one,
-# census line included, with a `mapfile` hidden after the stray marker.
-#
-# So this asks the same question the reader does, in the same order: a close with
-# nothing open, a second open inside one, and anything still open at the end.
-_bash32_region_fault() {
-    awk '
-        /^[[:space:]]*# bash32-scan: data-begin[[:space:]]*$/ {
-            if (open) { print "line " NR ": a data-begin inside a region opened at line " at; exit }
-            open = 1; at = NR; next
-        }
-        /^[[:space:]]*# bash32-scan: data-end[[:space:]]*$/ {
-            if (!open) { print "line " NR ": a data-end with no region open"; exit }
-            open = 0; next
-        }
-        END { if (open) print "the region opened at line " at " is never closed" }
-    ' "$1" | grep . || return 1
-}
+# A malformed `bash32-scan` region, in any scanned file. Prints what is wrong and
+# returns 0 when there is a fault; returns 1 when the file is well formed. The
+# state machine, and why counting the two markers is the wrong spelling, is at
+# `_region_fault`; the canaries below drive this name because they are the ones
+# that have watched it refuse.
+_bash32_region_fault() { _region_fault "bash32-scan" "$1"; }
 
 # Print one file's hits in full, resolving each index back to its reason.
 _bash32_report() {
@@ -4290,6 +4351,14 @@ fi
 # outside `scripts/` is outside the walk, and a file the classifier cannot see is
 # refused by name rather than silently excluded.
 #
+# It is asked ONCE and it answers for the WALK, not for one scan: `_shell_scripts`
+# is the set every scan in this file reads -- timeout, early-exit, wc, helper
+# copies, perl bounds, bash 3.2 constructs and SECONDS -- so a stray file is
+# outside all of them at once. Hence the name is about the walk. A second copy
+# beside each scan would be six more things to be wrong rather than a cross-check,
+# and its position after the loops costs nothing: a stray reddens the whole run,
+# so no scan's clean verdict is read as final.
+#
 # The claim states its SEARCH, because a census that does not is one somebody
 # quotes at the wrong set. The pattern is `git ls-files '*.sh'` -- tracked files
 # whose NAME ends `.sh` -- so this says nothing about the ten `#!/bin/sh`
@@ -4301,19 +4370,19 @@ if git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     ran=$(( ran + 1 ))
     stray="$(git -C "$source_dir" ls-files '*.sh' | grep -v '^scripts/' || true)"
     if [ -n "$stray" ]; then
-        echo "FAIL bash32-scope: tracked shell script(s) live outside scripts/, where the walk" >&2
-        echo "     above does not reach them:" >&2
+        echo "FAIL shell-walk-scope: tracked shell script(s) live outside scripts/, where the" >&2
+        echo "     _shell_scripts walk every scan in this file reads does not reach them:" >&2
         printf '%s\n' "$stray" | sed 's/^/     | /' >&2
         echo "     Widen the walk, or give each one an allowlist row saying why it is exempt." >&2
-        note_failure "bash32-scope"
+        note_failure "shell-walk-scope"
     else
-        echo "   bash 3.2: scope confirmed -- git ls-files '*.sh' finds none outside scripts/"
+        echo "   walk scope confirmed -- git ls-files '*.sh' finds none outside scripts/"
     fi
 else
     # Not a pass and not a failure: the question could not be asked. Said out
     # loud, because "no strays found" and "nothing looked" read identically --
     # and counted as SKIPPED only, never also as run.
-    echo "   bash 3.2: NOT CHECKED whether any *.sh lives outside scripts/ -- no git repository here" >&2
+    echo "   walk scope NOT CHECKED -- no git repository here, so whether any *.sh lives outside scripts/ is unknown" >&2
     skipped=$(( skipped + 1 ))
 fi
 
@@ -4408,9 +4477,36 @@ echo "== no bound is decided from SECONDS"
 # does not match itself, and declared as a REGION rather than a whole-file exemption
 # so the rest of this file, its own two timings above included, stays scanned.
 
+# What counts as a read of bash's `SECONDS`, spelled ONCE and used by both the
+# per-file walk and the extractor -- two sites, and a scan whose two halves can
+# disagree about what it is looking for is two scans.
+#
+# A WHOLE WORD, and that is the correction rather than a nicety. It was a bare
+# `grep -n 'SECONDS'`, which is a substring: `FASTCACHED_SCAN_BUDGET_SECONDS`,
+# `READY_SECONDS` and any other identifier ENDING in the token matched, and so
+# would one beginning with it. `pgrep -f` in a `grep` -- a pattern is broader than
+# its author reads it as -- and it is the same family as this file's own
+# `perl-bounds-scan` needing `{` and `)` as entry points.
+#
+# The tell was not a red run. **It was an exemption**: the row below for
+# `node-socket-activation-e2e.sh` said, in its own words, *"a READY_SECONDS budget
+# handed to wait_until, which is a NAME matched by the word rather than a clock
+# read of its own"* -- an allowlist row whose stated reason IS the false positive,
+# blinding the scan to that whole fixture to silence one identifier. A false
+# positive teaches people to work around it, and working around it is what
+# disarms a scan as thoroughly as deleting it. Another lane hit the same pattern
+# on a `..._BUDGET_SECONDS` CMake variable and renamed AROUND it, which is the
+# second instance of the same cost.
+#
+# So the row is gone with the defect that produced it, and the file it named is
+# scanned again -- measured, it has no wall-clock read at all. Deleting it is not
+# optional either: the "an exemption for a file with no SECONDS read left in it"
+# guard one screen down would refuse the tree for a row naming a file the fixed
+# pattern no longer matches, which is that guard doing exactly its job.
+_seconds_word='(^|[^A-Za-z0-9_])SECONDS([^A-Za-z0-9_]|$)'
+
 # One row per exemption, `basename:reason`, matched per row by `_scan_exempt`.
-seconds_exempt="tsan-canary-rate.sh:computes a delta and echoes it. It reports the figure and compares it against nothing, so there is no bound to be wrong.
-node-socket-activation-e2e.sh:a READY_SECONDS budget handed to wait_until, which is a NAME matched by the word rather than a clock read of its own."
+seconds_exempt="tsan-canary-rate.sh:computes a delta and echoes it. It reports the figure and compares it against nothing, so there is no bound to be wrong."
 
 # Every `SECONDS` read that is not a bound decided INSIDE the loop it bounds, with
 # the reason. TWO kinds appear and the distinction is the point:
@@ -4453,28 +4549,18 @@ fi
 # files. A scan nobody has watched refuse is a scan reporting PASS over nothing, and
 # the two scans above already learnt that.
 #
-# Read through `_bash32_readable`, which blanks comment lines AND declared data
-# regions while keeping line numbers: this file's own tables hold the very text being
-# scanned for, so a scan without that filter matches itself.
-# The same filter `_bash32_readable` is, over a DIFFERENT data vocabulary, and that
-# difference is the whole reason this is not a call to that one. Both blank comment
-# lines and declared data regions while keeping line numbers -- but the marker says
-# which SCAN a region is data FOR. Reusing `bash32-scan` markers here would blank
-# this scan's own implementation for the bash-3.2 check as well, exempting it from a
-# check it needs. And a region is needed: this file holds the very text this scan
-# looks for, in a table, in two canary heredocs and in three failure messages, so
-# without one the scan matches itself. AGENT.md's rule, and #492's shape -- a file
-# that matches its own scan by construction exempts a REGION, never itself. The other
-# 3000 lines stay scanned, which is exactly what a whole-file row would have cost.
-_seconds_readable() {
-    awk '
-        /^[[:space:]]*# seconds-scan: data-begin[[:space:]]*$/ { skip = 1; print ""; next }
-        /^[[:space:]]*# seconds-scan: data-end[[:space:]]*$/   { skip = 0; print ""; next }
-        skip                                                  { print ""; next }
-        /^[[:space:]]*#/                                      { print ""; next }
-        { print }
-    ' "$1"
-}
+# Read through the shared region filter under this scan's OWN marker. A region says
+# which SCAN its text is data for, so reusing `bash32-scan` markers here would blank
+# this scan's implementation for the bash-3.2 check as well, exempting it from a
+# check it needs. That argument is why the marker is a PARAMETER of
+# `_readable_dropping_regions` rather than why this is a third copy of the awk.
+#
+# And a region IS needed: this file holds the very text this scan looks for, in a
+# table, in two canary heredocs and in three failure messages, so without one the
+# scan matches itself. AGENT.md's rule, and #492's shape -- a file that matches its
+# own scan by construction exempts a REGION, never itself. The other 3000 lines stay
+# scanned, which is exactly what a whole-file row would have cost.
+_seconds_readable() { _readable_dropping_regions "seconds-scan" "$1"; }
 
 _seconds_unlisted() {
     local file="$1" line="" body="" trimmed="" pair="" matched=0 out=""
@@ -4490,7 +4576,7 @@ _seconds_unlisted() {
         out="${out}${out:+
 }${line}"
     done <<EOF
-$( _seconds_readable "$file" | grep -n 'SECONDS' || true )
+$( _seconds_readable "$file" | grep -nE "$_seconds_word" || true )
 EOF
     printf '%s' "$out"
 }
@@ -4500,12 +4586,26 @@ seconds_exempted=0
 seconds_reads=0
 seconds_seen=""
 seconds_hit=""
+seconds_regions=""
 while IFS= read -r script; do
     [ -n "$script" ] || continue
     base="${script##*/}"
     seconds_seen="${seconds_seen}${base}
 "
-    hits="$(_seconds_readable "$script" | grep -n 'SECONDS' || true)"
+    # This scan reads through a declared region and, until #843, checked no
+    # region's BALANCE and reported no region's existence -- while declaring one
+    # of its own that spans about two hundred lines of this file. A lost
+    # `data-end` would have blanked everything after it for this scan alone, with
+    # a census line that still read normally and nothing anywhere naming a region.
+    # `bash32` already had both guards; sharing the mechanism is what carried them
+    # here, which is the argument for parameterising it rather than copying it.
+    ran=$(( ran + 1 ))
+    _region_ok "seconds-bounds" "seconds-scan" "$script" "$base" || continue
+    case "$(grep -c '^[[:space:]]*# seconds-scan: data-begin[[:space:]]*$' "$script")" in
+        0) ;;
+        *) seconds_regions="${seconds_regions:+${seconds_regions}, }${base}" ;;
+    esac
+    hits="$(_seconds_readable "$script" | grep -nE "$_seconds_word" || true)"
     [ -n "$hits" ] || continue
     seconds_files=$(( seconds_files + 1 ))
     seconds_hit="${seconds_hit}${base}
@@ -4573,10 +4673,22 @@ deadline=$(( SECONDS + 5 ))
 while [ "$SECONDS" -lt "$deadline" ]; do :; done
 grace=$(( SECONDS + 2 ))
 CANARY
+# The accepting half, and the last three rows are the ones nobody writes. An
+# IDENTIFIER that merely contains the token is not a clock read, in either
+# direction -- ending in it, beginning with it, and named in prose -- and skipping
+# those is what let a substring `grep` stand: the refusing direction was pinned
+# from the first draft and passed throughout, so the pattern looked tested. Which
+# direction you skip decides which way a predicate lies, and this one lay toward
+# PRESENT, which is the direction that gets acted on. It cost one lane a rename
+# and this file an allowlist row that blinded a whole fixture.
 cat > "${seconds_canary_dir}/must-not-catch.sh" <<'CANARY'
 # a comment that names a bound: deadline=$(( SECONDS + 5 ))
 elapsed=$(( SECONDS - started ))
 stall=$(( SECONDS - grewAt ))
+readonly READY_SECONDS=240
+wait_until worker_ready "the worker" "$pid" "$log" "$READY_SECONDS"
+cmake -DFASTCACHED_SCAN_BUDGET_SECONDS=90 -P check.cmake
+SECONDS_PER_TICK=5
 CANARY
 _scan_canary "seconds-scan-canary" _seconds_unlisted \
     "${seconds_canary_dir}/must-catch.sh" "${seconds_canary_dir}/must-not-catch.sh" \
@@ -4595,6 +4707,7 @@ if [ "$seconds_reads" -lt 1 ]; then
     note_failure "seconds-bounds"
 fi
 echo "   SECONDS: ${seconds_reads} read(s) examined across $(( seconds_files - seconds_exempted )) file(s), ${seconds_exempted} exempted by name"
+echo "   SECONDS: declared data region(s) in: ${seconds_regions:-none}"
 # seconds-scan: data-end
 
 # --- every failure is recorded BY NAME ------------------------------------
