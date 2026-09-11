@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <ranges>
@@ -71,6 +72,81 @@ void RequireGenerationsPopulated(std::span<Generation<Key> const> rows)
     REQUIRE_FALSE(rows.empty());
 }
 
+/// Is this text a digest of the construction these tables carry?
+///
+/// Lowercase hex and nothing else, because that is what `HexDigest` emits. Accepting
+/// uppercase would accept a value hand-typed rather than computed, which is precisely
+/// the row `RequireDigestsComparable` exists to refuse.
+///
+/// @param text The candidate digest.
+/// @return Whether it is non-empty lowercase hex.
+[[nodiscard]] inline bool IsHexDigest(std::string_view text)
+{
+    return !text.empty() && std::ranges::all_of(text, [](char const c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+/// Require that a live digest and its table can meaningfully be compared at all.
+///
+/// **Every check below concludes from an INEQUALITY, so anything that differs from
+/// every row passes** — and an empty or malformed `live` differs from every row. The
+/// helper would then answer *no retired generation is reachable* for a digest it was
+/// never handed: a guard that cannot fail in its accepting direction, inside the
+/// header consolidated to make exactly that checkable (#548). It was reachable:
+/// `RequireNoRetiredDigest("", rows)` passed every row.
+///
+/// The same inequality covers a ROW that no build could have produced. A row pasted
+/// from the wrong place forbids nothing while the table still reports itself
+/// populated, which `CacheKey_test.cpp`'s own step 2 has warned about in prose since
+/// the table was written, checked by nothing. Width is derived from `live` rather
+/// than pinned, because the two callers digest differently — 32 hex characters on the
+/// key side, 64 on the stored-value side — and a constant here would be a third
+/// spelling of a fact the data already carries.
+///
+/// Rows must also be pairwise DISTINCT: two rows carrying one digest is one
+/// generation guarded twice and another not guarded at all, and it reads in a diff as
+/// two generations covered.
+///
+/// This is deliberately NOT asked of the structural pair below. That table's retired
+/// rows are DATED RECORDS whose digests no build can reproduce — that being what a
+/// dated record is — so requiring re-derivability there would refuse a correct tree.
+///
+/// @param live The digest computed now.
+/// @param rows The generation table it will be compared against.
+template <typename Key>
+void RequireDigestsComparable(std::string_view live, std::span<Generation<Key> const> rows)
+{
+    RequireGenerationsPopulated(rows);
+    {
+        INFO("the live digest is '"
+             << live
+             << "', which is not one this tree produces. Every check here concludes from an INEQUALITY, so "
+                "a value that is empty or malformed differs from every row and the table reports no retired "
+                "generation reachable for a digest nothing computed.");
+        REQUIRE(IsHexDigest(live));
+    }
+    for (auto const& row: rows)
+    {
+        INFO("retired generation " << RenderGenerationKey(row.key) << " carries '" << row.digest
+                                   << "', which is not a digest of the same construction as the live one ("
+                                   << live.size()
+                                   << " characters). Such a row forbids nothing while the table still reports "
+                                      "itself populated.");
+        REQUIRE(IsHexDigest(row.digest));
+        REQUIRE(row.digest.size() == live.size());
+    }
+    for (auto const i: std::views::iota(std::size_t { 1 }, rows.size()))
+        for (auto const j: std::views::iota(std::size_t { 0 }, i))
+        {
+            INFO("retired generations " << RenderGenerationKey(rows[j].key) << " and "
+                                        << RenderGenerationKey(rows[i].key)
+                                        << " carry the SAME digest, so one comparison covers both and one of "
+                                           "them is guarded by nothing.");
+            REQUIRE(rows[i].digest != rows[j].digest);
+        }
+}
+
 /// Require that a live digest reproduces no RETIRED generation's digest.
 ///
 /// **This is the guard for a table whose digested inputs are FROZEN, and it is
@@ -98,7 +174,7 @@ void RequireGenerationsPopulated(std::span<Generation<Key> const> rows)
 template <typename Key>
 void RequireNoRetiredDigest(std::string_view live, std::span<Generation<Key> const> retired)
 {
-    RequireGenerationsPopulated(retired);
+    RequireDigestsComparable(live, retired);
     for (auto const& generation: retired)
     {
         INFO("the live digest reproduces retired generation " << RenderGenerationKey(generation.key)
@@ -112,6 +188,19 @@ void RequireNoRetiredDigest(std::string_view live, std::span<Generation<Key> con
 /// The structural half, for a table that CONTAINS its live row. A bump appends, so
 /// order is what a reverting author has to defeat — and it is what still bites when
 /// `RequireNoRetiredDigest` cannot, because it says nothing about digests at all.
+///
+/// **`RequireDigestsComparable` deliberately does not reach this pair, and the
+/// asymmetry is a decision rather than an oversight.** A table keeping its retired
+/// rows holds DATED RECORDS: a digest describing the corpus as that generation met
+/// it, which nothing can recompute once the corpus or the behaviour has moved
+/// ([#583](https://github.com/LASTRADA-Software/fastcached/issues/583)). Demanding
+/// those digests be re-derivable is demanding they stop being dated records, and it
+/// would refuse a correct tree. That is worth saying HERE rather than only at the
+/// precondition, because an inconsistency between two tables in one header reads as
+/// something to tidy up, and the same check in the wrong place turns a documented
+/// decision into a red. These two functions compare KEYS, which are re-derivable by
+/// construction; the digest half compares against a value computed NOW, which is
+/// what makes a precondition meaningful there and vacuous here.
 ///
 /// @param rows The generation table, oldest first.
 template <typename Key>
