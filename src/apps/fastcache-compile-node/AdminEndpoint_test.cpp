@@ -494,14 +494,19 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
                               AdminCredential { "s3cret" },
                               Node::DashboardRefreshSeconds);
 
-    // Four routes: the page, the JSON that makes it replaceable and testable
-    // without a browser, the series behind the charts, and the charts themselves.
-    REQUIRE(routes.size() == 4);
+    // The page, the JSON that makes it replaceable and testable without a browser,
+    // the text that makes it readable without a JSON parser (#1300), the series
+    // behind the charts, and the charts themselves. The size is asserted because
+    // every index below is positional: a route inserted anywhere but the end moves
+    // the ones after it, and each of those CHECKs would then pass or fail for a
+    // reason that has nothing to do with what it is named for.
+    REQUIRE(routes.size() == 5);
     CHECK(routes[0].path == "/fleet");
     CHECK(routes[1].path == "/fleet.json");
-    CHECK(routes[2].path == "/fleet/series.json");
-    CHECK(routes[3].path == "/fleet/chart/");
-    CHECK(routes[3].match == AdminRouteMatch::Prefix);
+    CHECK(routes[2].path == "/fleet.txt");
+    CHECK(routes[3].path == "/fleet/series.json");
+    CHECK(routes[4].path == "/fleet/chart/");
+    CHECK(routes[4].match == AdminRouteMatch::Prefix);
 
     // Every one of them is gated. The chart routes are the ones worth asserting
     // about by name: an image URL that answered without a credential would leak the
@@ -531,6 +536,18 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     CHECK(document.status == "200 OK");
     CHECK(document.contentType == "application/json");
     CHECK(document.body.contains(R"("role":"leader")"));
+
+    AdminRequest const text { .path = "/fleet.txt", .query = {}, .headers = { "Bearer s3cret" } };
+    auto const plain = routes[2].handler(text);
+    CHECK(plain.status == "200 OK");
+    // `charset` is not decoration here: a fingerprint or a display name is text a
+    // PEER chose, so this document carries whatever UTF-8 the registration gate
+    // admitted, and a terminal told nothing renders it in the host's legacy page.
+    CHECK(plain.contentType == "text/plain; charset=utf-8");
+    // Tab-separated, and NOT the JSON: asserting only that it is 200 would pass
+    // just as well if this route had been wired to the JSON renderer by mistake.
+    CHECK(plain.body.contains("\t"));
+    CHECK_FALSE(plain.body.contains(R"("role":)"));
 }
 
 TEST_CASE("A node that does not lead answers the dashboard with 503 and names the leader", "[node][admin][dashboard]")
@@ -560,6 +577,15 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     auto const document = routes[1].handler(json);
     CHECK(document.status == "503 Service Unavailable");
     CHECK(document.body.contains(R"("role":"follower")"));
+
+    // The text route answers through the same `statusFor`, and -- the half that is
+    // not automatic -- its BODY names the leader and carries no table, so a reader
+    // piping it into `cut` gets nothing rather than a fraction of the fleet.
+    AdminRequest const text { .path = "/fleet.txt", .query = {} };
+    auto const plain = routes[2].handler(text);
+    CHECK(plain.status == "503 Service Unavailable");
+    CHECK(plain.body.contains("10.0.0.9:6676"));
+    CHECK_FALSE(plain.body.contains("\t"));
 }
 
 TEST_CASE("An endpoint with no credential serves the dashboard to anyone who reaches it", "[node][admin][dashboard]")
@@ -1039,7 +1065,7 @@ TEST_CASE("The history path follows the directories a node already has", "[node]
 namespace
 {
 
-/// The four fleet routes over a leading scheduler and a sampler that has sampled.
+/// The fleet routes over a leading scheduler and a sampler that has sampled.
 struct ChartFixture
 {
     ManualClock clock;
@@ -1176,6 +1202,36 @@ TEST_CASE("An unknown range is refused rather than quietly served as another", "
         CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").body.contains(row.key));
         // ...and each of them is genuinely served, or naming it is worse than not.
         CHECK(fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key)).status == "200 OK");
+    }
+}
+
+TEST_CASE("An unknown section is refused rather than quietly served as another", "[node][admin][dashboard]")
+{
+    // `range`'s rule at the other parameter, and it has to be restated here rather
+    // than inherited: these are two routes reading two parameters, and the reason
+    // the answer is the same is the reason, not the code.
+    ChartFixture const fixture;
+
+    CHECK(fixture.Get("/fleet.txt", "section=nonesuch").status == "400 Bad Request");
+    // Asking for NO section is not a guess, so it is not a refusal -- it is the
+    // whole document, which is also how the accepted keys are discoverable.
+    CHECK(fixture.Get("/fleet.txt").status == "200 OK");
+
+    for (auto const& row: Distributed::FleetSectionTable)
+    {
+        INFO("section " << row.key);
+        CHECK(fixture.Get("/fleet.txt", "section=nonesuch").body.contains(row.key));
+        // And what each one HOLDS, not only what it is called. A reader who guessed
+        // the word wrong is choosing again between five nouns otherwise -- and this
+        // is the only thing that reads `summary`, so without it the field is one
+        // nothing can keep true.
+        CHECK(fixture.Get("/fleet.txt", "section=nonesuch").body.contains(row.summary));
+        // ...and each of them is genuinely served, or naming it is worse than not.
+        auto const served = fixture.Get("/fleet.txt", std::format("section={}", row.key));
+        CHECK(served.status == "200 OK");
+        // The named section alone, with no marker: a marker would be one more thing
+        // every `cut` and `awk` reading this has to know to skip.
+        CHECK_FALSE(served.body.contains("# "));
     }
 }
 

@@ -11,6 +11,8 @@
 
 using FastCache::IsValidUtf8;
 using FastCache::Distributed::AppendJsonText;
+using FastCache::Distributed::DelimitedReplacement;
+using FastCache::Distributed::EscapeDelimited;
 using FastCache::Distributed::EscapeMarkup;
 using FastCache::Distributed::JsonReplacement;
 using FastCache::Distributed::MarkupReplacement;
@@ -187,4 +189,67 @@ TEST_CASE("Whatever these are given, what comes out is UTF-8", "[distributed][fl
         CHECK(IsValidUtf8(Json(text)));
         CHECK(IsValidUtf8(EscapeMarkup(text)));
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1300: the third format, whose reader is a terminal rather than a parser.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("A delimiter a peer chose is spelled, not carried", "[distributed][fleettext]")
+{
+    // What the FORMAT requires: the two delimiters, and the escape character.
+    CHECK(EscapeDelimited("a\tb"sv) == R"(a\tb)");
+    CHECK(EscapeDelimited("a\nb"sv) == R"(a\nb)");
+    CHECK(EscapeDelimited("a\rb"sv) == R"(a\rb)");
+    CHECK(EscapeDelimited(R"(a\tb)"sv) == R"(a\\tb)");
+
+    // And the row that makes it reversible rather than merely safe. Without the
+    // backslash row these two inputs -- a real tab, and the two characters that
+    // spell one -- both come out as `a\tb`, so nothing downstream could tell them
+    // apart: a value would forge a column boundary it never contained. Asserting
+    // they DIFFER is the discrimination; asserting either one alone passes under
+    // exactly that defect.
+    CHECK(EscapeDelimited("a\tb"sv) != EscapeDelimited(R"(a\tb)"sv));
+}
+
+TEST_CASE("A control byte a peer chose is spelled, because a terminal obeys it", "[distributed][fleettext]")
+{
+    // What this format escapes that the format does NOT require, and the reason is
+    // its reader: `/fleet.txt` is read in a terminal, and an ESC in a display name
+    // is a sequence the terminal acts on rather than a character it shows. Nothing
+    // upstream stops one -- it is valid UTF-8, so the registration gate admits it.
+    CHECK(EscapeDelimited("\x1b"
+                          "[2Jgone"sv)
+          == R"(\x1b[2Jgone)");
+    CHECK(EscapeDelimited("a\0"
+                          "b"sv)
+          == R"(a\x00b)");
+    // DEL is a control character ABOVE the printable range, so a guard written only
+    // as "below 0x20" passes every other case here and misses this one.
+    CHECK(EscapeDelimited("a\x7f"
+                          "b"sv)
+          == R"(a\x7fb)");
+    // A printable byte is left ALONE. Without this the three above would pass just
+    // as well against an escaper that spelled out everything it was given.
+    CHECK(EscapeDelimited("a~b"sv) == "a~b");
+}
+
+TEST_CASE("Text that is not UTF-8 is replaced, so the escaper is total", "[distributed][fleettext]")
+{
+    // The promise both siblings make, which this one has to make too: what comes
+    // back is text, whatever went in. A lone 0xFF belongs to no valid sequence.
+    CHECK(EscapeDelimited("a\xff"
+                          "b"sv)
+          == "a" + std::string { DelimitedReplacement } + "b");
+
+    // Valid multi-byte UTF-8 passes through WHOLE -- neither replaced nor escaped
+    // byte by byte. Without this the case above passes under an escaper that mangles
+    // every non-ASCII name in the fleet. Spelled in bytes because this file stays
+    // ASCII: `\xC3\xA4` is U+00E4, and an expectation written with the character
+    // would agree with an encoder that emitted the wrong one.
+    CHECK(EscapeDelimited("b\xC3\xA4"
+                          "cker"sv)
+          == "b\xC3\xA4"
+             "cker");
+    CHECK(EscapeDelimited("\xF0\x9F\x8E\x89"sv) == "\xF0\x9F\x8E\x89");
 }

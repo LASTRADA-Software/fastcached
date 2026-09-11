@@ -136,13 +136,17 @@ fault.
     snapshot and log entry undecodable, and a half-upgraded cluster unable to apply
     each other's entries. That is a consensus-format migration bought for a
     diagnostic page.
-- **The columns are a table both renderers walk, and the test asserts over the
-  table.** The page and the JSON take one spelling per column -- it is the header
-  cell *and* the key -- so the two cannot drift, and each row carries a projection
-  rather than a value, the shape `TierMetric` already uses against
-  `StorageTierTable`. A hand-written list of `<td>`s is the same defect as a
-  hand-written list of series, and a list of *expected* columns written out beside
-  the table is what goes stale, maintained by whoever forgot the renderer.
+- **The columns are a table every renderer walks, and the test asserts over the
+  table.** The page, the JSON and `/fleet.txt` take one spelling per column -- it is
+  the header cell, the JSON key *and* the text column -- so they cannot drift apart,
+  and each row carries a projection rather than a value, the shape `TierMetric`
+  already uses against `StorageTierTable`. A third walk was added (#1300) without
+  touching a single column, which is the property working rather than a coincidence:
+  the terminal rendering could only be written as a walk, because there was no second
+  list of columns anywhere to write it from. A hand-written list of `<td>`s is the
+  same defect as a hand-written list of series, and a list of *expected* columns
+  written out beside the table is what goes stale, maintained by whoever forgot the
+  renderer.
 - **A bounded listing carries its own total, sampled with it.** The outstanding
   leases the fleet page shows are the *oldest fifty* -- a fleet at full tilt holds
   thousands and a page that rendered all of them is one nobody can read -- so the

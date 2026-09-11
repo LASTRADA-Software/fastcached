@@ -25,6 +25,14 @@ inline constexpr std::string_view MarkupReplacement = "&#xFFFD;";
 /// How JSON spells the same thing.
 inline constexpr std::string_view JsonReplacement = "\\ufffd";
 
+/// How a tab-separated document spells it.
+///
+/// U+FFFD itself, where the other two spell it in an escape syntax: plain text has
+/// no such syntax, so the only way to write the replacement character is to write
+/// it. That is also why this constant is three bytes of UTF-8 rather than ASCII --
+/// the output of this format is text, not a document another parser will re-read.
+inline constexpr std::string_view DelimitedReplacement = "\xEF\xBF\xBD";
+
 /// How each format spells what it cannot carry, and the walk that applies it.
 ///
 /// Namespaced because the two functions below are the whole of what a caller
@@ -59,9 +67,28 @@ namespace Detail
         TextEscape { .byte = '\t', .spelling = "\\t" },
     };
 
+    /// The bytes a tab-separated document cannot carry literally.
+    ///
+    /// The two delimiters -- and the escape CHARACTER itself, which is the row that
+    /// is easy to leave out and the one that makes the mapping injective: without it
+    /// a value holding a literal backslash-t comes back out of any reader that
+    /// unescapes as a TAB, forging a column boundary it never contained. Arm order
+    /// is not what carries that, since this is one pass over each byte; the row
+    /// being PRESENT is.
+    inline constexpr std::array DelimitedEscapes {
+        TextEscape { .byte = '\\', .spelling = R"(\\)" },
+        TextEscape { .byte = '\t', .spelling = R"(\t)" },
+        TextEscape { .byte = '\n', .spelling = R"(\n)" },
+        TextEscape { .byte = '\r', .spelling = R"(\r)" },
+    };
+
     /// The lowest byte a text format may carry literally; everything below is a
     /// control character.
     inline constexpr unsigned char FirstPrintableByte = 0x20;
+
+    /// DEL, which is a control character above the printable range rather than below
+    /// it, so `FirstPrintableByte` does not cover it.
+    inline constexpr unsigned char DeleteByte = 0x7F;
 
     /// One inclusive range of code points a format may carry.
     struct CodePointRange
@@ -222,6 +249,75 @@ inline void AppendJsonText(std::string& out, std::string_view text)
         }
     }
     out += '"';
+}
+
+/// Escape one field of a tab-separated document.
+///
+/// The third format the fleet renders into, and the only one whose consumer is a
+/// TERMINAL rather than a parser. That changes what has to be escaped and why.
+///
+/// The delimiters first, for the obvious reason: a fingerprint, a version, a display
+/// name and a cluster member id are all text a PEER chose, and the only gate they
+/// pass is `IsValidUtf8` -- which says nothing about control characters, because a
+/// tab is valid UTF-8 and is legal XML `Char` besides. Nothing upstream stops a
+/// worker registering with a tab in its display name, and unescaped that shifts every
+/// later column of the row while a newline invents a row outright: one peer
+/// corrupting the document for every reader, which is the shape of the rule that one
+/// bad byte must not make `/fleet.json` unparseable for the whole fleet. Answered
+/// here rather than by narrowing the registration gate, because a tab in a display
+/// name is legal text and refusing it would be a rendering concern reaching back
+/// into what a machine may call itself.
+///
+/// Then every OTHER control byte, which markup and JSON escape for legality and this
+/// escapes for its reader: an ESC a peer chose is not a nuisance in a terminal, it is
+/// a sequence the terminal obeys. `\xNN` rather than `\uNNNN`, because these are
+/// bytes and the reader unescaping them has `printf` rather than a JSON parser.
+///
+/// What that does NOT cover, deliberately: the C1 controls U+0080-U+009F are two
+/// bytes each and decode as ordinary text here, so they pass through. This tests
+/// BYTES where `EscapeMarkup` tests code points, and it can afford to -- in UTF-8 a
+/// control sequence is introduced by ESC, which is escaped above. The single-byte C1
+/// introducer is an 8-bit-mode spelling, which is not how a UTF-8 document is read.
+/// Said out loud because a guard that does not name its edge gets either trusted past
+/// it or rewritten into a code-point walk it does not need.
+///
+/// And invalid UTF-8 is REPLACED, as in both siblings, so this function is total:
+/// what it returns is text whatever it was given.
+/// @param text Untrusted text.
+/// @return The same text, carrying no delimiter and no control byte, and valid UTF-8
+///         whatever it was given.
+[[nodiscard]] inline std::string EscapeDelimited(std::string_view text)
+{
+    std::string out;
+    out.reserve(text.size());
+    while (!text.empty())
+    {
+        auto const ch = text.front();
+        auto const byte = static_cast<unsigned char>(ch);
+        if (auto const escape = Detail::EscapeFor(Detail::DelimitedEscapes, ch); !escape.empty())
+        {
+            out += escape;
+            text.remove_prefix(1);
+        }
+        else if (byte < Detail::FirstPrintableByte || byte == Detail::DeleteByte)
+        {
+            out += std::format("\\x{:02x}", static_cast<unsigned>(byte));
+            text.remove_prefix(1);
+        }
+        else if (auto const decoded = DecodeUtf8(text); decoded.has_value())
+        {
+            out += text.substr(0, decoded->length);
+            text.remove_prefix(decoded->length);
+        }
+        else
+        {
+            // One replacement per BYTE, as in the JSON branch and unlike markup's:
+            // nothing decoded, so there is no sequence to consume.
+            out += DelimitedReplacement;
+            text.remove_prefix(1);
+        }
+    }
+    return out;
 }
 
 } // namespace FastCache::Distributed

@@ -106,8 +106,51 @@ Run `fastcache-cli --help` for the current list with operand counts. Today:
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
-| Node (`0xFC`) | `node`, `node-metrics` |
+| Node (`0xFC`) | `node`, `node-metrics`, `fleet` |
 | Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
+
+### The fleet verb
+
+Every fleet table — machines, workers, outstanding leases, members, cache tiers — used
+to be reachable from a browser and from nowhere else. `/fleet.json` is the only other
+door and it needs a JSON parser the operator supplies; `jq` is not on a Windows build
+box, and this tool has no JSON *parser* of its own — it only emits one.
+
+`fleet <section>` asks the node's **admin** surface for `/fleet.txt` and renders that
+section as a table, so `--format` works on it exactly as on every other verb:
+
+```console
+$ fastcache-cli fleet workers --addr=10.0.0.7:6674 --format=json
+$ fastcache-cli fleet machines --addr=10.0.0.7:6674 | column -t
+```
+
+**It needs no second address.** The node reports which port its admin surface bound,
+over the same `0xFC` connection every other node verb uses, so `--admin-addr` is an
+override for deployments that rewrite ports rather than something to supply. A node
+running no admin surface, one serving it over TLS this client cannot speak, and one
+naming the port already being talked `0xFC` to are each refused **by name** — none of
+them is "the fleet is down".
+
+The section is required, and the reason is the unit: this verb's answer is one table,
+and the whole document is five of them behind markers. A default would silently pick
+one of the five. A wrong guess is refused by the leader with the accepted keys and what
+each holds, and that refusal is relayed verbatim:
+
+```console
+$ fastcache-cli fleet worker --addr=10.0.0.7:6674
+fastcache-cli: /fleet.txt?section=worker answered HTTP 400: unknown section; this build serves:
+  machines  one row per machine; the grain a fleet total is computed over
+  workers   one row per (toolchain, endpoint) registry entry
+  ...
+```
+
+**The leader answers it and nobody else can**, exactly as for the page: a follower's
+registry holds whatever registered against *it*, so it replies `503` naming the leader,
+and that is relayed too rather than reported as an unreachable fleet.
+
+Cells arrive as the leader escaped them. A display name holding a tab is `\t` here and
+not a real tab — text a peer chose cannot be allowed to forge a column boundary, and
+this tool's own `--format=tsv` would carry a real one straight through.
 
 ### The cluster verbs
 

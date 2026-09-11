@@ -228,12 +228,21 @@ startup refusal as well.
 ## Anything the fleet reads has to be text
 
 A value that leaves this machine has to be valid UTF-8, because every other
-member reads it back: `/fleet.json` is JSON, the fleet page is HTML, and a chart
-is SVG. The flags that carry one are `--advertise`, `--node-id`,
+member reads it back: `/fleet.json` is JSON, the fleet page is HTML, `/fleet.txt`
+is tab-separated text, and a chart is SVG. The flags that carry one are
+`--advertise`, `--node-id`,
 `--raft-peer`, `--cluster-id`, `--cluster-admit`, `--cluster-set`, and the
 `<fingerprint>` half of `--toolchain=<fingerprint>=<compiler>`. A worker refuses
 to start rather than registering a value the scheduler would then reject on every
 heartbeat.
+
+Valid UTF-8 is not the same as safe in every one of those formats, and this gate
+deliberately does not try to be. A tab is valid UTF-8 and is legal XML `Char`
+besides, so it passes here — and unescaped in a tab-separated row it would shift
+every later column, while a newline would invent a row outright. Each encoder owes
+its own format that much, exactly as the JSON encoder owes JSON its quotes, so
+`/fleet.txt` spells out `\t`, `\n`, `\r` and `\\`. Narrowing the gate instead
+would let a rendering concern decide what a machine may call itself.
 
 Non-ASCII is fine — the rule is about the encoding, not about the alphabet. What
 is refused is a byte sequence that is not UTF-8 at all, and on Windows that used
@@ -2249,10 +2258,10 @@ refusal answered while nothing rises makes a port being hammered look, on
 
 ## Looking at the whole fleet
 
-`--dashboard` adds four more routes to that same endpoint: `/fleet`, a page;
-`/fleet.json`, the same facts for anything that is not a browser;
-`/fleet/chart/<chart>.svg`, one image per chart; and `/fleet/series.json`, the
-numbers those images are drawn from.
+`--dashboard` adds to that same endpoint: `/fleet`, a page; `/fleet.json`, the same
+facts for anything that is not a browser; `/fleet.txt`, those same facts again for a
+reader with no JSON parser; `/fleet/chart/<chart>.svg`, one image per chart; and
+`/fleet/series.json`, the numbers those images are drawn from.
 
 ```sh
 fastcache-compile-node --scheduler 127.0.0.1:6675 \
@@ -2265,6 +2274,43 @@ curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json |
 ```
 
 ![The fleet dashboard, served by the leader](fleet-dashboard.png)
+
+### The same tables, without a JSON parser
+
+`jq` is not on a Windows build box, and `fastcache-cli` has no JSON *parser* — it
+only emits — so while `/fleet.json` was the only door that was not a browser, every
+table below was reachable from a browser and from nowhere else. `/fleet.txt` is a
+third walk over the same column tables, emitting tab-separated text:
+
+```sh
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.txt
+curl -s -u ":$(cat /etc/fastcached/dashboard.token)" \
+     "localhost:6677/fleet.txt?section=workers" | cut -f1,2
+```
+
+It is gated on the same credential and answered by the same leader. A follower
+replies `503` and renders **no table at all** — every line a `#` comment, one of them
+naming the leader's scheduler port, so a reader stripping comments is left with an
+empty document rather than a partial one. That matters more here than on the page: a
+page has room for a sentence, while a table holding a fraction of the fleet is shaped
+exactly like one holding all of it by the time it reaches `cut`.
+
+Ask for no section and it is the whole document: each table behind a `# <key>`
+marker naming it, blank-line separated — which is also how the keys `section`
+accepts are discoverable without reading this page. Ask for one and it is that
+table alone, a header line and its rows with no marker, because that is the form
+that goes straight into `cut` or `awk`. A key naming no section is **refused**
+rather than quietly served as another, and the refusal names what it would accept:
+the same asymmetry `range` draws, and the opposite of `theme`, which has a safe
+default because no substitution there can mislead.
+
+Where a cell differs from the page, it differs the way `/fleet.json` does. Numbers
+are raw — `68719476736`, not `64.0 GiB` — because a humanised figure has to be
+parsed back before it can be compared or summed. An absent cell is `-`: never
+blank, which would be indistinguishable from a value that genuinely is the empty
+string, and never `0`, which is a claim about the world. And a tier no member runs
+contributes no column at all, rather than a column of dashes that would read as a
+tier standing empty.
 
 **The leader answers it, and nobody else can.** A follower's registry holds
 whatever registered against *it* rather than the fleet, which is the same reason

@@ -1440,9 +1440,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   tier the cache does not have renders no line at all.
 - The fleet page is served by the leader; anyone else answers `503` **naming** the
   leader, never a redirect and never a link to an address it guessed.
-- Its columns are a table both renderers walk, one spelling serving as header and
-  JSON key. Absent renders `null`/`–` at the **cell**, and a tier no member runs
-  gets no column.
+- Its columns are a table every renderer walks, one spelling serving as header cell,
+  JSON key and text column. Absent renders at the **cell** -- `null`, `–` or `-`,
+  never a blank and never a zero -- and a tier no member runs gets no column.
 - A fleet total is computed over `NodeReports()`, never over registry entries.
 - Nothing a receiver can **recompute** travels: a handed-over bucket carries two
   instants and the readings, and the leader rebuilds the fold and the coverage by

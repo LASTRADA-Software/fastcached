@@ -821,6 +821,71 @@ FleetSnapshot CollectFleet(FleetSources const& sources)
 
 namespace
 {
+    /// What an absent cell reads as in the text rendering.
+    ///
+    /// Not an empty field, which is the tempting spelling and the one that destroys
+    /// the distinction: a blank cell and a value that genuinely IS the empty string
+    /// would render alike, and *absent is not zero* means nothing once a reader
+    /// cannot tell them apart. This is the token `fastcache-cli`'s own human format
+    /// already uses, so a reader who learned one learned the other.
+    constexpr std::string_view TextAbsent = "-";
+
+    /// One cell, as the text rendering carries it.
+    ///
+    /// The RAW number, exactly as `AppendCellAsJson` writes it and never as the page
+    /// humanises it: this document is read by `awk` and `cut`, and `12.4 GiB` would
+    /// have to be parsed back before it could be compared or summed.
+    /// @param out Appended to.
+    /// @param cell The cell.
+    void AppendCellAsText(std::string& out, FleetCell const& cell)
+    {
+        switch (cell.kind)
+        {
+            case FleetCell::Kind::Absent:
+                out += TextAbsent;
+                break;
+            case FleetCell::Kind::Number:
+                out += std::format("{}", cell.number);
+                break;
+            case FleetCell::Kind::Text:
+                out += EscapeDelimited(cell.text);
+                break;
+        }
+    }
+
+    /// Append one TSV table -- a header line, then one line per subject.
+    ///
+    /// The same walk as `AppendJsonRows` and `AppendHtmlRows` over the same table, so
+    /// the three cannot name different columns. The header is emitted even when there
+    /// are no subjects: a reader piping this still needs to know the shape, and an
+    /// empty document would not say whether the fleet is empty or the section is
+    /// unknown.
+    template <typename Subject, std::size_t N>
+    void AppendTextRows(std::string& out,
+                        std::array<FleetColumn<Subject>, N> const& columns,
+                        std::vector<Subject> const& subjects)
+    {
+        bool firstCell = true;
+        for (auto const& column: columns)
+        {
+            if (!std::exchange(firstCell, false))
+                out += '\t';
+            out += EscapeDelimited(column.name);
+        }
+        out += '\n';
+        for (auto const& subject: subjects)
+        {
+            firstCell = true;
+            for (auto const& column: columns)
+            {
+                if (!std::exchange(firstCell, false))
+                    out += '\t';
+                AppendCellAsText(out, column.project(subject));
+            }
+            out += '\n';
+        }
+    }
+
     /// Append one JSON array of objects, one per subject, driven by a column table.
     template <typename Subject, std::size_t N>
     void AppendJsonRows(std::string& out,
@@ -1033,6 +1098,150 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot)
     out += std::format(":{}", snapshot.registrations);
 
     out += '}';
+    return out;
+}
+
+std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept
+{
+    for (auto const& row: FleetSectionTable)
+        if (row.key == key)
+            return row.section;
+    return std::nullopt;
+}
+
+namespace
+{
+    /// Append the tiers table: the endpoint, then every column of every tier some
+    /// member runs.
+    ///
+    /// Its own walk rather than `AppendTextRows`, because this table is not a
+    /// `FleetColumn` one -- the page builds it the same way, from `StorageTierTable`
+    /// crossed with `TierColumns`, and a tier no member runs contributes no column at
+    /// all rather than a column of absences. That is "absent is not zero" at COLUMN
+    /// granularity, and it has to survive into this rendering or a reader here would
+    /// see an empty disk tier where the page correctly shows none.
+    /// @param out Appended to.
+    /// @param snapshot What to render.
+    void AppendTierText(std::string& out, FleetSnapshot const& snapshot)
+    {
+        out += "endpoint";
+        for (auto const& tier: StorageTierTable)
+        {
+            if (!snapshot.tiersPresent[static_cast<std::size_t>(tier.tier)])
+                continue;
+            for (auto const& column: TierColumns)
+                out += std::format("\t{}", EscapeDelimited(TierColumnName(tier.tier, column.suffix)));
+        }
+        out += '\n';
+
+        for (auto const& node: snapshot.nodes)
+        {
+            out += EscapeDelimited(node.endpoint);
+            for (auto const& tier: StorageTierTable)
+            {
+                if (!snapshot.tiersPresent[static_cast<std::size_t>(tier.tier)])
+                    continue;
+                for (auto const& column: TierColumns)
+                {
+                    out += '\t';
+                    AppendCellAsText(out, column.project(node, tier.tier));
+                }
+            }
+            out += '\n';
+        }
+    }
+
+    /// Append one named section's table.
+    ///
+    /// A `switch` over the enum with no default arm, so a section added to
+    /// `FleetSectionTable` is a BUILD failure here rather than a key the route
+    /// accepts and this renders as nothing. A default would make the new section
+    /// answer an empty document, which reads exactly like a fleet with nothing in it.
+    /// @param out Appended to.
+    /// @param snapshot What to render.
+    /// @param section Which table.
+    void AppendSectionText(std::string& out, FleetSnapshot const& snapshot, FleetSection section)
+    {
+        switch (section)
+        {
+            case FleetSection::Machines:
+                AppendTextRows(out, NodeColumns, snapshot.nodes);
+                return;
+            case FleetSection::Workers:
+                AppendTextRows(out, WorkerColumns, snapshot.workers);
+                return;
+            case FleetSection::Leases:
+                AppendTextRows(out, LeaseColumns, snapshot.outstandingLeases);
+                return;
+            case FleetSection::Members:
+                // An empty vector where the node runs no cluster at all, which is a
+                // different fact -- but one the JSON spells `null` and a TSV table has
+                // no room for, so the marker line in the full document is what carries
+                // it: a reader sees the section, its header, and no rows.
+                AppendTextRows(out,
+                               MemberColumns,
+                               snapshot.cluster.has_value() ? snapshot.cluster->members
+                                                            : std::vector<Cluster::ClusterMember> {});
+                return;
+            case FleetSection::Tiers:
+                AppendTierText(out, snapshot);
+                return;
+            case FleetSection::Last:
+                break;
+        }
+    }
+} // namespace
+
+std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSection> section)
+{
+    std::string out;
+    out.reserve(2048);
+
+    // A follower renders NO table, exactly as the page renders none and for the same
+    // reason: its registry holds whatever registered against IT, so a table here is a
+    // fraction of the fleet in the shape of the whole of it. The status says "not me"
+    // and only the document can say "and here is who" -- and this format is the worst
+    // of the three to get that wrong in, because the page has room for a sentence
+    // while a partial table is shaped exactly like a complete one and the reader is
+    // piping it into `cut`.
+    //
+    // Every line is a comment, so a reader stripping them is left with an EMPTY
+    // document rather than a partial one. Naming the leader, never linking to it: the
+    // endpoint below is that machine's SCHEDULER port, where its dashboard is served
+    // is configuration on that node, and nothing replicates it here.
+    if (!LeadsTheFleet(snapshot))
+    {
+        out += "# this node does not lead the fleet, so it cannot answer for it\n";
+        out += "# its registry holds only what registered against it, which is a fraction of\n";
+        out += "# the fleet rather than a smaller picture of it\n";
+        if (snapshot.leaderEndpoint.empty())
+            out += "# leader: none known -- an election is in progress, so there is nobody to name\n";
+        else
+            out += std::format("# leader: {} -- that is its scheduler port, not its dashboard\n",
+                               EscapeDelimited(snapshot.leaderEndpoint));
+        return out;
+    }
+
+    // ONE section: the header row and its rows, and nothing else. No marker, because
+    // this is the form a reader pipes straight into `cut` or `awk` -- a marker line
+    // would be one more thing every consumer has to know to skip.
+    if (section.has_value())
+    {
+        AppendSectionText(out, snapshot, *section);
+        return out;
+    }
+
+    // Every section: each one behind a marker naming it, blank-line separated. This
+    // is the form somebody reads with `curl`, and it is self-describing so that the
+    // keys the `section` parameter accepts can be discovered by asking for none.
+    bool firstSection = true;
+    for (auto const& row: FleetSectionTable)
+    {
+        if (!std::exchange(firstSection, false))
+            out += '\n';
+        out += std::format("# {}\n", row.key);
+        AppendSectionText(out, snapshot, row.section);
+    }
     return out;
 }
 

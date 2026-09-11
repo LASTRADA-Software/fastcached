@@ -250,6 +250,93 @@ struct ToolchainPickCoverage
 /// @return A JSON document.
 [[nodiscard]] std::string RenderFleetJson(FleetSnapshot const& snapshot);
 
+/// One table of the fleet report, as a terminal reader asks for it.
+///
+/// The page's sections, named so a reader can take one
+/// ([#1300](https://github.com/LASTRADA-Software/fastcached/issues/1300)). The
+/// selection happens HERE, beside the tables, rather than in whatever client is
+/// reading: a client that filtered would have to know which columns belong to which
+/// section, which is the second place that mapping could be wrong.
+///
+/// Persisted and transmitted nowhere: this is a query parameter's vocabulary and a
+/// document's markers, so the enumerator VALUES bind nothing. The explicit `= 0` is
+/// `EnumTable`'s anchor and not a wire contract.
+enum class FleetSection : std::uint8_t
+{
+    Machines = 0, ///< One row per machine — the grain a fleet total is computed over.
+    Workers,      ///< One row per `(toolchain, endpoint)` registry entry.
+    Leases,       ///< The oldest outstanding leases, bounded as the page bounds them.
+    Members,      ///< What the cluster has agreed, when this node runs one.
+    Tiers,        ///< Per-tier cache figures, for the tiers some member runs.
+    Last,         ///< Not a section, and has no row: the length of a table keyed by one.
+};
+
+/// What one section is called.
+struct FleetSectionRow
+{
+    FleetSection section;     ///< The section this row describes.
+    std::string_view key;     ///< What a reader asks for, and the marker in the full document.
+    std::string_view summary; ///< One line, for whoever guessed the key wrong.
+};
+
+/// Every section `/fleet.txt` serves, in the order the page presents them.
+///
+/// A table rather than a `switch`, for the reason every other table here is one: the
+/// next section is a row, and the refusal that lists the valid keys walks this rather
+/// than restating them — a hand-listed refusal goes stale in the one place a reader
+/// who just guessed wrong is looking.
+inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
+    FleetSectionRow { .section = FleetSection::Machines,
+                      .key = "machines",
+                      .summary = "one row per machine; the grain a fleet total is computed over" },
+    FleetSectionRow {
+        .section = FleetSection::Workers, .key = "workers", .summary = "one row per (toolchain, endpoint) registry entry" },
+    FleetSectionRow { .section = FleetSection::Leases,
+                      .key = "leases",
+                      .summary = "the oldest outstanding leases, bounded as the page bounds them" },
+    FleetSectionRow { .section = FleetSection::Members,
+                      .key = "members",
+                      .summary = "what the cluster has agreed; absent when this node runs none" },
+    FleetSectionRow { .section = FleetSection::Tiers,
+                      .key = "tiers",
+                      .summary = "per-tier cache figures, for the tiers some member runs" },
+};
+static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section));
+
+/// Which section a reader named.
+/// @param key The `section` value, as typed.
+/// @return The section, or absent when nothing is called that.
+[[nodiscard]] std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept;
+
+/// Render a fleet snapshot as tab-separated text.
+///
+/// The **third** walk over the same `FleetColumn` tables the page and the JSON walk,
+/// which is what makes this parity rather than a second report: there is no second
+/// table to disagree with, so a column added once appears in all three and a
+/// `project()` changed once changes all three. A terminal reader had no door to these
+/// tables at all — `/fleet.json` needs a JSON parser the operator supplies, and `jq`
+/// is not on a Windows build box (#1300).
+///
+/// Numbers are RAW, as the JSON carries them rather than as the page renders them:
+/// `13314398617` and not `12.4 GiB`. This output is for `awk` and `cut`, and a
+/// humanised figure would have to be parsed back before it could be compared.
+///
+/// Absent is `-`, which is the spelling `fastcache-cli`'s own human format already
+/// uses, and never an empty field: a blank cell is indistinguishable from a value
+/// that is genuinely the empty string, and *absent is not zero* loses its meaning the
+/// moment the two render alike.
+///
+/// **Every field is escaped.** A fingerprint, a version and a display name are text a
+/// PEER chose, and a tab is perfectly valid UTF-8 — so one worker registering with a
+/// tab in its name would shift every later column of that row, and a newline would
+/// invent a row, for whoever is reading. That is the same shape as one bad byte making
+/// `/fleet.json` unparseable for the whole fleet, and the answer is the one the
+/// encoders already owe their formats: this is what escaping a quote is to JSON.
+/// @param snapshot What to render.
+/// @param section Which table, or absent for every section with its marker line.
+/// @return The document, each line ending in `\n`.
+[[nodiscard]] std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSection> section);
+
 /// What the page draws over time, gathered before rendering.
 ///
 /// Pure data, like `FleetSnapshot` and for the same reason: every rendering rule
