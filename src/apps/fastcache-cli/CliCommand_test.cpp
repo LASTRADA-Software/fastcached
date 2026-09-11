@@ -58,6 +58,42 @@ std::string envValue;
     ApplyEnvironment(command, &ScriptedLookup);
     return command;
 }
+
+/// The DETAILS row @p label names, from its label to the end of its line.
+///
+/// Asking the whole PAGE instead is what let a mutation through: `set`'s summary is
+/// *store a value; see --ttl, --nx, --xx*, so `page.contains("--ttl")` is satisfied by
+/// the summary and says nothing about the modifiers cell. Deleting the `--ttl` row from
+/// the modifier table left every case green -- measured, before this helper existed.
+/// @param page The rendered page.
+/// @param label The row's left column.
+/// @return The row's text, or empty when the page carries no such row.
+[[nodiscard]] std::string CellOf(std::string const& page, std::string_view label)
+{
+    auto const at = page.find(label);
+    if (at == std::string::npos)
+        return {};
+    return page.substr(at, page.find('\n', at) - at);
+}
+
+/// Whether every line of @p summary appears in @p page.
+///
+/// Not `page.contains(summary)`: a summary's continuation lines are re-indented by the
+/// renderer, exactly as the NOTES blocks are, so a verbatim match sees only the
+/// single-line summaries -- 3 of the verbs carry a newline escape and would go
+/// unchecked while the case reported green over the other 22.
+/// @param page The rendered page.
+/// @param summary The row's summary.
+/// @return True when each of its lines is present.
+[[nodiscard]] bool PageCarriesSummary(std::string const& page, std::string_view summary)
+{
+    auto carried = true;
+    ForEachLine(summary, [&](std::string_view line) {
+        if (!page.contains(line))
+            carried = false;
+    });
+    return carried;
+}
 } // namespace
 
 TEST_CASE("the option table is well formed and every row is documented", "[cli][command]")
@@ -473,11 +509,221 @@ TEST_CASE("nothing after a settled action can turn it into an error", "[cli][com
         auto const command = Parse({ "--help", "get" });
         CHECK(command.action == Action::ShowHelp);
         CHECK(command.verb.empty());
+
+        // `verb.empty()` was the WHOLE assertion here and is true under both readings:
+        // the word discarded and the word kept as a topic produce an empty verb alike.
+        // What separates them is where the word went.
+        REQUIRE(command.operands.size() == 1);
+        CHECK(command.operands[0] == "get");
     }
 
-    SECTION("and --version is settled the same way")
+    SECTION("and --version is settled the same way, minus the topic")
     {
         CHECK(Parse({ "--version", "--no-such-flag" }).action == Action::ShowVersion);
-        CHECK(Parse({ "--version", "get" }).action == Action::ShowVersion);
+    }
+}
+
+TEST_CASE("a settled question answers about its own tail", "[cli][command][help]")
+{
+    // The defect this case exists for: the trailing word was DISCARDED, so
+    // `help nosuchverb` printed 114 lines and exited **0** while the bare `nosuchverb`
+    // exits 2 -- a question that was not understood answered with a confident success.
+    // Measured on 89e3e858 before the fix.
+    SECTION("a known command becomes the topic, in both spellings")
+    {
+        for (auto const* const spelling: { "help", "--help" })
+        {
+            auto const command = Parse({ spelling, "get" });
+            CHECK(command.action == Action::ShowHelp);
+            REQUIRE(command.operands.size() == 1);
+            CHECK(command.operands[0] == "get");
+            CHECK(command.diagnostic.empty());
+        }
+    }
+
+    SECTION("a word that names no command is a usage error, in both spellings")
+    {
+        for (auto const* const spelling: { "help", "--help" })
+        {
+            auto const command = Parse({ spelling, "nosuchverb" });
+            // The ACTION, not the absence of help text: `UsageError` prints the help
+            // too, so *the help was printed* is true under the defect as well.
+            CHECK(command.action == Action::UsageError);
+            CHECK(command.diagnostic.contains("nosuchverb"));
+        }
+    }
+
+    SECTION("two topics are refused rather than one being silently dropped")
+    {
+        auto const command = Parse({ "help", "get", "set" });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains("2"));
+    }
+
+    SECTION("a question that takes no topic refuses one, naming the flag")
+    {
+        // The same discard, on the other settled action. `--version get` printed the
+        // version and exited 0; the operand said something and was heard by nobody.
+        auto const command = Parse({ "--version", "get" });
+        CHECK(command.action == Action::UsageError);
+        CHECK(command.diagnostic.contains("--version"));
+        CHECK(command.diagnostic.contains("get"));
+    }
+
+    SECTION("and the topic survives a presentation flag on either side of it")
+    {
+        // #1292's property, re-asked now that a topic shares the tail with the flags:
+        // a settled action still reads how it is RENDERED, and the topic is not a flag.
+        for (auto const& argv: { std::vector<std::string> { "help", "--color=always", "get" },
+                                 std::vector<std::string> { "--color=always", "help", "get" },
+                                 std::vector<std::string> { "help", "get", "--color=always" } })
+        {
+            auto const command = ParseCommand(argv);
+            CHECK(command.action == Action::ShowHelp);
+            CHECK(command.color == ColorChoice::Always);
+            REQUIRE(command.operands.size() == 1);
+            CHECK(command.operands[0] == "get");
+        }
+    }
+}
+
+TEST_CASE("a verb's own page is derived from its row", "[cli][command][help]")
+{
+    auto const* const get = FindVerb("get");
+    REQUIRE(get != nullptr);
+    auto const page = HelpTopicText(*get);
+
+    SECTION("it carries the row's invocation form, summary and arity")
+    {
+        CHECK(page.contains("get <key>"));
+        CHECK(PageCarriesSummary(page, get->summary));
+        CHECK(page.contains(DescribeOperandArity(*get)));
+        CHECK(page.contains(get->protocolCommand));
+        CHECK(page.back() == '\n');
+    }
+
+    SECTION("it is a PAGE, not the whole help")
+    {
+        // The cheapest thing that separates the fix from the defect at the rendering
+        // layer: under the discard, `help get` produced `HelpText()`. Both contain the
+        // word `get`, so a `contains` check alone passes either way.
+        auto const whole = HelpText();
+        CHECK(page.size() < whole.size() / 2);
+        CHECK_FALSE(page.contains("EXIT CODES"));
+    }
+
+    SECTION("colour changes no column")
+    {
+        CHECK(StripAnsi(HelpTopicText(*get, UsageColor::Colored)) == page);
+        CHECK(HelpTopicText(*get, UsageColor::Colored) != page);
+    }
+}
+
+TEST_CASE("a verb's page states which modifiers it honours, from the table", "[cli][command][help]")
+{
+    // `--ttl` had no row in `Modifiers` although the struct documented one, so `set` --
+    // whose own summary says *see --ttl* -- would have listed only `--nx, --xx`. The
+    // applicability loop never noticed, carrying its own hand-written `--ttl` clause.
+    auto const* const set = FindVerb("set");
+    REQUIRE(set != nullptr);
+    auto const cell = CellOf(HelpTopicText(*set), "modifiers");
+    REQUIRE_FALSE(cell.empty());
+    CHECK(cell.contains("--ttl"));
+    CHECK(cell.contains("--nx"));
+    CHECK(cell.contains("--xx"));
+
+    // The other direction, or *lists the modifiers* and *lists every modifier* are one
+    // passing test: `get` honours `--raw` alone.
+    auto const* const get = FindVerb("get");
+    REQUIRE(get != nullptr);
+    auto const getCell = CellOf(HelpTopicText(*get), "modifiers");
+    REQUIRE_FALSE(getCell.empty());
+    CHECK(getCell.contains("--raw"));
+    CHECK_FALSE(getCell.contains("--ttl"));
+    CHECK_FALSE(getCell.contains("--nx"));
+
+    // And a verb honouring none says so rather than leaving the cell blank, which reads
+    // as a cell nobody filled in.
+    auto const* const ping = FindVerb("ping");
+    REQUIRE(ping != nullptr);
+    CHECK(CellOf(HelpTopicText(*ping), "modifiers").contains("none"));
+}
+
+TEST_CASE("the ttl row does not disturb the applicability refusal", "[cli][command][help]")
+{
+    // The row it gained carries a NULL member pointer, which `UnhonouredModifier` reads
+    // through. A control: both directions still answer as they did.
+    CHECK(Parse({ "set", "k", "v", "--ttl", "5" }).action == Action::RunVerb);
+
+    auto const refused = Parse({ "get", "k", "--ttl", "5" });
+    CHECK(refused.action == Action::UsageError);
+    CHECK(refused.diagnostic.contains("--ttl"));
+}
+
+TEST_CASE("a verb's page says what a compile node does with it", "[cli][command][help]")
+{
+    // THREE states. Reading `nodeFallback` alone gives two, and renders `node` -- the
+    // verb whose entire subject is a compile node -- as refused by it.
+    auto const* const node = FindVerb("node");
+    auto const* const version = FindVerb("version");
+    auto const* const get = FindVerb("get");
+    REQUIRE(node != nullptr);
+    REQUIRE(version != nullptr);
+    REQUIRE(get != nullptr);
+
+    CHECK(node->wire == Wire::Node);
+    CHECK(version->nodeFallback != nullptr);
+    CHECK(get->nodeFallback == nullptr);
+
+    // Asserting the three pages DIFFER, because that is the property: a renderer that
+    // collapses two of them still contains the word `node` in all three.
+    auto const nodePage = HelpTopicText(*node);
+    auto const versionPage = HelpTopicText(*version);
+    auto const getPage = HelpTopicText(*get);
+
+    auto const cell = [](std::string const& page) {
+        return CellOf(page, "on a compile node");
+    };
+
+    REQUIRE_FALSE(cell(nodePage).empty());
+    CHECK(cell(nodePage) != cell(getPage));
+    CHECK(cell(versionPage) != cell(getPage));
+    CHECK(cell(nodePage) != cell(versionPage));
+}
+
+TEST_CASE("a verb that sends no single command says so rather than rendering absent", "[cli][command][help]")
+{
+    // An empty `protocolCommand` is a KNOWN fact -- the column means *sends none
+    // directly* -- and a dash is how this tool spells a value it could not obtain. Two
+    // states, two renderings, and `stats` is the one row that has the first.
+    auto const* const stats = FindVerb("stats");
+    REQUIRE(stats != nullptr);
+    CHECK(stats->protocolCommand.empty());
+
+    auto const page = HelpTopicText(*stats);
+    auto const sends = CellOf(page, "sends");
+    REQUIRE_FALSE(sends.empty());
+    CHECK(sends.contains("chosen at run time"));
+    // Not a dash, which is how this tool spells a value it could NOT obtain: the
+    // difference between those two states is the whole subject of the cell.
+    CHECK_FALSE(sends.contains(" -"));
+
+    // Its wire opens TWO connections, which is the column doing work the wire name
+    // cannot: an operator told only `wire: stats` cannot see that two addresses are in
+    // play, which is the first thing they need when one of the two is wrong.
+    CHECK(page.contains("resp"));
+    CHECK(page.contains("0xFC"));
+}
+
+TEST_CASE("every verb has a page, and every page names its own verb", "[cli][command][help]")
+{
+    // Derived rather than a list, so a verb added tomorrow is covered by arriving.
+    for (auto const& verb: Verbs())
+    {
+        INFO("verb: " << verb.name);
+        auto const page = HelpTopicText(verb);
+        CHECK(page.contains(verb.name));
+        CHECK(PageCarriesSummary(page, verb.summary));
+        CHECK_FALSE(page.empty());
     }
 }
