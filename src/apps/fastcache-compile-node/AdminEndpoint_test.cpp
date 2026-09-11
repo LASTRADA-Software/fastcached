@@ -1444,3 +1444,48 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     CHECK_FALSE(sampler.History().Empty());
     CHECK_FALSE(sampler.NodeHistory().Empty());
 }
+
+TEST_CASE("The fleet 401 is a page a phone can read, and says what the challenge cannot", "[node][admin][dashboard]")
+{
+    // #1305. Two halves, and only one of them was what the ticket claimed.
+    //
+    // The ticket said the 401 "names --dashboard-token-file but not how to present
+    // it". The challenge header was already there and already says `Basic`, so a
+    // BROWSER has always been served -- that half of the premise is stale.
+    //
+    // What is live: the body was a bare fragment with no viewport meta, so the
+    // most-seen page of a rollout rendered at desktop zoom on a phone; and
+    // `AdminCredential` also accepts `Bearer` and ignores Basic's username, neither
+    // of which the header can say. A script user learned nothing from it.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger schedulerLogger;
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+
+    auto const routes =
+        Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+                              AdminCredential { "s3cret" },
+                              Node::DashboardRefreshSeconds);
+
+    // Found by PATH rather than taken at index 0. Every route here refuses an
+    // unauthenticated caller, and all but this one refuse in a format that carries no
+    // viewport meta and no prose -- so a route inserted ahead of `/fleet` would not
+    // make this case say "the wrong route was read", it would make it say the page has
+    // lost its viewport tag, which sends the next reader at the renderer.
+    auto const page = std::ranges::find(routes, "/fleet", &AdminRoute::path);
+    REQUIRE(page != routes.end());
+
+    auto const refused = page->handler(AdminRequest { .path = "/fleet", .query = {} });
+    REQUIRE(refused.status == "401 Unauthorized");
+
+    CHECK(refused.body.contains(R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"));
+
+    // **The discrimination, and the reason the sentence is not redundant.** The
+    // header carries `Basic` and cannot carry `Bearer`; the body carries both. If a
+    // later edit deletes the sentence as duplicated by the challenge, this fails --
+    // where asserting only "the body mentions a scheme" would not.
+    REQUIRE(refused.extraHeaders.size() == 1);
+    CHECK((refused.body.contains("Bearer") && !refused.extraHeaders[0].contains("Bearer")));
+}

@@ -148,6 +148,41 @@ namespace
     }
 #endif
 
+    /// One small HTML page, with the head a phone needs.
+    ///
+    /// The routes below answered with bare fragments -- a doctype, a `<title>` and a
+    /// `<p>`. **A document with no viewport meta renders at desktop zoom on a phone**,
+    /// and the 401 is the most-seen page of a rollout: it is what an operator meets
+    /// before they have a credential, often on the device they are holding.
+    ///
+    /// A shell rather than a `<meta>` copied into each body, so the viewport is stated
+    /// once. `RenderFleetHtml` keeps its own -- it is a whole dashboard with a palette
+    /// and a refresh interval, and sharing a head between a one-paragraph refusal and
+    /// that page would couple two things that have no reason to move together.
+    /// @param body The body markup, already escaped by its caller.
+    /// @return The whole document.
+    [[nodiscard]] std::string MinimalHtmlPage(std::string_view body)
+    {
+        // One initializer rather than a run of appends: every piece here is constant,
+        // so adjacent literals are spliced at compile time and only the caller's body
+        // is appended at run time. No `{}` is spelled, which is what kept this off
+        // `std::format` -- a CSS block is mostly braces.
+        std::string out { R"(<!doctype html><html lang="en"><head><meta charset="utf-8">)"
+                          R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"
+                          R"(<title>fastcache fleet</title><style>)"
+                          R"(body{margin:0;padding:2rem 1.25rem;color:#1c1f23;background:#f6f7f9;)"
+                          R"(font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif})"
+                          R"(main{max-width:34rem;margin:0 auto}h1{font-size:1.15rem;margin:0 0 .8rem})"
+                          R"(p{margin:0 0 .8rem}code{font:13px/1.4 ui-monospace,monospace;)"
+                          R"(background:#e8eaed;padding:.1em .35em;border-radius:3px;word-break:break-word})"
+                          R"(@media(prefers-color-scheme:dark){body{color:#e6e8ea;background:#16181b})"
+                          R"(code{background:#262a2f}})"
+                          R"(</style></head><body><main>)" };
+        out += body;
+        out += R"(</main></body></html>)";
+        return out;
+    }
+
     /// The challenge an unauthorised caller is answered with.
     ///
     /// `Basic` is named first because it is the one a browser can prompt for, and
@@ -382,10 +417,23 @@ std::vector<AdminRoute> MakeFleetRoutes(Distributed::FleetSources sources,
         .path = "/fleet",
         .handler = gated(
             [] {
-                return Unauthorised("text/html; charset=utf-8",
-                                    "<!doctype html><title>fastcache fleet</title>"
-                                    "<p>This page needs the credential named by "
-                                    "<code>--dashboard-token-file</code>.</p>");
+                // **The scheme sentence is NOT redundant with the header**, which is
+                // the objection to answer here rather than in a commit message. The
+                // response already carries `WWW-Authenticate: Basic`, and that fully
+                // serves a browser -- it is what makes the prompt appear. It serves a
+                // script user with nothing: `AdminCredential` also accepts `Bearer`,
+                // which the header does not advertise, and it IGNORES the username
+                // half of Basic, which is what makes `-u :<token>` the spelling. Two
+                // audiences, two mechanisms; the header reaches one of them.
+                return Unauthorised(
+                    "text/html; charset=utf-8",
+                    MinimalHtmlPage("<h1>This page needs a credential</h1>"
+                                    "<p>The node serves it only to a caller holding the token in the file named by "
+                                    "<code>--dashboard-token-file</code>.</p>"
+                                    "<p>A browser is prompted for it. A script presents it as either "
+                                    "<code>Authorization: Bearer &lt;token&gt;</code> or as Basic with the username left "
+                                    "empty &mdash; only the password half is read, so "
+                                    "<code>curl -u :&quot;$(cat &lt;file&gt;)&quot;</code> works.</p>"));
             },
             [refreshSeconds, statusFor, rangeAsked, viewFor](Distributed::FleetSnapshot const& snapshot,
                                                              AdminRequest const& request) -> AdminResponse {
