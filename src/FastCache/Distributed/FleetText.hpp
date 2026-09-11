@@ -273,6 +273,14 @@ inline void AppendJsonText(std::string& out, std::string_view text)
 /// a sequence the terminal obeys. `\xNN` rather than `\uNNNN`, because these are
 /// bytes and the reader unescaping them has `printf` rather than a JSON parser.
 ///
+/// What that does NOT cover, deliberately: the C1 controls U+0080-U+009F are two
+/// bytes each and decode as ordinary text here, so they pass through. This tests
+/// BYTES where `EscapeMarkup` tests code points, and it can afford to -- in UTF-8 a
+/// control sequence is introduced by ESC, which is escaped above. The single-byte C1
+/// introducer is an 8-bit-mode spelling, which is not how a UTF-8 document is read.
+/// Said out loud because a guard that does not name its edge gets either trusted past
+/// it or rewritten into a code-point walk it does not need.
+///
 /// And invalid UTF-8 is REPLACED, as in both siblings, so this function is total:
 /// what it returns is text whatever it was given.
 /// @param text Untrusted text.

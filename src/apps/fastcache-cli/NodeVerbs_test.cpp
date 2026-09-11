@@ -1060,3 +1060,33 @@ TEST_CASE("fleet with no admin surface available says so rather than dialling no
 
     CHECK(answer.outcome == Outcome::Usage);
 }
+
+TEST_CASE("fleet refuses a table whose row does not match its header", "[cli][node][fleet]")
+{
+    // Reachable, and the reason is the transport: `HttpGet` sends `Connection: close`
+    // and reads to EOF, so a transfer cut short arrives as a complete-looking body
+    // whose last line is half a row. Every renderer then walks `row[index]` across the
+    // HEADER's columns -- an out-of-range read on a vector, not a narrow table.
+    ScriptedAdmin admin { std::string { "id\ttoolchain\tslots\nw1\tgcc-13\n" } };
+
+    auto const answer = RunFleet(&admin, { "workers" });
+
+    // `Protocol` and not `Refused`: nothing declined anything. Bytes arrived that this
+    // client cannot read as a table, which is a different thing to tell an operator.
+    CHECK(answer.outcome == Outcome::Protocol);
+    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("header names 3"); }));
+}
+
+TEST_CASE("fleet refuses a document with no header line", "[cli][node][fleet]")
+{
+    // An empty SECTION still renders its header -- that is why the renderer emits one
+    // for a table with no rows at all. A document without one is not an empty fleet,
+    // it is a body this client cannot read, and rendering it as a table with no
+    // columns would show an operator an empty result for a question that failed.
+    ScriptedAdmin admin { std::string {} };
+
+    auto const answer = RunFleet(&admin, { "workers" });
+
+    CHECK(answer.outcome == Outcome::Protocol);
+    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("no header line"); }));
+}

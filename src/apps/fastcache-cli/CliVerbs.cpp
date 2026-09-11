@@ -1358,7 +1358,7 @@ namespace
     /// second description of the same columns.
     /// @param document One section's rendering.
     /// @return The table.
-    [[nodiscard]] Value FleetTable(std::string_view document)
+    [[nodiscard]] std::expected<Value, std::string> FleetTable(std::string_view document)
     {
         std::vector<std::string> columns;
         std::vector<std::vector<Cell>> rows;
@@ -1397,12 +1397,29 @@ namespace
                 continue;
             }
 
+            auto const fields = split(line);
+
+            // Every renderer walks `row[index]` for each of the HEADER's columns, so a
+            // short row is an out-of-range read rather than a narrow table. Refused
+            // rather than padded: padding presents truncated data as complete, and an
+            // `Absent` cell claims nobody reported the value when in fact it was
+            // reported and lost.
+            if (fields.size() != columns.size())
+                return std::unexpected(std::format(
+                    "row {} carries {} field(s) where the header names {}", rows.size() + 1, fields.size(), columns.size()));
+
             std::vector<Cell> row;
             row.reserve(columns.size());
-            for (auto const& field: split(line))
+            for (auto const& field: fields)
                 row.push_back(field == "-" ? AbsentCell() : TextCell(std::string { field }));
             rows.push_back(std::move(row));
         }
+
+        // No header at all is not an empty fleet -- an empty SECTION still renders its
+        // header line, which is the whole reason the renderer emits one for a table
+        // with no rows. A document without one is not a table this client can read.
+        if (columns.empty())
+            return std::unexpected("the document carries no header line");
 
         return TableValue(std::move(columns), std::move(rows));
     }
@@ -1442,7 +1459,11 @@ namespace
             return Concluded(Outcome::Unreachable, document.error().detail);
         }
 
-        return Answered(FleetTable(*document));
+        auto table = FleetTable(*document);
+        if (!table.has_value())
+            return Concluded(Outcome::Protocol, std::format("the fleet table could not be read: {}", table.error()));
+
+        return Answered(*std::move(table));
     }
 
     /// The verbs, in the order `--help` documents them.
