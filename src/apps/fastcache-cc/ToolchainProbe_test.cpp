@@ -2262,3 +2262,232 @@ TEST_CASE("A localized banner is what the two hosts would otherwise have disagre
     CHECK_FALSE(german.SawEnglishRequest());
     CHECK(unasked.out.starts_with(GermanBanner));
 }
+
+// --- the merged identity probe (#1237) --------------------------------------
+
+namespace
+{
+/// A driver whose two spellings answer DIFFERENTLY, and which records both.
+///
+/// The difference is the whole point. A fake answering the same bytes to
+/// `--version` and to `-###` cannot tell a reader of one from a reader of the other,
+/// so every case below would pass whichever stream the code under test consulted --
+/// which is `.agent/rules/testing.md`'s "assert what DISTINGUISHES, not what both
+/// sides produce", and it is exactly the shape #1237's acceptance warns about:
+/// *"it round-trips" passes under the bug*.
+class TwoSpellingRunner final: public IProcessRunner
+{
+  public:
+    TwoSpellingRunner(std::string versionOut, std::string hashesErr, int hashesExit = 0):
+        _versionOut { std::move(versionOut) },
+        _hashesErr { std::move(hashesErr) },
+        _hashesExit { hashesExit }
+    {
+    }
+
+    /// How `--version` is asked: combined capture, answer on stdout.
+    CompileRun RunCaptureCombined(std::span<std::string const> argv) override
+    {
+        Record(argv);
+        ++_versionCalls;
+        return { .exitCode = 0, .out = _versionOut, .err = {} };
+    }
+
+    /// How the target probe is asked: split capture, answer on stderr.
+    CompileRun RunCaptureSplit(std::span<std::string const> argv) override
+    {
+        Record(argv);
+        ++_hashesCalls;
+        return { .exitCode = _hashesExit, .out = {}, .err = _hashesErr };
+    }
+
+    [[nodiscard]] int VersionCalls() const noexcept
+    {
+        return _versionCalls;
+    }
+
+    [[nodiscard]] int HashesCalls() const noexcept
+    {
+        return _hashesCalls;
+    }
+
+    /// Every spawn, in order, for a case that asserts a COUNT and wants to say which.
+    [[nodiscard]] std::vector<std::vector<std::string>> const& Spawns() const noexcept
+    {
+        return _spawns;
+    }
+
+  private:
+    void Record(std::span<std::string const> argv)
+    {
+        _spawns.emplace_back(argv.begin(), argv.end());
+    }
+
+    std::string _versionOut;
+    std::string _hashesErr;
+    int _hashesExit { 0 };
+    int _versionCalls { 0 };
+    int _hashesCalls { 0 };
+    std::vector<std::vector<std::string>> _spawns;
+};
+
+/// A clang target-probe output whose FIRST LINE is a banner and which also carries a
+/// frontend line, so one capture can be asked for both facts.
+constexpr std::string_view MergedDriverOutput =
+    "Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)\n"
+    "Target: x86_64-pc-linux-gnu\n"
+    "Thread model: posix\n"
+    "InstalledDir: /usr/lib/llvm-20/bin\n"
+    " \"/usr/lib/llvm-20/bin/clang\" \"-cc1\" \"-triple\" \"x86_64-pc-linux-gnu\" \"-emit-obj\" \"-x\" \"c++\" "
+    "\"/dev/null\"\n";
+
+/// What the SAME driver prints for `--version` here, deliberately DIFFERENT in its
+/// first line so a case can tell which stream was read.
+constexpr std::string_view VersionOnlyOutput = "Ubuntu clang version 77.7.7 (A DIFFERENT FIRST LINE)\n"
+                                               "Target: x86_64-pc-linux-gnu\n";
+
+/// The first line of each, named so a case asserts against one spelling of them.
+constexpr std::string_view MergedFirstLine = "Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)";
+constexpr std::string_view VersionFirstLine = "Ubuntu clang version 77.7.7 (A DIFFERENT FIRST LINE)";
+} // namespace
+
+TEST_CASE("The node's banner and the launcher's identity are the same answer", "[toolchain-probe][identity]")
+{
+    // #1237's acceptance, and the one assertion here that is NOT satisfied by the two
+    // ends agreeing on a healthy machine. `CompilerBanner` is what the compile node
+    // calls (`NodeToolchains.cpp`); `ProbeDriverIdentity` is what the launcher's
+    // `main.cpp` calls. The value reaches `ComputeKey`, `ComputeManifestKey` and
+    // `ComputeToolchainFingerprint`, so if the two ends ever read different streams
+    // every client silently stops matching every worker, with no counter moving
+    // (#226).
+    //
+    // The runner answers the two spellings DIFFERENTLY, which is what makes this a
+    // test rather than a tautology: were `CompilerBanner` to go on reading
+    // `--version` while the launcher reads the merged probe, these two strings would
+    // differ, and this case is the only thing in the tree that would notice.
+    TwoSpellingRunner runner { std::string { VersionOnlyOutput }, std::string { MergedDriverOutput } };
+
+    auto const fromNode = CompilerBanner(runner, "clang++");
+    auto const fromLauncher = ProbeDriverIdentity(runner, "clang++").banner;
+
+    CHECK(fromNode == fromLauncher);
+
+    // And WHICH answer they agree on, because agreeing on the wrong one is also a way
+    // to pass the line above.
+    CHECK(fromLauncher == MergedFirstLine);
+
+    // The control on the fixture: the two spellings really are different, so the
+    // agreement above is a fact about the code rather than about the fake.
+    CHECK(MergedFirstLine != VersionFirstLine);
+}
+
+TEST_CASE("A clang driver yields the banner and the triple from ONE spawn", "[toolchain-probe][identity]")
+{
+    // The whole point of #1237: the launcher is one process per translation unit, so
+    // a second spawn here is a second spawn per unit of the entire build.
+    TwoSpellingRunner runner { std::string { VersionOnlyOutput }, std::string { MergedDriverOutput } };
+
+    auto const identity = ProbeDriverIdentity(runner, "clang++");
+
+    CHECK(identity.banner == MergedFirstLine);
+    REQUIRE_FALSE(identity.driverOutput.empty());
+
+    // ONE. Two is the defect, and the count is broken out per stream so a failure
+    // says WHICH probe came back rather than only that the total moved.
+    CHECK(runner.Spawns().size() == 1);
+    CHECK(runner.HashesCalls() == 1);
+    CHECK(runner.VersionCalls() == 0);
+
+    // And the triple falls out of the SAME captured bytes with no further spawn,
+    // which is what the call site in `main.cpp` relies on.
+    auto const triple = TargetTripleFromDriverOutput(DriverOf(Flavor::Clang), identity.driverOutput);
+    CHECK(triple == "x86_64-pc-linux-gnu");
+    CHECK(runner.Spawns().size() == 1);
+}
+
+TEST_CASE("A GCC driver keeps both spawns, and says so by yielding no driver output", "[toolchain-probe][identity]")
+{
+    // GCC's own target probe leads with `Using built-in specs.` rather than a banner,
+    // so the merge cannot cover it. The signal to the caller is an EMPTY
+    // `driverOutput`, never a wrong banner: `main.cpp` reads that emptiness as "go
+    // and discover the triple separately".
+    TwoSpellingRunner runner { "g++ (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0\n", "Using built-in specs.\n" };
+
+    auto const identity = ProbeDriverIdentity(runner, "g++");
+
+    CHECK(identity.banner == "g++ (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0");
+    CHECK(identity.driverOutput.empty());
+    CHECK(runner.VersionCalls() == 1);
+    CHECK(runner.HashesCalls() == 0);
+}
+
+TEST_CASE("cc and c++ keep both spawns, because the stem decides before a banner can", "[toolchain-probe][identity]")
+{
+    // The carve-out, asserted rather than only written down. `ProbeDriverIdentity`
+    // dispatches on the PROVISIONAL flavour taken from the file stem, and `cc`/`c++`
+    // classify as `Gcc` there -- on macOS they are Apple clang, and
+    // `ClassifyCompilerFromBanner` corrects that afterwards, for the key, by which
+    // time this probe has already chosen its path.
+    //
+    // A reader who knows `cc` is clang on macOS will read the two-spawn behaviour as
+    // an oversight. This case is where that reader finds out it is a decision.
+    for (auto const* policyName: { "cc", "c++" })
+    {
+        TwoSpellingRunner runner { std::string { VersionOnlyOutput }, std::string { MergedDriverOutput } };
+
+        auto const identity = ProbeDriverIdentity(runner, policyName);
+
+        INFO("driver: " << policyName);
+        CHECK(identity.driverOutput.empty());
+        CHECK(runner.VersionCalls() == 1);
+        CHECK(runner.HashesCalls() == 0);
+        // The `--version` first line, which is what this driver's row asks for.
+        CHECK(identity.banner == VersionFirstLine);
+    }
+}
+
+TEST_CASE("A clang driver that refuses the merged probe falls back to --version", "[toolchain-probe][identity]")
+{
+    // The zero-exit premise, and it is load-bearing: the banner is the compiler's
+    // IDENTITY, so a non-zero probe must not yield whatever bytes it happened to
+    // print. It falls through to `--version` -- and to `--version` rather than to the
+    // basename, because a driver that would not answer the probe has said nothing
+    // about the question this function is for.
+    TwoSpellingRunner runner { std::string { VersionOnlyOutput }, "clang: error: unknown argument\n", 1 };
+
+    auto const identity = ProbeDriverIdentity(runner, "clang++");
+
+    CHECK(identity.banner == VersionFirstLine);
+    // EMPTY, so the caller still discovers the triple by its own route. A non-empty
+    // value here would hand `TargetTripleFromDriverOutput` an error message to parse.
+    CHECK(identity.driverOutput.empty());
+    CHECK(runner.HashesCalls() == 1);
+    CHECK(runner.VersionCalls() == 1);
+}
+
+TEST_CASE("A clang driver whose merged probe says nothing falls back too", "[toolchain-probe][identity]")
+{
+    // Exit 0 and an empty stream. Distinct from the case above because the guard is a
+    // CONJUNCTION, and a guard testing only the status would accept an empty banner --
+    // and an empty banner IS an identity, so it would key every object under it.
+    TwoSpellingRunner runner { std::string { VersionOnlyOutput }, "" };
+
+    auto const identity = ProbeDriverIdentity(runner, "clang++");
+
+    CHECK(identity.banner == VersionFirstLine);
+    CHECK(identity.driverOutput.empty());
+}
+
+TEST_CASE("A Windows child's CRLF first line is stripped once", "[toolchain-probe][identity]")
+{
+    // Exactly one carriage return, and the case exists because the banner is HASHED:
+    // a stray one is a different cache key, not a cosmetic difference. A line that
+    // legitimately ended in two would keep one, which is why this asserts the
+    // resulting string rather than "no trailing whitespace".
+    TwoSpellingRunner runner { std::string { VersionOnlyOutput },
+                               "clang version 22.1.3\r\nTarget: x86_64-pc-windows-msvc\r\n" };
+
+    auto const identity = ProbeDriverIdentity(runner, "clang-cl");
+
+    CHECK(identity.banner == "clang version 22.1.3");
+}
