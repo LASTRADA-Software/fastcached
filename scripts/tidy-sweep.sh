@@ -593,7 +593,31 @@ PlanRowFields() {
 #          `PlanUnits` cannot hold two rules about which command belongs to a
 #          file.
 PreprocessArgv() {
-    python3 - "$1/compile_commands.json" "$2" <<'PYARGV'
+    # The two arguments want OPPOSITE treatment at the shell boundary, and on Git
+    # Bash they do not both get it. MSYS rewrites anything argument-shaped that
+    # looks like a POSIX path before a native `python3` sees it, so a target of
+    # `/repo/src/Bar.cpp` arrives as `C:/Program Files/Git/repo/src/Bar.cpp` --
+    # but $1 is a path python must OPEN (it has to be host-native) while $2 is a
+    # key it COMPARES verbatim against the database. Rewritten, the exact-match
+    # lookup below matches nothing and the unit reads `unknown` with no reason
+    # kept: silent, and in the direction that looks like a clean sweep.
+    #
+    # Conversion is per-SPAWN and all-or-nothing, so $1 is converted HERE and the
+    # spawn is then left alone. Measured on this leg, one spawn, four channels:
+    # `MSYS_NO_PATHCONV=1` suppresses it for arguments AND for the environment,
+    # `MSYS2_ARG_CONV_EXCL='*'` for arguments ONLY -- an environment variable
+    # still arrives rewritten under it, which is why passing the target that way
+    # is not the fix it looks like. Both are set because they are read by
+    # different spawn paths; `cygpath` exists only where the mangling does, so
+    # every other host takes the argument unchanged.
+    #
+    # Only a Windows leg can see this. The two Linux legs of the local gate pass
+    # in both directions, so a green gate is no evidence about this line.
+    local db="$1/compile_commands.json"
+    if command -v cygpath >/dev/null 2>&1; then
+        db="$(cygpath -m "$db")"
+    fi
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' python3 - "$db" "$2" <<'PYARGV'
 import json, re, shlex, sys
 sys.stdout.reconfigure(newline="\n")
 
