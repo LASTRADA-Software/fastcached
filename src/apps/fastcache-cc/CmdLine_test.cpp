@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheKey.hpp"
 #include "CmdLine.hpp"
 
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
@@ -223,6 +224,86 @@ TEST_CASE("PreprocessCommand drops the GNU spelling of compile-only on clang-cl"
     CHECK_FALSE(std::ranges::contains(pp, "-c"));
     CHECK_FALSE(std::ranges::contains(pp, "/showIncludes"));
     CHECK_FALSE(std::ranges::contains(pp, "/Foout.obj"));
+}
+
+TEST_CASE("PreprocessCommand drops warnings-as-errors from the probe line")
+{
+    // Regression guard, and the second instance of #688's MECHANISM rather than
+    // its cause. The probe exists to emit text to hash; whether a warning is
+    // fatal does not change that text. What `/WX` does on the probe line is turn
+    // ANY diagnostic into a hard failure, and a failed probe means no key, which
+    // means the launcher falls back to the real compiler -- correct object, green
+    // build, and that translation unit never cached again.
+    //
+    // #688 was a stray `-c` the driver warned about, fixed by dropping the flag.
+    // This one needs no stray flag at all: a source-level
+    // `#pragma warning(disable: 4005)` is honoured by the compiler but NOT by the
+    // preprocess-only pass, so the warning fires on the probe and `/WX` promotes
+    // it to `error C2220`. Measured on MSVC 14.51 against four translation units
+    // of an MFC codebase, uncacheable on every machine for as long as the pragma
+    // had been there.
+    SECTION("cl")
+    {
+        std::vector<std::string> const argv { R"(C:\VC\bin\cl.exe)", "/WX", "/c", "/Foout.obj", "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+
+        CHECK(std::ranges::contains(pp, "/EP"));
+        CHECK_FALSE(std::ranges::contains(pp, "/WX"));
+        CHECK(std::ranges::contains(pp, "a.cpp"));
+    }
+
+    SECTION("clang-cl accepts the GNU introducer here too")
+    {
+        std::vector<std::string> const argv { R"(C:\llvm\bin\clang-cl.exe)", "-WX", "-c", "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+
+        CHECK_FALSE(std::ranges::contains(pp, "-WX"));
+    }
+
+    SECTION("gcc and clang")
+    {
+        for (auto const* const compiler: { "/usr/bin/g++", "/usr/bin/clang++" })
+        {
+            std::vector<std::string> const argv { compiler, "-Werror", "-c", "-o", "out.o", "a.cpp" };
+            auto const pp = PreprocessCommand(Parse(argv), argv);
+
+            CHECK_FALSE(std::ranges::contains(pp, "-Werror"));
+            CHECK(std::ranges::contains(pp, "a.cpp"));
+        }
+    }
+
+    SECTION("/WX- is the documented opt-out and is not a prefix match")
+    {
+        // Matching is exact or joined-with-a-value, never a bare prefix, so the
+        // negative form survives -- it asks for the opposite of what is dropped.
+        std::vector<std::string> const argv { R"(C:\VC\bin\cl.exe)", "/WX-", "/c", "a.cpp" };
+        auto const pp = PreprocessCommand(Parse(argv), argv);
+
+        CHECK(std::ranges::contains(pp, "/WX-"));
+    }
+}
+
+TEST_CASE("Dropping warnings-as-errors from the probe does not take them out of the key")
+{
+    // The discriminating half, and the reason the case above is not sufficient on
+    // its own. `/WX` changes what the compiler DOES, so it has to stay in the
+    // cache key: two builds that differ only in `/WX` must not collide on one
+    // entry. The key hashes the original argv, not the probe line, so the two
+    // facts are independent -- but nothing else in this suite ties them together,
+    // and a "fix" that dropped `/WX` from both would pass every assertion above.
+    //
+    // This is also why `/WX` is NOT a row in MsvcDrop: that table is read through
+    // MatchDroppedFlag, which RemoteCompileArgs shares, and a dispatched compile
+    // must go on failing the build on warnings exactly as a local one does.
+    std::vector<std::string> const argv { R"(C:\VC\bin\cl.exe)", "/WX", "/c", "/Foout.obj", "a.cpp" };
+    auto const cmd = Parse(argv);
+
+    auto const relativized = RelativizeArgs(std::span<std::string const> { argv }.subspan(1), "", "", {});
+    CHECK(std::ranges::contains(relativized, "/WX"));
+
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    REQUIRE(remote.has_value());
+    CHECK(std::ranges::contains(*remote, "/WX"));
 }
 
 TEST_CASE("PreprocessCommand does not drop a flag that merely starts like a dropped one")
@@ -566,6 +647,7 @@ TEST_CASE("The gcc and clang rows differ in nothing but how a target is discover
     CHECK(gcc.dispatchPreprocessFlags.data() == clang.dispatchPreprocessFlags.data());
     CHECK(gcc.preprocessedInput.data() == clang.preprocessedInput.data());
     CHECK(gcc.preprocessDropFlags.data() == clang.preprocessDropFlags.data());
+    CHECK(gcc.probeDropFlags.data() == clang.probeDropFlags.data());
     CHECK(gcc.dependencyProbeFlags.data() == clang.dependencyProbeFlags.data());
     CHECK(gcc.usesDepfile == clang.usesDepfile);
     CHECK(gcc.includeDiscovery == clang.includeDiscovery);
