@@ -9,7 +9,7 @@ about one of them:
 
 | Role | What switches it on | Default |
 |---|---|---|
-| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir`, `--memory-compression` | on, 25% of RAM in memory, uncompressed |
+| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory, uncompressed |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft` | **off** — a lone node leads itself |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
@@ -597,6 +597,32 @@ fraction safe at both ends — a small laptop still gets a cache worth having, a
 `--cache-disk` caps the on-disk half, which is otherwise allowed to grow as
 needed — the same default `--storage-max-disk` has on the daemon. On a build
 server that is usually right; on somebody's workstation it usually is not.
+
+!!! note "One node per `--cache-dir`, and the store enforces it"
+
+    The store claims its file exclusively for the life of the process, so a
+    second node pointed at one directory refuses to start and says so:
+
+    ```
+    --cache-dir cannot open /var/cache/fastcache-node/objects.cow: another process
+    already has this cache open. A --cache-dir belongs to one node; give this one a
+    path of its own.
+    ```
+
+    If a machine runs several nodes — one per toolchain is a common shape — give
+    each its own path. Nothing is written to the file to do this, so a store is
+    readable by any build either way.
+
+    Some filesystems cannot enforce this — network mounts and user-mode
+    filesystems that either refuse to lock or accept a share mode and ignore it.
+    The node checks rather than assumes, starts anyway, and warns that nothing
+    is stopping a second one. That is the only case where the rule is still
+    yours to keep.
+
+Its reads and writes happen on the reactor thread the node's framed surfaces
+share, so a large store can briefly delay other connections on it
+([#136](https://github.com/LASTRADA-Software/fastcached/issues/136)). Worth
+knowing before profiling a node that feels slow under load.
 
 ### Compressing what each tier holds
 

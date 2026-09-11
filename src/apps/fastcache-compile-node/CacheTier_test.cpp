@@ -444,16 +444,16 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
     // The two tiers denominate their budgets differently, and it is easy to assert
     // the wrong one: `InMemoryLruStorage` charges STORED bytes, so compression shows
     // up there, while `CowTreeStorage` charges `originalLen` -- the pre-compression
-    // size (`CowTreeStorage.cpp:1337`) -- so a compressed disk tier reports exactly
-    // the same `bytesUsed` as an uncompressed one. Asserting on it here would have
-    // compared 65536 with 65536 and read as "the codec did nothing", which is a true
-    // observation carrying a false claim.
+    // size, at `_storeBytes += originalLen` in `StoreEntry` -- so a compressed disk
+    // tier reports exactly the same `bytesUsed` as an uncompressed one. Asserting on
+    // it here would have compared 65536 with 65536 and read as "the codec did
+    // nothing", which is a true observation carrying a false claim.
     //
     // It also means `--cache-disk` bounds LOGICAL bytes: a compressed disk tier holds
     // its cap in pre-compression terms and occupies less than that on the filesystem.
     auto fileBytes = [&payload](CompressionCodec codec, std::string_view scratchName) {
         Testing::ScratchDirectory const scratch { scratchName };
-        auto const store = scratch.Path() / "objects.cow";
+        auto const store = scratch.Path() / DiskStoreFileName;
         {
             Fixture fixture;
             auto cfg = Fixture::BaseConfig();

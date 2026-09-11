@@ -240,7 +240,10 @@ damage says which binary it is about.
 `InMemoryLruStorage` charges its budget the STORED size — `_bytesUsed += storedSize`
 in `InsertNew`, where `storedSize` is whatever `EncodeForStorage` returned, so a
 compressed value is charged what it actually occupies in RAM. `CowTreeStorage`
-charges `originalLen` (`CowTreeStorage.cpp:1337`), the size before the codec ran.
+charges `originalLen` — `_storeBytes += originalLen` in `CowTreeStorage::StoreEntry`,
+the size before the codec ran. Cited by SYMBOL rather than by offset on purpose: a
+line number in a 1400-line file that is still being edited goes stale silently, and a
+reader who follows a stale one concludes the rule describes whatever now sits there.
 
 So the same object under the same codec moves `bytesUsed` by different amounts in
 the two halves, and the operator-facing consequence is that `--cache-memory` bounds
