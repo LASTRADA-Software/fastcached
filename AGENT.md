@@ -735,292 +735,223 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 **[`.agent/rules/platform-service-and-config.md`](.agent/rules/platform-service-and-config.md)**
 — service registration, config lookup, the CLI table. Before `Platform/`, `Config/`,
 `packaging/`.
-- A service to register is a `ServiceSpec`; what it runs as is part of it, and an
-  empty `serviceAccount` means **root**.
-- `--install-service` registers the *command-line* config, never the merged one.
-- An install is judged by the **startup** rules as well as the install-time ones:
-  a registration replays its command line forever, so refuse it while somebody is
-  watching.
-- A refusal that depends on nothing but the parsed configuration belongs in a table
-  — the option row for a grammar, `StartupPolicyRejection` for a cross-flag rule —
-  never in the tier that happens to need it. An install returns before any tier
-  exists.
-- **The addresses a node OPENS and the ones it DIALS are two tables, and one predicate
-  cannot serve both** (#208, #968). Opened surfaces are `NodeSurfaceTable()`'s rows;
-  dialled ones carry a predicate EACH, because their grammars differ. `--advertise`,
-  `--scheduler` and `--upstream` take `ParseDialEndpoint`, where a bare port names no
-  machine. `--fleet-member` must NOT: it is matched against a peer's source address
-  through `HostOfEndpoint`, which keeps an unsplittable value whole on purpose, so a
-  bare host is legal there and refusing it breaks the documented setup. What IS
-  refusable there is an EMPTY element — `--fleet-member=` makes the list non-empty, so
-  `HasMembershipPolicy` says yes, the no-membership-policy rule stays silent, and the
-  node serves a scheduler that admits nobody. Shape and PRESENCE stay separate rules:
-  `--scheduler` is required elsewhere, and a shape row demanding presence describes the
-  wrong problem. `--bind` is in neither — a host is only checkable by binding it.
-- Whatever reaches a supervisor must survive this project's own parser round trip
-  — including the flags the *installer itself* adds, which are the daemon's only
-  when the spec names an application.
+- A service to register is a `ServiceSpec`; what it runs as is part of it, and an empty
+  `serviceAccount` means **root**.
+- `--install-service` registers the *command-line* config, never the merged one, and carries
+  the config PATH rather than the file's values or a resolved default — either pins the
+  service to one reading of a file the operator then edits with no effect.
+- An install is judged by the **startup** rules as well as the install-time ones: a
+  registration replays its command line forever, so refuse it while somebody is watching.
+- A refusal that depends on nothing but the parsed configuration belongs in a table — the
+  option row for a grammar, `StartupPolicyRejection` for a cross-flag rule — never in the tier
+  that happens to need it. An install returns before any tier exists.
+- **The addresses a node OPENS and the ones it DIALS are two tables, and one predicate cannot
+  serve both.** Opened surfaces are `NodeSurfaceTable()`'s rows; dialled ones carry a predicate
+  EACH, because their grammars differ. `--advertise`, `--scheduler` and `--upstream` take
+  `ParseDialEndpoint`, where a bare port names no machine. `--fleet-member` must NOT: it is
+  matched against a peer's source address through `HostOfEndpoint`, so a bare host is legal
+  there. What IS refusable there is an EMPTY element. Shape and PRESENCE stay separate rules.
+  `--bind` is in neither — a host is only checkable by binding it.
+- Whatever reaches a supervisor must survive this project's own parser round trip — including
+  the flags the *installer itself* adds, which are the daemon's only when the spec names an
+  application.
 - Whether the operator **named** a setting is provenance, recorded by the parse in
-  `OptionSpec::explicitBit` — never recovered by comparing the value to the default,
-  which cannot see the operator who typed the default. Both sides of such a flag ask
-  it: the startup decision AND what the service registration emits, which is
-  `emitIfExplicit`, never `emitIfSet`. A flag whose default is empty needs no bit;
-  there is nothing to arrive at without asking.
-- A config the operator named is strict; one the daemon found is skipped when
-  absent, unreadable or untrusted.
-- A machine-wide config is obeyed only when only an administrator could have
-  written it (`Platform/FileTrust`).
-- That is INTEGRITY. Secrecy is a second question and the same access list cannot
-  answer it: `%ProgramData%\fastcached` grants `BUILTIN\Users` read *inheritably*
-  because the daemon's virtual account is one, and `OICI` handed that read to the
-  one file `InlineCredentialRejection` tells operators to move `requirepass:` into
-  — so the documented remedy relocated the secret (#741). `--seed-config` gives the
-  FILE a protected list of its own (SYSTEM, Administrators, `NT AUTHORITY\SERVICE`
-  read), not the MSI, which cannot reach a file that is not payload. An existing
-  file is repaired only when it is *currently* broadly readable, never by content.
-- A secret reached BY PATH is not provenance-gated — the path is not the secret and
-  the file is — so `--tls-key`, `--cluster-key-file` and the two token files are asked
-  about however their paths were named, while `--requirepass` out of a config file
-  still is. Which `=<path>` rows are which is a TABLE per binary and classification is
-  MANDATORY (`--tls-cert` is named PUBLIC, not left off), because an opt-in list reads
-  identically to complete coverage. One subject list per binary
-  (`DaemonSecretFiles`, `NodeSecretFiles`), so a row reaches every moment that reads it.
-  BOTH binaries ask at the start AND at every accepted reload, through one
-  `SecretExposureWatcher` that re-asks the FILESYSTEM: a mode is in no configuration,
-  so an implementation diffing the reloader's two snapshots covers half the rule and
-  looks right. A worker with no configuration file has no second moment and gets the
-  observation without the memory.
+  `OptionSpec::explicitBit` — never recovered by comparing the value to the default, which
+  cannot see the operator who typed the default. Both the startup decision AND the service
+  registration ask it, which is `emitIfExplicit`, never `emitIfSet`. A flag whose default is
+  empty needs no bit.
+- A config the operator named is strict; one the daemon found is skipped when absent,
+  unreadable or untrusted.
+- A machine-wide config is obeyed only when only an administrator could have written it
+  (`Platform/FileTrust`).
+- That is INTEGRITY. Secrecy is a second question and the same access list cannot answer it:
+  a directory readable by `BUILTIN\Users` hands that read to the one file operators are told
+  to move `requirepass:` into, so the documented remedy relocates the secret.
+  `--seed-config` gives the FILE a protected list of its own, not the MSI, which cannot reach
+  a file that is not payload. An existing file is repaired only when it is *currently* broadly
+  readable, never by content.
+- A secret reached BY PATH is not provenance-gated — the path is not the secret and the file
+  is — while `--requirepass` out of a config file still is. Which `=<path>` rows are which is
+  a TABLE per binary and classification is MANDATORY (`--tls-cert` is named PUBLIC, not left
+  off), because an opt-in list reads identically to complete coverage. One subject list per
+  binary, so a row reaches every moment that reads it. BOTH binaries ask at the start AND at
+  every accepted reload, through one `SecretExposureWatcher` that re-asks the FILESYSTEM: a
+  mode is in no configuration, so an implementation diffing the reloader's two snapshots
+  covers half the rule and looks right.
 - Every flag is one row of `CliOptions()`, which drives parsing **and** help.
-- Which flags carry text *other machines* will read is a column of that table
-  (`ParseUtf8Text`). `--cluster-forget` is deliberately out of it, or a bad member
-  becomes unremovable; so is every path-valued flag, and the compiler half of
-  `--toolchain`.
+- Which flags carry text *other machines* will read is a column of that table (`ParseUtf8Text`).
+  `--cluster-forget` is deliberately out of it, or a bad member becomes unremovable; so is
+  every path-valued flag, and the compiler half of `--toolchain`.
 - A value parser cannot know which flag it was reached through, so it names none and
   `ApplyOneOption` stamps the row's own spelling.
-- A configuration FILE reaches the same fields through the SAME appliers, in that
-  order, so "the command line wins" is which loop runs second — never a per-field
-  merge with a per-field explicit bit and a per-field presence bit, which is the
-  daemon's shape and has shipped a flag that parsed and never merged four times.
-  And a RELOAD rebuilds the candidate the way the START built it — one
-  `AssembleEffectiveConfig` (file, then argv, then the environment), which
-  `ConfigReloader` takes as a REQUIRED argument. Re-reading the file alone made an
-  immutable setting refuse every reload by name and a RELOADABLE one worse: it
-  PUBLISHED, so `--max-memory=8g` became a fraction of host RAM at the first SIGHUP
-  and the storage evicted down to it, silently. A setting a FILE can carry and argv
-  cannot is that same defect standing still — the option table is blind to it and no
-  registration replays it — so closing one spans `Config/` and `Platform/` in ONE
-  change, or the installer drops a flag or the registration sweep is red.
-  Which key a row answers to is a COLUMN (`yamlKey`), because the mapping is not
-  derivable: 34 keys across 48 daemon flag rows, diverging four ways. A key naming no row
-  is REFUSED — a file is read at every start, so a key nothing reads is a setting an
-  operator believes is in force forever. A row a file may not carry is on a named
-  list with a per-row reason, and the compile-time guard READS that list.
-- A flag whose meaning is its presence is a boolean in the file and `apply` runs on
-  `true` alone — the key spells the FLAG, so `no_toolchain_discovery: false` passes
-  nothing. A repeatable row APPENDS, so the command line EMPTIES the list first
-  (driven off the `clear` column) or `--toolchain` extends the file's set instead of
-  replacing it — and that reset walks argv through the parser's own `TakeValue`, or a
-  flag's VALUE spelled like a list flag empties the list. A file that failed halfway
-  is DECLINED, never half-applied.
-- `--install-service` registers the command-line-only parse and carries the config
-  PATH, never the file's values and never a resolved default — either pins the
-  service to one reading of a file the operator then edits with no effect.
+- A configuration FILE reaches the same fields through the SAME appliers, in that order, so
+  "the command line wins" is which loop runs second — never a per-field merge with a per-field
+  explicit bit and a per-field presence bit. And a RELOAD rebuilds the candidate the way the
+  START built it — one `AssembleEffectiveConfig` (file, then argv, then the environment), which
+  `ConfigReloader` takes as a REQUIRED argument; re-reading the file alone makes an immutable
+  setting refuse every reload by name and a RELOADABLE one PUBLISH a wrong value. A setting a
+  FILE can carry and argv cannot is that same defect standing still, so closing one spans
+  `Config/` and `Platform/` in ONE change. Which key a row answers to is a COLUMN (`yamlKey`),
+  because the mapping is not derivable. A key naming no row is REFUSED. A row a file may not
+  carry is on a named list with a per-row reason, and the compile-time guard READS that list.
+- A flag whose meaning is its presence is a boolean in the file and `apply` runs on `true`
+  alone — the key spells the FLAG. A repeatable row APPENDS, so the command line EMPTIES the
+  list first (driven off the `clear` column), and that reset walks argv through the parser's
+  own `TakeValue`, or a flag's VALUE spelled like a list flag empties the list. A file that
+  failed halfway is DECLINED, never half-applied.
 - A missing file is `FileNotFound`, not `ParseError`: `YAML::BadFile` derives from
-  `YAML::Exception`, and the general catch sent a mistyped `--config` hunting for a
-  syntax error in a file that is not there.
+  `YAML::Exception`, and the general catch sent a mistyped `--config` hunting for a syntax
+  error in a file that is not there.
 - The shipped reference configuration is checked against the table
-  (`ctest -R node-config-reference`) — nothing else connects them, and that check
-  fails when either scan matches nothing, because two empty lists agree perfectly.
-
+  (`ctest -R node-config-reference`) — nothing else connects them, and that check fails when
+  either scan matches nothing, because two empty lists agree perfectly.
 **[`.agent/rules/storage.md`](.agent/rules/storage.md)** — the on-disk format and
 converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
-- An old store is `UnsupportedFormatVersion`, never `Corrupt` — the code is what
-  monitoring sees, and `Corrupt` is what makes somebody delete a healthy cache.
-- `Corrupt` means the BYTES ARE DAMAGED, and nothing a client sends may reach it. A set
-  or a stream is a value blob tagged by a `flags` word the memcached verbs let a client
-  choose, so a planted blob reported disk corruption against a healthy store — the rule
-  above, reachable on demand rather than at a migration. `SetCodec`/`StreamCodec` return
-  `MalformedValue` themselves, so no caller picks; it is not a persistence failure; and
-  `CacheMalformedValues` keeps it visible, because removing a wrong signal without adding
-  a right one is the other way to get this wrong.
-- One `Corrupt`, two events, and WHERE decides: `Open` reads two meta slots, the free
-  list and two reserved keys, and `Replay()` is a no-op — so damage in that reach refuses
-  the process to start (fatal in both binaries) and damage anywhere else is found per key
-  while it serves. Making `Open` touch more of the store converts the second into the
-  first, which is a decision rather than an optimisation.
-- A format is convertible exactly as long as its reader is in `RecordFormats()`.
-  Bumping the version without adding a row is the decision to discard every store.
-- "No marker" is an INFERENCE. Validate every record before writing any of them:
-  a store this build cannot read must come back unmodified.
-- The conversion commits in slices — one transaction inflates the file by a page
-  per record per level, permanently — and each slice must `Flush()`, or the freed
-  pages are not reclaimable and the slicing buys nothing.
-- Each slice records its resume point in its own transaction, so an interrupted
-  run is refused by name and finished by re-running it.
+- An old store is `UnsupportedFormatVersion`, never `Corrupt` — the code is what monitoring
+  sees, and `Corrupt` is what makes somebody delete a healthy cache.
+- `Corrupt` means the BYTES ARE DAMAGED, and nothing a client sends may reach it. A set or a
+  stream is a value blob tagged by a `flags` word a client chooses, so `SetCodec`/`StreamCodec`
+  return `MalformedValue` themselves and no caller picks. `CacheMalformedValues` keeps it
+  visible, because removing a wrong signal without adding a right one is the other way to get
+  this wrong.
+- One `Corrupt`, two events, and WHERE decides: damage within `Open`'s reach refuses the
+  process to start, damage anywhere else is found per key while it serves. Making `Open` touch
+  more of the store converts the second into the first, which is a decision rather than an
+  optimisation.
+- A format is convertible exactly as long as its reader is in `RecordFormats()`. Bumping the
+  version without adding a row is the decision to discard every store.
+- "No marker" is an INFERENCE. Validate every record before writing any of them: a store this
+  build cannot read must come back unmodified.
+- The conversion commits in slices — one transaction inflates the file by a page per record
+  per level, permanently — and each slice must `Flush()`, or the freed pages are not
+  reclaimable and the slicing buys nothing.
+- Each slice records its resume point in its own transaction, so an interrupted run is refused
+  by name and finished by re-running it.
 - A tree walk is bounded by `PageCount()`, and must not overlap a commit.
-- A tier's `bytesUsed` is denominated differently per tier: memory counts STORED
-  (compressed) bytes, disk counts `originalLen`. So `--cache-memory` bounds resident
-  bytes and `--cache-disk` bounds logical ones, and a compression test asserted
-  through the DISK tier's `bytesUsed` compares a number with itself and cannot fail.
-  Measure the store FILE there.
-- The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and
-  no `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather
-  than a workaround: an entry the mirror lacks has not been used since startup. Measured
-  (#1012): a store reopened over its bound, with ONE key read back, evicted THAT key, the
-  mirror's only member, then stopped with the bound still violated. One cause, two
-  failures, and a test asserting only the total sees neither. Fourth of a family where
-  state describing the STORE was populated only by touch — #175, #990, #1006 are the
-  others, all closed by finding a durable SOURCE for a number; this one could not be,
-  because eviction needs a VICTIM rather than a figure.
-
+- A tier's `bytesUsed` is denominated differently per tier: memory counts STORED (compressed)
+  bytes, disk counts `originalLen`. So a compression test asserted through the DISK tier's
+  `bytesUsed` compares a number with itself and cannot fail — measure the store FILE there.
+- The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and no
+  `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather than a
+  workaround. A test asserting only the total sees neither the wrong victim nor the bound still
+  violated. Fourth of a family where state describing the STORE was populated only by touch;
+  this one could not be closed by finding a durable SOURCE for a number, because eviction needs
+  a VICTIM rather than a figure.
 **[`.agent/rules/metrics-and-observability.md`](.agent/rules/metrics-and-observability.md)**
 — counters and scrape surfaces. Before `Metrics/`, `/metrics`, `/healthz`.
-- A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every
-  enumerator; the renderer walks the table rather than a hand-picked list.
-- A refusal's wire code and its counter are one row — one fact, two audiences. And a
-  refusal answered while NOTHING rises is a probed port that looks unused: `Refuse`
-  takes the row, so there is no argument to pass a bare `ErrorCode` to, and every
-  refusal on the surface goes through it — including the ones that already counted,
-  which is what makes `worker-refusals-counted` exact rather than a proximity
-  heuristic. The row is the REFUSAL, not the code: two share `MalformedFrame` and must
-  not share a counter, so a table keyed on the code cannot hold them.
-- A surface MERGING undoes that without anybody writing a bug. `FrameEndpoint` encoded
-  five refusals itself, two of which had counted on the compile port #290 retired, so
-  #326's counter went flat at a *migration* while the docs still named it and nothing
-  failed (#447). The scan covered three files and not the listener. It is EXACT, so a
-  file with one uncovered site cannot be covered at all — all of them or the door stays
-  open, and a partial fix leaves the instrument blind to the file that allowed the
-  omission. The endpoint owns WHEN, the surface owns WHAT including the counter
-  (`RefusalReply` / `EndpointRefusalReply`); a refusal decided before a header exists
-  names no verb, so it is the ENDPOINT's own row rather than a default arm on the
-  router — which is also what keeps the two `EndpointBusy` refusals from ever summing.
-  And `SchedulerRequestsRefusedUnauthenticated` fires only pre-payload, so a WRONG
-  token counted nothing: three outcomes, three rows. But not every refusal is an EVENT
-  — a verb this node runs no component for is what a HEALTHY build gets, once per
-  exchange, so counting it buries the scan it would be read for.
-- That scan is a GLOB over `src/`, never a file list. It was a hand-kept list of `.cpp`
-  files, grown by hand twice and unable to reach a header at all — which is where #447
-  then put two security counters. **A list is exact about the files it knows and silent
-  about the ones it does not, and silence reads identically to complete coverage**
-  (#492). An over-broad scan fails CLOSED, so the only rows left are the two ends of one
-  function: the header defining the encoder and `Protocol/SurfaceRefusal.hpp`, the
-  primitive's shared home — out of `fastcache-cc`'s private header so coverage is a
-  property of the TYPE. Header-only, so `_fc_cc_core` gains no row.
-- And "deliberately uncounted" must not be spelled like "forgot": both were a bare
-  `EncodeErrorReply`, so no scan could tell a considered decision from a defect --
-  and two of #490's five written rationales turned out to be neither, asserting
-  positions #491 exists to settle, one of them the opposite of what #491 argues. THREE spellings, three claims — `Refuse` (a rise means something),
-  `RefuseWithoutCounter` (a rise would mean nothing, and why), `RefuseUntriaged`
-  (nobody has decided, and which issue will). The third is safe only because the check
-  TALLIES it and prints the total per issue on every run: a placeholder reason would
-  spell *forgot* in the vocabulary of *decided*, which is worse than the bare encoder.
-  The reason is a forcing function, not a dead field — and it is `rationale`, never
-  `why`, which on `RefusedVerb` is text a CLIENT is SENT; the two meet in one
-  expression and one word cannot carry both contracts.
-- The SET of spellings is derived from that header, never restated in the check. A
-  restated list catches one going away and is blind to one ARRIVING — add a fourth and
-  every call site reaching it passes the scan, joins no backlog and asserts nothing,
-  which is #492's own defect one level up. `worker-refusals-selftest` drives seven
-  synthetic trees, including that one, because a guard nobody has watched refuse is
-  not a guard.
-- The scan filters whole-file before splitting: 403 of 413 files contain none of the
-  three substrings, and scanning them all cost a default-set entry 2.9 s on every
-  platform to find matches in ten files. 208 ms after. Exact rather than approximate —
-  each needle is a strict prefix of the regex that would have matched it.
-- Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8
-  makes `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
-  (`SchedulerService::Register`) and never repaired by a renderer — and the
-  encoders are total anyway, because a consensus entry is applied after it is
-  committed, with nobody left to refuse it. Markup's rule is XML's `Char`
-  production over **code points**, not bytes: `U+FFFF` is valid UTF-8 and
-  illegal in an SVG.
-- **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five times in four
-  instruments in one session, twelve across eight once a later session's are counted, none of them a coding mistake, all of them a representation that could not tell
-  two things apart. A count cannot carry this and neither can a `bool`: "25 of 26 green" is arithmetic that is
-  true and useless. **Absence of the negative is not the positive** — "no pending checks" is not "all checks
-  reported", "no failures found" is not "the tool ran" — so a check concluding from a count of BAD things needs
-  a separate assertion that the good things exist. **That reaches any probe you TYPE — a `grep`, a `find`, a
-  `gh api --jq`, a throwaway script — which is where it is skipped**: ask it for something it must find before
-  believing what it did not find — **and the mirror, which is the half that gets acted on: a positive finding
-  settles nothing when it is true under BOTH readings of the claim**, as a `grep -c` for a timer that is present
-  in the healthy code and in the broken code alike, run as a control while correcting somebody else — and read
-  its exit status — and note **134** is not `2`, so anything neither `0`
-  nor `1` is the instrument failing (`grep -c -i -F` aborted, no stdout, and read as dropped hunks in a merge
-  just declared clean). Where the answer cannot be determined, report that as
-  its own outcome rather than the nearest neighbour.
-- **A state-collapsing bug is likeliest in the tool whose JOB is that state distinction** — a watcher that
-  exited on any red without asking whether it was a REQUIRED context, a checker that folded SKIPPED then
-  CANCELLED into `fail`. Its author is thinking about the subject's states, not the instrument's. And the repair
-  is not "stop exiting": it must report the unrequired red by name AND KEEP WATCHING, or it looks identical to
-  the broken one on every green run. **The repair for one collapse is the prime site for the next, and the
-  location is the `*)` arm** — splitting `pending` out of `fail` left a default that swallowed `cancelled` and
-  invented a red. Enumeration does not save you there; you enumerate the states you are thinking about. **A
-  `case` with a `*)` is an unguarded table** — the `EnumTable`/`RowsInEnumeratorOrder` argument, never yet made
-  for a shell script. And a verdict computed from a SUMMARY while the evidence sits in the same output is its own
-  defect, more durable because the output looks thorough.
-- Absent is not zero: a process with no cache reports no cache, and *names* the
-  field to do it.
-- Its converse: an absence must not be counted as an event. `NoUpstream`'s honest
-  `false` was read as a failed store, so a machine with no shared cache reported a
-  100% upstream failure rate. An outcome that can be *not attempted* is an enum, not
-  a `bool` — and it is fixed at the seam, never at the one call site that noticed.
-- A counter is a tally, so zero is the truth about events that never happened;
-  absence is modelled in the **snapshot**, never by dropping a counter row.
+- A counter is a row in `MetricsCatalog`, `static_assert`ed to cover every enumerator; the
+  renderer walks the table rather than a hand-picked list.
+- A refusal's wire code and its counter are one row — one fact, two audiences. `Refuse` takes
+  the row, so there is no argument to pass a bare `ErrorCode` to, and every refusal on the
+  surface goes through it, including the ones that already counted. The row is the REFUSAL,
+  not the code: two refusals may share a code and must not share a counter.
+- A surface MERGING undoes that without anybody writing a bug, so the scan is EXACT: a file
+  with one uncovered site cannot be covered at all. The endpoint owns WHEN, the surface owns
+  WHAT including the counter (`RefusalReply` / `EndpointRefusalReply`); a refusal decided
+  before a header exists names no verb, so it is the ENDPOINT's own row rather than a default
+  arm on the router. `SchedulerRequestsRefusedUnauthenticated` fires only pre-payload, so a
+  WRONG token is a third row. But not every refusal is an EVENT — a verb this node runs no
+  component for is what a HEALTHY build gets, so counting it buries the scan it would be read
+  for.
+- That scan is a GLOB over `src/`, never a file list. **A list is exact about the files it
+  knows and silent about the ones it does not, and silence reads identically to complete
+  coverage.** An over-broad scan fails CLOSED. Header-only, so `_fc_cc_core` gains no row.
+- And "deliberately uncounted" must not be spelled like "forgot". THREE spellings, three
+  claims — `Refuse` (a rise means something), `RefuseWithoutCounter` (a rise would mean
+  nothing, and why), `RefuseUntriaged` (nobody has decided, and which issue will). The third
+  is safe only because the check TALLIES it and prints the total per issue on every run: a
+  placeholder reason would spell *forgot* in the vocabulary of *decided*. The reason is a
+  forcing function, and it is `rationale`, never `why`, which on `RefusedVerb` is text a CLIENT
+  is SENT — one word cannot carry both contracts.
+- The SET of spellings is derived from that header, never restated in the check. A restated
+  list catches one going away and is blind to one ARRIVING. `worker-refusals-selftest` drives
+  synthetic trees including that one, because a guard nobody has watched refuse is not a guard.
+- The scan filters whole-file before splitting; each needle is a strict prefix of the regex
+  that would have matched it.
+- Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8 makes
+  `/fleet.json` unparseable for the **whole** fleet. Refused where it enters
+  (`SchedulerService::Register`) and never repaired by a renderer — the encoders are total
+  anyway, because a consensus entry is applied after it is committed, with nobody left to
+  refuse it. Markup's rule is XML's `Char` production over **code points**, not bytes.
+- **Skipped, absent, unstarted and failed are FOUR states**, and tooling collapses them — five
+  times in four instruments in one session, twelve across eight once a later session's are
+  counted, none of them a coding mistake, all of them a representation that could not tell two
+  things apart. A count cannot carry this and neither can a `bool`. **Absence of the negative
+  is not the positive** — "no pending checks" is not "all checks reported" — so a check
+  concluding from a count of BAD things needs a separate assertion that the good things exist.
+  **That reaches any probe you TYPE — a `grep`, a `find`, a `gh` query, a throwaway script —
+  which is where it is skipped**: ask it for something it must find before believing what it
+  did not find — **and the mirror, which is the half that gets acted on: a positive finding
+  settles nothing when it is true under BOTH readings of the claim** — and read its exit
+  status, where anything neither `0` nor `1` is the instrument failing. Where the answer cannot
+  be determined, report that as its own outcome rather than the nearest neighbour.
+- **A state-collapsing bug is likeliest in the tool whose JOB is that state distinction**, and
+  its author is thinking about the subject's states rather than the instrument's. The repair is
+  not "stop exiting": it must report the unrequired failure by name AND KEEP GOING, or it looks
+  identical to the broken one on every clean run. **The repair for one collapse is the prime
+  site for the next, and the location is the `*)` arm** — enumeration does not save you there,
+  because you enumerate the states you are thinking about. **A `case` with a `*)` is an
+  unguarded table.** And a verdict computed from a SUMMARY while the evidence sits in the same
+  output is its own defect, more durable because the output looks thorough.
+- Absent is not zero: a process with no cache reports no cache, and *names* the field to do it.
+- Its converse: an absence must not be counted as an event. `NoUpstream`'s honest `false` read
+  as a failed store made a machine with no shared cache report a 100% upstream failure rate. An
+  outcome that can be *not attempted* is an enum, not a `bool` — and it is fixed at the seam,
+  never at the one call site that noticed.
+- A counter is a tally, so zero is the truth about events that never happened; absence is
+  modelled in the **snapshot**, never by dropping a counter row.
 - A duration is a `_sum`/`_count` pair, never a gauge.
-- A merged snapshot is one tier's answer standing in for all of them:
-  `SnapshotTiers()` reports the split, the `tier` label comes from a table, and a
-  tier the cache does not have renders no line at all.
-- The fleet page is served by the leader; anyone else answers `503` **naming** the
-  leader, never a redirect and never a link to an address it guessed.
-- Its columns are a table every renderer walks, one spelling serving as header cell,
-  JSON key and text column. Absent renders at the **cell** -- `null`, `–` or `-`,
-  never a blank and never a zero -- and a tier no member runs gets no column.
+- A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
+  the split, the `tier` label comes from a table, and a tier the cache does not have renders no
+  line at all.
+- The fleet page is served by the leader; anyone else answers `503` **naming** the leader, never
+  a redirect and never a link to an address it guessed.
+- Its columns are a table every renderer walks, one spelling serving as header cell, JSON key
+  and text column. Absent renders at the **cell** — `null`, `–` or `-`, never a blank and never
+  a zero — and a tier no member runs gets no column.
 - A fleet total is computed over `NodeReports()`, never over registry entries.
-- Nothing a receiver can **recompute** travels: a handed-over bucket carries two
-  instants and the readings, and the leader rebuilds the fold and the coverage by
-  replaying them. History is filed under the **machine**, never the worker id.
-- A handover cursor advances only on the verb that carried the batch — `accepted`
-  also counts a registration, which carries no history at all.
-- A node's version is compiled in, rides REGISTER's *nested* capacity record (whose
-  arity is variable) rather than its top level (whose arity is exact), and is
-  refreshed on re-registration — a restart is what an upgrade looks like.
-- A history stores a counter **raw**; a rate is the delta at render, taken only
-  between adjacent *present* buckets. A restart is then a gap, not a spike.
-- A node records **itself** always; only the fleet-wide slots are leader-only, and
-  which is which is `FleetMetricTable`'s `scope` column. Every node samples whatever
-  surfaces it serves — a sampler owned by the admin surface left a pure worker, the
-  machine doing the compiles, recording nothing.
-- A **backfilled** window answers for a machine, never for the scheduler: its
-  fleet-scoped zeroes are not readings, and drawn as such they are a rate running
-  backwards and then a spike, neither of which happened.
-- The routes reach a history through **one** door (`IFleetHistoryView`), or the
-  backfill is filled, persisted, restored and never drawn. Assert the wiring.
-- No state of a history file may keep a node from starting — and a file a **later**
-  build wrote is kept and never written over, which is a property of the shared
-  envelope rather than of each store that remembers to copy it.
-- A chart served as its own resource inherits nothing from the page, so it carries
-  its own palette and theme is part of its URL — and that URL carries no
-  cache-buster, or the `304` never fires.
-- A `304` carries its validators and no content; whether a body is allowed is a
-  property of the **status**, not a flag each route sets.
-- An unknown `range` is refused, an unknown `theme` is not: refuse where a silent
-  substitution would mislead, default where it cannot.
-- A stacked area is drawn **top band first**, or translucent fills multiply into a
-  colour belonging to no series.
-- A `<circle>` is not path data. One `<` in an attribute value makes a browser refuse
-  the whole SVG, and the chart is then a broken image behind a 200. A run of one
-  reading is a dot whether the shape is filled or not — closing it gives a shape with
-  no width that draws nothing and still claims the series was observed. Neither is
-  visible in a test that renders dense data: gaps are what a live dashboard has.
-- The dashboard credential is its own file, never `--requirepass`; a non-loopback
-  bind without one is a startup refusal, and TLS does not substitute for it.
-- Plain HTTP is a supported way to serve the admin surface. TLS is on by naming
-  material or by asking for material to be made (`--tls-self-signed`) — never a
-  bare boolean, and the two spellings are refused together.
-- A generated certificate encrypts but does not identify: its fingerprint is
-  logged because that is all an operator can compare, and its subject names decide
-  whether any client accepts it at all.
-
+- Nothing a receiver can **recompute** travels: a handed-over bucket carries two instants and
+  the readings, and the leader rebuilds the fold and the coverage by replaying them. History is
+  filed under the **machine**, never the worker id.
+- A handover cursor advances only on the verb that carried the batch — `accepted` also counts a
+  registration, which carries no history at all.
+- A node's version is compiled in, rides REGISTER's *nested* capacity record (whose arity is
+  variable) rather than its top level (whose arity is exact), and is refreshed on
+  re-registration — a restart is what an upgrade looks like.
+- A history stores a counter **raw**; a rate is the delta at render, taken only between adjacent
+  *present* buckets. A restart is then a gap, not a spike.
+- A node records **itself** always; only the fleet-wide slots are leader-only, and which is which
+  is `FleetMetricTable`'s `scope` column. Every node samples whatever surfaces it serves — a
+  sampler owned by the admin surface left a pure worker recording nothing.
+- A **backfilled** window answers for a machine, never for the scheduler: its fleet-scoped zeroes
+  are not readings, and drawn as such they are a rate running backwards and then a spike.
+- The routes reach a history through **one** door (`IFleetHistoryView`), or the backfill is
+  filled, persisted, restored and never drawn. Assert the wiring.
+- No state of a history file may keep a node from starting — and a file a **later** build wrote
+  is kept and never written over, which is a property of the shared envelope rather than of each
+  store that remembers to copy it.
+- A chart served as its own resource inherits nothing from the page, so it carries its own
+  palette and theme is part of its URL — and that URL carries no cache-buster, or the `304` never
+  fires.
+- A `304` carries its validators and no content; whether a body is allowed is a property of the
+  **status**, not a flag each route sets.
+- An unknown `range` is refused, an unknown `theme` is not: refuse where a silent substitution
+  would mislead, default where it cannot.
+- A stacked area is drawn **top band first**, or translucent fills multiply into a colour
+  belonging to no series.
+- A `<circle>` is not path data. One `<` in an attribute value makes a browser refuse the whole
+  SVG, and the chart is then a broken image behind a 200. A run of one reading is a dot whether
+  the shape is filled or not — closing it gives a shape with no width that draws nothing and
+  still claims the series was observed. Neither is visible in a test that renders dense data:
+  gaps are what a live dashboard has.
+- The dashboard credential is its own file, never `--requirepass`; a non-loopback bind without
+  one is a startup refusal, and TLS does not substitute for it.
+- Plain HTTP is a supported way to serve the admin surface. TLS is on by naming material or by
+  asking for material to be made (`--tls-self-signed`) — never a bare boolean, and the two
+  spellings are refused together.
+- A generated certificate encrypts but does not identify: its fingerprint is logged because that
+  is all an operator can compare, and its subject names decide whether any client accepts it at
+  all.
 **[`.agent/rules/packaging-and-release.md`](.agent/rules/packaging-and-release.md)**
 — packaging, versioning, cutting a release. Before `packaging/`, `cmake/Packaging.cmake`,
 `cmake/Version.cmake`, the release job.
@@ -1029,16 +960,14 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - The resolved version stays a bare numeric `X.Y.Z`; suffixes live on the string.
 - The payload is rooted at `/`, not `/usr`; third-party `install()` rules are excluded.
 - Neither a `.pkg` nor an MSI has a conffile mechanism — only a `.default` ships.
-- Every `build.yml` checkout that could configure passes `fetch-depth: 0`, and the
-  release job's asset list stays the **last** key of its `with:` mapping.
-- **A new INSTALLED binary is not one CMake row.** CPack installs the whole Runtime
-  component while the three `Package (...)` jobs name their build targets by hand, so
-  a target with an `install()` rule that no packaging job builds fails at INSTALL time
-  on all three platforms at once — and none of those contexts is required, so it lands
-  on whoever cuts the release. Three `--target` lines in `build.yml`, the macOS
-  redistributable loop (a different list: payload, not symlinks) and
-  `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
-
+- Every `build.yml` checkout that could configure passes `fetch-depth: 0`, and the release
+  job's asset list stays the **last** key of its `with:` mapping.
+- **A new INSTALLED binary is not one CMake row.** CPack installs the whole Runtime component
+  while the three `Package (...)` jobs name their build targets by hand, so a target with an
+  `install()` rule that no packaging job builds fails at INSTALL time on all three platforms
+  at once — and none of those contexts is required, so it lands on whoever cuts the release.
+  Three `--target` lines in `build.yml`, the macOS redistributable loop (a different list:
+  payload, not symlinks) and `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
 - Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare
