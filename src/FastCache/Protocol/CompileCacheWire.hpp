@@ -130,7 +130,17 @@ using WireVersion = std::uint8_t;
 /// carries is a nested variable-arity record, for the reason `EncodeCapacity` is
 /// nested inside REGISTER. So this arity moves once, here, and every later runtime
 /// fact costs no version at all.
-inline constexpr WireVersion CurrentVersion = 7;
+///
+/// **8 gave the CLUSTER-ADMIT reply a receipt.** It answered an empty success, so the
+/// only thing an operator learned was that the message had arrived; the id and the
+/// endpoint the leader wrote into the command now come back as bytes they can read
+/// against the machine being admitted
+/// ([#1296](https://github.com/LASTRADA-Software/fastcached/issues/1296)).
+///
+/// A RECEIPT and not a confirmation, which is a constraint on the shape as much as on
+/// the wording: see `ClusterAdmitReceipt`. Exact arity of two, like every other reply
+/// body here.
+inline constexpr WireVersion CurrentVersion = 8;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -211,7 +221,9 @@ inline constexpr WireVersion CurrentVersion = 7;
 /// this build ACCEPT a version-6 request and answer it with bytes no version-6 client
 /// can read. That is a supported version by advertisement and an unsupported one in
 /// fact -- the version-4 paragraph's own defect one level up, since
-/// `UnsupportedVersion` names the range (*"this server speaks 7..7"*), which
+/// `UnsupportedVersion` names the range -- `CompileCacheHandler`'s own
+/// *"unsupported wire version {}; this server speaks {}..{}"*, whose numbers are these
+/// two constants and are deliberately not restated here -- which
 /// `docs/tools/fastcache-cc.md` documents as meaning a mixed install, while a decode
 /// failure names no version and reads as a corrupt reply or a protocol bug. Refusing
 /// by name is the more actionable of two loud failures.
@@ -222,7 +234,43 @@ inline constexpr WireVersion CurrentVersion = 7;
 /// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)), so the cost
 /// of the flag day is one local rebuild. Opening a real window is the work that page
 /// describes and is not owed yet.
-inline constexpr WireVersion MinSupportedVersion = 7;
+///
+/// **And again for version 8, whose argument is version 7's INVERTED.** It is written
+/// out for the same reason 7's was: *the floor always moves* is not a reason, and the
+/// reason here is not any of the four above. Every one of them rests on the older peer
+/// failing -- loudly (7, 6) or silently-and-wrongly (4, 3). A version-7 client meeting
+/// a version-8 CLUSTER-ADMIT reply does neither. It **succeeds**, correctly, and
+/// quietly loses the change: that client renders its sentence from the verb it asked
+/// and reads no reply body for this one at all, so an added payload is neither misread
+/// nor refused. It prints *"accepted; the change is replicating"* -- still true -- and
+/// drops the receipt.
+///
+/// That is worse than either loud failure, and worse **in this verb specifically**.
+/// The receipt exists so that an operator compares two printed strings, and a string
+/// that is missing does not announce itself as missing: there is nothing on the screen
+/// to be suspicious of, and the operator concludes the comparison passed because they
+/// never knew there was one. #1296 is a ticket about a quiet failure; a floor left at
+/// 7 would manufacture a second one inside the fix.
+///
+/// A window is also only real if this build can SERVE the older version, and it cannot
+/// for the reason version 7 could not: `EncodeClusterAdmitReceipt` emits one shape and
+/// takes no version, so a floor of 7 would ACCEPT a version-7 request and answer it
+/// with a body that version has no reading for. Supported by advertisement,
+/// unsupported in fact.
+///
+/// The mirror direction rules out meeting in the middle. A version-8 client against a
+/// version-7 leader asks for a receipt and is handed an empty body: it either refuses
+/// -- loud, but misattributed, since an absent body reads as a corrupt reply rather
+/// than as an older leader -- or renders nothing, which is the missing string again.
+/// `UnsupportedVersion` naming the range -- the same sentence, rendered from these two
+/// constants -- is the only one of the three that sends an operator to the right
+/// machine.
+///
+/// The cost is unchanged from every bump above and is stated rather than reasoned from
+/// again: one installation
+/// ([#332](https://github.com/LASTRADA-Software/fastcached/issues/332)), both binaries
+/// shipped together, and the stop-upgrade-start procedure that page already carries.
+inline constexpr WireVersion MinSupportedVersion = 8;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -3450,6 +3498,99 @@ struct ClusterAdmitView
     if (!fields.has_value())
         return std::nullopt;
     return ClusterAdmitView { .memberId = (*fields)[0], .raftEndpoint = (*fields)[1] };
+}
+
+/// What a CLUSTER-ADMIT reply carries back: what the leader RECORDED, never what is in
+/// force.
+///
+/// **That distinction is the whole of this record, and a renderer that loses it makes
+/// things worse than the silence it replaces.** `SchedulerService::Offer` states why it
+/// reports only that a command was appended -- a leader cannot know whether a majority
+/// has taken it until one answers -- and this record does not weaken that position. It
+/// answers a DIFFERENT question, one the leader can answer with no majority at all:
+/// *which bytes did you write into the command*. That answer is known the instant the
+/// command is built, and it is the one that catches an address typo.
+///
+/// So anything rendering this says **recorded** and **as received**, and about what
+/// happens next says nothing stronger than **appended and replicating** -- never
+/// *admitted*, *added* or *committed*. An echo that reads as *in force* when it is
+/// *taken down* is a confident wrong signal, which this codebase rates worse than a
+/// vague right one.
+///
+/// *Will be proposed* is safe for the same reason and is a shade weaker than the
+/// truth: by the time this record exists `ProposeToCluster` has returned, so the entry
+/// is appended and replicating already. Understating what a leader has done is the
+/// direction to err in; overstating it is the whole defect
+/// ([#1296](https://github.com/LASTRADA-Software/fastcached/issues/1296)).
+///
+/// **What it buys, stated narrowly, because the wider claim is false.** The leader
+/// records verbatim what this client sent, so holding the echo against the same
+/// operator's own keystrokes proves the message round-tripped and nothing else. What it
+/// is FOR is the comparison against the OTHER machine, which is where the disagreement
+/// lives: the joiner mints its own id into `--cluster-dir` and resolves its own
+/// consensus endpoint, and the seed can know neither. Printed here, the pair is held
+/// against the joiner's own `NodeStatusFields::nodeId` and the address it was given by
+/// `--raft-self`/`--listen-raft` -- two printed strings from two machines, rather than
+/// one string and a memory.
+///
+/// **Owning rather than a `*View`**, against this file's local convention for reply
+/// bodies and by the conjunction the rule states: a view needs every consumer to read
+/// it in scope AND something to depend on not copying. The second clause is false --
+/// this is a member id and a `host:port`, and both ARRIVED inside a request the verb's
+/// own `MaxControlPayload` row had already bounded, so neither is large -- and
+/// what the field DECIDES is an operator's eyeball comparison, so a borrowed one that
+/// outlived its buffer would print a plausible endpoint assembled from freed memory,
+/// which is the failure this record exists to remove arriving through the record
+/// itself. `CallerContext` is the precedent: first clause satisfied, its measurement
+/// killed the second, and the rule selected OWN. The encode side goes on borrowing.
+///
+/// **Two fields and not three.** `ClusterAdmit` passes an empty scheduler endpoint
+/// always -- `AddMember` applies that field WHOLESALE, so a re-admit deliberately
+/// clears whatever the member had announced -- which would make a third field here a
+/// constant, and a constant on a wire is
+/// [#1295](https://github.com/LASTRADA-Software/fastcached/issues/1295)'s
+/// `worker = true` under a new name: a value that carries no information and that two
+/// builds can still disagree about. The CONSEQUENCE is real and an operator moving a
+/// node should be told it, but it follows from the VERB and belongs in what a renderer
+/// says, not in a field nobody can vary.
+struct ClusterAdmitReceipt
+{
+    std::string memberId;     ///< The id as received, byte for byte.
+    std::string raftEndpoint; ///< The consensus endpoint as parsed, byte for byte.
+
+    [[nodiscard]] friend bool operator==(ClusterAdmitReceipt const&, ClusterAdmitReceipt const&) = default;
+};
+
+/// Frame the payload of a successful CLUSTER-ADMIT reply.
+///
+/// Both fields are UTF-8 by construction on the only path that reaches here:
+/// `Cluster::Validate` refuses an `AddMember` whose id or endpoint is not text, and
+/// this payload is built only once it has accepted. So the receipt is not a door around
+/// the gate that keeps a fleet's own rendering parseable -- worth saying, because a
+/// reply is the one direction that gate is not written on.
+/// @param receipt What the leader wrote into the command.
+/// @return The reply payload (not a whole frame).
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmitReceipt(ClusterAdmitReceipt const& receipt)
+{
+    return WireFields::Encode({ AsBytes(receipt.memberId), AsBytes(receipt.raftEndpoint) });
+}
+
+/// Read a CLUSTER-ADMIT reply body.
+///
+/// Exact arity, like every other reply body here: two fields or nothing. An EMPTY
+/// payload is refused rather than read as *this leader recorded nothing*, which is not
+/// a state that exists -- a reply carrying no receipt came from a build older than this
+/// one, and that is `MinSupportedVersion`'s question rather than a shape to tolerate
+/// here.
+/// @param payload The reply body.
+/// @return The receipt, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ClusterAdmitReceipt> DecodeClusterAdmitReceipt(std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, 2);
+    if (!fields.has_value())
+        return std::nullopt;
+    return ClusterAdmitReceipt { .memberId = std::string { AsStringView((*fields)[0]) },
+                                 .raftEndpoint = std::string { AsStringView((*fields)[1]) } };
 }
 
 /// Frame a COMPILE request.

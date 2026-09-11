@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <optional>
 #include <ranges>
@@ -1780,4 +1781,230 @@ TEST_CASE("A lease is granted for as long as the CLUSTER agreed, not for as long
                                   [](auto const& record) { return record.message.contains(Cluster::LeaseLifetimeSetting); })
             == 1);
     }
+}
+
+namespace
+{
+
+/// A cluster that records what it was asked to propose, and can refuse.
+///
+/// Distinct from `StubCluster` above, which accepts silently and exists for cases
+/// about what a scheduler READS. These cases are about what it ANSWERS after
+/// proposing, so what reached consensus has to be observable -- an echo that agrees
+/// with the request and disagrees with the command is exactly the defect a receipt
+/// must not have.
+class RecordingCluster final: public IClusterAdmin
+{
+  public:
+    /// Every command `Offer` put to consensus, in order.
+    std::vector<Cluster::Command> proposed;
+
+    /// When engaged, refuse every proposal with this error.
+    std::optional<ConsensusError> refusal;
+
+    [[nodiscard]] Cluster::ClusterState ClusterState() const override
+    {
+        return {};
+    }
+
+    [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
+    {
+        if (refusal.has_value())
+            return std::unexpected { *refusal };
+        proposed.push_back(command);
+        return {};
+    }
+};
+
+/// The receipt out of a CLUSTER-ADMIT reply.
+/// @param reply What `ClusterAdmit` answered.
+/// @return The decoded receipt, or nullopt when the body is not one.
+[[nodiscard]] std::optional<Wire::ClusterAdmitReceipt> ReceiptOf(SchedulerReply const& reply)
+{
+    return Wire::DecodeClusterAdmitReceipt(reply.payload);
+}
+
+/// A leading scheduler wired to a cluster whose proposals a case can read back.
+///
+/// The member ORDER is the point rather than an accident: `AdministerWith` hands the
+/// service a REFERENCE, so the cluster is declared FIRST and therefore destroyed LAST.
+/// Composition rather than deriving from `Leading` for exactly that -- a base is
+/// destroyed after its members, so the inherited spelling would leave every case
+/// ending with a service reaching a collaborator that has already gone.
+struct Admitting
+{
+    /// Declared first, so it outlives the service that holds a reference to it.
+    RecordingCluster cluster;
+    /// The leading scheduler, wired to `cluster` at construction.
+    Leading leading;
+
+    Admitting()
+    {
+        leading.service.AdministerWith(cluster);
+    }
+
+    /// The service under test.
+    /// @return The scheduler these cases ask.
+    [[nodiscard]] SchedulerService& Service()
+    {
+        return leading.service;
+    }
+};
+
+} // namespace
+
+TEST_CASE("An admission answers with what the leader RECORDED, so a typed address can be read back",
+          "[distributed][scheduler][cluster-admit]")
+{
+    // #1296. `--raft-self`/`--listen-raft` on the joiner and the address typed into
+    // `--cluster-admit` on the seed are two spellings of one address and nothing
+    // compares them. When they disagree the member is in the committed configuration
+    // and contacts nobody, and at three members or more that presents as an election
+    // storm that settles -- so every *a leader exists eventually* test passes under
+    // it and the symptom points at consensus rather than at a typo.
+    //
+    // The leader cannot check the joiner's half. What it CAN do, with no majority and
+    // no round trip, is put its own half on the screen, and this is that half.
+    Admitting fleet;
+
+    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    REQUIRE(reply.status == Wire::Status::Ok);
+
+    auto const receipt = ReceiptOf(reply);
+    REQUIRE(receipt.has_value());
+
+    // A CONJUNCTION: something reached consensus, AND the receipt describes it. That
+    // catches an echo built from a constant, from the wrong field, or from no
+    // proposal at all -- which is the failure a receipt would be worthless under.
+    //
+    // What it does NOT catch, stated rather than implied: reading the receipt off the
+    // two PARAMETERS instead of off the command. Nothing transforms between them here,
+    // so the two spellings are equal in every tree this case can build, and a mutation
+    // swapping one for the other reddens nothing. The argument for reading the command
+    // is at the call site and is about what a later transformation would do; it is not
+    // a property this case establishes, and claiming it would make this one more of
+    // the assertions that cannot fail for the reason they are written down for.
+    REQUIRE(fleet.cluster.proposed.size() == 1);
+    CHECK(Unwrap(receipt).memberId == fleet.cluster.proposed.front().key);
+    CHECK(Unwrap(receipt).raftEndpoint == fleet.cluster.proposed.front().value);
+
+    // And against the literals too, distinct from each other, so a transposed pair
+    // reddens rather than agreeing with itself.
+    CHECK(Unwrap(receipt).memberId == "node-c");
+    CHECK(Unwrap(receipt).raftEndpoint == "10.0.0.9:6675");
+}
+
+TEST_CASE("An admission refused before a command exists carries no receipt", "[distributed][scheduler][cluster-admit]")
+{
+    // A receipt on a refusal would be the confident wrong signal this change exists
+    // to avoid, one level in: the operator reads their endpoint back and concludes it
+    // was taken down, when nothing was.
+    //
+    // These two arms return before `Offer` is reached, so there is no command for a
+    // receipt to have been taken from. Their sibling case covers the arms that get
+    // further, and the SPLIT is deliberate rather than tidy: a Catch2 binary spends
+    // its exit status on its failed-assertion count, and at exactly FOUR that collides
+    // with `SKIP_RETURN_CODE 4` and is scored SKIPPED rather than failed (#1128,
+    // mechanism open as #1152). Four arms in one case is four assertions one defect
+    // can fail together, which is the single total this harness cannot report.
+    SECTION("a caller the fleet has not admitted")
+    {
+        Admitting fleet;
+
+        auto const reply = fleet.Service().ClusterAdmit(Outsider, "node-c", "10.0.0.9:6675");
+        REQUIRE(reply.status == Wire::Status::Error);
+        CHECK(reply.payload.empty());
+        CHECK(fleet.cluster.proposed.empty());
+    }
+
+    SECTION("a node running no consensus at all")
+    {
+        // Deliberately NOT the fixture: this arm is about a service with no cluster
+        // seam at all, which is the one arrangement `Admitting` cannot express.
+        Leading bare;
+
+        auto const reply = bare.service.ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+        REQUIRE(reply.status == Wire::Status::Error);
+        CHECK(reply.error == Wire::ErrorCode::NoCluster);
+        CHECK(reply.payload.empty());
+    }
+}
+
+TEST_CASE("An admission refused once the command exists carries no receipt", "[distributed][scheduler][cluster-admit]")
+{
+    // The arms that DO reach `Offer`, where a command has been built and a receipt
+    // could be attached to it. A fix applied only to the arms above would look
+    // complete and leave these two answering with an endpoint nobody recorded.
+    SECTION("consensus itself declines")
+    {
+        Admitting fleet;
+        fleet.cluster.refusal = ConsensusError { .code = ConsensusErrorCode::NotLeader,
+                                                 .context = "somebody else leads",
+                                                 .knownLeader = std::string { "10.0.0.2:6675" } };
+
+        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+        REQUIRE(reply.status == Wire::Status::Error);
+        CHECK(reply.payload.empty());
+    }
+
+    SECTION("this build refuses it before consensus sees it")
+    {
+        // `Validate` runs inside `Offer`, so this arm never reaches the seam -- which
+        // is precisely why it is here: a receipt built before the offer rather than
+        // after it would be attached to a command nothing proposed.
+        Admitting fleet;
+
+        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "");
+        REQUIRE(reply.status == Wire::Status::Error);
+        CHECK(reply.payload.empty());
+        CHECK(fleet.cluster.proposed.empty());
+    }
+}
+
+TEST_CASE("The receipt says what was recorded and the reply says nothing about commitment",
+          "[distributed][scheduler][cluster-admit]")
+{
+    // Two facts, and conflating them is worse than the silence the receipt replaces.
+    // `Offer` reports only that a command was APPENDED, because a leader cannot know
+    // whether a majority has taken it; the receipt answers the other question, which
+    // needs no majority. This case pins the structural half of that: the server sends
+    // FACTS and no sentence, so whoever renders them owns the wording -- *recorded*,
+    // *as received*, and for what happens next nothing stronger than *appended and
+    // replicating*; never *admitted*, *added* or *committed*.
+    //
+    // A `message` here would be a second, unversioned channel saying the same thing
+    // in prose, and prose is what would end up claiming the member is in force.
+    Admitting fleet;
+
+    auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    REQUIRE(reply.status == Wire::Status::Ok);
+    CHECK(reply.message.empty());
+}
+
+TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distributed][scheduler][cluster-admit]")
+{
+    // The receipt is attached at `ClusterAdmit`'s call site and not inside `Offer`,
+    // and this is the difference that decision makes observable. `Offer` is shared by
+    // `ClusterSet` and `ClusterForget`, whose reply SHAPE is what their own tests
+    // assert on -- so a later tidy hoisting the echo into `Offer` would change three
+    // replies where one was decided, and would do it silently, since a client that
+    // ignores a reply body cannot tell.
+    //
+    // The hazard the receipt exists for is `AddMember`'s alone: it is the only command
+    // that carries an ADDRESS, which is the thing two machines can spell differently.
+    Admitting fleet;
+
+    auto const set = fleet.Service().ClusterSet(Insider, Cluster::LeaseLifetimeSetting, "2400000");
+    REQUIRE(set.status == Wire::Status::Ok);
+    CHECK(set.payload.empty());
+
+    auto const forget = fleet.Service().ClusterForget(Insider, "node-b");
+    REQUIRE(forget.status == Wire::Status::Ok);
+    CHECK(forget.payload.empty());
+
+    // And the admission beside them, in the same case, so "all three are empty" and
+    // "all three carry a receipt" are both red rather than one of them passing.
+    auto const admit = fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675");
+    REQUIRE(admit.status == Wire::Status::Ok);
+    CHECK_FALSE(admit.payload.empty());
 }
