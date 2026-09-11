@@ -91,9 +91,11 @@
 # 17.6s against several minutes of per-process runtime startup.
 #
 # Those two figures are from BEFORE #316 widened the tag list, when the filter
-# matched 612 cases against today's 871. They are kept because what they are
-# cited for is the COLLAPSE, which a 42% larger scope does not undo -- and they
-# are deliberately NOT restated as today's cost. Nobody has re-measured this on a
+# matched the smaller scope whose count is recorded beside TARGETS below --
+# stated once, there, because a figure written twice in one file is two things to
+# be wrong and they drift. They are kept because what they are cited for is the
+# COLLAPSE, which a scope around two-fifths larger does not undo, and they are
+# deliberately NOT restated as today's cost. Nobody has re-measured this on a
 # quiet host, and a figure taken on a box running three other builds would be a
 # worse claim than a stale one that says which scope it was taken at.
 #
@@ -163,15 +165,52 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # enforcing an empty scope.
 #
 # Which tag reaches which threaded file, so that a tag removed here is removed
-# knowing what stops being sanitized (#316). `[net]` and `[tls]` between them
-# cover all 152 `Net/` cases -- every `Net/` test file carries `[net]`, and three
-# `TlsContext` cases carry only `[tls]` -- which is what lets the scope name that
-# whole directory rather than picking threaded files out of it. The rest are
-# per-file: `[sharded]` for `Cache/ShardedStorage_test.cpp` (the tree's one
-# explicit concurrency stress case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`,
-# `[clock]` for `Core/Clock_test.cpp`, `[pubsub]` for
-# `Protocol/RedisRespSocket_test.cpp`, `[server]` for the two threaded `Server/`
-# files. Measured on this tree: 612 cases selected before, 871 after.
+# knowing what stops being sanitized (#316). Every `Net/` test file carries
+# `[net]`, which is what lets the scope name that whole directory rather than
+# picking threaded files out of it. The rest are per-file: `[sharded]` for
+# `Cache/ShardedStorage_test.cpp` (the tree's one explicit concurrency stress
+# case), `[expiry]` for `Cache/ExpiryReaper_test.cpp`, `[clock]` for
+# `Core/Clock_test.cpp`, `[pubsub]` for `Protocol/RedisRespSocket_test.cpp`,
+# `[server]` for the two threaded `Server/` files.
+#
+# MEASURED 2026-09-11 on 9c5cc374, Linux, with `-DFASTCACHED_ENABLE_TLS=ON` --
+# what the clang-tsan job passes, and the condition that decides the number:
+# without it the same commit builds 830 rather than 848, so counts taken at the
+# two settings were never comparable. Read from Catch2's OWN trailing
+# `N test cases` line:
+#
+#     before this widening   608
+#     after                  848      about two-fifths more
+#     [net] 134, [tls] 19, union 139  (14 carry both; 5 carry `[tls]` alone)
+#
+# The conditions are PINNED here rather than pointed at. They are one tree at one
+# instant, so a comment that tracked its source would one day claim this
+# measurement had been taken under conditions nobody measured it under.
+#
+# WHICH QUANTITY, as well as which conditions -- this comment previously said
+# "612 cases selected before, 871 after", in the language of selection, and those
+# were STATIC counts over the sources rather than what any binary selects. 612
+# still reproduces exactly that way; 871 reproduces neither way (the static count
+# is 861 today). A source count and a binary count answer different questions --
+# platform-guarded cases exist in one and not the other -- so a figure that does
+# not say which it is invites exactly the reconciliation that cannot succeed, and
+# one was attempted against these across two platforms before they were re-taken.
+#
+# NOT counted by counting indented `--list-tests` lines. That reports about
+# DOUBLE the figures above, because each case prints a name line and a tag line.
+# A lane that measured it that way undercounted its UNFILTERED total by exactly
+# the untagged cases while every FILTERED figure came out right, so the error hid
+# in precisely the numbers being used and showed only in the total.
+#
+# Two things the obvious reading of the above gets wrong, both measured rather
+# than reasoned. `Net/` holds 152 TEST_CASE-family macros in SOURCE, more than
+# the union above selects: the difference is cases behind platform guards this
+# Linux build does not compile, so the gap is two different questions rather than
+# an error, and a reader reconciling the two numbers should expect it.
+# And the five `[tls]`-only cases are neither all `TlsContext` nor all in `Net/`
+# -- two are `CliParser: --tls captures cert and key paths` and a `Server:` TLS
+# metrics case -- so `[tls]` reaches a little outside the directory it is named
+# for. This paragraph said "three `TlsContext` cases" until it was asked.
 TARGETS=(
     "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[pubsub],[server]"
     "fastcache-compile-node-tests|"
