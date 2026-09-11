@@ -2,6 +2,7 @@
 #include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "ScriptedExchange.hpp"
+#include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -10,10 +11,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/Unwrap.hpp>
@@ -1118,6 +1121,14 @@ TEST_CASE("fleet with no admin surface available says so rather than dialling no
     auto const answer = RunFleet(nullptr, { "workers" });
 
     CHECK(answer.outcome == Outcome::Usage);
+    // **And it names no flag, deliberately.** #1329 gave `ResolveAdmin`'s absent-surface
+    // arm a `--admin-listen` remedy, and the wrong version of that change is the one
+    // that suggests itself here: the two sentences read almost identically. They are not
+    // the same state. `main.cpp` sets `.admin` unconditionally in the only `VerbContext`
+    // production builds, so this arm is unreachable in the shipped binary -- naming a
+    // flag would assert a CONFIGURATION cause for something only a programming error can
+    // produce. Pinned as an absence, because that is the direction nothing else checks.
+    CHECK(std::ranges::none_of(answer.advisories, [](std::string const& line) { return line.contains("--admin-listen"); }));
 }
 
 TEST_CASE("fleet refuses a table whose row does not match its header", "[cli][node][fleet]")
@@ -1148,4 +1159,115 @@ TEST_CASE("fleet refuses a document with no header line", "[cli][node][fleet]")
 
     CHECK(answer.outcome == Outcome::Protocol);
     CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) { return line.contains("no header line"); }));
+}
+
+// ---------------------------------------------------------------------------
+// #1329: `ResolveAdmin`'s "runs no admin surface" arm says what to SET.
+//
+// The first tests `LadderGatherer` has ever had. `ScriptedAdmin` above says these
+// questions "are tested where they are decided", which was true of none of them: the
+// class was constructed only in `main.cpp`.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A gatherer pointed at a scripted node, with no admin override and no cache.
+///
+/// The admin endpoint is left UNCONFIGURED deliberately: a configured one wins at
+/// `ResolveAdmin`'s first line, so a fixture that supplied one would exercise the
+/// override and reach none of the four discovery arms these cases are about.
+/// @param node The scripted `0xFC` connection; it must outlive the gatherer.
+/// @param cachePort The port this invocation already dialled, which the collision arm
+///        compares a reported admin port against.
+/// @return The gatherer.
+[[nodiscard]] LadderGatherer GathererFor(INodeExchange& node, std::uint16_t cachePort = 6674)
+{
+    return LadderGatherer { Endpoint {},     Endpoint { .host = "10.0.0.4", .port = cachePort },
+                            DialTimeouts {}, std::nullopt,
+                            nullptr,         &node };
+}
+
+/// What `ResolveAdmin` refuses with, for a node reporting @p surfaces.
+/// @param surfaces Every surface the node says it opened.
+/// @param cachePort The port this invocation is already talking `0xFC` to.
+/// @return The refusal text, as both callers receive it.
+[[nodiscard]] std::string AdminRefusalFor(std::vector<Cc::SurfaceReport> surfaces, std::uint16_t cachePort = 6674)
+{
+    ScriptedNodeExchange node {
+        { StatusReply({ .version = "0.2.0", .nodeId = {}, .uptimeSeconds = 5, .surfaces = std::move(surfaces) }) },
+        "10.0.0.4:6674"
+    };
+    auto gatherer = GathererFor(node, cachePort);
+    auto const document = gatherer.FetchAdmin("/fleet.txt?section=workers");
+    REQUIRE_FALSE(document.has_value());
+    return document.error().detail;
+}
+
+} // namespace
+
+TEST_CASE("a node that opened no admin surface is told which flag opens one", "[cli][node][stats][admin]")
+{
+    // `--admin-listen` is off by default and that default was defended on review, so
+    // this arm is what an ORDINARY node answers -- and it is therefore the first thing
+    // a new `fleet` user meets. It used to say only what was true and name nothing to
+    // do about it, where the other three arms each already point somewhere.
+    auto const detail = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } });
+
+    CHECK(detail.contains("--admin-listen"));
+    // The load-bearing clause. Without it the sentence reads as something being WRONG
+    // on the operator's machine, when a node with no admin surface is a configuration
+    // choice somebody made.
+    CHECK(detail.contains("off unless asked for"));
+    // Still names WHICH node, which is the half a rewrite drops first: an operator with
+    // several nodes cannot act on a remedy that does not say where to apply it.
+    CHECK(detail.contains("10.0.0.4:6674"));
+}
+
+TEST_CASE("the other three admin arms name no flag, because none of them is a node lacking one", "[cli][node][stats][admin]")
+{
+    // **The load-bearing negative.** "The refusal names `--admin-listen`" is satisfied
+    // by a build that names it in EVERY arm -- which would tell an operator whose admin
+    // surface is running perfectly, or is TLS, or collided on a port, to go and switch
+    // on a flag they already set. That is a confident wrong signal inside a refusal,
+    // which is the failure this tree catalogues most often, and asserting only the
+    // positive direction cannot see it.
+    ScriptedNodeExchange silent { { NodeFailure(ExchangeFailure::Transport, "connection refused") }, "10.0.0.4:6674" };
+    auto silentGatherer = GathererFor(silent);
+    auto const undiscovered = silentGatherer.FetchAdmin("/fleet.txt?section=workers");
+    REQUIRE_FALSE(undiscovered.has_value());
+
+    auto const tls = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 9000, .tls = true } });
+    auto const collides = AdminRefusalFor({ Cc::SurfaceReport { .surface = Cc::WireSurface::Admin, .port = 6674 } });
+
+    CHECK_FALSE(undiscovered.error().detail.contains("--admin-listen"));
+    CHECK_FALSE(tls.contains("--admin-listen"));
+    CHECK_FALSE(collides.contains("--admin-listen"));
+}
+
+TEST_CASE("the stats ladder relays the same remedy when it skips /metrics", "[cli][node][stats][admin]")
+{
+    // **One sentence, two callers**, and the ticket's acceptance says to CHECK this
+    // rather than assume it. `fleet` renders `ResolveAdmin`'s words as the whole
+    // answer; the ladder folds the same string into "<source> was not asked: <note>".
+    // A remedy that only reads correctly in one of the two renderings is half a fix,
+    // and nothing short of a case that drives both can tell.
+    ScriptedNodeExchange node {
+        { StatusReply({ .version = "0.2.0",
+                        .nodeId = {},
+                        .uptimeSeconds = 5,
+                        .surfaces = { Cc::SurfaceReport { .surface = Cc::WireSurface::Raft, .port = 6680 } } }),
+          NodeFailure(ExchangeFailure::Transport, "the node-metrics verb went unanswered") },
+        "10.0.0.4:6674"
+    };
+    auto gatherer = GathererFor(node);
+
+    auto const answer = ChooseStats(gatherer.Gather());
+
+    CHECK(answer.outcome == Outcome::Unreachable);
+    // `was not asked` AND the flag in ONE line: asserted separately they would pass on
+    // a build that put the remedy on some other source's advisory.
+    CHECK(std::ranges::any_of(answer.advisories, [](std::string const& line) {
+        return line.contains("was not asked") && line.contains("--admin-listen");
+    }));
 }

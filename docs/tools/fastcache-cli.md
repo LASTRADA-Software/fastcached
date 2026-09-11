@@ -506,7 +506,7 @@ source=node-metrics
 fastcached_connections_total=0
 ...
 fastcache-cli: the node's own NodeMetrics verb over 0xFC returned 99 field(s); this is the counter catalogue only; /metrics adds the storage and per-tier series
-fastcache-cli: the admin surface's /metrics endpoint was not asked: 127.0.0.1:36751 runs no admin surface
+fastcache-cli: the admin surface's /metrics endpoint was not asked: 127.0.0.1:36751 runs no admin surface. Start the node with --admin-listen to open one: it is off unless asked for, so a node without one is configured rather than broken
 ```
 
 Against a daemon with no metrics listener, `stats` falls back to `INFO` and is
