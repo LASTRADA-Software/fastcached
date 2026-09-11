@@ -130,6 +130,22 @@ void ApplyEnvironment(Command& command, std::optional<std::string> (*lookup)(std
 /// @return The complete usage text, ending in a newline.
 [[nodiscard]] std::string HelpText(UsageColor color = UsageColor::Plain);
 
+/// Render the help for ONE verb.
+///
+/// Every cell is derived from the verb's own row -- its wire, the connections that wire
+/// opens, the protocol command it sends, its operand bounds, the modifiers it honours and
+/// whether a compile node answers it -- so a verb cannot be documented here as doing
+/// something `VerbTable` does not say it does.
+///
+/// Reached by `help <command>` and `--help <command>`. The word that names no verb is a
+/// USAGE ERROR rather than a page about nothing, which is the half that was missing: the
+/// operand used to be discarded, so `help nosuchverb` printed the whole text and exited
+/// **0** while the bare `nosuchverb` exits 2.
+/// @param verb The verb to explain.
+/// @param color Whether to emit ANSI SGR escapes; see StdoutSupportsColor.
+/// @return The page, ending in a newline.
+[[nodiscard]] std::string HelpTopicText(VerbSpec const& verb, UsageColor color = UsageColor::Plain);
+
 /// The `FASTCACHE_*` variables this tool reads.
 struct EnvVarSpec
 {

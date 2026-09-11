@@ -168,6 +168,34 @@ expect_status 0 "ping"
 expect_stdout "PONG" "ping"
 
 # ---------------------------------------------------------------------------------
+# case 1b: `help` answers about a topic, and refuses a word that names nothing
+# ---------------------------------------------------------------------------------
+# The unit tests cover the parse and the rendering; this covers the half that is the
+# product -- the EXIT CODE. `help nosuchverb` printed 114 lines and exited **0** while
+# the bare `nosuchverb` exits 2, so the operand said something and was heard by nobody.
+echo "==> case 1b: help, with and without a topic"
+
+run_cli help
+expect_status 0 "bare help still answers"
+expect_stdout "EXIT CODES" "the whole help carries every section"
+
+run_cli help get
+expect_status 0 "help with a known topic answers"
+expect_stdout "on a compile node" "the topic page carries the per-verb details"
+# It is a PAGE, not the whole help: both contain the word `get`, so asserting that
+# would pass under the discard this case exists for.
+refute_stdout "EXIT CODES" "a topic page is one verb, not the whole text"
+
+run_cli help nosuchverb
+expect_status 2 "a topic naming no command is a usage error"
+expect_stderr "nosuchverb" "and the refusal names the word that was typed"
+
+# The other settled question. `--version get` printed the version and exited 0.
+run_cli --version get
+expect_status 2 "a question that takes no topic refuses one"
+expect_stderr "--version" "and names the flag it is about"
+
+# ---------------------------------------------------------------------------------
 # case 2: a store and a read back
 # ---------------------------------------------------------------------------------
 echo "==> case 2: set, get, del"

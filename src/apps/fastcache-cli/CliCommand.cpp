@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <deque>
 #include <format>
 #include <ranges>
 #include <utility>
@@ -309,11 +310,58 @@ namespace
     /// worse than no refusal, because it sends the reader looking for something that is
     /// not there.
     constexpr auto Modifiers = std::to_array<ModifierSpec>({
+        // `--ttl` had no row although the struct's own `set` field was documented as
+        // *"null for `--ttl`, which is not a bool"* -- the column anticipated the row and
+        // the row was never written. Nothing was wrong while `UnhonouredModifier` was the
+        // only reader, because it carries a second, hand-written `--ttl` clause below; it
+        // goes wrong the moment a SECOND reader treats the table as the modifier list,
+        // which `HelpTopicText` does. `set` staying null is what keeps the two readers
+        // honest: the applicability loop skips the row it cannot read, and the help
+        // renderer, which only ever wants the spelling, does not.
+        { .bit = Modifier::Ttl, .flag = "--ttl", .set = nullptr },
         { .bit = Modifier::Exclusivity, .flag = "--nx", .set = &VerbOptions::onlyIfAbsent },
         { .bit = Modifier::Exclusivity, .flag = "--xx", .set = &VerbOptions::onlyIfPresent },
         { .bit = Modifier::Raw, .flag = "--raw", .set = &VerbOptions::raw },
         { .bit = Modifier::Everything, .flag = "--all", .set = &VerbOptions::everything },
     });
+
+    /// One connection a verb's wire needs, and the word the help calls it.
+    struct ConnectionSpec
+    {
+        bool WireSpec::* needed; ///< The `WireSpec` column that says whether it is opened.
+        std::string_view name;   ///< What to call it in the help.
+    };
+
+    /// The connections, so the per-verb help reads the three columns rather than `wire`.
+    ///
+    /// `stats` is why this is not derived from the wire name: its row needs the RESP port
+    /// AND the `0xFC` one, because the ladder's `/metrics` rung asks the node where its
+    /// admin surface is. A reader told only *wire: stats* cannot see that two addresses
+    /// are in play, which is the first thing they need when one of the two is wrong.
+    constexpr auto Connections = std::to_array<ConnectionSpec>({
+        { .needed = &WireSpec::needsResp, .name = "resp" },
+        { .needed = &WireSpec::needsMemcached, .name = "memcached-text" },
+        { .needed = &WireSpec::needsNode, .name = "0xFC" },
+    });
+
+    /// What a compile node does with @p verb, for its page's last row.
+    ///
+    /// THREE states, and reading `nodeFallback` alone gives two. That column answers *is
+    /// there a SECOND answer once the primary wire has already failed against a compile
+    /// node*, which is a question a verb whose primary wire IS the node does not have --
+    /// so `node` and `node-metrics`, the two verbs whose whole subject is a compile node,
+    /// rendered as *refuses it by name*. A confident wrong answer, on the page written to
+    /// stop an operator having to dial a machine to find out.
+    /// @param verb The verb.
+    /// @return The cell's text.
+    [[nodiscard]] std::string_view NodeAnswerFor(VerbSpec const& verb) noexcept
+    {
+        if (verb.wire == Wire::Node)
+            return "answered: this is a node verb";
+        if (verb.nodeFallback != nullptr)
+            return "answered: the row carries a fallback";
+        return "refused by name";
+    }
 
     /// Refuse a modifier the verb does not honour.
     /// @param command The parsed command.
@@ -323,6 +371,10 @@ namespace
     {
         for (auto const& modifier: Modifiers)
         {
+            // The `--ttl` row carries no bool to read; whether it was given is a
+            // comparison against `TtlUnset`, which the clause after this loop makes.
+            if (modifier.set == nullptr)
+                continue;
             if (!(command.verbOptions.*modifier.set))
                 continue;
             if ((verb.modifiers & modifier.bit) == 0)
@@ -405,6 +457,72 @@ namespace
     constexpr std::array WordAliases {
         WordAlias { .word = "help", .action = Action::ShowHelp, .flag = "--help" },
     };
+
+    /// A question about this BINARY, and what a bare word after it may name.
+    ///
+    /// `--help get` and `help get` ask for help ABOUT `get`; `--version get` asks nothing
+    /// at all. So the arity of what follows is a property of the settled ACTION, and it
+    /// is a row rather than a comparison so the next such question has to state its own
+    /// answer instead of inheriting `ShowHelp`'s by being written nearby.
+    struct SettledQuestion
+    {
+        Action action;             ///< The action that settled the parse.
+        std::string_view spelling; ///< Its canonical spelling, for the diagnostic.
+        bool takesTopic;           ///< Whether ONE trailing bare word is meaningful.
+        std::string_view subject;  ///< What that word names; empty iff `!takesTopic`.
+    };
+
+    /// The settled actions, and what each accepts after it.
+    ///
+    /// Deliberately NOT an `EnumTable` over `Action`: the subject is *the actions that
+    /// settle*, which is two of the four, and rows for `RunVerb` and `UsageError` would
+    /// be statements nothing can reach or test.
+    constexpr auto SettledQuestions = std::to_array<SettledQuestion>({
+        { .action = Action::ShowHelp, .spelling = "help", .takesTopic = true, .subject = "command" },
+        { .action = Action::ShowVersion, .spelling = "--version", .takesTopic = false, .subject = "" },
+    });
+
+    /// The row for @p action, or nullptr when it has none.
+    ///
+    /// A missing row means a trailing word is REFUSED rather than discarded, which is the
+    /// safe direction: a new stopping flag that nobody gave a row gets a diagnostic
+    /// naming the operand, not the silence this whole change is about.
+    /// @param action The settled action.
+    /// @return Its row, or nullptr.
+    [[nodiscard]] SettledQuestion const* FindSettledQuestion(Action action) noexcept
+    {
+        for (auto const& row: SettledQuestions)
+            if (row.action == action)
+                return &row;
+        return nullptr;
+    }
+
+    /// Refuse or accept the bare words that followed a settled action.
+    ///
+    /// @param command The parsed command, whose `operands` hold the trailing words.
+    /// @return The diagnostic, or empty when what followed is acceptable.
+    [[nodiscard]] std::string UnacceptableTopic(Command const& command)
+    {
+        auto const* const question = FindSettledQuestion(command.action);
+        if (question == nullptr || !question->takesTopic)
+        {
+            if (command.operands.empty())
+                return {};
+            auto const spelling = question == nullptr ? std::string_view { "that option" } : question->spelling;
+            return std::format("{} takes no operand, and `{}` was given", spelling, command.operands.front());
+        }
+
+        if (command.operands.empty())
+            return {};
+        if (command.operands.size() > 1)
+            return std::format("{} explains one {} at a time, and {} were given",
+                               question->spelling,
+                               question->subject,
+                               command.operands.size());
+        if (FindVerb(command.operands.front()) == nullptr)
+            return std::format("no help for `{}`: it is not a command (try --help)", command.operands.front());
+        return {};
+    }
 
     /// The alias @p word names, or nullptr.
     ///
@@ -504,10 +622,21 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
             continue;
         }
 
-        // Once `--help` has answered, a bare word is not a verb either -- `--help get`
-        // asks for the help, not for a `get`.
+        // Once the action is settled a bare word is not a verb -- `--help get` asks for
+        // the help, not for a `get`. It is not NOTHING either, which is what this arm
+        // used to make it: `help nosuchverb` printed 114 lines and exited **0**, while
+        // the bare `nosuchverb` exits 2. A question that was not understood answered
+        // with a confident success is the same defect `WordAliases` was written to fix,
+        // one level down -- the operand went the way the exit code had.
+        //
+        // So it is a TOPIC of the settled question, kept in `operands` because that is
+        // where positional words already live, and judged after the loop by
+        // `UnacceptableTopic` -- which needs the whole tail, so it cannot be judged here.
         if (settled)
+        {
+            command.operands.emplace_back(token);
             continue;
+        }
 
         if (command.verb.empty())
         {
@@ -527,11 +656,19 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
             command.operands.emplace_back(token);
     }
 
-    // A settled action needs no verb and no operand arity: it was a question about this
-    // binary. Returning here is what keeps `--help` from falling into *expected a
-    // command* now that the loop no longer returns early.
+    // A settled action needs no verb and no VERB operand arity: it was a question about
+    // this binary. Returning here is what keeps `--help` from falling into *expected a
+    // command* now that the loop no longer returns early. What it does still owe is an
+    // answer about its own tail, which is the one thing the loop could not decide.
     if (settled)
+    {
+        if (auto const unacceptable = UnacceptableTopic(command); !unacceptable.empty())
+        {
+            command.action = Action::UsageError;
+            command.diagnostic = unacceptable;
+        }
         return command;
+    }
 
     if (command.verb.empty())
     {
@@ -571,6 +708,77 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
     }
 
     return command;
+}
+
+std::string HelpTopicText(VerbSpec const& verb, UsageColor color)
+{
+    auto const& wire = WireTable[static_cast<std::size_t>(verb.wire)];
+
+    // `UsageRows::Add` takes the description as a VIEW, so a computed one has to outlive
+    // the render. A deque, for the reason `UsageRows` itself keeps one: growing a vector
+    // reseats its strings and every entry already added would view freed bytes.
+    std::deque<std::string> cells;
+    auto const cell = [&cells](std::string text) -> std::string_view {
+        return cells.emplace_back(std::move(text));
+    };
+
+    UsageRows details;
+    details.Add("wire", cell(std::string { wire.name }));
+
+    std::string opens;
+    for (auto const& connection: Connections)
+    {
+        if (!(wire.*connection.needed))
+            continue;
+        if (!opens.empty())
+            opens += ", ";
+        opens += connection.name;
+    }
+    details.Add("opens", cell(std::move(opens)));
+
+    // An empty `protocolCommand` is NOT an absent cell. The column's own documentation
+    // says empty means *sends none directly*, which is a fact this client knows -- and a
+    // dash, which is how this tool spells a value it could not obtain, would claim the
+    // opposite. Two states, two renderings.
+    details.Add("sends",
+                cell(verb.protocolCommand.empty() ? std::string { "no single command; the source is chosen at run time" }
+                                                  : std::string { verb.protocolCommand }));
+    details.Add("operands", cell(DescribeOperandArity(verb)));
+
+    std::string honoured;
+    for (auto const& modifier: Modifiers)
+    {
+        if ((verb.modifiers & modifier.bit) == 0)
+            continue;
+        if (!honoured.empty())
+            honoured += ", ";
+        honoured += modifier.flag;
+    }
+    details.Add("modifiers", cell(honoured.empty() ? std::string { "none" } : std::move(honoured)));
+
+    // The question #1275 was about, asked per verb rather than discovered by dialling a
+    // node and reading the refusal.
+    details.Add("on a compile node", NodeAnswerFor(verb));
+
+    auto const invocation = std::format(" fastcache-cli [options] {}", RenderVerb(verb));
+
+    auto const blocks = std::to_array<UsageBlock>({
+        UsageBlock { .text = verb.summary, .textIndent = 2 },
+        UsageBlock { .entries = details.Rows() },
+        UsageBlock { .text = "fastcache-cli --help lists every command, the options, the formats, the exit\n"
+                             "codes and the environment variables.",
+                     .textIndent = 2 },
+    });
+
+    std::span<UsageBlock const> const all { blocks };
+    auto const sections = std::to_array<UsageSection>({
+        { .title = "usage:", .subject = invocation },
+        { .blocks = all.subspan(0, 1) },
+        { .title = "DETAILS", .blocks = all.subspan(1, 1) },
+        { .title = "SEE ALSO", .blocks = all.subspan(2, 1) },
+    });
+
+    return RenderUsage({ .sections = sections }, color);
 }
 
 std::string HelpText(UsageColor color)

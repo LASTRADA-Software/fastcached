@@ -305,9 +305,16 @@ int main(int argc, char* argv[])
 
     switch (command.action)
     {
-        case Action::ShowHelp:
-            std::cout << HelpText(ResolveColor(command.color));
+        case Action::ShowHelp: {
+            // A topic is present only once `ParseCommand` has found it a row, so the
+            // lookup here cannot answer null for a word an operator typed -- `help
+            // nosuchverb` is a `UsageError` and never reaches this arm. Answered rather
+            // than asserted, for the reason the unknown-verb arm below gives.
+            auto const* const topic = command.operands.empty() ? nullptr : FindVerb(command.operands.front());
+            std::cout << (topic == nullptr ? HelpText(ResolveColor(command.color))
+                                           : HelpTopicText(*topic, ResolveColor(command.color)));
             return ExitCodeOf(Outcome::Affirmative);
+        }
         case Action::ShowVersion:
             std::cout << ProgramName << ' ' << FASTCACHE_CLI_VERSION << '\n';
             return ExitCodeOf(Outcome::Affirmative);
