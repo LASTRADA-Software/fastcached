@@ -822,6 +822,14 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   admits or dispatches by it, which is what makes a mutable non-unique value safe to
   carry. It still passes the UTF-8 gate at `SchedulerService::Register`: one byte makes
   `/fleet.json` unparseable for the whole fleet. **No prefix matching on ids.**
+- **A replicated setting must not decide where a node sends a CREDENTIAL.** `upstream`
+  was a `SettingTable` row and is #1123: a node presents its `--requirepass` at whatever
+  address it names (`CacheTier.cpp:227`/`:228`, `RemoteUpstream.cpp:135`/`:175`), so one
+  committed entry would have redirected every member's secret — while the secret itself
+  stays per machine. Removed rather than wired, which is the OPPOSITE answer to #1112's
+  on the same shape of unread row, because what picks between them is what the value
+  would decide. Refused BY NAME through `RefusedSettingTable`, since *no such cluster
+  setting* reads as a typo or as a node too old.
 - **A mode rides on the PORT, never on the absence of a NAME.** Consensus is on iff
   `--listen-raft` resolves — asked of the surface row, so `--print-surfaces` and the
   mode cannot disagree. It read `--node-id` until #1022, and a flag whose ABSENCE

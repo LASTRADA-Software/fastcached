@@ -1002,13 +1002,24 @@ live in the `fastcached` this state merely names.
 
 | Setting | Means |
 | --- | --- |
-| `upstream` | host:port of the shared `fastcached` every member reads through to |
 | `fleet-open` | `1` to admit every caller to the fleet, `0` for members only |
+| `lease-lifetime` | milliseconds a compile lease lives end to end |
 
 A key the build does not know is **refused when it is proposed**, not stored. The
 alternative is a typo replicated to every node, snapshotted, carried across
 restarts — and doing nothing, with the only symptom being that the thing you
 configured did not happen.
+
+**`upstream` was in this table and is not any more, and the build refuses the key by
+name.** A node reads through to the shared cache its own `--upstream` names, and it
+presents its own `--requirepass` credential there on every fetch and every store — so
+a replicated address would decide where every member sends a secret that is
+configured per machine, and one committed entry would redirect all of them. The
+refusal says that and names the flag, rather than answering *no such cluster
+setting*, which reads as a typo or as a node too old
+([#1123](https://github.com/LASTRADA-Software/fastcached/issues/1123)). Nothing read
+the setting, so there is nothing to move: `--upstream` on the node that reads through
+is what has always decided this.
 
 ### Membership at runtime
 
@@ -1091,7 +1102,7 @@ directly, and each exits when it has an answer:
 
 ```sh
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-status
-fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=upstream=cache.internal:6674
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=fleet-open=1
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n4=10.0.0.4:6680
 fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-forget=n3
 ```
@@ -1165,8 +1176,10 @@ fastcache-compile-node: this node does not lead the cluster; ask --scheduler=10.
 ```
 
 **A non-member is refused too**, and here anti-leeching is not about capacity: a
-stranger who could set `upstream` would point the whole fleet's cache at a host of
-their choosing.
+stranger who could set `fleet-open` would admit every caller on the network to the
+fleet. This paragraph named `upstream` until #1123 removed that row — the attack it
+described is closed at the table now rather than at the gate, and the gate is still
+what stands between a stranger and the rows that remain.
 
 **A node running no cluster says so** rather than answering as though it had one. A
 single node started without `--listen-raft` leads itself and has no replicated state,

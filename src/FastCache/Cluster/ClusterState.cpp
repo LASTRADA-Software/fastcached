@@ -406,6 +406,17 @@ std::expected<void, ConsensusError> Validate(Command const& command)
         case CommandKind::SetSetting:
             if (!command.schedulerEndpoint.empty())
                 return std::unexpected(InvalidConfiguration("a setting carries no scheduler endpoint"));
+            // Asked BEFORE the lookup: a key this cluster refuses gets its own answer
+            // rather than the one a typo gets. Both are a null `FindSetting`, and
+            // *no such cluster setting* reads as a misspelling or as a node too old,
+            // which sends an operator to upgrade a machine over a decision. The
+            // `static_assert` beside `RefusedSettingTable` is what makes the ORDER
+            // here irrelevant rather than load-bearing -- a refusal must not become
+            // escapable by a row arriving later and shadowing it.
+            if (auto const* const refused = FindRefusedSetting(command.key); refused != nullptr)
+                return std::unexpected(
+                    InvalidConfiguration(std::format("{} is not a replicated setting: {}", command.key, refused->reason)));
+
             // Refused HERE rather than ignored at each applier. A key nobody knows
             // would otherwise be replicated to every node, snapshotted, carried across
             // restarts and do nothing -- with the only symptom being that the thing
