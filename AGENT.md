@@ -144,23 +144,14 @@ not have.
 
 **No completion port is ever drained from several threads**, on Windows or
 anywhere else. `IocpReactor.hpp` says that migrates a coroutine across threads
-and is unsafe, and `RunMultiReactorWindows` runs one thread per reactor
-exactly as the POSIX path does. This paragraph claimed the opposite until
-[#896](https://github.com/LASTRADA-Software/fastcached/issues/896) — it
-described a threading model this project does not implement and a header in
-the same tree calls unsafe, which is worse than a stale sentence twice over:
-it is the document a session reads FIRST and is told to obey, so it licenses
-the defect, and it changes how a reader grades a concurrency bug. A scoped
-review of #884 recorded that taking it as authoritative would have made its
-verdict *"too kind"* — a same-thread ordering question becomes a cross-thread
-data race — and it reached the right answer only by choosing the header over
-this file. The `fsync`-overlap mechanism it described is in no source either.
-#896 argued that from "no `ThreadPoolExecutor` appears in
-`ReactorServerLoop.cpp`", and **that half of the ticket is wrong**: one is
-constructed on all three serving paths. It is `ThreadPoolExecutor { 1 }`
-running the EXPIRY SWEEP, drains no completion port, and overlaps no `fsync`
-with anything — so the conclusion holds and the evidence offered for it did
-not, which is the shape worth catching in a document nobody re-derives.
+and is unsafe, and `RunMultiReactorWindows` runs one thread per reactor exactly
+as the POSIX path does. This paragraph claimed the opposite until
+[#896](https://github.com/LASTRADA-Software/fastcached/issues/896), and a wrong
+sentence HERE is worse than a stale one twice over: this is the document a
+session reads FIRST and is told to obey, so it licenses the defect, and it
+changes how a reader grades a concurrency bug. The one
+`ThreadPoolExecutor { 1 }` on each of the three serving paths runs the EXPIRY
+SWEEP; it drains no completion port and overlaps no `fsync` with anything.
 
 ## The rulebook
 
@@ -175,13 +166,15 @@ tripwires, not summaries: they are there so a rule fires even in a session that
 never opens the file, and none of them carries the reasoning that makes it stick.
 
 **So a rule landed in `.agent/rules/` without a bullet here fires in no session that
-does not open its file** — which is the population the rule was written for. #355
-shipped that way: a rule stating that a test asserting what both sides produce is no
-test, with no tripwire, so it would have applied to nobody who had not already gone
-looking for it. Caught by a review, not by the author. It is not one of the
-state-collapse instances the observability rules catalogue — nothing failed to tell
-two things apart. It is a rule that did not apply itself, and the reason it is easy
-is that writing the rule feels like the work.
+does not open its file** — which is the population the rule was written for. It has
+shipped that way (#355), caught by a review rather than by the author, and the reason
+it is easy is that writing the rule feels like the work.
+
+**And the converse governs this file's size: a bullet that has grown a derivation is
+a rule nobody finishes reading.** Reasoning belongs in the matching rules file, where
+it can be as long as it needs to be; what belongs here is the sentence that makes the
+rule fire and the pointer to where the argument lives. A tripwire that has acquired
+measurements, ticket archaeology or a counter-argument has stopped being one.
 
 > Link these as plain markdown, never as an `@`-prefixed path. Claude Code resolves
 > `@` imports recursively out of `CLAUDE.md`, so `@`-importing a rule file would
@@ -1584,60 +1577,51 @@ and what they may assume.
 
 ## Issues and pull requests
 
-Labels here have teeth: a pull request carrying no `type/` label **fails a
-check**, because that label decides which section of the generated release notes
-the change lands in (`.github/release.yml`), and nothing downstream can recover
-it afterwards. CI derives `area/` and `os/` from the changed paths and reads
-`type/` from a conventional-commit title when there is one — a prose title, which
-most of this repository's are, means setting the label by hand.
+Labels here have teeth: a pull request carrying no `type/` label **fails a check**,
+because that label decides which section of the generated release notes the change
+lands in (`.github/release.yml`), and nothing downstream can recover it afterwards.
+CI derives `area/` and `os/` from the changed paths and reads `type/` from a
+conventional-commit title when there is one — a prose title, which most of this
+repository's are, means setting the label by hand.
 [`CONTRIBUTING.md`](CONTRIBUTING.md) carries the taxonomy and the reasoning.
 
-A label applied by hand can be **destroyed by CI seconds later**, and the gate
-then fails for a pull request that was labelled correctly. `actions/labeler`
-finishes with `setLabels(...)` — a full replacement computed from the labels it
-read when its run started — *whatever* `sync-labels` is set to, so a label added
-between that read and that write is lost. `pr-labels.yml` brackets the action with
-a remember/restore pair and warns when it fires; if a `type/` label vanishes,
-re-apply it and read that warning rather than assuming the gate is flaky (#347).
+A label applied by hand can be **destroyed by CI seconds later**, and the gate then
+fails for a pull request that was labelled correctly. `actions/labeler` finishes with
+`setLabels(...)` — a full replacement computed from the labels it read when its run
+started — *whatever* `sync-labels` is set to. `pr-labels.yml` brackets the action with
+a remember/restore pair and warns when it fires; if a `type/` label vanishes, re-apply
+it and read that warning rather than assuming the gate is flaky (#347).
 
 Deferred work is a GitHub issue linked from the matching rulebook file's
 `## Open work` section, never a residual recorded only in prose.
 
 **A ticket is a claim about a tree, taken once, and every merge since is an unrecorded
 condition change — so a premise is CHECKED against the tree before it is built on, never
-read.** The rulebook already carries this for performance figures (*a quantity UNDER
-CONDITIONS, and the citation is where the conditions get lost*); a ticket is the same
-object with a longer half-life and no units, and the difference is that a figure at least
-LOOKS like it might be stale while a sentence does not. Eight instances in one evening
-across five lanes, none of them a coding mistake and **not one visible from reading the
-ticket** — every one was found by checking, and the check is cheap: a `grep` for a cited
-symbol, `gh issue view` on a cited number, `git log -S` on a cited claim. The stale-body
-six are #401 (three separate premises: a flag that exists, a symbol `FleetMemory` that is
-in no tree, and a version pair that had moved from 2 to 3 at #730), #386 (line numbers
-moved), #614 (*"no diagnostic"* — there is one), #543 (*"one hunk superseded, three to
-land"*, all four stale, two of which would have added CLOSED work to an `## Open work`
-section), and #665 (assumes a shared cost layer #664 never built). **The cost is
-asymmetric**: a stale figure makes somebody re-measure, a stale premise sends a whole lane
-to build against a tree that does not exist, and two of the eight would have made the
-documentation actively wrong.
+read.** The rulebook carries this for performance figures (*a quantity UNDER CONDITIONS,
+and the citation is where the conditions get lost*); a ticket is the same object with a
+longer half-life and no units, and the difference is that a figure at least LOOKS like it
+might be stale while a sentence does not. **Not one instance has been visible from reading
+the ticket** — every one was found by checking, and the check is cheap: a `grep` for a
+cited symbol, `gh issue view` on a cited number, `git log -S` on a cited claim. **The cost
+is asymmetric**: a stale figure makes somebody re-measure, a stale premise sends a whole
+lane to build against a tree that does not exist.
 
 Three consequences, none of which follows from the headline:
 
-- **The ticket may not be OPEN.** #489 and #203 were dispatched as open work with both
-  closed two days earlier, #489 having been escalated and decided at owner level. Asking
-  `gh issue view` is one call and it is not the same question as *is the body accurate*.
-- **"Does not reproduce" is a first-class outcome with a DELIVERABLE**, not a close and
-  not a shrug: the falsified claims with `file:line`, plus **a test at the production seam
-  that stays green**, committed `Refs #N` rather than `Closes #N`. A test that records why
-  a ticket does not reproduce is worth keeping, and it must not silently close a design
-  question underneath it. #401 is the worked example.
+- **The ticket may not be OPEN.** Work has been dispatched against issues closed days
+  earlier, one of them escalated and decided at owner level. Asking `gh issue view` is one
+  call and it is not the same question as *is the body accurate*.
+- **"Does not reproduce" is a first-class outcome with a DELIVERABLE**, not a close and not
+  a shrug: the falsified claims with `file:line`, plus **a test at the production seam that
+  stays green**, committed `Refs #N` rather than `Closes #N`. A test that records why a
+  ticket does not reproduce is worth keeping, and it must not silently close a design
+  question underneath it.
 - **A ticket whose acceptance clause cannot be EXECUTED is a different failure from one
-  that is merely stale, and it can be closed by nobody, ever.** #401's clause said *"by
-  removing the identity from the registration reply"* and the REGISTER reply is a bare id
-  string — there is nothing to remove, so the clause could not have been shown red even on
-  a tree where the defect existed. #537 is the other variant: dispatched as buildable, and
-  a signature record by design with no acceptance clause at all. Separate these from the
-  stale-body six rather than filing them together. This generalises the counts rule in
+  that is merely stale, and it can be closed by nobody, ever** — a clause naming a removal
+  from a reply that carries no such field could not have been shown red even on a tree
+  where the defect existed. The other variant is a ticket dispatched as buildable that is a
+  signature record by design, with no acceptance clause at all. Separate these from
+  stale bodies rather than filing them together. This generalises the counts rule in
   [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md) — *a ticket
   cannot be closed against a count that no longer describes the tree* — from counts to
   claims.
@@ -1647,7 +1631,6 @@ developers — the lane ownership, rebase and merge protocol, review gates and t
 type-label check's cancelled-versus-failed distinction are in
 [`.agent/guides/team-run.md`](.agent/guides/team-run.md). It carries no board state by
 design; what is done and what is left lives in the issues.
-
 ## Design Patterns & Principles
 
 ### Error handling: `std::expected<T, E>`
@@ -1733,97 +1716,62 @@ quickly.
 
 - **Staleness that costs a refusal, a miss or a retry is safe to cache.** The
   local-address set behind the node's cache gate is this shape: an address added is
-  refused until the next refresh — it fails **closed** and self-heals; an address
-  removed is accepted a little longer, and exploiting that needs DHCP to reassign it
-  inside the window.
+  refused until the next refresh — it fails **closed** and self-heals.
 - **Staleness that produces a wrong answer which looks right is NOT cacheable**,
-  however expensive the probe. `DiscoverTargetTriple` costs ~40 ms per translation
-  unit and is deliberately *not* memoized, because the triple goes into `compilerId`:
-  a stale one is **a wrong hit, not a miss** — an object built by a different code
-  generator, served under a key claiming otherwise
-  ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)). Expense is
-  not the criterion; what a stale answer *does* is.
+  however expensive the probe. `DiscoverTargetTriple` costs ~40 ms per translation unit
+  and is deliberately *not* memoized, because the triple goes into `compilerId`: a stale
+  one is **a wrong hit, not a miss**
+  ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)). Expense is not
+  the criterion; what a stale answer *does* is.
 
 **Then, if it is safe:**
 
-- **A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost separately.**
-  `ProbeToolchainFiles` recorded "about 2 s warm" — honestly measured, condition attached — and two other
-  sites then cited it as "the 2-second full walk" and "about 2 seconds over 288 MB". Both dropped the `warm`,
-  and the design was reasoned from the citations, so an operation observed exceeding **300 s** cold was
-  treated as costing two seconds. Attaching conditions is necessary and **not sufficient: the citation is
-  where they get lost**, so a figure others will refer to lives in ONE place they point at, never restated.
-  And a figure can be current, correctly measured and still **the wrong quantity** — quoting the warm cost as
-  the price of MISSING a cache is circular, since the cache is what makes the warm case warm. Record a table
-  of conditions, not a number; a spread states its own uncertainty and forces a citer to pick a row.
-  **The same rule governs a claim handed between PEOPLE, and a handoff IS a citation.** Worse than the
-  comment case: a reader who doubts a comment can re-measure, while a reader who is HANDED one usually
-  cannot — the measurement was made in another session, on another machine, in a run whose log has gone —
-  and a sentence looks identical whether it was measured, inferred, remembered or guessed. Four in one
-  session, all through a handoff: a mechanism reported and published as ESTABLISHED when the subject
-  contradicted it (#517); a `36/36` correspondence verified BY HAND and relayed as though a guard enforced
-  it; a pull request number that was an ISSUE number; and "thirty lines up", written in a comment quoting
-  BOTH line numbers without subtracting them — really 117 and 212 (#172), a correction that STRENGTHENS the
-  point, since a reader can arrive at either call site having never seen the helper at all. The remedy is on
-  the SENDING end because only it can be: **say what was MEASURED and what was INFERRED, separately, every
-  time.** The receiver cannot recover the distinction at any price; the sender states it for free.
-  **And the receiver owes one thing back: state what would FALSIFY a claim BEFORE opening the file to
-  check it.** Two readers an hour apart made one wrong claim about `RunLaunchctl`, and the standard remedy
-  for the first IS the action that produced the second — the first inferred the implementation from a
-  caller's error message, the second READ THE SOURCE and wrote the defect down anyway (#536). A handed-over
-  shape arrives already sounding checked, so reading for CONFIRMATION stops at the first line matching it
-  — here a `std::format` naming a timeout constant — while only the LOOP shows the printed number is the
-  measurement. Confirmation stops at the format string; falsification has to reach the loop. **A relayed
-  diagnosis is relayed code.** Not *distrust the sender*, which does not scale: derive the falsifier from
-  the claim itself, first.
-  **And that never-restate sentence does NOT reach a measurement's CONDITIONS — pin those, do not point
-  at them.** The test is whether the two copies are supposed to stay EQUAL. A live figure (a rate, a
-  count, a required-context set) has two copies meant to agree, so they drift while both claim to be
-  current: one copy, everyone points at it. A measurement's conditions are the state of the world at one
-  INSTANT and must NOT track their source, so they are restated deliberately and marked as of the
-  measurement. Measured 2026-09-09 (#1151): a registration comment recorded a hosted scan at **2.11 s**
-  under `four cores at CTEST_PARALLEL_LEVEL: 4`, and the tidy that suggests itself is to delete the
-  numbers and point at `build.yml`. Do that and the day somebody sets four to eight, the 2.11 s figure
-  silently claims it was measured at eight — a false condition welded to a real measurement by an
-  unrelated edit, with no signal, and worse than the stale constant it replaces, which at least
-  misstates only itself. **The corrected comment LOOKS like the defect**: it restates a number from a
-  file it cites, exactly the shape the sentence above catches, so it must say why it is pinned or the
-  next cleanup reverses it. Two people applied the never-restate rule correctly here and got the wrong
-  answer — and the original error, `two-core` against a workflow saying four, was not drift at all but a
-  value wrong when typed against a file its author had not opened, which no link and no guard catches.
-  Only reading the source you cite does.
-- **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs
-  ~2.09 ms on Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart.
-  A design that looks free on the platform you develop on can be the dominant cost
-  on the one you ship to. "It is only a syscall" is how a hot path gets slow.
-- **Prefer being fast by construction to being fast by cache.** The cache gate
-  answers `IsLoopbackHost(peer)` first and never consults the seam for
-  essentially all real traffic. The cache then bounds only the rare path, which is
-  a far weaker thing to have to get right.
-- **Refresh on an interval, never on a miss.** A miss-triggered refresh hands a
-  remote peer a free amplifier: it can force the expensive probe once per request
-  simply by asking. Interval-guarded, an attacker gets one per interval regardless.
-- **Name both failure directions in the header** — what a too-old answer costs in
-  each direction — because that asymmetry is what makes a longer interval
-  defensible.
-- **Reach it through an injected seam with an injected clock**, like every other
-  ambient dependency. A cache with a hidden clock is untestable by construction.
+- **A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost
+  separately.** Attaching conditions is necessary and **not sufficient: the citation is
+  where they get lost**, so a figure others will refer to lives in ONE place they point
+  at, never restated. A figure can be current, correctly measured and still **the wrong
+  quantity** — quoting a warm cost as the price of MISSING a cache is circular. Record a
+  table of conditions, not a number.
+  - **The same rule governs a claim handed between PEOPLE, and a handoff IS a citation.**
+    Worse than the comment case: a reader who doubts a comment can re-measure, while one
+    who is HANDED a claim usually cannot, and a sentence looks identical whether it was
+    measured, inferred, remembered or guessed. The remedy is on the SENDING end because
+    only it can be: **say what was MEASURED and what was INFERRED, separately, every
+    time.** The receiver cannot recover the distinction at any price.
+  - **And the receiver owes one thing back: state what would FALSIFY a claim BEFORE
+    opening the file to check it.** A handed-over shape arrives already sounding checked,
+    so reading for CONFIRMATION stops at the first line matching it — reading the source
+    is not enough on its own, and has produced the wrong answer twice in an hour. **A
+    relayed diagnosis is relayed code.** Derive the falsifier from the claim itself, first.
+  - **And that never-restate sentence does NOT reach a measurement's CONDITIONS — pin
+    those, do not point at them.** The test is whether the two copies are supposed to stay
+    EQUAL: a live figure has two copies meant to agree, so one copy and everyone points at
+    it; a measurement's conditions are the world at one INSTANT and must NOT track their
+    source, or an unrelated edit silently re-attributes a real measurement to conditions it
+    was never taken under. **The corrected comment LOOKS like the defect**, so it says why
+    it is pinned or the next cleanup reverses it.
+- **Measure before choosing, on every platform.** `GetAdaptersAddresses` costs ~2.09 ms on
+  Windows against ~0.0088 ms for `getifaddrs` on Linux — **238×** apart. A design that
+  looks free on the platform you develop on can be the dominant cost on the one you ship
+  to. "It is only a syscall" is how a hot path gets slow.
+- **Prefer being fast by construction to being fast by cache.** The cache gate answers
+  `IsLoopbackHost(peer)` first and never consults the seam for essentially all real
+  traffic, so the cache bounds only the rare path — a far weaker thing to get right.
+- **Refresh on an interval, never on a miss.** A miss-triggered refresh hands a remote peer
+  a free amplifier: it can force the expensive probe once per request simply by asking.
+- **Name both failure directions in the header** — what a too-old answer costs in each
+  direction — because that asymmetry is what makes a longer interval defensible.
+- **Reach it through an injected seam with an injected clock.** A cache with a hidden clock
+  is untestable by construction.
 
-**And prefer not needing the cache.** Computing a value once and returning what you
-already have beats caching it: `CachedToolchainFingerprint` derived the resolved
-path, the include roots and the stamp, returned none of them, and its caller
-re-derived all three at an extra driver spawn per toolchain per survey — on warm
-starts too, because a cache HIT said nothing about the roots it covered. That was
-not a caching problem and a cache would have been the wrong fix for it; the fix was
-`ToolchainIdentity` handing back the `ToolchainEvidence` it had already folded
-([#259](https://github.com/LASTRADA-Software/fastcached/issues/259)). A wider return
-value is also the STRONGER answer, not merely the cheaper one: two derivations a few
-milliseconds apart can disagree, and the caller was recording evidence a compiler
-upgrade in between would have made describe a different include tree than the digest
-covers. **Evidence a caller may not have is a disengaged `optional`, never an empty
-field** — empty roots and an empty stamp are both ordinary answers, so neither can
-carry "there was no probe", and that is the guard from
-[`.agent/rules/distributed-compilation.md`](.agent/rules/distributed-compilation.md)
-moved out of the call site and into the type.
+**And prefer not needing the cache.** Computing a value once and returning what you already
+have beats caching it: a fingerprint helper that derived the resolved path, the include
+roots and the stamp and returned none of them cost its caller an extra driver spawn per
+toolchain per survey, on warm starts too, because a cache HIT said nothing about the roots
+it covered. A wider return value is also the STRONGER answer, not merely the cheaper one:
+two derivations a few milliseconds apart can disagree. **Evidence a caller may not have is
+a disengaged `optional`, never an empty field** — empty roots and an empty stamp are both
+ordinary answers, so neither can carry "there was no probe".
 
 ## C++ Coding Guidelines
 
@@ -1848,18 +1796,15 @@ moved out of the call site and into the type.
   [`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md).
   **It builds in `out/build/gate-clang-debug` and `out/build/gate-gcc-release`, which it
   OWNS** — never the `out/build/clang-debug` and `out/build/gcc-release` this file tells
-  you to build in. A reference build turns the compiler cache off, a `-D` writes a cache
-  entry, and `option()` never overrides one, so while the two shared a directory a single
-  gate run left every ordinary build in the tree uncached for good — about 2.4x on a full
-  rebuild, in the repository whose product is a compile cache
-  ([#487](https://github.com/LASTRADA-Software/fastcached/issues/487)). The cost of the
-  split is disk and a first gate run that cannot start from your warm object tree.
+  you to build in. Sharing a directory leaves every ordinary build in the tree uncached
+  for good, because a reference build turns the compiler cache off with a `-D` and
+  `option()` never overrides a cache entry (#487).
 - **`clang-format` and `clang-tidy` after every change — at the version CI pins**
   (`$CLANG_TOOLS_VERSION` in `.github/workflows/build.yml`). Successive LLVM
   releases disagree with each other, so a tree clean under whichever binary is on
   `PATH` can still be rejected. Name the version explicitly and use a build
   directory of its own; the `clang-debug` preset is **not** that sweep.
-- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT` — address the underlying issue. The `clang-debug` preset enables `clang-tidy` automatically at whatever version `PATH` resolves to — which is why **`scripts/local-gate.sh` passes it `-DCLANG_TIDY_EXE=clang-tidy-$V` and refuses to start when that binary is missing**, rather than letting the preset pick. Running the preset by hand still takes whatever `PATH` offers; see the bullet above for why that is not the same as the one CI enforces.
+- **`clang-tidy` reports must be fixed at the source.** Never silence with `NOLINT`. The `clang-debug` preset enables `clang-tidy` at whatever version `PATH` resolves to, which is why **`scripts/local-gate.sh` passes `-DCLANG_TIDY_EXE=clang-tidy-$V` and refuses to start when that binary is missing** rather than letting the preset pick — so running the preset by hand is not the sweep CI enforces.
 - **No `g_`-prefix on globals either — and the rule lives in `.clang-tidy`, not only here.** A file-scope or `thread_local` name is spelled like any other name of its kind: `CamelCase` if it is a constant, `camelBack` if it is mutable. There is no "forbid this prefix" option in `readability-identifier-naming` (its `...Prefix` keys only ever *require* one), so the `GlobalVariableCase`/`GlobalConstantCase`/`StaticVariableCase` rows are what reject `g_foo` — and with `WarningsAsErrors: "*"` that is a build failure rather than a review comment. A function-local `static` is `camelBack` whether or not it is `const`: `StaticConstantCase` is left unset precisely so a local constant falls back to that, which keeps `g_` rejected there without demanding PascalCase for locals that are `static` only for their lifetime. The prefix is a substitute for a naming convention rather than one, and it makes ambient state read as normal; if a bare name looks wrong at the call site, that is the "inject it" rule above telling you something.
 - **No `k`-prefix on identifiers.** Do not use the Google-style `kFoo` prefix for constants, enumerators, or any other symbol — it violates the project `.clang-tidy` naming convention. Use `Foo` (PascalCase) for constants/enumerators and `foo`/`fooBar` for locals and members instead.
 - **All changes covered by unit tests.** Aim to **increase** coverage with every PR.

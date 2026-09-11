@@ -2269,6 +2269,57 @@ no timestamp and cannot be refused by anything downstream, whereas a request aga
 live system -- `gh pr merge --auto`, a write that can conflict, a `cancel` -- is refused
 with current truth at the moment the staleness would otherwise have done harm.
 
+### And the never-restate rule does NOT reach a measurement's CONDITIONS -- pin those
+
+**The test is whether the two copies are supposed to stay EQUAL.**
+
+A *live* figure -- a rate, a count, a required-context set -- has two copies meant to
+agree, so they drift while both go on claiming to be current. One copy; everyone points
+at it. That is the rule the section above makes.
+
+A *measurement's conditions* are the state of the world at one INSTANT and must **NOT**
+track their source. They are restated deliberately, and marked as of the measurement.
+
+Measured 2026-09-09 ([#1151](https://github.com/LASTRADA-Software/fastcached/issues/1151)):
+a registration comment recorded a hosted scan at **2.11 s** under `four cores at
+CTEST_PARALLEL_LEVEL: 4`. The tidy that suggests itself is to delete the numbers and
+point at `build.yml`. Do that, and the day somebody sets four to eight the 2.11 s figure
+**silently claims it was measured at eight** -- a false condition welded to a real
+measurement by an unrelated edit, with no signal, and worse than the stale constant it
+replaces, which at least misstates only itself.
+
+**The corrected comment LOOKS like the defect.** It restates a number from a file it
+cites, which is exactly the shape the never-restate rule catches -- so it must say why it
+is pinned, or the next cleanup reverses it.
+
+Two people applied the never-restate rule correctly here and got the wrong answer. And
+the original error, `two-core` against a workflow saying four, was **not drift at all**:
+it was a value wrong when typed, against a file its author had not opened. No link and no
+guard catches that one. Only reading the source you cite does.
+
+## Prefer not needing the cache at all
+
+Computing a value once and returning what you already have beats caching it.
+
+`CachedToolchainFingerprint` derived the resolved path, the include roots and the stamp,
+returned **none of them**, and its caller re-derived all three at an extra driver spawn
+per toolchain per survey -- on warm starts too, because a cache HIT said nothing about
+the roots it covered. That was not a caching problem, and a cache would have been the
+wrong fix for it. The fix was `ToolchainIdentity` handing back the `ToolchainEvidence` it
+had already folded ([#259](https://github.com/LASTRADA-Software/fastcached/issues/259)).
+
+**A wider return value is the STRONGER answer, not merely the cheaper one.** Two
+derivations a few milliseconds apart can disagree, and the caller was recording evidence
+that a compiler upgrade in between would have made describe a different include tree than
+the digest covers. Returning what was already folded makes that disagreement
+unrepresentable; a cache only makes it rarer.
+
+**Evidence a caller may not have is a disengaged `optional`, never an empty field.**
+Empty roots and an empty stamp are both ordinary answers, so neither can carry *there was
+no probe* -- which is the `exitCode == NotSpawned` guard from
+[`distributed-compilation.md`](distributed-compilation.md) moved out of the call site and
+into the type.
+
 ## Open work
 
 - **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
