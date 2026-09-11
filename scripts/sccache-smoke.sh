@@ -17,7 +17,16 @@ set -euo pipefail
 
 fastcached=""
 protocol="memcached"
-port="11611"
+# Empty means DRAW one; `--port` still overrides, which is what CI and a human
+# debugging a run need. A FIXED port needs a reaper and this fixture never had one,
+# so a run that missed its cleanup left a daemon holding 11611 for the life of the
+# machine and every later run failed against it, naming neither the port nor the
+# process (#220 is that same defect one fixture over).
+#
+# The reason offered for the constant was TRUE and did not support it: the backend
+# URL must be decided before sccache starts, which is an argument for deciding the
+# port EARLY -- not for fixing it. Drawing it early is what this file now does.
+port=""
 compiler="${CXX:-c++}"
 
 while [[ $# -gt 0 ]]; do
@@ -37,15 +46,20 @@ command -v sccache >/dev/null 2>&1 || { echo "sccache not found; skipping"; exit
 command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler'; skipping"; exit "$SKIP"; }
 
 case "$protocol" in
-    memcached) export SCCACHE_MEMCACHED="tcp://127.0.0.1:${port}" ;;
-    redis)     export SCCACHE_REDIS="redis://127.0.0.1:${port}" ;;
+    memcached|redis) ;;
     *) echo "unknown protocol: '$protocol'" >&2; exit 2 ;;
 esac
 export SCCACHE_NO_DAEMON=0
 
+# The shared fixture library: `free_port`, `port_answers` and the bounded waits.
+# Sourced AFTER the prerequisite checks above, which exit 77 for a skip -- the
+# library's `fail` exits 1, and a missing sccache is not a failure.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+
 workdir="$(mktemp -d)"
 src="${workdir}/hello.cpp"
 obj="${workdir}/hello.o"
+daemon_log="${workdir}/fastcached.log"
 cat > "$src" <<'EOF'
 #include <string>
 int main() { return static_cast<int>(std::string{"hi"}.size()); }
@@ -62,9 +76,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$fastcached" --port="$port" --log-level=info &
+# After the EXIT trap, which is this library's stated precondition: a `fail` raised
+# in a subshell arrives here as SIGTERM, and `e2e_begin` turns it back into an
+# ordinary exit so the cleanup above still runs.
+e2e_begin "sccache smoke (${protocol})" "$workdir"
+
+# Drawn from below the ephemeral range and remembered in the run's ledger, so two
+# protocols in one run cannot pick the same one.
+[ -n "$port" ] || port="$(free_port)"
+
+case "$protocol" in
+    memcached) export SCCACHE_MEMCACHED="tcp://127.0.0.1:${port}" ;;
+    redis)     export SCCACHE_REDIS="redis://127.0.0.1:${port}" ;;
+esac
+
+"$fastcached" --port="$port" --log-level=info > "$daemon_log" 2>&1 &
 server_pid=$!
-sleep 1
+# Waits on the LISTENER, bounded, and says which kind of failure it was: a flat
+# `sleep 1` is either flaky on a cold runner or slow on a warm one, and when it is
+# too short the failure surfaces later as sccache being unable to reach a backend
+# that was merely not up yet.
+wait_for_port 127.0.0.1 "$port" "$server_pid" "fastcached" "$daemon_log"
 
 sccache --stop-server >/dev/null 2>&1 || true
 # Starting the server is where sccache validates that the requested backend is
