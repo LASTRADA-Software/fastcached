@@ -1801,6 +1801,108 @@ run_case() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# The one door every perl stand-in goes through
+# ---------------------------------------------------------------------------
+#
+# Run a perl program as THIS process, under a lifetime bound it cannot omit.
+#
+# ## What it owns, and why it is one function rather than a convention
+#
+# Every stand-in below needs the same PAIR, and neither half is optional:
+#
+#   `exec`  -- `$!` for a backgrounded shell FUNCTION is the subshell bash forks,
+#              not the program that subshell goes on to run. Without it every
+#              `kill "$listener"` in this file reaps a wrapper and leaves perl
+#              alive, reparented, still holding its LISTEN socket (#839).
+#   `alarm` -- no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
+#              CI job, and those are the paths a leak actually accumulates on.
+#              #839 measured what that costs: **1368 orphan listeners holding
+#              loopback ports, the oldest 30.5 hours old**, on a fixture in the
+#              DEFAULT ctest set on every platform CI builds. The expensive half
+#              was the PORTS -- these fixtures draw from below the ephemeral
+#              range, so the next run meets a port held by a process nobody knows
+#              about and fails somewhere else entirely.
+#
+# They are INDEPENDENT and a survivor count cannot tell you whether either works:
+# each alone drives the count to zero for a different reason, so a count reads as
+# "both arms fine" while one is dead. #839's arm-independence table is what shows
+# the third arm is doing real work rather than belt-and-braces, and it is quoted
+# in #843 rather than restated here.
+#
+# Three stand-ins each spelled that pair by hand, so a fix to one reached none of
+# the others (#1214) -- and the arm that can be reopened by omission is `alarm`,
+# because a stand-in written without `exec` fails LOUDLY the moment the existing
+# `kill` stops working. #843 is the ticket, and it happened rather than being
+# hypothetical: PR #834 added `_selftest_unprompted_listener` with no bound at
+# all, while the ticket about bounds was open and its diagnosis was written down.
+#
+# So the pair rides on the thing every stand-in must do anyway -- launching its
+# perl -- and there is no argument to pass an unbounded program to. This is the
+# same idiom as `Refuse` taking a row and `SigningDomain` being a required
+# parameter. `check-e2e-perl-bounds` (further down) is what stops a new stand-in
+# spelling `perl` for itself and bypassing the door.
+#
+# ## How the bound is injected without touching the program
+#
+# `perl` accepts several `-e` chunks and joins them, in order, into ONE program.
+# So the bound is its own chunk and the caller's body is passed through verbatim:
+# the three bodies stay textually distinct, which is #1214's own constraint --
+# they model three different things and concatenating perl program text as
+# strings is the hazard the ticket exists to avoid, not the fix.
+#
+# Measured (perl 5.38.2, Linux): the two chunks compose in order, `@ARGV` after
+# `--` is exactly the caller's arguments, `alarm(0)` read from the SECOND chunk
+# reports 30 still pending, and a program that would run 60 s dies at 3 s with
+# status 142 when armed for 3. Control: the same program with no bound chunk
+# survives.
+#
+# ## Why the bodies wait with `select` and not `sleep`
+#
+# perldoc warns that `sleep` may be implemented with `alarm` on some systems, and
+# the two must not then overlap -- which is why `_selftest_listener` used to arm
+# its own alarm AFTER its delay rather than before. Arming here means arming
+# first, so that ordering is no longer available and the question has to be
+# closed rather than sequenced around.
+#
+# Measured on this platform it is a non-issue: `alarm 3; sleep 1; sleep 30` dies
+# at exactly 3.00 s over three runs, with both controls (alarm alone dies at
+# 3.00, no alarm survives). But macOS ships its own perl and cannot be measured
+# from here, so the bodies use `select(undef, undef, undef, N)` -- perldoc's own
+# alarm-safe spelling of a pause -- and the question does not arise on any
+# platform. Stated as MEASURED on Linux and INFERRED nowhere else, deliberately.
+#
+# @param 1 the lifetime bound in whole seconds; refused unless positive
+# @param 2 the perl program, single-quoted at the call site so the shell expands
+#          nothing in it
+# @param 3.. arguments, which the program reads from @ARGV
+_selftest_bounded_perl() {
+    local seconds="$1" program="$2"
+    shift 2
+    # A bound is REQUIRED and must be a positive whole number. `alarm 0` is
+    # perl's spelling of *cancel the alarm*, so a `0` here would read at the call
+    # site as a bound and be the absence of one -- an escape hatch wearing the
+    # shape of the guard, which is the failure this whole door exists to close.
+    case "$seconds" in
+        ''|*[!0-9]*) fail "_selftest_bounded_perl: '${seconds}' is not a whole number of seconds" ;;
+        0) fail "_selftest_bounded_perl: a bound of 0 cancels the alarm; there is no unbounded spelling" ;;
+    esac
+    [ -n "$program" ] || fail "_selftest_bounded_perl: no program given"
+    # The trailing marker is what `perl-bounds-scan` further down reads. This is
+    # the one `perl` command position in the tree allowed to name a program of
+    # its own, because it is the line that ARMS the bound every other one
+    # inherits -- so the scan cannot simply refuse every `perl`, and the claim
+    # has to be stated where it can be read back.
+    exec perl -e "alarm ${seconds};" -e "$program" -- "$@" # perl-lifetime: this line IS the injector
+}
+
+# The bound every stand-in below runs under, in seconds. One number, because
+# nothing here has measured a reason to differ and a per-stand-in constant is a
+# second thing to drift. It outlives every case in this file by a wide margin:
+# the longest staged delay is 1 s and the longest wait a case arms is far short
+# of this.
+_selftest_perl_lifetime=30
+
 # A listener that answers one request per connection with a body ending in NO
 # newline, and records the request headers it was sent.
 #
@@ -1809,54 +1911,49 @@ run_case() {
 #          POLLS rather than happening to be called after the bind
 # @param 3 file to record request lines in
 _selftest_listener() {
-    # `exec` for the reason `cleanup` above gives: without it `$!` is the subshell
-    # bash forks for a backgrounded function, so the three `kill "$listener"`
-    # calls below signalled a wrapper and left this perl reparented to init with
-    # its listening socket still open (#839).
+    # `exec` and the `alarm` bound both come from `_selftest_bounded_perl`, which
+    # is where the whole argument for them lives. What stays here is the one part
+    # that is about THIS stand-in.
     #
-    # Only ever called with `&`. In the FOREGROUND this would replace the calling
-    # shell, so a new call site backgrounds it or does not use it.
-    #
-    # That sentence is the ONLY guard, and it is worth saying why rather than
-    # leaving the next reader to wonder whether one was forgotten. Enforcing it
-    # means asking "am I in a subshell", which needs `BASHPID` -- bash 4.0+, and
-    # UNSET on the macOS 3.2 this script also runs under, so the check would hold
-    # on Linux and be silently inert on the platform it matters on. That is the
-    # exact trap this file already records in its own bash 3.2 table, where
-    # `BASHPID` is a banned construct for the same reason: a guard that cannot
-    # fire everywhere is worse than a comment, because it reads as enforcement.
-    # A rule nothing can express is a rule nothing can be held to, so this one is
-    # written down instead of pretended at.
-    exec perl -e '
+    # Only ever called with `&`. The door `exec`s, so in the FOREGROUND this would
+    # replace the calling shell -- a new call site backgrounds it or does not use
+    # it. That sentence is the ONLY guard on that, and it is worth saying why
+    # rather than leaving the next reader to wonder whether one was forgotten.
+    # Enforcing it means asking "am I in a subshell", which needs `BASHPID` --
+    # bash 4.0+, and UNSET on the macOS 3.2 this script also runs under, so the
+    # check would hold on Linux and be silently inert on the platform it matters
+    # on. That is the exact trap this file already records in its own bash 3.2
+    # table, where `BASHPID` is a banned construct for the same reason: a guard
+    # that cannot fire everywhere is worse than a comment, because it reads as
+    # enforcement. A rule nothing can express is a rule nothing can be held to,
+    # so this one is written down instead of pretended at.
+    _selftest_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile) = @ARGV;
-        sleep $delay if $delay;
-        # A self-imposed lifetime -- the belt-and-braces half of #839, and the
-        # same shape `_selftest_node` below already has in its trailing
-        # `sleep 30`. `cleanup` reaps this process on every path a case can take,
-        # but a trap does not run on SIGKILL, and this fixture is in the DEFAULT
-        # ctest set: it therefore also runs under `ctest --timeout`, under every
-        # cancelled CI job and under any `kill -9`, on every platform CI builds,
-        # and on those paths nothing whatever reaps it.
+        # The delay is what lets a caller prove a wait POLLS rather than
+        # happening to be called after the bind, so it runs BEFORE the listen.
         #
-        # A TIME bound and not a connection count. `port_answers` is `/dev/tcp`,
-        # so every `free_port` draw and every `wait_for_port` poll costs this
-        # loop an `accept()`; a loop bounded by connections would exit before the
-        # request under test arrived, and the case would then fail for a reason
-        # having nothing to do with the helper it exists to test.
-        #
-        # Armed AFTER the delay and never across it: the perl `sleep` builtin may
-        # be implemented with `alarm` on some systems, and the two must not
-        # overlap. There is deliberately no handler -- the default disposition of
-        # SIGALRM terminates, and that is what interrupts the blocking `accept()`.
+        # `select` rather than `sleep`: the bound is already armed by the time
+        # this program starts, and perldoc warns that `sleep` may be implemented
+        # with `alarm` on some systems. The reasoning, and what was measured, is
+        # at `_selftest_bounded_perl`.
+        select(undef, undef, undef, $delay) if $delay;
+        # The bound is a TIME and deliberately not a connection count.
+        # `port_answers` is `/dev/tcp`, so every `free_port` draw and every
+        # `wait_for_port` poll costs this loop an `accept()`; a loop bounded by
+        # connections would exit before the request under test arrived, and the
+        # case would then fail for a reason having nothing to do with the helper
+        # it exists to test. There is deliberately no SIGALRM handler -- the
+        # default disposition terminates, and that is what interrupts the
+        # blocking `accept()`.
         #
         # NOTE: this program is a shell single-quoted string, so no apostrophe
         # may appear anywhere inside it, comments included. One here ended the
         # quote and the script died at PARSE time -- which leaks nothing, and is
         # therefore indistinguishable, by a count of survivors alone, from the
         # fix working -- which is the argument this file makes in its own
-        # header, arriving from inside the file.
-        alarm 30;
+        # header, arriving from inside the file. Passing the body as an ARGUMENT
+        # to the door does not change that: it is still single-quoted here.
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
@@ -1887,31 +1984,16 @@ _selftest_listener() {
 # @param 2 `answer` to speak first and close, `hold` to accept and do neither
 # @param 3 the log to write failures to
 #
-# ## Two lifetime bounds, and neither closes the other's hole
-#
-# **`exec`, because `$!` for a backgrounded shell FUNCTION is the subshell bash
-# forks, not the program that subshell goes on to run.** Every `kill "$listener"` in
-# this file therefore reaped a wrapper and left `perl` alive, reparented, still
-# holding its LISTEN socket. Measured: `$! comm=bash` with a `perl` child, and the
-# port still held after the kill. `exec` replaces the subshell, so the pid the caller
-# holds IS the perl. Safe ONLY because these helpers are always invoked with `&` --
-# in the foreground `exec` would replace the calling shell and end the run.
-#
-# **`alarm`, because no trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled
-# CI job**, which are the paths a leak actually accumulates on. A bound on TIME and
-# deliberately not on connection count: `port_answers` is `/dev/tcp`, so every
-# `free_port` draw and every `wait_for_port` poll costs this listener an `accept()`,
-# and a count bound would kill it before the request under test ever arrived.
-#
-# **They are independent, and a survivor COUNT cannot tell you whether either works**
-# -- each alone drives it to zero, for a different reason, so a count reads as "both
-# arms fine" while one is dead. Ask the process TREE. (#839)
+# Its lifetime pair -- `exec` and the `alarm` bound, why neither closes the other's
+# hole, and why a survivor COUNT cannot tell you whether either works -- is
+# `_selftest_bounded_perl`'s, which every stand-in here goes through since #1214.
+# This one is the reason that ticket was filed: #834 added it with no bound at all
+# while #843 was open, and its `hold` mode is the worst of the three to leak, since
+# it accumulates accepted CLIENT sockets as well as the listening port.
 _selftest_unprompted_listener() {
-    exec perl -e '
+    _selftest_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
-        # Outlives any case here; dies without one whatever killed the run.
-        alarm 30;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
@@ -1960,11 +2042,13 @@ _selftest_unprompted_listener() {
 # saying the process was making progress beside a COUNTER finding saying what
 # actually went wrong. A stand-in that logged nothing would collapse the two.
 #
-# `exec` and `alarm` for the reasons `_selftest_listener` gives at length: `$!`
-# for a backgrounded FUNCTION is the subshell bash forks, so without `exec` every
-# `kill` here signals a wrapper and leaves a perl holding a LISTEN socket; and no
-# trap runs under `SIGKILL`, a `ctest --timeout` or a cancelled CI job, which are
-# the paths a leak accumulates on. Only ever called with `&`.
+# `exec` and the lifetime bound come from `_selftest_bounded_perl`. This is the
+# FOURTH stand-in and the one that made #1214 a ticket rather than a tidy-up: it
+# was added by a branch in flight while the door was being written on another, so
+# it spelled the pair by hand and nothing but a scan could have said so. That the
+# collision announced itself here -- `perl-bounds-scan` refusing this line by name
+# at the rebase -- is the intended failure and is why the scan walks rather than
+# reading a list. Only ever called with `&`, since the door `exec`s.
 #
 # NOTE: a shell single-quoted string, so no apostrophe may appear anywhere inside
 # it, comments included.
@@ -1973,10 +2057,9 @@ _selftest_unprompted_listener() {
 # @param 2 mode: rise | flat | absent
 # @param 3 the log to append one line per request to
 _selftest_metrics() {
-    exec perl -e '
+    _selftest_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $mode, $logfile) = @ARGV;
-        alarm 30;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
@@ -2039,24 +2122,34 @@ _selftest_metrics() {
 # @param 3 the log to write it to
 # @param 4 the marker text to log, e.g. `$E2eNodeReadyMarker`
 _selftest_node() {
-    # `exec` for the reason `_selftest_listener` above gives: `$!` must be this
-    # perl and not the subshell bash forks for a backgrounded function, or the
-    # `kill "$staged"` at the call site signals a wrapper and leaves this process
-    # holding its port for the full 30 seconds below. Only ever called with `&`.
-    exec perl -e '
+    # `exec` and the `alarm` bound come from `_selftest_bounded_perl`. Only ever
+    # called with `&`, since the door `exec`s: `$!` must be this perl and not the
+    # subshell bash forks for a backgrounded function, or the `kill "$staged"` at
+    # the call site signals a wrapper and leaves this process holding its port.
+    _selftest_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
         my ($port, $delay, $logfile, $marker) = @ARGV;
         my $srv = IO::Socket::INET->new(
             LocalAddr => "127.0.0.1", LocalPort => $port,
             Listen => 5, ReuseAddr => 1, Proto => "tcp") or die "listen: $!";
         if ($delay ne "never") {
-            sleep $delay;
+            select(undef, undef, undef, $delay);
             open(my $log, ">>", $logfile) or die $!;
             print $log "$marker on 127.0.0.1:$port, and then whatever else the line carries
 ";
             close $log;
         }
-        sleep 30;
+        # The HOLD, which is what this stand-in is for: `wait_for_node_ready`
+        # polls the log with the process still under liveness watch, so one that
+        # exited after writing the marker would be reported as having DIED --
+        # a different verdict, and a passing test for the wrong reason.
+        #
+        # It is also a SECOND bound, and that is deliberate rather than
+        # redundant: it was this stand-in ONLY bound until #1214, and if the
+        # injected alarm ever stopped arming, this ends the process anyway. Two
+        # arms, each sufficient, which is #839 arriving at the same shape from
+        # the other side. `select` for the reason the other bodies give.
+        select(undef, undef, undef, 30);
     ' "$1" "$2" "$3" "$4"
 }
 
@@ -3584,7 +3677,226 @@ if [ "$scanned" -lt 1 ]; then
     note_failure "helper-scan"
 fi
 
-if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then
+# --- every perl invocation is bounded, or SAYS why it is not ----------------
+#
+# `_selftest_bounded_perl` makes the `exec` + `alarm` pair impossible to omit for
+# anything that goes through it. Nothing makes a new stand-in go through it, and
+# that is exactly the gap #843 is about: **a rule stated in the files that obey it
+# reaches no file that does not** (#970). The three stand-ins here now carry the
+# rule; the fourth, written next month in another fixture, would not -- and #834
+# is the proof this is not hypothetical, having added an unbounded listener while
+# the ticket about bounds was open, with the diagnosis written down.
+#
+# So the rule is a SCAN and not a comment, and it asks the question the door can
+# answer rather than the one it cannot: not *does this perl body contain a bound*
+# -- which #843 notes a naive `grep` gets wrong, since `alarm 30` appears in prose
+# in this very file -- but **does any script name a perl PROGRAM outside the one
+# line that arms the bound**. That is a question about command positions, which is
+# the same shape as the `timeout` scan above and needs no region machinery.
+#
+# TWO spellings, each a claim, which is `Refuse` / `RefuseWithoutCounter` in a
+# shell script:
+#
+#   * route through `_selftest_bounded_perl` -- bounded, nothing to say;
+#   * carry `# perl-lifetime: <reason>` on the invocation line -- deliberately
+#     unbounded, and WHY.
+#
+# The second is TALLIED and printed on every run, exactly as the refusal-rationale
+# check prints its per-issue totals: a marker whose reason is a placeholder must be
+# visible, or "decided" and "forgot" are one spelling again. Two rows today, and
+# both are read out below rather than counted.
+#
+# ## The census, and why it is a check rather than a sentence
+#
+# Measured on this tree, two constructions with a positive control: `perl` in a
+# COMMAND position appears in exactly one tracked shell script -- this one -- and
+# `git grep -c -i perl` over every tracked file agrees that no other script
+# mentions it at all. A scan whose subject has left the tree reports every file
+# clean, and that reads identically to complete coverage, so the tally below
+# REFUSES at zero rather than passing. Finding one instance by other means before
+# believing a zero is what that clause is.
+#
+# ## Why this reads through a declared region and the other scans' canaries do not
+#
+# The helper-copy canary one screen up stages its fixture with `printf` at column
+# zero, and that is enough for IT because its pattern is anchored at column zero.
+# This one is not: `out="$(perl -e ...)"` is a real invocation shape and has to be
+# caught, so the `$(` entry point matches inside a quoted `printf` argument too --
+# measured, the first run of this block failed on its own canary staging. So the
+# staging sits in a `perl-scan` declared region, which is the mechanism this file
+# already uses twice for exactly this, and the region is BALANCE-CHECKED and
+# COUNTED below, or it is just an exemption nobody can see being added.
+#
+# ## The entry-point class, and the hole the mutation found
+#
+# `{` and `)` are ENTRY POINTS and not merely keywords, which is the correction
+# this pattern needed rather than a nicety. The first draft copied the `timeout`
+# scan's class -- `^ ; & | ( ` $( && ||` -- with `{` in the optional-keyword
+# alternation, and the arm written to prove the rule REACHES another fixture
+# planted `stage_thing() { perl -e "sleep 99" & }` in `cluster-e2e.sh` and the
+# scan reported CLEAN. The `perl` there follows `) { `, and neither `)` nor `{`
+# could open a match: `^` was consumed by the function name, so nothing anchored.
+# A one-line brace group is the shape a hurried new stand-in takes, so the scan
+# was blind to precisely its own subject in precisely the file it exists to reach.
+# `)` comes with it because a `case` arm (`foo) perl -e ...`) is a command
+# position by the same argument -- found by asking what ELSE the missing anchor
+# would have cost rather than by patching the one shape that failed.
+#
+# What it does NOT reach, stated rather than left for somebody to discover: a perl
+# behind a PREFIX COMMAND with flags of its own -- `nice -n 10 perl -e ...`,
+# `env FOO=1 perl -e ...`, `xargs perl`. `exec` is in the alternation because it is
+# the spelling every stand-in here used before the door existed; the rest are not,
+# and no regex over shell text reaches them without matching the word `perl` in
+# prose and in `command -v perl`, which is the noise that gets a scan deleted. That
+# residue is an EVASION rather than an accident -- nobody writes `nice perl` for a
+# fixture stand-in by mistake -- and the accidental shapes are the six the canary
+# pins. Stating the limit is the remedy; widening the pattern is not.
+_perl_invocations() {
+    _perl_readable "$1" \
+        | grep -nE '(^|[;&|(){}`]|\$\(|&&|\|\|)[[:space:]]*(if|then|else|elif|while|until|do|!|exec)?[[:space:]]*perl[[:space:]]' \
+        || true
+}
+_perl_readable() { _readable_dropping_regions "perl-scan" "$1"; }
+
+# The same set, split on whether the line states a reason. `grep -F` on the marker
+# and not a pattern: the marker is a literal and a regex here would be one more
+# thing to be wrong about.
+_perl_unmarked_invocations() {
+    _perl_invocations "$1" | grep -vF '# perl-lifetime:' || true
+}
+_perl_marked_invocations() {
+    _perl_invocations "$1" | grep -F '# perl-lifetime:' || true
+}
+
+# The canary, both directions. SIX entry points staged, because each is a way a
+# perl program reaches a shell: `exec`, a command substitution, a background job,
+# a bare command in an `if`, a one-line brace group, and a `case` arm. The
+# must-catch COUNT is what makes a narrowed pattern fail here rather than in six
+# months -- and the last two are in this list because the pattern that shipped in
+# the first draft passed all four of the others while being blind to them.
+# perl-scan: data-begin
+canary_dir="$(mktemp -d)"
+cat > "${canary_dir}/must-catch.sh" <<'CANARY'
+exec perl -e "while (1) {}"
+out="$(perl -e "print 1")"
+perl -e "sleep 99" &
+if perl -e "exit 0"; then :; fi
+stage_thing() { perl -e "sleep 99" & }
+case "$x" in thing) perl -e "exit 0" ;; esac
+CANARY
+# The negative half. Five shapes that must NOT fire, and each is a way this scan
+# could have been written too wide: a routed stand-in, a marked invocation, `perl`
+# as an ARGUMENT rather than a command, the word inside a string, and a comment.
+cat > "${canary_dir}/must-not-catch.sh" <<'CANARY'
+_selftest_bounded_perl 30 "print 1" "$@"
+perl -e "exit 0" # perl-lifetime: a probe, and here is the reason
+command -v perl >/dev/null 2>&1 || skip "no perl"
+echo "SKIPPED: perl with IO::Socket::INET is not available"
+# exec perl -e "commented out"
+CANARY
+# perl-scan: data-end
+_scan_canary "perl-bounds-canary" _perl_unmarked_invocations \
+    "${canary_dir}/must-catch.sh" "${canary_dir}/must-not-catch.sh" \
+    6 "invocations" "a routed, marked, argument-position, quoted or commented mention of perl"
+rm -rf "$canary_dir"
+
+perl_scanned=0
+perl_marked_total=0
+perl_regions=""
+while IFS= read -r script; do
+    [ -n "$script" ] || continue
+    base="${script##*/}"
+    ran=$(( ran + 1 ))
+    _region_ok "perl-bounds-scan" "perl-scan" "$script" "$base" || continue
+    case "$(grep -c '^[[:space:]]*# perl-scan: data-begin[[:space:]]*$' "$script")" in
+        0) ;;
+        *) perl_regions="${perl_regions:+${perl_regions}, }${base}" ;;
+    esac
+    perl_scanned=$(( perl_scanned + 1 ))
+    ran=$(( ran + 1 ))
+    hits="$(_perl_unmarked_invocations "$script")"
+    if [ -n "$hits" ]; then
+        echo "FAIL perl-bounds-scan: ${base} runs a perl program of its own." >&2
+        echo "     A stand-in needs 'exec' (or the kill at its call site reaps a wrapper)" >&2
+        echo "     and a lifetime bound (or nothing reaps it under SIGKILL, ctest --timeout" >&2
+        echo "     or a cancelled job) -- #839 measured 1368 orphan listeners holding ports." >&2
+        echo "     Use _selftest_bounded_perl <seconds> '<program>' <args...>, or state a" >&2
+        echo "     reason on the line as '# perl-lifetime: why this one needs no bound'." >&2
+        printf '%s\n' "$hits" | sed 's/^/     | /' >&2
+        note_failure "perl-bounds-scan"
+    fi
+    marked="$(_perl_marked_invocations "$script")"
+    if [ -n "$marked" ]; then
+        while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            perl_marked_total=$(( perl_marked_total + 1 ))
+            echo "   perl-lifetime: ${base}:${row%%:*} -- ${row#*# perl-lifetime: }"
+        done <<EOF
+$marked
+EOF
+    fi
+done < <( _shell_scripts )
+
+# Both empties, and they are different failures. No scripts means the walk broke;
+# no marked invocation means the SUBJECT left the tree, and a scan whose subject is
+# gone reports every file clean.
+ran=$(( ran + 1 ))
+if [ "$perl_scanned" -lt 1 ]; then
+    echo "FAIL perl-bounds-scan: the walk matched no shell scripts, so every one of them 'passed'." >&2
+    note_failure "perl-bounds-scan"
+fi
+ran=$(( ran + 1 ))
+if [ "$perl_marked_total" -lt 1 ]; then
+    echo "FAIL perl-bounds-scan: not one perl invocation was found anywhere under scripts/." >&2
+    echo "     The injector in _selftest_bounded_perl carries a '# perl-lifetime:' marker," >&2
+    echo "     so zero means the pattern has stopped matching rather than that the tree is" >&2
+    echo "     clean -- which is the reading that passes over everything." >&2
+    note_failure "perl-bounds-scan"
+fi
+# Reported, not merely tolerated: a region nobody can see added is this mechanism's
+# own way of becoming an exemption, which is the bash-3.2 scan's argument for the
+# same line.
+echo "   perl bounds: scanned ${perl_scanned} script(s) under scripts/ (walked, not listed)"
+echo "   perl bounds: declared data region(s) in: ${perl_regions:-none}"
+echo "   perl bounds: a tracked *.sh outside scripts/ is refused by shell-walk-scope, below"
+
+# And the DOOR itself, asked behaviourally rather than by reading it. A scan that
+# refuses every unrouted `perl` is worth nothing if what they are routed INTO has
+# stopped arming anything, and that failure is silent in exactly the way #839 was.
+#
+# The verdict is an EXIT STATUS and not a duration: 142 is 128 + SIGALRM, which is
+# host- and clock-independent -- and this repository has a standing finding that a
+# wall clock under WSL2 steps ~2 s backwards every ~32 s, so a bound asserted by
+# timing is a flake waiting for a runner. Both directions, because a door that
+# killed everything would pass the refusing half alone.
+if command -v perl >/dev/null 2>&1; then
+    ran=$(( ran + 1 ))
+    bounded_out="$( ( _selftest_bounded_perl 2 'select(undef, undef, undef, 60); print "SURVIVED\n";' ) 2>/dev/null )"
+    bounded_status=$?
+    if [ "$bounded_status" -ne 142 ] || [ -n "$bounded_out" ]; then
+        echo "FAIL perl-bounds-door: a program that would run 60s under a 2s bound exited" >&2
+        echo "     ${bounded_status} (want 142 = 128 + SIGALRM) and printed '${bounded_out}'." >&2
+        echo "     _selftest_bounded_perl is not arming the alarm, so every stand-in that" >&2
+        echo "     goes through it is unbounded while the scan above reports clean." >&2
+        note_failure "perl-bounds-door"
+    fi
+
+    ran=$(( ran + 1 ))
+    alive_out="$( ( _selftest_bounded_perl 30 'print "ALIVE:", join(",", @ARGV), "\n";' one two ) 2>/dev/null )"
+    alive_status=$?
+    if [ "$alive_status" -ne 0 ] || [ "$alive_out" != "ALIVE:one,two" ]; then
+        echo "FAIL perl-bounds-door: the ACCEPTING direction. A short program under a 30s" >&2
+        echo "     bound exited ${alive_status} and printed '${alive_out}', want 0 and" >&2
+        echo "     'ALIVE:one,two'. A guard nobody has watched accept is not known to work," >&2
+        echo "     and the arguments after -- are what every stand-in reads from @ARGV." >&2
+        note_failure "perl-bounds-door"
+    fi
+else
+    echo "   perl-bounds-door: NOT CHECKED -- no perl on this host" >&2
+    skipped=$(( skipped + 1 ))
+fi
+
+if command -v perl >/dev/null 2>&1 && perl -MIO::Socket::INET -e1 >/dev/null 2>&1; then # perl-lifetime: a foreground availability probe; it exits at once and is never backgrounded
     echo "== the helpers, against a real listener"
     for record in "${socket_cases[@]}"; do
         name="${record%%|*}"
