@@ -71,7 +71,7 @@ namespace
 /// Sized rather than tuned: `SO_SNDBUF` is not reachable through `ISocket`, and a
 /// canary that parked only on hosts with small buffers would report the guard
 /// unwatched on the others -- which is the state this whole program exists to end.
-constexpr std::size_t UnsendableBytes = 32uz * 1024uz * 1024uz;
+constexpr std::size_t UnsendableBytes = 32UZ * 1024UZ * 1024UZ;
 
 /// Park a `Write` on @p socket and stay there.
 ///
@@ -85,6 +85,32 @@ constexpr std::size_t UnsendableBytes = 32uz * 1024uz * 1024uz;
 FastCache::DetachedTask ParkOnWrite(FastCache::ISocket* socket, std::span<std::byte const> buffer)
 {
     static_cast<void>(co_await socket->Write(buffer));
+}
+
+/// Read the control bytes the server sends, then stop reading.
+///
+/// The reads are what let the positive control complete; the SILENCE afterwards is what
+/// makes the next write park, which is the whole arrangement this canary needs.
+///
+/// A free function taking a POINTER rather than a capturing lambda, for the reason
+/// `BlockingSocket_test.cpp` states beside its own: a coroutine frame outlives the call
+/// expression that created it, so a lambda coroutine capturing by reference can resume
+/// after its closure object is gone. clang-tidy refuses it
+/// (`cppcoreguidelines-avoid-capturing-lambda-coroutines`) and is right to.
+///
+/// @param socket The connected client socket.
+/// @return The task, awaited synchronously on the client thread.
+FastCache::Task<void> DrainControlBytes(FastCache::ISocket* socket)
+{
+    std::array<std::byte, 16> scratch {};
+    std::size_t got = 0;
+    while (got < 16)
+    {
+        auto const read = co_await socket->Read(std::span<std::byte> { scratch });
+        if (!read.has_value() || *read == 0)
+            co_return;
+        got += *read;
+    }
 }
 
 /// Accept one connection, watch the guard ACCEPT, then arm a write over a parked one.
@@ -172,25 +198,14 @@ int main()
         if (!socket.has_value())
             return;
 
-        // Read exactly the control bytes, then stop. The reads are what let the
-        // positive control complete; the silence afterwards is what makes the next
-        // write park. A client that kept reading would drain 32 MiB and the canary
-        // would report "the double-arm was not refused" for a reason that is nothing
-        // to do with the guard.
-        // `SyncRun` takes a `Task`, not a bare `IoAwaitable`, so the read is wrapped in
-        // a lambda coroutine -- the idiom the rest of this tree uses for exactly this.
-        auto drainControl = [&socket]() -> FastCache::Task<void> {
-            std::array<std::byte, 16> scratch {};
-            std::size_t got = 0;
-            while (got < 16)
-            {
-                auto const read = co_await (*socket)->Read(std::span<std::byte> { scratch });
-                if (!read.has_value() || *read == 0)
-                    co_return;
-                got += *read;
-            }
-        };
-        FastCache::SyncRun(drainControl());
+        // Read exactly the control bytes, then stop. A client that kept reading would
+        // drain 32 MiB and the canary would report "the double-arm was not refused" for
+        // a reason that is nothing to do with the guard.
+        //
+        // `SyncRun` takes a `Task`, not a bare `IoAwaitable`, which is why the read goes
+        // through a coroutine at all -- `DrainControlBytes` above, a free function rather
+        // than a lambda because a coroutine must not capture by reference.
+        FastCache::SyncRun(DrainControlBytes(socket->get()));
 
         std::this_thread::sleep_for(std::chrono::seconds { 3 });
         (*socket)->Close();
