@@ -1671,19 +1671,33 @@ jobs:
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
       # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
-      # it `./bin/fastcached` dies at dynamic-link time before it binds anything. The
-      # two jobs that omitted it were not merely fragile -- they were GREEN, because
-      # sccache fell back to its own local disk cache and hit itself on the second
-      # compile, satisfying `Cache hits [1-9]` with no daemon in the picture at all
-      # (measured on #1315: `Cache location Local disk` on these two legs against
-      # `Cache location memcached` on the leg that installs this package). The
-      # bounded readiness wait is what surfaced it; #1318 is the vacuous assertion.
-      - name: "Install sccache + a C++ compiler + the libyaml-cpp runtime"
+      # it `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      - name: "Install a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
-          sudo apt-get install -y sccache g++-14 libyaml-cpp0.8
+          sudo apt-get install -y g++-14 libyaml-cpp0.8
+      # NOT apt's sccache. Measured (#1318): Ubuntu builds sccache with the backends
+      # OFF -- `sccache --help` reports `Memcached: false` on the very 0.7.7 whose
+      # OFFICIAL release binary reports `Memcached: true`. Same version, different
+      # build. So this leg ran for its whole life against sccache's own local disk
+      # cache, never reaching fastcached, and passed.
+      #
+      # Pinned to **0.7.7** rather than latest, and the pin is what this leg IS: the
+      # memcached wire dialect follows the sccache version -- 0.7.x speaks TEXT,
+      # >= 0.8 (OpenDAL >= 0.45) speaks BINARY -- so taking the default here would
+      # silently convert this into a second copy of the binary leg while keeping the
+      # name `memcached text`. That is the same false-coverage claim #1318 is about,
+      # re-established on purpose, which is why `--expect-flavor` below is asserted
+      # rather than trusted: the daemon reports the dialect it was actually spoken to.
+      - name: "Install sccache 0.7.7 (memcached TEXT dialect, backends compiled in)"
+        uses: mozilla-actions/sccache-action@v0.0.6
+        with:
+          version: "v0.7.7"
       - name: "Smoke"
-        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
+        run: >
+          bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached
+          --protocol memcached --port 11611 --compiler g++-14
+          --expect-flavor memcached-text
 
   sccache-smoke-memcached-binary:
     name: "sccache smoke (memcached binary)"
@@ -1705,9 +1719,11 @@ jobs:
         run: |
           bash scripts/ci-apt-update.sh
           sudo apt-get install -y g++-14 libyaml-cpp0.8
-      # mozilla-actions/sccache-action ships sccache >= 0.8, which uses
-      # OpenDAL >= 0.45 and speaks the memcached BINARY protocol; the apt
-      # sccache (0.7.7) on noble still speaks text.
+      # Unpinned, so the action's default (>= 0.8, OpenDAL >= 0.45) speaks the
+      # memcached BINARY dialect -- which is exactly what this leg is for, and is
+      # why its sibling one job up pins 0.7.7 for TEXT. The pair only means
+      # something while the two dialects differ, so both assert `--expect-flavor`
+      # rather than trusting the version: the daemon reports what it was spoken to.
       #
       # v0.0.6 while the Windows jobs are on v0.0.11, deliberately: this job uses
       # the action purely to put an sccache BINARY on PATH and then points it at a
@@ -1716,7 +1732,10 @@ jobs:
       - name: "Install sccache (binary protocol via OpenDAL >= 0.45)"
         uses: mozilla-actions/sccache-action@v0.0.6
       - name: "Smoke"
-        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol memcached --port 11611 --compiler g++-14
+        run: >
+          bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached
+          --protocol memcached --port 11611 --compiler g++-14
+          --expect-flavor memcached-binary
 
   sccache-smoke-redis:
     name: "sccache smoke (redis RESP2)"
@@ -1735,19 +1754,23 @@ jobs:
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
       # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
-      # it `./bin/fastcached` dies at dynamic-link time before it binds anything. The
-      # two jobs that omitted it were not merely fragile -- they were GREEN, because
-      # sccache fell back to its own local disk cache and hit itself on the second
-      # compile, satisfying `Cache hits [1-9]` with no daemon in the picture at all
-      # (measured on #1315: `Cache location Local disk` on these two legs against
-      # `Cache location memcached` on the leg that installs this package). The
-      # bounded readiness wait is what surfaced it; #1318 is the vacuous assertion.
-      - name: "Install sccache + a C++ compiler + the libyaml-cpp runtime"
+      # it `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      - name: "Install a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
-          sudo apt-get install -y sccache g++-14 libyaml-cpp0.8
+          sudo apt-get install -y g++-14 libyaml-cpp0.8
+      # NOT apt's sccache, for the reason recorded on the text leg: Ubuntu builds it
+      # with the backends OFF (`Redis: false`), so this job spent its whole life on
+      # sccache's local disk cache and never spoke RESP2 to anything. Unpinned --
+      # unlike memcached, redis has ONE dialect here, so no version carries meaning
+      # and the newest release is the right default.
+      - name: "Install sccache (backends compiled in, unlike the distro package)"
+        uses: mozilla-actions/sccache-action@v0.0.6
       - name: "Smoke"
-        run: bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached --protocol redis --port 11611 --compiler g++-14
+        run: >
+          bash scripts/sccache-smoke.sh --fastcached ./bin/fastcached
+          --protocol redis --port 11611 --compiler g++-14
+          --expect-flavor redis-resp
 
   # The fourth client: our own launcher over the compile-cache 0xFC protocol.
   # It runs the same harness the E2E jobs do rather than a cut-down copy of its
