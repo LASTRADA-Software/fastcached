@@ -232,7 +232,15 @@ struct DriverIdentityProbe
 ///   ---------------------------- --------- ---------- ----------
 ///   Windows 11 NTFS, clang++       34.2 ms    22.4 ms    11.8 ms   (34%)
 ///   Windows 11 NTFS, clang-cl      51.8 ms    40.1 ms    11.8 ms   (23%)
-///   WSL2 Ubuntu on DrvFs, clang++ 133.3 ms   112.5 ms    20.8 ms   (16%)
+///   WSL2 on DrvFs, clang++ [SLOW] 133.3 ms   112.5 ms    20.8 ms   (16%)
+///
+/// **The third row is a SLOW PATH and must not be differenced against the first
+/// two.** It is a Linux VM reaching a Windows filesystem over DrvFs, where every
+/// per-file operation costs an order of magnitude more than native
+/// (`.agent/rules/`'s DrvFs measurements say 11x-104x), so its absolute numbers
+/// describe that arrangement and nothing else. Read each row against ITSELF: the
+/// saving is one driver spawn on every row, and the rows differ in what a spawn
+/// costs there. Subtracting 22.4 from 112.5 measures the filesystem.
 ///
 /// The mechanism is confirmed by COUNT rather than inferred from the clock: a
 /// logging wrapper standing in for the driver recorded **4 compiler spawns before
