@@ -939,12 +939,26 @@ int DaemonBody(FastCache::Config const& effective,
                                                       : std::span<FastCache::BindConfig const> { legacyBind };
     auto const bindSummary = FastCache::FormatBindSummary(bannerBinds);
 
-    // `compression=` names what the STORE will do, not what was asked for. It read
-    // `effective.compression` until the worker was found doing the same thing: the
-    // disk default is `zstd`, a default is the one value `ParseCompressionCodec`
-    // never sees, and a build without the codec then stored plaintext under a
-    // banner saying `compression=zstd`.
+    // Both codec fields name what the STORE will do, not what was asked for.
+    // `compression=` read `effective.compression` until the worker was found doing
+    // the same thing: the disk default is `zstd`, a default is the one value
+    // `ParseCompressionCodec` never sees, and a build without the codec then stored
+    // plaintext under a banner saying `compression=zstd`.
+    //
+    // **Both halves, adjacent.** The daemon has had two codecs since
+    // `--memory-compression` landed and reported one of them, so the tier an
+    // operator is most likely to have turned on by hand was the one they could not
+    // see. Adjacent rather than scattered because the question is almost always
+    // which of the two is which.
+    //
+    // The disk field says `<no disk tier>` without `--storage`, in the banner's own
+    // vocabulary for an absent thing (`<none>`, `<in-memory>`) and deliberately not
+    // `none`, which is the name of a CODEC. A codec beside a tier this daemon does
+    // not run describes nothing -- the worker's line spells the same rule as `disk
+    // off` with no codec after it -- and this is the half that can be absent, since
+    // an L1 is built on every path.
     auto const diskCodec = FastCache::Compression::EffectiveCodec(effective.compression);
+    auto const memoryCodec = FastCache::Compression::EffectiveCodec(effective.memoryCompression);
 
     // And said out loud rather than left to be inferred from a field that now reads
     // `none`. The operator cannot reach this from their own configuration -- the
@@ -967,23 +981,25 @@ int DaemonBody(FastCache::Config const& effective,
     // non-empty) or the synthesised legacy single-bind. Either way, a TLS
     // banner field that reports "off" while a TLS listener is up is the
     // operator-misleading bug — fold `anyTlsBind` into the TLS field below.
-    logger.Logf(FastCache::LogLevel::Info,
-                "fastcached {} starting; bind={} max-memory={} config={} storage={} "
-                "durability={} compression={} max-value={} reactors={} shards={}{} auth={} tls={}",
-                ProgramVersion,
-                bindSummary,
-                FastCache::FormatByteSize(effective.maxMemoryBytes),
-                effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
-                effective.storagePath.empty() ? std::string_view { "<in-memory>" }
-                                              : std::string_view { effective.storagePath },
-                durabilityName,
-                FastCache::Compression::NameOf(diskCodec),
-                FastCache::FormatByteSize(effective.storageMaxValueBytes),
-                reactorCount,
-                physicalShards,
-                shardingMode,
-                authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
-                (effective.tlsEnabled || anyTlsBind) ? std::string_view { "on" } : std::string_view { "off" });
+    logger.Logf(
+        FastCache::LogLevel::Info,
+        "fastcached {} starting; bind={} max-memory={} config={} storage={} "
+        "durability={} compression={} memory-compression={} max-value={} reactors={} shards={}{} auth={} "
+        "tls={}",
+        ProgramVersion,
+        bindSummary,
+        FastCache::FormatByteSize(effective.maxMemoryBytes),
+        effective.configPath.empty() ? std::string_view { "<none>" } : std::string_view { effective.configPath },
+        effective.storagePath.empty() ? std::string_view { "<in-memory>" } : std::string_view { effective.storagePath },
+        durabilityName,
+        effective.storagePath.empty() ? std::string_view { "<no disk tier>" } : FastCache::Compression::NameOf(diskCodec),
+        FastCache::Compression::NameOf(memoryCodec),
+        FastCache::FormatByteSize(effective.storageMaxValueBytes),
+        reactorCount,
+        physicalShards,
+        shardingMode,
+        authSource.Current() ? std::string_view { "on" } : std::string_view { "off" },
+        (effective.tlsEnabled || anyTlsBind) ? std::string_view { "on" } : std::string_view { "off" });
 
     InstallStopHandlers();
     // The "ready, accepting connections" line is emitted by the server loop

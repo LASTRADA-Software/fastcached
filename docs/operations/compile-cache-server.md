@@ -86,8 +86,17 @@ decompress on every read.
 `lz4` and `zstd` are only present when the build was configured with
 `FASTCACHED_ENABLE_COMPRESSION`. A codec you *name* on a build without them is
 refused at startup; the disk half's `zstd` **default** is not, since nobody typed
-it — that tier stores plaintext instead, and the startup banner then reads
-`compression=none` rather than repeating the configuration back to you.
+it — that tier stores plaintext instead, and a warning says so.
+
+Both codecs are on the startup banner, and both name what the store will actually
+do rather than what was asked for:
+
+```console
+... storage=/var/lib/fastcached/store.cow durability=batched compression=zstd memory-compression=none max-value=256M ...
+```
+
+Without `--storage` there is no on-disk tier for a codec to describe, so that
+field reads `<no disk tier>` — distinct from `none`, which is the name of a codec.
 
 ## Prefetch groups
 
