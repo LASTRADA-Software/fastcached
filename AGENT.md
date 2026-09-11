@@ -1326,6 +1326,11 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - Each slice records its resume point in its own transaction, so an interrupted
   run is refused by name and finished by re-running it.
 - A tree walk is bounded by `PageCount()`, and must not overlap a commit.
+- A tier's `bytesUsed` is denominated differently per tier: memory counts STORED
+  (compressed) bytes, disk counts `originalLen`. So `--cache-memory` bounds resident
+  bytes and `--cache-disk` bounds logical ones, and a compression test asserted
+  through the DISK tier's `bytesUsed` compares a number with itself and cannot fail.
+  Measure the store FILE there.
 - The LRU mirror holds what this SESSION touched — `TouchOrInsert` is its only writer and
   no `Open` path calls it — so eviction reaches the COLD set first, and that is LRU rather
   than a workaround: an entry the mirror lacks has not been used since startup. Measured

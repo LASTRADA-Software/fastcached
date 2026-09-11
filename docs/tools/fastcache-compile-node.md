@@ -9,7 +9,7 @@ about one of them:
 
 | Role | What switches it on | Default |
 |---|---|---|
-| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory |
+| [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory, uncompressed |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler` | **off** |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft` | **off** — a lone node leads itself |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
@@ -623,6 +623,76 @@ Its reads and writes happen on the reactor thread the node's framed surfaces
 share, so a large store can briefly delay other connections on it
 ([#136](https://github.com/LASTRADA-Software/fastcached/issues/136)). Worth
 knowing before profiling a node that feels slow under load.
+
+### Compressing what each tier holds
+
+Both halves take a codec, spelled exactly as `fastcached` spells it, and the two are
+independent:
+
+| Flag | Applies to | Default |
+|---|---|---|
+| `--compression`, `--compression-level`, `--compression-min-bytes` | the `--cache-dir` half | `zstd`, level `3`, above `256` bytes |
+| `--memory-compression`, `--memory-compression-level`, `--memory-compression-min-bytes` | the `--cache-memory` half | **off**, level `3`, above `4096` bytes |
+
+The disk half has always compressed with zstd; these flags only give you the dial
+that was already turning. The memory half has never compressed, and still does not
+unless you say so — turning it on by default would change the CPU cost of every
+existing node on upgrade.
+
+**Naming a codec for the memory tier makes `--cache-memory` hold more, not less.**
+The in-memory budget counts the bytes a value actually occupies, so compressing them
+is what lets a given budget hold more entries — compile-cache objects with debug
+information compress well. What it costs is a decompress on every read, paid on the
+hit path. That trade is worth making when the working set is larger than the budget
+and not when it fits comfortably inside it.
+
+**The two budgets are denominated differently, and it is worth knowing which.**
+`--cache-memory` bounds *compressed* bytes — what the tier occupies in RAM.
+`--cache-disk` bounds *logical* bytes: the store accounts a value at its
+pre-compression size, so a compressed disk tier reaches its cap holding that much
+original data while occupying less than that on the filesystem. `--cache-disk=36g`
+with zstd is therefore 36 GB of objects, not 36 GB of file.
+
+Changing a codec needs no migration and no `--migrate-cache`: every record carries
+the codec it was written under, so reads keep decoding correctly and only later
+writes follow the new setting. A store written by a mixed sequence of settings is
+readable throughout.
+
+`none` is always available; `lz4` and `zstd` depend on
+`FASTCACHED_ENABLE_COMPRESSION`, and **which half of that rule you meet depends on
+whether you named the codec or inherited it.** A codec you *name* is refused by name
+at startup:
+
+```
+--memory-compression=zstd: codec 'zstd' is not available in this build
+(rebuild with FASTCACHED_ENABLE_COMPRESSION)
+```
+
+The disk half's **default** is `zstd`, and a default is typed by nobody and validated
+by nothing — so on a build without those codecs it is not refused. The tier falls
+back to storing plaintext, the startup line reports `none` rather than the `zstd` that
+was configured, and a warning says why. That is deliberate: refusing would stop a
+build that never asked for compression from running at all.
+
+A codec configured for a half this node does not build **is** refused, because a
+setting that reaches nothing looks from every surface exactly like one that works:
+`--memory-compression*` with `--cache-memory=0`, and `--compression*` with no
+`--cache-dir`, each name their remedy and stop the node. A default you did not type
+never triggers this.
+
+All six settings are read once at startup and are **not** reloadable: the tiers are
+built as the node starts and nothing can reach them afterwards, so a reload that
+appeared to change a codec would be a configuration claiming something about a live
+tier that is not true.
+
+Which codec each tier actually holds is on the startup line, because nothing else
+reports it — and it is the **effective** codec, not the configured one, so a build
+without the codec reads `none` here rather than claiming a compression it is not
+doing:
+
+```console
+local cache tier (memory 36G zstd, disk 36G zstd at /var/cache/fastcache-node, upstream none)
+```
 
 ### `--upstream` may be empty
 

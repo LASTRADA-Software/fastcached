@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/ByteSize.hpp>
 #include <FastCache/Config/CliParser.hpp>
+#include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/EnvExpand.hpp>
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
@@ -107,24 +108,24 @@ namespace
                                          line));
     }
 
-    [[nodiscard]] std::expected<CompressionCodec, ConfigError> ParseCompression(std::string_view sv,
-                                                                                std::filesystem::path const& path,
-                                                                                unsigned line)
+    /// Re-stamp a value parser's error as coming from this file, line and key.
+    ///
+    /// The shared parsers in `Config/CompressionValues.hpp` name no field and no
+    /// source, because neither is knowable from the value text. This is the file
+    /// reader's half of that contract -- and it names the KEY, where the private
+    /// copy this replaced hard-coded `compression` and so reported the wrong
+    /// setting for every `memory_compression` refusal.
+    /// @param err The parser's error.
+    /// @param path File the value came from.
+    /// @param field The key that carried it.
+    /// @param line 1-based line of that key.
+    /// @return The error, attributed.
+    [[nodiscard]] ConfigError AtFileKey(ConfigError err, std::filesystem::path const& path, std::string field, unsigned line)
     {
-        auto const codec = Compression::CodecFromName(sv);
-        if (!codec.has_value())
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                             path,
-                                             "compression",
-                                             std::string { "unknown codec (expect none|lz4|zstd): " } + std::string { sv },
-                                             line));
-        if (!Compression::IsAvailable(*codec))
-            return std::unexpected(MakeError(ConfigErrorCode::OutOfRange,
-                                             path,
-                                             "compression",
-                                             std::string { "codec not available in this build: " } + std::string { sv },
-                                             line));
-        return *codec;
+        err.source = path.string();
+        err.line = line;
+        err.field = std::move(field);
+        return err;
     }
 
     [[nodiscard]] std::expected<LogLevel, ConfigError> ParseLogLevel(std::string_view sv,
@@ -314,72 +315,54 @@ namespace
         /// `compression`: none | lz4 | zstd on-disk value codec.
         if (key == "compression")
         {
-            auto const c = ParseCompression(valueNode.as<std::string>(), path, line);
+            auto const c = ParseCompressionCodec(valueNode.as<std::string>());
             if (!c.has_value())
-                return std::expected<void, ConfigError> { std::unexpect, c.error() };
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(c.error(), path, key, line) };
             cfg.compression = *c;
             return std::expected<void, ConfigError> {};
         }
         /// `compression_level`: codec effort level (1..22).
         if (key == "compression_level")
         {
-            auto const raw = valueNode.as<int>();
-            if (raw < 1 || raw > 22)
-                return std::expected<void, ConfigError> {
-                    std::unexpect,
-                    MakeError(ConfigErrorCode::OutOfRange, path, "compression_level", "must be in 1..22", line)
-                };
-            cfg.compressionLevel = raw;
+            auto const level = ParseCompressionLevel(valueNode.as<std::string>());
+            if (!level.has_value())
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(level.error(), path, key, line) };
+            cfg.compressionLevel = *level;
             return std::expected<void, ConfigError> {};
         }
         /// `compression_min_bytes`: skip compression below this size.
         if (key == "compression_min_bytes")
         {
-            auto const raw = valueNode.as<std::string>();
-            auto parsed = ParseByteSize(raw, "compression_min_bytes");
+            auto const parsed = ParseCompressionMinBytes(valueNode.as<std::string>());
             if (!parsed.has_value())
-            {
-                auto err = std::move(parsed).error();
-                err.source = path.string();
-                err.line = line;
-                return std::expected<void, ConfigError> { std::unexpect, std::move(err) };
-            }
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(parsed.error(), path, key, line) };
             cfg.compressionMinBytes = *parsed;
             return std::expected<void, ConfigError> {};
         }
         /// `memory_compression`: none | lz4 | zstd codec for the IN-MEMORY tier.
         if (key == "memory_compression")
         {
-            auto const c = ParseCompression(valueNode.as<std::string>(), path, line);
+            auto const c = ParseCompressionCodec(valueNode.as<std::string>());
             if (!c.has_value())
-                return std::expected<void, ConfigError> { std::unexpect, c.error() };
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(c.error(), path, key, line) };
             cfg.memoryCompression = *c;
             return std::expected<void, ConfigError> {};
         }
         /// `memory_compression_level`: codec effort level (1..22).
         if (key == "memory_compression_level")
         {
-            auto const raw = valueNode.as<int>();
-            if (raw < 1 || raw > 22)
-                return std::expected<void, ConfigError> {
-                    std::unexpect,
-                    MakeError(ConfigErrorCode::OutOfRange, path, "memory_compression_level", "must be in 1..22", line)
-                };
-            cfg.memoryCompressionLevel = raw;
+            auto const level = ParseCompressionLevel(valueNode.as<std::string>());
+            if (!level.has_value())
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(level.error(), path, key, line) };
+            cfg.memoryCompressionLevel = *level;
             return std::expected<void, ConfigError> {};
         }
         /// `memory_compression_min_bytes`: keep values below this uncompressed.
         if (key == "memory_compression_min_bytes")
         {
-            auto const raw = valueNode.as<std::string>();
-            auto parsed = ParseByteSize(raw, "memory_compression_min_bytes");
+            auto const parsed = ParseCompressionMinBytes(valueNode.as<std::string>());
             if (!parsed.has_value())
-            {
-                auto err = std::move(parsed).error();
-                err.source = path.string();
-                err.line = line;
-                return std::expected<void, ConfigError> { std::unexpect, std::move(err) };
-            }
+                return std::expected<void, ConfigError> { std::unexpect, AtFileKey(parsed.error(), path, key, line) };
             cfg.memoryCompressionMinBytes = *parsed;
             return std::expected<void, ConfigError> {};
         }

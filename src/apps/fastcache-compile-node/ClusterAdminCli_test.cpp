@@ -17,9 +17,13 @@
 #include <vector>
 
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ErrorOf;
+using FastCache::Testing::PayloadOf;
+using FastCache::Testing::StatusOf;
 using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
@@ -78,22 +82,6 @@ struct Fixture
     }
 };
 
-/// The status byte of a reply, or nullopt when the reply is unreadable.
-[[nodiscard]] std::optional<Wire::Status> StatusOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    return header.has_value() ? std::optional { header->status } : std::nullopt;
-}
-
-/// The error code of a refusal, or nullopt when the reply is not one.
-[[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    if (!header.has_value() || header->status != Wire::Status::Error || header->payloadLength == 0)
-        return std::nullopt;
-    return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
-}
-
 /// The message of a refusal.
 [[nodiscard]] std::string MessageOf(std::span<std::byte const> reply)
 {
@@ -101,12 +89,6 @@ struct Fixture
     if (payload.empty())
         return {};
     return std::string { Wire::AsStringView(payload.subspan(1)) };
-}
-
-/// The payload of a reply, as bytes.
-[[nodiscard]] std::span<std::byte const> PayloadOf(std::span<std::byte const> reply)
-{
-    return reply.subspan(Wire::ReplyHeaderSize);
 }
 
 /// Parse a command line the way `main` does.

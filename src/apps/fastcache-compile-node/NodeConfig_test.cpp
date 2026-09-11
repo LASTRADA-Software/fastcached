@@ -4,6 +4,8 @@
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 
+#include <FastCache/Cache/CowTreeStorage.hpp>
+#include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -11,6 +13,7 @@
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -4741,4 +4744,205 @@ TEST_CASE("No node flag can override how long a compile may take", "[node][confi
         CHECK_FALSE(row.primary.contains("request-timeout"));
         CHECK_FALSE(row.primary.contains("job-timeout"));
     }
+}
+
+TEST_CASE("The compression settings parse, and each names its own flag", "[node][config][compression]")
+{
+    // `none` is the only codec guaranteed to exist: lz4 and zstd are behind
+    // FASTCACHED_ENABLE_COMPRESSION, so a build without them must still parse the
+    // flag rather than refuse a value the table documents.
+    auto const off = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression=none", "--compression=none" });
+    REQUIRE(off.has_value());
+    CHECK(off->memoryCompression == CompressionCodec::Identity);
+    CHECK(off->compression == CompressionCodec::Identity);
+
+    for (auto const codec: { CompressionCodec::Lz4, CompressionCodec::Zstd })
+    {
+        if (!Compression::IsAvailable(codec))
+            continue;
+        auto const named = std::format("--memory-compression={}", Compression::NameOf(codec));
+        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", named.c_str() });
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->memoryCompression == codec);
+    }
+
+    // The refusal names the flag that was typed. It matters that this is the
+    // MEMORY one: the parser is shared with `--compression`, and the daemon's
+    // private copy of it hard-coded `compression` as the field, which sent an
+    // operator to a flag they had not written.
+    auto const bad = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression=brotli" });
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().code == ConfigErrorCode::OutOfRange);
+    CHECK(bad.error().field == "--memory-compression");
+}
+
+TEST_CASE("A compression setting that reaches no tier refuses the node", "[node][config][compression]")
+{
+    // A flag that configures a half this node does not build is inert, and inert is
+    // invisible: the startup line drops the codec along with the half, so the one
+    // surface that reports a codec says nothing at all about the one that was typed.
+    // Same shape as `--dashboard-token-file` without `--dashboard`, and refused the
+    // same way.
+    auto startable = [] {
+        auto cfg = Installable();
+        cfg.cacheMemoryBytes = 8ULL * 1024 * 1024;
+        return cfg;
+    };
+
+    SECTION("the memory trio with --cache-memory=0")
+    {
+        // Each of the three separately, because a rule written as one `||` chain and
+        // a rule that reads only the codec are the same test otherwise -- and the
+        // level and min-bytes flags are the ones a value comparison could never see,
+        // their defaults being 3 and 4096 rather than anything falsy.
+        for (auto const& [name, bit]: std::vector<std::pair<std::string_view, bool NodeConfig::*>> {
+                 { "--memory-compression", &NodeConfig::memoryCompressionExplicit },
+                 { "--memory-compression-level", &NodeConfig::memoryCompressionLevelExplicit },
+                 { "--memory-compression-min-bytes", &NodeConfig::memoryCompressionMinBytesExplicit } })
+        {
+            INFO("flag: " << name);
+            auto cfg = startable();
+            cfg.cacheMemoryBytes = 0;
+            cfg.*bit = true;
+
+            auto const refusal = StartupPolicyRejection(cfg);
+            REQUIRE(refusal.has_value());
+            CHECK(Unwrap(refusal).contains("--cache-memory"));
+        }
+    }
+
+    SECTION("the disk trio with no --cache-dir")
+    {
+        for (auto const& [name, bit]: std::vector<std::pair<std::string_view, bool NodeConfig::*>> {
+                 { "--compression", &NodeConfig::compressionExplicit },
+                 { "--compression-level", &NodeConfig::compressionLevelExplicit },
+                 { "--compression-min-bytes", &NodeConfig::compressionMinBytesExplicit } })
+        {
+            INFO("flag: " << name);
+            auto cfg = startable();
+            cfg.cacheDir.clear();
+            cfg.*bit = true;
+
+            auto const refusal = StartupPolicyRejection(cfg);
+            REQUIRE(refusal.has_value());
+            CHECK(Unwrap(refusal).contains("--cache-dir"));
+        }
+    }
+
+    SECTION("the same flags with the half they configure ARE accepted")
+    {
+        // The control. Without it "a named codec with no tier is refused" and "a
+        // named codec is refused" are one passing test, and the second would refuse
+        // every node that compresses anything.
+        Testing::ScratchDirectory const scratch { "node-compression-reaches-a-tier" };
+
+        auto cfg = startable();
+        cfg.cacheDir = scratch.Path();
+        cfg.memoryCompressionExplicit = true;
+        cfg.memoryCompressionLevelExplicit = true;
+        cfg.memoryCompressionMinBytesExplicit = true;
+        cfg.compressionExplicit = true;
+        cfg.compressionLevelExplicit = true;
+        cfg.compressionMinBytesExplicit = true;
+
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a DEFAULT nobody typed starts a node that asked for nothing")
+    {
+        // The other control, and the one the rule would be wrong without: all six
+        // settings carry a default, the disk codec's being `zstd`, so a rule asking
+        // what the VALUE is rather than whether an operator NAMED it would refuse the
+        // ordinary memory-only worker at every boot.
+        auto cfg = startable();
+        cfg.cacheDir.clear();
+        REQUIRE(cfg.compression == CompressionCodec::Zstd);
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        auto memoryOff = startable();
+        memoryOff.cacheMemoryBytes = 0;
+        memoryOff.cacheDir.clear();
+        CHECK_FALSE(StartupPolicyRejection(memoryOff).has_value());
+    }
+}
+
+TEST_CASE("The compression level is range-checked at both ends", "[node][config][compression]")
+{
+    for (auto const* good: { "--compression-level=1", "--compression-level=22" })
+    {
+        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", good });
+        INFO("flag: " << good);
+        REQUIRE(parsed.has_value());
+    }
+    // Both ends, because a guard written as `> 22` alone accepts 0 and a guard
+    // written as `== 0` alone accepts 23.
+    for (auto const* bad: { "--compression-level=0", "--compression-level=23", "--memory-compression-level=0" })
+    {
+        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", bad });
+        INFO("flag: " << bad);
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().code == ConfigErrorCode::OutOfRange);
+    }
+    auto const level = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-level=9" });
+    REQUIRE(level.has_value());
+    CHECK(level->memoryCompressionLevel == 9);
+}
+
+TEST_CASE("The compression floors take byte suffixes", "[node][config][compression]")
+{
+    auto const parsed =
+        ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-min-bytes=8k", "--compression-min-bytes=512" });
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->memoryCompressionMinBytes == 8192);
+    CHECK(parsed->compressionMinBytes == 512);
+
+    // A disk budget as a fraction of RAM is meaningless, and so is a compression
+    // floor: no host total is passed to the parser, so `%` is refused rather than
+    // silently resolved against this machine.
+    auto const percent = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-min-bytes=10%" });
+    CHECK_FALSE(percent.has_value());
+}
+
+TEST_CASE("The compression defaults leave every existing node unchanged", "[node][config][compression]")
+{
+    // The whole safety argument for this feature in one case. The disk tier has
+    // always compressed with zstd level 3 above 256 bytes, and the memory tier has
+    // never compressed at all -- so these are the values that make an upgrade a
+    // no-op for somebody who names none of the six flags.
+    NodeConfig const defaults;
+    CHECK(defaults.compression == CompressionCodec::Zstd);
+    CHECK(defaults.compressionLevel == 3);
+    CHECK(defaults.compressionMinBytes == 256);
+    CHECK(defaults.memoryCompression == CompressionCodec::Identity);
+    CHECK(defaults.memoryCompressionLevel == 3);
+    CHECK(defaults.memoryCompressionMinBytes == 4096);
+
+    // And they match what the storage layer would have used on its own, which is
+    // the property that actually holds the claim up: a default stated here that
+    // disagreed with `CowTreeStorage::Options` would change behaviour silently.
+    CowTreeStorage::Options const storeDefaults;
+    CHECK(defaults.compression == storeDefaults.compression);
+    CHECK(defaults.compressionLevel == storeDefaults.compressionLevel);
+    CHECK(defaults.compressionMinBytes == storeDefaults.compressionMinBytes);
+
+    InMemoryLruStorage::CompressionOptions const memoryDefaults;
+    CHECK(defaults.memoryCompression == memoryDefaults.codec);
+    CHECK(defaults.memoryCompressionLevel == memoryDefaults.level);
+    CHECK(defaults.memoryCompressionMinBytes == memoryDefaults.minBytes);
+}
+
+TEST_CASE("A registration carries the codec by name, not by number", "[node][config][compression][service]")
+{
+    // `emitIfExplicit` formats its value, and a CompressionCodec is a byte-wide
+    // enum -- so a registration built without `NameOf` would bake in `--memory-
+    // compression=2`, which the next start refuses. A service that installs and
+    // then fails at every boot, with nobody watching.
+    if (!Compression::IsAvailable(CompressionCodec::Zstd))
+        SKIP("this build has no zstd, so there is no non-default codec to pin");
+
+    auto parsed = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/g++", "--memory-compression=zstd" });
+    REQUIRE(parsed.has_value());
+
+    auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", *parsed);
+    CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return arg == "--memory-compression=zstd"; }));
 }

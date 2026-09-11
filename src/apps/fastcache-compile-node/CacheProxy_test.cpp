@@ -25,9 +25,13 @@
 
 #include <tests/ForeignGenerationValue.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::ErrorOf;
+using FastCache::Testing::PayloadOf;
+using FastCache::Testing::StatusOf;
 using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
@@ -56,24 +60,6 @@ struct Fixture
     CacheProxy proxy { cache, metrics };
 };
 
-[[nodiscard]] std::optional<Wire::Status> StatusOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    return header.has_value() ? std::optional { header->status } : std::nullopt;
-}
-
-[[nodiscard]] std::span<std::byte const> PayloadOf(std::span<std::byte const> reply)
-{
-    return reply.subspan(Wire::ReplyHeaderSize);
-}
-
-[[nodiscard]] std::optional<Wire::ErrorCode> ErrorOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    if (!header.has_value() || header->status != Wire::Status::Error || header->payloadLength == 0)
-        return std::nullopt;
-    return static_cast<Wire::ErrorCode>(reply[Wire::ReplyHeaderSize]);
-}
 } // namespace
 
 TEST_CASE("A node stores and serves an object over the cache wire", "[node][cacheproxy]")

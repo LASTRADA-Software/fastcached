@@ -300,6 +300,36 @@
 # it refuses to start.
 #cache_dir:
 
+# on-disk value codec for cache_dir: none, lz4 or zstd (default zstd). Reads
+# always return plaintext and each record carries its own codec tag, so this
+# can be changed between runs with no migration -- only later writes follow
+# the new setting.
+#compression:
+
+# codec effort level for compression (1..22; default 3, zstd).
+#compression_level:
+
+# skip on-disk compression for values smaller than this; k/m/g accepted
+# (default 256). Below it the CPU rarely pays for itself and a codec can make
+# a small record larger.
+#compression_min_bytes:
+
+# in-memory value codec for cache_memory: none, lz4 or zstd. Default none,
+# which keeps reads allocation-free. Independent of compression, which is the
+# on-disk one. The memory budget counts COMPRESSED bytes, so a codec makes
+# cache_memory hold materially more -- compile-cache objects with debug info
+# compress well -- at the cost of a decompress on every read.
+#memory_compression:
+
+# codec effort level for memory_compression (1..22; default 3, zstd).
+#memory_compression_level:
+
+# keep in-memory values smaller than this uncompressed; k/m/g accepted
+# (default 4096). Higher than the on-disk floor on purpose: an in-memory read
+# pays the decompress on every hit, where a disk read has already paid for the
+# I/O it saves.
+#memory_compression_min_bytes:
+
 # this node's 0xFC port, and its only one: the cache verbs, the compile
 # verbs a scheduler dispatches here, and the scheduler verbs themselves with
 # --serve-scheduler (default port 6674, where fastcache-cc already looks;

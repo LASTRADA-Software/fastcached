@@ -2,12 +2,15 @@
 #include "CacheTier.hpp"
 #include "NodeIoLoop.hpp"
 
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,20 +18,28 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::StatusOf;
 using FastCache::Testing::Unwrap;
+
+namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
@@ -115,6 +126,14 @@ template <typename Table>
 [[nodiscard]] auto const& At(Table const& tiers, StorageTier tier)
 {
     return tiers[static_cast<std::size_t>(tier)];
+}
+
+/// A payload that compresses hugely, so a codec effect cannot be mistaken for noise.
+/// @param bytes How long.
+/// @return That many identical bytes.
+[[nodiscard]] std::vector<std::byte> Compressible(std::size_t bytes)
+{
+    return std::vector<std::byte>(bytes, std::byte { 0x41 });
 }
 
 } // namespace
@@ -330,4 +349,264 @@ TEST_CASE("A tier says whether it has a shared cache behind it", "[node][cache-t
         REQUIRE(tier != nullptr);
         CHECK(tier->HasUpstream());
     }
+}
+
+// --- compression --------------------------------------------------------------
+//
+// These cases exist because a compression setting that reaches no tier is INERT and
+// indistinguishable, from every other surface, from one that works: the object still
+// stores, still reads back byte-for-byte, and every counter moves exactly as before.
+// So what is asserted is the DIFFERENCE between a tier told to compress and one told
+// not to -- never the round trip alone, which passes under the bug.
+
+TEST_CASE("MemoryCompressionOf carries what the node was told", "[node][cache-tier][compression]")
+{
+    NodeConfig cfg;
+    cfg.memoryCompression = CompressionCodec::Zstd;
+    cfg.memoryCompressionLevel = 9;
+    cfg.memoryCompressionMinBytes = 1234;
+
+    auto const options = MemoryCompressionOf(cfg);
+    CHECK(options.level == 9);
+    CHECK(options.minBytes == 1234);
+
+    // The codec is the EFFECTIVE one, so this is not `== Zstd`: on a build without
+    // `FASTCACHED_ENABLE_COMPRESSION` the tier stores plaintext and an assertion
+    // naming the configured value would fail there for being right. The level and
+    // the floor above are carried verbatim, which is why they are spelled as
+    // literals and this is not.
+    CHECK(options.codec == Compression::EffectiveCodec(CompressionCodec::Zstd));
+    CHECK(options.codec
+          == (Compression::IsAvailable(CompressionCodec::Zstd) ? CompressionCodec::Zstd : CompressionCodec::Identity));
+
+    // The default is OFF, stated here rather than assumed: turning it on by default
+    // would change the CPU cost of every existing deployment on upgrade.
+    CHECK(MemoryCompressionOf(NodeConfig {}).codec == CompressionCodec::Identity);
+}
+
+TEST_CASE("The memory tier compresses only when a codec is named", "[node][cache-tier][compression]")
+{
+    if (!Compression::IsAvailable(CompressionCodec::Zstd))
+        SKIP("this build has no zstd, so there is no codec to tell apart from none");
+
+    constexpr std::size_t PayloadBytes = 64 * 1024;
+    auto const payload = Compressible(PayloadBytes);
+
+    // One tier per codec, each storing the same object, each asked what it now holds.
+    auto residentBytes = [&payload](CompressionCodec codec) {
+        Fixture fixture;
+        auto cfg = Fixture::BaseConfig();
+        cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+        cfg.memoryCompression = codec;
+        cfg.memoryCompressionMinBytes = 1024;
+
+        auto started = fixture.Start(cfg);
+        REQUIRE(started.has_value());
+        auto const tier = std::move(*started);
+        REQUIRE(tier != nullptr);
+
+        auto const stored = SyncRun(tier->Responder().Answer(
+            Wire::EncodeStore(Wire::StoreRequest {
+                .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
+            "127.0.0.1"));
+        REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+        // And it must still be READABLE: a tier that compressed and could not decode
+        // would shrink exactly as convincingly.
+        auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1"));
+        REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+
+        auto const tiers = tier->SnapshotTiers();
+        REQUIRE(At(tiers, StorageTier::Memory).has_value());
+        return Unwrap(At(tiers, StorageTier::Memory)).bytesUsed;
+    };
+
+    auto const plain = residentBytes(CompressionCodec::Identity);
+    auto const packed = residentBytes(CompressionCodec::Zstd);
+
+    // The budget counts STORED bytes, which is the whole point: an uncompressed tier
+    // is charged the object, a compressed one a fraction of it. A ratio rather than a
+    // constant, because how well zstd does on this payload is for zstd to decide.
+    CHECK(plain >= PayloadBytes);
+    CHECK(packed < plain / 2);
+}
+
+TEST_CASE("The disk tier compresses with the codec the node names", "[node][cache-tier][compression]")
+{
+    if (!Compression::IsAvailable(CompressionCodec::Zstd))
+        SKIP("this build has no zstd, so there is no codec to tell apart from none");
+
+    constexpr std::size_t PayloadBytes = 256 * 1024;
+    auto const payload = Compressible(PayloadBytes);
+
+    // Measured on the STORE FILE, not on `bytesUsed`.
+    //
+    // The two tiers denominate their budgets differently, and it is easy to assert
+    // the wrong one: `InMemoryLruStorage` charges STORED bytes, so compression shows
+    // up there, while `CowTreeStorage` charges `originalLen` -- the pre-compression
+    // size, at `_storeBytes += originalLen` in `StoreEntry` -- so a compressed disk
+    // tier reports exactly the same `bytesUsed` as an uncompressed one. Asserting on
+    // it here would have compared 65536 with 65536 and read as "the codec did
+    // nothing", which is a true observation carrying a false claim.
+    //
+    // It also means `--cache-disk` bounds LOGICAL bytes: a compressed disk tier holds
+    // its cap in pre-compression terms and occupies less than that on the filesystem.
+    auto fileBytes = [&payload](CompressionCodec codec, std::string_view scratchName) {
+        Testing::ScratchDirectory const scratch { scratchName };
+        auto const store = scratch.Path() / DiskStoreFileName;
+        {
+            Fixture fixture;
+            auto cfg = Fixture::BaseConfig();
+            // No memory tier, so nothing mirrors the value into an L1 instead.
+            cfg.cacheMemoryBytes = 0;
+            cfg.cacheDir = scratch.Path();
+            cfg.compression = codec;
+            cfg.compressionMinBytes = 1024;
+
+            auto started = fixture.Start(cfg);
+            REQUIRE(started.has_value());
+            auto const tier = std::move(*started);
+            REQUIRE(tier != nullptr);
+
+            auto const stored = SyncRun(tier->Responder().Answer(
+                Wire::EncodeStore(Wire::StoreRequest {
+                    .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
+                "127.0.0.1"));
+            REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+            // Still readable: a tier that compressed and could not decode would
+            // shrink the file exactly as convincingly.
+            auto const fetched = SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), "127.0.0.1"));
+            REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+
+            // The budget is denominated in logical bytes whatever the codec, which is
+            // the other half of the note above and is worth pinning: if this ever
+            // starts tracking the compressed size, the assertion below is measuring
+            // something else.
+            auto const tiers = tier->SnapshotTiers();
+            REQUIRE(At(tiers, StorageTier::Disk).has_value());
+            CHECK(Unwrap(At(tiers, StorageTier::Disk)).bytesUsed >= PayloadBytes);
+        }
+        // Sized after the tier is closed, so the last commit has certainly landed.
+        std::error_code error;
+        auto const size = std::filesystem::file_size(store, error);
+        REQUIRE_FALSE(error);
+        return static_cast<std::size_t>(size);
+    };
+
+    auto const plain = fileBytes(CompressionCodec::Identity, "node-disk-codec-none");
+    auto const packed = fileBytes(CompressionCodec::Zstd, "node-disk-codec-zstd");
+
+    // A ratio rather than a constant: how well zstd does on this payload is for zstd
+    // to decide, and the file carries pages of tree overhead either way.
+    CHECK(plain >= PayloadBytes);
+    CHECK(packed < plain / 2);
+}
+
+TEST_CASE("The startup line names a present tier's codec and an absent tier's nothing", "[node][cache-tier][compression]")
+{
+    // Nothing else reports it -- no metric, no fleet.json field -- so without this an
+    // operator cannot tell a compressed tier from an uncompressed one.
+    //
+    // Both halves present, so BOTH `NameOf` calls run. The first version of this case
+    // left the disk half off and pinned the memory codec to its default, so it
+    // asserted `memory 8M none` and `disk off` -- text a build with the codec dropped
+    // from either arm produces just as happily. Assert what tells the two apart.
+    Testing::ScratchDirectory const scratch { "node-startup-line-codecs" };
+
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+    cfg.cacheDir = scratch.Path();
+    cfg.cacheDiskBytes = 16 * 1024 * 1024;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    // The disk arm renders a codec beside its size and path. Deleting
+    // `Compression::NameOf` from that arm leaves `16M at <path>`, which this refuses.
+    CHECK(Logged(fixture.logger,
+                 std::format("disk 16M {} at {}",
+                             Compression::NameOf(Compression::EffectiveCodec(cfg.compression)),
+                             scratch.Path().string())));
+    CHECK(Logged(fixture.logger, "memory 8M none"));
+}
+
+TEST_CASE("The startup line names each half's OWN codec", "[node][cache-tier][compression]")
+{
+    // Two different codecs, so a literal, a swap and a dropped call each fail. One
+    // codec in both halves passes under a line that reads either half twice, which is
+    // exactly the mistake a format string with two identical-looking arms invites.
+    if (!Compression::IsAvailable(CompressionCodec::Zstd) || !Compression::IsAvailable(CompressionCodec::Lz4))
+        SKIP("this build has no lz4/zstd, so the two halves cannot be given different codecs");
+
+    Testing::ScratchDirectory const scratch { "node-startup-line-two-codecs" };
+
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+    cfg.memoryCompression = CompressionCodec::Zstd;
+    cfg.cacheDir = scratch.Path();
+    cfg.cacheDiskBytes = 16 * 1024 * 1024;
+    cfg.compression = CompressionCodec::Lz4;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, "memory 8M zstd"));
+    CHECK(Logged(fixture.logger, "disk 16M lz4 at"));
+
+    // And neither half wandered into the other's. `contains` is a substring test, so
+    // the two checks above both pass on a line naming one codec twice.
+    CHECK_FALSE(Logged(fixture.logger, "memory 8M lz4"));
+    CHECK_FALSE(Logged(fixture.logger, "disk 16M zstd"));
+}
+
+TEST_CASE("An absent tier is named without a codec", "[node][cache-tier][compression]")
+{
+    // "off zstd" would describe a tier this node does not run. Its own case rather
+    // than an assertion tacked onto a present-tier one, because it is the only thing
+    // here that a build with no codecs at all can still tell apart.
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, "disk off,"));
+    CHECK_FALSE(Logged(fixture.logger, "disk off none"));
+}
+
+TEST_CASE("The startup line reports the codec the tier was BUILT with", "[node][cache-tier][compression]")
+{
+    // The report and the store read one function, so they cannot disagree about a
+    // build. That is the property; what makes it worth a case is that the failure it
+    // prevents is invisible everywhere else -- on a build without
+    // `FASTCACHED_ENABLE_COMPRESSION` the tier stores plaintext and a report taken
+    // from the configuration says `zstd`, with every counter normal and every object
+    // correct.
+    //
+    // Asserted against `MemoryCompressionOf`, which is what `BuildStorage` hands the
+    // tier. A literal here would be this case authoring a second answer, which is the
+    // defect rather than the test for it.
+    Fixture fixture;
+    auto cfg = Fixture::BaseConfig();
+    cfg.cacheMemoryBytes = 8 * 1024 * 1024;
+    cfg.memoryCompression = CompressionCodec::Zstd;
+
+    auto started = fixture.Start(cfg);
+    REQUIRE(started.has_value());
+    REQUIRE(*started != nullptr);
+
+    CHECK(Logged(fixture.logger, std::format("memory 8M {}", Compression::NameOf(MemoryCompressionOf(cfg).codec))));
+
+    // And on a build that HAS zstd the effective codec is zstd, so the line above is
+    // not quietly asserting `none` against `none`. On a build without it, both sides
+    // read `none` and the case still says something true.
+    CHECK(MemoryCompressionOf(cfg).codec
+          == (Compression::IsAvailable(CompressionCodec::Zstd) ? CompressionCodec::Zstd : CompressionCodec::Identity));
 }

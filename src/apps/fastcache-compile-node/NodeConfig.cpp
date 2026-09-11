@@ -7,6 +7,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Config/ByteSize.hpp>
+#include <FastCache/Config/CompressionValues.hpp>
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/FileOptions.hpp>
 #include <FastCache/Config/SecretProvenance.hpp>
@@ -1094,6 +1095,97 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "cache_dir",
             .same = FieldEq<&NodeConfig::cacheDir>(),
         },
+        // The six compression settings, in the daemon's spelling and with the daemon's
+        // defaults. One concept, one name across both binaries: an operator moving
+        // between a `fastcached` and a worker types the same flag, and the shipped
+        // reference blocks read the same in both files.
+        //
+        // All six are `Reloadable::No`, and DELIBERATELY rather than by inheritance
+        // (#756 asked for the distinction to be stated where the next reader finds it).
+        // The reason is reach, not safety: a value is decodable whatever the setting
+        // later becomes, because every entry is stamped with the codec it was written
+        // under -- but `SetCompression` is an unsynchronised member write, the L1
+        // instances are built inside `ShardedStorage`/`LayeredStorage` with no handle
+        // that outlives `BuildStorage`, and the disk codec is fixed at
+        // `CowTreeStorage::Open`. Publishing a new value that reached no tier would be
+        // a configuration claiming something about a live object that is not true.
+        {
+            .primary = "--compression",
+            .arity = Arity::Value,
+            .operand = "=<codec>",
+            .apply = AssignFrom<&NodeConfig::compression, ParseCompressionCodec>(),
+            .explicitBit = &NodeConfig::compressionExplicit,
+            .description = "on-disk value codec for --cache-dir:\n"
+                           "none|lz4|zstd (default zstd). Reads always return\n"
+                           "plaintext and each record decodes by its own tag,\n"
+                           "so changing this needs no migration.",
+            .yamlKey = "compression",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compression>(),
+        },
+        {
+            .primary = "--compression-level",
+            .arity = Arity::Value,
+            .operand = "=<N>",
+            .apply = AssignFrom<&NodeConfig::compressionLevel, ParseCompressionLevel>(),
+            .explicitBit = &NodeConfig::compressionLevelExplicit,
+            .description = "codec effort level for --compression\n"
+                           "(1..22; default 3, zstd).",
+            .yamlKey = "compression_level",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compressionLevel>(),
+        },
+        {
+            .primary = "--compression-min-bytes",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::compressionMinBytes, ParseCompressionMinBytes>(),
+            .explicitBit = &NodeConfig::compressionMinBytesExplicit,
+            .description = "skip on-disk compression for values smaller than\n"
+                           "this; k/m/g accepted (default 256).",
+            .yamlKey = "compression_min_bytes",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::compressionMinBytes>(),
+        },
+        {
+            .primary = "--memory-compression",
+            .arity = Arity::Value,
+            .operand = "=<codec>",
+            .apply = AssignFrom<&NodeConfig::memoryCompression, ParseCompressionCodec>(),
+            .explicitBit = &NodeConfig::memoryCompressionExplicit,
+            .description = "in-memory value codec for --cache-memory:\n"
+                           "none|lz4|zstd (default none). Independent of\n"
+                           "--compression, which is the on-disk one. The budget\n"
+                           "counts COMPRESSED bytes, so a codec makes the tier\n"
+                           "hold more, at a decompress on every read.",
+            .yamlKey = "memory_compression",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompression>(),
+        },
+        {
+            .primary = "--memory-compression-level",
+            .arity = Arity::Value,
+            .operand = "=<N>",
+            .apply = AssignFrom<&NodeConfig::memoryCompressionLevel, ParseCompressionLevel>(),
+            .explicitBit = &NodeConfig::memoryCompressionLevelExplicit,
+            .description = "codec effort level for --memory-compression\n"
+                           "(1..22; default 3, zstd).",
+            .yamlKey = "memory_compression_level",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompressionLevel>(),
+        },
+        {
+            .primary = "--memory-compression-min-bytes",
+            .arity = Arity::Value,
+            .operand = "=<size>",
+            .apply = AssignFrom<&NodeConfig::memoryCompressionMinBytes, ParseCompressionMinBytes>(),
+            .explicitBit = &NodeConfig::memoryCompressionMinBytesExplicit,
+            .description = "keep in-memory values smaller than this\n"
+                           "uncompressed; k/m/g accepted (default 4096).",
+            .yamlKey = "memory_compression_min_bytes",
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::memoryCompressionMinBytes>(),
+        },
         {
             .primary = "--listen-node",
             .arity = Arity::Value,
@@ -1809,6 +1901,15 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
         argv.emplace_back("--serve-scheduler");
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
+    // Codecs by NAME: `emitIfExplicit` formats its value, and a `CompressionCodec`
+    // is a byte-wide enum, so the registration would otherwise bake in `2` -- which
+    // the next start's own parser refuses.
+    emitIfExplicit("compression", Compression::NameOf(cfg.compression), cfg.compressionExplicit);
+    emitIfExplicit("compression-level", cfg.compressionLevel, cfg.compressionLevelExplicit);
+    emitIfExplicit("compression-min-bytes", cfg.compressionMinBytes, cfg.compressionMinBytesExplicit);
+    emitIfExplicit("memory-compression", Compression::NameOf(cfg.memoryCompression), cfg.memoryCompressionExplicit);
+    emitIfExplicit("memory-compression-level", cfg.memoryCompressionLevel, cfg.memoryCompressionLevelExplicit);
+    emitIfExplicit("memory-compression-min-bytes", cfg.memoryCompressionMinBytes, cfg.memoryCompressionMinBytesExplicit);
     emitIfExplicit("listen-node", cfg.nodeListen, cfg.nodeListenExplicit);
     // **The one flag emitted on VALUE rather than on provenance, and NOT through a
     // general-purpose emitter.** The provenance rule is not being broken here so much
@@ -2380,6 +2481,45 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return cfg.fleetOpen || !cfg.fleetMembers.empty();
 }
 
+/// Whether a compression setting was NAMED for a tier half this node will not build.
+///
+/// Two of them, one per half, because the remedies differ: a memory codec is turned
+/// back on with `--cache-memory` and a disk one with `--cache-dir`, so a single
+/// predicate would give half its readers the wrong flag.
+///
+/// **Asked of the EXPLICIT bit, never of the value.** All six settings carry a
+/// default and two of them default to something non-zero (`3`, `4096`), so "differs
+/// from the default" cannot be the test and "is not `none`" would not see the level
+/// flag at all -- which is `platform-service-and-config.md`'s provenance rule: only
+/// the parse knows whether an operator typed a setting, and a default nobody typed
+/// has to go on starting a node that asked for nothing.
+///
+/// **Named functions rather than expressions in the rows**, and that is measured
+/// rather than stylistic: spelled inline, the two `||` chains took
+/// `StartupPolicyRejection` to a cognitive complexity of 62 against clang-tidy's
+/// threshold of 60, which with `WarningsAsErrors` is a failed build rather than a
+/// review note.
+/// @param cfg The parsed configuration.
+/// @return Whether the in-memory trio was named with no in-memory tier to configure.
+[[nodiscard]] bool NamesMemoryCompressionWithoutATier(NodeConfig const& cfg)
+{
+    auto const named =
+        cfg.memoryCompressionExplicit || cfg.memoryCompressionLevelExplicit || cfg.memoryCompressionMinBytesExplicit;
+    return named && cfg.cacheMemoryBytes == 0;
+}
+
+/// Whether the on-disk trio was named with no on-disk tier to configure.
+///
+/// The disk half's mirror; see `NamesMemoryCompressionWithoutATier` for why the bit
+/// rather than the value, and why these are two predicates.
+/// @param cfg The parsed configuration.
+/// @return Whether the on-disk trio was named with no `--cache-dir`.
+[[nodiscard]] bool NamesDiskCompressionWithoutATier(NodeConfig const& cfg)
+{
+    auto const named = cfg.compressionExplicit || cfg.compressionLevelExplicit || cfg.compressionMinBytesExplicit;
+    return named && cfg.cacheDir.empty();
+}
+
 /// Whether this node registers with a scheduler that cannot be on this machine.
 ///
 /// Syntactic, never resolved, for the reason `AdvertisesPastALoopbackBind` gives: this
@@ -2824,6 +2964,24 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--cache-memory or --cache-dir was given with an empty --listen-node: the cache tier is "
                      "served on the node surface, so with no port there is nothing to reach it through and the "
                      "cache would be configured and unused. Give --listen-node a port, or drop the cache flags." },
+        // A codec trio that reaches no tier. Same shape as the row above and as
+        // `--dashboard-token-file` without `--dashboard`: a setting that configures a
+        // half this node does not build is inert, and inert is invisible -- the
+        // startup line drops the codec along with the half, so the ONE surface that
+        // reports a codec says nothing about the one that was typed.
+        //
+        // Two rows rather than one, and named predicates rather than expressions; both
+        // reasons are on `NamesMemoryCompressionWithoutATier`.
+        { .refuses = [](NodeConfig const& c) { return NamesMemoryCompressionWithoutATier(c); },
+          .message = "--memory-compression, --memory-compression-level or --memory-compression-min-bytes was given "
+                     "with --cache-memory=0: there is no in-memory tier for it to configure, so the setting would "
+                     "be accepted and reach nothing. Give --cache-memory a budget, or drop the memory-compression "
+                     "flags." },
+        { .refuses = [](NodeConfig const& c) { return NamesDiskCompressionWithoutATier(c); },
+          .message = "--compression, --compression-level or --compression-min-bytes was given with no --cache-dir: "
+                     "those configure the ON-DISK half, which is off without a path, so the setting would be "
+                     "accepted and reach nothing. Name a --cache-dir, or use the --memory-compression flags, which "
+                     "are the in-memory half's." },
         // Not on a CLUSTERED node, where the premise is false: consensus supplies the
         // member set, so an empty `--fleet-member` there is a working configuration
         // rather than one that declines everybody (#262).
