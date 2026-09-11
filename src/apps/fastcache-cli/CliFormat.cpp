@@ -2,6 +2,7 @@
 #include "CliFormat.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <format>
 #include <ranges>
@@ -428,12 +429,48 @@ namespace
         return out;
     }
 
-    /// The identity "quoter", for TSV.
-    /// @param field The field.
-    /// @return @p field unchanged.
-    [[nodiscard]] std::string TsvField(std::string_view field)
+    /// One character TSV cannot carry raw, and what it is written as.
+    struct TextEscape
     {
-        return std::string { field };
+        char byte;
+        std::string_view replacement;
+    };
+
+    /// The four `/fleet.txt` spells out, in one pass so the escape character cannot be
+    /// escaped twice.
+    ///
+    /// A table rather than a `switch` for the usual reason, and one that bites here: the
+    /// fifth character this format cannot carry is a row, not a new arm -- and a table is
+    /// also what lets the set be compared against `/fleet.txt`'s by reading rather than
+    /// by tracing control flow.
+    constexpr auto TsvEscapes = std::to_array<TextEscape>({
+        { .byte = '\\', .replacement = "\\\\" },
+        { .byte = '\t', .replacement = "\\t" },
+        { .byte = '\n', .replacement = "\\n" },
+        { .byte = '\r', .replacement = "\\r" },
+    });
+
+    /// What TSV writes for @p byte, or nothing when it may carry it as it is.
+    ///
+    /// A range-based scan rather than `std::ranges::find`, and the reason is
+    /// portability rather than taste: over a `std::array`, libstdc++ and libc++ yield a
+    /// raw POINTER, so clang-tidy's `readability-qualified-auto` demands
+    /// `auto const* const` -- which MSVC, whose iterator is a class type, cannot deduce.
+    /// The first spelling here was the `find` one, and it was red on the analyser and
+    /// would have been red on all three Windows legs for opposite reasons.
+    /// `FleetText.hpp`'s `EscapeFor` scans for exactly this reason and says so.
+    ///
+    /// An empty answer means "carry it literally", which is unambiguous only because no
+    /// row spells a byte as nothing -- the four below are all non-empty, and a row that
+    /// wrote `""` would mean "delete this byte", which no format here wants.
+    /// @param byte The byte to spell.
+    /// @return Its spelling, or an empty view when it needs none.
+    [[nodiscard]] constexpr std::string_view EscapeForTsv(char byte) noexcept
+    {
+        for (auto const& row: TsvEscapes)
+            if (row.byte == byte)
+                return row.replacement;
+        return {};
     }
 } // namespace
 
@@ -484,6 +521,24 @@ std::string QuoteCsvField(std::string_view field)
     return out;
 }
 
+std::string EscapeTsvField(std::string_view field)
+{
+    std::string out;
+    out.reserve(field.size());
+    for (auto const ch: field)
+    {
+        // One pass over the table, so the escape character is never escaped twice: a
+        // two-pass implementation that spells tabs and then backslashes turns one tab
+        // into `\\t`, which reads back as a literal backslash followed by a `t`.
+        auto const replacement = EscapeForTsv(ch);
+        if (replacement.empty())
+            out += ch;
+        else
+            out += replacement;
+    }
+    return out;
+}
+
 std::string RenderValue(Value const& value, RenderOptions const& options)
 {
     switch (options.format)
@@ -495,7 +550,7 @@ std::string RenderValue(Value const& value, RenderOptions const& options)
         case OutputFormat::Kv:
             return RenderKv(value, options);
         case OutputFormat::Tsv:
-            return RenderSeparated(value, options, Separator { .text = "\t" }, &TsvField);
+            return RenderSeparated(value, options, Separator { .text = "\t" }, &EscapeTsvField);
         case OutputFormat::Csv:
             return RenderSeparated(value, options, Separator { .text = "," }, &QuoteCsvField);
         case OutputFormat::Last:

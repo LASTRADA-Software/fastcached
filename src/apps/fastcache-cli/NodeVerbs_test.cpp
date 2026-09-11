@@ -1007,18 +1007,30 @@ TEST_CASE("fleet turns the leader's dash into a real absent cell", "[cli][node][
 
 TEST_CASE("fleet keeps the escaping the leader applied", "[cli][node][fleet]")
 {
-    // A tab a peer put in its own display name arrives spelled, and stays spelled.
-    // Unescaping here would put a real tab into a cell, and this tool's own
-    // `--format=tsv` writer quotes nothing -- so the corruption the renderer just
-    // closed would reopen one layer up, in the format an operator pipes.
+    // A tab a peer put in its own display name arrives spelled, and stays spelled. This
+    // tool is a RELAY rather than a second author of the leader's rule: unescaping here
+    // would re-derive one convention in two binaries, free to drift, and would put a
+    // real tab back into a cell that `--format=csv` carries raw and the human format
+    // prints into its own aligned columns.
     ScriptedAdmin admin { std::string { "endpoint\tname\n10.0.0.2:7100\tbuild\\tnode\n" } };
 
     auto const answer = RunFleet(&admin, { "machines" });
 
     REQUIRE(answer.outcome == Outcome::Affirmative);
     auto const rendered = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Tsv });
-    // Two characters, not one: the row still has exactly as many columns as its header.
-    CHECK(rendered.contains("build\\tnode"));
+
+    // **What distinguishes moved when #1327 landed, and this is the assertion that
+    // followed it.** The cell holds a backslash and a `t` -- that is what the leader
+    // sent -- so this client's own TSV writer, now that it escapes rather than passing
+    // text through, DOUBLES that backslash. A build that unescaped the leader's text
+    // would hold a real tab, which the same writer would spell as a single `\t`.
+    //
+    // So the two hypotheses differ in the output by one backslash, and neither shifts a
+    // column any more. The tab count below was the load-bearing half before #1327 and
+    // is now the weaker one: it still refuses an invented column, but an unescaping
+    // client would pass it, because the writer would spell the tab it had introduced.
+    CHECK(rendered.contains("build\\\\tnode"));
+    CHECK_FALSE(rendered.contains("build\\tnode"));
     CHECK(std::ranges::count(rendered, '\t') == std::ranges::count(std::string_view { "endpoint\tname" }, '\t') * 2);
 }
 
