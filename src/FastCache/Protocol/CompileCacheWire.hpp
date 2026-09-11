@@ -2610,8 +2610,7 @@ struct CompileRequest
     /// never sees the lease request -- and asking the scheduler for it would put a
     /// round trip on the one exchange that must not have one.
     CodecList acceptedCodecs;
-    /// The BASE NAME of the translation unit, for the worker to name its scratch
-    /// file with.
+    /// The translation unit's source PATH, as the CLIENT's own compile would record it.
     ///
     /// A compiler records the name of the file it was handed -- clang-cl and gcc in
     /// the COFF/ELF `.file` symbol, MSVC in its compiland record -- so a worker that
@@ -2619,10 +2618,36 @@ struct CompileRequest
     /// compiled one in that name and nothing else. Measured on clang-cl: seven bytes,
     /// and byte-identical once the names agree.
     ///
-    /// The base name only. The worker has no use for the client's directory and no
-    /// business learning it, and the worker sanitizes what arrives regardless: this
-    /// is a string from the network that becomes a path, so the two checks are the
-    /// same pair as the argument filter's.
+    /// **This said "the BASE NAME only" until #800 made it a path, and the stale
+    /// sentence survived the change that falsified it**
+    /// ([#907](https://github.com/LASTRADA-Software/fastcached/issues/907)). clang takes
+    /// `DW_AT_name` from the INPUT FILE PATH, so a dispatched object recorded the
+    /// worker's `<scratch>/job-N/<name>` -- a directory on no machine -- and two
+    /// dispatches of ONE translation unit produced byte-differing objects under one key
+    /// (#660). Closing that needs the client's own spelling, and that is a path. It
+    /// travels already put through the client's own `-fdebug-prefix-map` rules, so what
+    /// arrives is the MAPPED spelling when the client maps anything and the raw one when
+    /// it does not.
+    ///
+    /// **So the client's directory IS learned, by design.** The old text said the worker
+    /// had "no business learning it", and the half of that which survives is narrower and
+    /// still true: no business learning it in order to OPEN it. This is never a path the
+    /// worker resolves, and it reaches only the debug record of the object it sends back.
+    ///
+    /// **Two halves of this one value, sanitized differently, and the split is
+    /// load-bearing:**
+    ///
+    /// - The FILE NAME on disk goes through `SafeSourceName` -- last component only,
+    ///   checked stem, forced known extension. That is the untrusted-string-becomes-a-path
+    ///   defence, unchanged and still correct.
+    /// - The prefix-map RULE's right-hand side is this value VERBATIM, because recording
+    ///   the client's spelling is the entire purpose. It reaches a COMMAND LINE, so what
+    ///   bounds it is the spellability check and the payload cap, **not** `SafeSourceName`.
+    ///
+    /// Routing the rule through `SafeSourceName` is the plausible wrong repair, and it
+    /// fails silently: the object would record `tu.cpp` instead of the client's path,
+    /// with every test that checks the on-disk file name still green. `WorkerSourceNameRule`
+    /// says so at the line where it would be made.
     std::string_view sourceName;
     /// The directory the CLIENT's own compile runs in, and what its own
     /// `-fdebug-prefix-map` rules spell that directory as. Both empty when the client
@@ -2676,11 +2701,12 @@ struct CompileRequest
     /// root as. Both empty when the client maps nothing; a half-filled pair is malformed
     /// and a worker refuses it, exactly as the compilation-directory pair above.
     ///
-    /// **`sourceName` cannot carry this and that is not an oversight** (#883). That one
-    /// is a base name, deliberately -- the worker has no business learning the client's
-    /// directory to OPEN it -- and #800 makes it the already-MAPPED spelling, which is
-    /// one value. A rule needs two: what the compiler will emit, and what it should say
-    /// instead.
+    /// **`sourceName` cannot carry this and that is not an oversight** (#883). #800 makes
+    /// it the client's already-MAPPED source spelling, which is ONE value, and a rule needs
+    /// TWO operands: what the compiler will emit, and what it should say instead. The
+    /// worker still has no business learning that directory in order to OPEN it -- which
+    /// is the surviving true half of a clause that also called `sourceName` "a base name,
+    /// deliberately" and so contradicted its own next line (#907).
     ///
     /// **It exists because gcc and clang take `DW_AT_name` from different places.**
     /// clang takes it from the input file path, so #800's mapped `sourceName` reaches it.
@@ -2702,9 +2728,12 @@ struct CompileView
     std::span<std::byte const> leaseToken;
     std::span<std::byte const> fingerprint;
     std::span<std::byte const> args;
-    std::span<std::byte const> source;     ///< Still enveloped; decode with DecodeCodecEnvelope.
-    CodecList acceptedCodecs;              ///< What the client can decode.
-    std::span<std::byte const> sourceName; ///< Base name to give the scratch file; sanitize before use.
+    std::span<std::byte const> source; ///< Still enveloped; decode with DecodeCodecEnvelope.
+    CodecList acceptedCodecs;          ///< What the client can decode.
+    /// The client's source PATH -- see `CompileRequest::sourceName` for what it is and
+    /// why it is not a base name. `SafeSourceName` it before it names a FILE; the
+    /// prefix-map rule takes it RAW, deliberately.
+    std::span<std::byte const> sourceName;
     /// The client's own compile directory and what its mapping spells it as; both
     /// empty when the client maps nothing. Bound and restrict them before either
     /// reaches a command line.

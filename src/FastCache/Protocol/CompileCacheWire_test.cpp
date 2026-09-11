@@ -627,6 +627,48 @@ TEST_CASE("Every dispatch verb round-trips its fields")
         CHECK(Unwrap(decoded).compileDirReplacement.empty());
         CHECK(AsStringView(Unwrap(decoded).sourceName) == "Widget.cpp");
     }
+
+    SECTION("COMPILE carries a PATH in sourceName, not a base name")
+    {
+        // Every other case here sends `Widget.cpp`, which is what this field used to
+        // carry. #800 made it the client's source path put through the client's own
+        // `-fdebug-prefix-map` rules -- clang takes `DW_AT_name` from the input file
+        // path, so without it a dispatched object records the worker's scratch
+        // directory -- and the header went on saying "the base name only" for months
+        // afterwards ([#907](https://github.com/LASTRADA-Software/fastcached/issues/907)).
+        // So the wire test was exercising a value shape the wire no longer carries.
+        //
+        // **The `!=` arm is the assertion, not decoration.** A round trip alone passes
+        // just as well on a base name, so it asserts what both readings produce. What
+        // DISCRIMINATES is that nothing between the encoder and the decoder reduces this
+        // to a component -- which is exactly the "fix" the stale contract invited, and
+        // the one that would silently undo #800 while every on-disk file-name test
+        // stayed green.
+        //
+        // The value is deliberately awkward in the three ways a real one is: separators,
+        // a space, and a Windows drive colon. `SafeSourceName` would cut all of it back
+        // to `Widget.cpp` -- that is correct for naming the scratch FILE and wrong for
+        // the prefix-map rule, which is the split the two halves of this field have.
+        constexpr auto MappedSource = std::string_view { "C:/src/my project/sub dir/Widget.cpp" };
+        auto const frame = EncodeCompile(CompileRequest { .leaseToken = "l1",
+                                                          .fingerprint = "gcc-13-abc",
+                                                          .args = {},
+                                                          .source = {},
+                                                          .acceptedCodecs = { 1 },
+                                                          .sourceName = MappedSource,
+                                                          .compileDir = "/home/ci/build",
+                                                          .compileDirReplacement = ".",
+                                                          .sourceRoot = "/home/ci/src",
+                                                          .sourceRootReplacement = "." });
+        auto const decoded = DecodeCompilePayload(std::span { frame }.subspan(RequestHeaderSize));
+        REQUIRE(decoded.has_value());
+        CHECK(AsStringView(Unwrap(decoded).sourceName) == MappedSource);
+        CHECK(AsStringView(Unwrap(decoded).sourceName) != "Widget.cpp");
+        // The pair that only exists because gcc reads the name from the `#line` marker
+        // instead (#883), and which travels BESIDE this rather than inside it.
+        CHECK(AsStringView(Unwrap(decoded).sourceRoot) == "/home/ci/src");
+        CHECK(AsStringView(Unwrap(decoded).sourceRootReplacement) == ".");
+    }
 }
 
 TEST_CASE("A capacity record tolerates a peer that says less, or more")
