@@ -242,30 +242,6 @@ function Stop-Spawned {
     $script:procs = @()
 }
 
-function Wait-ForPort([int]$port, [System.Diagnostics.Process]$proc, [string]$what, [string]$errorLog) {
-    foreach ($attempt in 1..100) {
-        if ($proc.HasExited) {
-            # The log, not just the code. "exited before listening (exit 2)" names
-            # a whole class of startup refusals and distinguishes none of them --
-            # which cost a CI round trip to learn that an argument had been split
-            # in two. What the process itself said is the answer.
-            if ($errorLog) { Write-Host (Read-LiveText $errorLog) }
-            throw "$what exited before listening (exit $($proc.ExitCode))"
-        }
-        $client = New-Object System.Net.Sockets.TcpClient
-        try {
-            $client.Connect("127.0.0.1", $port)
-            $client.Close()
-            return
-        } catch {
-            Start-Sleep -Milliseconds 200
-        } finally {
-            $client.Dispose()
-        }
-    }
-    throw "$what never listened on port $port"
-}
-
 # Read a file another process is still writing to.
 #
 # Get-Content is not enough here. These logs belong to a worker that is STILL
@@ -300,6 +276,115 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
     }
     Write-Host (Read-LiveText $path)
     throw "$what never reported /$pattern/"
+}
+
+# The readiness markers, as a TABLE (#1213).
+#
+# Two markers, six waits. A row rather than a string at each site is the shape
+# #644 landed on the POSIX side, and the reason there was that five copies of one
+# wait had each drifted a phrase of their own.
+#
+# `Core/ReadinessMarker.hpp` is where these literals are DEFINED, and its own doc
+# names this file's language as one of the waiters. Keep the bytes: nothing here
+# is recompiled by that build, so the text is a published interface. What the
+# markers MEAN is written in that table's `meaning` column and is deliberately not
+# paraphrased here -- `compile node ready` is `ReadinessFact::Serving`, which has
+# no `Bound` enumerator on purpose.
+$script:ReadinessMarkerText = @{
+    Daemon = 'ready, accepting connections'
+    Node   = 'compile node ready'
+}
+
+# Bind, THEN the marker, on ONE budget.
+#
+# ## What was wrong with waiting on the port
+#
+# A socket that is BOUND is not one that is ACCEPTING, and neither is one that is
+# SERVING. Every marker in the table above is emitted strictly after the last
+# acceptor arms, precisely because the bind is reachable while nothing will
+# answer. Six sites here waited on the connect alone, so #634's node fix and
+# #644's daemon fix reached the POSIX fixture and stopped at the language
+# boundary. What it produces is the race #634 measured as case 8 -- a node
+# compiled against immediately after its bind -- presenting on Windows as *the
+# compile was not dispatched to a worker*, which sends the reader to the
+# scheduler.
+#
+# ## Why the bind leg is KEPT rather than replaced
+#
+# It names a class the marker cannot: a process that exits before it ever
+# listens, with its own log printed. Dropping it would turn every such startup
+# refusal into one undifferentiated readiness timeout.
+#
+# ## The two refusals, and why they are refusals rather than waits
+#
+# A role with no row and an empty log path are both PROGRAMMER errors, and both
+# fail toward silence if they are allowed through: an absent marker would make
+# `Contains('')` true on the first poll, so the wait would return instantly
+# having established nothing -- the PowerShell shape of the `grep -q "$marker" -`
+# hazard `_e2e_wait_ready` refuses by name on the POSIX side.
+#
+# @param role   a key of $ReadinessMarkerText
+# @param port   the port whose bind is the first leg
+# @param proc   the process, so an early exit is reported as one
+# @param what   the participant's name, for every message
+# @param log    the file the marker is read out of; required
+# @param seconds the budget SHARED by both legs
+function Wait-ForReady([string]$role, [int]$port, [System.Diagnostics.Process]$proc,
+                       [string]$what, [string]$log, [int]$seconds = 20) {
+    if (-not $script:ReadinessMarkerText.ContainsKey($role)) {
+        throw "Wait-ForReady: no readiness marker for role '$role' (the table has: $(($script:ReadinessMarkerText.Keys | Sort-Object) -join ', '))"
+    }
+    $marker = $script:ReadinessMarkerText[$role]
+    if (-not $log) {
+        throw "Wait-ForReady: $what was given no log, and the marker is only readable out of one"
+    }
+
+    $polls = [Math]::Max(1, $seconds * 5)
+    $spent = 0
+
+    $bound = $false
+    while ($spent -lt $polls -and -not $bound) {
+        if ($proc -and $proc.HasExited) {
+            Write-Host (Read-LiveText $log)
+            throw "$what exited before listening (exit $($proc.ExitCode))"
+        }
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $client.Connect("127.0.0.1", $port)
+            $client.Close()
+            $bound = $true
+        } catch {
+            Start-Sleep -Milliseconds 200
+            $spent++
+        } finally {
+            $client.Dispose()
+        }
+    }
+    if (-not $bound) {
+        Write-Host (Read-LiveText $log)
+        throw "$what never listened on port $port"
+    }
+
+    # The readiness leg runs on what the bind LEFT of the same budget, and the
+    # message says so -- otherwise a slow start is reported against a number no
+    # caller configured.
+    while ($spent -lt $polls) {
+        if ($proc -and $proc.HasExited) {
+            Write-Host (Read-LiveText $log)
+            throw "$what exited before it was ready (exit $($proc.ExitCode))"
+        }
+        $text = Read-LiveText $log
+        # A literal substring, never `-match`: the marker is data, and a regex
+        # would make its punctuation meaningful.
+        if ($text -and $text.Contains($marker)) { return }
+        Start-Sleep -Milliseconds 200
+        $spent++
+    }
+    Write-Host (Read-LiveText $log)
+    # It must NOT claim a bind failure. The port is open and answering -- that is
+    # the whole reason this wait exists -- and a message pointing at the port
+    # sends the reader to check something that is working (#652).
+    throw "$what never reported readiness within a ${seconds}s budget shared with the bind (marker: '$marker'). Its port IS bound and answering, so an open port is not evidence this succeeded."
 }
 
 # One translation unit whose text is unique to the caller.
@@ -666,10 +751,12 @@ function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 
 function Invoke-SelfTest {
     $failures = 0
     function Assert-That([bool]$condition, [string]$what) {
+        $script:selfTestCases++
         if ($condition) { Write-Host "   ok   $what" }
         else { Write-Host "   FAIL $what"; $script:selfTestFailures++ }
     }
     $script:selfTestFailures = 0
+    $script:selfTestCases = 0
 
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("dist-e2e-selftest-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
     if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
@@ -753,15 +840,80 @@ function Invoke-SelfTest {
         Assert-That ($sections.Count -eq 2) "both sections are found"
         Assert-That ($sections[0].Name -eq ".text`$mn" -and $sections[1].Name -eq ".debug`$S") "in file order, by name"
         Assert-That ($sections[0].Size -eq $code.Length) "with their sizes"
+
+        # ---- the readiness waits (#1213) --------------------------------
+        #
+        # Driven here rather than through the fixture, for the reason
+        # `node-scratch-isolation-e2e-selftest` records: the DECISION is what can
+        # be wrong, and a case that needs a daemon, a node and a compiler is
+        # reachable only where the whole fixture already runs -- which is the
+        # population it is not for.
+        #
+        # A REAL listener, because the first leg is a real connect. Port 0 lets
+        # the kernel choose, so this touches neither `$BasePort` nor the ledger.
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        try {
+            $readyPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+            # This process: it has certainly not exited, so the early-exit arm
+            # cannot fire and every case below turns on the marker.
+            $me = Get-Process -Id $PID
+
+            # What was thrown, so a case can assert WHICH refusal it got. A test
+            # that only asserts "it threw" passes when it throws for the wrong
+            # reason, and two of the cases below differ only in their message.
+            function Get-Refusal([scriptblock]$block) {
+                try { & $block; return "" } catch { return $_.Exception.Message }
+            }
+
+            $nodeLog = Join-Path $dir "ready-node.log"
+            Set-Content -Path $nodeLog -Value "starting`ncompile node ready, serving 1 of 1 toolchain(s)`n"
+
+            # The literals, pinned. They are a published interface for a fixture
+            # this build does not recompile, so a reword here is a wire change.
+            Assert-That ($script:ReadinessMarkerText.Node -eq 'compile node ready') "the node marker is the published literal"
+            Assert-That ($script:ReadinessMarkerText.Daemon -eq 'ready, accepting connections') "the daemon marker is the published literal"
+
+            # The POSITIVE direction first: every refusal below is evidence only
+            # if the right marker on a bound port actually returns.
+            $m = Get-Refusal { Wait-ForReady Node $readyPort $me "a node whose marker is present" $nodeLog 5 }
+            Assert-That ($m -eq "") "the right marker on a bound port returns"
+
+            # THE CASE THIS TICKET IS ABOUT. The port answers throughout, so a
+            # wait that merely connects passes here; one pointed at the wrong
+            # marker must not.
+            $m = Get-Refusal { Wait-ForReady Daemon $readyPort $me "a node waited on with the DAEMON marker" $nodeLog 1 }
+            Assert-That ($m -like "*never reported readiness*") "the WRONG marker refuses, though the port answers throughout"
+            Assert-That ($m -like "*port IS bound and answering*") "and the refusal says an open port is not evidence"
+
+            $silent = Join-Path $dir "ready-silent.log"
+            Set-Content -Path $silent -Value "starting`n"
+            $m = Get-Refusal { Wait-ForReady Node $readyPort $me "a node that binds and never reports" $silent 1 }
+            Assert-That ($m -like "*never reported readiness*") "a bound process that never reports is a READINESS failure, not a bind one"
+
+            # The two programmer errors, refused rather than waited on. Both fail
+            # toward silence if they are let through: an absent row makes the
+            # marker empty, and an empty needle is found in everything.
+            $m = Get-Refusal { Wait-ForReady Nonesuch $readyPort $me "a role nobody registered" $nodeLog 1 }
+            Assert-That ($m -like "*no readiness marker for role 'Nonesuch'*") "an unknown role is refused BY NAME"
+            $m = Get-Refusal { Wait-ForReady Node $readyPort $me "a wait with no log" "" 1 }
+            Assert-That ($m -like "*given no log*") "an empty log is refused rather than polled"
+        } finally {
+            $listener.Stop()
+        }
     } finally {
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
     }
 
+    # A self-test that stopped early must not look like one that judged
+    # something, so the COUNT is printed on both paths out. It is not written
+    # down in a comment anywhere: it moves whenever a case is added, and a
+    # restated total is a second thing to be wrong.
     if ($script:selfTestFailures -ne 0) {
-        Write-Host "object-comparison self-test FAILED ($script:selfTestFailures)"
+        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison and the readiness waits)"
         return 1
     }
-    Write-Host "object-comparison self-test PASSED"
+    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison and the readiness waits)"
     return 0
 }
 
@@ -835,7 +987,7 @@ try {
             "--listen=127.0.0.1:$cachePort",
             "--storage-max-value=64M", "--log-level=info") $daemonLog
         $procs += $daemon
-        Wait-ForPort $cachePort $daemon "daemon" $daemonLog
+        Wait-ForReady Daemon $cachePort $daemon "daemon" $daemonLog
 
         # A compile node running the fleet's scheduler. --fleet-open because every
         # peer here is loopback -- and because the policy has to be STATED: a node
@@ -859,7 +1011,7 @@ try {
             "--toolchain=scheduler-only=$((Get-Command $cc).Source)", "--slots=1",
             "--log-level=debug") $schedLog
         $procs += $scheduler
-        Wait-ForPort $dispatchPort $scheduler "scheduler" $schedLog
+        Wait-ForReady Node $dispatchPort $scheduler "scheduler" $schedLog
 
         # Asked of the launcher rather than derived here. The fingerprint is a
         # digest over the compiler's whole include tree; a fixture that recomputed
@@ -896,7 +1048,7 @@ try {
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
-        Wait-ForPort $workerPort $worker "worker" $workerLog
+        Wait-ForReady Node $workerPort $worker "worker" $workerLog
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
 
         # The worker computed its own fingerprint from a bare --toolchain. If it
@@ -1085,7 +1237,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             "--listen=127.0.0.1:$isoCache",
             "--log-level=info") $isoDaemonLog
         $procs += $isoDaemon
-        Wait-ForPort $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
+        Wait-ForReady Daemon $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
 
         # A second SCHEDULER as well, so the mismatched worker is the only one
         # registered with it -- and it too serves a toolchain nothing here uses, or it
@@ -1099,7 +1251,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             "--toolchain=also-not-the-compiler-this-client-uses=$((Get-Command $cc).Source)",
             "--slots=1", "--log-level=debug") $isoSchedLog
         $procs += $isoScheduler
-        Wait-ForPort $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
+        Wait-ForReady Node $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
@@ -1109,7 +1261,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
-        Wait-ForPort $isoWorker $isoNode "isolation worker" $isoWorkerLog
+        Wait-ForReady Node $isoWorker $isoNode "isolation worker" $isoWorkerLog
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
 
         $isoRoot = Join-Path $scratch "iso-proj"

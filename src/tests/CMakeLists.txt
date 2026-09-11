@@ -4211,6 +4211,29 @@ if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node OR NOT TARGET fast
     message(STATUS "dist-compile-e2e: daemon, compile node or launcher not built — skipping")
 else()
     if(WIN32)
+        # The readiness waits, and what a green run here CANNOT show (#1213).
+        #
+        # All six waits in that fixture are on the readiness MARKER rather than on
+        # the bind: a socket that is bound is not one that is accepting, and
+        # neither is one that is serving.
+        #
+        # **A passing run of this test is not evidence for that change.** The port
+        # answers throughout and the process does eventually log, so a wait on the
+        # bind -- or one matching any string at all -- passes this suite exactly
+        # as the correct one does. The argument is `claude/batch-node`'s
+        # `6ce7ed7f`: two lanes implemented #1213 independently and reached that
+        # sentence separately, which is why it belongs in the tree rather than in
+        # either transcript.
+        #
+        # The discriminating evidence is in `-SelfTest`, where the decision is
+        # driven against a real listener and staged logs: a node waited on with
+        # the DAEMON marker must REFUSE while its port answers, and neutering the
+        # wait to return at the bind reddens exactly those cases and no others.
+        #
+        # An end-to-end run is still worth having -- it says the fixture is not
+        # broken -- and one was taken: `dist-compile E2E PASSED` against
+        # `out/build/clangcl-release`, 2026-09-11. It is simply not the evidence
+        # the change rests on.
         add_test(
             NAME "dist-compile-e2e"
             COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
