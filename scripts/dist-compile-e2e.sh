@@ -134,7 +134,6 @@ workdir="$(mktemp -d)"
 # secret would make a failure look like a flake. Sixteen bytes is the minimum.
 cluster_key="${workdir}/cluster.key"
 printf 'e2e-fixture-cluster-key-not-a-secret\n' > "$cluster_key"
-pids=()
 cleanup() {
     # Every spawned process, not just the ones a happy path reaps: a `fail`
     # anywhere exits the script, and a daemon or worker left holding a port makes
@@ -147,20 +146,28 @@ cleanup() {
     # suite timed out with no output", which is how this fixture's own first
     # version reported a real worker-shutdown bug: ***Timeout 900.10 sec, in
     # three CI jobs, naming nothing.
-    for pid in ${pids+"${pids[@]}"}; do
-        kill "$pid" >/dev/null 2>&1 || true
-    done
-    for pid in ${pids+"${pids[@]}"}; do
-        for _ in $(seq 1 25); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.2
-        done
-        kill -9 "$pid" >/dev/null 2>&1 || true
-        wait "$pid" 2>/dev/null || true
-    done
+    #
+    # The SET is `jobs -pr` and no longer a `pids` array the spawn sites appended
+    # to (#845). Every one of those appends was correct; that is the point rather
+    # than a reprieve, because correctness maintained by memory is a defect with
+    # a delay and nothing made a missing `pids+=` fail. Deleting the ledger
+    # outright is what makes the omission impossible rather than fixable -- and
+    # #451 folding the spawns into `start_node`/`start_daemon` did not do it, it
+    # only moved the forgettable line from ten sites to two.
+    #
+    # Checked rather than assumed, since `jobs -pr` cannot see a process started
+    # INSIDE a `( ... )`: every long-lived spawn is in this shell -- directly,
+    # inside a top-level `if`, or in `start_node`/`start_daemon`, which are
+    # functions called from the top level -- and the `( ... ) &` sites background
+    # the SUBSHELL, which is itself a job of this shell. None starts a grandchild.
+    #
+    # It now also reaps the launcher subshells `cap_pids` and the case 11 pair
+    # hold, which the ledger never covered. On the happy path they have been
+    # waited for and are gone; on a `fail` between the spawn and the `wait` they
+    # were left running until now.
+    reap_background_jobs 5
     rm -rf "$workdir"
 }
-trap cleanup EXIT
 
 # The shared helpers: `fail`, `free_port`, `wait_for_port`, `wait_for_log`,
 # `wait_for_registration`, `stop_and_require_exit` and `http_get` (#449, #451).
@@ -187,6 +194,14 @@ trap cleanup EXIT
 #     the endpoints this file reads happen to end in a newline, and
 #     `fleet-dashboard-e2e`'s copy had already been bitten by it.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+# The EXIT trap is armed AFTER the source, which is the order the library's own
+# caller contract states and which this file did not follow: `cleanup` calls
+# `reap_background_jobs` since #845, so a trap armed above the source would name a
+# function that does not exist yet. Nothing ran in that window -- comments and one
+# function definition -- so this is closing a shape rather than a live defect, and
+# `e2e_begin` still comes after the trap for the reason it always did: the TERM
+# trap it installs exists to let this one run.
+trap cleanup EXIT
 e2e_begin "dist-compile E2E" "$workdir"
 
 # How long a bounded wait in this fixture may take.
@@ -265,10 +280,15 @@ daemon_stop_seconds=5
 # A function that PRINTED its pid would have to be called in a command
 # substitution, and the whole spawn would then happen in a subshell: the
 # background process would be that subshell's child rather than this shell's, so
-# `wait` could not reap it, `kill -0` would be racing a pid this shell does not
-# own, and the `pids` array cleanup depends on would be discarded at the closing
-# paren. `fail` inside such a substitution ends the run correctly and would still
+# `wait` could not reap it and `kill -0` would be racing a pid this shell does not
+# own. `fail` inside such a substitution ends the run correctly and would still
 # hand the caller an empty pid on the way past.
+#
+# Since #845 that argument is STRONGER rather than weaker. Cleanup reaps
+# `jobs -pr`, which is the job table of THIS shell, so a spawn inside a command
+# substitution would leave a process cleanup cannot see AT ALL -- where the old
+# `pids` array at least had a line somebody could have added. The reason this
+# returns through a global rather than on stdout is now the reason the reap works.
 started_pid=""
 
 # And the log that process writes, so a caller that wants to dump it on a later
@@ -284,12 +304,17 @@ started_port=""
 #
 # THE recipe this fixture inlined at ten sites (#451). What was actually repeated
 # is not the flags -- those are what each case is ABOUT and they stay at the call
-# sites -- but the six lines around them: name a log under `$workdir`, background
-# the process, capture `$!`, append it to `pids` so cleanup reaps it, and wait for
-# the port with the right host and the right log. Every one of those is a place a
-# copy can be silently short, and two of them already were: a node whose pid never
-# reached `pids` is a worker still holding its port after the run, and a wait given
-# the wrong log dumps a file that explains nothing.
+# sites -- but the lines around them: name a log under `$workdir`, background the
+# process, capture `$!`, and wait for the port with the right host and the right
+# log. Every one of those is a place a copy can be silently short, and two of them
+# already were: a node whose pid never reached the old `pids` ledger was a worker
+# still holding its port after the run, and a wait given the wrong log dumps a
+# file that explains nothing.
+#
+# The ledger line is gone (#845) and its failure mode with it: cleanup reaps
+# `jobs -pr`, so there is no append for a new spawn site to omit. Folding the
+# recipe here did not close that -- it moved the forgettable line from ten sites
+# to one, which is fewer places to forget rather than none.
 #
 # The invariant flags are the three no case varies: the drain this fixture states
 # rather than inherits (#380), the cluster key that makes every dispatch here a
@@ -339,7 +364,6 @@ start_node() {
     started_pid="$pid"
     started_log="$log"
     started_port="$port"
-    pids+=("$pid")
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 
@@ -348,8 +372,9 @@ start_node() {
 # `start_node`'s counterpart, and it exists for the same reason one ticket later
 # (#644). The node recipe reached twelve copies before #451 folded it; the DAEMON
 # recipe was still written out five times, each repeating its own
-# `> "${workdir}/<tag>.log" 2>&1 &`, its own `$!`, its own `pids+=` and its own
-# wait -- and each free to spell the tag one way and the log another. That is the
+# `> "${workdir}/<tag>.log" 2>&1 &`, its own `$!`, its own ledger append and its
+# own wait -- and each free to spell the tag one way and the log another. The
+# append is gone outright since #845; the rest is why this function still exists. That is the
 # mapping a reader needs when a run fails: the failure names a daemon, the
 # evidence is in a file, and nothing connects the two if the two are typed
 # separately. Here the TAG is both, exactly as `start_node` documents for itself.
@@ -394,7 +419,6 @@ start_daemon() {
     started_pid="$pid"
     started_log="$log"
     started_port="$port"
-    pids+=("$pid")
     wait_for_daemon_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 

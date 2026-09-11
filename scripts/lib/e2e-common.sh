@@ -2162,6 +2162,119 @@ run_bounded() {
     return "$status"
 }
 
+# ---------------------------------------------------------------------------
+
+# Reap every still-running background job of the CALLING shell: TERM, one shared
+# grace, then KILL the survivors. For a fixture's `cleanup`.
+#
+# ## `jobs -pr`, and not a pid ledger the call sites append to
+#
+# This is #839's argument, arriving at the two fixtures that still had the ledger
+# (#845). A ledger is per-SITE, so the next background site reopens the leak by
+# forgetting one line -- and that is not hypothetical: #834 was writing exactly
+# such a site while #839 was being fixed. There is nothing here to forget. Every
+# still-running background job of this shell is reaped, whatever started it, on
+# whichever path the fixture left by.
+#
+# What it cost when it leaked, so a reader does not have to go and find it: 1368
+# orphan listeners holding loopback ports, the oldest 30.5 hours old. The PORTS
+# were the expensive half rather than the load -- `free_port` draws by asking
+# whether anything is listening, so a held LISTEN socket is precisely what its
+# probe refuses, in growing numbers, on a machine several lanes share, and the
+# failure surfaces in whatever OTHER fixture next draws a port.
+#
+# ## Two things a caller may NOT assume, and must check by enumerating its sites
+#
+#   * **`jobs -pr` is per-shell.** A backgrounded SUBSHELL (`( ... ) &`) is itself
+#     a job and is seen; a process started INSIDE one is a grandchild and is not.
+#     Measured: three plain jobs and one `( sleep & wait ) &` -- the subshell was
+#     listed, its child was not. A fixture converting to this walks its `&` sites
+#     and confirms none is of the second shape.
+#   * **`$!` for a backgrounded shell FUNCTION is the wrapper subshell**, not the
+#     program it runs. `exec` is the fix, and it is a property of the site rather
+#     than of this helper.
+#
+# A ledger may still exist for ADDRESSING -- `cluster-e2e.sh` keeps a slot-indexed
+# one so a case can stop one named node and read its status. What it must stop
+# being is the thing CLEANUP depends on, because that is the copy a new site
+# silently omits.
+#
+# ## Why it cannot be `stop_and_require_exit` in a loop
+#
+# Two reasons, both of which have bitten:
+#
+#   * that one ends in `fail`, which is `kill -TERM $_e2e_top_pid; exit 1` --
+#     re-entrant inside the EXIT trap that is already firing;
+#   * a bare `wait` before the KILL is UNBOUNDED, and these suites stage a
+#     TERM-ignoring child on purpose. So `wait` runs only AFTER the escalation,
+#     where SIGKILL is uncatchable and the reap is prompt.
+#
+# So this NEVER fails the run. It is cleanup; it is reached on the failing paths,
+# and a cleanup that can raise its own failure buries the one being reported.
+#
+# ## The grace is ONE window, not one per job
+#
+# The signal goes to everything first, so the shutdowns overlap and a shared
+# window is what "TERM them and wait for them to go" actually means. Per-job it
+# was N x 5s worst case for no benefit. It is counted in `sleep` ticks rather
+# than from `SECONDS`, deliberately: `sleep` is CLOCK_MONOTONIC on both platforms
+# while `SECONDS` is CLOCK_REALTIME and this host STEPS it (#1066), and a grace
+# is not a bound anybody asserts on -- nothing reads it, it only decides when to
+# escalate. Reaching for `_e2e_deadline_arm` here would be worse than the
+# arithmetic it fixes: it backgrounds a subshell, and doing that inside a firing
+# EXIT trap is the one place this file has already been bitten.
+#
+# bash 3.2: `jobs -pr` in the caller's shell (a function does not fork), and a
+# plain `for` over word splitting -- no `mapfile`, no arrays, no `wait -n`.
+#
+# @param 1 seconds of grace before escalating to SIGKILL; default 5
+# @return always 0; sets `E2eReapKilled` to how many needed the KILL
+E2eReapKilled=0
+reap_background_jobs() {
+    local seconds="${1:-5}" ticks=0 tick=0 leftover="" alive=""
+    E2eReapKilled=0
+    # Snapshotted BEFORE anything is signalled, and before the poll below can add
+    # a job of its own: what is reaped is what was running when cleanup started.
+    local doomed=""
+    doomed="$(jobs -pr)"
+    [ -n "$doomed" ] || return 0
+
+    for leftover in $doomed; do
+        kill "$leftover" >/dev/null 2>&1 || true
+    done
+
+    ticks=$(( seconds * 5 ))
+    tick=0
+    while [ "$tick" -lt "$ticks" ]; do
+        alive=""
+        for leftover in $doomed; do
+            if kill -0 "$leftover" 2>/dev/null; then alive="yes"; break; fi
+        done
+        [ -n "$alive" ] || break
+        sleep 0.2
+        tick=$(( tick + 1 ))
+    done
+
+    # The tally is the KILL's own status and not a line beside it. That is the
+    # `ClaimReadSlot` idiom -- a guard folded INTO the operation is self-enforcing,
+    # one called alongside it can be forgotten independently -- and here it was
+    # measured rather than assumed: with the increment on its own line, deleting
+    # the `kill -9` left `E2eReapKilled` still reporting 1, so the self-test case
+    # written to prove the escalation works passed with the escalation GONE. The
+    # stubborn child died of its own accord while `wait` sat on it, and a count
+    # that cannot tell that from a SIGKILL is a count of nothing.
+    for leftover in $doomed; do
+        if kill -0 "$leftover" 2>/dev/null; then
+            kill -9 "$leftover" >/dev/null 2>&1 && E2eReapKilled=$(( E2eReapKilled + 1 ))
+        fi
+        # AFTER the escalation, never before: SIGKILL is uncatchable, so this is
+        # prompt. A `wait` reached before it is unbounded against exactly the
+        # TERM-ignoring child these suites stage on purpose.
+        wait "$leftover" 2>/dev/null || true
+    done
+    return 0
+}
+
 # Put a command to whoever leads NOW, and assert what comes back.
 #
 # Generalised from `cluster-e2e.sh`'s `submit_setting`, which was this logic with

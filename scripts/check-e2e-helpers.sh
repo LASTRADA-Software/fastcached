@@ -1554,6 +1554,48 @@ run_case() {
         echo "a TERM-ignoring child exited ${rc}"
         ;;
 
+    # `reap_background_jobs` reaps what NOBODY RECORDED, which is the whole of
+    # #845: the ledger it replaces was per-site, so the next background site
+    # reopened the leak by forgetting one line.
+    #
+    # The assertion is therefore about a job this case deliberately keeps no
+    # record of beyond what it needs to CHECK the outcome. A case that handed the
+    # pid to the reaper would pass under a reaper that only read a ledger, which
+    # is the thing being removed -- assert what DISTINGUISHES.
+    #
+    # Both directions in one case, because a reaper that killed nothing and one
+    # that hung are different defects and the pass has to exclude both:
+    #
+    #   * an ORDINARY child, which dies on TERM inside the grace;
+    #   * a TERM-IGNORING child, which must be escalated to SIGKILL -- the shape
+    #     `bounded-outlasts-a-trapped-term` above stages for the same reason, and
+    #     the one a bare `wait` in cleanup would hang on forever.
+    #
+    # `E2eReapKilled` is what says the escalation ran rather than the grace being
+    # long enough by luck: a reaper whose KILL arm was dead would still reach zero
+    # survivors for the polite child and would leave the stubborn one alive, so
+    # the two numbers together discriminate where either alone does not.
+    reap-takes-what-nothing-recorded)
+        sleep 30 &
+        polite=$!
+        sh -c 'trap "" TERM; exec sleep 30' &
+        stubborn=$!
+        # Not `wait_for_port`: nothing binds here. A short pause so both children
+        # have execed before the signal, since a TERM delivered to a shell that
+        # has not yet run `exec` would kill the wrapper and prove nothing about
+        # the escalation.
+        sleep 0.5
+        reap_background_jobs 2
+        killed="$E2eReapKilled"
+        alive=""
+        kill -0 "$polite" 2>/dev/null && alive="${alive} polite"
+        kill -0 "$stubborn" 2>/dev/null && alive="${alive} stubborn"
+        echo "reaped without a ledger: escalated=${killed}, still alive:${alive:- none}"
+        [ -z "$alive" ] || echo "BUG: reap_background_jobs left${alive} running"
+        [ "$killed" = "1" ] \
+            || echo "BUG: expected exactly one SIGKILL escalation, got ${killed} -- a dead KILL arm and a lucky grace read alike"
+        ;;
+
     # --- the real-socket cases ----------------------------------------------
     #
     # `wait_for_port` and `http_get` against a listener that really binds, really
@@ -2614,6 +2656,7 @@ cases=(
     "duration-reading-shape|0|accepted 3 readings and refused 7|!BUG:"
     "bounded-fast-path-bites|0|the staged flat-pause defect asked for|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
+    "reap-takes-what-nothing-recorded|0|escalated=1, still alive: none|!BUG:"
     "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
     "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
     "ask-leader-election|0|recovered from an election in progress|asked 2 time(s)|!BUG:"
