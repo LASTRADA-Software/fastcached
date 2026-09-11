@@ -23,13 +23,14 @@
 #include <vector>
 
 #include <tests/DeclaredCountBlob.hpp>
+#include <tests/RetiredGenerations.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
-using FastCache::Cc::Test::RequireNoRetiredGeneration;
-using FastCache::Cc::Test::RetiredGeneration;
 using FastCache::Cc::Test::SplitMix64;
+using FastCache::Testing::Generation;
+using FastCache::Testing::RequireNoRetiredDigest;
 
 namespace
 {
@@ -1674,13 +1675,13 @@ TEST_CASE("The manifest digests are pinned, so changing them is deliberate")
     // above cannot cover: a v5 manifest is only safe because no launcher carrying
     // the refusal ever records a defective one, so putting `manifest-v4` back makes
     // every pre-#104 manifest reachable again and direct mode serves a stale object
-    // under a zero exit code. See RetiredGeneration.
-    constexpr auto Retired = std::to_array<RetiredGeneration>({
-        { .tag = "manifest-v3", .digest = "76b19c2b7caf3e0db4dcc1efcecb76aa" },
-        { .tag = "manifest-v4", .digest = "8221eaeac6f3f8e52e523507780ed186" },
-        { .tag = "manifest-v5", .digest = "72ed897f5c3dd9ec9fc2b4607aafdc96" },
+    // under a zero exit code. See Generation in <tests/RetiredGenerations.hpp>.
+    constexpr auto Retired = std::to_array<Generation<std::string_view>>({
+        { .key = "manifest-v3", .digest = "76b19c2b7caf3e0db4dcc1efcecb76aa" },
+        { .key = "manifest-v4", .digest = "8221eaeac6f3f8e52e523507780ed186" },
+        { .key = "manifest-v5", .digest = "72ed897f5c3dd9ec9fc2b4607aafdc96" },
     });
-    RequireNoRetiredGeneration(manifestKey, Retired);
+    RequireNoRetiredDigest<std::string_view>(manifestKey, Retired);
 
     // The header-state digest is deliberately NOT part of that pair: nothing is
     // stored under it, so it has no stale entries to re-key and its tag stays at

@@ -175,8 +175,13 @@ under test reads `FASTCACHE_ADDR` from the environment and several child process
 inherit it, so the port has to be decided BEFORE the daemon starts — which is an
 argument for deciding it early, and drawing does that. The fixture draws from
 20000..32000 like every sibling now, and the four were CHECKED rather than assumed:
-`compile-cache-e2e.sh` and `dist-compile-e2e.sh` call `free_port`;
-`sccache-smoke.{sh,ps1}` and `FASTCACHED_SMOKE_PORT` still fix 11611, which is #183.
+`compile-cache-e2e.sh` and `dist-compile-e2e.sh` call `free_port`; `sccache-smoke.sh`
+does too, and `FASTCACHED_SMOKE_PORT` defaults to EMPTY so the registration passes no
+`--port` at all. `sccache-smoke.ps1` still fixes 11611, and that is the remainder of
+#183. The CMake half is worth naming separately from the script half, because for a
+while the script drew and the registration passed `--port 11611` unconditionally: the
+draw was live, unreachable from the only caller there is, and the diff showed a
+converted fixture.
 
 Three things worth keeping:
 

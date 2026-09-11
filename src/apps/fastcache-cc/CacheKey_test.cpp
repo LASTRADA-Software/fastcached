@@ -17,11 +17,13 @@
 #include <unordered_set>
 #include <vector>
 
+#include <tests/RetiredGenerations.hpp>
+
 using namespace FastCache::Cc;
 using FastCache::Cc::Test::DigestQuarters;
-using FastCache::Cc::Test::RequireNoRetiredGeneration;
-using FastCache::Cc::Test::RetiredGeneration;
 using FastCache::Cc::Test::SplitMix64;
+using FastCache::Testing::Generation;
+using FastCache::Testing::RequireNoRetiredDigest;
 
 namespace
 {
@@ -414,7 +416,7 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     //      only when a bump changes nothing but the tag, as v4 -> v5 did; pasting
     //      the outgoing vector after a construction change records a digest this
     //      build can no longer produce, and the row then forbids nothing while
-    //      `RequireNoRetiredGeneration` still reports the table as populated;
+    //      `RequireNoRetiredDigest` still reports the table as populated;
     //   3. only then update this vector.
     // Updating the vector alone leaves old entries matching new keys and being
     // served under rules they were not written by, which is the silent mis-serve
@@ -433,15 +435,15 @@ TEST_CASE("ComputeKey's value is pinned, so changing the construction is deliber
     CHECK(key == "e7d074ee4bda35d76e6bf65eba71e7b1");
 
     // What the vector alone cannot say: that the tag has not been put BACK. See
-    // RetiredGeneration -- reverting the tag and re-pasting the vector is one edit
+    // Generation -- reverting the tag and re-pasting the vector is one edit
     // two hunks apart and leaves the suite green, so each generation this key space
     // has retired is required to stay unreachable in its own right.
-    constexpr auto Retired = std::to_array<RetiredGeneration>({
-        { .tag = "objkey-v3", .digest = "65a330c5e6541bf33b2682d642717669" },
-        { .tag = "objkey-v4", .digest = "a38a64d1e6e4c72f555c7e97ba26bd16" },
-        { .tag = "objkey-v5", .digest = "b89cce126e819bbb6868c7a6065e01cb" },
+    constexpr auto Retired = std::to_array<Generation<std::string_view>>({
+        { .key = "objkey-v3", .digest = "65a330c5e6541bf33b2682d642717669" },
+        { .key = "objkey-v4", .digest = "a38a64d1e6e4c72f555c7e97ba26bd16" },
+        { .key = "objkey-v5", .digest = "b89cce126e819bbb6868c7a6065e01cb" },
     });
-    RequireNoRetiredGeneration(key, Retired);
+    RequireNoRetiredDigest<std::string_view>(key, Retired);
 }
 
 TEST_CASE("Field contents cannot be shifted across a field boundary")

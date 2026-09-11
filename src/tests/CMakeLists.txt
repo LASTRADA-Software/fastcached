@@ -4573,7 +4573,22 @@ endif()
 if(NOT TARGET fastcached)
     message(STATUS "sccache smoke tests: daemon not built — skipping")
 elseif(SCCACHE)
-    set(FASTCACHED_SMOKE_PORT "11611" CACHE STRING "TCP port the sccache smoke tests bind fastcached to")
+    # EMPTY by default, and that emptiness is half of #183's port fix rather than a
+    # tidy-up: `sccache-smoke.sh` draws a free port per run and a `--port` passed
+    # here OVERRIDES that draw, so defaulting this to 11611 and passing it
+    # unconditionally -- which is what it used to do -- leaves the draw unreachable
+    # from the only caller that matters. The fixture then reads as converted while
+    # every run still binds one constant, which is the shape a diff cannot show.
+    # Kept as a cache entry so somebody who needs to pin it still can.
+    #
+    # `sccache-smoke.ps1` is NOT yet converted and keeps its own `11611` default, so
+    # on Windows an empty value here changes nothing. That is #183's remaining half.
+    set(FASTCACHED_SMOKE_PORT "" CACHE STRING
+        "TCP port the sccache smoke tests bind fastcached to; empty draws one per run")
+    set(_smoke_port_arg "")
+    if(FASTCACHED_SMOKE_PORT)
+        set(_smoke_port_arg --port ${FASTCACHED_SMOKE_PORT})
+    endif()
 
     if(WIN32)
         set(_smoke_driver pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/sccache-smoke.ps1")
@@ -4587,11 +4602,12 @@ elseif(SCCACHE)
             COMMAND ${_smoke_driver}
                 --fastcached "$<TARGET_FILE:fastcached>"
                 --protocol ${_proto}
-                --port ${FASTCACHED_SMOKE_PORT}
+                ${_smoke_port_arg}
                 --compiler "${CMAKE_CXX_COMPILER}"
         )
-        # Both tests bind the same port and drive one shared sccache server, so
-        # they must not run concurrently with each other.
+        # They still drive one shared sccache server, so they must not run
+        # concurrently with each other -- the per-run draw settles the port
+        # collision, not the server one.
         set_tests_properties("sccache-smoke-${_proto}" PROPERTIES
             LABELS "smoke"
             SKIP_RETURN_CODE 77

@@ -21,6 +21,7 @@
 
 #include <tests/DeclaredCountBlob.hpp>
 #include <tests/ForeignGenerationValue.hpp>
+#include <tests/RetiredGenerations.hpp>
 
 using namespace FastCache;
 using PathCanon::Grammar;
@@ -966,11 +967,13 @@ constexpr std::array ConformanceCorpus {
 /// whose FIRST BYTE is `CompileValueVersion`, so comparing across generations is
 /// unequal by construction. What catches a bump being put back is structural and
 /// lives in the case below.
-struct StoredValueGeneration
-{
-    std::string_view digest; ///< What the corpus of its day yielded under that generation.
-    std::uint8_t version;    ///< The `CompileValueVersion` it was written under.
-};
+/// A generation of the stored-value contract, keyed on its `CompileValueVersion`.
+///
+/// The shape and its guards are shared with the key space's schema-tag table through
+/// `<tests/RetiredGenerations.hpp>` (#548). The two tables assert DIFFERENTLY and the
+/// header says why: a retired digest is only re-derivable while the digested inputs
+/// are frozen, and this corpus grows.
+using StoredValueGeneration = FastCache::Testing::Generation<std::uint8_t>;
 
 /// Every generation of the stored-value contract this build knows about.
 ///
@@ -979,22 +982,186 @@ struct StoredValueGeneration
 constexpr std::array StoredValueGenerations {
     // Generation 1 is RETIRED (#547): a bare root canonicalized nothing on the
     // producer side and doubled its separator on the consumer side.
-    StoredValueGeneration { .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c", .version = 1 },
+    StoredValueGeneration { .key = 1, .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c" },
     // Generation 2 is RETIRED (#879, #891): `Grammar::ShowIncludes` matched only the
     // literal English marker, at column zero, so a localized `cl` and an indented
     // note both canonicalized to nothing and their regions kept the producing
     // checkout's absolute paths.
-    StoredValueGeneration { .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4", .version = 2 },
+    StoredValueGeneration { .key = 2, .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4" },
     // Generation 3 is RETIRED (#202): stderr was tagged `Grammar::ShowIncludes`, a
     // grammar that cannot see a diagnostic's path, so a replayed warning named the
     // checkout that STORED it -- on a machine with several checkouts, a path that
     // resolves to a different tree at a different revision, so the line number
     // lands on unrelated code.
-    StoredValueGeneration { .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e", .version = 3 },
-    StoredValueGeneration { .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf", .version = 4 },
+    StoredValueGeneration { .key = 3, .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e" },
+    StoredValueGeneration { .key = 4, .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf" },
 };
 
-/// Digest the whole stored-value contract over the conformance corpus.
+/// One corpus row's own contribution to a generation's conformance digest.
+///
+/// The aggregate digest is a FOLD, and a fold destroys precisely what
+/// [#583](https://github.com/LASTRADA-Software/fastcached/issues/583) needs: it
+/// answers *the contract's behaviour moved* and cannot answer WHICH rows moved, so it
+/// cannot check the one claim a bump actually makes.
+struct RowDigest
+{
+    std::string_view row;    ///< The `ConformanceCase::name` this covers.
+    std::string_view digest; ///< That row's covered stages, digested alone.
+};
+
+/// Generation 4's rows, frozen as this build produces them.
+///
+/// **The freeze starts HERE and does not run backwards.** Generations 1 to 3 keep
+/// only their aggregate digest and stay DATED RECORDS, for a reason worth stating
+/// rather than leaving as an omission: re-deriving one means running THAT
+/// generation's behaviour, which is gone, and running today's behaviour over its
+/// corpus yields a confident number that is neither its digest nor anything a reader
+/// can interpret -- worse than no number, because it would look like a re-derivation.
+/// Recovering them needs old trees built, which is not what this mechanism is for.
+constexpr std::array Generation4Rows {
+    RowDigest { .row = "posix showIncludes under both roots",
+                .digest = "14df5a11169bc099b908969bfa598dbd1bd5af12f4042fa66d3fa8c7ce239c09" },
+    RowDigest { .row = "windows showIncludes, mixed case, CRLF",
+                .digest = "9d6cb862c0a9f2eb9d51d2336fcea8b6734073fed8bf7850fd3be41646847026" },
+    RowDigest { .row = "showIncludes final line with no newline",
+                .digest = "0d6e5bab4b4ea85cd1225b1591e0a325c313a1b06dfc75dd30564bb9b78f79d5" },
+    RowDigest { .row = "showIncludes already carrying tokens is left alone",
+                .digest = "e3cfd9ba878c360606dfbdb5ee25cece0268dd048034d35631b863c25fd5ba0f" },
+    RowDigest { .row = "msvc diagnostics, line and column",
+                .digest = "39f4621416681297a2d93a856cea4b53a7af0b23409995fcc8d00b3f15351e2e" },
+    RowDigest { .row = "gcc depfile, target, continuations and escaped space",
+                .digest = "7f982a9fdc5f6c1d0478f370f9726f08bd823a28d6f31baf8fd04ec66c84a222" },
+    RowDigest { .row = "depfile under a drive-relative root",
+                .digest = "106c4c40b209bc9a686c7cfd3d7baf79df4f236d229ea688dc5e7a8665639c83" },
+    RowDigest { .row = "showIncludes under a UNC root",
+                .digest = "acfd322dbf79226e1090352581d7d5964f6a5dde5aa5767a7b10edc41fbde8cb" },
+    RowDigest { .row = "a bare root produces, and a bare root consumes",
+                .digest = "4b4691413029e66261df20c6075e1d6e3cd4612d4943015450ceda30f1435e61" },
+    // This digest and "a bare drive root consumes" below are EQUAL, and that is the
+    // canonicalization working rather than a redundant row. The two differ only on the
+    // PRODUCER side -- a bare `C:\` root against a nested `C:\src\proj` one -- and
+    // erasing exactly that difference is what the stored form is for, so identical
+    // stored bytes is the property this cache exists to have. They are not
+    // interchangeable: a defect in the bare-drive-root producer path moves this row
+    // and leaves the other standing, which is the whole reason both are here. Equal
+    // today is not redundant.
+    RowDigest { .row = "a bare drive root produces, and a bare drive root consumes",
+                .digest = "62f9934c4822d8bd526b0e24bb8697b1c13226f734e28aed21c90a64c08e47ae" },
+    RowDigest { .row = "an untrimmed root produces, and an untrimmed root consumes",
+                .digest = "e6b6b9c572cf0ebe03bbbf9cd0635b42941308e584f8b4cc6a47b4ef8acb3311" },
+    RowDigest { .row = "a drive-relative root consumes",
+                .digest = "763f779e22bcdb69025f0c75c43e3f3dcb3ca9516cfa72845bdbfd42be175b0d" },
+    RowDigest { .row = "a UNC root consumes", .digest = "1f4cbb8b5b91b84a0470524f64c959e4929679ba3e5c24e7bc2f7cfaee981713" },
+    RowDigest { .row = "a bare drive root consumes",
+                .digest = "62f9934c4822d8bd526b0e24bb8697b1c13226f734e28aed21c90a64c08e47ae" },
+    RowDigest { .row = "a localized producer normalizes its marker, and an English consumer matches it",
+                .digest = "7fc2e9b7e11fc499187b98cd570200b2ff1244bb3b68610df8e779738a68daf9" },
+    RowDigest { .row = "an English producer's value replays under a localized consumer's marker",
+                .digest = "920b678d7d302237bbac8322218492f3bb5914c003b4311fce054ce0adf08968" },
+    RowDigest { .row = "an indented note canonicalizes, and its depth survives",
+                .digest = "697f9fdbcfb486cc563d9c5919ea4714e60b1e5b56abca9faaba092dd22b4344" },
+    RowDigest { .row = "a diagnostic quoting the marker mid-line is not a note",
+                .digest = "d41d57eafffe2a9a78b4ca327db1c822a55bef0ae56434677f1f8ccf31e2a1ce" },
+    RowDigest { .row = "empty region", .digest = "ff7acbd998d5e32f2ba3a47c779137140e018b16b2a9875b6d4945b86975469b" },
+    RowDigest { .row = "gcc diagnostic under the source root",
+                .digest = "e6bbb746df126c4529546cc65c85e61c1b8676e11b9b05269c201fa7ee5dbc05" },
+    RowDigest { .row = "gcc include chain, header and continuation",
+                .digest = "b11f9576be6f2394a2aa132c633cf62ab15bf72c4899d508b1c9f9cfa71e3361" },
+    RowDigest { .row = "gcc diagnostic in a toolchain header is untouched",
+                .digest = "28a4d31422770fbb7a6a0926830fb4006cfaba358a0b62524684e68d2c974bfa" },
+};
+
+/// A generation whose per-row output this build has frozen.
+struct FrozenGeneration
+{
+    std::span<RowDigest const> rows; ///< Its rows, one per corpus row.
+    std::uint8_t generation;         ///< The `CompileValueVersion` they were taken under.
+};
+
+/// Every generation frozen per row, oldest first.
+constexpr std::array FrozenGenerations {
+    FrozenGeneration { .rows = Generation4Rows, .generation = 4 },
+};
+
+/// What a bump CLAIMS it changed.
+///
+/// The claim is the `changed` set alone -- rows present in both generations whose
+/// output moved. Rows ADDED or REMOVED by the same commit are reported to the reader
+/// and deliberately excluded from the claim: widening the corpus is a repin rather
+/// than a behaviour change, and #547 did both in one commit, so demanding one list
+/// for two different acts would make the honest case unstatable.
+struct GenerationBump
+{
+    std::span<std::string_view const> changedRows; ///< Rows this bump says it moved.
+    std::uint8_t from;                             ///< The generation left behind.
+    std::uint8_t to;                               ///< The generation adopted.
+};
+
+/// Every bump between adjacent frozen generations.
+///
+/// Empty while only one generation is frozen, which is not a licence to forget: the
+/// `static_assert` below fails the BUILD the moment a second generation is frozen
+/// without the row saying what it moved. A runtime check would let that ship and
+/// report it afterwards, and this is a *do something* obligation rather than a *say
+/// why* one, so it belongs to the type system.
+constexpr std::array<GenerationBump, 0> GenerationBumps {};
+
+static_assert(GenerationBumps.size() + 1 == FrozenGenerations.size(),
+              "Every adjacent pair of frozen generations needs a bump row saying which corpus rows it "
+              "moved. Freeze the new generation's rows and add that row; a bump that moved nothing "
+              "spells an empty changedRows, which is a statement rather than an omission.");
+
+/// How two frozen generations differ.
+struct RowSetDelta
+{
+    std::vector<std::string_view> changed; ///< Present in both, output moved.
+    std::vector<std::string_view> added;   ///< Only in the newer generation.
+    std::vector<std::string_view> removed; ///< Only in the older generation.
+};
+
+/// Compare two frozen generations row by row.
+/// @param before The older generation's rows.
+/// @param after The newer generation's rows.
+/// @return Which rows changed, arrived and left, each in its own table's order.
+[[nodiscard]] RowSetDelta CompareFrozenRows(std::span<RowDigest const> before, std::span<RowDigest const> after)
+{
+    RowSetDelta delta;
+    for (auto const& row: after)
+    {
+        auto const* const earlier = FindOrNull(before, row.row, &RowDigest::row);
+        if (earlier == nullptr)
+            delta.added.push_back(row.row);
+        else if (earlier->digest != row.digest)
+            delta.changed.push_back(row.row);
+    }
+    for (auto const& row: before)
+        if (FindOrNull(after, row.row, &RowDigest::row) == nullptr)
+            delta.removed.push_back(row.row);
+    return delta;
+}
+
+/// Render a row list for a failure message.
+/// @param rows The row names.
+/// @return Them, comma-separated, or `(none)` -- which a reader must be able to tell
+/// from a list, since an empty claim is a real thing to say.
+[[nodiscard]] std::string RenderRows(std::span<std::string_view const> rows)
+{
+    if (rows.empty())
+        return "(none)";
+    std::string out;
+    for (auto const& row: rows)
+        out += (out.empty() ? "" : ", ") + std::string { row };
+    return out;
+}
+
+/// Append the stages a generation's contract covers, framed, to `material`.
+///
+/// Shared by the aggregate digest and the per-row one (#583) so the two cannot come to
+/// cover different stages, which is what two spellings of one list eventually do. They
+/// must NOT share a byte LAYOUT: the aggregate's value is pinned to
+/// `CompileValueVersion`, so re-folding it -- even into something that looks
+/// equivalent -- would move a published number with no behaviour changing, which is
+/// the exact failure the pin exists to catch, arriving from the instrument side.
 ///
 /// Each field is length-prefixed through `WireFields`, which is this tree's one
 /// definition of that framing — and it needs framing for the reason recorded at the
@@ -1004,13 +1171,14 @@ constexpr std::array StoredValueGenerations {
 /// A row's `name` is deliberately NOT hashed. It is a label for a human reading a
 /// failure, so hashing it would make renaming one — a purely editorial change — fail
 /// this test with a message telling the author to bump `CompileValueVersion`, which
-/// is the one action this design exists to make hard.
+/// is the one action this design exists to make hard. The per-row table keys ON that
+/// name, which is not a contradiction: a rename there is caught as a row that left
+/// and a row that arrived, and neither is a claim about behaviour.
 ///
-/// @return The hex digest.
-[[nodiscard]] std::string ConformanceDigest()
+/// @param trace One row's pipeline output.
+/// @param material The digest material to append to.
+void AppendCoveredStages(PipelineTrace const& trace, std::vector<std::byte>& material)
 {
-    std::vector<std::byte> material;
-
     auto const append = [&material](std::span<std::byte const> field) {
         auto const framed = WireFields::Encode({ field });
         material.insert(material.end(), framed.begin(), framed.end());
@@ -1019,26 +1187,39 @@ constexpr std::array StoredValueGenerations {
         append(AsBytes(text));
     };
 
+    // The STORED bytes, framing included: what one server writes and another
+    // reads is this exact byte string, so this is the thing two generations
+    // have to agree about. It is downstream of the producer's marker
+    // normalization, which is why that rewrite is inside the digest at all --
+    // two builds normalizing differently would put different bytes here under
+    // one generation, which is the failure this vector exists for.
+    append(trace.storedBytes);
+
+    // And the consumer's half, all the way to what the build system actually
+    // reads. Localize is the inverse the producer's rewrite is only useful
+    // through, so a change to it splits a fleet exactly as a change to
+    // Canonicalize does -- and the marker restore after it is the same argument
+    // one field over.
+    appendText(trace.replayed);
+}
+
+/// Digest the whole stored-value contract over the conformance corpus.
+/// @return The hex digest, folded exactly as every earlier generation took it.
+[[nodiscard]] std::string ConformanceDigest()
+{
+    std::vector<std::byte> material;
     for (auto const& row: ConformanceCorpus)
-    {
-        auto const trace = RunConformanceRow(row);
+        AppendCoveredStages(RunConformanceRow(row), material);
+    return HexDigest(Sha256::Hash(material));
+}
 
-        // The STORED bytes, framing included: what one server writes and another
-        // reads is this exact byte string, so this is the thing two generations
-        // have to agree about. It is downstream of the producer's marker
-        // normalization, which is why that rewrite is inside the digest at all --
-        // two builds normalizing differently would put different bytes here under
-        // one generation, which is the failure this vector exists for.
-        append(trace.storedBytes);
-
-        // And the consumer's half, all the way to what the build system actually
-        // reads. Localize is the inverse the producer's rewrite is only useful
-        // through, so a change to it splits a fleet exactly as a change to
-        // Canonicalize does -- and the marker restore after it is the same argument
-        // one field over.
-        appendText(trace.replayed);
-    }
-
+/// Digest ONE corpus row's contribution.
+/// @param row The corpus row.
+/// @return Its covered stages, digested alone.
+[[nodiscard]] std::string ConformanceRowDigest(ConformanceCase const& row)
+{
+    std::vector<std::byte> material;
+    AppendCoveredStages(RunConformanceRow(row), material);
     return HexDigest(Sha256::Hash(material));
 }
 
@@ -1048,8 +1229,9 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 {
     auto const& rows = StoredValueGenerations;
     // An emptied table would pass every check below vacuously, and read exactly like
-    // one that found nothing wrong.
-    REQUIRE_FALSE(rows.empty());
+    // one that found nothing wrong. Each shared assertion re-asks this for itself, so
+    // it holds even for a case that reaches only one of them.
+    FastCache::Testing::RequireGenerationsPopulated<std::uint8_t>(rows);
 
     auto const live = ConformanceDigest();
 
@@ -1057,7 +1239,7 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // on libstdc++ and libc++ and a class type on MSVC's, so the spelling the
     // analyser asks for on one host does not compile on another. That argument is
     // the helper's own, which is why this calls it instead of restating it.
-    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::version);
+    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::key);
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
@@ -1105,18 +1287,142 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
     // The structure carries it instead, and structure is what the reverting author
     // actually has to defeat. A bump ADDS a row, so the live byte names the LAST one;
     // putting the byte back names an earlier row however good its digest is.
-    for (auto const i: std::views::iota(std::size_t { 1 }, rows.size()))
+    FastCache::Testing::RequireGenerationsAscending<std::uint8_t>(rows);
+    FastCache::Testing::RequireLiveGenerationIsLast<std::uint8_t>(CompileValueVersion, rows);
+}
+
+TEST_CASE("Every corpus row is frozen under the live generation")
+{
+    auto const* const frozen = FindOrNull(FrozenGenerations, CompileValueVersion, &FrozenGeneration::generation);
     {
-        INFO("StoredValueGenerations is out of order at row " << i << ": generations are unique and ascending, so a "
-                                                              << "bump appends");
-        REQUIRE(rows[i].version > rows[i - 1].version);
+        INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
+                                       << " and no frozen row table names it. A bump freezes the new "
+                                          "generation's rows beside the old ones and adds the bump row that "
+                                          "says which rows it moved.");
+        REQUIRE(frozen != nullptr);
     }
 
-    INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion) << " but the newest generation in "
-                                   << "the table is " << static_cast<unsigned>(rows.back().version)
-                                   << ". A bump appends a row, so the live byte is the last one -- naming an earlier "
-                                   << "generation is a bump that was reverted, whatever digest was pasted with it.");
-    CHECK(CompileValueVersion == rows.back().version);
+    // Every digest is computed BEFORE any view is taken of one. A `std::string_view`
+    // into `digests.back()` would dangle the moment the vector reallocated, and a
+    // 64-character digest is past every standard library's inline capacity, so the
+    // bug would be invisible until somebody shortened the digest.
+    //
+    // The `reserve` is what clang-tidy asks for, and it REINFORCES that argument
+    // rather than replacing it: at an exact reservation the storage never moves, so
+    // no view can dangle even transiently. The ordering above is still the guarantee
+    // — a reservation holds only while nothing else pushes, and the next person to
+    // add a row to this case owes nothing to a `capacity()` they did not read.
+    std::vector<std::string> digests;
+    digests.reserve(ConformanceCorpus.size());
+    for (auto const& row: ConformanceCorpus)
+        digests.push_back(ConformanceRowDigest(row));
+
+    std::vector<RowDigest> live;
+    live.reserve(ConformanceCorpus.size());
+    for (auto const i: std::views::iota(std::size_t { 0 }, ConformanceCorpus.size()))
+        live.push_back(RowDigest { .row = ConformanceCorpus[i].name, .digest = digests[i] });
+
+    auto const delta = CompareFrozenRows(frozen->rows, live);
+
+    // The guard's remedy is part of the guard, so it says where each answer leads
+    // rather than only that something is wrong -- and the two directions call for
+    // OPPOSITE actions, which is the whole reason the aggregate check spells both.
+    std::string paste;
+    for (auto const& row: live)
+    {
+        paste += "    RowDigest { .row = \"";
+        paste.append(row.row);
+        paste += "\", .digest = \"";
+        paste.append(row.digest);
+        paste += "\" },\n";
+    }
+
+    {
+        INFO("the corpus has rows this generation's frozen table does not: "
+             << RenderRows(delta.added)
+             << ".\nAdding a corpus row is a REPIN and not a bump -- it widens what the generation is "
+                "measured over without changing what any server does -- so repin the aggregate digest "
+                "and paste this table over Generation"
+             << static_cast<unsigned>(CompileValueVersion) << "Rows:\n"
+             << paste);
+        CHECK(delta.added.empty());
+    }
+    {
+        INFO("this generation's frozen table has rows the corpus no longer holds: "
+             << RenderRows(delta.removed)
+             << ".\nA row RENAMED reads as one that left and one that arrived, and neither is a claim "
+                "about behaviour. Paste this table over Generation"
+             << static_cast<unsigned>(CompileValueVersion) << "Rows:\n"
+             << paste);
+        CHECK(delta.removed.empty());
+    }
+    {
+        INFO("these rows produce something other than what generation "
+             << static_cast<unsigned>(CompileValueVersion) << " was frozen with: " << RenderRows(delta.changed)
+             << ".\nThat is a BEHAVIOUR change and it is not repinnable: two servers on one wire at "
+                "different builds would stamp this same generation on text they rewrote differently. "
+                "Bump CompileValueVersion, freeze the new generation's rows, and add the bump row naming "
+                "exactly these.\nWhat this adds over the aggregate digest is only WHICH rows -- the "
+                "aggregate already fails, since it folds these same stages.");
+        CHECK(delta.changed.empty());
+    }
+}
+
+TEST_CASE("A generation bump names the rows it moved")
+{
+    // Every real bump against its claim. That loop is EMPTY today -- one generation is
+    // frozen, so there is no bump to check -- and a case whose only content is an empty
+    // loop passes vacuously, which is what this file refuses everywhere else. So the
+    // mechanism is driven below against staged tables, and the static_assert beside
+    // `GenerationBumps` is what makes the real loop non-empty the moment a second
+    // generation is frozen.
+    for (auto const& bump: GenerationBumps)
+    {
+        auto const* const before = FindOrNull(FrozenGenerations, bump.from, &FrozenGeneration::generation);
+        auto const* const after = FindOrNull(FrozenGenerations, bump.to, &FrozenGeneration::generation);
+        INFO("bump " << static_cast<unsigned>(bump.from) << " to " << static_cast<unsigned>(bump.to)
+                     << " names a generation with no frozen rows");
+        REQUIRE(before != nullptr);
+        REQUIRE(after != nullptr);
+
+        auto const delta = CompareFrozenRows(before->rows, after->rows);
+        INFO("bump " << static_cast<unsigned>(bump.from) << " to " << static_cast<unsigned>(bump.to) << " claims it moved "
+                     << RenderRows(bump.changedRows) << " and actually moved " << RenderRows(delta.changed)
+                     << ".\nRows that arrived (" << RenderRows(delta.added) << ") and left (" << RenderRows(delta.removed)
+                     << ") are corpus width rather than behaviour and are not part of the claim.\nThe "
+                        "order is the corpus's own, so list them as they appear there.");
+        CHECK(RenderRows(delta.changed) == RenderRows(bump.changedRows));
+    }
+
+    SECTION("a moved row is told apart from one that arrived and one that left")
+    {
+        constexpr auto Before = std::to_array<RowDigest>({
+            { .row = "stays", .digest = "aa" },
+            { .row = "moves", .digest = "bb" },
+            { .row = "leaves", .digest = "cc" },
+        });
+        constexpr auto After = std::to_array<RowDigest>({
+            { .row = "stays", .digest = "aa" },
+            { .row = "moves", .digest = "b2" },
+            { .row = "arrives", .digest = "dd" },
+        });
+        auto const delta = CompareFrozenRows(Before, After);
+        CHECK(RenderRows(delta.changed) == "moves");
+        CHECK(RenderRows(delta.added) == "arrives");
+        CHECK(RenderRows(delta.removed) == "leaves");
+    }
+
+    SECTION("two identical generations report nothing at all")
+    {
+        constexpr auto Rows = std::to_array<RowDigest>({
+            { .row = "stays", .digest = "aa" },
+            { .row = "also stays", .digest = "bb" },
+        });
+        auto const delta = CompareFrozenRows(Rows, Rows);
+        CHECK(RenderRows(delta.changed) == "(none)");
+        CHECK(RenderRows(delta.added) == "(none)");
+        CHECK(RenderRows(delta.removed) == "(none)");
+    }
 }
 
 namespace

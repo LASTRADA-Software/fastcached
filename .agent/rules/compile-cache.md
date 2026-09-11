@@ -535,11 +535,15 @@ same on both — the same defect with no MSVC anywhere near it.
           carried by every later reader and does not expire.
         - **A golden vector does not pin a bump; a retired-generation table does.** Reverting
           the tag and re-pasting the vector is one edit two hunks apart and leaves the suite
-          green. `Test::RetiredGeneration` in `KeyDigestTestSupport.hpp` is a row per generation
-          each key space has retired, and the live key must equal none of them, so restoring an
-          old tag reproduces a retired digest and fails whatever the golden says. Rows reach
-          back only to `v3`, because issue #63 moved the digest itself and `v2` and earlier are
-          unreachable by construction rather than by tag.
+          green. `Testing::Generation` in `src/tests/RetiredGenerations.hpp` is a row per
+          generation each key space has retired, and `RequireNoRetiredDigest` requires the live
+          key to equal none of them, so restoring an old tag reproduces a retired digest and
+          fails whatever the golden says. **That check is only a guard where the digested
+          inputs are FROZEN**, as this case's `KeyInputs` are; where they GROW it is vacuous,
+          which is why the stored-value table one section down asserts structurally instead
+          (#548, and the header states the distinction at the helper rather than at either
+          caller). Rows reach back only to `v3`, because issue #63 moved the digest itself
+          and `v2` and earlier are unreachable by construction rather than by tag.
     - One diagnostic consequence of the drop that used to happen: the launcher's
       `dependency set: 0 of M reported path(s) keyed` line was reachable for a second reason,
       so that fingerprint stopped identifying the #66 short-name mismatch on its own. The two
@@ -1808,16 +1812,40 @@ were open to breaking it, and neither needed anybody's install to be stale.
     and `PathCanon::LocalizeRegion`, digested, and matched against the row for the
     live `CompileValueVersion`. A digest alone would not do it — the behaviour and
     the golden are one edit two hunks apart, and moving both leaves the suite green,
-    which is `Test::RetiredGeneration`'s argument arriving at the same place from the
+    which is `RequireNoRetiredDigest`'s argument arriving at the same place from the
     key side. Retired rows stay, and what makes a reverted bump fail is STRUCTURAL:
     generations are unique and ascending and the live byte names the LAST row, so
     putting the byte back names an earlier one however good the digest pasted with it.
+    Both halves are `src/tests/RetiredGenerations.hpp` since #548 — the shared home the
+    two key types forced, a library test being unable to include an app header — and the
+    consolidation is what made the two tables' DIFFERENCE statable in one place: the key
+    side can assert digest-inequality because its inputs are frozen, and this side cannot
+    because its corpus grows.
     It used to be "the live digest must reproduce none of them", which reads like the
     same guard and is not one: the digest frames `canonical.bytes`, whose leading byte
     IS the version, so two generations are unequal by construction and that check
     could not fail. And a retired digest is a dated record besides — it describes the
     corpus as that generation met it, which the next corpus row invalidates
     ([#583](https://github.com/LASTRADA-Software/fastcached/issues/583)).
+  - **A bump's claim is checkable from generation 4 forward, and the aggregate digest
+    could never have carried it** (#583). The digest is a FOLD, so it answers *the
+    behaviour moved* and cannot answer WHICH rows moved — which is the only claim a
+    bump actually makes. `Generation4Rows` freezes the corpus PER ROW, and a second
+    frozen generation without a `GenerationBumps` row naming what it moved fails the
+    **build**, not a test: this is a *do something* obligation, so it belongs to the
+    type system. The ticket asked instead for a frozen corpus so a retired digest
+    could be **re-derived**, and that cannot be built at all: `ConformanceDigest`
+    folds the outputs of PRODUCTION functions, so the digest is a function of the
+    corpus AND of current behaviour, and a bump moves the behaviour half by
+    definition. Freezing the inputs alone yields today's behaviour over old inputs —
+    a number that is neither the retired digest nor anything a reader can interpret,
+    and worse than none because it would look like a re-derivation. So generations 1
+    to 3 stay DATED RECORDS by decision rather than by omission: recovering them needs
+    their behaviour, which is gone, and that is an accepted cost rather than open
+    work. Two frozen rows sharing a digest is the canonicalization WORKING — the two
+    bare-drive-root rows differ only on the producer side and erasing that difference
+    is the whole point — so equal-today is not redundant, and deleting one is the
+    available mistake.
   - **Measured, because a guard nobody has watched refuse is not a guard**: an edit to
     `JoinLocalized` — which changes what every consumer replays — is refused by
     **exactly one** case in the whole suite, the pin. Stated that way on purpose: the
@@ -2279,19 +2307,3 @@ with current truth at the moment the staleness would otherwise have done harm.
   the narrow reading is the useful one: the hazard is real for a discovery run over the
   USER's compile output and absent for one run over a probe TU the launcher wrote
   itself, so it is a design constraint on the fix rather than an argument against it.
-- **[#583](https://github.com/LASTRADA-Software/fastcached/issues/583)** — a
-  RETIRED generation's conformance digest is a dated record and nothing can
-  re-derive it: it describes the corpus as that generation met it, and #547 retired
-  generation 1 while adding three corpus rows in the same commit. The live row is
-  guarded, and a reverted bump is caught structurally (unique ascending versions,
-  the live byte naming the last row) — what is missing is any assertion that a bump
-  changed what it SAID it changed, which needs a per-generation frozen corpus. Read
-  with #548, since the key side's retired rows have the same property and whichever
-  lands second inherits the other's shape.
-- **[#548](https://github.com/LASTRADA-Software/fastcached/issues/548)** — the
-  retired-generation idiom has two homes with different key types:
-  `apps/fastcache-cc/KeyDigestTestSupport.hpp` keyed on a schema-tag string, and
-  `CompileValue_test.cpp`'s generation table keyed on a version byte. It could not be
-  reused as it stands because a library test may not include an app header, so the
-  shared home is `src/tests/` — and that constraint is what shapes the fix rather
-  than being incidental to it.
