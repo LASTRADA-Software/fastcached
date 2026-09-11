@@ -379,6 +379,51 @@ void ApplyEnvironment(Command& command, std::optional<std::string> (*lookup)(std
         command.credential.username = *user;
 }
 
+namespace
+{
+
+    /// A bare word that asks the same question as a flag.
+    struct WordAlias
+    {
+        std::string_view word; ///< What the operator typed in the command position.
+        Action action;         ///< The action it selects.
+        std::string_view flag; ///< The flag it is an alias FOR, for the help text.
+    };
+
+    /// Bare words accepted in the command position.
+    ///
+    /// **`help` is the word people type**, and answering it with *unknown command* while
+    /// printing the help text anyway was the worst of both: exit 2 for a question that was
+    /// understood, the text on stderr where a pipe swallows it, and uncoloured because the
+    /// usage-error path is deliberately plain. The text appearing made it look like it had
+    /// worked, so nothing about the output said the exit code was 2.
+    ///
+    /// A TABLE rather than a comparison, so the next such word -- `--version`'s bare
+    /// spelling is the obvious candidate, and is deliberately NOT here because `version` is
+    /// already a VERB that dials a server and reports both ends -- is a row rather than a
+    /// branch in a parse loop.
+    constexpr std::array WordAliases {
+        WordAlias { .word = "help", .action = Action::ShowHelp, .flag = "--help" },
+    };
+
+    /// The alias @p word names, or nullptr.
+    ///
+    /// A plain loop rather than `std::ranges::find`: `std::array`'s iterator is a raw pointer
+    /// on libstdc++ and libc++ and a class type on MSVC, so no one spelling of `auto`
+    /// satisfies both the compilers and `readability-qualified-auto`. The same collision
+    /// `FindVerb` records.
+    /// @param word What was typed in the command position.
+    /// @return Its row, or nullptr when the word is not an alias.
+    [[nodiscard]] WordAlias const* FindWordAlias(std::string_view word) noexcept
+    {
+        for (auto const& row: WordAliases)
+            if (row.word == word)
+                return &row;
+        return nullptr;
+    }
+
+} // namespace
+
 Command ParseCommand(std::span<std::string const> argv, Command seed)
 {
     auto command = std::move(seed);
@@ -399,6 +444,11 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
     std::span<char const* const> const args { raw };
 
     auto optionsEnded = false;
+
+    // Set once `--help` or `--version` has chosen the action. What follows can still say
+    // how to RENDER it and can no longer say what it is.
+    auto settled = false;
+
     for (std::size_t index = 0; index < args.size(); ++index)
     {
         std::string_view const token { args[index] };
@@ -417,6 +467,12 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
             auto const flow = ApplyOneOption(CliToolOptions(), args, index, command);
             if (!flow.has_value())
             {
+                // A bad flag AFTER `--help` cannot change the answer, so it must not
+                // replace it with a diagnostic. `--help --bogus` printed the help before
+                // this change -- the loop had already returned -- and goes on doing so.
+                if (settled)
+                    continue;
+
                 command.action = Action::UsageError;
                 auto const& error = flow.error();
                 command.diagnostic = error.field.empty() ? error.context : std::format("{}: {}", error.field, error.context);
@@ -432,18 +488,50 @@ Command ParseCommand(std::span<std::string const> argv, Command seed)
                                     command.verb);
                 return command;
             }
-            // `--help` and `--version` answer without reading the rest, which is right:
-            // they are questions about this binary, not about the command line.
+            // `--help` and `--version` are questions about this BINARY, so nothing
+            // after them may change the answer. That is what `ParseFlow::Stop` says and
+            // it stays true -- but *the answer* and *how the answer is rendered* are two
+            // questions, and returning here collapsed them: `--help --color=always` threw
+            // the flag away in silence, while `--color=always --help` honoured it. A flag
+            // that works in one position and is ignored in the other, with no diagnostic
+            // either way, is the worst of the three possible behaviours.
+            //
+            // So the action is SETTLED and scanning continues. Presentation flags still
+            // land; nothing can select a different action, because the rows that select
+            // one are exactly the rows that set this.
             if (*flow == ParseFlow::Stop)
-                return command;
+                settled = true;
             continue;
         }
 
+        // Once `--help` has answered, a bare word is not a verb either -- `--help get`
+        // asks for the help, not for a `get`.
+        if (settled)
+            continue;
+
         if (command.verb.empty())
+        {
+            // A bare word that asks a flag's question. Checked BEFORE `FindVerb`, so a
+            // row here shadows a verb of the same name rather than racing it -- and the
+            // table's own comment records why `version` is not one.
+            auto const* const alias = FindWordAlias(token);
+            if (alias != nullptr)
+            {
+                command.action = alias->action;
+                settled = true;
+                continue;
+            }
             command.verb = token;
+        }
         else
             command.operands.emplace_back(token);
     }
+
+    // A settled action needs no verb and no operand arity: it was a question about this
+    // binary. Returning here is what keeps `--help` from falling into *expected a
+    // command* now that the loop no longer returns early.
+    if (settled)
+        return command;
 
     if (command.verb.empty())
     {
