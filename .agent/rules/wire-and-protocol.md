@@ -915,6 +915,27 @@ Every rule below has already been a bug.
     a case that must survive an open write side, "detect a graceful close" and
     "abandon everything" are the same passing test.
 
+  - **And on the compile surface those two arms are now COUNTED apart, so they may not
+    be folded even though both reach one outcome.** `WatchPeer` sets `gone` either
+    way, which is what makes the fold look free — and
+    [#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090) proposed
+    exactly it, collapsing to `!readable.has_value() || *readable == 0` once the probe
+    `Read` went. That form reaches the right verdict and **cannot say which departure
+    it was**: a peer that RESET and one that said goodbye are different diagnoses, and
+    only the first is worth an alert
+    ([#1092](https://github.com/LASTRADA-Software/fastcached/issues/1092)). A graceful
+    mid-answer departure is a cancelled build or a reclaimed CI runner and its rate
+    means nothing; a rise in abortive closes is crashing clients, a lost route, or a
+    middlebox resetting long-lived connections. Both landed together for that reason —
+    the cleanup is real and the distinction survives it, each arm naming a
+    `PeerDeparture` that a table maps to its counter.
+
+    The pair is proved the same way the arms above are, by neutering: reporting every
+    departure abortive fails ONLY the FIN case, reporting the abortive arm graceful
+    fails ONLY the RESET case. **The FIN case is the load-bearing one** — an
+    implementation that counts every departure as abortive passes the RESET case, so a
+    suite holding only the positive assertion is green over it.
+
     And the signal is that the HANDLER RETURNED, not that a reply was empty: a reader
     still parked and one that unwound having written nothing produce identical bytes,
     which is why the in-memory suite could not see this even after
@@ -2093,19 +2114,6 @@ consequence rather than a precaution.
   again. The erase is what makes the event true exactly once.
 
 ## Open work
-
-- **[#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090)** —
-  `WatchPeer`'s 512-byte probe `Read`, `PeerWatch::pulled` and the `ByteReader`
-  priming that undoes the consumption exist to tell a readable edge from EOF.
-  `WaitReadable` has answered that directly since #677 — `0` for EOF, `>0` for data,
-  consuming nothing — on all five overrides, IOCP included, which does the peek in
-  `Dispatch` under `readPeekOnly`. So the mechanism is redundant rather than wrong:
-  it reaches the same verdict one syscall later, and the EOF path runs through it to
-  no effect. Listed here because what justified it was a claim about the EOF rule
-  above. Its own acceptance carries the constraint that matters — the collapse to a
-  single `!readable.has_value() || *readable == 0` cannot tell an error from a zero,
-  which is the distinction #1092 would need, so whichever lands second has to know
-  about the other.
 
 - **[#1218](https://github.com/LASTRADA-Software/fastcached/issues/1218)** —
   `FrameEndpoint`'s exactly-one-writer property is **declared** and not **enforced**.

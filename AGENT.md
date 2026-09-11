@@ -1024,6 +1024,16 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   close is the ORDINARY one (#712). `TlsSocket::WaitReadable` decrypts with `SSL_peek`,
   which removes nothing — "consumes nothing" is about bytes the CALLER could have read,
   not the decorator's own buffering. A raw EOF before a full record is EOF too.
+- And on the compile surface those two arms are COUNTED apart, so folding them is a
+  regression even though both reach one outcome. `WatchPeer` sets `gone` either way,
+  which is what makes the fold look free — #1090 proposed exactly it once the probe
+  `Read` went, and that form cannot say WHICH departure it was. A peer that RESET and
+  one that said goodbye are different diagnoses and only the first is worth an alert
+  (#1092): graceful is a cancelled build or a reclaimed runner, abortive is crashing
+  clients, a lost route, or a middlebox resetting long-lived connections. Both landed
+  together, each arm naming a `PeerDeparture` a table maps to its counter. Proved by
+  neutering, and the FIN case is the load-bearing one — counting every departure
+  abortive PASSES the RESET case.
 - An object a reactor OWNS is destroyed on that reactor's worker thread, or with that
   reactor stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, since clearing a
   pending awaitable anywhere else races the completion dispatch. #668 landed the

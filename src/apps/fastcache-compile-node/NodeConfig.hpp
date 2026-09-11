@@ -864,6 +864,25 @@ inline constexpr std::array<std::string_view, 5> LocalReloadableFlags {
     "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-member", "--fleet-open"
 };
 
+/// Both reloadable-flag lists, so the guards walk a derived SET rather than naming
+/// each list by hand.
+///
+/// **This exists because the omission it prevents has already happened.** The converse
+/// guard was written for `AdvertisedReloadableFlags` alone, with a comment explaining
+/// precisely why it was needed, and `LocalReloadableFlags` -- three lines away -- got
+/// none of it. A guard sitting next to the place it is missing is the shape that
+/// survives review, because the reader sees the assert and reads it as coverage
+/// ([#1027](https://github.com/LASTRADA-Software/fastcached/issues/1027)).
+///
+/// So the lists are enumerated ONCE, here, and the assertions in `NodeConfig.cpp` walk
+/// this. A third list is covered by being added to this array; naming the two lists in
+/// each assertion instead is the same duplication one level up, and is how the first
+/// guard came to stand alone.
+inline constexpr std::array<std::span<std::string_view const>, 2> ReloadableFlagLists {
+    std::span<std::string_view const> { AdvertisedReloadableFlags },
+    std::span<std::string_view const> { LocalReloadableFlags },
+};
+
 /// Whether a reload changed something this worker had TOLD the fleet.
 ///
 /// The band #403 made reloadable is not local wiring: `--toolchain` and

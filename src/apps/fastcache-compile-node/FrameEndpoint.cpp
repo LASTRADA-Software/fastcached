@@ -807,13 +807,6 @@ namespace
         /// a different case on purpose.
         bool consulted { false };
 
-        /// Bytes the watcher took off the socket proving the peer is still there.
-        ///
-        /// A pipelined request, in whole or in part. They are handed back rather than
-        /// consumed because the loop's `ByteReader` is the only thing that may parse
-        /// this stream -- see `ServeConnection`, which primes them.
-        std::vector<std::byte> pulled {};
-
         /// Where an abandoned delivery on this request is recorded.
         ///
         /// **A plain value, and that is the point.** The surface answers
@@ -826,6 +819,48 @@ namespace
         /// `bugprone-unchecked-optional-access` objects to and it is right to.
         IMetricsSink::Counter counter {};
     };
+
+    /// How a peer left, as the transport reported it.
+    ///
+    /// **An enum and not a bool**, because the question already has more than two
+    /// answers: a watch also reaches `RecordDeparture` for a socket THIS NODE closed,
+    /// which is neither of these and is suppressed there rather than named here. A
+    /// bool would have to be read as "abortive, or else something", which is the shape
+    /// this tree keeps having to undo.
+    enum class PeerDeparture : std::uint8_t
+    {
+        /// The peer reset the connection: `WaitReadable` answered an ERROR.
+        Abortive,
+
+        /// The peer closed gracefully: `WaitReadable` answered `0`, which is EOF.
+        Graceful,
+
+        Last,
+    };
+
+    /// What each cause adds beyond the shared departure rows.
+    struct PeerDepartureRow
+    {
+        PeerDeparture cause {};
+
+        /// The sibling counter this cause also increments, if it has one.
+        ///
+        /// Disengaged is a DECISION and not an omission: the graceful half is exactly
+        /// `departures - abortive`, so a row for it would carry no fact the pair does
+        /// not already carry, and it is the half nobody alerts on.
+        std::optional<IMetricsSink::Counter> counter {};
+    };
+
+    /// The causes, in enumerator order.
+    ///
+    /// A table rather than an `if` at the one call site, so a third cause -- a peer
+    /// swept by this node, say, were it ever named here rather than suppressed -- is a
+    /// row and not a new arm threaded through `RecordDeparture`.
+    constexpr std::array<PeerDepartureRow, static_cast<std::size_t>(PeerDeparture::Last)> PeerDepartureTable { {
+        { .cause = PeerDeparture::Abortive, .counter = IMetricsSink::Counter::FramePeerWatchDeparturesAbortive },
+        { .cause = PeerDeparture::Graceful, .counter = std::nullopt },
+    } };
+    static_assert(RowsInEnumeratorOrder(PeerDepartureTable, &PeerDepartureRow::cause));
 
     /// Mark a watch as having reached "gone", and count it when it still means
     /// something.
@@ -867,20 +902,20 @@ namespace
     /// @param state The server state: the counters, and whether this node closed it.
     /// @param socket The connection, to ask that second question about.
     /// @param watch The watch reaching its verdict.
-    void RecordDeparture(FrameServer::State& state, ISocket const* socket, PeerWatch& watch)
+    /// @param cause How the peer left, which decides only the sibling row: both
+    ///        suppressions above apply to it unchanged, so the abortive row is a
+    ///        SUBSET of the departures row rather than a parallel tally that could
+    ///        disagree with it.
+    void RecordDeparture(FrameServer::State& state, ISocket const* socket, PeerWatch& watch, PeerDeparture cause)
     {
         watch.gone = true;
         state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDeparturesObserved);
-        if (!watch.consulted && !state.ClosedLocally(socket))
-            state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDepartures);
+        if (watch.consulted || state.ClosedLocally(socket))
+            return;
+        state.metrics.Increment(IMetricsSink::Counter::FramePeerWatchDepartures);
+        if (auto const& row = PeerDepartureTable.at(static_cast<std::size_t>(cause)); row.counter.has_value())
+            state.metrics.Increment(*row.counter);
     }
-
-    /// How much a watcher takes when the socket turns out to have data on it.
-    ///
-    /// Small on purpose: whatever it does not take stays in the kernel's receive queue
-    /// and the loop's own reader collects it a moment later. This buffer exists to
-    /// answer one question -- EOF or data -- not to read a request.
-    constexpr std::size_t PeerWatchProbeBytes = 512;
 
     /// Watch for the peer going away while a responder answers.
     ///
@@ -910,13 +945,20 @@ namespace
     /// `0` only when its inbound pipe is drained AND write-closed; `TlsSocket`
     /// delegates or reports buffered plaintext.
     ///
-    /// So the probe `Read`, `PeerWatch::pulled` and the `PrimeWith` that undoes the
-    /// consumption are a mechanism whose justification has gone. **That is
-    /// [#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090), and it is
-    /// deliberately not done here**: #711 is a comment correction, and deleting a
-    /// mechanism inside one is a change wearing a review's authority. Until then the
-    /// `Read` is redundant rather than wrong -- it reaches the same verdict one syscall
-    /// later, and the EOF path runs through it to no effect.
+    /// So the probe `Read`, `PeerWatch::pulled` and the `PrimeWith` that undid the
+    /// consumption were a mechanism whose justification had gone, and
+    /// [#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090) removed
+    /// them. `WaitReadable` consumes nothing, so a pipelined request now simply stays
+    /// in the kernel's receive queue until the loop's own reader collects it -- which
+    /// deletes the prepend-ordering hazard rather than documenting it.
+    ///
+    /// **The two arms did NOT collapse into `!readable.has_value() || *readable == 0`,
+    /// which is what #1090 proposed.** That form reaches the right verdict and cannot
+    /// say WHICH departure it was, and the two are different diagnoses:
+    /// [#1092](https://github.com/LASTRADA-Software/fastcached/issues/1092) needs an
+    /// abortive close told apart from a graceful one, because only the first is worth
+    /// an alert. So the arms stay, each naming its `PeerDeparture`, and the cleanup
+    /// keeps the distinction the transport already draws.
     ///
     /// @param state The server state, shared for the same LIFETIME reason the socket
     ///        is: this watcher can still be parked when the connection's frame has
@@ -941,24 +983,39 @@ namespace
                            std::shared_ptr<ISocket> socket,
                            std::shared_ptr<PeerWatch> watch)
     {
+        // **ONE call decides the cause, and that is what makes the split clean.** This
+        // reads the socket exactly once: `WaitReadable` reports the count (#677) and
+        // nothing looks at the socket again before the verdict, so each arm carries a
+        // single cause.
+        //
+        // Reintroducing a read between the wait and the verdict brings back a
+        // TWO-CAUSE arm and files a reset as a goodbye. That is what the removed probe
+        // did: its `if (!got.has_value() || *got == 0)` folded EOF together with the
+        // probe failing on a socket `WaitReadable` had just called ready -- a reset
+        // landing in the window between the two calls. Both are departures and the
+        // total is unchanged, so the misfiling is silent. The clean two-way split is
+        // therefore a CONSEQUENCE of #1090 rather than a property of this function,
+        // which is the opposite of what #1092 warned about and the same fact.
         auto const readable = co_await socket->WaitReadable();
         if (!readable.has_value())
         {
-            // The socket errored or was closed under us -- including by the `Close()`
-            // the connection issues to retrieve this very frame. Either way there is
-            // nobody to answer, and a connection tearing itself down does not care
-            // which of the two it was.
-            RecordDeparture(*state, socket.get(), *watch);
-            watch->finished = true;
-            co_return;
+            // An ERROR is an abortive close -- the peer reset, or the socket was closed
+            // under us, including by the `Close()` the connection issues to retrieve
+            // this very frame. That last one is this node's own teardown and must not
+            // read as a client crashing, which is why `RecordDeparture` still asks
+            // `ClosedLocally`: the cause names what the TRANSPORT saw, and the
+            // suppressions decide whether it is anybody's business.
+            RecordDeparture(*state, socket.get(), *watch, PeerDeparture::Abortive);
         }
-
-        std::array<std::byte, PeerWatchProbeBytes> probe {};
-        auto const got = co_await socket->Read(std::span<std::byte> { probe });
-        if (!got.has_value() || *got == 0)
-            RecordDeparture(*state, socket.get(), *watch);
-        else
-            watch->pulled.assign(probe.begin(), probe.begin() + static_cast<std::ptrdiff_t>(*got));
+        else if (*readable == 0)
+        {
+            // Zero is EOF: the peer finished sending and said goodbye. Ordinary, and
+            // counted apart from the arm above for exactly that reason.
+            RecordDeparture(*state, socket.get(), *watch, PeerDeparture::Graceful);
+        }
+        // Anything else is bytes pending -- a pipelined request, which proves the peer
+        // is still there. `WaitReadable` consumed none of them, so there is nothing to
+        // hand back and the loop's reader will collect them itself.
         watch->finished = true;
         co_return;
     }
@@ -1029,16 +1086,16 @@ namespace
 
     /// Start watching for this peer going away, when the surface asks for it.
     ///
-    /// **Armed only when the reader holds nothing, and that is what makes priming the
-    /// pulled bytes ordering-safe.** `PrimeWith` prepends, so handing it bytes read
-    /// AFTER something already buffered would put the later bytes first and corrupt the
-    /// stream. With the buffer empty here it cannot happen: the loop is the only other
-    /// thing that touches this reader and it is suspended for the whole of `Answer`, on
-    /// the one reactor thread these surfaces share.
+    /// **Armed only when the reader holds nothing**, and the reason is now the only one
+    /// left: a peer that has just pipelined a request has proved it is there, which is
+    /// the entire question this watch exists to ask, so watching would cost a park to
+    /// learn what is already known.
     ///
-    /// Declining to watch when bytes are already queued costs nothing worth having,
-    /// either -- a peer that has just pipelined a request has proved it is there, which
-    /// is the entire question this watch exists to ask.
+    /// It used to carry a second reason -- the watcher consumed bytes and `PrimeWith`
+    /// prepended them back, which corrupts the stream if anything was already buffered.
+    /// That hazard is gone rather than guarded: since
+    /// [#1090](https://github.com/LASTRADA-Software/fastcached/issues/1090) the watcher
+    /// only peeks, so there is nothing to prepend and nothing to order wrongly.
     ///
     /// The optional is consulted HERE and nowhere else; what travels on is a plain
     /// counter on the watch, so the loop holds no optional it could mis-handle.
@@ -1202,9 +1259,12 @@ namespace
     /// where the `WriteAll` it must follow is visible.
     /// @param reactor The loop this connection runs on; never null.
     /// @param watch The watch, shared so it cannot die under the wait.
-    /// @param reader Where pipelined bytes are handed back; the one parser of this stream.
     /// @return Whether this connection may serve another request.
-    Task<AfterWatch> SettleWatch(IReactor* reactor, std::shared_ptr<PeerWatch> watch, ByteReader* reader)
+    ///
+    /// It took a `ByteReader*` until #1090, to hand back the bytes the probe `Read` had
+    /// consumed. The watcher only peeks now, so there is nothing to hand back and the
+    /// parameter went with the priming rather than being left unused.
+    Task<AfterWatch> SettleWatch(IReactor* reactor, std::shared_ptr<PeerWatch> watch)
     {
         if (watch == nullptr)
             co_return AfterWatch::KeepServing; // Not watching: the loop is unchanged.
@@ -1224,11 +1284,9 @@ namespace
         if (watch->gone)
             co_return AfterWatch::EndConnection;
 
-        // Bytes the watcher took to tell EOF from data -- before the write or during
-        // it. They belong to a pipelined request and go back into the one reader
-        // allowed to parse this stream; ordering is safe because the watch is armed
-        // only when that reader holds nothing and nothing has read from it since.
-        reader->PrimeWith(watch->pulled);
+        // Nothing to hand back: the watcher only ever peeked. A pipelined request is
+        // still in the kernel's receive queue and the loop's own reader takes it from
+        // there, which is why this no longer primes anything (#1090).
         co_return AfterWatch::KeepServing;
     }
 
@@ -1846,17 +1904,11 @@ namespace
                 if (state->responder.HoldsOwnByteBudget(decoded->opRaw))
                     bytes.Release();
 
-                // **Armed only when the reader holds nothing, and that is what makes
-                // priming the pulled bytes ordering-safe.** `PrimeWith` prepends, so
-                // handing it bytes read AFTER something already buffered would put the
-                // later bytes first and corrupt the stream. With the buffer empty here
-                // it cannot happen: the loop is the only other thing that touches this
-                // reader and it is suspended for the whole of `Answer`, on the one
-                // reactor thread these surfaces share.
-                //
-                // Declining to watch when bytes are already queued costs nothing worth
-                // having, either -- a peer that has just pipelined a request has proved
-                // it is there, which is the entire question this watch exists to ask.
+                // Armed only when the reader holds nothing: a peer that has just
+                // pipelined a request has proved it is there, which is the entire
+                // question this watch exists to ask. The prepend-ordering reason that
+                // used to stand here went with the probe read (#1090) -- the watcher
+                // peeks now, so there is nothing to hand back.
                 // Null when this surface does not watch this verb, or when the reader
                 // already holds a pipelined request -- see `ArmPeerWatch`, which carries
                 // the ordering argument. Every helper below takes that null.
@@ -1982,7 +2034,7 @@ namespace
                 // the bytes it goes on to pull are dropped: the next `ReadExactly`
                 // starts mid-frame, decodes a foreign magic, and closes a connection
                 // whose peer did nothing wrong.
-                if (co_await SettleWatch(&state->io.Reactor(), watch, &reader) == AfterWatch::EndConnection)
+                if (co_await SettleWatch(&state->io.Reactor(), watch) == AfterWatch::EndConnection)
                     break;
             }
         }
