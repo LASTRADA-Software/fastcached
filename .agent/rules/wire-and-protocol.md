@@ -1660,6 +1660,33 @@ Every rule below has already been a bug.
     Shown red by removing the guard from one arm site, where it reports `the canary
     SURVIVED` rather than a bare failure.
 
+- **The WRITE slot is the same rule, and it is enforced the same way.** One write op
+  per socket per direction, so arming a `Write` over a parked one drops that coroutine
+  exactly as #663's read side does. `Detail::ClaimWriteSlot` (`Net/WriteSlot.hpp`,
+  [#893](https://github.com/LASTRADA-Software/fastcached/issues/893)) folds the claim
+  and the `assert` into one expression, for the reason the read side gives: a guard
+  folded INTO the operation is self-enforcing, and one called alongside it needs a
+  scan. Debug-only, and refusing the operation is wrong here for the same reason.
+  - **It reaches `FrameEndpoint`'s one-writer property because `WriteAll` sends a whole
+    frame in ONE `ISocket::Write`.** So a write that PARKS is a half-sent frame, and a
+    second writer arming over it is a client reading a length out of the middle of
+    somebody else's frame -- the pulse-versus-reply interleaving
+    [`distributed-compilation.md`](distributed-compilation.md) describes. A write that
+    completes inline takes no claim and needs none.
+  - **Watched BOTH ways, which the read-side canary is not.**
+    `ctest -R write-slot-guard-canary` drives an ordinary sequential pair of writes and
+    only then the double-arm, and `scripts/write-slot-guard-gate.cmake` requires the
+    acceptance marker BEFORE the abort. A guard nobody has watched refuse is not a
+    guard; a guard nobody has watched ACCEPT is not known to work either (#1031) -- one
+    that objected to every write would pass a refusal-only gate and surface days later
+    as a different defect. That canary did not exist when `WriteSlot.hpp` first claimed
+    in its own doc comment that it did, which is
+    [#1218](https://github.com/LASTRADA-Software/fastcached/issues/1218).
+  - **What is still NOT enforced** is that a new helper can simply name `Loop`: the
+    scan behind `EndpointWriterTable` cannot say which FUNCTION a call sits in without
+    parsing bodies, so that half stays a refusal by ROW, which a reviewer sees, rather
+    than a property a compiler checks.
+
 - **A parked read is retrieved by `CancelRead`, and the caller that armed it is the
   only one who may.** `Read` and `WaitReadable` share one slot, and until #710 the
   only thing that could take a parked wait back was `Close()` -- so the caller-side
@@ -2112,25 +2139,3 @@ consequence rather than a precaution.
 - **Reporting without erasing would have been worse than neither.** The record
   stays, so the next `APPEND`/`INCR`/CAS on the same lapsed key fires `expired`
   again. The erase is what makes the event true exactly once.
-
-## Open work
-
-- **[#1218](https://github.com/LASTRADA-Software/fastcached/issues/1218)** —
-  `FrameEndpoint`'s exactly-one-writer property is **declared** and not **enforced**.
-  #675 gave every write a row in `EndpointWriterTable` naming which sanctioned writer
-  it is, so a fifth is a row with a reason rather than a `WriteAll` that appeared in a
-  helper — a refusal by ROW where there was only a refusal by absence. It stops
-  neither of the two things enforcement would: two writers writing at once, and a new
-  helper simply naming `Loop`, since the scan cannot say which FUNCTION a call sits in
-  without parsing bodies. Enforcement is the write-side mirror of
-  `Detail::ClaimReadSlot`, folded into the operation so no site has a line to forget.
-  What makes it its own ticket is the OWNERSHIP rather than the guard: the claim has
-  to be shared with `PulseProgress`, a `DetachedTask` holding only
-  `shared_ptr<ISocket>` and `shared_ptr<ProgressPulse>`, so it is either a slot on
-  `ISocket` — `Net/`-wide, and #1208 records `ISocket::Close` reaching
-  `EpollReactor::Detach` from the watchdog's own thread, so state there cannot assume
-  the single-threaded interleaving that makes the question easy inside one endpoint —
-  or a new shared per-connection object, which is a new lifetime in the file #737,
-  #840 and #875 were each spent on. **Ordering:** #1211 infers a teardown race in that
-  same file, so the second shape waits on it; the first does not.
-

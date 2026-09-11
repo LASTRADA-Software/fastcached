@@ -1123,6 +1123,16 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   ordinary disconnect. The hazard is the **SITE**, not ownership: at the ARM site a
   socket cannot tell a stale parked wait from a live one, and cancelling a live one is
   a false disconnect that drops a healthy client. The CALLER can tell.
+- The WRITE slot is the same rule: one write op per direction, so arming a `Write` over
+  a parked one drops that coroutine the same way. `Detail::ClaimWriteSlot`
+  (`Net/WriteSlot.hpp`, #893) folds the claim in, Debug-only, and it reaches
+  `FrameEndpoint`'s one-writer property because `WriteAll` sends a whole frame in ONE
+  `Write` — so a parked write is a HALF-SENT frame and a second writer splices into it.
+  `write-slot-guard-canary` watches it BOTH ways, driving an ordinary sequential pair of
+  writes before the double-arm and requiring the acceptance marker first: a guard nobody
+  has watched ACCEPT is not known to work either (#1031). It landed (#893) with its own
+  doc comment citing a canary that did not exist — one `git grep` hit, the sentence
+  making the claim (#1218). What is still unenforced is a new helper naming `Loop`.
 - So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of
   *abandon* that is not `Close()`, virtual with a default no-op like `ShutdownWrite`.
   `RunBlockingRead` armed a watch per loop pass and cancelled none (#710): it now keeps
