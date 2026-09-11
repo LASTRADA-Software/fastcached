@@ -208,6 +208,53 @@ struct DriverIdentityProbe
 /// and two spellings would put every worker permanently out of agreement with every
 /// client -- silently, as a scheduler that simply never matches.
 ///
+/// ## Why the saving is worth a branch at all
+///
+/// The launcher is ONE PROCESS PER TRANSLATION UNIT, so a second spawn here is a
+/// second spawn per unit of the whole build rather than a one-off. Measured rather
+/// than assumed: a 5-unit project built through a real `fastcache-cc` produced 5
+/// records in its `invocations.log`, with a positive control on the launcher being
+/// wired (5 `LAUNCHER =` bindings in `build.ninja`; zero would have voided the run).
+/// That is also why memoizing the triple buys nothing -- a within-process memo has
+/// nothing to hit -- and a cross-process one is unsound, `clang-cl` taking
+/// `-fms-compatibility-version` from an MSVC install that can be upgraded beside a
+/// byte-identical driver. This is not a cache: nothing is remembered.
+///
+/// ## Why keying on the STEM is sound rather than merely convenient
+///
+/// `ClassifyCompilerFromBanner` moves a flavour in ONE direction only -- `Gcc` to
+/// `Clang`, on positive evidence. So a driver whose NAME already says clang cannot be
+/// reclassified, and the row read here, before the banner is known, is the row the
+/// caller reads after the correction. A triple parsed from the wrong row is a wrong
+/// cache key, and that one-directional property is what rules it out.
+///
+/// It is also what GENERATES the `cc`/`c++` carve-out, rather than that being a
+/// separate rule to remember: those two name a policy rather than a product -- on
+/// macOS, Apple clang -- so they classify as `Gcc` here and keep both spawns. `gcc`
+/// and `g++` keep them too, their `-###` leading with `Using built-in specs.` rather
+/// than a banner (measured, g++ 14.2.0). `cl` has neither flag and is untouched.
+///
+/// ## The identity is CHECKED, which is why no fingerprint bump rides with this
+///
+/// Measured 2026-09-11 byte-identical to `--version`'s first line on seven drivers
+/// over two hosts and three clang builds -- clang, clang++ and clang-cl from VS 18's
+/// LLVM 22.1.3; clang and clang++ from Ubuntu's 20.1.2; clang-22 and clang++-22 from
+/// Ubuntu's 22.1.8 -- with `-###` exiting 0 on all seven, which is load-bearing
+/// because the fallback below requires a zero exit and an empty banner IS an
+/// identity. GCC discriminates the measurement rather than passing it: g++ 14.2.0's
+/// `-###` leads with `Using built-in specs.`, so a comparison that could not tell the
+/// two apart would have been visible.
+///
+/// Seven drivers on two hosts is not a fleet, so the property is not left as an
+/// assumption. `scripts/check-banner-probe-identity.sh` asks it of every merged-path
+/// driver on whatever machine runs the suite, skipping-and-naming where there is
+/// none. **That check is what stands in for the bump.** Bumping unconditionally
+/// would discard every stored object to record a change that -- if the lines really
+/// are identical -- did not happen; the check costs a few spawns and turns the
+/// remaining doubt into a red build on the first platform that breaks it. A driver
+/// found disagreeing is the finding that reopens the bump question, and it goes to
+/// whoever owns the fleet rather than being absorbed by adjusting the check.
+///
 /// @param runner Process-spawning seam.
 /// @param compiler The compiler to ask.
 /// @return The banner, and the driver output it came from when the two were merged.
