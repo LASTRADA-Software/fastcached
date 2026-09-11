@@ -970,791 +970,401 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   payload, not symlinks) and `FASTCACHED_MACOS_LINKED_TOOLS`. Guard: #1202.
 **[`.agent/rules/build-and-toolchain.md`](.agent/rules/build-and-toolchain.md)** —
 what differs between compilers, standard libraries, hosts and tool versions.
-- Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare
-  path**, which is this file's own #723 rule. It used to be argued from the file MODE, and
-  that reason has gone false: `ctest -R script-modes` requires every tracked shell script
-  carrying a shebang to be `100755`, so the **126** this bullet used to cite cannot happen
-  here any more (#720 repaired the modes and added the guard; #1033 is this correction).
-  The count that stood here was wrong in both halves and is not replaced by a corrected
-  one — a restated figure is a second source of truth that drifts again, and the property
-  is enforced rather than remembered. **The rule outlives its dead reason**: a call that
-  fails to START fails for reasons a chmod does not cover, and inside a `want-fail`
-  assertion any of them is indistinguishable from the rule firing. Name the interpreter
-  regardless. One configuration
-  is not the gate. A RED run
-  stops at the first failing leg — correct, and it now NAMES the legs it skipped, because
-  "GATE FAILED: clang-debug tests" alone read as "the rest passed" and two `-Werror`
-  defects hid behind five red runs that never reached `gcc-release` (#501). Read the
-  per-leg block, not just the reason. A run printing NEITHER terminal line did not
-  CONCLUDE — a fifth state beside skipped/absent/unstarted/failed, never a red gate,
-  because a `pkill -f local-gate.sh` in another lane's worktree is fixed somewhere
-  else entirely. Every run opens with a start marker naming its pid, tree and commit,
-  and `--classify=<log>` reads the rule back with an exit status per outcome. A trap
-  cannot do this job: bash DEFERS one until `ninja` returns (measured, 2 s in and 6 s
-  late), and the `wait` workaround fires on time only by orphaning the build — 34 live
-  descendants, measured (#584). A GREEN run is silent in the OTHER
-  direction: four defects in four tickets were reachable only by the analyser or a
-  sanitizer, so a fully green MSVC run of ~2997 tests could not have reported any of
-  them. A platform's leg answers a different question, not a weaker version of the same one.
-- **A retry makes an instrument's own failures disappear without fixing them.** The ways
-  the gate has reported on something other than the tree under test are enumerated below
-  and deliberately NOT tallied. This bullet used to open "Twelve ways … across five
-  tickets" while `.agent/rules/build-and-toolchain.md` opened "Eleven separate ways …
-  across four tickets" — two hand-kept numbers for one fact, and they had already drifted
-  apart (#1033). The rules file's figure is at least DERIVED, being the sum of the
-  per-ticket breakdown it states; this one was a bare number over a prose list, which
-  nothing can check and #780 watched drift three commits running. A number no check can
-  derive from the thing it counts is a second source of truth, so the list is the claim:
-  `| tail` reporting the pipe's status, quoting collapsing through three parsers
-  so the run never happened, two gates in one build directory, a dirty tree, the log on
-  `/tmp` where a WSL idle-out erases it, the wrapper edited WHILE bash was executing it, a
-  `/mnt` path mangled by Git Bash so the launcher exited **0** having run nothing, and a
-  BACKGROUND LAUNCH that started nothing and said so in the affirmative — `A && B &&
-  nohup C & echo STARTED` binds the `&` to the WHOLE `&&` list, so the marker is printed
-  by the launcher before anything it describes could have failed, and under `wsl.exe` the
-  detached job dies with the invocation that started it whether or not `setsid` and
-  `nohup` are spelled; the tell was that the log file did not EXIST, never the exit
-  status, and the two mangled-path re-encounters beside it were already two entries on
-  this list, which is what the list is for — and its SHARPEST form, `nohup` inside
-  `wsl.exe -e bash -lc`, where the child dies with the WSL session and the log is never
-  CREATED: not stale, not truncated, **absent**, so there is no artefact to examine or
-  date and absence is exactly what a lane reads as *still running*. `pgrep -f
-  local-gate.sh` cannot settle that — it found three gates, none of them the asking
-  lane's, and every one matched the same pattern; `readlink /proc/<pid>/cwd` per pid is
-  what named them. **Four spellings in one evening from four lanes, and the property that
-  ties them is that NEITHER the wrapper's exit status NOR the presence of a log settles
-  it**: two produce exit 0 with no work done, one produces no artefact at all, and one
-  produces a status about the wrong process — `GATE_EXIT=$?` inside a `wsl.exe` string is
-  the OUTER shell's, reporting `0` over a run that had just printed `TSAN GATE FAILED`,
-  which is a second mechanism reaching the same false verdict as the `setsid` fork below.
-  So the wrapper writes an artefact BEFORE the gate starts, naming the commit it is
-  about, which makes *the wrapper ran* checkable independently of *the gate produced
-  output* — and the verdict itself is read from the tool's own terminal text, never from
-  a status. And a
-  DrvFs log redirect that failed while leaving the gate child ALIVE, and the gate's own
-  `clang-format -i` REWRITING the commit and then measuring what it had rewritten, and a
-  `ctest` total that counts only the TARGET SET it was configured with — `-DFASTCACHED_BUILD_TESTCLIENT`
-  and `-DFASTCACHED_BUILD_BENCHMARKS` default OFF, so one commit on one platform gives two
-  different totals and the tree just looks smaller. A total is comparable only against the
-  same tree, the same platform AND the same target set, and a LOG THAT DOES NOT NAME ITS
-  OWN COMMIT — a `/tmp` wipe left the previous run's durable copy sitting where the current
-  one goes, reporting a failure already fixed, and only an accident of timestamps told them
-  apart. A verdict must carry what it is a verdict about, and a WRAPPER's exit code is a
-  verdict about the WRAPPER — `setsid` **forks when the caller is already a process-group
-  leader**, so the parent returned instantly and `GATE EXIT=$?` recorded **0 before the gate
-  ran a step**, which a waiter keyed on that string then believed. It was caught because the
-  line sat ABOVE the gate's own `LOCAL GATE STARTED` marker: an ORDERING check, where every
-  value check agreed with it. And a run that was KILLED mid-build is discarded rather than
-  read — an unfinished run has told you nothing, which is not the same as telling you the
-  tree is fine. None
-  announces itself; each looks like a flake; a re-run clears every one of them. **And a gate that
-  DIED partway writes no verdict at all** — two full gates ran concurrently on one host,
-  swap went to 7G of 7G with no OOM kill logged, and one died mid-build with exit **144**.
-  A nonzero exit from a KILLED gate is not a red tree, and 144 turned up twice that day in
-  unrelated contexts, so it means *something killed this* and never *the tree is bad*.
-  Serialise the gate across lanes rather than racing it — **with a LOCK, and a
-  poll-for-zero is not one.** *"Wait until no other `local-gate.sh` is running, then
-  start"* reads as mutual exclusion and behaves like it **only while there is a single
-  waiter**, which is the condition it is invariably tested under. With N waiters it fails
-  twice: it STARVES, because it waits for zero rather than for the set running when you
-  arrived, so every later arrival extends your wait — measured on this box, a lane queued
-  at 5:35 was still waiting at 15:57 while one that arrived ten minutes later started and
-  finished first; and it is a THUNDERING HERD, because when the running set drains every
-  waiter's next poll sees zero and they all start at once, which is the concurrent-gate
-  storm the rule exists to prevent, arriving at the moment adoption is complete and
-  looking exactly like nobody following the rule. `flock` on a lock file, never `fcntl`,
-  for the reason the storage and scratch-root rules already give — an `fcntl` lock is per
-  PROCESS, so two gates inside one shell would both take it and succeed. It is not FIFO,
-  so a lane can be unlucky; unlucky-and-bounded is not starving and cannot stampede, and
-  it must not be "improved" into a queue. A dirty-tree guard
-  that samples once AT THE START cannot see an instrument that dirties the tree itself —
-  sample at both ends, and note that implementing half of a two-clause rule looks exactly
-  like compliance. Presence is not usability, and a
-  finding fixed at the line rather than at the rule comes back.
+- Run `bash scripts/local-gate.sh` before pushing — **`bash <path>`, never the bare path**.
+  A call that fails to START fails for reasons a `chmod` does not cover, and inside a
+  `want-fail` assertion any of them is indistinguishable from the rule firing. One
+  configuration is not the gate. A RED run stops at the first failing leg and NAMES the legs
+  it skipped, so read the per-leg block, not just the reason. A run printing NEITHER terminal
+  line did not CONCLUDE — a fifth state beside skipped/absent/unstarted/failed, and never a
+  red gate; `--classify=<log>` reads the rule back with an exit status per outcome. A trap
+  cannot do this job. **A GREEN run is silent in the OTHER direction**: a platform's leg
+  answers a different question, not a weaker version of the same one.
+- **A retry makes an instrument's own failures disappear without fixing them.** The ways the
+  gate has reported on a tree other than the one under test are enumerated in the rules file
+  and deliberately NOT tallied — a number no check can derive from the thing it counts is a
+  second source of truth, so the list is the claim. None announces itself, each looks like a
+  flake, a re-run clears every one. **Neither the wrapper's exit status NOR the presence of a
+  log settles whether the gate ran**, so the wrapper writes an artefact BEFORE the gate starts
+  naming the commit it is about, and the verdict is read from the tool's own terminal text.
+  Serialise the gate across lanes with `flock` — **a poll-for-zero is not a lock**: it starves
+  and it stampedes, and it behaves correctly only while there is a single waiter, which is the
+  condition it is invariably tested under. A run that was KILLED mid-build is discarded rather
+  than read.
 - **A red gate reads as "my branch is bad", never as "the gate is broken" — so a gate that
-  fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it.** This is not
-  another entry in the list above: every one of those is the gate reporting on the WRONG
-  TREE, and this is the gate refusing EVERY tree, at its first leg, with a confidently
-  worded false cause. #1031 shipped in the change that added the guard (#926) and stood for
-  two days — `run_preset` read `$dir`, which is `local` to `configure_reason` and unbound
-  there, and under `set -uo pipefail` with no `-e` the expansion killed only the
-  substitution's subshell, so the caller carried on with `""` and the `*)` arm reported
-  *"the resolved C++ compiler IS  (a compiler cache)"*. All THREE are needed for that to be
-  quiet — `-u` making it an error, the ABSENCE of `-e` letting the parent continue, and a
-  default arm accepting the empty result; remove any one and it is a loud failure naming
-  the variable. Two lanes hit it and worked around it by hand before anybody suspected the
-  instrument. Its `none` arm had, on the evidence, never once been observed answering. The
-  lesson the list above does not carry: **a guard nobody has watched ACCEPT is not known to
-  work**, so assert the passing direction, not only the refusing one.
-- **Verifying the FACT a check is about is not verifying the CHECK**, and that is the
-  version that feels like diligence — you doubt an instrument, answer its question a
-  second way, and report the agreement, but two spellings are two instruments and only
-  one was under test. **Run both directions: which one you skipped decides which way it
-  lies** — skip the negative case and a predicate fails toward *present* (the direction
-  that gets acted on), skip the positive and it fails toward *refuted* (the direction
-  that gets believed, because refuting looks like rigour). And measure an idiom at REAL
-  size: `producer | grep -q` under `pipefail` is size-dependent — wrong 20 of 20 at
-  101 KB, right 20 of 20 at 1.1 KB — so a small fixture reports it working.
-- **A count that OVERSTATES what is wrong is the same defect as one that understates it**,
-  and the tell is an arm reporting a number nobody can explain — which is the only
-  actionable half, since all three instances were caught that way and none by reading the
-  code. The directions are not symmetric: an under-report is silent and found late, while
-  an over-report is **loud and misattributed**, sending somebody to a defect that is not
-  there and discrediting the instrument when they find nothing. A literal `;` in a CMake
-  list element made one violation count as **2**; an edit landing a `string(REPLACE ...)`
-  *between* `list(APPEND violations` and its argument made the run report **10**; a missing
-  file gave three findings for one cause because the loop still ran after the guard. And a
-  `macro()` substitutes its arguments TEXTUALLY, so CMake re-parses them and a backslash is
-  eaten twice — `"\\("` at the call site reaches `MATCHES` as a bare `(` and fails at
-  regex-COMPILE time, which reads as *my pattern is wrong* rather than *my macro ate a
-  backslash*; the same textual substitution makes `if(param ...)` inside a macro compare
-  the literal string `param`, silently dead
-  ([#1216](https://github.com/LASTRADA-Software/fastcached/issues/1216)).
+  fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it.** Not another
+  wrong-tree entry: that list is the gate reporting on the wrong tree, this is the gate
+  refusing EVERY tree, at its first leg, with a confidently worded false cause. **A guard
+  nobody has watched ACCEPT is not known to work**, so assert the passing direction, not only
+  the refusing one.
+- **Verifying the FACT a check is about is not verifying the CHECK**, and that is the version
+  that feels like diligence. **Run both directions: which one you skipped decides which way it
+  lies** — skip the negative case and a predicate fails toward *present*, skip the positive and
+  it fails toward *refuted*, which is the direction that gets believed because refuting looks
+  like rigour. And measure an idiom at REAL size.
+- **A count that OVERSTATES what is wrong is the same defect as one that understates it**, and
+  the tell is an arm reporting a number nobody can explain. The directions are not symmetric:
+  an under-report is silent and found late, an over-report is **loud and misattributed**,
+  sending somebody to a defect that is not there and discrediting the instrument. A `macro()`
+  substitutes its arguments TEXTUALLY, so CMake re-parses them, a backslash is eaten twice, and
+  `if(param ...)` inside a macro compares the literal string `param`, silently dead.
 - **A claim about a tool is checked against the tool.** A pattern is broader than its author
-  reads it as (`pgrep -f "scripts/local.gate"` is a REGEX; the `.` matches the `-`), a
-  process is attributed by its ancestor chain and never by a cmdline match or a leaf `cwd`,
-  and a bound nobody has watched fire is untested rather than proven. The general form: "a
-  SIGTERM does not take 55 seconds to arrive" is true of `local-gate.sh` only because it
-  traps `EXIT` and not `TERM` — bash defers a TRAPPED signal, so the general claim and the
-  specific one point opposite ways and nothing warns you which you hold. And **the tree
-  you measured is not necessarily the tree in question** — a grep in a checkout parked on
-  a merged branch produced a CONFIDENT CORRECTION, which propagates where a missing log
-  merely stalls. The tell is that the answer was too convenient.
-- A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007 `/bin/bash`, and a default-set
-  script runs on every platform CI builds. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the
-  process substitution when replacing `mapfile`, or the `pipefail` trap comes back. The constraint was already in
-  `coverage.sh`'s comments, where nobody looking at a new script would find it.
-- **`std::from_chars` has no FLOATING-POINT overload in libc++ before macOS 26.0** --
-  the `macos-14` runners -- so `std::from_chars(first, last, someDouble)` compiles on
-  libstdc++ and on MSVC and fails to BUILD on the one leg CI runs it on. Every integral
-  `from_chars` in this tree is fine, and there are many, which is what makes the
-  standing remedy for a missing libc++ facility (*grep for it in non-test code and see
-  that macOS already compiles it*) answer YES and be WRONG: a grep tests a NAME while
-  the hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's
-  one answer, and it pins the C locale as well, which the obvious `istringstream`
-  spelling does not. It cost a red `macOS-clang-release` once, written by an author with
-  the correct implementation already in the tree -- in a comment only the RESP handler's
-  readers ever see, which is why it has moved.
-- A `char` is UTF-8 here, at run time and at compile time: every Windows executable
-  declares the UTF-8 process code page and MSVC gets `/utf-8`. Converting one
-  boundary instead would leave `path`, `CreateProcessA` and `getenv` on the legacy
-  page.
-- `std::filesystem::path`'s narrow constructor THROWS on such a host for bytes that
-  are not UTF-8 — before any `error_code` overload runs. `PathFromNarrowText` is the
-  one `catch` in this tree.
-- Where `clang-debug` will not build, get ASan from GCC (`-fsanitize=address` alone —
-  UBSan breaks the option tables' constexpr checks) and run the **whole** suite: a
-  freed block nothing disturbs reports nothing.
-- Run clang-format and clang-tidy **at the version CI pins**, in a build directory
-  of its own; `PATH` resolving to an older binary reports clean in the way that
-  means nothing.
-- **And `CLANG_TOOLS_VERSION: 22` pins a MAJOR, not a BUILD.** apt.llvm.org ships
-  rolling snapshots under one version number, so `clang-tidy-22 --version` prints
-  `Ubuntu LLVM version 22.1.8` for two binaries a month apart, and only
-  `dpkg-query -W -f='${Version}\n' clang-tidy-22` tells them apart. Measured
-  2026-09-10 (PR #1198): local `20260613092238+e80beda6e255` against CI's
-  `20260714014902+ca7933e47d3a`. CI reported **19**
-  `modernize-use-designated-initializers` errors in a new test file; the local sweep
-  of the same file, same database, with the check NAMED EXPLICITLY and a canary
-  proving the analyser ran, reported **0** — and after
-  `apt-get install --only-upgrade clang-tidy-22` reported exactly 19. Both directions
-  measured, so the variable is the binary. What makes it expensive is that the remedy
-  reads as already applied: you have a binary called `clang-tidy-22`, so the rule
-  above looks satisfied while the analyser is silent about a check it does not carry —
-  and it invalidates every earlier verdict of that session, not just the one file.
-  `clang-format-22` rides the same stream and was equally stale, which is the mirror
-  hazard, so upgrade the pair; read `apt-cache policy`, never the `--version` banner.
-- A script that NAMES a tool version must name it **everywhere that version matters**.
-  `local-gate.sh` pinned the formatter and handed the analyser to `PATH`, with the
-  paragraph explaining why that is wrong in its own header four lines above — an
-  argument carried one call short. And a cached `find_program` result outlives every
-  reason it was chosen: the gate configured only when `CMakeCache.txt` was ABSENT, so a
-  tree kept the first clang-tidy it ever found and re-running the gate could not repair
-  it. Check the pin against the cache, not only pass it. `ctest -R local-gate-selftest`.
-- A **reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference
-  build** — it did not, and both its configurations were fronted by whatever launcher was
-  installed (148 and 618 `LAUNCHER = ` edges, measured). The rule was already standing in
-  `launcher-replay-e2e.sh`, which names it and cites #319; *stating a rule in the file that
-  obeys it is how the file that does not obey it never learns about it*. Pinning the other
-  two tools argues for REMOVING this one, not versioning it: their version changes the
-  verdict and has a canonical value, a cache is supposed to be verdict-neutral, and
-  requiring "the launcher built from this tree" is unsound twice — `-dirty` is not an
-  identity, and it routes the gate's objects through the change being gated. Passing the
-  flag is not the fact: `CompileCache.cmake` leaves an externally-set launcher untouched,
-  so the refusal reads `build.ninja`, never `CMakeCache.txt`, which never holds it.
-- **sccache is never selected AUTOMATICALLY** (`ALLOW_SCCACHE_FALLBACK`, default OFF). Being
-  the unasked-for answer to `fastcache-cc` being unusable is how this project built through
-  sccache for weeks while believing it dogfooded its own launcher: an 0.1.0 daemon refused a
-  wire-3 launcher, everything degraded exactly as designed, and the only trace was a `STATUS`
-  line and a `--show-stats` tally nobody reads (#815). The three Windows jobs opt in — miss one
-  and it compiles cold, which their `compile_requests -eq 0` assertion is what catches. Gating
-  the ROW, never having CI set `CMAKE_CXX_COMPILER_LAUNCHER`: the module returns early on an
-  external launcher and would take #170's `/showIncludes` caveat warning out of the log with it.
-  **And dropping sccache RELOCATES the silence to ccache rather than ending it** — so a rejection
-  matching its row's `predicts` column is a WARNING whatever replaced it, *including nothing*,
-  which is the loudest case and was the one emitting nothing at all. #658 conditioned that
-  warning on the winner's caveat, which exists only on MSVC/clang-cl, so it was silent by
-  construction on the host that filed the bug. A WARNING, never `SEND_ERROR`: this module may
-  not fail a configure, and a stale daemon is the normal state during a rollout. The refusal's
-  wording comes from the DAEMON, so an old one sends the old sentence forever and the direction
-  (*your daemon is the older one*) is named in the module's `predicts_detail`, not at the source.
-- A `cmake -P` check is judged by its OUTPUT, never by its exit code
-  (`FAIL_REGULAR_EXPRESSION`, one spelling defined once). Two reasons, and the one
-  this bullet used to give was neither: `message(WARNING)` exits **0** on every
-  CMake while printing `CMake Warning`, and a check that shells out to another
-  `cmake -P` without reading `RESULT_VARIABLE` exits 0 with its child's error on
-  the output. It said `message(FATAL_ERROR)` exits **0** on 3.28, this project's
-  declared minimum; that does not reproduce — exit **1** on 3.22.6 through 4.3.0,
-  six script shapes — so `ctest -R fatal-error-exit` now ASKS on every platform CI
-  builds rather than restating a sentence (#565). The likely mechanism is a true
-  neighbouring fact carried one clause too far: a `-P` script cannot *choose* its
-  exit code before 3.29, which decides the SKIP direction and was read as *cannot
-  signal failure by exit code*.
-  - A failure signal that is a *property* needs both `script-check-canary` (a
-    script that must be seen to fail, `WILL_FAIL`) and `script-check-signals` (no
-    registration omits it). And **`WILL_FAIL` inverts the WHOLE verdict**, so a
-    canary carried by its exit code is vacuous: exiting 1 it passed on the status
-    alone and would have gone on reporting green with `FAIL_REGULAR_EXPRESSION`
-    deleted from every registration in the tree. It therefore exits **0** and
-    prints a real `CMake Error` from a nested `cmake -P`, which leaves the pattern
-    as the only thing that can fail it. Fixing a wrong *reason* without
+  reads it as (`pgrep -f "scripts/local.gate"` is a REGEX), a process is attributed by its
+  ancestor chain and never by a cmdline match or a leaf `cwd`, and a bound nobody has watched
+  fire is untested rather than proven. The general claim and the specific one can point
+  opposite ways with nothing to warn you which you hold. And **the tree you measured is not
+  necessarily the tree in question** — the tell is that the answer was too convenient.
+- A hygiene script `ctest` runs is constrained to **bash 3.2** — macOS ships a 2007
+  `/bin/bash`. No `mapfile`/`readarray`, `declare -A`, `${var^^}`, `local -n`; keep the process
+  substitution when replacing `mapfile`, or the `pipefail` trap comes back.
+- **`std::from_chars` has no FLOATING-POINT overload in libc++ before macOS 26.0** — the
+  `macos-14` runners — so it compiles on libstdc++ and on MSVC and fails to BUILD on the one
+  leg CI runs it on. The standing remedy for a missing libc++ facility (*grep for it and see
+  that macOS already compiles it*) answers YES and is WRONG here: a grep tests a NAME while the
+  hazard is a SIGNATURE. `Core/NumericText.hpp`'s `ParseFiniteDouble` is the tree's one answer,
+  and it pins the C locale as well.
+- A `char` is UTF-8 here, at run time and at compile time: every Windows executable declares the
+  UTF-8 process code page and MSVC gets `/utf-8`. Converting one boundary instead would leave
+  `path`, `CreateProcessA` and `getenv` on the legacy page.
+- `std::filesystem::path`'s narrow constructor THROWS on such a host for bytes that are not
+  UTF-8 — before any `error_code` overload runs. `PathFromNarrowText` is the one `catch` in this
+  tree.
+- Where `clang-debug` will not build, get ASan from GCC (`-fsanitize=address` alone — UBSan
+  breaks the option tables' constexpr checks) and run the **whole** suite: a freed block nothing
+  disturbs reports nothing.
+- Run clang-format and clang-tidy **at the version CI pins**, in a build directory of its own;
+  `PATH` resolving to an older binary reports clean in the way that means nothing.
+- **And `CLANG_TOOLS_VERSION` pins a MAJOR, not a BUILD.** apt.llvm.org ships rolling snapshots
+  under one version number, so two binaries a month apart print the same `--version` and only
+  `dpkg-query -W` tells them apart. What makes it expensive is that the remedy reads as already
+  applied — you have a binary with the right name, so the rule above looks satisfied while the
+  analyser is silent about a check it does not carry — and it invalidates every earlier verdict
+  of that session, not just the one file. `clang-format` rides the same stream, so upgrade the
+  pair; read `apt-cache policy`, never the `--version` banner.
+- A script that NAMES a tool version must name it **everywhere that version matters**. And a
+  cached `find_program` result outlives every reason it was chosen, so check the pin against the
+  cache, not only pass it. `ctest -R local-gate-selftest`.
+- A **reference build passes `-DUSE_COMPILER_CACHE=OFF`, and the gate is a reference build.**
+  Pinning the other two tools argues for REMOVING this one, not versioning it: a cache is
+  supposed to be verdict-neutral, and requiring "the launcher built from this tree" is unsound
+  twice. Passing the flag is not the fact — `CompileCache.cmake` leaves an externally-set
+  launcher untouched, so the refusal reads `build.ninja`, never `CMakeCache.txt`.
+- **sccache is never selected AUTOMATICALLY** (`ALLOW_SCCACHE_FALLBACK`, default OFF). Being the
+  unasked-for answer to `fastcache-cc` being unusable is how this project built through sccache
+  for weeks while believing it dogfooded its own launcher. The three Windows jobs opt in — miss
+  one and it compiles cold, which their `compile_requests -eq 0` assertion catches. Gate the
+  ROW, never have CI set `CMAKE_CXX_COMPILER_LAUNCHER`. **And dropping sccache RELOCATES the
+  silence to ccache rather than ending it** — so a rejection matching its row's `predicts` column
+  is a WARNING whatever replaced it, *including nothing*, which is the loudest case. A WARNING,
+  never `SEND_ERROR`: this module may not fail a configure, and a stale daemon is the normal
+  state during a rollout.
+- A `cmake -P` check is judged by its OUTPUT, never by its exit code (`FAIL_REGULAR_EXPRESSION`,
+  one spelling defined once): `message(WARNING)` exits **0** on every CMake while printing
+  `CMake Warning`, and a check that shells out without reading `RESULT_VARIABLE` exits 0 with
+  its child's error on the output. `ctest -R fatal-error-exit` ASKS on every platform rather
+  than restating a sentence.
+  - A failure signal that is a *property* needs both `script-check-canary` (a script that must
+    be seen to fail, `WILL_FAIL`) and `script-check-signals` (no registration omits it). And
+    **`WILL_FAIL` inverts the WHOLE verdict**, so a canary carried by its exit code is vacuous:
+    it therefore exits **0** and prints a real `CMake Error` from a nested `cmake -P`, which
+    leaves the pattern as the only thing that can fail it. Fixing a wrong *reason* without
     re-deriving what it justified is how a guard survives as decoration.
-- **A guard's REMEDY TEXT is part of the guard. Nothing tests it, and it is the only
-  part of a check most people ever read.** `check-catch-skip-return-code` went on
-  telling the reader to *"Add to the registration: `PROPERTIES SKIP_RETURN_CODE 4`"*
-  after the same commit made that property the thing it REFUSES — so following the
-  instrument's own advice reintroduced #1128, hit the identical refusal, and read as
-  the CHECK being broken, which is the reading that gets a guard deleted. It survives
-  every test a check normally gets: the verdict logic was correct throughout and ten
-  synthetic trees drove it in both directions, because a self-test asserts THAT the
-  check objected and never what it advised. The window is a change of MECHANISM rather
-  than of verdict — nobody forgets the message when a check starts refusing something
-  new; it rots when the check refuses the same SHAPE for the opposite reason. Read it
-  as somebody who has never seen it: not *is this accurate* but **if I did exactly what
-  this says, where do I end up.** And state what the rule does NOT cover in the refusal
-  itself — the script-driven `SKIP_RETURN_CODE 77` registrations are unaffected, a
-  shell script choosing its own exit code where a Catch2 binary spends its status on
-  the failed-assertion count — or the next reader over-applies it and deletes a
-  property that is load-bearing elsewhere.
+- **A guard's REMEDY TEXT is part of the guard. Nothing tests it, and it is the only part of a
+  check most people ever read.** It survives every test a check normally gets, because a
+  self-test asserts THAT the check objected and never what it advised. The window is a change of
+  MECHANISM rather than of verdict: nobody forgets the message when a check starts refusing
+  something new; it rots when the check refuses the same SHAPE for the opposite reason. Read it
+  as somebody who has never seen it: not *is this accurate* but **if I did exactly what this
+  says, where do I end up.** And state what the rule does NOT cover in the refusal itself, or the
+  next reader over-applies it and deletes a property that is load-bearing elsewhere.
 - Never silence clang-tidy with `NOLINT` — fix the source.
-- A return type is not part of a function's mangled name on Linux, so two
-  functions differing only in return type silently collide.
-- `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail
-  a configure. `check_<lang>_compiler_flag` is a hard error for a language the project
-  has not ENABLED, and a bad flag in `CMAKE_<LANG>_FLAGS` fails the ABI check — so ask
-  `ENABLED_LANGUAGES` first, and CHECK a flag rather than gating on a compiler-ID
-  string. What it computes and appends is a function, checked as a computation
-  (`ctest -R debug-prefix-map-rules`): the layouts that break such a rule are the ones
-  nobody has locally.
-- A sanitizer that is on in the cache is not one that is on in the build — a tool
-  that silently does nothing is worse than one that is visibly off.
-- A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler,
-  so it runs `ctest` rather than only building. Nothing states that level — it follows
-  from `_DEBUG`, from the runtime library, from `CMAKE_BUILD_TYPE` — so
-  `iterator-debug-canary` is a program that must die and
-  `scripts/iterator-debug-gate.ps1` refuses a build where it survives. It is guarded
-  to MSVC Debug, so its absence on other platforms is normal rather than a lost
-  registration.
-- So a sanitizer job proves nothing until something proves the sanitizer.
-  `scripts/tsan-gate.sh` refuses to report clean until every artefact's OWN OBJECT
-  FILES carry an **undefined** `__tsan_init` reference **and** a deliberate race
-  (`src/tests/TsanCanary.cpp`, built by the same `add_compile_options`) has gone red
-  — run **with** `.tsan-suppressions` active, so no pattern broad enough to swallow
-  an obvious race can disarm it. Do not repair that file. A known race lives in
-  `.tsan-suppressions` with its issue number; deleting the entry is part of closing
-  the issue, never part of going green.
-- That proof is asked of the OBJECTS because it cannot be answered by a binary:
-  `__tsan_init` is DEFINED by the sanitizer runtime, which the link pulls in whole,
-  so a canary whose TU was compiled with no sanitizer flag at all still produced a
-  binary carrying it and PASSED (#472). An object cannot borrow the symbol, so its
-  undefined reference is the one that means something. The canary was never the
-  exposed half — an uninstrumented one fails closed — the SUITES were, since
-  `RunTarget` checks the timeout, the tag filter and the assertion count and none of
-  those tells an instrumented run from an uninstrumented one. Not
-  `__tsan_func_entry`: that is per-FUNCTION, so an object whose TU has no functions
-  carries none, and six of `FastCacheTest`'s 135 are exactly that. `ctest -R
-  tsan-gate-selftest` drives every verdict against staged object trees.
-- The canary's job is to be caught EVERY time, so a change to it is judged by a RATE
-  and never by a green run: `scripts/tsan-canary-rate.sh`, a few hundred runs, the
-  number recorded. It used to be silent in a few runs per thousand — the race
-  happened and nothing was reported — which is worse than it sounds, because a gate
-  that is red a few percent of the time teaches people to re-run it and is then
-  disarmed as thoroughly as if it had been deleted (#473). Pinning to two CPUs made
-  the old shape WORSE (0.700% against 0.220%), which is the wrong direction for a
-  two-core runner. It now races across an array rather than one `int`, because
-  distinct LOCATIONS are what the measurements move on — and the file claims no
-  mechanism, since the obvious one (shadow-cell eviction) predicts that more
-  accesses are worse and the data says the opposite.
-- An edit script asserts its anchor **matched** — `assert count == 1`, count rather
-  than presence, so "missing" and "not unique" both fire — and a generator that
-  produced nothing fails instead of printing success. Three separate tools reported
-  success for work they did not do in one night: an edit that matched no anchor, a
-  test fixture whose writer wrote nothing, and a YAML `if:` silently discarded as a
-  duplicate key. Report what changed, not that the script finished.
-- `producer | grep -q` is a false **negative** under `set -o pipefail`, and it
-  fails on the SUCCESS path: `grep -q` exits at the first match, the producer dies
-  of SIGPIPE, and `pipefail` reports the producer's status. `nm "$b" | grep -q
-  __tsan_init` therefore says "absent" precisely *because* the symbol is there.
-  Capture into a variable and match afterwards. **It came back in EIGHTEEN sites
-  across twelve scripts** (#970) — including the two checks that decide which contexts
-  are REQUIRED — so it is now a SCAN in `check-e2e-helpers.sh` beside the `timeout` and
-  bash-3.2 ones, over every script that actually turns `pipefail` on. A rule stated in
-  the five files that obey it reaches no file that does not; five of them carry a
-  comment explaining why they avoid the idiom, and it still spread. **And the hand
-  census that opened the ticket missed five of the eighteen**, because it spelled the
-  pattern `| grep -q` and the real spelling was `grep -Fxq` — the scan found those. A
-  pattern is narrower than its author reads it as, which is the mirror of `pkill -f`.
-  The remedy is a HERESTRING (`grep -q P <<< "$text"`), which is not a pipe.
-- The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS`
-  table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than
-  restating it — a second copy is not a cross-check, it is a second thing to be
-  wrong — and `ctest -R tsan-scope-hygiene`, in the **default** set, fails when a
-  test CASE in a scoped location carries no tag that expression selects. Both
-  halves have been wrong once. The tags were: three of them looked complete and
-  excluded six of ten `Async/` files, which is what the check was written for.
-  Then the SCOPE was: it named three directories, and a `std::thread` census over
-  `FastCacheTest`'s own sources finds **nineteen** threaded files with **eleven** in no row and
-  under no tag — every threaded `Net/` test among them, which is `BlockingListener`'s
-  module and so the module the tree's one observed race (#260) came out of, reached
-  only because the node binary is run whole (#316). A row is now a directory OR a
-  FILE, and the file row IS the exemption mechanism — a mostly single-threaded
-  directory is scoped one file at a time, so the check never forces an unrelated tag
-  onto a case. What it still cannot check is whether the table names every threaded
-  FILE: that census is a proxy (a helper spawns the thread; a comment names one) so
-  promoting it to a check would refuse correct files and miss incorrect ones.
-- **The BINARY half is not a proxy and IS checked** (`ctest -R tsan-binaries`, #1209).
-  `fastcache-cc-tests` was in no row for its whole life and no tag could have put it
-  there — the launcher does not link the library, so it is a separate binary the other
-  rows cannot contain. The set is DERIVED from the `catch_discover_tests(`
-  registrations, and each member is a `TARGETS` row or carries a written exemption; an
-  empty reason, a row naming a binary nothing registers, and a row that is also a
-  `TARGETS` row are each refused. #1209's own hand census listed four test binaries
-  where the tree registers six, which is why this is a check and not a review item.
-  Adding a row is TWO edits — `TARGETS` and the `clang-tsan` job's build step — and
-  the ticket's rule stands: **run the binary under TSan before adding its row**, or the
-  job goes red for the next person.
-- And it proves a CASE, not a FILE. One selected tag ANYWHERE in a file used to cover
-  every case in it, so a 28th case tagged `[fleetchart]` in a file of 27
-  `[distributed]` ones left the sanitized scope with the check reporting covered —
-  the defect the file was written for, one level down (#317). A case's tag string is
-  the **LAST** string literal of its header, never the second: three cases here spell
-  a long name as two adjacent literals, so "second" reads half a NAME as tags, and
-  489 cases tree-wide carry NO tag string, which is caught by ARITY rather than by
-  pattern because a name is free to contain `[async]` and must not talk its way in.
-  A header may span lines (28 in scope do) and may hold an unmatched `(` in a name,
-  so the reader strips the literals BEFORE counting parenthesis depth — a reader that
-  does not still closes a matched pair and passes such a case for the wrong reason.
-  Every way of losing the question is a REFUSAL: a header that never closes, one past
-  a line bound, a scope holding no case at all. `scripts/check-tsan-scope-selftest.cmake`
-  drives 20 cases over trees staged from the REAL scope table and copies of the REAL
-  gate and root `CMakeLists.txt` — it `include()`s the check for its table rather than
-  keeping one, and it is a sibling script rather than a `-D` mode because that is what
-  every other `cmake -P` check here does and because `check-selftest-registered` reads
-  argument dispatch, so a `-D` mode is invisible to it. Ten mutations each redden
-  exactly the case that names them; reverting to file-level matching reddens eleven and
-  leaves the nine that cannot see the difference green.
-- **A workaround with an expiry date is WIRED to fire, never written down where only
-  its own file's reader will meet it.** The scope is a tag expression rather than
-  `ctest -L` because `catch_discover_tests` exports tags as labels only from Catch2
-  **3.8.0** (`ADD_TAGS_AS_LABELS`); this tree pins 3.6.0, whose `extras/Catch.cmake`
-  carries zero occurrences of it — measured, against `catch_discover_tests`'s 11 in
-  the same file as the positive control. The reason lived in `tsan-gate.sh`'s header,
-  which whoever bumps the CPM block never opens (#312), so `check-tsan-scope.cmake`
-  now READS the declared version and refuses past a WATERMARK. The watermark is a
-  pinned CONDITION and must not be made to track `CMakeLists.txt` — point it at its
-  own subject and the comparison is `x > x`, false forever, the tripwire silently
-  gone. That mutation is a self-test case, because it is the tidy that suggests
-  itself. The refusal names what must survive the move regardless of where the scope
-  ends up: **a scope selecting NOTHING is a refusal**, since a typo runs zero cases
-  while every other signal says clean.
-- A `paths-ignore` filter on a workflow whose checks are **required** makes a pull
-  request unmergeable, not fast: the workflow never triggers, so no check run is
-  created and the required context never reports. Master is guarded by a *ruleset*,
-  so `/branches/master/protection` answers `404` and tells you nothing. Gate at the
-  **job** level instead — a skipped job still reports, and `scripts/ci-scope.sh`
-  (tested by `ctest -R ci-scope`) is what decides, escalating every way of not
-  knowing to "build everything".
-- A **merge queue** is the third door to that same never-arrives failure: it dispatches `merge_group`, and a workflow
-  not listening for it produces no check run, so a queued PR *sits there*. `pr-labels.yml` is the sharp case —
-  `pull_request_target` does not fire on `merge_group` at all, so its gate needs a queue leg that STATES what it
-  checked, or it is a stub that reads like a working gate. Check the concurrency key too (a PR-number key collapses to
-  a constant and each entry cancels the last), state `merge_group` in the scope classifier rather than falling through,
-  and add no JOB to `build.yml` — `check-release-gate` would drag the release behind it.
-  `ctest -R merge-queue-contexts` asserts every required context can report. **Neither the SET nor its COUNT is
-  written in prose** — `RequiredContexts` in that script is the one place either lives, every consumer reads it
-  from there, and the run prints the live figure. A stale LIST is worse than a stale count: it reads as complete,
-  so a leg checked against it is concluded *unrequired* rather than merely miscounted, and it carries no number
-  for a count-shaped search to find. Nothing GUARDS this — the obvious scan was measured and is unsound (#830) —
-  so the rule is all there is; the sites, the figures and the argument are in the rule file.
-- A **CONFLICTING** pull request is the fourth door, and the only one the workflow files
-  cannot explain: a `pull_request` workflow runs off the MERGE REF, GitHub computes none
-  for a conflicting pull request, and it therefore dispatches NOTHING — required contexts
-  ABSENT rather than pending, no run to fail and no signal that no run exists. Silent in
-  both directions, so neither the lane nor the manager is watching it. Measured, one pull
-  request, two heads: conflicting gave zero `Build` runs on `opened` **and** on
-  `reopened`; rebased queued within a second. The tell points the wrong way — `pr-labels`
-  is `pull_request_target`, runs off the BASE, needs no merge ref, and reports normally
-  throughout, so it reads as CI being slow. **Order matters more than the fact**: contexts
-  absent rather than pending → ask `mergeable` BEFORE reading a workflow, and on push ask
-  `git merge-tree --write-tree <branch> origin/master`, which needs no pull request and
-  no API. Resolving it, assert the ORDERING of diff3's four markers rather than counting
-  three, and prove the resolution with `git diff origin/master HEAD -- <file>` showing no
-  deletion lines.
-- A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING — measured: three required contexts came
-  back `skipped` on `b4777aa`, which merged. A skipped **matrix** job is the opposite: it never expands, so its
-  per-leg contexts never exist and nothing reports at all. One passes, one hangs; the difference is the matrix.
-  So never let a dependency's failure skip a required gate — the skip reads green. `if: ${{ !cancelled() }}`, and
-  check for real. Not `always()`, which runs even while the run is being cancelled.
-- A workflow must not invert its own script's principle one level up: `ci-scope.sh` escalates every way of not
-  knowing to build-everything, and the workflow read it as `== 'true'` — so a FAILED `changes` published no
-  output, sixteen jobs skipped, and the skips read green. `!= 'false'` everywhere, plus `!cancelled()` on every
-  job that consults it. The matrix trap had been the only thing saving this (a skipped matrix job hangs rather
-  than passing); it is no longer load-bearing, so do not reintroduce a job-level `if:` on `linux`/`windows`
-  believing it will catch you. `ctest -R gated-jobs-fail-safe` asserts both rules, derived not tabulated.
-- A gate that does not REPORT reads as a gate that passed, and the *required* clause is not what makes it
-  so. Measured over every failing `merge_group` `Build` run the API still held: **five of six failed a job that
-  is not a required context, and all five pull requests merged with nobody told** — the pull request is green,
-  the queue reports success, and master is green afterwards because the same job passes on the merge commit
-  (#684). The unit is the CONTEXT, never the job key: `Windows-cl-debug` is unrequired while
-  `Windows-cl-release`, a leg of the same matrix job, is required, and two of the six rows are that case. Not a
-  JOB in `build.yml` (`check-release-gate` would drag the release behind a notifier that is skipped on every
-  tag) and not a STEP per job (ten copies, ten `issues: write`, and it cannot see the other legs) — so
-  `workflow_run`, after the queue has concluded, gating nothing. `workflow_run` runs only the DEFAULT branch's
-  copy, so the DECISION is a script driven against captured real records and the wiring is asserted statically:
-  `ctest -R merge-group-report`, `-R merge-group-report-selftest`. Its trigger carries **no `branches:` filter**
-  on purpose — that is what makes the one claim nobody could measure (that `workflow_run` fires for a
-  `merge_group` run at all) show itself on the first ordinary run instead of failing silently. The SECOND door is a push
-  to master, which needed no new trigger (#774): `workflow_run` already fired for those
-  runs, so the fix is a row of `EventPolicy` — `merge_group` reports unrequired
-  failures, `push` to master reports ALL of them, `pull_request` reports NONE and says
-  why. The release gate did not change and should not; `check-release-gate` already
-  stops a red packaging job shipping. A push report is a TRANSITION, opened once
-  (`FASTCACHED_REPORT_ONLY_IF_NEW`), or a context failing on every push comments
-  forever; and a push with no branch is REFUSED, never assumed master, because `fix-ci`
-  is expected to fail.
-- A step's `env:` is its OWN, and a whole-file grep cannot tell a line that runs from one
-  that cannot. `EVENT` was defined on the `decide` step and READ by the reporting step, so
-  #684's notifier died on `EVENT: unbound variable` and opened no report in its entire life
-  — measured over 200 runs: 190 `success` on the `reportable == 0` path that never enters
-  the step, and **all 10** that had something to report were that line, swallowing
-  `clang-tidy-windows`, `macOS-clang-release`, `compile-cache E2E (Windows)` and `Code
-  coverage` twice (#1174). Its own guard passed, correctly: the rule motivating the
-  `$EVENT` read is a whole-file `grep -q FASTCACHED_REPORT_ONLY_IF_NEW`, satisfied by the
-  line inside the step that cannot run — a rule satisfied by a line that never executes is
-  a rule satisfied by prose. So the rule is per STEP, and it covers EVERY `run:` and not
-  only the `set -u` ones: without `-u` the name expands to EMPTY and the branch is taken
-  the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the model
-  of bash is deliberately narrower than bash (the first version made `echo` and `gh`
-  variables — a model MORE PERMISSIVE than the thing it stands for, in the check whose
-  whole point is that permissiveness), and the refusal names the STEP, because a guard
-  printing `(unnamed)` cannot be acted on. The self-test's *correct* fixture had modelled
-  the defect and vouched for it; `no-event-env` is the positive control. One workflow's
-  scan, not the repository's — 28 `run:` blocks across six files are outside it, and that
-  is #1175.
-- Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch, because
-  `code=false` is right for a compiler and backwards for prose (#687). Prose drifts by being EDITED. The set is
-  the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` with each check's arguments and verdict
-  patterns — never restated — and every way of not being able to run one is a REFUSAL, never a skip: a label
-  matching nothing, a build-tree variable left unresolved, a missing script, an all-skipped run. It runs from an
-  UNGATED step of `check-clang-format`, whose `name:` is the required context `Check C++ style`, because
-  reporting without gating is #684 and fixing one ticket by reintroducing the other is not a fix. That `name:`
-  is a wire constant. `ctest -R doc-subject-checks-derivation`, `-R doc-subject-checks-selftest`, and
-  `gated-jobs-fail-safe` rule C.
+- A return type is not part of a function's mangled name on Linux, so two functions differing
+  only in return type silently collide.
+- `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure.
+  `check_<lang>_compiler_flag` is a hard error for a language the project has not ENABLED, and a
+  bad flag in `CMAKE_<LANG>_FLAGS` fails the ABI check — so ask `ENABLED_LANGUAGES` first, and
+  CHECK a flag rather than gating on a compiler-ID string. What it computes and appends is a
+  function, checked as a computation (`ctest -R debug-prefix-map-rules`).
+- A sanitizer that is on in the cache is not one that is on in the build — a tool that silently
+  does nothing is worse than one that is visibly off.
+- A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler, so it runs
+  `ctest` rather than only building. Nothing states that level, so `iterator-debug-canary` is a
+  program that must die and `scripts/iterator-debug-gate.ps1` refuses a build where it survives.
+  Guarded to MSVC Debug, so its absence elsewhere is normal rather than a lost registration.
+- So a sanitizer job proves nothing until something proves the sanitizer. `scripts/tsan-gate.sh`
+  refuses to report clean until every artefact's OWN OBJECT FILES carry an **undefined**
+  `__tsan_init` reference **and** a deliberate race (`src/tests/TsanCanary.cpp`) has gone red —
+  run **with** `.tsan-suppressions` active, so no pattern broad enough to swallow an obvious race
+  can disarm it. Do not repair that file. A known race lives in `.tsan-suppressions` with its
+  issue number; deleting the entry is part of closing the issue, never part of going green.
+- That proof is asked of the OBJECTS because it cannot be answered by a binary: `__tsan_init` is
+  DEFINED by the sanitizer runtime, which the link pulls in whole, so a canary whose TU was
+  compiled with no sanitizer flag still produced a binary carrying it and PASSED. An object
+  cannot borrow the symbol. The canary was never the exposed half — an uninstrumented one fails
+  closed — the SUITES were. Not `__tsan_func_entry`: that is per-FUNCTION, so an object whose TU
+  has no functions carries none.
+- The canary's job is to be caught EVERY time, so a change to it is judged by a RATE and never by
+  a green run: `scripts/tsan-canary-rate.sh`, a few hundred runs, the number recorded. A gate that
+  is red a few percent of the time teaches people to re-run it and is then disarmed as thoroughly
+  as if it had been deleted. It races across an array rather than one `int`, because distinct
+  LOCATIONS are what the measurements move on — and the file claims no mechanism, since the
+  obvious one predicts the opposite of what the data says.
+- An edit script asserts its anchor **matched** — `assert count == 1`, count rather than presence,
+  so "missing" and "not unique" both fire — and a generator that produced nothing fails instead of
+  printing success. Report what changed, not that the script finished.
+- `producer | grep -q` is a false **negative** under `set -o pipefail`, and it fails on the
+  SUCCESS path: `grep -q` exits at the first match, the producer dies of SIGPIPE, and `pipefail`
+  reports the producer's status. **It came back in eighteen sites across twelve scripts**,
+  including the two checks that decide which contexts are REQUIRED, so it is now a SCAN in
+  `check-e2e-helpers.sh`. A rule stated in the five files that obey it reaches no file that does
+  not. **And the hand census that opened the ticket missed five of the eighteen**, because the
+  real spelling was `grep -Fxq` — a pattern is narrower than its author reads it as, the mirror
+  of `pkill -f`. The remedy is a HERESTRING, which is not a pipe.
+- The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS` table, READ from
+  there and never restated; `ctest -R tsan-scope-hygiene` is in the **default** set. A row is a
+  directory OR a FILE, and the file row IS the exemption mechanism. It proves a CASE, not a FILE:
+  a case's tag string is the **LAST** string literal of its header, and every way of losing the
+  question is a REFUSAL. **A scope selecting NOTHING is a refusal.** The BINARY half is checked
+  separately and is not a proxy (`ctest -R tsan-binaries`) — a tag expression says nothing about
+  which binaries the gate builds, and a binary the launcher owns is one no tag could reach.
+  Adding a row is TWO edits, and **run the binary under TSan before adding its row.**
+- **A workaround with an expiry date is WIRED to fire, never written down where only its own
+  file's reader will meet it.** The scope is a tag expression rather than `ctest -L` because
+  `catch_discover_tests` exports tags as labels only from a Catch2 later than this tree pins, so
+  `check-tsan-scope.cmake` READS the declared version and refuses past a WATERMARK. The watermark
+  is a pinned CONDITION and must not be made to track `CMakeLists.txt` — point it at its own
+  subject and the comparison is `x > x`, false forever, the tripwire silently gone.
+- A `paths-ignore` filter on a workflow whose checks are **required** makes a pull request
+  unmergeable, not fast: the workflow never triggers, so no check run is created and the required
+  context never reports. Master is guarded by a *ruleset*, so the protection API answers `404` and
+  tells you nothing. Gate at the **job** level instead — a skipped job still reports — and
+  `scripts/ci-scope.sh` is what decides, escalating every way of not knowing to "build everything".
+- A **merge queue** is the third door to that same never-arrives failure: it dispatches
+  `merge_group`, and a workflow not listening for it produces no check run, so a queued PR *sits
+  there*. `pull_request_target` does not fire on `merge_group` at all. Check the concurrency key
+  too, state `merge_group` in the scope classifier, and add no JOB to `build.yml`.
+  `ctest -R merge-queue-contexts` asserts every required context can report. **Neither the SET nor
+  its COUNT is written in prose** — a stale LIST is worse than a stale count, because it reads as
+  complete. Nothing GUARDS this, so the rule is all there is.
+- A **CONFLICTING** pull request is the fourth door, and the only one the workflow files cannot
+  explain: a `pull_request` workflow runs off the MERGE REF, GitHub computes none for a conflicting
+  pull request, and it dispatches NOTHING — required contexts ABSENT rather than pending. The tell
+  points the wrong way, since `pull_request_target` jobs report normally throughout, so it reads as
+  CI being slow. **Order matters more than the fact**: ask `mergeable` BEFORE reading a workflow,
+  and on push ask `git merge-tree --write-tree`, which needs no pull request and no API. Resolving
+  it, assert the ORDERING of diff3's four markers rather than counting three, and prove the
+  resolution with `git diff origin/master HEAD -- <file>` showing no deletion lines.
+- A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING. A skipped **matrix** job
+  is the opposite: it never expands, so its per-leg contexts never exist and nothing reports at all.
+  One passes, one hangs; the difference is the matrix. So never let a dependency's failure skip a
+  required gate. `if: ${{ !cancelled() }}`, and check for real — not `always()`, which runs even
+  while the run is being cancelled.
+- A workflow must not invert its own script's principle one level up: `ci-scope.sh` escalates every
+  way of not knowing to build-everything, and the workflow read it as `== 'true'`, so a FAILED
+  `changes` published no output and sixteen jobs skipped green. `!= 'false'` everywhere, plus
+  `!cancelled()` on every job that consults it. The matrix trap is no longer load-bearing, so do
+  not reintroduce a job-level `if:` believing it will catch you. `ctest -R gated-jobs-fail-safe`.
+- A gate that does not REPORT reads as a gate that passed, and the *required* clause is not what
+  makes it so: five of six failing queue runs failed a job that is not a required context, and all
+  five pull requests merged with nobody told. The unit is the CONTEXT, never the job key — two legs
+  of one matrix job can differ. Not a JOB in `build.yml` and not a STEP per job, so `workflow_run`,
+  after the queue has concluded, gating nothing. Its trigger carries **no `branches:` filter** on
+  purpose. `merge_group` reports unrequired failures, `push` to master reports ALL of them,
+  `pull_request` reports NONE and says why. A push report is a TRANSITION, opened once, or a context
+  failing on every push comments forever; and a push with no branch is REFUSED, never assumed master.
+- A step's `env:` is its OWN, and a whole-file grep cannot tell a line that runs from one that
+  cannot: a variable defined on one step and read by another died on `unbound variable` and opened no
+  report in its entire life. Its own guard passed, correctly — a whole-file grep satisfied by a line
+  inside the step that cannot run is a rule satisfied by prose. So the rule is per STEP, and it
+  covers EVERY `run:` and not only the `set -u` ones: without `-u` the name expands to EMPTY and the
+  branch is taken the wrong way silently, which is worse. The runner vocabulary is an ALLOWLIST, the
+  model of bash is deliberately narrower than bash, and the refusal names the STEP.
+- Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
+  because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
+  EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and
+  never restated, and every way of not being able to run one is a REFUSAL, never a skip. It runs
+  from an UNGATED step of the job whose `name:` is the required context `Check C++ style`, because
+  reporting without gating is the previous bullet's defect. That `name:` is a wire constant.
 - **A flag combination that cannot express the question still returns an answer.** Same species as
-  `pkill -f`, `grep -c` read as a position, and `grep -q` under `pipefail`: the shell obliges regardless
-  and **none of them errors**. Cleanest specimen `grep -Lq`, where the contradiction is internal — `-L`
-  lists files WITHOUT a match, `-q` exits at the first match — so it picks one and names files as lacking
-  a symbol they contain. Worst of the family for three reasons, and the middle one generalises past
-  shells: it was a **positive control**, and *a control is the one instrument nobody checks, because
-  checking it is what it was for*; its error pointed at **refuting** a claim, which is the direction that
-  gets acted on because refuting feels like diligence; and nothing about the output looked wrong. Re-derive
-  a control by a different construction before trusting it.
-- **An intermediate reading is BIASED, not noisy.** A tree sampled mid-build can only be MISSING artefacts,
-  never carrying extra ones, so the error is one-sided by construction — always toward failure. Measured:
-  `ctest -L hygiene` at 235/429 edges reported 2 failures where the settled tree reports 60/60. So the
-  natural response to a mid-build failure, investigating it, is the wasted motion, and no care in
-  *interpreting* the reading helps. **Do not take the reading** — wait for the completion signal.
-- **CMake WRAPS its diagnostic messages**, so a phrase you grep for can exist in the output and in no
-  single LINE of it. A mutation harness called all three of its arms `SELFTEST STAYED GREEN` while the
-  self-test was RED with four cases named. Measured, for a phrase crossing column 74: `message(STATUS)`
-  **1 match — does not wrap**; `WARNING` **0**; `FATAL_ERROR` **0**; flattened first, **1**. The `STATUS`
-  row is the trap inside the trap — a negative test written with it reproduces nothing and reads as a
-  refutation, and in mixed output the unwrapped copy hides the wrapped one. It is the DIAGNOSTIC types
-  that wrap — and that is a property of every verdict this repository reads rather than a trap somebody
-  might hit: a check's verdict travels through the DIAGNOSTIC channel because `FAIL_REGULAR_EXPRESSION`
-  must also hear one that merely WARNS, and a warning exits 0 on every CMake. (This said *a `-P` script
-  cannot fail by exit code*; it can — exit **1** on 3.22.6 through 4.3.0, #565 — and the conclusion never
-  needed it.) **43 of 44** `scripts/check-*.cmake` carry `message(FATAL_ERROR)` (37 of 37 on the branch that
-  added this entry, 35 of 35 on the master it branched from — same pattern, different tree, so say which),
-  and the 44th reports through `message("CMake Error: …")` instead, so the count is a PROXY for the property
-  and has now parted company with it. There are also TWO ways to write the negative test wrong — use `STATUS`, or emit
-  both and let the unwrapped copy mask the wrapped one — and both read as a refutation. Flatten
-  (`tr '\n' ' ' | tr -s ' '`) before matching, or match a phrase that cannot straddle 74 columns. Distinct
-  from every other entry here: **the text does not exist in the form you are matching it in, and the tool
-  that printed it changed the form.** The tell: three arms agreeing perfectly is what a broken instrument
-  looks like as well as what a real pattern looks like.
-- Five ways an instrument reported on something other than its subject, all in one branch, all written by
-  someone who had just read the rulebook. A **COMMENT is not a call site** — two checks matched their own
-  headers, one reporting a step twice and one refusing a correct workflow — so strip full-line comments, and
-  self-test both directions. **`bash <path>`, never a bare path**, in a self-test AND in a workflow: a bare
-  `"$0"` in `check-gated-jobs.sh --self-test` exited **126** on a mode-644 script, so eight `want-fail` cases
-  passed because the SHELL refused — green, testing nothing, caught only by the one case expecting a PASS — and
-  a bare `run: scripts/doc-subject-checks.sh` took the REQUIRED `Check C++ style` context red the same way.
-  The mode is the smaller half (#720 covers it; #723 the rest): a call that fails to START fails for reasons a
-  chmod does not cover, and inside a `want-fail` assertion any of them is indistinguishable from the rule
-  firing. Name the interpreter regardless.
-  **`IFS=$'\t' read` does not read TSV**: tab is IFS whitespace, so an empty field collapses and shifts every
-  field after it. **A fixture built on `message(FATAL_ERROR)` cannot test that verdicts are read from OUTPUT** —
-  it exits **1** everywhere measured (#565), so the status alone is sufficient and the rule's own test passed
-  with the rule deleted; the correction makes the finding stronger, the fixture having been insufficient on
-  every machine rather than only a modern one. And **a self-test that
-  stops early must not look like one that judged something**: `set -e` plus a generator ending in
-  `[[ ... ]] && echo` truncated a run at eight cases with no case named, so the self-tests print how many cases
-  they ran.
-- A bracket-vulnerable `cmake -P` reader is judged per **(reader, file, surviving lines)** and never per
-  script, because the verdict flips on the corpus alone. Measured over the six remaining `file(STRINGS)`
-  readers by injecting one `]` into a comment on a line the reader KEEPS: `tsan-scope` and
-  `node-config-reference` refuse (LOUD), `net-boundary` passed over a REAL cross-boundary include and
-  `psk-signing-seam` counted 15 `HmacSha256` calls as 14 and still passed (both SILENT), `vslang-probe-only`
-  is unchanged **by coincidence** — every file it reads holds exactly one matching line, so there is no second
-  element to merge with — and only `script-check-signals`'s `LIMIT_COUNT 1` is safe for a reason. A reader left
-  alone because today's files happen to be safe is a defect scheduled for later.
-- **And the usual remedy is wrong where the brackets are the DATA.** Blanking `[`/`]` before splitting made
-  `check-tsan-scope` report its table as naming no Catch2 tags at all — a tag IS `[async]` — and refuse on a
-  good tree; measured, because it was the first attempt. That reader is a list-free `FIND`/`SUBSTRING` walk
-  instead, immune by construction. Consolidating the five-plus copies of the splitting idiom is **#495**, not
-  the ticket in front of you: `check-glob-traversals.cmake` says so in its own comment, and absorbing it closes
-  one ticket by swallowing another.
-- **`if(VAR STREQUAL "")` does not fire when VAR is UNSET**, and the one place that matters is a glob that came
-  back empty: `set(x ${empty})` unsets `x`, and CMake then reads the left operand as the literal string `x`.
-  `check-net-boundary`'s empty-directory guard — its own comment calls it *"the one failure mode a boundary test
-  must not be allowed to have"* — could therefore never fire, and it reported "0 source(s) … reach only
-  themselves" over a tree with no sources. Quote the variable. Siblings assigned by `set(x "")` are fine, which
-  is why only one instance broke.
-- **A clean-tree injection understates a check that only reports violations**, so plant the violation. On a
-  clean tree everything a merged element swallows is something the check had nothing to say about, and nothing
-  changes at all — which is how #518 classified `net-boundary` as merely PARTIAL. Three arms, and the third is
-  not decoration: violation alone, violation behind a bracket, bracket alone. Without the last, a check that
-  refused every bracket would pass the middle one for the wrong reason.
-- **A census cannot falsify a premise — it can only produce a number consistent with it.**
-  Re-derive an inherited claim BEFORE the census, never after: afterwards it has already
-  told you what you expected to hear. Measured: a lane counted eleven analyser-blind
-  translation units and `scripts/tidy-sweep.sh` had already recorded the same 13/11/2
-  breakdown in its own comments — **agreement between a fresh measurement and a source you
-  have not read is worth nothing**, and it *felt* like corroboration. The ticket's premise
-  ("the sweep reports clean") was false throughout, and seven consecutive tickets fell to
-  premise checks that a count would have confirmed.
-- **A listing that came back AT its `--limit` is an answer about a set that is not the
-  whole set**, and nothing about the rows says so — the cap reads as the total, wrong in
-  the unsuspicious direction (#724). Measured: two board figures reported onward were
-  300 and 121 against a real 356 and 147. Raising the limit moves the cliff and hides
-  that there is one. `ctest -R gh-listing-seam` requires every `gh` listing to go
-  through `ci-report-issue.sh`, which warns at the cap, or to carry a stated reason. Ask
-  a question truncation cannot reach where one exists — the search API's `total_count`
-  counts the whole set rather than a page.
-- **A census states its PATTERN, not only its number.** Two independent audits of one file set differed by
-  exactly one and neither had miscounted: `scripts/check-*.cmake` (the glob a ticket names) gives 20 / 18 /
-  34 for cac9bda-all / cac9bda-excl-selftests / HEAD, while an unanchored `grep 'check-.*\.cmake$'` gives
-  21 / 19 / 36. The whole difference is `script-check-canary.cmake`, because *"script-**check-**canary.cmake"*
-  contains `check-`. The `pkill -f` lesson in a `grep`, twice in two days — **a pattern is broader than its
-  author reads it as** — and the second instance was a manager quoting a corrected number back, wrong for the
-  same reason as the thing it corrected. Nobody is outside this: the remedy is that the pattern travels with
-  the figure, not that people count more carefully. And **a ticket cannot be closed against a count that no
-  longer describes the tree** — #510's "only 4 of 16" matches none of 20, 18 or the 13 content-readers.
-- **A total stated beside a table is DERIVED from it, or it is a second claim** — a hand-maintained number
-  describing a hand-maintained list is two sources of truth wearing one hat, and it drifted three commits
-  running, in one file, in one day, each commit fixing the last count and introducing the next (#780).
-  `ctest -R table-totals`. The multipliers are PARSED, not banned: 8 rows carrying `(twice)`/`(three times)`
-  describe 12 collapses, so a checker that counts ROWS is wrong for exactly the table that motivated it, and
-  plausible enough to go green on it. The marker is MANDATORY with `none` as the opt-out, because opt-in is
-  silent about a table that never opted in (#492) — `RefuseWithoutCounter`'s argument, in markdown. Its own
-  scope census was then wrong by 100%: `^|` anchoring misses a table INDENTED inside a bullet, 10 of 20. And
-  the figure that describes a table is the one NEAREST it, since a paragraph may state an older count with
-  the same noun — that one refused a CORRECT tree, which is how it was found.
-- `clang-format -i` at any version but the pinned one silently reformats code the
-  pinned one already accepted; run an older binary as `--dry-run` only. Both pinned
-  tools ship on PyPI (`pip download clang-format==<v>` / `clang-tidy==<v>`), so "the
-  distro only has an older one" is not a reason to use it. An older clang-tidy is
-  worse than a laxer one: it is *silent* about checks that do not exist in it yet.
-- A clang-tidy sweep that cannot prove the tool ran is worth nothing and reads like
-  success — `scripts/tidy-sweep.sh` canaries it first and treats a failure to
-  execute as fatal, never as "no findings".
-- A ccache hit does NOT skip clang-tidy: the launcher and the analyser are two
-  independent commands under `cmake -E __run_co_compile`. On a pull request CI
-  therefore tidies the diff plus every translation unit that includes a changed
-  header, and anything that changes how EVERY unit is read gets a row in
-  `SweepEverythingWhen` — a missing row is a sweep that checks the wrong set and
-  prints a confident count.
-- A compile database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF`
-  named explicitly. `CompileCache.cmake` sets it only when it picks a launcher, and
-  without it every unit fails to parse and the sweep reports clean.
-- And it must be configured with the same TARGET SET CI builds. A sweep whose scope
-  comes from a database is only as complete as that database's targets, and a target
-  gated off by default is invisible to it rather than absent from CI — 15 units where
-  CI tidies 20, every one of the five missing ones inside the change. The script
-  cannot catch it: a changed file with no compile command is dropped silently, and
-  must be, since that is also what a platform-specific TU looks like. Account for
-  every file in the diff the sweep did not reach, before trusting its count.
-- **Running the launcher is not testing it.** The synthetic fixtures prove it RUNS and produces AN object; only
-  building a REAL target through it and running that target's tests catches a WRONG one (#319, #320).
-  `scripts/launcher-replay-e2e.sh` builds three times — cache-off control, cold (stores), warm (REPLAYS) — and
-  runs the replayed binary. Compare cold-against-warm, never control-against-warm: a launcher-active configure
-  disables PCH and module scanning, so those objects legitimately differ. Guards: the cold build must be seen
-  USING the launcher, the warm one must be seen HITTING — a warm build that missed replayed nothing and passes
-  everything. And staging a wrong object needs the LINK command (`ninja -t commands`), never `touch`: ninja
-  records output mtimes, so a replaced object reads as dirty and is rebuilt, undoing the injection silently.
-- A compiler cache that reads like success is worse than none: the Windows sccache
-  was running into a directory the runner deletes, so the jobs are asserted to be
-  backed by the Actions cache — before `ctest`, which restarts the sccache server
-  and zeroes its counters.
-- Every `bool` and byte-wide enum in a config struct lives in one run: one between two
-  8-aligned members costs seven bytes, and clang-tidy's padding budget fails the build.
-- A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`.
-  A length anchored on an enumerator by name is a guard that fires only when
-  nothing is wrong.
-- Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000
-  processes, and gcov's shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp`
-  sits next to the implementation, so a report that counts it measures the tests
-  testing themselves. A compiler cache and coverage cannot be combined — a
-  replayed object's embedded mapping names the tree it was built in.
-- A rulebook `## Open work` entry names an OPEN issue, or it is a rule that has gone
-  false — the expensive shape being an entry saying something *cannot* be done, which
-  instructs the next session not to try (#395). `ctest -R rulebook-open-work`. The ENTRY
-  is a bullet's LEADING reference; a citation in its prose names the landed change that
-  produced the residual and is correctly closed — #619's own body called two of those
-  stale. `gh` falls back to PULL REQUESTS, asymmetrically: a merged one answers `closed`
-  and looks like the check working, an **open** one answers `open` and PASSES while
-  naming no issue — so the KIND is asserted too. FOUR outcomes, not two, and of the
-  three that share exit 1 with an empty result, **two are the checker's own fault** —
-  read as *stale* they invent a finding somebody then edits a correct entry to satisfy,
-  so the verdict is the HTTP status behind a `rate_limit` liveness anchor. A self-test
-  whose only negative case is a closed issue passes under all three. Grammar in the
-  default set, resolution in `smoke`; only a PREREQUISITE missing before any entry
-  resolved may skip.
-- **A configure's OUTPUT is the module's CLAIM; the generated buildsystem is the
-  artefact.** `check-compile-cache-caveat` asserted only on what `CompileCache.cmake`
-  printed, so a module printing `-- [cache] Enabling sccache …` with the full caveat at
-  the right severity while wiring NO launcher passed every row (#187). The cache cannot
-  answer it — the launcher is a NORMAL variable, unset in `CMakeCache.txt` across all
-  eleven trees measured, five of them demonstrably running sccache — so read Ninja's
-  per-rule `LAUNCHER =` or the Makefile compile line. Three things the ticket did not
-  name: the fixture had **no target**, so there was no compile edge to read; the two
-  stand-in launchers were **one program**, which makes the assertion presence rather
-  than identity and leaves *ccache won over sccache* resting on a status line (they are
-  `${CMAKE_COMMAND}` and `${CMAKE_CTEST_COMMAND}` now); and a generator the reader
-  cannot parse is a THIRD state, named — while a generator it CLAIMS to handle reading
-  nothing is a violation, since every row's assertion is then vacuous. Broken on
-  purpose: the check refuses with exactly the three rows expecting a launcher.
-  **Its first version was green on Linux and red on all three Windows legs for one
-  and the same file** — `build.ninja` writes `LAUNCHER = "C:\Program
-  Files\CMake\bin\cmake.exe"`, quoted for the space and backslashed, against
-  `${CMAKE_COMMAND}`'s `C:/Program Files/CMake/bin/cmake.exe`, and on Linux the two
-  spellings are byte-identical. A comparison written against the spelling ONE
-  generator on ONE platform happens to emit is a comparison nobody has tested:
-  normalise a path as a PATH, on BOTH sides, and re-run the MUTATION on the platform
-  that failed — a normalisation's risk is accepting too much, so *it stopped failing*
-  is not *it still bites*.
-  Its sibling is #257 — **the DECISION a guard makes is what gets tested, not the
-  acquisition around it**: `tidy-sweep.sh`'s canary needed clang-tidy, a database and a
-  real TU, so it was reachable only where a full sweep was already running, which is the
-  population it is not for. `CanaryVerdict` is pure now and `--self-test` (already a
-  ctest on every platform) drives it. Its two failing arms are NOT one — ≥126 is the
-  shell saying the program never started, with no output; the pattern arm is a binary
-  that started and analysed nothing, exiting normally — and every OTHER non-zero exit is
-  `ok`, because clang-tidy exits non-zero when it has FINDINGS.
-- A branch BEHIND master is unverified, and only a build says otherwise: its green
-  checks are a true statement about the tree it was branched from, and stay one however
-  often they are re-read. Neither shortcut works. **How far behind is not a measure of
-  the risk** — it measures elapsed time, while the defect is a collision that either
-  exists or does not, so ranking a queue by it sorts by nothing. **File overlap is
-  evidence only in the direction that says there IS a hazard**; its ABSENCE is evidence
-  of nothing. #520 and #525 share no file — #520 changed `IConnector::Connect`'s third
-  parameter to `DialOptions` across every implementation, #525 adds callers in
-  `FrameEndpoint` — and both pairwise runs were green, correctly, each built against a
-  master without the other. NEITHER branch has ever gone red, which is the point rather
-  than a contradiction: the failing tree is the combination, and that is the one thing
-  nothing built. The hazard is a NAME shared between two changes, not a line shared
-  between two diffs, and a diff cannot show a name it does not mention. So a branch is
-  rebased and rebuilt before it merges, never inspected — the #292 worktree was nine
-  behind and the rebuild took about two minutes and was clean, which is what this costs
-  when it passes, and passing is why skipping it feels free.
-  - **And the diff that VERIFIES such a rebase is three-dot.** `A..B` folds in the
-    commits `B` carries and `A` does not — the ordinary state right after a rebase —
-    so it answers a question nobody asked: measured, `expect=-35` against `delta=10`,
-    a 45-line gap that reads as a dropped hunk and was reported as one, where `A...B`
-    agreed exactly. A wrong NUMBER, not an error, inside the step that exists to
-    verify. The two forms disagreeing is itself the signal that the branch is behind
-    its base — a finding, not a fault (#541).
-- **After a revert, test for the REVERT, never for the defect.** A revert leaves the
-  reverted commit in the ancestry forever, so `--is-ancestor <fix>` answers YES for every
-  branch including master and discriminates nothing; the only useful question is
-  `--is-ancestor <revert>` coming back NO. The instinct is to check for the thing that
-  broke you, and it is the one test that cannot work.
-- **A subject line is an abbreviated identifier with no prefix to disagree about.** Two
-  commits here carried the identical subject and opposite revert status — one rebased from
-  the other — and two people measured correctly and reported contradictory answers. A
-  truncated SHA at least *looks* like an identifier and invites comparison; a subject line
-  looks like a description, so nobody checks whether two exist. Same family as a ctest
-  index (per build), two worktrees one token apart, and `gate-gcc-release` against
-  `Linux-gcc-release` — **a leg travels with its compiler and its machine.**
-- **A reason that generalises further than the fact it was drawn from is worse than the
-  narrow one**, because it reads as licence somewhere it was never measured — and it is
-  introduced while TIDYING, which is when it is least likely to be re-checked. Measured:
-  `IsDeadlineExpiry`'s true reachability reason was "improved" into a false semantic one
-  during a `/simplify`, a later review faithfully propagated it into two rulebook files
-  and added a counter-paragraph beside it, and the header then argued both sides.
-- A reference-build refusal is a REFUSAL and not a warning, because a verdict about a
-  tree that was not built cannot be read in EITHER direction. #626 was five metrics
-  tests failing in four files the branch never touched, all clearing under
-  `-DUSE_COMPILER_CACHE=OFF` — a false alarm, which costs an investigation; **the same
-  substituted object can equally HIDE a real failure, and nothing would say so.** That
-  sentence lives in the refusal's own text, or whoever meets it argues for a warning.
-  The guard was already there under #319/#368 and the ticket did not know — check a
-  premise against the TREE before building to it. And the count is LAUNCHER
-  **BINDINGS**, not edges: ninja emits one per RULE, so this tree reads **5 covering
-  501 compile edges** on Linux where #626's Windows reproduction recorded **669**.
-  Those are not comparable and the message said nothing; the verdict is unaffected,
-  since any count above zero refuses, but **a unit error in a refusal message is how
-  two numbers get compared that should not be.** The symptom does not reproduce on
-  Linux in either cache state — three builds, three suites, all five passing — so
-  #626's Windows/MSVC/sccache reproduction stands unexecuted, stated as an analogue.
+  `pkill -f` and `grep -q` under `pipefail`: the shell obliges regardless and **none of them
+  errors**. Cleanest specimen `grep -Lq`, where the contradiction is internal. Worst of the family
+  for three reasons, and the middle one generalises past shells: it was a **positive control**, and
+  *a control is the one instrument nobody checks, because checking it is what it was for*; its error
+  pointed at **refuting** a claim, the direction that gets acted on because refuting feels like
+  diligence; and nothing about the output looked wrong. Re-derive a control by a different
+  construction before trusting it.
+- **An intermediate reading is BIASED, not noisy.** A tree sampled mid-build can only be MISSING
+  artefacts, never carrying extra ones, so the error is one-sided by construction — always toward
+  failure. So the natural response to a mid-build failure, investigating it, is the wasted motion,
+  and no care in *interpreting* the reading helps. **Do not take the reading** — wait for the
+  completion signal.
+- **CMake WRAPS its diagnostic messages**, so a phrase you grep for can exist in the output and in
+  no single LINE of it. The `STATUS` row is the trap inside the trap — it does NOT wrap, so a
+  negative test written with it reproduces nothing and reads as a refutation. It is the DIAGNOSTIC
+  types that wrap, and that is a property of every verdict this repository reads: a check's verdict
+  travels through the DIAGNOSTIC channel because `FAIL_REGULAR_EXPRESSION` must also hear one that
+  merely WARNS. Flatten (`tr '\n' ' ' | tr -s ' '`) before matching, or match a phrase that cannot
+  straddle 74 columns. The tell: three arms agreeing perfectly is what a broken instrument looks
+  like as well as what a real pattern looks like.
+- Five ways an instrument reported on something other than its subject, all in one branch, all
+  written by someone who had just read the rulebook. A **COMMENT is not a call site** — so strip
+  full-line comments, and self-test both directions. **`bash <path>`, never a bare path**, in a
+  self-test AND in a workflow. **`IFS=$'\t' read` does not read TSV**: tab is IFS whitespace, so an
+  empty field collapses and shifts every field after it. **A fixture built on `message(FATAL_ERROR)`
+  cannot test that verdicts are read from OUTPUT**, since the status alone is then sufficient. And
+  **a self-test that stops early must not look like one that judged something**, so they print how
+  many cases they ran.
+- A bracket-vulnerable `cmake -P` reader is judged per **(reader, file, surviving lines)** and never
+  per script, because the verdict flips on the corpus alone: two of the six remaining readers refuse
+  LOUDLY, two pass SILENTLY over a real violation, one is unchanged **by coincidence**, and only one
+  is safe for a reason. A reader left alone because today's files happen to be safe is a defect
+  scheduled for later.
+- **And the usual remedy is wrong where the brackets are the DATA.** Blanking `[`/`]` before
+  splitting made the TSan scope check report its table as naming no Catch2 tags at all — a tag IS
+  `[async]` — and refuse on a good tree. That reader is a list-free `FIND`/`SUBSTRING` walk instead,
+  immune by construction. Consolidating the copies of the splitting idiom is **#495**, not the
+  ticket in front of you: absorbing it closes one ticket by swallowing another.
+- **`if(VAR STREQUAL "")` does not fire when VAR is UNSET**, and the one place that matters is a glob
+  that came back empty: `set(x ${empty})` unsets `x`, and CMake then reads the left operand as the
+  literal string `x`. Quote the variable. Siblings assigned by `set(x "")` are fine, which is why
+  only one instance broke.
+- **A clean-tree injection understates a check that only reports violations**, so plant the
+  violation. Three arms, and the third is not decoration: violation alone, violation behind a
+  bracket, bracket alone — without the last, a check that refused every bracket would pass the
+  middle one for the wrong reason.
+- **A census cannot falsify a premise — it can only produce a number consistent with it.** Re-derive
+  an inherited claim BEFORE the census, never after: afterwards it has already told you what you
+  expected to hear. **Agreement between a fresh measurement and a source you have not read is worth
+  nothing**, and it *feels* like corroboration.
+- **A listing that came back AT its `--limit` is an answer about a set that is not the whole set**,
+  and nothing about the rows says so — the cap reads as the total, wrong in the unsuspicious
+  direction. Raising the limit moves the cliff and hides that there is one. `ctest -R
+  gh-listing-seam` requires every `gh` listing to go through a seam that warns at the cap, or to
+  carry a stated reason. Ask a question truncation cannot reach where one exists.
+- **A census states its PATTERN, not only its number.** Two independent audits of one file set
+  differed by exactly one and neither had miscounted, the whole difference being a filename that
+  contains the pattern. **A pattern is broader than its author reads it as** — and the second
+  instance was a manager quoting a corrected number back, wrong for the same reason as the thing it
+  corrected. Nobody is outside this: the remedy is that the pattern travels with the figure. And
+  **a ticket cannot be closed against a count that no longer describes the tree.**
+- **A total stated beside a table is DERIVED from it, or it is a second claim** — a hand-maintained
+  number describing a hand-maintained list is two sources of truth wearing one hat, and it drifted
+  three commits running, in one file, in one day, each commit fixing the last count and introducing
+  the next. `ctest -R table-totals`. The multipliers are PARSED, not banned, so a checker that counts
+  ROWS is wrong for exactly the table that motivated it. The marker is MANDATORY with `none` as the
+  opt-out, because opt-in is silent about a table that never opted in. And the figure that describes
+  a table is the one NEAREST it.
+- `clang-format -i` at any version but the pinned one silently reformats code the pinned one already
+  accepted; run an older binary as `--dry-run` only. Both pinned tools ship on PyPI, so "the distro
+  only has an older one" is not a reason to use it. An older clang-tidy is worse than a laxer one: it
+  is *silent* about checks that do not exist in it yet.
+- A clang-tidy sweep that cannot prove the tool ran is worth nothing and reads like success —
+  `scripts/tidy-sweep.sh` canaries it first and treats a failure to execute as fatal, never as "no
+  findings".
+- A ccache hit does NOT skip clang-tidy: the launcher and the analyser are two independent commands
+  under `cmake -E __run_co_compile`. On a pull request CI therefore tidies the diff plus every
+  translation unit that includes a changed header, and anything that changes how EVERY unit is read
+  gets a row in `SweepEverythingWhen` — a missing row is a sweep that checks the wrong set and prints
+  a confident count.
+- A compile database generated for clang-tidy needs `CMAKE_CXX_SCAN_FOR_MODULES=OFF` named
+  explicitly. Without it every unit fails to parse and the sweep reports clean.
+- And it must be configured with the same TARGET SET CI builds. A sweep whose scope comes from a
+  database is only as complete as that database's targets, and a target gated off by default is
+  invisible to it rather than absent from CI. The script cannot catch it — a changed file with no
+  compile command is dropped silently, and must be, since that is also what a platform-specific TU
+  looks like. Account for every file in the diff the sweep did not reach, before trusting its count.
+- **Running the launcher is not testing it.** The synthetic fixtures prove it RUNS and produces AN
+  object; only building a REAL target through it and running that target's tests catches a WRONG
+  one. `scripts/launcher-replay-e2e.sh` builds three times — cache-off control, cold (stores), warm
+  (REPLAYS) — and runs the replayed binary. Compare cold-against-warm, never control-against-warm: a
+  launcher-active configure disables PCH and module scanning. The cold build must be seen USING the
+  launcher, the warm one seen HITTING. And staging a wrong object needs the LINK command, never
+  `touch`: ninja records output mtimes, so a replaced object reads as dirty and is rebuilt, undoing
+  the injection silently.
+- A compiler cache that reads like success is worse than none: the Windows sccache was running into a
+  directory the runner deletes, so the jobs are asserted to be backed by the Actions cache — before
+  `ctest`, which restarts the sccache server and zeroes its counters.
+- Every `bool` and byte-wide enum in a config struct lives in one run: one between two 8-aligned
+  members costs seven bytes, and clang-tidy's padding budget fails the build.
+- A table indexed by an enumerator is `EnumTable<Enum, Row>` + `RowsInEnumeratorOrder`. A length
+  anchored on an enumerator by name is a guard that fires only when nothing is wrong.
+- Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000 processes, and gcov's
+  shared `.gcda` races them. `%8m`, not `%p`. `*_test.cpp` sits next to the implementation, so a
+  report that counts it measures the tests testing themselves. A compiler cache and coverage cannot
+  be combined — a replayed object's embedded mapping names the tree it was built in.
+- A rulebook `## Open work` entry names an OPEN issue, or it is a rule that has gone false — the
+  expensive shape being an entry saying something *cannot* be done, which instructs the next session
+  not to try. `ctest -R rulebook-open-work`. The ENTRY is a bullet's LEADING reference; a citation in
+  its prose names the landed change that produced the residual and is correctly closed. `gh` falls
+  back to PULL REQUESTS asymmetrically, so the KIND is asserted too. FOUR outcomes, not two, and of
+  the three sharing exit 1 with an empty result **two are the checker's own fault** — read as *stale*
+  they invent a finding somebody then edits a correct entry to satisfy — so the verdict is the HTTP
+  status behind a liveness anchor.
+- **A configure's OUTPUT is the module's CLAIM; the generated buildsystem is the artefact.** A module
+  printing the right status line at the right severity while wiring NO launcher passes every row, and
+  the cache cannot answer it — the launcher is a NORMAL variable, unset in `CMakeCache.txt`. Read
+  Ninja's per-rule `LAUNCHER =` or the Makefile compile line. A fixture needs a TARGET, two stand-in
+  launchers must be two PROGRAMS, and a generator the reader cannot parse is a THIRD state, named —
+  while a generator it CLAIMS to handle reading nothing is a violation. **Its first version was green
+  on Linux and red on all three Windows legs for one and the same file**, because a comparison
+  written against the spelling ONE generator on ONE platform emits is a comparison nobody has tested:
+  normalise a path as a PATH, on BOTH sides, and re-run the MUTATION on the platform that failed.
+  Its sibling: **the DECISION a guard makes is what gets tested, not the acquisition around it.**
+- A branch BEHIND master is unverified, and only a build says otherwise: its green checks are a true
+  statement about the tree it was branched from. **How far behind is not a measure of the risk** — it
+  measures elapsed time, while the defect is a collision that either exists or does not. **File
+  overlap is evidence only in the direction that says there IS a hazard**; its ABSENCE is evidence of
+  nothing. The hazard is a NAME shared between two changes, not a line shared between two diffs, and
+  a diff cannot show a name it does not mention. NEITHER branch has ever gone red, which is the point
+  rather than a contradiction: the failing tree is the combination. So a branch is rebased and
+  rebuilt before it merges, never inspected.
+  - **And the diff that VERIFIES such a rebase is three-dot.** `A..B` folds in the commits `B`
+    carries and `A` does not — the ordinary state right after a rebase — so it answers a question
+    nobody asked, and produces a wrong NUMBER rather than an error inside the step that exists to
+    verify. The two forms disagreeing is itself the signal that the branch is behind its base.
+- **After a revert, test for the REVERT, never for the defect.** A revert leaves the reverted commit
+  in the ancestry forever, so `--is-ancestor <fix>` answers YES for every branch and discriminates
+  nothing; the only useful question is `--is-ancestor <revert>` coming back NO. The instinct is to
+  check for the thing that broke you, and it is the one test that cannot work.
+- **A subject line is an abbreviated identifier with no prefix to disagree about.** Two commits here
+  carried the identical subject and opposite revert status, and two people measured correctly and
+  reported contradictory answers. A truncated SHA at least *looks* like an identifier and invites
+  comparison; a subject line looks like a description. Same family as a ctest index, two worktrees
+  one token apart, and a leg name without its compiler — **a leg travels with its compiler and its
+  machine.**
+- **A reason that generalises further than the fact it was drawn from is worse than the narrow one**,
+  because it reads as licence somewhere it was never measured — and it is introduced while TIDYING,
+  which is when it is least likely to be re-checked. Measured: a true reachability reason was
+  "improved" into a false semantic one during a `/simplify`, a later review faithfully propagated it
+  into two rulebook files, and the header then argued both sides.
+- A reference-build refusal is a REFUSAL and not a warning, because a verdict about a tree that was
+  not built cannot be read in EITHER direction: a substituted object can equally HIDE a real failure,
+  and nothing would say so. That sentence lives in the refusal's own text, or whoever meets it argues
+  for a warning. And the count is LAUNCHER **BINDINGS**, not edges — ninja emits one per RULE — so
+  **a unit error in a refusal message is how two numbers get compared that should not be.**
 - **A diagnostic that never RAN and one that ran and found nothing are the same green.**
-  `continue-on-error` is RIGHT for a probe — one that can redden a packaging job teaches
-  people to ignore packaging reds — and it is also exactly what hides a probe that could
-  not start. A `#376` probe staged its helper with a here-document that had to survive
-  YAML's literal scalar AND bash's parser, lost on both, printed three lines and stopped,
-  and the job reported **SUCCESS**. Keep the flag; add the missing half — **assert the
-  classifier was REACHED** (a verdict as `::notice`, its absence as `::warning`), and give
-  it **three** outcomes, since a probe that can only answer the two you expect will answer
-  one of them whatever it sees. And **a green test on the wrong object is worse
-  than no test, because it RETIRES THE SUSPICION** — that version's classifier had been
-  driven against three fake `xcrun`s and was correct the whole time, so every test passed
-  honestly and told nobody anything, and the passing suite is what stopped anyone looking.
-  Ask not *is this tested* but *is the thing tested the thing that ships*; here they
-  differed as TEXT, so extract the step's own `run:` block from the workflow and execute
-  THAT.
-- `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag
-  and the suppressions it makes necessary are governed by ONE condition — split, a
-  build directory reused across presets holds `PEDANTIC_COMPILER` ON with `WERROR`
-  OFF, which is a database no correction to the configure line explains. That is one
-  of #454's two halves, and **a symptom with two mechanisms reads as unreproducible
-  the moment either one alone is ruled out.**
-- **When the SUBJECT under test is the build environment, a green local gate is not weak
-  evidence — it is none.** One change, one afternoon, four platform defects, none visible
-  locally: a `/_deps/` DENYLIST that CI's in-repo CPM cache walked past (an exclusion list
-  bets on the world's layout; an inclusion list states your own), a POSIX shell stub
-  spawned by Python on Windows (**ENOEXEC**), a heredoc inside `$( )` that bash 3.2 cannot
-  PARSE, and Git Bash rewriting `clang-cl … /nologo` into
-  `'C:/Program Files/Git/nologo'` — `MSYS2_ARG_CONV_EXCL='*'` **and** `MSYS_NO_PATHCONV=1`,
-  both spellings, always. The mangling was the LUCKY half: the same GNU-only strip left
-  `/c` and `/Fo<obj>` standing, which SUCCEEDS — preprocessed text into the object file,
-  empty stdout, an honest `empty` rather than `unknown`, and a coverage check reporting
-  **CLEAN over the six files it exists to read**. Drop flags from a TABLE keyed on the
-  driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
-  report clean over a member it could not cover — `--all` chose its own set, `--only` was
-  handed one. Knowing a rule and having just applied it is not protection: the ENOEXEC was
-  the same author's own fix from three hours earlier, in a file written afterwards.
-
+  `continue-on-error` is RIGHT for a probe and is also exactly what hides a probe that could not
+  start. Keep the flag; add the missing half — **assert the classifier was REACHED** (a verdict as
+  `::notice`, its absence as `::warning`) — and give it **three** outcomes, since a probe that can
+  only answer the two you expect will answer one of them whatever it sees. And **a green test on the
+  wrong object is worse than no test, because it RETIRES THE SUSPICION**: ask not *is this tested*
+  but *is the thing tested the thing that ships*, and where they differ as TEXT, extract the step's
+  own `run:` block from the workflow and execute THAT.
+- `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag and the
+  suppressions it makes necessary are governed by ONE condition — split, a build directory reused
+  across presets holds `PEDANTIC_COMPILER` ON with `WERROR` OFF, which is a database no correction to
+  the configure line explains. And **a symptom with two mechanisms reads as unreproducible the moment
+  either one alone is ruled out.**
+- **When the SUBJECT under test is the build environment, a green local gate is not weak evidence —
+  it is none.** One change, one afternoon, four platform defects, none visible locally: a `/_deps/`
+  DENYLIST that CI's in-repo CPM cache walked past (an exclusion list bets on the world's layout; an
+  inclusion list states your own), a POSIX shell stub spawned by Python on Windows (**ENOEXEC**), a
+  heredoc inside `$( )` that bash 3.2 cannot PARSE, and Git Bash rewriting a `/`-led MSVC flag into a
+  path — `MSYS2_ARG_CONV_EXCL='*'` **and** `MSYS_NO_PATHCONV=1`, both spellings, always. The mangling
+  was the LUCKY half: the same GNU-only strip left `/c` and `/Fo<obj>` standing, which SUCCEEDS, and
+  a coverage check then reported CLEAN over the six files it exists to read. Drop flags from a TABLE
+  keyed on the driver NAME, never by sniffing a leading `/`. And a mode that NAMES its set may not
+  report clean over a member it could not cover. Knowing a rule and having just applied it is not
+  protection: the ENOEXEC was the same author's own fix from three hours earlier.
 **[`.agent/rules/testing.md`](.agent/rules/testing.md)** — how tests are registered
 and what they may assume.
 - `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as
