@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -113,6 +114,74 @@ TEST_CASE("A setting this build does not know is refused, not stored", "[cluster
     // that describes ONE machine is not one -- replicating `--slots` would impose one
     // host's size on all of them.
     CHECK(FindSetting("slots") == nullptr);
+}
+
+namespace ConsumerGuard
+{
+// Synthetic tables, so the guard can be watched REFUSING and ACCEPTING. They are at
+// namespace scope because `RowsCarryAConsumer` is `consteval`: a span over a block
+// local is not a constant expression, and a runtime call is not available to fall
+// back on -- deliberately, since a runtime `CHECK` of a `consteval` predicate cannot
+// fail in a translation unit that compiled and would read as a guarantee while
+// asserting nothing.
+
+/// The omission the guard exists for: a row that says nothing about who reads it.
+constexpr std::array<SettingSpec, 1> SaysNothing { SettingSpec { .name = "x", .summary = "y" } };
+
+/// A row claiming BOTH that something reads it and that nothing does.
+constexpr std::array<SettingSpec, 1> SaysBoth { SettingSpec {
+    .name = "x", .summary = "y", .readBy = "Thing::Reader", .unreadBecause = "nothing yet, #1" } };
+
+/// An opt-out that names no issue -- `forgot` in the vocabulary of `decided`.
+constexpr std::array<SettingSpec, 1> OptOutWithNoIssue { SettingSpec {
+    .name = "x", .summary = "y", .unreadBecause = "we will get to it" } };
+
+/// A row that names a reader.
+constexpr std::array<SettingSpec, 1> NamesAReader { SettingSpec { .name = "x", .summary = "y", .readBy = "Thing::Reader" } };
+
+/// An opt-out spelled properly.
+constexpr std::array<SettingSpec, 1> OptOutWithAnIssue { SettingSpec {
+    .name = "x", .summary = "y", .unreadBecause = "nothing reads it until #4242 wires the scheduler" } };
+} // namespace ConsumerGuard
+
+TEST_CASE("Every replicated setting says what reads it", "[cluster][state]")
+{
+    // #1124. `SettingTable`'s header names the failure it exists to prevent -- a
+    // setting accepted, replicated, snapshotted and carried across restarts while
+    // doing nothing -- and `FindSetting` closes it only for a MISSPELLED key. Two of
+    // the three rows were write-only at once under a correctly spelled name.
+    //
+    // Both directions, because one alone establishes nothing: a guard nobody has
+    // watched refuse is not a guard, and one nobody has watched accept is not known
+    // to work (#1031). These are `static_assert`s rather than `CHECK`s, so a broken
+    // guard fails the BUILD of this file; the case then exists to name the property
+    // and to carry the runtime half below.
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::SaysNothing), "a row saying nothing must be refused");
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::SaysBoth), "a row saying both must be refused");
+    static_assert(!RowsCarryAConsumer(ConsumerGuard::OptOutWithNoIssue), "an opt-out must name its issue");
+    static_assert(RowsCarryAConsumer(ConsumerGuard::NamesAReader), "a row naming a reader must be accepted");
+    static_assert(RowsCarryAConsumer(ConsumerGuard::OptOutWithAnIssue), "a stated opt-out must be accepted");
+    static_assert(RowsCarryAConsumer(SettingTable), "and the table this build ships");
+
+    // The runtime half, and it is not a restatement of the line above: the guard
+    // accepts an opt-out, so a table where every row had opted out would satisfy it
+    // completely. This is the tally -- `RefuseUntriaged`'s argument in the metrics
+    // rules -- and it NAMES the rows rather than counting them, because a count
+    // cannot be acted on. Adding a legitimate opt-out is expected to fail this and to
+    // be acknowledged here; that is the visibility, not an obstacle.
+    std::string optedOut;
+    for (auto const& row: SettingTable)
+        if (row.readBy.empty())
+            optedOut += std::string { row.name } + " (" + std::string { row.unreadBecause } + ") ";
+    CHECK(optedOut.empty());
+
+    // And every reader named is a real one. A claim is only as good as somebody
+    // checking it, so the two live rows are spelled out here: the guard cannot tell a
+    // true `Class::Function` from a plausible one, and this is where a rename that
+    // left the column behind shows up.
+    REQUIRE(SettingTable.size() == 2);
+    CHECK(FindSetting(FleetOpenSetting)->readBy == "NodeMembership::AgreedOpenness");
+    CHECK(FindSetting(LeaseLifetimeSetting)->readBy == "SchedulerService::AgreedLeaseLifetime");
 }
 
 TEST_CASE("A key this cluster refuses to replicate is refused BY NAME", "[cluster][state]")

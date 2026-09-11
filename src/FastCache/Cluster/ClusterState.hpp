@@ -113,7 +113,64 @@ struct SettingSpec
     /// @param value The value as the operator typed it.
     /// @return Why it may not be set, or nullopt when it may.
     std::optional<std::string> (*refuse)(std::string_view value) = nullptr;
+
+    /// Where the value is READ BACK, or empty when nothing reads it.
+    ///
+    /// `Class::Function`, never a line number: a citation carrying a line rots at the
+    /// next edit above it and sends a reader somewhere arbitrary.
+    ///
+    /// A CLAIM a reader can check, and deliberately not a mechanism (#1124). The scan
+    /// that would mechanise it is the weakest option available, and the ticket says
+    /// why: a row's name is a string literal, one of them is a named constant, and
+    /// `upstream`'s name collided with a per-node FLAG spelled the same way -- so the
+    /// natural grep reported the deadest row in the table as wired. A check with a
+    /// false negative built into it is worse than a claim somebody has to write down.
+    std::string_view readBy {};
+
+    /// Why NOTHING reads this row yet, naming the issue that will -- or empty.
+    ///
+    /// The opt-out, and a separate COLUMN rather than an empty `readBy`, for
+    /// `RefuseWithoutCounter`'s reason in the metrics rules: *nobody has wired this*
+    /// must not be spelled the way *forgot the column* is, or a placeholder says
+    /// `forgot` in the vocabulary of `decided`. Exactly one of the two is set --
+    /// neither and both are the same refusal, since both mean nobody has decided.
+    std::string_view unreadBecause {};
 };
+
+/// Whether every row of @p table says what reads it.
+///
+/// **The failure this closes is the one `SettingTable`'s own header describes, for the
+/// key an operator spells CORRECTLY** (#1124). `FindSetting` refuses a typo; nothing
+/// refused a row that was accepted, replicated, snapshotted and carried across
+/// restarts while being read by nobody -- and two of the three rows were in that state
+/// at once, which is a pattern rather than luck. `fleet-open` was closed by wiring it
+/// (#1112) and `upstream` by removing it (#1123); this is the guard each of those
+/// instances left standing.
+///
+/// MANDATORY with an explicit opt-out rather than opt-in, because opt-in is silent
+/// about the row that never opted in -- #492's argument inside a table. It takes the
+/// table as a PARAMETER rather than reading `SettingTable` directly, and that is what
+/// lets a test drive it in the REFUSING direction: a guard nobody has watched refuse
+/// is not a guard, and one nobody has watched accept is not known to work (#1031).
+///
+/// `consteval`, so it cannot be called at runtime and mistaken for a test -- a runtime
+/// check of it could not fail in a translation unit that compiled.
+///
+/// @param table The rows to check.
+/// @return True when every row names a reader, or names the issue that will add one.
+[[nodiscard]] consteval bool RowsCarryAConsumer(std::span<SettingSpec const> table) noexcept
+{
+    return std::ranges::all_of(table, [](SettingSpec const& row) {
+        // Neither is the omission this exists to catch; BOTH is a row saying that a
+        // reader exists and also that none does. One condition, because they are one
+        // fact: nobody has decided.
+        if (row.readBy.empty() == row.unreadBecause.empty())
+            return false;
+        // An opt-out names the issue that will close it, exactly as `RefuseUntriaged`
+        // does, or *nobody has decided yet* reads as *decided against*.
+        return !row.readBy.empty() || row.unreadBecause.contains('#');
+    });
+}
 
 /// The key naming how long a lease -- and therefore a dispatched compile -- may live.
 ///
@@ -168,12 +225,20 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
 inline constexpr std::array<SettingSpec, 2> SettingTable {
-    SettingSpec { .name = FleetOpenSetting, .summary = R"('1' to admit every caller to the fleet, '0' for members only)" },
+    SettingSpec { .name = FleetOpenSetting,
+                  .summary = R"('1' to admit every caller to the fleet, '0' for members only)",
+                  .readBy = "NodeMembership::AgreedOpenness" },
     SettingSpec { .name = LeaseLifetimeSetting,
                   .summary = "milliseconds a compile lease lives END TO END -- upload, wait for a slot, "
                              "compile, and the object coming back -- not how long a compiler may run",
-                  .refuse = &RefuseLeaseLifetime },
+                  .refuse = &RefuseLeaseLifetime,
+                  .readBy = "SchedulerService::AgreedLeaseLifetime" },
 };
+
+static_assert(RowsCarryAConsumer(SettingTable),
+              "every SettingTable row must name what READS it, or name the issue that will wire it: a row "
+              "nothing reads is accepted, replicated, snapshotted and carried across restarts while the thing "
+              "the operator configured does not happen, and a correctly spelled key reaches no other guard");
 
 /// Whether `name` is a setting this cluster replicates.
 /// @param name The key.
