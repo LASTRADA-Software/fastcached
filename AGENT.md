@@ -453,124 +453,81 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 
 **[`.agent/rules/consensus-and-cluster.md`](.agent/rules/consensus-and-cluster.md)**
 — Raft, discovery, membership. Before `Consensus/`, `Cluster/`.
-- The pre-shared key never travels in a beacon. It appears only inside an HMAC
-  over a nonce *this* node chose, and the MAC covers the `(node, endpoint)` pair.
-- A proof only ever answers a challenge this node issued, and the nonce is spent
-  whatever the outcome.
+- The pre-shared key never travels in a beacon. It appears only inside an HMAC over a nonce
+  *this* node chose, and the MAC covers the `(node, endpoint)` pair.
+- A proof only ever answers a challenge this node issued, and the nonce is spent whatever
+  the outcome.
 - Discovery never changes membership: it reports who proved the key and where.
 - `RaftNode` reads no clock, opens no socket and draws no randomness of its own.
-- A snapshot is durable before it is acknowledged, and the configuration travels
-  inside it.
-- A seeded draw must be identical on every standard library — `UniformInRange`,
-  never `std::uniform_int_distribution`.
+- A snapshot is durable before it is acknowledged, and the configuration travels inside it.
+- A seeded draw must be identical on every standard library — `UniformInRange`, never
+  `std::uniform_int_distribution`.
 - A node being admitted must never have bootstrapped a cluster of itself, so
-  `RaftConfig::members` may legally be **empty** and `--raft-join` is what starts a
-  machine that way. Who a node dials is not who it counts.
-- The quorum follows the replicated state, one change at a time, additions before
-  removals — and a member is never counted before every node can dial it. **One at a
-  time is load-bearing for READS as well as for commitment** (#1095): CheckQuorum
-  consults the committed configuration while a change is in flight, and that is only
-  safe because any majority of the old and any majority of the new share a member.
-  Relaxing the single-member restriction on the commitment argument alone breaks a
-  rule nothing would warn you about.
-- Absence from `ClusterState` is not removal: a `--raft-peer` member is in the
-  configuration and in no state, so a member named in the bootstrap set is never
+  `RaftConfig::members` may legally be **empty** and `--raft-join` is what starts a machine
+  that way. Who a node dials is not who it counts.
+- The quorum follows the replicated state, one change at a time, additions before removals —
+  and a member is never counted before every node can dial it. **One at a time is
+  load-bearing for READS as well as for commitment**: CheckQuorum consults the committed
+  configuration while a change is in flight, and that is only safe because any majority of
+  the old and any majority of the new share a member. Relaxing the restriction on the
+  commitment argument alone breaks a rule nothing would warn you about.
+- Absence from `ClusterState` is not removal: a member named in the bootstrap set is never
   proposed for removal, and a node given no bootstrap set proposes none at all.
-- A cluster that has elected is not one that has formed. Until every member
-  attaches, pre-vote refuses nothing and any stall re-elects — assert leadership
-  stability only after formation, and log the term or nothing explains it.
-- A leader and a follower stamp the same link half a round trip apart, so a shared
-  window never bought a shared answer. A non-leader decides a pre-vote from its own
-  `_knownLeader` and election deadline, never from a timestamp.
-- CheckQuorum DEPOSES a leader here — the rulebook said for months that nothing did,
-  and #1061 is what that cost. It measures SILENCE, and a member admitted a moment
-  ago has not been silent, it has not been ASKED: adopting the configuration grows
-  the quorum before the new member can have answered, so the leader deposes itself
-  at its next heartbeat. So while a change is UNCOMMITTED, CheckQuorum asks about the
-  **committed** configuration (#1095) — the set that elected this leader and still
-  answers it — never by seeding `_followerContact`, whose absence means something
-  else and which pre-vote reads too. The first fix was a per-member grace of one
-  `electionTimeoutMin`, and a window closed by a CONSTANT is one a slow first round
-  trip outruns: a joiner's first exchange carries two fsyncs and a `nextIndex`
-  walk-back, which no steady-state heartbeat does. This rule has no constant.
-  It is safe for READS — which is what CheckQuorum here protects — only because a
-  change is restricted to a SINGLE member, so any majority of the old configuration
-  and any majority of the new share one; that restriction is load-bearing for reads
-  as well as for commitment. At two members the arithmetic cannot
-  be satisfied and nothing recovers, because the member just admitted holds no
-  configuration and so grants no votes; at three and above somebody else campaigns,
-  so it presents as an election storm that settles and every *a leader exists
-  eventually* test passes under it. `undecided` in a node log is
-  `SchedulerRole::Undecided`, not a Raft role.
-- A refusal code carries its own PERMANENCE, and there are THREE answers.
-  `InvalidConfiguration` had two producers meaning opposite things — `Cluster::Validate`
-  for a command nothing could ever apply, and `ProposeMembership` for *a change is
-  already in flight* and *the proposed set is the current one*, both of which clear on
-  their own — so `SubjectOf`, a `constexpr` table that reads as a global fact, was right
-  on one path and wrong on the other, guarded only by a sentence in its own doc and by
-  `ReconcileQuorum` declining to consult it. Wiring it in was the obvious next tidy-up
-  and would have reported *wait for it to commit* as **can never be recorded as it
-  stands**, at Warn, every interval (#196). Two enumerators now, and `WireCodeFor` — an
-  `EnumTable` over the same enum — fails the BUILD until each says what it means on the
-  wire; both new wire codes are UNCOUNTED, one being what a healthy cluster answers
-  mid-replication and the other an idempotent request arriving twice.
-  **`RefusalSubject` gained `Satisfied`**: *already in force* is `Command` reported at
-  Warn as a record to go and correct, or `Moment` abandoning a pass with nothing left to
-  do — both the misleading symptom the classification exists to remove. It stays a
-  refusal rather than a success because a success must name an entry that does not
-  exist, and `NextQuorumChange` never proposes an unchanged set.
-- "A leader spoke" arrives at two handlers, and every rule about it belongs in
-  both: `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and
-  candidate demotion included.
-- **A node IS its state directory: its identity is MINTED into `--cluster-dir` and read
-  back forever, never derived from the machine.** Not the hostname (mutable, and one
-  machine may run several nodes), and not the OS machine-id even as a SEED — two clones
-  of one image with no state yet mint the SAME id, and an identity that outlives its own
-  vote record is `--cluster-dir`'s two-leaders hazard arriving automatically. A wiped
-  state directory MUST get a new identity. `--node-id` stays as an override and is
-  recorded; a derived id cannot be typed into `--raft-peer`, so `--raft-self=<host>`
-  states the address and takes the port from `--listen-raft`. The resolved value reaches
-  the running config, the service registration AND every reload candidate, or reloads are
-  refused by name. A recorded id that is empty or not text is refused, never re-minted.
-  A copied state directory copies the node and is NOT refused — `--cluster-admit` at a new
-  address is how a MOVE is recorded, so the two requests are identical.
-- **The hostname is a fleet-page LABEL and decides nothing** — nothing keys, routes,
-  admits or dispatches by it, which is what makes a mutable non-unique value safe to
-  carry. It still passes the UTF-8 gate at `SchedulerService::Register`: one byte makes
-  `/fleet.json` unparseable for the whole fleet. **No prefix matching on ids.**
-- **A replicated setting must not decide where a node sends a CREDENTIAL.** `upstream`
-  was a `SettingTable` row and is #1123: a node presents its `--requirepass` at whatever
-  address it names (`CacheTier.cpp:227`/`:228`, `RemoteUpstream.cpp:135`/`:175`), so one
-  committed entry would have redirected every member's secret — while the secret itself
-  stays per machine. Removed rather than wired, which is the OPPOSITE answer to #1112's
-  on the same shape of unread row, because what picks between them is what the value
-  would decide. Refused BY NAME through `RefusedSettingTable`, since *no such cluster
-  setting* reads as a typo or as a node too old.
+- A cluster that has elected is not one that has formed. Until every member attaches,
+  pre-vote refuses nothing and any stall re-elects — assert leadership stability only after
+  formation, and log the term or nothing explains it.
+- A leader and a follower stamp the same link half a round trip apart, so a shared window
+  never bought a shared answer. A non-leader decides a pre-vote from its own `_knownLeader`
+  and election deadline, never from a timestamp.
+- CheckQuorum DEPOSES a leader here. It measures SILENCE, and a member admitted a moment ago
+  has not been silent, it has not been ASKED — so while a change is UNCOMMITTED, CheckQuorum
+  asks about the **committed** configuration, never by seeding `_followerContact`, whose
+  absence means something else and which pre-vote reads too. **This rule has no constant**: a
+  window closed by one is a window a slow first round trip outruns. `undecided` in a node log
+  is `SchedulerRole::Undecided`, not a Raft role.
+- A refusal code carries its own PERMANENCE, and there are THREE answers. `SubjectOf` reads
+  as a global fact, so one enumerator may have only one meaning; `WireCodeFor` fails the
+  BUILD until each says what it means on the wire. **`RefusalSubject` has `Satisfied`** —
+  *already in force* is `Command` to go and correct, or `Moment` abandoning a pass with
+  nothing left to do. It stays a refusal rather than a success because a success must name an
+  entry that does not exist.
+- "A leader spoke" arrives at two handlers, and every rule about it belongs in both:
+  `OnInstallSnapshot` is `OnAppendEntries` speaking, membership guard and candidate demotion
+  included.
+- **A node IS its state directory: its identity is MINTED into `--cluster-dir` and read back
+  forever, never derived from the machine.** Not the hostname, and not the OS machine-id even
+  as a SEED — two clones of one image with no state yet mint the SAME id. A wiped state
+  directory MUST get a new identity. `--node-id` stays as an override and is recorded; a
+  derived id cannot be typed into `--raft-peer`, so `--raft-self=<host>` states the address
+  and takes the port from `--listen-raft`. The resolved value reaches the running config, the
+  service registration AND every reload candidate, or reloads are refused by name. A recorded
+  id that is empty or not text is refused, never re-minted. A copied state directory copies
+  the node and is NOT refused — `--cluster-admit` at a new address is how a MOVE is recorded.
+- **The hostname is a fleet-page LABEL and decides nothing** — nothing keys, routes, admits or
+  dispatches by it, which is what makes a mutable non-unique value safe to carry. It still
+  passes the UTF-8 gate at `SchedulerService::Register`. **No prefix matching on ids.**
+- **A replicated setting must not decide where a node sends a CREDENTIAL.** A node presents
+  its `--requirepass` at whatever address it names, so one committed entry would redirect
+  every member's secret while the secret itself stays per machine. Removed rather than wired,
+  and refused BY NAME through `RefusedSettingTable`, since *no such cluster setting* reads as
+  a typo or as a node too old.
 - **A mode rides on the PORT, never on the absence of a NAME.** Consensus is on iff
-  `--listen-raft` resolves — asked of the surface row, so `--print-surfaces` and the
-  mode cannot disagree. It read `--node-id` until #1022, and a flag whose ABSENCE
-  carries a mode can never be given a default: any default makes `nodeId.empty()`
-  false forever, so `ClusterSelfMember` names nothing on the one-machine deployment
-  and that node is refused at every boot AND at `--install-service`. A boolean beside
-  the port is the tempting alternative and is worse — two things that can disagree,
-  and both disagreements are states nothing could describe. One predicate,
-  `RunsConsensus`, because #613 was two tiers authoring this one rule.
+  `--listen-raft` resolves — asked of the surface row, so `--print-surfaces` and the mode
+  cannot disagree. A flag whose ABSENCE carries a mode can never be given a default. A boolean
+  beside the port is the tempting alternative and is worse: two things that can disagree, and
+  both disagreements are states nothing could describe. One predicate, `RunsConsensus`.
 
 **Backwards compatibility is not owed yet, and designing around it has already cost
-work.** Until this software is declared production ready, a wire format, an on-disk
-format, a cache-key version, an enumerator order, a CLI flag or a config key may change
-outright. `fastcache-compile-node` has ONE installation, so a format change costs one
-local rebuild rather than a migration. Four tickets were designed against a burden that
-does not exist — #319 weighed a fix against "an `objkey-v*` bump discards every stored
-value", #322 argued fields were "cheap now and expensive later", #308 read an enumerator
-order as immovable rather than as movable-with-a-bump, and #290 owed no migration path
-at all. **Two limits, and they are the whole of it:** it does not license changing a
-format without bumping its VERSION — the version is how a mismatch is *detected*, which
-is why `UnsupportedFormatVersion` and `Corrupt` are different answers
+work.** Until this software is declared production ready, a wire format, an on-disk format,
+a cache-key version, an enumerator order, a CLI flag or a config key may change outright;
+`fastcache-compile-node` has ONE installation, so a format change costs one local rebuild
+rather than a migration. **Two limits, and they are the whole of it:** it does not license
+changing a format without bumping its VERSION — the version is how a mismatch is *detected*,
+which is why `UnsupportedFormatVersion` and `Corrupt` are different answers
 ([`.agent/rules/storage.md`](.agent/rules/storage.md)) — and it EXPIRES at the
-production-ready declaration, so anything written on the strength of it is due a re-read
-then rather than inherited. Removing superseded code outright rather than keeping a
-compatibility shim is the same position from the other side (#332).
+production-ready declaration, so anything written on the strength of it is due a re-read then
+rather than inherited. Removing superseded code outright rather than keeping a compatibility
+shim is the same position from the other side.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
