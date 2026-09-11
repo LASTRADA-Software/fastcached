@@ -17,6 +17,10 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+// For `ConsensusStatus`, which is the shape a scrape reports this node's own quorum
+// in. Defined beside `MetricsSnapshot` rather than here because the renderer is what
+// has to know its shape, and `/metrics` is the one surface every node already serves.
+#include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Net/ThreadedAddressResolver.hpp>
 
@@ -55,6 +59,22 @@ namespace FastCache::Node
 ///        none.
 /// @return The endpoint to advertise, empty when there is nothing to advertise.
 [[nodiscard]] std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound);
+
+/// What one read of the driver says about this node's own cluster.
+///
+/// Pure, and separated from `ConsensusTier::Status()` for the reason
+/// `QuorumProposalPending` is separated from the reconciler: the acquisition needs a
+/// live driver — a reactor, a listener, a peer transport and a state directory — and
+/// the mapping needs none of that, so folding the two together would put the answer
+/// #435 is about behind a running cluster and out of reach of every unit test.
+///
+/// **It carries the member set VERBATIM**, in whatever order consensus holds it. A
+/// renderer that wants it sorted sorts it; sorting here would make a caller unable
+/// to see the order a configuration was adopted in, and this is the read an operator
+/// uses to compare two nodes.
+/// @param progress One read of the driver, taken under its lock.
+/// @return What to report about this node.
+[[nodiscard]] ConsensusStatus ConsensusStatusFrom(Consensus::RaftDriver::Progress const& progress);
 
 /// The line announcing what this node has become.
 ///
@@ -277,6 +297,20 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// By value, because the applying thread is not this one: see
     /// `ClusterStateMachine::State`.
     [[nodiscard]] Cluster::ClusterState ClusterState() const override;
+
+    /// What this node believes about its OWN consensus configuration.
+    ///
+    /// Deliberately a different question from `ClusterState()`, and confusing the
+    /// two is how the gap #435 records came about: that reports the FLEET's member
+    /// record from `ClusterStateMachine`, which a leader answers and which is a
+    /// different set from the quorum. This one is the quorum, answered by whoever is
+    /// asked, leader or not — because the node whose view matters when a cluster
+    /// will not re-elect is precisely the one that redirects you.
+    ///
+    /// A snapshot taken under the driver's lock, so the role, the term, the member
+    /// set and the commit index describe one moment rather than four.
+    /// @return This node's consensus state.
+    [[nodiscard]] ConsensusStatus Status() const;
 
     /// Offer a change to the cluster, discarding where it landed.
     ///
@@ -620,6 +654,22 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 ///        owning a listener when the surfaces merged (#290) -- and it is what a leader
 ///        advertises, so it must be what was BOUND: `--listen-node=0` means "pick a
 ///        port", and an endpoint echoing `:0` back names nothing a client could dial.
+/// The consensus reader a `/metrics` scrape uses, disengaged when this node runs none.
+///
+/// A function rather than a ternary in `WorkerBody`, for the reason
+/// `StartConsensusOrExplain` below is one: spelled inline it took `WorkerBody` to a
+/// cognitive complexity of 61 against clang-tidy's threshold of 60 -- a build
+/// failure, since `WarningsAsErrors` is `*` -- and `main.cpp` is in no test target.
+///
+/// What it encodes is that *this node runs no consensus* is a fact about the NODE,
+/// while an empty `std::function` is merely how a scrape spells it. Deciding it here
+/// keeps the absence in one place instead of in a call site that is already
+/// assembling five other fields, and it is the branch that makes the scrape say NO
+/// cluster rather than a cluster of nobody.
+/// @param tier This node's consensus tier, or null when it runs no consensus.
+/// @return A reader of that tier's status, or an empty function when there is none.
+[[nodiscard]] std::function<ConsensusStatus()> ConsensusScrapeSource(ConsensusTier const* tier);
+
 [[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,

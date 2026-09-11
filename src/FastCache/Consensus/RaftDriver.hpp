@@ -200,14 +200,24 @@ class RaftDriver
     /// @return Where the entry landed, or why it was refused.
     [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(std::vector<NodeId> members, TimePoint now);
 
-    /// What consensus counts, and how far it has agreed.
+    /// What consensus counts, how far it has agreed, and what this node is playing.
     ///
-    /// Both under one lock, because the caller compares them and two acquisitions
-    /// would let a configuration change land between them — reading a member set
-    /// from before it and a commit index from after, which is a pair that never
-    /// existed. By value for the reason `Failure` is: `Node()` hands back a
+    /// Every field under one lock, because the caller compares them and two
+    /// acquisitions would let a configuration change land between them — reading a
+    /// member set from before it and a commit index from after, which is a pair that
+    /// never existed. By value for the reason `Failure` is: `Node()` hands back a
     /// reference to a member the timer loop and a peer reader are both free to
     /// move.
+    ///
+    /// It is also the ONE read anything outside this driver has of what a node
+    /// believes about its own cluster, which is why the role and the leader belong
+    /// here rather than on accessors of their own
+    /// ([#435](https://github.com/LASTRADA-Software/fastcached/issues/435)).
+    /// `RaftDriver::Node()` says in as many words that it is not synchronized, so a
+    /// caller assembling this picture from `Node().CurrentRole()` and
+    /// `Node().ActiveMembers()` would be reading two moments and reporting them as
+    /// one — and the moment that matters is an election, which is exactly when the
+    /// two disagree.
     struct Progress
     {
         std::vector<NodeId> members; ///< The member set this node operates under.
@@ -221,9 +231,27 @@ class RaftDriver
         /// would let leadership move between the reads and produce a triple that
         /// never existed.
         Term term;
+
+        /// What this node is playing in that term.
+        ///
+        /// Not derivable from anything else here: a follower and a candidate hold
+        /// the same members, the same commit index and — for as long as the
+        /// election lasts — terms that differ by one, so a reader comparing two
+        /// samples cannot tell a node that is campaigning from one that is quietly
+        /// following a leader it has stopped hearing from.
+        Role role {};
+
+        /// Who it believes leads, if anybody.
+        ///
+        /// Disengaged is a reading rather than a gap, and the commonest one that is
+        /// worth seeing: no member leads *right now*, which is what an election in
+        /// progress looks like from every node taking part in it. Distinct from
+        /// `role == Role::Leader`, which answers only whether the leader is this
+        /// node.
+        std::optional<NodeId> knownLeader;
     };
 
-    /// @return The member set and commit index, read together.
+    /// @return What this node believes about its own cluster, read together.
     [[nodiscard]] Progress CurrentProgress() const;
 
     /// The node being driven, for inspection.

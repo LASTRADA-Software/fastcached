@@ -1021,7 +1021,12 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
                                   .busySlots = [&compileCapacity] { return compileCapacity.InFlight(); },
                                   .cache = cacheTier.get(),
                                   .slots = slots,
-                                  .scratchRoot = jobs.ScratchRoot() },
+                                  .scratchRoot = jobs.ScratchRoot(),
+                                  // Empty when this node runs no consensus, which is what makes the
+                                  // scrape say NO cluster rather than a cluster of nobody. The tier is
+                                  // declared above, so it outlives the provider: locals are destroyed in
+                                  // reverse.
+                                  .consensus = Node::ConsensusScrapeSource(consensusTier.get()) },
         std::chrono::steady_clock::now());
 
     // Absent when this node runs no scheduler: there is then no registry to report,

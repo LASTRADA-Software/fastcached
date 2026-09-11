@@ -510,6 +510,202 @@ does: a list of what is wrong today is maintained by the same person who
 introduces the next one. Put the flag anywhere but first — "Naming `--cache-dir`
 gives the node an on-disk tier" reads no worse and runs.
 
+### A COMMA splits the spec, so such a name cannot select itself — and the miss is a RED
+
+The dash is one instance of the rule; the comma is the next, and **the rule is
+that the name is an argument, not that these two characters are bad.** Whatever
+Catch2 adds to its spec grammar joins this list, so read the general form first:
+**a filter that matched nothing must never be read as a subject that failed.**
+
+Catch2 parses a test spec as a **comma-separated list of specs**. So
+
+```
+The endpoint arms the responder's deadline, not its own
+```
+
+splits into two fragments, neither of which names a case, and the run reports
+`No test cases matched ...` twice and `No tests ran`. **`No tests ran` exits
+non-zero**, so the miss does not present as an empty result — it presents as a
+**deterministic red**, identical on every iteration, which is exactly what a real
+reproducible failure looks like.
+
+Re-measured against a built `FastCacheTest` rather than taken from the tickets,
+both directions, because a subject with no control cannot tell *this name matches
+nothing* from *my quoting is broken* — the first attempt's control picked the
+`--list-tests` header instead of a case and reported `No tests ran` for the
+control too, which would have proved nothing:
+
+```
+"A push while the consumer is parked does not resume it inline"   exit 0
+                              All tests passed (8 assertions in 1 test case)
+"A deadline fires exactly once, on the reactor"                   exit 2
+    No test cases matched '"A deadline fires exactly once"'
+    No test cases matched '"on the reactor"'
+    No tests ran
+``` A lane stress-checking a timing-sensitive case
+got five runs and five "failures" for a case that had just passed inside the full
+suite (#636). Another, measuring an abort rate, selected its case by name and read
+`0 failed` over **zero cases executed** — for a measurement whose expected result
+was 20/20, that is indistinguishable from a clean pass (#895).
+
+**Both readings of that output are wrong in the direction you were hoping for**,
+which is what makes it worth a rule rather than a footnote.
+
+Measured 2026-09-10 on this tree — pattern stated because three tickets quote
+three different figures and those are **different questions asked of earlier
+trees, not drift**: over `src/**/*_test.cpp`, the four case macros, the name taken
+as the first string literal on the line, **529 of 3503 names (15.1%) contain a
+comma**. #895 recorded 455 of 3263, #636 418 of 3074, #729 3166 names.
+
+**This is not a reason to rename them.** The names are sentences stating what the
+case establishes, that convention is deliberate and good, and 15% is not a corner
+to be tidied away — the filter is what cannot express the convention, and
+`test-name-hygiene` therefore does **not** refuse a comma. What to do instead:
+
+- **`ctest -R` is unaffected.** `catch_discover_tests` registers each case under
+  its full name and CTest matches by regex, so CI and `scripts/local-gate.sh`
+  never meet this. It bites the person narrowing a failure by hand, which is the
+  worst moment for it.
+- **Select by TAG**, or by a comma-free substring, wherever tooling picks a case —
+  rate measurements, reproductions, bisects.
+- **Anything selecting a subset asserts HOW MANY CASES RAN**, not only how many
+  failed. A run that executed nothing and a run that passed are one number today,
+  and the assertion is what separates them. That is the positive control that
+  caught #895 in the first place.
+
+**That last obligation is the CALLER's, and `flake-rate.sh` is where this is easy
+to misplace.** It counts exit statuses of an arbitrary `"$@"` and never selects a
+case itself, so its `ran=` is a count of ITERATIONS, not of cases executed — a
+comma-bearing name handed to it yields `ran=200 pass=0 fail=200`, which is a
+perfect deterministic red produced by a filter that matched nothing. The script
+cannot fix that for you without assuming its command is Catch2, and `--quiet`
+discards the `No tests ran` that would have said so. So the caller selects by tag
+and checks the case actually ran, before reading any rate off it.
+
+### A DUPLICATED name registers two entries that each run BOTH cases
+
+A different mechanism, same subject. `catch_discover_tests` registers one entry
+per NAME, so two cases sharing one name produce two ctest entries that each run
+the binary filtered by that name — and Catch2 matches **both** cases for either
+entry, tolerating names that differ only in tags.
+
+**Nothing is skipped, and that is why it reads as harmless.** It is the mirror of
+this tree's usual disease: work done twice under a name that cannot say which case
+it was, rather than work skipped. What breaks is attribution — one defect surfaces
+as two red entries and neither names the failing case, `ctest -R "^<name>$"` cannot
+select one of the pair, and per-case timings and `--repeat` flake hunts are filed
+under an ambiguous name.
+
+`test-name-hygiene` refuses duplicates. Its exemption table carries a **reason**
+per row, so an allowed duplicate cannot be spelled the same way as a forgotten one
+— and a row that has **stopped** describing a duplicate is refused as stale,
+because an exemption nobody must keep true is a licence that outlives its argument
+and would wave through the next duplicate of that name. There is one row: the
+Epoll and Kqueue reactor tests are wholly inside `#if defined(__linux__)` and
+`#if defined(__APPLE__)`, so they never co-exist in one build, and the parallel
+naming is what makes one property greppable across the two platform reactors.
+
+The check also refuses a scan that matched **no file or no case**. Every verdict
+in it is drawn from an accumulated list, so an empty scan and a clean tree produced
+byte-identical output — two empty lists agree perfectly (#729).
+
+## A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG
+
+A test starts something that needs an explicit stop — a reactor on a `jthread`, a
+server, a loop — and puts its `REQUIRE`s above the `Stop()`. **Catch2 unwinds on a
+failed `REQUIRE`**, so the failure skips the stop, and `~jthread` then joins a loop
+nobody asked to end.
+
+The test hangs instead of reporting, and that is strictly worse than a plain
+failure three ways:
+
+- **The timeout does not name the assertion.** The one thing the test existed to
+  produce is the thing that is lost.
+- **A timeout and a wedge look identical**, so the reader's first hypothesis is
+  infrastructure rather than the subject — the wrong investigation, by the wrong
+  person, usually on the wrong machine.
+- **It is silent until something fails.** A green suite says nothing about it, so
+  it can only be found by breaking the thing under test, which is exactly when you
+  least want a second puzzle.
+
+**It concentrates in teardown tests, and that is not coincidence.** A test whose
+subject is orderly shutdown is by construction one that starts a thing and must
+stop it, written by somebody thinking about the *subject's* ordering rather than
+the *harness's*. Same species as the entry elsewhere here that a state-collapsing
+bug is likeliest in the tool whose job is that state distinction.
+
+**`CHECK` does not unwind.** Only the `REQUIRE` family, `FAIL` and `SKIP` throw, so
+a `CHECK` above a stop is not this hazard — and counting it as one buries the real
+ones.
+
+### The two fixes, and the second half is the one that gets forgotten
+
+**Stop before you assert**, where the diagnosis does not need the thing running —
+`HealthProbe_test.cpp` calls `server.Shutdown()` *before* its `FAIL`, having
+already taken the diagnosis into locals, precisely because `AdminHttpServer::Run`
+leaves only on the shutdown flag and its lambda takes no stop token for
+`~jthread`'s `request_stop` to reach.
+
+Or **RAII** — a guard whose destructor stops the thing, so the stop runs on the
+unwind path too. **Declaration order is half of the fix**: the fake being closed
+must be declared *before* the guard, so it outlives the thread still touching it.
+Get the guard right and the order wrong and the hang becomes a use-after-free,
+which is worse. `ThreadedAddressResolver_test.cpp` spells it with the order stated
+on the line itself (`// after 'stopper', so destroyed before it`), and
+`RaftPeerServer_test.cpp` states the whole reverse-destruction argument.
+
+**A `jthread` whose lambda takes a `std::stop_token` and loops on
+`stop_requested()` is not exposed at all** — `~jthread` requests the stop and the
+thread ends unaided. That is the cheapest fix where the body can be written that
+way, and it is what makes the census below discriminating rather than a file count.
+
+### Is it mechanizable? Not soundly — and the tractable form is a DIFFERENT check
+
+Stated rather than left open, because an unstated *"we could not check this"*
+reads as *"this is checked"*.
+
+The hazard is *"termination depends on a statement a throwing macro can skip"*.
+Deciding that needs to know which paths reach the stop — **dataflow, not a
+regex**. Anything textual is approximate in **both** directions: it cannot see RAII
+that is already correct, and it cannot see a stop reached through a helper. Both
+misreadings were observed while triaging this: a scan flagged
+`HealthProbe_test.cpp` because a *later* stop existed, missing the correctly-placed
+earlier one, and flagged an `IocpSocket` case by running past the case boundary
+into the next block.
+
+So: **not soundly mechanizable; mechanizable as a helper-usage scan — a raw thread
+in a test file refused by name, with the RAII holder in `src/tests/` — at the cost
+of an exemption list, since a thread that ends unaided is legitimate.** That
+converts an undecidable check into a decidable one over a different property, which
+is the move that worked for `ClaimReadSlot` and for `SigningDomain`.
+
+**It is deliberately not written.** With the tree measured clean below, such a scan
+would refuse the 18 legitimate raw threads on day one and arrive needing an
+exemption list longer than its findings — and a check that fails on arrival is a
+check somebody disables. That is a decision recorded here, not a residual: if a
+third instance turns up, the scan is the shape to reach for, and the exemption
+list is what it costs.
+
+### The tree was clean when this rule was written, and how that was established
+
+Measured 2026-09-10, patterns stated so the next reader can re-run them rather
+than trust the number:
+
+- **24** files under `src/**/*_test.cpp` match `std::jthread|std::thread`
+  (positive control: it finds both files the ticket names). **11** of those also
+  carry an explicit `.Stop()` / `request_stop()` / `.Shutdown()`.
+- **20** `std::jthread` declarations; **2** take a `std::stop_token`, **18** do not
+  and so depend on something else stopping their subject.
+- Every one of the resulting candidates was read **by hand**, and all were already
+  correct — stop-before-assert, an RAII guard, a bounded self-terminating body, or
+  a scoped join.
+
+**Zero is a finding only with a control**, so the triage was run against a planted
+hazard and named it, and against a `stop_token` case and correctly excluded it. The
+instances that motivated the ticket were fixed by hand as they were found; what was
+missing was the rule, which is why this section exists with no accompanying code
+change.
+
 ## The shared helpers: `Unwrap`, `ScratchPath` and `ScriptedSocket`
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and

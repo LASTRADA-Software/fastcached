@@ -25,6 +25,8 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/DeclaredCountBlob.hpp>
+
 using namespace FastCache;
 
 namespace
@@ -105,13 +107,12 @@ struct BothProtocols
 /// cannot drift from the format it exercises.
 [[nodiscard]] std::string SetBlob(std::uint32_t count, std::size_t trailing = 0)
 {
-    std::string out;
-    out.push_back(static_cast<char>(SetCodec::Magic));
-    out.push_back(static_cast<char>(SetCodec::TypeSet));
-    for (auto const shift: { 24, 16, 8, 0 })
-        out.push_back(static_cast<char>((count >> shift) & 0xFFU));
-    out.append(trailing, '\0');
-    return out;
+    return Testing::DeclaredCountBlob {}
+        .Byte(static_cast<std::uint8_t>(SetCodec::Magic))
+        .Byte(static_cast<std::uint8_t>(SetCodec::TypeSet))
+        .U32(count)
+        .Pad(trailing)
+        .String();
 }
 
 /// Store `blob` under `key` as a SET, exactly the way an ordinary memcached client
@@ -219,10 +220,14 @@ TEST_CASE("SetCodec::Decode refuses a member LENGTH the blob cannot supply", "[c
         return SetCodec::Decode(AsBytes(blob), members);
     };
 
-    // Append a big-endian u32 to `s`.
+    // Append a big-endian u32 to `s`. Through the shared builder rather than a shift
+    // loop of its own: a hand-rolled width conversion in a test is a second
+    // implementation of the convention under test (#305). A BARE `u32` is what these
+    // cases need and exactly what `ByteAppender` refuses to expose, because on this
+    // wire it is a length that must agree with its payload -- which is the lie being
+    // built here.
     auto const appendU32 = [](std::string& s, std::uint32_t v) {
-        for (auto const shift: { 24, 16, 8, 0 })
-            s.push_back(static_cast<char>((v >> shift) & 0xFFU));
+        s += Testing::DeclaredCountBlob {}.U32(v).String();
     };
 
     // One member declaring 0xFFFFFFFF bytes it does not carry. The count is a legal
@@ -257,6 +262,28 @@ TEST_CASE("SetCodec::Decode refuses a member LENGTH the blob cannot supply", "[c
     truncated.push_back('x');
     REQUIRE(decode(truncated));
     CHECK(members == std::vector<std::string> { "xxxx" });
+}
+
+TEST_CASE("SetCodec::Encode writes the layout its header documents, byte for byte", "[cache][setcodec]")
+{
+    // **The assertion that distinguishes.** The round-trip case below is necessary and
+    // not sufficient: it agrees with whatever layout and byte order `Encode` and
+    // `Decode` happen to share, so it passes under the hand-rolled append loop this
+    // encoder used to carry and under `ByteAppender` alike (#305). The expected bytes
+    // here are spelled field by field through a builder that shares no code with
+    // `Encode`, so a flipped width, a little-endian prefix or a dropped length fails.
+    std::vector<std::string> const members { "ab", "", "xyz" };
+
+    auto const expected = Testing::DeclaredCountBlob {}
+                              .Byte(static_cast<std::uint8_t>(SetCodec::Magic))
+                              .Byte(static_cast<std::uint8_t>(SetCodec::TypeSet))
+                              .U32(3)
+                              .Field("ab")
+                              .Field("")
+                              .Field("xyz")
+                              .Vector();
+
+    CHECK(SetCodec::Encode(members) == expected);
 }
 
 TEST_CASE("SetCodec round-trips, and its per-member minimum tracks the encoder", "[cache][setcodec]")

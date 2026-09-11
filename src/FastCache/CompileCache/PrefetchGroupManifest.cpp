@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/ByteCursor.hpp>
-#include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <ranges>
@@ -76,21 +75,12 @@ namespace
     /// @return Encoded bytes.
     [[nodiscard]] std::vector<std::byte> EncodeKeyList(std::vector<std::string> const& keys)
     {
-        auto const appendU32 = [](std::vector<std::byte>& out, std::uint32_t n) {
-            std::array<std::byte, sizeof(std::uint32_t)> buf {};
-            WriteBigEndian<std::uint32_t>(buf, n);
-            out.insert(out.end(), buf.begin(), buf.end());
-        };
-
-        std::vector<std::byte> out;
-        appendU32(out, static_cast<std::uint32_t>(keys.size()));
+        std::vector<std::byte> blob;
+        ByteAppender out { blob };
+        out.AppendCount(keys.size());
         for (auto const& key: keys)
-        {
-            appendU32(out, static_cast<std::uint32_t>(key.size()));
-            auto const* p = reinterpret_cast<std::byte const*>(key.data());
-            out.insert(out.end(), p, p + key.size());
-        }
-        return out;
+            out.AppendField(key);
+        return blob;
     }
 
 } // namespace

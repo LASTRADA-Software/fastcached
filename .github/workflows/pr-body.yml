@@ -61,7 +61,24 @@ on:
 # nothing.
 concurrency:
   group: pr-body-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
-  cancel-in-progress: true
+  # **`false`, for the reason the paragraph above did not reach** (#761, #820).
+  #
+  # That reasoning is about a RUNNER: the earlier run answers for a superseded body,
+  # so killing it wastes nothing. True, and it weighs the wrong thing. `Check the PR
+  # body's closing keywords` is a REQUIRED context, and `edited` -- the event this
+  # file exists for -- does not change the head SHA. So the run being killed is the
+  # one holding that commit's only verdict, and until the successor finishes the
+  # context reads `cancelled`: neither pass nor fail, and a blocked pull request.
+  #
+  # Measured on the sibling workflow `pr-labels.yml`, which has the identical shape:
+  # 14 of the 100 most recent runs cancelled, every one superseded seconds to minutes
+  # later, and each reporting its required context as `completed/cancelled`. This
+  # workflow is younger and rarer, so the figure is that one's rather than its own --
+  # stated as an analogue, not as a measurement of this file.
+  #
+  # `build.yml` keeps `true` and is not a defect: it triggers on `push` and a bare
+  # `pull_request:`, so its superseding runs carry a new SHA.
+  cancel-in-progress: false
 
 jobs:
   closing-keywords:

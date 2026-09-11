@@ -11,6 +11,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <tests/Unwrap.hpp>
 
@@ -202,4 +203,76 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         REQUIRE_FALSE(tier.has_value());
         CHECK(tier.error() == ConsensusNamesNoSelfPeerRefusal);
     }
+}
+
+TEST_CASE("What a node reports about its own quorum is one read of the driver", "[node][consensus][observability]")
+{
+    // #435. `ConsensusTier::Status()` is `ConsensusStatusFrom` over a single
+    // `RaftDriver::Progress`, and the mapping is split out for the reason
+    // `QuorumProposalPending` is: acquiring a `Progress` needs a reactor, a peer
+    // listener, a state directory and somebody to elect this node, while turning one
+    // into what a scrape reports needs none of that. Folded together, the answer this
+    // ticket is about would be reachable only from a running cluster.
+    //
+    // Every field is asserted, not a representative one. The failure this maps
+    // against is a scrape that reports a healthy-looking cluster because one field
+    // was dropped or crossed -- and a crossed `term`/`commitIndex` is exactly the
+    // shape `Consensus::Term` and `Consensus::LogIndex` are distinct types to
+    // prevent, so a case checking only "something came back" would pass under it.
+    auto const progress = Consensus::RaftDriver::Progress { .members = { "n1", "n2", "n3" },
+                                                            .commitIndex = Consensus::LogIndex { .value = 12 },
+                                                            .term = Consensus::Term { .value = 4 },
+                                                            .role = Consensus::Role::Leader,
+                                                            .knownLeader = Consensus::NodeId { "n1" } };
+
+    auto const status = ConsensusStatusFrom(progress);
+
+    // Verbatim, in the order consensus holds it: a caller comparing two nodes needs
+    // to see the order a configuration was adopted in, and sorting here would take
+    // that away with nothing saying so.
+    CHECK(status.members == std::vector<Consensus::NodeId> { "n1", "n2", "n3" });
+    CHECK(status.knownLeader == Consensus::NodeId { "n1" });
+    CHECK(status.term.value == 4);
+    CHECK(status.commitIndex.value == 12);
+    CHECK(status.role == Consensus::Role::Leader);
+}
+
+TEST_CASE("A node that has adopted no configuration reports an empty set, not a leader-less nothing",
+          "[node][consensus][observability]")
+{
+    // The #388 shape, carried through the mapping. A joiner that received the
+    // ClusterState record and never adopted the CONFIGURATION entry counts nobody --
+    // and it can still name a leader, because a node with no cluster accepts entries
+    // from any leader (`RaftNode::HasCluster`).
+    //
+    // So `knownLeader` is NOT constrained to `members`, and the pairing is the
+    // diagnosis: a node naming a leader while counting nobody is admitted to the
+    // fleet and absent from the quorum, which is invisible while that leader lives.
+    auto const status = ConsensusStatusFrom(Consensus::RaftDriver::Progress { .members = {},
+                                                                              .commitIndex = Consensus::LogIndex {},
+                                                                              .term = Consensus::Term {},
+                                                                              .role = Consensus::Role::Follower,
+                                                                              .knownLeader = Consensus::NodeId { "n1" } });
+
+    CHECK(status.members.empty());
+    CHECK(status.knownLeader == Consensus::NodeId { "n1" });
+    CHECK(status.role == Consensus::Role::Follower);
+    CHECK(status.term.value == 0);
+}
+
+TEST_CASE("A node that runs no consensus hands a scrape nothing to call", "[node][consensus][observability]")
+{
+    // The branch `main.cpp` cannot be asked about, which is why it is a function
+    // rather than a ternary in `WorkerBody`: that translation unit is in no test
+    // target, so spelled there this decision was unreachable AND it took the
+    // enclosing function past clang-tidy's cognitive-complexity ceiling.
+    //
+    // What is asserted is that the source is DISENGAGED rather than a callable that
+    // answers a default `ConsensusStatus`. The two are not interchangeable and the
+    // difference is the whole of #435's absence rule: a disengaged source leaves
+    // `MetricsSnapshot::consensus` empty and the renderer emits no consensus series
+    // at all, while a callable returning `ConsensusStatus {}` would report a node
+    // that runs consensus and counts nobody -- which is the #388 fault state being
+    // claimed about every daemon and every node started without `--listen-raft`.
+    CHECK_FALSE(static_cast<bool>(ConsensusScrapeSource(nullptr)));
 }

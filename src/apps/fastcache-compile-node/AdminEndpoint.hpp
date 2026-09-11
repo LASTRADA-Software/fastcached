@@ -80,6 +80,23 @@ struct NodeScrapeSources
     std::size_t slots {};
     /// The filesystem whose free space is reported.
     std::filesystem::path scratchRoot;
+
+    /// What this node counts as its own Raft cluster, or **empty** when it runs no
+    /// consensus.
+    ///
+    /// A callable for the reason `busySlots` is one, and a stronger one: a live
+    /// `ConsensusTier` needs a reactor, a peer listener, a state directory and
+    /// somebody to elect it, so a scrape that demanded one could be exercised only
+    /// by standing a cluster up. It is also sampled per scrape, which is what a
+    /// callable is — a role and a term captured once would be a value that looks
+    /// current and describes the election before last.
+    ///
+    /// **Empty is the ONE spelling of "this process runs no consensus."** It is not
+    /// a `std::function` returning an optional, because two spellings of one absence
+    /// is how a caller comes to test the wrong one. An empty member set INSIDE a
+    /// present answer is a different fact entirely — a node that runs consensus and
+    /// holds no configuration — and renders, which is the whole of #435.
+    std::function<ConsensusStatus()> consensus;
 };
 
 /// Build the provider that answers each `/metrics` scrape.

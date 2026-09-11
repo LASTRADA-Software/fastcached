@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Core/Endian.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 
 #include <algorithm>
 #include <array>
-#include <cstring>
 #include <fstream>
 #include <ranges>
 #include <span>
@@ -215,12 +216,17 @@ namespace
 
     /// Big-endian, because that is what every other encoder in this tree writes;
     /// the choice is arbitrary for a private file and consistency is not.
+    ///
+    /// Kept as a named helper over `ByteAppender` rather than spelled at each of its
+    /// fifteen call sites, because the sentence above is what it is for. What it no
+    /// longer does is state the byte order a second time (#305): this file's records
+    /// are `[u64 length][bytes]`, which is NOT the `[u32 length][bytes]` grammar
+    /// `AppendField` writes, so the framing stays here and only the integer is shared.
+    /// @param out The buffer.
+    /// @param value Host-order value.
     void AppendU64(std::string& out, std::uint64_t value)
     {
-        auto const encoded = HostToBigEndian(value);
-        std::array<char, sizeof(encoded)> bytes {};
-        std::memcpy(bytes.data(), &encoded, sizeof(encoded));
-        out.append(bytes.data(), bytes.size());
+        ByteAppender { out }.AppendU64(value);
     }
 
     /// Stamp a big-endian word over one already appended.
@@ -229,10 +235,7 @@ namespace
     /// @param value What it should say.
     void WriteU64(std::string& out, std::size_t offset, std::uint64_t value)
     {
-        auto const encoded = HostToBigEndian(value);
-        std::array<char, sizeof(encoded)> bytes {};
-        std::memcpy(bytes.data(), &encoded, sizeof(encoded));
-        std::ranges::copy(bytes, out.begin() + static_cast<std::ptrdiff_t>(offset));
+        WireFields::PutBigEndian<std::uint64_t>(std::as_writable_bytes(std::span { out }), offset, value);
     }
 
     [[nodiscard]] std::uint64_t ReadU64(std::string_view bytes, std::size_t offset) noexcept

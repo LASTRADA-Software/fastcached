@@ -247,7 +247,7 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     CHECK(second.seen.front().raftEndpoint == "n1.local:6675");
 }
 
-TEST_CASE("Two fleets on one segment ignore each other", "[node][discovery]")
+TEST_CASE("Two fleets on one segment ignore each other at the node's discovery tier", "[node][discovery]")
 {
     // A cluster id is routing rather than authentication, and this is what it buys:
     // the challenge is never even issued, so a shared key would not help. Checked

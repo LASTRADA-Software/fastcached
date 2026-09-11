@@ -5227,3 +5227,180 @@ set_tests_properties("credential-containers-selftest" PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 300
 )
+
+# ---------------------------------------------------------------------------
+# The lane reaper's own self-test (#877, #591).
+#
+# `scripts/reap-my-gate.sh` exists because `pkill -f "local-gate.sh"` matches every
+# lane's gate on this machine -- each worktree runs the same three script names, so a
+# name match is GUARANTEED to hit somebody else's process, and it did twice in one
+# night. The victim's gate then prints neither `LOCAL GATE PASSED` nor `GATE FAILED:`,
+# so it reads as a crash in their own tree rather than as somebody else's kill.
+#
+# **The self-test IS the deliverable here, not evidence for it.** A reaper is defined
+# by what it SPARES, and sparing is invisible: a reaper that killed everything would
+# pass any test asserting only that the target died. So both directions are driven,
+# and the sparing half is driven LIVE -- real processes, a real process table -- since
+# the three traps the script is built around (`pgrep -f` is a regex whose `.` matches a
+# `-`; `pgrep -f` matches its own argv while `ps | grep '[l]...'` does not; two
+# worktrees here are one token apart) are all properties of real tools that a staged
+# table cannot exhibit. The decision function itself is pure and injectable, so the
+# branches no machine can arrange -- a process whose cwd is unreadable, and one that is
+# the reaper's own ancestor -- are driven over staged facts in the same run.
+#
+# Registered with the FLAG PASSED rather than merely with the script named: a
+# registration in the script's plain mode satisfies every grep for coverage and runs no
+# case at all, which is how twelve cases guarding the apt sweep never executed once
+# (#1160). `selftest-registered` refuses the plain shape for exactly that reason.
+#
+# Judged by its EXIT STATUS, like `local-gate-selftest` and `tsan-gate-selftest` above:
+# a shell script chooses its own exit code, so the `cmake -P` rule -- that a verdict is
+# read from OUTPUT because `message(WARNING)` exits 0 -- does not reach it, and
+# `script-check-signals` scopes itself to `cmake -P` registrations accordingly. The
+# `FAIL_REGULAR_EXPRESSION` is therefore REDUNDANT rather than load-bearing, and is
+# here because the two channels cannot disagree by construction: only `_reap_expect`
+# prints that marker, and only on a mismatch that also increments the counter the exit
+# status is taken from. It cannot fire on a healthy run -- the tally line says `failed`
+# in lower case and carries no colon.
+#
+# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and here the guard
+# is LOAD-BEARING rather than conventional -- measured, not assumed. Under Git Bash
+# this self-test fails: `ps -Ao pid=,ppid=`, which `gate_ppid_of` walks, is answered
+# by MSYS2's `ps` with `unknown option -- A`. The ancestry walk therefore returns
+# nothing, the caller is not protected, and the one case that matters goes red:
+# `and the WRAPPER that invoked it -- a candidate by cwd -- survives: expected
+# 'alive', got 'gone'`. That is the script's own macOS warning arriving one platform
+# over -- *a usage error that prints nothing reads exactly like a process with no
+# ancestors* -- and its consequence is that the reaper would kill its own invoker.
+# So this is not merely untested on Windows: do not hand `reap-my-gate.sh` to a
+# Windows lane until that is fixed.
+#
+# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, 14 cases and no case skipped.
+# A range rather than a number, because the two readings differ by the load and a
+# single figure would silently claim whichever condition the reader assumes: **2.69 s**
+# on a quiet box, **6.87 s** with two other lanes' full gates running. `TIMEOUT 60` is
+# the figure its two neighbours carry rather than a new one, so the margin is ~9x at
+# the worst reading taken here. It is a wall-clock reading and this host steps
+# CLOCK_REALTIME, so treat it as an order of magnitude, not a budget.
+if(NOT WIN32)
+    add_test(
+        NAME "reap-my-gate-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/reap-my-gate.sh" --self-test
+    )
+    set_tests_properties("reap-my-gate-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "REAP SELF-TEST FAILED:"
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# The worktree-pointer repair's own self-test (#336).
+#
+# `git worktree add` writes ABSOLUTE pointers in the dialect of whichever git created
+# the worktree, so a tree created from Windows is unreadable to WSL git -- which then
+# resolves the two paths CONCATENATED and reports a repository that exists nowhere.
+# `local-gate.sh` needs git for its formatter list, its header-filter census and its
+# test-registration walk, so in such a worktree every one of those answers NOTHING and
+# the compiler-specific defects the gate exists to catch reach CI instead.
+#
+# What the self-test pins that no argument can: the repair is asserted against REAL
+# git, by staging a linked worktree, rewriting both pointers relative, and MOVING the
+# whole arrangement -- because "both gits read it" is a claim about a tool and is
+# checked against the tool. It also pins the direction that looks like a fix and is
+# not: `git worktree repair` rewrites the pointers absolute in the dialect of whichever
+# git runs it, so it reproduces the defect from one side and creates it on the other.
+#
+# And the case with teeth is the last one, which asserts that a repair leaving the tree
+# STILL UNREADABLE refuses -- having written the files. Writing the pointers is not the
+# property; git reading the result is, and a check that stopped at "the files were
+# written" would report success for a worktree nobody can use.
+#
+# Registered with the flag passed and judged by exit status for the reasons given on
+# `reap-my-gate-selftest` above. `if(NOT WIN32)` is measured here too, and what fires
+# is the self-test's own POSITIVE CONTROL: under Git Bash it reports `git wrote an
+# ABSOLUTE pointer, which is what makes this necessary: expected 'yes', got 'no'`.
+# Windows git writes `D:/...`, which is absolute and does not begin with `/`, so the
+# control correctly says the whole section would be vacuous in that shell rather than
+# letting it pass over a fixture whose premise does not hold. A control doing its job
+# is the reason to guard the registration, not a reason to loosen the control.
+#
+# The script's two SKIP arms -- no git, and a git that could not stage a linked
+# worktree -- exit 0 having said so on the tally line. That is a `SUCCEED` where a skip
+# belongs, and it is the script's own shape rather than this registration's; it is
+# noted here so the next reader does not mistake a skipped run for a covered one.
+#
+# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04: 23 cases, 0.06 s wall, neither
+# skip arm taken. `TIMEOUT 60` is its neighbours' figure; the margin is enormous and
+# the alternative is inventing a number nobody can check.
+if(NOT WIN32)
+    add_test(
+        NAME "repair-worktree-pointers-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
+    )
+    set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# The consumer of `check-merge-queue-contexts.sh`'s `RequiredContexts` table:
+# which required contexts are blocking THIS pull request, by name (#542), and
+# which of them reported a verdict and then had it thrown away with nothing
+# queued to replace it (#903).
+#
+# APPENDED AT THE END OF THIS FILE ON PURPOSE, rather than beside the check whose
+# table it reads. Several lanes append registrations here at once, and an
+# append-only conflict resolves by keeping both blocks -- a resolution anybody can
+# perform correctly, where an interleaved insertion is one nobody can. Proximity
+# to `merge-queue-contexts` would read better and is the wrong trade while the
+# file is contended; the coupling is stated here instead, and it is real: this
+# tool READS that script's table rather than restating it, so a rename there is a
+# failure here.
+#
+# `if(NOT WIN32)` for the reason `merge-queue-contexts` carries the same guard:
+# the script is POSIX, and a Windows counterpart would be a translation rather
+# than new coverage. What it checks is platform-independent and the Linux and
+# macOS jobs run it.
+#
+# No `FAIL_REGULAR_EXPRESSION`: that rule is about a `cmake -P` check, whose
+# `message(FATAL_ERROR)` is heard through the diagnostic channel and whose
+# `message(WARNING)` exits 0. This is a bash check behind `run-check.sh`, which
+# passes the child's status through untouched and prints a terminal marker saying
+# which of four things happened to it -- so the exit status IS the verdict here,
+# and adding an output pattern beside it would assert a second one.
+if(NOT WIN32)
+    # The plain mode asserts the WIRING: the tool exists, it names the shared
+    # table rather than restating it, and the table still yields rows -- counted
+    # two ways, since two empty lists agree perfectly. That last one is not
+    # ceremony: the text readers of that table used to admit its COMMENT lines as
+    # context names, which put eight contexts no job produces into every
+    # consumer's required set, while the authoritative count taken from bash's own
+    # view of the array stayed right and hid it.
+    add_test(
+        NAME "pr-required"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-pr-required.sh"
+    )
+    set_tests_properties("pr-required" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against synthesised check-run records. Every state #542
+    # names is reachable from a file, so this needs no pull request, no network
+    # and no clock -- which is why the DECISION takes a record and the acquisition
+    # is a separate mode, the split `ci-merge-group-report.sh` uses.
+    #
+    # Both directions, and the positive one first: a fully green record must
+    # report MERGEABLE, or every refusal below is evidence of nothing.
+    add_test(
+        NAME "pr-required-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-pr-required.sh" --self-test
+    )
+    set_tests_properties("pr-required-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()

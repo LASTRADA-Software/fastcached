@@ -177,9 +177,11 @@ trap cleanup EXIT
 #
 #   * `fail` raised inside `$( ... )` stops the RUN. The copy that lived here
 #     called `exit 1`, which ends the command substitution's subshell only --
-#     and `free_port` and `wait_for_counter` are both called that way, so a
+#     and `free_port` and `wait_for_counter` were both called that way, so a
 #     drawn-port exhaustion or a counter that never moved stopped the script
 #     only because `set -e` happened to notice the assignment's status.
+#     `wait_for_counter` is no longer called that way at all (#643): it sets
+#     `E2eCounterReading`, so the subshell is gone rather than made survivable.
 #   * `http_get` keeps a final chunk with no trailing newline. `read` returns
 #     non-zero on one, so the copy here dropped it; that is latent only because
 #     the endpoints this file reads happen to end in a newline, and
@@ -204,12 +206,17 @@ e2e_begin "dist-compile E2E" "$workdir"
 # the time any node starts, because `--print-toolchain-fingerprint` below walks
 # the same tree first.
 #
-# It is the default for the LIBRARY's waits, and this fixture has a second budget
-# it does not reach: `wait_for_counter` below is still a hand-written poll loop
-# with its own `seconds=10`, because its three-way triage -- nothing ever
-# answered, the series is absent, the reading never rose -- is not something
-# `wait_until` can say. Naming that here so the number above is not read as the
-# only one.
+# IT IS THE ONLY BUDGET IN THIS FIXTURE, and it was not until #643. The counter
+# wait kept a hand-written loop with its own `seconds=10`, so an operator raising
+# this number -- the documented remedy for a slow box -- scaled every wait here
+# except the one a slow box lengthens most: the others wait for a process to bind,
+# that one waits for a COMPILE to finish and a counter to rise. It failed at the
+# one place the remedy did not reach, and said the worker never got there, which
+# is true and points at the worker rather than at the budget.
+#
+# It was not simply converted at the time because `wait_until` cannot say its
+# three terminal states. That is what the library's findings hook is for, so the
+# triage survived the conversion rather than being traded for the budget.
 e2e_wait_seconds 30
 
 # Statistics are per-user state; keep this run out of the developer's real log.
@@ -252,8 +259,8 @@ stop_bound_seconds=$(( worker_drain_seconds + 5 ))
 # made the old single 15 wrong in the first place.
 daemon_stop_seconds=5
 
-# The pid of the process the last `start_node` started, and the only way it is
-# handed back.
+# The pid of the process the last `start_node` or `start_daemon` started, and the
+# only way it is handed back.
 #
 # A function that PRINTED its pid would have to be called in a command
 # substitution, and the whole spawn would then happen in a subshell: the
@@ -264,7 +271,7 @@ daemon_stop_seconds=5
 # hand the caller an empty pid on the way past.
 started_pid=""
 
-# And the log that node writes, so a caller that wants to dump it on a later
+# And the log that process writes, so a caller that wants to dump it on a later
 # failure need not respell the tag.
 started_log=""
 
@@ -336,6 +343,61 @@ start_node() {
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
 }
 
+# Start one `fastcached` daemon, and wait for it to be ACCEPTING.
+#
+# `start_node`'s counterpart, and it exists for the same reason one ticket later
+# (#644). The node recipe reached twelve copies before #451 folded it; the DAEMON
+# recipe was still written out five times, each repeating its own
+# `> "${workdir}/<tag>.log" 2>&1 &`, its own `$!`, its own `pids+=` and its own
+# wait -- and each free to spell the tag one way and the log another. That is the
+# mapping a reader needs when a run fails: the failure names a daemon, the
+# evidence is in a file, and nothing connects the two if the two are typed
+# separately. Here the TAG is both, exactly as `start_node` documents for itself.
+#
+# The five copies had already drifted in the smaller way: the message each wait
+# printed was a phrase of its own (`membership daemon`, `isolation daemon`, `tier
+# upstream`) while the log was named something else, so `cat`ing the right file
+# after a failure meant knowing the mapping. There is now one name.
+#
+# IT WAITS FOR ACCEPTING, NOT FOR THE BIND, and that is the one behavioural change
+# rather than a fold. All five copies used `wait_for_port`, which returns for a
+# socket that is bound with nobody accepting on it -- the connect lands in the
+# backlog and answers the probe. `Core/ReadinessMarker.hpp` puts the daemon's
+# `ready, accepting connections` strictly after the last acceptor arms, and the
+# very next thing every one of these call sites does is point a launcher at that
+# port. #634 is the same hole in the node's half of this file, found only after it
+# had been open for months, and building the weaker recipe here knowing that is
+# how it gets inherited.
+#
+# `--listen` is the invariant, because every daemon here binds one address and
+# that address is what the caller then probes. Everything else is the caller's,
+# including the log level: a default plus an override is the same flag twice, and
+# which wins is then the option table's overwrite order.
+#
+# THE READINESS LINE IS `Info`, so a caller that passes `--log-level=warn` gets a
+# daemon that never writes the marker and a wait that spends its whole budget. The
+# failure names the marker and dumps the log, so it is diagnosable rather than
+# silent -- but it is a trap, and `Info` is the config default, so the flag can
+# only ever move AWAY from it. Every call site here says `info` explicitly.
+#
+# @param 1 tag: names the log file (`${workdir}/<tag>.log`) AND every message
+#          about this daemon
+# @param 2 host to bind and probe
+# @param 3 port to bind and probe
+# @param 4.. every flag that differs between the daemons this fixture starts
+start_daemon() {
+    local tag="$1" host="$2" port="$3"
+    shift 3
+    local log="${workdir}/${tag}.log" pid=""
+    "$fastcached" --listen="${host}:${port}" ${@+"$@"} > "$log" 2>&1 &
+    pid=$!
+    started_pid="$pid"
+    started_log="$log"
+    started_port="$port"
+    pids+=("$pid")
+    wait_for_daemon_ready "$host" "$port" "$pid" "$tag" "$log"
+}
+
 # Write a translation unit whose content is unique to the caller.
 #
 # Every case gets its own source text. Sharing one would let a case pass by
@@ -400,83 +462,21 @@ run_launcher() {
     "$launcher" "$compiler" "$@" > "$logfile" 2>&1
 }
 
-# Pull one counter out of a Prometheus body.
+# The Prometheus grammar, the one-scrape read and the counter wait are the
+# LIBRARY's (#643). They were three private helpers here -- `metric_value`,
+# `worker_counter` and a hand-written `wait_for_counter`; what moved with them is
+# the reasoning each carried, and what the wait gained is a bound that honours the
+# `e2e_wait_seconds` above and a slow-versus-wedged verdict on expiry. Its three
+# terminal states -- nothing answered, the series is absent, the reading never
+# rose -- are `_e2e_counter_finding`'s and are unchanged, which is why it is a
+# counter-shaped wait in the library rather than a `wait_until` with the triage
+# thrown away.
 #
-# The grammar lives HERE and nowhere else. It was written out at three call sites
-# before this function existed, and the day the exporter grows a label or renders
-# `1` as `1.0` a copy that still matches nothing does not say "the series changed
-# shape" -- it says "the counter did not move", which is a statement about the
-# subject rather than about the instrument.
-#
-# Nothing on stdout means the series was ABSENT, which is a different fact from a
-# reading of zero and must not be folded into one: a counter is a tally, so zero is
-# the truth about events that never happened, while an absent series is a counter
-# nothing exports. Every caller checks for the empty string separately.
-#
-# @param 1 a whole /metrics body
-# @param 2 the Prometheus series name
-metric_value() {
-    local body="$1" name="$2"
-    sed -n "s/^${name} \([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
-}
-
-# Read one counter off a worker's admin endpoint.
-#
-# Separate from `metric_value` because the suite's assertions deliberately fetch
-# ONE body and read three series out of it -- three requests would be three
-# different instants, and a fixture comparing series taken a round trip apart is
-# asserting something nobody meant.
-#
-# @param 1 admin port
-# @param 2 the Prometheus series name
-worker_counter() {
-    local port="$1" name="$2" body=""
-    body="$(http_get 127.0.0.1 "$port" /metrics)" || return 1
-    metric_value "$body" "$name"
-}
-
-# Wait until a worker's counter reaches a floor, the way `wait_for_port` waits for
-# a listener, and echo the reading.
-#
-# The third member of the bounded-wait family rather than a fourth hand-written
-# poll loop, for exactly the reason `wait_for_log`'s header gives: two of the three
-# loops it replaced never checked that the process was still alive. A counter makes
-# that worse, not better -- a worker that DIED simply stops changing its reading,
-# so an open-coded poll runs out its bound and then explains the silence with a
-# confident sentence about what the counter means.
-#
-# @param 1 admin port
-# @param 2 the Prometheus series name
-# @param 3 the floor the reading must reach
-# @param 4 pid
-# @param 5 what it is, for the message
-# @param 6 the log to dump when it does not get there
-# A failed scrape does not end the wait, because ending it is what a retry loop
-# exists to avoid -- but it is remembered, so a bound that expires having never
-# had an answer says THAT rather than blaming the counter. Three outcomes, three
-# sentences: nothing ever answered, the series is absent, the reading never rose.
-wait_for_counter() {
-    local port="$1" name="$2" floor="$3" pid="$4" what="$5" logfile="$6"
-    local seconds=10 value="" answered=0
-    for _ in $(seq 1 $(( seconds * 5 ))); do
-        if value="$(worker_counter "$port" "$name")"; then
-            answered=1
-            if [[ -n "$value" && "$value" -ge "$floor" ]]; then
-                printf '%s\n' "$value"
-                return 0
-            fi
-        fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$logfile" >&2
-            fail "${what} exited while ${name} was still below ${floor}"
-        fi
-        sleep 0.2
-    done
-    cat "$logfile" >&2
-    [[ "$answered" == "1" ]] || fail "${what} never answered a /metrics request within ${seconds}s"
-    [[ -n "$value" ]] || fail "${what} exports no ${name} series"
-    fail "${what} never reached ${name} >= ${floor} within ${seconds}s; last reading ${value}"
-}
+# `wait_for_counter` hands its reading back in `E2eCounterReading` rather than on
+# stdout, so the call sites below read it on the next line instead of capturing
+# the call in `$( )`. That is not cosmetic: this file's own header records that a
+# counter that never moved used to end the run only because `set -e` happened to
+# notice a command substitution's status.
 
 # Slots enough that background CPU cannot withdraw all of them.
 #
@@ -647,12 +647,9 @@ if [[ "$mode" == "membership" ]]; then
     # sends the launcher to 127.0.0.1:6674, which on a developer machine is very
     # likely a real node serving real builds.
     mem_cache_port="$(free_port)"
-    "$fastcached" --listen="127.0.0.1:${mem_cache_port}" \
-        --storage-max-value=64M --log-level=info \
-        > "${workdir}/mem-daemon.log" 2>&1 &
-    mem_daemon_pid=$!
-    pids+=("$mem_daemon_pid")
-    wait_for_port 127.0.0.1 "$mem_cache_port" "$mem_daemon_pid" "membership daemon" "${workdir}/mem-daemon.log"
+    start_daemon "mem-daemon" 127.0.0.1 "$mem_cache_port" \
+        --storage-max-value=64M --log-level=info
+    mem_daemon_pid="$started_pid"
     export FASTCACHE_ADDR="127.0.0.1:${mem_cache_port}"
 
     proj="${workdir}/memproj"
@@ -723,12 +720,30 @@ if [[ "$mode" == "membership" ]]; then
             --admin-listen="$admin" \
             --toolchain="${fingerprint}=${compiler}" --slots="$worker_slots" --log-level=debug \
             ${@+"$@"}
-        # Registration and the admin surface are waited for separately from the
-        # bind and the readiness `start_node` covers, because a stall in one is a
-        # different fault from a stall in another and a fixture that folds them
-        # cannot say which happened.
+        # Registration is waited for separately from the bind and the readiness
+        # `start_node` covers, because a stall in one is a different fault from a
+        # stall in the other and a fixture that folds them cannot say which
+        # happened.
         wait_for_registration "$started_pid" "$tag" "$started_log"
-        wait_for_port 127.0.0.1 "$admin" "$started_pid" "${tag} admin endpoint" "$started_log"
+
+        # THERE IS NO WAIT FOR THE ADMIN PORT, and the absence is the point (#655).
+        # One stood here and could not fail. `main.cpp` binds the admin surface in
+        # `StartAdminSurfaceOrExplain`, synchronously through `BlockingListener::Bind`
+        # and about four hundred lines BEFORE it logs `compile node ready`; a bind
+        # that fails is `return ExitUsage`, so the marker is unreachable without it.
+        # `start_node` waits for that marker since #634 and `wait_for_registration`
+        # above waits for a heartbeat round, which is later still -- so by here the
+        # port has been listening for two waits.
+        #
+        # Deleting it also improves the failure it appeared to guard: an admin port
+        # this node could not bind is now a DEATH inside `start_node`, reported with
+        # the node's log and its exit status, where the wait would have spent its
+        # budget and then said a healthy-looking process never listened.
+        #
+        # What DOES establish that the surface answers is the first `wait_for_counter`
+        # against it, whose three terminal states begin with `nothing ever answered a
+        # /metrics request`. An unfalsifiable wait is not free: it reads as an
+        # assertion, and gets copied into a fixture where the ordering does not hold.
     }
 
     # --- leg 1: the address is a member, and the compile is served ---------------
@@ -778,8 +793,9 @@ if [[ "$mode" == "membership" ]]; then
     # worker served the dispatched compile without refusing anything on the way --
     # a leg that dispatched AND refused would be describing two different callers
     # and would not be the clean control leg 2 is measured against.
-    admit_completed="$(wait_for_counter "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
-        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log")"
+    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_worker_jobs_completed_total 1 \
+        "$admit_worker_pid" "the admitting worker" "${workdir}/mem-admit-worker.log"
+    admit_completed="$E2eCounterReading"
     admit_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     admit_refused="$(metric_value "$admit_metrics" fastcache_worker_jobs_refused_not_a_member_total)"
@@ -863,8 +879,9 @@ if [[ "$mode" == "membership" ]]; then
     # after the merge those two refusals share a wire code -- a caller that is not on
     # this machine and a caller with no claim on its CPU both answer `not-a-member` --
     # so the counters are the only place they are told apart.
-    tier_hits="$(wait_for_counter "$admit_admin_port" fastcache_node_cache_hits_total 1 \
-        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log")"
+    wait_for_counter 127.0.0.1 "$admit_admin_port" fastcache_node_cache_hits_total 1 \
+        "$admit_worker_pid" "the admitting worker's cache tier" "${workdir}/mem-admit-worker.log"
+    tier_hits="$E2eCounterReading"
     tier_metrics="$(http_get 127.0.0.1 "$admit_admin_port" /metrics)" \
         || fail "the admitting worker's admin endpoint refused a /metrics request"
     tier_refused="$(metric_value "$tier_metrics" fastcache_node_cache_requests_refused_not_local_total)"
@@ -962,10 +979,11 @@ if [[ "$mode" == "membership" ]]; then
     # moved and the build went green -- and this counter was the one signal that
     # would have named it. Bounded rather than read once, because the refusal is
     # counted on the worker's accept loop and the client has its answer first.
-    refuse_after="$(wait_for_counter "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
+    wait_for_counter 127.0.0.1 "$refuse_admin_port" fastcache_worker_jobs_refused_not_a_member_total \
         $(( refuse_before + 1 )) "$refuse_worker_pid" \
         "the refusing worker (it refused the compile and the counter never moved past ${refuse_before})" \
-        "${workdir}/mem-refuse-worker.log")"
+        "${workdir}/mem-refuse-worker.log"
+    refuse_after="$E2eCounterReading"
     refuse_metrics="$(http_get 127.0.0.1 "$refuse_admin_port" /metrics)" \
         || fail "the refusing worker's admin endpoint refused a /metrics request"
     refuse_completed="$(metric_value "$refuse_metrics" fastcache_worker_jobs_completed_total)"
@@ -992,12 +1010,9 @@ fi
 # arrive on it beside the cache and scheduler verbs.
 cache_port="$(free_port)"
 
-"$fastcached" --listen="127.0.0.1:${cache_port}" \
-    --storage-max-value=64M --log-level=info \
-    > "${workdir}/daemon.log" 2>&1 &
-daemon_pid=$!
-pids+=("$daemon_pid")
-wait_for_port 127.0.0.1 "$cache_port" "$daemon_pid" "daemon" "${workdir}/daemon.log"
+start_daemon "daemon" 127.0.0.1 "$cache_port" \
+    --storage-max-value=64M --log-level=info
+daemon_pid="$started_pid"
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
@@ -1069,8 +1084,24 @@ wait_for_registration "$worker_pid" "worker" "${workdir}/worker.log"
 # that is simultaneously doing its job -- it runs on its own thread beside the
 # accept loop, and "it constructs" and "it answers while the worker is busy" are
 # different claims.
-wait_for_port 127.0.0.1 "$worker_admin_port" "$worker_pid" "worker admin endpoint" "${workdir}/worker.log"
-
+#
+# THAT IS AN ARGUMENT FOR THE `http_get` BELOW AND NOT FOR A `wait_for_port`, and
+# one stood here carrying it (#655). A port wait establishes a BIND. What
+# establishes "it answers while the worker is busy" is a request that gets a `200`
+# back, which is the next line.
+#
+# The wait could not have failed either. `main.cpp` binds this surface
+# synchronously in `StartAdminSurfaceOrExplain`, about four hundred lines before
+# it logs `compile node ready`, and a bind that fails is `return ExitUsage` -- so
+# the marker `start_node` waits on since #634 is unreachable without it, and the
+# `wait_for_registration` above is a heartbeat round later still. Its deletion
+# also improves the failure it looked like it guarded: an admin port this node
+# could not bind is a DEATH inside `start_node`, with the log and the exit status,
+# rather than a spent budget reporting that a healthy process never listened.
+#
+# Recorded at this length because deleting the wait WITHOUT reading the comment
+# would look like the claim went with it, and the next reader might restore the
+# wait or -- worse -- delete the `http_get` as the apparently redundant one.
 health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" \
     || fail "worker admin endpoint refused a connection on ${worker_admin_port}"
 [[ "$health" == *"200 OK"* ]] \
@@ -1173,11 +1204,8 @@ echo "== case 3: fingerprint isolation"
 # worker, which is exactly what this case must not have.
 iso_cache_port="$(free_port)"
 iso_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${iso_cache_port}" \
-    --log-level=info > "${workdir}/iso-daemon.log" 2>&1 &
-iso_daemon_pid=$!
-pids+=("$iso_daemon_pid")
-wait_for_port 127.0.0.1 "$iso_cache_port" "$iso_daemon_pid" "isolation daemon" "${workdir}/iso-daemon.log"
+start_daemon "iso-daemon" 127.0.0.1 "$iso_cache_port" --log-level=info
+iso_daemon_pid="$started_pid"
 
 start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
     "$no_local_cache" \
@@ -1271,11 +1299,8 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
 cap_dispatch_port="$(free_port)"
-"$fastcached" --listen="127.0.0.1:${cap_cache_port}" \
-    --log-level=info > "${workdir}/cap-daemon.log" 2>&1 &
-cap_daemon_pid=$!
-pids+=("$cap_daemon_pid")
-wait_for_port 127.0.0.1 "$cap_cache_port" "$cap_daemon_pid" "capacity daemon" "${workdir}/cap-daemon.log"
+start_daemon "cap-daemon" 127.0.0.1 "$cap_cache_port" --log-level=info
+cap_daemon_pid="$started_pid"
 
 # The scheduler node names a toolchain nothing here compiles with, deliberately.
 # Every node is both a peer and a possible scheduler, so it always registers as a
@@ -1428,10 +1453,8 @@ echo "== case 9: a local hit never reaches the shared cache"
 cache_node_port="$(free_port)"
 cache_upstream_port="$(free_port)"
 
-"$fastcached" --listen="127.0.0.1:${cache_upstream_port}" --log-level=info     > "${workdir}/tier-upstream.log" 2>&1 &
-tier_upstream_pid=$!
-pids+=("$tier_upstream_pid")
-wait_for_port 127.0.0.1 "$cache_upstream_port" "$tier_upstream_pid" "tier upstream" "${workdir}/tier-upstream.log"
+start_daemon "tier-upstream" 127.0.0.1 "$cache_upstream_port" --log-level=info
+tier_upstream_pid="$started_pid"
 
 start_node "tier-node" 127.0.0.1 "$cache_node_port" \
     --cache-memory=64m \

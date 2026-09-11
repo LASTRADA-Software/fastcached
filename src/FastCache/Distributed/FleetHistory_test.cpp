@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/ByteAppender.hpp>
 #include <FastCache/Core/Crc32c.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
@@ -47,10 +48,14 @@ namespace
 }
 
 /// Big-endian, matching the file format, so a hand-built fixture is byte-exact.
+///
+/// Through `ByteAppender` rather than a shift loop of its own (#305): a hand-rolled
+/// width conversion in a test is a second implementation of the convention under test.
+/// What stays hand-built is the LAYOUT below -- which is the whole point of the v1
+/// fixture, since a file produced by this build would be v2 and would exercise nothing.
 void AppendU64(std::string& out, std::uint64_t value)
 {
-    for (auto const shift: { 56, 48, 40, 32, 24, 16, 8, 0 })
-        out.push_back(static_cast<char>((value >> shift) & 0xFFU));
+    ByteAppender { out }.AppendU64(value);
 }
 
 /// A history file in the ORIGINAL v1 layout, written by hand.
@@ -227,6 +232,47 @@ TEST_CASE("A range is looked up by what the URL said, and an unknown one is refu
     // put a reader on the wrong axis without saying so.
     CHECK_FALSE(FleetRangeFromKey("30d").has_value());
     CHECK_FALSE(FleetRangeFromKey("").has_value());
+}
+
+TEST_CASE("A history file's words are big-endian, and not only self-consistent", "[distributed][fleethistory]")
+{
+    // **The assertion that distinguishes.** Every other case here saves with `Save` and
+    // reads back with `Load`, which agrees with whatever byte order the two halves
+    // share -- so it passes under the `HostToBigEndian` + `memcpy` this writer used to
+    // carry and under `ByteAppender` alike (#305), and it would go on passing if both
+    // halves became little-endian together. This reads the FILE.
+    //
+    // The envelope is fixed and documented in `FleetHistory.cpp`: four magic bytes, a
+    // version byte, then the body length and the body's CRC32C, both `u64`. The body
+    // then opens with the history's generation. Two present buckets means a generation
+    // of two, which is a number small enough that a byte-swapped word is unmistakable:
+    // big-endian puts it in the LAST byte of its eight.
+    Testing::ScratchDirectory const scratch { "fleet-history-byte-order" };
+    auto const file = scratch.Path() / "history.bin";
+
+    PlacedWallClock clock;
+    FleetHistory history { clock };
+    history.Record(Reading(11));
+    clock.Advance(std::chrono::minutes { 1 });
+    history.Record(Reading(23));
+    REQUIRE(history.Generation() == 2);
+    REQUIRE(history.Save(file));
+
+    auto const raw = ReadFile(file);
+    REQUIRE(raw.size() > 21);
+    CHECK(raw.substr(0, 4) == "FCFH");
+    CHECK(raw[4] == char { 2 }); // the version this build writes
+
+    // The body length, big-endian, and it really is the body's length.
+    std::string expectedLength;
+    AppendU64(expectedLength, raw.size() - 21);
+    CHECK(raw.substr(5, 8) == expectedLength);
+
+    // And the first word of the body is the generation, big-endian.
+    std::string expectedGeneration;
+    AppendU64(expectedGeneration, 2);
+    CHECK(raw.substr(21, 8) == expectedGeneration);
+    CHECK(expectedGeneration == std::string(7, '\0') + std::string(1, char { 2 }));
 }
 
 TEST_CASE("History survives a save and reload", "[distributed][fleethistory]")

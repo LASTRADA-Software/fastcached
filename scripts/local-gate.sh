@@ -923,6 +923,12 @@ run_all_legs() {
 fail() {
     echo "GATE FAILED: $*" >&2
     leg_summary $(leg_pairs) >&2
+    # #877, and on THIS path as much as the green one: a red leg says nothing about
+    # what the gate could not reach, and a reader looking at a failure is the reader
+    # most likely to conclude the rest was covered. `|| true` because a refusal here
+    # must not change an exit that is already 1 -- and because the green path calls
+    # `fail` when it refuses, which would otherwise re-enter.
+    coverage_once >&2 || true
     exit 1
 }
 
@@ -1510,6 +1516,281 @@ target_set_report() {
     fi
 }
 
+
+# ---------------------------------------------------------------------------
+# What NEITHER gate configuration can reach
+# ---------------------------------------------------------------------------
+#
+# `LOCAL GATE PASSED` with `3303 tests` beside it reads as coverage, and it is a
+# true number comparable to nothing. #877: a required CI leg went red on a change
+# this gate had passed, and the check that failed -- `tidy-blind-spots` -- **could
+# not have run here at all**. It registers only under ASan AND
+# `FASTCACHED_ENABLE_TLS`, and `gate-clang-debug` has the first and not the second.
+# Nothing was broken and nobody made a mistake; the gate simply cannot reach it and
+# said nothing about that. The same lane had already read `17 tests, 100% passed`
+# as covering the check earlier that session. It was ABSENT, not passing, and the
+# two render identically in a total.
+#
+# This is `AGENT.md`'s own rule -- *a ctest total is comparable only against the
+# same tree, the same platform AND the same target set* -- for CONFIGURATION rather
+# than target set, and worse in one respect: a target set is visible in the
+# configure line somebody typed, while a feature flag gating a test REGISTRATION is
+# visible nowhere the reader of `LOCAL GATE PASSED` is looking.
+#
+# **The answer is not "run everything".** Some configurations are legitimately
+# expensive or platform-bound, and whether to add a gate configuration is a
+# separate decision this deliberately does not make. Naming the gap is what makes
+# that decision possible.
+#
+# DERIVED BY WALKING REGISTRATIONS, never a maintained list. A restated list is
+# exact about what it knows and silent about what arrives (#492), and the arriving
+# case is precisely the one this exists for -- a test added tomorrow under a flag
+# no gate preset sets.
+#
+# **It must never call `fail`.** The block that prints it runs on BOTH terminal
+# paths, and one of them is `fail` itself; refusing from inside it would be
+# re-entrant. So it prints its refusal and returns non-zero, and the GREEN path is
+# what turns that into a verdict. A red run is already red and needs no second one.
+
+# The CMake sources that may register a test.
+#
+# A LANGUAGE rule rather than a file list: a `.sh` cannot register a ctest test, so
+# the three non-CMake files whose text contains `add_test(` are excluded by what
+# they are rather than by being named -- `check-run-check-coverage.sh` and
+# `doc-subject-checks.sh` SCAN for the pattern and
+# `check-target-file-guards-selftest.cmake` STAGES it into synthetic trees. A file
+# that merely matches a scan is not a call site, and a list of today's three
+# exceptions would be blind to tomorrow's fourth.
+#
+# `scripts/*.cmake` is excluded for the same reason and it is not an oversight:
+# those run under `cmake -P`, which has no test registry to add to.
+#
+# GIT is the enumerator, so an unreadable work tree yields NOTHING -- which is a
+# refusal below rather than a clean answer. That is not hypothetical here: a linked
+# worktree whose `.git` file holds an ABSOLUTE `gitdir:` is unreadable to the other
+# git on this machine, which is #1064 and #336, and it presents as every command
+# listing zero files.
+gate_registration_sources() {
+    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null
+}
+
+# Every test name the CMake sources register, and every registration whose name
+# this cannot resolve.
+#
+# TWO SHAPES, both measured in this tree rather than assumed: 157 registrations put
+# `NAME "<literal>"` on the line AFTER `add_test(`, and one puts it on the same line
+# (`add_test(NAME "${name}" ...)`, the skip-registration helper). A parser that
+# handled only the common shape would silently miss the second -- and the second is
+# a NON-LITERAL, so missing it would drop the one registration whose name this
+# genuinely cannot know while reporting nothing about it.
+#
+# A NON-LITERAL NAME IS ITS OWN OUTCOME. Three registrations name themselves through
+# a variable, and a parser that dropped them would be reporting *derived nothing*
+# and *found nothing to derive* as one silence. They are emitted as `unresolved
+# <file>:<line>` and counted where a reader sees them: a gap this derivation cannot
+# see is worth a sentence, because it is exactly the shape the ticket is about.
+#
+# A full-line comment is not a call site, which is the rule three checks in this
+# repository each had to learn separately.
+#
+# @param 1.. the files to read
+# @return lines of `literal <name>` and `unresolved <file>:<line>`
+gate_declared_tests() {
+    [[ "$#" -gt 0 ]] || return 0
+    awk '
+        FNR == 1 { seeking = 0 }
+        /^[ \t]*#/ { next }
+        {
+            line = $0
+            if (seeking == 0) {
+                if (line !~ /add_test[ \t]*\(/) next
+                seeking = 1
+                startfile = FILENAME
+                startline = FNR
+                # Everything before the opening paren belongs to no argument.
+                sub(/^.*add_test[ \t]*\(/, "", line)
+            }
+            if (line !~ /NAME[ \t]+/) next
+            sub(/^.*NAME[ \t]+/, "", line)
+            tok = line
+            sub(/[ \t].*$/, "", tok)
+            sub(/\).*$/, "", tok)
+            seeking = 0
+            if (tok ~ /^"[A-Za-z0-9_.+-]+"$/) {
+                gsub(/"/, "", tok)
+                print "literal " tok
+            } else {
+                print "unresolved " startfile ":" startline
+            }
+        }
+    ' ${1+"$@"}
+}
+
+# Every test name one build directory's ctest has registered.
+#
+# `ctest -N` rather than reading `CTestTestfile.cmake` by hand: the file `include()`s
+# per-directory copies and a hand parse would have to walk them, which is ctest's
+# job and it is already installed.
+#
+# A directory that was never configured RETURNS NON-ZERO rather than an empty list,
+# because those are two different facts and the caller counts configurations that
+# contributed. A leg that has not run yet contributes nothing; a leg that ran and
+# registered nothing would be a defect.
+#
+# WHAT THIS COSTS, measured rather than assumed, because it runs on the terminal
+# path of every gate run including the failing ones somebody is waiting on.
+# Measured 2026-09-10 on this machine, under **WSL over DrvFs** against a warm
+# `gate-clang-debug` holding 3609 tests: `git ls-files` plus one `ctest -N` is
+# **7.6 s**, and grepping the generated `CTestTestfile.cmake` files instead is
+# **5.2 s**. The difference is DrvFs directory traversal rather than the tool, so
+# trading `ctest -N`'s authority for a bracket parse of generated CMake buys about
+# two seconds and takes on the `[=[ ... ]=]` reader this repository has already
+# been bitten by. The same pair from the Windows side is 0.10 s, which is the
+# figure NOT to quote: the gate runs under WSL.
+#
+# @param 1 build directory
+# @return the names, one per line; non-zero when the directory is not a build
+gate_reached_tests() {
+    local dir="$1"
+    [[ -f "$dir/CTestTestfile.cmake" ]] || return 1
+    # awk and not `sed -E`, whose availability differs between the BSD and GNU
+    # userlands this gate runs under. `[^:]*` stops at the FIRST colon, so a test
+    # name that itself contains one survives intact.
+    ctest --test-dir "$dir" -N 2>/dev/null \
+        | awk '/^[ \t]*Test[ \t]+#[0-9]+:/ { sub(/^[^:]*:[ \t]*/, ""); if (length($0)) print }'
+}
+
+# The report: which declared tests no gate configuration registers.
+#
+# PURE. It reads no clock, opens no file and runs no ctest -- everything it says
+# comes from its arguments, for the reason `_e2e_verdict` and `Get-WaitVerdict` are
+# pure: a decision worth several named outcomes is worth separating from the ambient
+# facts it reads, and a branch that cannot be arranged becomes one staged line.
+#
+# FOUR OUTCOMES, and the reason they are four is the whole ticket. *Skipped, absent,
+# unstarted and failed are four states*, and a gate total collapses ABSENT into the
+# same silence as PASSED:
+#
+#   * no registrations found at all -- the derivation failed, and it agrees
+#     perfectly with "the gate covers everything". REFUSED.
+#   * no configuration contributed a list -- nothing to compare against, so the
+#     answer is unknown rather than clean. REFUSED, and distinct from the above,
+#     because one is a broken derivation and the other is a gate that has not built
+#     anything yet.
+#   * a gap -- named, counted, and NOT a failure: the ticket asks for the gap to be
+#     named, not for the gate to demand a third configuration.
+#   * clear -- every declared test is reachable somewhere, which is stated
+#     positively rather than left as the absence of the previous line.
+#
+# @param 1 declared lines, as `gate_declared_tests` prints them
+# @param 2 reached names, one per line, the UNION over configurations
+# @param 3 how many configurations contributed a list
+# @param 4 how many configurations were asked
+# @return non-zero on a REFUSAL only
+coverage_gap() {
+    local declared="$1" reached="$2" contributed="$3" asked="$4"
+    local literals unresolved names count gap gapCount
+
+    literals="$(printf '%s\n' "$declared" | awk '$1 == "literal" { print $2 }' | sort -u)"
+    unresolved="$(printf '%s\n' "$declared" | awk '$1 == "unresolved" { print $2 }' | sort -u)"
+    count="$(printf '%s\n' "$literals" | grep -c . || true)"
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "== coverage: REFUSED -- no test registrations were found in the CMake sources."
+        echo "==   That cannot be true of this tree, so this is the derivation failing rather"
+        echo "==   than a gate that reaches everything. An unreadable work tree does it: a"
+        echo "==   linked worktree whose .git file holds an absolute gitdir: lists no files."
+        return 1
+    fi
+
+    if [[ "$contributed" -eq 0 ]]; then
+        echo "== coverage: REFUSED -- none of the ${asked} gate configuration(s) contributed a"
+        echo "==   test list, so ${count} declared test(s) were compared against nothing. This is"
+        echo "==   not 'everything is reachable'; it is 'nothing is known'."
+        return 1
+    fi
+
+    gap="$(comm -23 <(printf '%s\n' "$literals") <(printf '%s\n' "$reached" | sort -u))"
+    gapCount="$(printf '%s\n' "$gap" | grep -c . || true)"
+
+    if [[ "$gapCount" -eq 0 ]]; then
+        echo "== coverage: ${count} declared test(s), every one reachable in at least one of the"
+        echo "==   ${contributed} configuration(s) this run built."
+    else
+        echo "== coverage: ${gapCount} of ${count} declared test(s) are registered by NEITHER of the"
+        echo "==   ${contributed} configuration(s) this run built, so the totals above exclude them."
+        echo "==   Named, not counted:"
+        local line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] && echo "==     ${line}"
+        done <<< "$gap"
+        echo "==   This is a statement about what the gate can reach, not a failure. CI builds"
+        echo "==   configurations this does not."
+        # A PARTIAL run's gap is not the gate's gap, and this is the failure path's
+        # ordinary state rather than an exotic one: `fail` prints this block, and a
+        # gate that stopped in its first leg has one configuration's list or none.
+        # Without this line the same sentence is printed for "the gate cannot reach
+        # these" and "this run did not get far enough to say", which is the ticket's
+        # own collapse wearing the fix's clothes.
+        if [[ "$contributed" -lt "$asked" ]]; then
+            echo "==   AND THIS RUN IS PARTIAL: ${contributed} of ${asked} configuration(s) contributed a"
+            echo "==     list, so some of the names above may be reachable in one it did not build."
+        fi
+    fi
+
+    if [[ -n "$unresolved" ]]; then
+        local ucount
+        ucount="$(printf '%s\n' "$unresolved" | grep -c . || true)"
+        echo "==   plus ${ucount} registration(s) whose name is built from a variable, which this"
+        echo "==   derivation cannot resolve and does not claim to have checked:"
+        local u
+        while IFS= read -r u || [[ -n "$u" ]]; do
+            [[ -n "$u" ]] && echo "==     ${u}"
+        done <<< "$unresolved"
+    fi
+    return 0
+}
+
+# Acquire the two lists and hand them to the pure decision above.
+#
+# Everything ambient lives here and nothing decides anything: the git enumeration,
+# the ctest calls, and the count of configurations that answered. Split for
+# `--self-test`'s sake, which drives `coverage_gap` over staged lists in
+# milliseconds and needs no build directory at all.
+coverage_report() {
+    local declared reached="" contributed=0 asked=0 row preset one
+    declared="$(gate_declared_tests $(gate_registration_sources))"
+    for row in "${gate_presets[@]}"; do
+        preset="${row%%|*}"
+        asked=$(( asked + 1 ))
+        if one="$(gate_reached_tests "out/build/${preset}")"; then
+            contributed=$(( contributed + 1 ))
+            reached="${reached}${one}"$'\n'
+        fi
+    done
+    coverage_gap "$declared" "$reached" "$contributed" "$asked"
+}
+
+# Print the coverage block AT MOST ONCE per run.
+#
+# Both terminal paths reach it and one of them is `fail`, which the other calls
+# when the derivation refuses -- so without this the block prints twice on exactly
+# the run somebody is reading carefully. The guard is a flag rather than an
+# argument because the second caller is `fail`, which has no idea whether it is the
+# first.
+#
+# `--self-test` sets the flag before its cases run. Those drive `coverage_gap`
+# directly over staged lists; the acquisition around it needs configured build
+# directories, so leaving this live would make a self-test case's output depend on
+# whether a gate has ever run on the machine -- a fixture whose result is an
+# accident of the developer's disk.
+gate_coverage_printed=0
+coverage_once() {
+    [[ "$gate_coverage_printed" -eq 0 ]] || return 0
+    gate_coverage_printed=1
+    coverage_report
+}
+
 # Whether the formatter should be run at all, and over how many files.
 #
 # A pure function of the list so `--self-test` drives the same code the run uses;
@@ -1551,6 +1832,13 @@ format_plan() {
 if [[ "$self_test" -eq 1 ]]; then
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
+    # The coverage block is inert for the cases below, and `coverage_once`'s header
+    # says why: the cases that reach `fail` would otherwise print a block derived
+    # from whichever build directories happen to exist on this machine, so a
+    # fixture's expected output would depend on whether a gate had ever run here.
+    # `coverage_gap` -- the part that decides anything -- is driven directly, over
+    # staged lists, further down.
+    gate_coverage_printed=1
     self_test_failures=0
     # How many checks RAN, printed on both paths. `expect` is silent when it
     # passes, so without this a run that died half way through -- an unbound
@@ -2492,6 +2780,176 @@ $gate_passed_marker"
         "== gate-clang-debug: no tests skipped" \
         "$(skip_report gate-clang-debug <<< "100% tests passed, 0 tests failed out of 10")"
 
+
+    # --- #877: what NEITHER configuration can reach --------------------------
+    #
+    # `coverage_gap` is pure, so all four of its outcomes cost one staged line
+    # each -- including the two that need a machine in a state nobody can arrange
+    # on purpose (a work tree git cannot enumerate, a gate that has built
+    # nothing). The acquisition around it is driven separately, against the REAL
+    # sources, below.
+    #
+    # The outcomes are pinned APART rather than each shown once, because the whole
+    # ticket is that a total collapses ABSENT into the same silence as PASSED: two
+    # refusals that printed the same sentence would be this defect reappearing
+    # inside its own fix.
+    expect "a declared test that no configuration registers is named, not counted" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"==     tidy-blind-spots"* ]] && echo yes || echo no)"
+    expect "and the gap says how many of how many, so the total carries its exclusion" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2)" == *"1 of 2 declared test(s) are registered by NEITHER"* ]] && echo yes || echo no)"
+    # A NAMED gap is not a failure. The ticket is explicit that whether to add a
+    # gate configuration is a separate decision, so a run that names one must
+    # still be able to pass -- and a status of 1 here would fail every gate on
+    # this tree, which has six.
+    expect "a named gap does not refuse the run" \
+        "0" \
+        "$(coverage_gap 'literal alpha
+literal tidy-blind-spots' 'alpha' 2 2 >/dev/null; echo $?)"
+
+    # Clear is stated POSITIVELY. Left as the absence of the gap block it would be
+    # indistinguishable from a derivation that produced nothing at all, which is
+    # the next two rows.
+    expect "everything reachable is said in words, not by silence" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha' 'alpha
+beta' 2 2)" == *"every one reachable in at least one"* ]] && echo yes || echo no)"
+
+    # The two REFUSALS, and they must not share a sentence: one is a broken
+    # derivation, the other is a gate that has not built anything. A reader sent to
+    # the wrong one looks for a missing test that is not missing.
+    expect "no registrations at all is REFUSED, and named as the derivation failing" \
+        "yes" \
+        "$([[ "$(coverage_gap '' 'alpha' 2 2)" == *"no test registrations were found"* ]] && echo yes || echo no)"
+    expect "a derivation that found nothing refuses the run" \
+        "1" "$(coverage_gap '' 'alpha' 2 2 >/dev/null; echo $?)"
+    expect "no configuration contributing is a DIFFERENT refusal" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha' '' 0 2)" == *"contributed a"* ]] && echo yes || echo no)"
+    expect "and it says nothing is KNOWN rather than that everything is reachable" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha' '' 0 2)" == *"it is 'nothing is known'"* ]] && echo yes || echo no)"
+    expect "a gate that built nothing refuses the run" \
+        "1" "$(coverage_gap 'literal alpha' '' 0 2 >/dev/null; echo $?)"
+    # The two refusals are two sentences. Sharing one would satisfy every row
+    # above while collapsing the states they exist to keep apart.
+    #
+    # THE FIRST LINE, not the whole output, and the difference is the whole value
+    # of this row: staging the second refusal to open with the first one's sentence
+    # left the two full outputs still unequal -- the later lines differ -- so a
+    # comparison of everything passed over exactly the collapse it was written to
+    # catch. Measured, not reasoned: that mutation reddened one row and this one
+    # stayed green. What a reader sees is the opening sentence.
+    expect "the two refusals do not open with the same sentence" \
+        "no" \
+        "$(a="$(coverage_gap '' 'a' 2 2)"; b="$(coverage_gap 'literal alpha' '' 0 2)"
+           [[ "${a%%$'\n'*}" == "${b%%$'\n'*}" ]] && echo yes || echo no)"
+
+    # A PARTIAL run's gap is not the gate's gap, and this is the failure path's
+    # ordinary state: `fail` prints this block, and a gate that stopped in its
+    # first leg has one list or none. Both directions, one apart in `contributed`
+    # alone -- without the second row the caveat could be unconditional and the
+    # first would still pass.
+    expect "a partial run says so, so its gap is not read as the gate's" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha
+literal beta' 'alpha' 1 2)" == *"THIS RUN IS PARTIAL"* ]] && echo yes || echo no)"
+    expect "a complete run does not caveat a gap it fully derived" \
+        "no" \
+        "$([[ "$(coverage_gap 'literal alpha
+literal beta' 'alpha' 2 2)" == *"THIS RUN IS PARTIAL"* ]] && echo yes || echo no)"
+
+    # A registration whose name is a variable is its own outcome, and it is
+    # reported even on the CLEAR path -- a gap this derivation cannot see is worth
+    # a sentence precisely when everything it CAN see looks fine.
+    expect "a name built from a variable is reported as underivable, with its site" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha
+unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"src/tests/CMakeLists.txt:288"* ]] && echo yes || echo no)"
+    expect "and it does not claim to have checked it" \
+        "yes" \
+        "$([[ "$(coverage_gap 'literal alpha
+unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to have checked"* ]] && echo yes || echo no)"
+
+    # --- and the ACQUISITION, against the real sources ------------------------
+    #
+    # The pure rows above cannot see a parser that reads the wrong files or the
+    # wrong shape, and that is where this went wrong first: a draft matched every
+    # `NAME "..."` in the CMake sources and reported `DEB-DEFAULT`, `fastcached`
+    # and `fastcached.service` as unreachable tests -- CPack components and install
+    # RENAMEs, matched because the pattern was broader than its author read it.
+    # Anchoring to `add_test(` is what fixed it, and only a run against the real
+    # tree could have shown it.
+    #
+    # Guarded on git being able to enumerate: where it cannot -- a Windows-created
+    # worktree whose `.git` holds an absolute `gitdir:` -- this reports SKIPPED by
+    # name rather than passing over an empty list, which is the same empty-set
+    # hazard the production path refuses.
+    coverage_sources="$(gate_registration_sources)"
+    if [[ -z "$coverage_sources" ]]; then
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the registration walk (git enumerated no CMake sources here)"
+    else
+        coverage_declared="$(gate_declared_tests $coverage_sources)"
+        # A positive control FIRST, so a parser that matched nothing cannot report
+        # a clean census. `local-gate-selftest` is this very test's own
+        # registration, so a tree where it is absent is one where nothing below
+        # means anything.
+        expect "the registration walk finds this test's own registration" \
+            "1" "$(printf '%s\n' "$coverage_declared" | grep -cx 'literal local-gate-selftest' || true)"
+        # And the negative: a CPack component name is not a test. This is the
+        # defect the first draft shipped, pinned so it cannot come back.
+        expect "a CPack component NAME is not read as a test registration" \
+            "0" "$(printf '%s\n' "$coverage_declared" | grep -cx 'literal DEB-DEFAULT' || true)"
+        expect "an install(RENAME) target is not read as a test registration" \
+            "0" "$(printf '%s\n' "$coverage_declared" | grep -cx 'literal fastcached.service' || true)"
+        # The same-line shape, which 157 of 158 registrations do not use and which
+        # a parser written from the common case alone would silently drop -- and it
+        # is the one registration whose name genuinely cannot be resolved, so
+        # dropping it would lose the report rather than an entry.
+        expect "the one same-line add_test(NAME ...) is seen, and reported unresolved" \
+            "yes" \
+            "$([[ "$coverage_declared" == *"unresolved"* ]] && echo yes || echo no)"
+    fi
+
+    # --- #591: the reaper ships with this gate, so this gate tests it ---------
+    #
+    # `reap-my-gate.sh` has its own `--self-test`, and it is driven from HERE
+    # rather than from a registration of its own: `local-gate-selftest` is already
+    # registered and runs on every platform CI builds, so the helper is covered the
+    # day it lands instead of the day somebody sequences a row into
+    # `src/tests/CMakeLists.txt`. A self-test nothing invokes is a self-test nobody
+    # has watched refuse.
+    #
+    # `bash <path>`, never the bare path: a mode-644 script exits 126, and inside an
+    # assertion any failure to START is indistinguishable from the rule firing.
+    #
+    # Its own summary line is what is asserted, not merely its status, so a run that
+    # SKIPPED its real-process half is visible here rather than folded into a pass.
+    # The count is not pinned -- that would be a second copy of a number the helper
+    # already prints -- but `0 failed` is.
+    reap_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/reap-my-gate.sh" --self-test 2>&1)"
+    reap_status=$?
+    expect "the gate reaper's own self-test passes" "0" "$reap_status"
+    expect "and it reports a count, so a run that judged nothing is visible" \
+        "yes" "$([[ "$reap_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
+    case "$reap_out" in
+        *SKIPPED*) self_test_skipped="${self_test_skipped:+$self_test_skipped, }the reaper's real-process half (${reap_out#*SKIPPED: })" ;;
+    esac
+
+    # #336's helper, driven here for the reason the reaper's is: it ships with this
+    # gate and the gate's own registration already runs everywhere.
+    repair_out="$(bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" --self-test 2>&1)"
+    repair_status=$?
+    expect "the worktree-pointer repairer's own self-test passes" "0" "$repair_status"
+    expect "and it reports a count, so a run that judged nothing is visible" \
+        "yes" "$([[ "$repair_out" == *"checks ran, 0 failed"* ]] && echo yes || echo no)"
+    case "$repair_out" in
+        *SKIPPED*) self_test_skipped="${self_test_skipped:+$self_test_skipped, }the repairer's real-git half (${repair_out#*SKIPPED: })" ;;
+    esac
+
     expect "the preset table still has two rows" "2" "${#gate_presets[@]}"
     for row in "${gate_presets[@]}"; do
         case "${row#*|}" in
@@ -2530,6 +2988,33 @@ fi
 gate_commit="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$repo_root" diff --quiet HEAD 2>/dev/null || gate_commit="${gate_commit}-dirty"
 echo "$gate_start_marker -- pid $$, tree $repo_root, commit $gate_commit, $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# FIRST, because everything after it reads the tree through git, and because the
+# refusal it replaces named the wrong subject (#336).
+#
+# In a worktree created by the OTHER git on this machine, `git ls-files` answers
+# nothing -- the pointers are absolute in a dialect this git cannot follow -- and
+# every git-driven step here goes empty. The gate already refused rather than
+# passing, which is #1064, but it refused with
+#
+#   GATE FAILED: no tracked headers were found under this tree ... git ls-files
+#   answered nothing, which in a checkout of this repository cannot be true
+#
+# -- measured on exactly that tree. True, and it sends the reader to `.clang-tidy`
+# and the header filter, which are working perfectly. The cause is two pointer
+# files, and the remedy is one command; neither appeared anywhere in the output.
+#
+# `commit ${gate_commit}` reads `unknown-dirty` in that state for the same reason,
+# which is the tell if you already know what you are looking at.
+#
+# The check REFUSES rather than repairing: rewriting a developer's git metadata
+# without being asked is not the gate's business, and `--apply` is one line away.
+# It is also why the diagnosis lives in its own script rather than here -- the
+# thing an operator needs is a command they can run, not a paragraph they have to
+# translate into two `printf`s.
+if ! bash "$(dirname "${BASH_SOURCE[0]}")/repair-worktree-pointers.sh" "$repo_root"; then
+    fail "this work tree is not readable by the git running this gate (diagnosis above)"
+fi
 
 # Resolved once, to an absolute path, and checked before anything is built -- the
 # treatment `clang-format` already had, for the same reason: a gate whose tool is
@@ -2785,4 +3270,13 @@ run_all_legs run_preset
 # statement of what it had just done.
 echo
 leg_summary $(leg_pairs)
+# #877: the number a reader compares carries what it EXCLUDES, or it reads as
+# coverage. A refusal here is a refusal of the RUN -- an empty derivation agrees
+# perfectly with "the gate reaches everything", which is the one reading this block
+# exists to prevent, so it must not be printed and passed over. A named gap is not
+# a failure: CI builds configurations this gate does not, and deciding to add one is
+# a separate question this only makes askable.
+if ! coverage_once; then
+    fail "the coverage derivation refused (above), so this run cannot say what it did not reach"
+fi
 echo "LOCAL GATE PASSED"

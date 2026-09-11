@@ -232,6 +232,17 @@ causes below is not a cancellation at all:
 - Red **immediately after a multi-label create or edit** — self-inflicted by the
   concurrency group, and a queued run is already on its way to clearing it. **Wait.**
   Firing another label event cancels the survivor and starts the cycle over.
+  **Fixed at the source in #761/#820**, so this should no longer happen: `pr-labels.yml`
+  and `pr-body.yml` both set `cancel-in-progress: false`, because their re-trigger
+  events (`labeled`, `unlabeled`, `edited`) do not change the head SHA, so the run
+  being killed held that commit's only verdict. It was not rare — 14 of the 100 most
+  recent `pr-labels` runs to 2026-09-10 were cancelled, and in three of four inspected
+  the labelling job had already *succeeded* before the verdict was discarded.
+  `check-merge-queue-contexts` refuses the combination now. If you still meet a
+  `CANCELLED` required context, it is **not** this: suspect a run cancelled while
+  still *pending* (GitHub does that whatever the setting says), or `build.yml`, which
+  cancels correctly because its superseding runs carry a new SHA — so its cancelled
+  contexts belong to a commit nothing gates on.
 - Red on a PR whose **labels have been stable for minutes**, nothing queued — genuinely
   stuck. Re-apply **one** accurate missing `area/*` label to fire a fresh event.
 - Red while the PR **visibly has its `type/` label** — `actions/labeler` destroyed a

@@ -43,6 +43,64 @@ namespace
 
 } // namespace
 
+TEST_CASE("StreamCodec::Encode writes the layout its header documents, byte for byte", "[cache][stream]")
+{
+    // **The assertion that distinguishes.** Every other case here round-trips against
+    // `Decode`, which agrees with whatever layout and byte order the two halves share
+    // -- so it passes under the hand-rolled append helpers this encoder used to carry
+    // and under `ByteAppender` alike (#305). These expected bytes are spelled field by
+    // field through a builder sharing no code with `Encode`, against the layout written
+    // out at the top of `StreamCodec.hpp`, so a flipped width, a little-endian prefix
+    // or a dropped count fails here.
+    //
+    // One entry with one field and one group with one consumer and one pending entry:
+    // small enough to read, and reaching every one of the encoder's five counts.
+    Stream stream;
+    stream.lastId = StreamId { .ms = 7, .seq = 1 };
+    stream.maxDeletedId = StreamId { .ms = 3, .seq = 0 };
+    stream.entriesAdded = 9;
+    stream.entries.push_back(StreamEntry { .id = StreamId { .ms = 7, .seq = 1 }, .fields = { { "k", "v" } } });
+    ConsumerGroup group;
+    group.name = "g";
+    group.lastDelivered = StreamId { .ms = 7, .seq = 0 };
+    group.entriesRead = 2;
+    group.consumers = { "alice" };
+    group.pel.push_back(PendingEntry {
+        .id = StreamId { .ms = 7, .seq = 1 }, .consumer = "alice", .deliveryTimeMs = 1234, .deliveryCount = 3 });
+    stream.groups.push_back(std::move(group));
+
+    auto const expected = Testing::DeclaredCountBlob {}
+                              .Byte(static_cast<std::uint8_t>(StreamCodec::Magic))
+                              .Byte(static_cast<std::uint8_t>(StreamCodec::TypeStream))
+                              .U64(7)
+                              .U64(1) // lastId
+                              .U64(3)
+                              .U64(0) // maxDeletedId
+                              .U64(9) // entriesAdded
+                              .U32(1) // entryCount
+                              .U64(7)
+                              .U64(1) // entry id
+                              .U32(1) // fieldCount
+                              .Field("k")
+                              .Field("v")
+                              .U32(1) // groupCount
+                              .Field("g")
+                              .U64(7)
+                              .U64(0) // lastDelivered
+                              .U64(2) // entriesRead
+                              .U32(1) // consumerCount
+                              .Field("alice")
+                              .U32(1) // pelCount
+                              .U64(7)
+                              .U64(1)    // pending id
+                              .U64(1234) // deliveryTimeMs
+                              .U64(3)    // deliveryCount
+                              .Field("alice")
+                              .Vector();
+
+    CHECK(StreamCodec::Encode(stream) == expected);
+}
+
 TEST_CASE("StreamCodec: round-trips a populated stream", "[cache][stream]")
 {
     auto const original = SampleStream();

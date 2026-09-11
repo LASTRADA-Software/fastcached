@@ -556,7 +556,22 @@ _e2e_verdict() {
     #     subject is the MACHINE, and the findings below are about a starved observer.
     #
     # `-` means the caller took no such reading, and then nothing is claimed either way.
-    if [ "$requestedMs" != "-" ] && [ "$requestedMs" -lt $(( bound * 500 )) ]; then
+    #
+    # AND A WAIT THAT ENDED EARLY CLAIMS NOTHING EITHER, which `alive = no` is the
+    # whole of. The comparison is against the BUDGET, so it only means anything for
+    # a wait that spent one: a process noticed dead on the first poll has asked for
+    # 0 ms of pauses by design, and the note then reads
+    #
+    #   the loop asked for only 0ms of pauses inside a 10s budget, so this machine
+    #   could not poll at the rate the wait assumed
+    #
+    # directly above `the process DIED` -- a confident claim about the MACHINE
+    # stacked on top of a finding that says the machine is not the subject. It
+    # fires on every prompt death, which is the one case this verdict gets exactly
+    # right, and `a confident wrong signal is worse than a vague right one` is the
+    # rule it breaks. `unknown` is deliberately NOT exempt: no pid was watched, so
+    # that wait ran to its budget and the pacing reading is real.
+    if [ "$alive" != "no" ] && [ "$requestedMs" != "-" ] && [ "$requestedMs" -lt $(( bound * 500 )) ]; then
         echo "  NOTE: the loop asked for only ${requestedMs}ms of pauses inside a ${bound}s budget, so this"
         echo "        machine could not poll at the rate the wait assumed. Read the findings below with"
         echo "        that in mind."
@@ -689,9 +704,31 @@ _e2e_wait_retire_deadline() {
 #          one, this wait SHARES it and does not retire it -- which is how a
 #          caller spends ONE budget across two waits without subtracting two clock
 #          readings to split it. Absent, this wait arms and retires its own.
+# @param 7 optional function name printing SUBJECT-specific findings when the wait
+#          ends badly, or "". See below.
+#
+# WHY THERE IS A FINDINGS HOOK AT ALL, since one more parameter on the general
+# wait wants justifying. `_e2e_verdict` answers one question -- was this a slow
+# machine, a wedged process or a dead one -- and it answers it from readings every
+# wait takes. Some waits can say something MORE, and it is a different fact about
+# a different subject: a counter wait knows whether anything answered a scrape,
+# whether the series exists at all, and what the last reading was, and those three
+# are three terminal states that must not collapse into "timed out" (#643).
+#
+# The alternative spellings were both worse. `e2e_on_fail` is a FIXTURE-wide hook
+# -- `cluster-e2e` dumps every node's log through it -- so a wait that claimed it
+# would silently displace whatever the fixture had installed, and it fires for
+# every `fail` rather than for this one. A bespoke loop beside `wait_until` is how
+# six copies of `wait_for_port` came to have three different failure semantics.
+#
+# The hook takes no arguments and reads what it needs from its caller's locals by
+# dynamic scope, exactly as `_e2e_wait_retire_deadline` does. It runs AFTER the
+# verdict and BEFORE the log dump, on stderr, on every bad exit -- expiry and
+# death alike, because a process that died with its counter at 3 is a fact worth
+# printing beside the death.
 wait_until() {
     local ready="$1" what="$2" pid="$3" logfile="$4" seconds="$5"
-    local armed="${6:-}"
+    local armed="${6:-}" findings="${7:-}"
     local started="$SECONDS" grewAt="$SECONDS"
     local elapsed=0 polls=0 size=0 baseline=0 grew="no" stall=0 alive="yes" status="-"
     local dpid="" dmark="" ownsDeadline="yes" requestedMs=0
@@ -751,7 +788,7 @@ wait_until() {
             # fixture starts.
             _e2e_wait_retire_deadline
             _e2e_expire "$what" "$seconds" "$elapsed" "$polls" \
-                "$alive" "$status" "$grew" "$stall" "$logfile" "$requestedMs"
+                "$alive" "$status" "$grew" "$stall" "$logfile" "$requestedMs" "$findings"
         fi
 
         if [ "$logfile" != "-" ]; then
@@ -776,7 +813,7 @@ wait_until() {
     _e2e_wait_retire_deadline
     if [ "$grew" = "no" ]; then stall="-"; fi
     _e2e_expire "$what" "$seconds" "$elapsed" "$polls" \
-        "$alive" "$status" "$grew" "$stall" "$logfile" "$requestedMs"
+        "$alive" "$status" "$grew" "$stall" "$logfile" "$requestedMs" "$findings"
 }
 
 # Bytes in a file, as a bare integer. Fails the run when the file is missing.
@@ -813,6 +850,36 @@ count_lines() {
 # Not `count_bytes`: a missing file is ORDINARY here (a wait polls a log before
 # anything has written it) where for `count_bytes` it is a fixture bug. Two
 # contracts, so two functions.
+#
+# **AND THIS IS THE ONE THAT WOULD BE DELETED, WHICH IS WHY THE ARGUMENT IS HERE.**
+# The two sit a few lines apart, run the same `wc -c ... | tr -d ' '`, and differ
+# only in what they do when the file cannot be read -- `count_bytes` calls `fail`,
+# this answers 0. So this one reads as the redundant copy, and it is not: routing
+# it through `count_bytes` would end the run on the FIRST POLL of essentially every
+# bounded wait in this repository, because a log that does not exist yet is the
+# ordinary state of a process that has just been started.
+#
+# Three things make that worth a paragraph rather than a shrug.
+#
+# **Nothing checks it.** The `no script keeps its own copy of a shared helper` scan
+# compares a FIXTURE against the library and cannot see two LIBRARY functions
+# overlapping. There is no guard to build either: the property is *these two must
+# not be merged*, which is a claim about intent, and prose at the site is this
+# tree's answer for that class.
+#
+# **It has a demonstrated victim from day one.** The first reader to meet the two
+# together matched `count_bytes`'s comment -- *"Fails the run when the file is
+# missing"* -- to THIS function by adjacency, within minutes of the merge that
+# introduced it, and came within one step of reporting it as a defect. A trap that
+# caught somebody on the day it appeared is not hypothetical.
+#
+# **A `/simplify` finding is a change like any other and is not exempt from the
+# review its subject just had.** This tree has a measured instance: a late cleanup
+# -- made precisely BECAUSE an off-by-one had hidden in three-origin arithmetic --
+# introduced a skipped-definition bug into the very instrument built to prevent
+# false passes, landing after four passes that would have caught it. A cleanup
+# arrives wearing the authority of a review rather than the suspicion of a change,
+# and two adjacent functions with one body is exactly the shape that attracts one.
 _e2e_size() {
     if [ -r "$1" ]; then
         wc -c < "$1" 2>/dev/null | tr -d ' '
@@ -822,11 +889,18 @@ _e2e_size() {
 }
 
 # Print the verdict, dump the log, and stop the run. Never returns.
+#
+# @param 10 the total the loop asked for in ms, or "-"
+# @param 11 a function name printing subject-specific findings, or "". See
+#           `wait_until`'s param 7 for why one exists.
 _e2e_expire() {
     local what="$1" seconds="$2" elapsed="$3" polls="$4"
     local alive="$5" status="$6" grew="$7" stall="$8" logfile="$9"
-    local requestedMs="${10:--}"
+    local requestedMs="${10:--}" findings="${11:-}"
     _e2e_verdict "$what" "$seconds" "$elapsed" "$polls" "$alive" "$status" "$grew" "$stall" "$requestedMs" >&2
+    # AFTER the verdict and BEFORE the log, so a reader meets the general
+    # diagnosis, then what this particular wait knows, then the evidence.
+    if [ -n "$findings" ]; then "$findings" >&2; fi
     if [ "$logfile" != "-" ] && [ -r "$logfile" ]; then
         { echo "--- ${logfile}"; cat "$logfile"; } >&2
     fi
@@ -959,6 +1033,20 @@ wait_for_registration() {
 # behaviour are different jobs.
 E2eNodeReadyMarker="compile node ready"
 
+# The line `fastcached` logs once every acceptor is armed, and the marker
+# `wait_for_daemon_ready` below waits on.
+#
+# The second row of `Core/ReadinessMarker.hpp`, and the two constants here are that
+# table read from the shell. Both are wire constants in all but name: this build
+# recompiles no fixture, so rewording either breaks its waiters by TIMEOUT -- the
+# slowest and least informative failure there is -- with a green build behind it.
+#
+# `ready, accepting connections` reports ACCEPTING, which is strictly later than the
+# bind (#646). That is why a daemon gets a readiness wait rather than the port wait
+# five call sites used: a bound port with nobody accepting answers a connect probe
+# out of the backlog and then holds the client.
+E2eDaemonReadyMarker="ready, accepting connections"
+
 # Wait until a compile node is SERVING, not merely bound.
 #
 # BOUND IS NOT READY. Since #365 a node binds FIRST and logs this line
@@ -1030,6 +1118,39 @@ E2eNodeReadyMarker="compile node ready"
 # @param 6 optional bound in seconds for BOTH waits together; defaults to
 #          `e2e_wait_seconds`
 wait_for_node_ready() {
+    _e2e_wait_ready "$E2eNodeReadyMarker" wait_for_node_ready ${@+"$@"}
+}
+
+# Wait until a `fastcached` daemon is ACCEPTING, not merely bound.
+#
+# The daemon's half of the rule above, and it is not a weaker version of it: its
+# marker is emitted by `ReadinessAnnouncer` once the LAST acceptor has armed, so
+# between the bind and this line sit every reactor thread and every acceptor the
+# daemon runs. `Core/ReadinessMarker.hpp` states both facts in one table and has
+# no `Bound` enumerator at all, precisely so a fixture cannot claim the weaker one.
+#
+# It exists because `dist-compile-e2e.sh` started five daemons and waited on the
+# PORT for each (#644). A connect that lands in the backlog with nobody accepting
+# answers the probe and then holds the client, and the fixture's very next act is
+# to point a launcher at that port. The window is small on a warm machine, which
+# is exactly the property #634 found had been quietly true of the node for months.
+#
+# Same signature, same shared deadline, same required log as
+# `wait_for_node_ready`; the marker is the only difference, so they are two rows
+# rather than two functions.
+wait_for_daemon_ready() {
+    _e2e_wait_ready "$E2eDaemonReadyMarker" wait_for_daemon_ready ${@+"$@"}
+}
+
+# The body both readiness waits are: bind, then the marker, on ONE deadline.
+#
+# @param 1 the marker to wait for
+# @param 2 the caller's own name, for the refusal below -- a message naming this
+#          function would send a reader to a helper they did not call
+# @param 3.. the caller's arguments, unchanged
+_e2e_wait_ready() {
+    local marker="$1" caller="$2"
+    shift 2
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
     local seconds="${6:-$_e2e_wait_seconds}"
     # A log is REQUIRED, and `-` is refused rather than passed through. It is the
@@ -1037,8 +1158,8 @@ wait_for_node_ready() {
     # already pass it there -- so a call site converted from `wait_for_port`
     # without noticing would reach `grep -q "$marker" -`, which reads the
     # FIXTURE'S OWN STDIN once per poll, never matches, and ends the run as a
-    # readiness timeout for a node that was perfectly healthy.
-    [ "$logfile" != "-" ]         || fail "wait_for_node_ready needs a log to read the marker out of; ${what} was given '-'"
+    # readiness timeout for a process that was perfectly healthy.
+    [ "$logfile" != "-" ]         || fail "${caller} needs a log to read the marker out of; ${what} was given '-'"
     local armed dpid dmark
     _e2e_deadline_arm "$seconds"
     armed="$_e2e_deadline_armed"
@@ -1053,9 +1174,205 @@ wait_for_node_ready() {
     # It now says it by naming the SHARED budget rather than a remainder, because a
     # remainder is exactly the subtraction of two clock readings this function
     # stopped doing. The deadline is retired here, by the leg that armed it.
-    wait_for_log "$E2eNodeReadyMarker" "$pid"         "${what} (readiness, on what is left of a ${seconds}s budget shared with the bind)"         "$logfile" "$seconds" "$armed"
+    wait_for_log "$marker" "$pid"         "${what} (readiness, on what is left of a ${seconds}s budget shared with the bind)"         "$logfile" "$seconds" "$armed"
     _e2e_deadline_disarm "$dpid" "$dmark"
 }
+
+
+# ---------------------------------------------------------------------------
+# The counter wait
+# ---------------------------------------------------------------------------
+
+# Pull one counter out of a Prometheus body.
+#
+# THE GRAMMAR LIVES HERE AND NOWHERE ELSE. It was written out at three call sites
+# inside `dist-compile-e2e.sh` before that fixture grew a function for it, and the
+# day the exporter grows a label or renders `1` as `1.0`, a copy that still
+# matches nothing does not say "the series changed shape" -- it says "the counter
+# did not move", which is a statement about the SUBJECT rather than about the
+# instrument.
+#
+# It is in the library rather than in that fixture because `wait_for_counter`
+# below needs it, and a second grammar inside the library would be the same defect
+# one level down: the wait's "the series is absent" and the fixture's direct reads
+# would then disagree about what absent MEANS, silently, in the run where it
+# matters (#643).
+#
+# NOTHING ON STDOUT MEANS THE SERIES WAS ABSENT, which is a different fact from a
+# reading of zero and must not be folded into one: a counter is a tally, so zero
+# is the truth about events that never happened, while an absent series is a
+# counter nothing exports. Every caller checks for the empty string separately.
+#
+# The body is a whole HTTP response, headers included, because that is what
+# `http_get` echoes; the expression is anchored at the start of a line, so no
+# header can match it.
+#
+# @param 1 a whole /metrics response
+# @param 2 the Prometheus series name
+# @return echoes the reading, or nothing when the series is absent
+metric_value() {
+    local body="$1" name="$2"
+    sed -n "s/^${name} \([0-9][0-9]*\)\$/\1/p" <<< "$body" | tail -1
+}
+
+# Read one counter off an admin endpoint: one scrape, one series.
+#
+# The two outcomes are told apart by the STATUS and not by the output, and both
+# callers depend on it: a non-zero return is "nothing answered the request at
+# all", an empty echo with status zero is "it answered and the series is not
+# there". Folding those two into an empty string is what makes a wait unable to
+# say which of its three terminal states it reached.
+#
+# A caller that wants several series from ONE instant does not use this: it takes
+# a body with `http_get` and reads it with `metric_value` as many times as it
+# likes, because three requests are three different instants and comparing series
+# taken a round trip apart asserts something nobody meant.
+#
+# @param 1 host
+# @param 2 port
+# @param 3 the Prometheus series name
+# @return echoes the reading; returns 1 if the scrape itself failed
+counter_value() {
+    local host="$1" port="$2" name="$3" body=""
+    body="$(http_get "$host" "$port" /metrics)" || return 1
+    metric_value "$body" "$name"
+}
+
+# Which of the three ways a counter wait can end badly this one was.
+#
+# PURE: it reads no clock, opens no socket and touches no process. Everything it
+# says comes from its arguments, for the reason `_e2e_verdict` above is pure --
+# a decision worth several named outcomes is worth separating from the ambient
+# facts it reads, and each branch then costs one staged row rather than a stand-in
+# that has to be arranged to exhibit it.
+#
+# THREE STATES, and the whole of #643 is that they must not collapse:
+#
+#   * nothing ever answered a scrape -- the admin surface is down, or the port is
+#     wrong. Nothing observed here is a statement about the counter at all.
+#   * it answered and the series is ABSENT -- the process exports no such counter.
+#     A worker with no cache tier exports no cache series, so this is an ordinary
+#     answer as well as a possible defect, and it is never a reading of zero.
+#   * the series is present and never reached the floor -- and then the LAST
+#     READING is the finding, because "it sat at 0" and "it reached 2 of 3" send a
+#     reader to different places.
+#
+# These are printed BESIDE `_e2e_verdict`'s slow-versus-wedged finding rather than
+# instead of it: one says what this wait saw, the other says whether the machine
+# was in a state to see anything.
+#
+# @param 1 whether any scrape was answered at all: yes | no
+# @param 2 the last reading, or "" when the series was never present
+# @param 3 the floor the reading had to reach
+# @param 4 the series name
+_e2e_counter_finding() {
+    local answered="$1" value="$2" floor="$3" name="$4"
+
+    if [ "$answered" != "yes" ]; then
+        echo "  COUNTER: nothing ever answered a /metrics request, so ${name} was never read."
+        echo "           Nothing above is a statement about the counter; the admin surface is"
+        echo "           the subject."
+        return 0
+    fi
+
+    if [ -z "$value" ]; then
+        echo "  COUNTER: /metrics answered and exports no ${name} series at all."
+        echo "           An absent series is not a reading of zero."
+        return 0
+    fi
+
+    echo "  COUNTER: ${name} was read and never reached ${floor}; the last reading was ${value}."
+}
+
+# What the last `wait_for_counter` read, and the only way it hands one back.
+#
+# A global rather than a value on stdout, and the reason is not style. `wait_until`
+# announces its own success on stdout -- `waited 0s (3 polls) for ...` -- so a wait
+# called in `$( )` would hand its caller that line with the reading appended, and
+# every consumer would have to strip it. `start_node` in `dist-compile-e2e.sh` sets
+# `started_pid` for a neighbouring reason and records it at length: a function
+# called in a command substitution runs in a SUBSHELL, and that fixture's own
+# header notes its private counter wait was called that way, so a counter that
+# never moved ended the run only because `set -e` happened to notice the
+# assignment's status.
+#
+# Read it on the line after the call.
+E2eCounterReading=""
+
+# Whether any scrape during the last `wait_for_counter` was answered at all.
+# Private; `_e2e_counter_finding` is what reads it.
+_e2e_counter_answered="no"
+
+# Wait until a counter on an admin endpoint reaches a floor, the way
+# `wait_for_port` waits for a listener.
+#
+# The third member of the bounded-wait family rather than a fourth hand-written
+# poll loop. `dist-compile-e2e.sh` kept one of those after every other wait in it
+# had been converted (#451), and it cost two things (#643):
+#
+#   * IT DID NOT HONOUR `e2e_wait_seconds`. It opened `local seconds=10`, so an
+#     operator raising the fixture's budget -- the documented remedy for a slow
+#     box -- scaled every wait in the file except this one. And this is the wait a
+#     slow machine lengthens MOST: it waits for a compile to finish and a counter
+#     to rise, where the others wait for a process to bind.
+#   * IT PRODUCED NO SLOW-VERSUS-WEDGED VERDICT, so its timeout could not say
+#     which kind of failure it was -- the distinction `.agent/rules/testing.md`
+#     requires of every wait, because a loaded machine and a wedged process are
+#     fixed in completely different places.
+#
+# What it DID have is the reason it was not simply converted: three terminal
+# states, and `wait_until` cannot say them. They are `_e2e_counter_finding`'s
+# now, reached through the findings hook, so this wait keeps all three AND gains
+# the verdict, rather than trading one for the other.
+#
+# A DEAD PROCESS is `wait_until`'s to report and is not special-cased here: it is
+# noticed on the poll it happens on rather than after the budget, and the counter
+# finding prints beside it, so "it exited with its counter at 2 of 3" is one
+# reading rather than two.
+#
+# @param 1 host of the admin endpoint
+# @param 2 port of the admin endpoint
+# @param 3 the Prometheus series name
+# @param 4 the floor the reading must reach
+# @param 5 pid to watch, or "-"; the rules on `wait_until` apply unchanged
+# @param 6 what it is, for the messages
+# @param 7 the log to dump when it does not get there, or "-"
+# @param 8 optional bound in seconds; defaults to `e2e_wait_seconds`
+# @return sets `E2eCounterReading`; never returns on failure
+wait_for_counter() {
+    local host="$1" port="$2" name="$3" floor="$4" pid="$5" what="$6" logfile="$7"
+    local seconds="${8:-$_e2e_wait_seconds}"
+
+    E2eCounterReading=""
+    _e2e_counter_answered="no"
+
+    # A FAILED SCRAPE DOES NOT END THE WAIT, because not ending it is what a retry
+    # loop is for -- but it is remembered, so a bound that expires having never
+    # had an answer says THAT rather than blaming the counter.
+    _e2e_counter_ready() {
+        local reading=""
+        # `2>/dev/null` on the POLL and not inside `counter_value`, so a fixture
+        # that scrapes once still sees what bash says. A refused `/dev/tcp` writes
+        # a diagnostic carrying exactly the fact the status already carries, and a
+        # wait polling a dead admin surface for its whole budget would print it
+        # once per poll -- burying the verdict and the COUNTER finding that say the
+        # same thing once, at the end, in a sentence.
+        reading="$(counter_value "$host" "$port" "$name" 2>/dev/null)" || return 1
+        _e2e_counter_answered="yes"
+        E2eCounterReading="$reading"
+        [ -n "$reading" ] || return 1
+        [ "$reading" -ge "$floor" ]
+    }
+    _e2e_counter_findings() {
+        _e2e_counter_finding "$_e2e_counter_answered" "$E2eCounterReading" "$floor" "$name"
+    }
+
+    # The deadline is this wait's own, so the sixth argument is empty; the seventh
+    # is the hook. Spelled positionally because that is what bash has.
+    wait_until _e2e_counter_ready "${what} to reach ${name} >= ${floor}" \
+        "$pid" "$logfile" "$seconds" "" _e2e_counter_findings
+}
+
 
 # Stop a process and require it to actually exit, within a bound.
 #

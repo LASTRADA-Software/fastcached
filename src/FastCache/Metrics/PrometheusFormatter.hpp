@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cache/IStorage.hpp>
+#include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace FastCache
 {
@@ -50,6 +52,75 @@ struct HostCapacity
     /// between them would report a phantom job — the difference is right on
     /// average and wrong at exactly the moment somebody is looking.
     std::size_t busySlots { 0 };
+};
+
+/// What a node believes about its OWN consensus configuration.
+///
+/// The gap [#435](https://github.com/LASTRADA-Software/fastcached/issues/435) is
+/// about: `--cluster-status` reports `ClusterState.members`, which is the FLEET's
+/// member record and a different set from the quorum, and only the leader answers
+/// it at all — so the one node whose view an operator needs during a stall is the
+/// one that redirects them elsewhere. Nothing else could be asked what a given node
+/// counts. #388 is what that costs: a joiner that received the state record and
+/// never adopted the configuration entry has `HasCluster()` false, so
+/// `NextDeadline()` excuses it from every deadline; it campaigns in no election,
+/// grants no pre-vote, logs nothing, and is indistinguishable from a healthy
+/// follower until the leader dies and the cluster cannot re-elect.
+///
+/// **Gauges, every one, and none of them is a counter.** These describe a state
+/// rather than tally events, and `IMetricsSink` is counter-only by design — so they
+/// arrive in the snapshot beside `host` and `upstreamConfigured` rather than as
+/// `MetricsCatalog` rows. That is also what makes absence spellable: a *counter* is
+/// a tally where zero is the truth about events that never happened, while a
+/// *reading* of zero is a claim about the world.
+///
+/// **`members` being empty is a reading and not an absence**, which is the one
+/// distinction worth getting right here. A process that runs no consensus leaves
+/// `MetricsSnapshot::consensus` disengaged and renders no consensus line at all; a
+/// node that RUNS consensus and holds no configuration renders an empty member set,
+/// because that is precisely the #388 state and hiding it would defeat the ticket.
+/// The two are told apart by whether the block is there, never by a zero inside it.
+struct ConsensusStatus
+{
+    /// The member set the local Raft node operates under, in whatever order
+    /// consensus holds it.
+    ///
+    /// Empty means this node holds no configuration — the legitimate waiting state
+    /// of a `--raft-join` node, and a fatal one for any other. Its SIZE is
+    /// `HasCluster()`, which is why no separate boolean is carried: `HasCluster()`
+    /// is defined as `!members.empty()`, and a second field saying the same thing is
+    /// a second thing to be wrong.
+    std::vector<Consensus::NodeId> members {};
+
+    /// Who this node believes leads, if anybody.
+    ///
+    /// Disengaged during an election, which is a different fact from "somebody else
+    /// leads" and the one a client cannot act on. It is NOT constrained to
+    /// @ref members: a node with no configuration accepts entries from any leader,
+    /// so it can name one while counting nobody — which is the #388 shape exactly.
+    std::optional<Consensus::NodeId> knownLeader {};
+
+    /// The term this node is operating in.
+    ///
+    /// A gauge and not a counter, although it only ever rises within one state
+    /// directory: a term is a reading, and wiping `--cluster-dir` legitimately
+    /// resets it to zero. A counter that resets is one a scraper renders as a
+    /// spike of the whole history.
+    Consensus::Term term {};
+
+    /// How far this node's log is committed.
+    ///
+    /// Carried because it is the one number that separates "this node has adopted a
+    /// configuration" from "this node is being caught up": a joiner sits at a commit
+    /// index far behind its peers for as long as the walk-back takes.
+    Consensus::LogIndex commitIndex {};
+
+    /// What this node is playing.
+    ///
+    /// Last, so the one byte-wide member sits at the end rather than between two
+    /// 8-aligned ones; see the padding rule in
+    /// [`.agent/rules/build-and-toolchain.md`](../../../.agent/rules/build-and-toolchain.md).
+    Consensus::Role role {};
 };
 
 /// Everything a `/metrics` scrape needs that varies per call: the storage
@@ -112,6 +183,16 @@ struct MetricsSnapshot
     /// default member initializer is a clang-tidy error, so a field added without one
     /// breaks every exhaustive brace-init of this struct in the tree.
     std::optional<bool> upstreamConfigured {};
+
+    /// What this node believes about its own Raft cluster, absent when it runs no
+    /// consensus at all.
+    ///
+    /// Absent for the daemon, which has none, and for a compile node started
+    /// without `--listen-raft`, which leads itself and holds no configuration for
+    /// anybody to read. Present — with an empty member set — for a node that runs
+    /// consensus and has not yet been admitted to anything, because that is a
+    /// *reading* and the one #435 exists to make observable. See `ConsensusStatus`.
+    std::optional<ConsensusStatus> consensus {};
 
     Uptime uptime {};
 };

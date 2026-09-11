@@ -1957,6 +1957,35 @@ fact about it. These are gauges, not counters.
 | `fastcache_node_slots_configured` | Concurrent compiles this node advertises to the scheduler. |
 | `fastcache_node_slots_busy` | Compiles running right now — **sampled**, so it is a reading and not a difference of two counters. |
 
+**What this node counts as its own cluster.** Rendered only by a node that runs
+consensus — a node started without `--listen-raft` leads itself, holds no
+configuration, and emits none of these. Gauges, all of them, and sampled per scrape.
+
+This is a different question from `--cluster-status`, and confusing the two is the
+gap [#435](https://github.com/LASTRADA-Software/fastcached/issues/435) records.
+`--cluster-status` reports the **fleet's** member record from the replicated state,
+and only the **leader** answers it — so the one node whose view you need when a
+cluster will not re-elect is the one that redirects you elsewhere. These series are
+the **quorum**, answered by whichever node you scrape, leader or not.
+
+| Series | Says |
+|---|---|
+| `fastcache_node_consensus_members` | How many members the configuration this node operates under names. `0` is a *reading*, not an absence: the node holds no configuration, so it stands for no election and grants no vote. That is the ordinary waiting state of a `--raft-join` node before it is admitted, and a fault for any other — see the alert below. |
+| `fastcache_node_consensus_term` | The election term this node is operating in. A gauge and not a counter: wiping `--cluster-dir` legitimately resets it, and a counter that resets renders as a spike of its whole history. |
+| `fastcache_node_consensus_commit_index` | How far this node's replicated log is committed. Far behind its peers means it is being caught up rather than taking part. |
+| `fastcache_node_consensus_role` | One sample per role — `follower`, `pre-candidate`, `candidate`, `leader` — with exactly one of them `1`. A node cycling between `candidate` and `follower` is a cluster that cannot settle. |
+| `fastcache_node_consensus_member` | One sample per member of that configuration, carrying its id. The set rather than only its size, because "which members does this node count" is what you ask when an election will not resolve. No samples at all when the configuration is empty. |
+| `fastcache_node_consensus_leader` | The member this node believes leads. **Absent** when it believes none does, which is what an election in progress looks like — not an empty label, which a dashboard would draw as a member. |
+
+The alert worth writing is `fastcache_node_consensus_members == 0` sustained on a node
+that is not currently being admitted. Such a node has been admitted to the *fleet* and
+never adopted the *configuration*: it answers cluster verbs, it names the leader
+correctly, and it is excused from every deadline, so it neither campaigns nor answers a
+pre-vote ([#388](https://github.com/LASTRADA-Software/fastcached/issues/388)). Nothing
+is wrong until the leader goes, and then the cluster cannot re-elect. The second one
+worth writing is the whole fleet disagreeing about
+`fastcache_node_consensus_leader{leader=...}` for longer than an election takes.
+
 ### What a refused connection looks like
 
 These are what a probe of that port looks like from outside the machine. They are

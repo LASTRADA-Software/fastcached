@@ -2107,3 +2107,22 @@ consequence rather than a precaution.
   which is the distinction #1092 would need, so whichever lands second has to know
   about the other.
 
+- **[#1218](https://github.com/LASTRADA-Software/fastcached/issues/1218)** —
+  `FrameEndpoint`'s exactly-one-writer property is **declared** and not **enforced**.
+  #675 gave every write a row in `EndpointWriterTable` naming which sanctioned writer
+  it is, so a fifth is a row with a reason rather than a `WriteAll` that appeared in a
+  helper — a refusal by ROW where there was only a refusal by absence. It stops
+  neither of the two things enforcement would: two writers writing at once, and a new
+  helper simply naming `Loop`, since the scan cannot say which FUNCTION a call sits in
+  without parsing bodies. Enforcement is the write-side mirror of
+  `Detail::ClaimReadSlot`, folded into the operation so no site has a line to forget.
+  What makes it its own ticket is the OWNERSHIP rather than the guard: the claim has
+  to be shared with `PulseProgress`, a `DetachedTask` holding only
+  `shared_ptr<ISocket>` and `shared_ptr<ProgressPulse>`, so it is either a slot on
+  `ISocket` — `Net/`-wide, and #1208 records `ISocket::Close` reaching
+  `EpollReactor::Detach` from the watchdog's own thread, so state there cannot assume
+  the single-threaded interleaving that makes the question easy inside one endpoint —
+  or a new shared per-connection object, which is a new lifetime in the file #737,
+  #840 and #875 were each spent on. **Ordering:** #1211 infers a teardown race in that
+  same file, so the second shape waits on it; the first does not.
+
