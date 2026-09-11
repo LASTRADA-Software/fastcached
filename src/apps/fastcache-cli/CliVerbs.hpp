@@ -10,6 +10,7 @@
 
 #include <FastCache/Core/EnumTable.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -63,7 +64,23 @@ struct WireSpec
     Wire wire;                    ///< The enumerator this row describes.
     std::string_view name;        ///< Stable lower-case name, for diagnostics.
     std::string_view unavailable; ///< What to tell an operator when it could not be opened.
-    WireAvailable available;      ///< Which collaborator says this wire is open.
+
+    /// The sub-heading `--help` prints above this wire's verbs.
+    ///
+    /// `--help` groups `COMMANDS` by this column, so *which server answers this* is
+    /// read off the page rather than discovered by dialling one and reading the
+    /// refusal. A COLUMN rather than a list beside the renderer, for the reason every
+    /// other property of a wire is one: a list is a second set keyed on the same enum,
+    /// which agrees on the day it is written and silently stops agreeing afterwards.
+    ///
+    /// It names the wire's OWN server and claims no exclusivity, deliberately. A row
+    /// carrying a `nodeFallback` -- `version` is the one today -- is also answered by a
+    /// compile node, so a heading reading *the only verbs a daemon answers* would be
+    /// false for it. Which verbs have that second answer is a per-verb fact and is on
+    /// the verb's own page, where `NodeAnswerFor` states it in three values.
+    std::string_view heading;
+
+    WireAvailable available; ///< Which collaborator says this wire is open.
 
     /// Whether this wire can present a credential at all.
     ///
@@ -152,6 +169,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
     { .wire = Wire::Resp,
       .name = "resp",
       .unavailable = "no connection to the cache was opened",
+      .heading = "a cache daemon, over RESP",
       .available = [](VerbContext const& context) { return context.resp != nullptr; },
       .authenticable = true,
       .needsResp = true,
@@ -160,6 +178,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
     { .wire = Wire::Memcached,
       .name = "memcached",
       .unavailable = "no memcached-text connection to the cache was opened",
+      .heading = "a cache daemon, over the memcached text protocol",
       .available = [](VerbContext const& context) { return context.memcached != nullptr; },
       .authenticable = false,
       .needsResp = false,
@@ -168,6 +187,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
     { .wire = Wire::Node,
       .name = "node",
       .unavailable = "no 0xFC connection to the node was opened",
+      .heading = "a compile node, over the 0xFC wire",
       .available = [](VerbContext const& context) { return context.node != nullptr; },
       // `AUTH` IS a `0xFC` verb, unlike on the memcached wire -- so this wire can
       // present a credential and a refusal about one is about the credential.
@@ -178,6 +198,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
     { .wire = Wire::Stats,
       .name = "stats",
       .unavailable = "no stats source was configured",
+      .heading = "either, over whichever surface answers",
       .available = [](VerbContext const& context) { return context.stats != nullptr; },
       .authenticable = true,
       .needsResp = true,
@@ -187,6 +208,30 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
 
 static_assert(RowsInEnumeratorOrder(WireTable, &WireSpec::wire),
               "WireTable must hold one row per Wire, in enumerator order");
+
+/// Whether every wire states the heading its verbs are grouped under.
+///
+/// `RowsInEnumeratorOrder` cannot see this: a row omitting `.heading` from its
+/// designated initializers is still a row, at the right index, describing the right
+/// enumerator -- it just renders a run of verbs under a blank line, which is the flat
+/// list this grouping replaced, for one wire, with nothing to say which.
+///
+/// A `static_assert` rather than a render-time fallback because the obligation is DO
+/// SOMETHING rather than SAY WHY: there is no reason a wire could have for being
+/// unnamed, so this is the half of that rule the type system answers. Written out
+/// rather than left to a missing-field-initializer warning: which compilers carry that
+/// warning, and under which flags, is a question this guard then would not have to
+/// depend on -- and a guard that holds only where a flag is on reports clean wherever
+/// it is not.
+///
+/// @param table The wire table.
+/// @return True when no row's heading is empty.
+[[nodiscard]] consteval bool EveryWireIsHeaded(EnumTable<Wire, WireSpec> const& table) noexcept
+{
+    return std::ranges::none_of(table, [](WireSpec const& row) { return row.heading.empty(); });
+}
+
+static_assert(EveryWireIsHeaded(WireTable), "every Wire row must carry the heading --help groups its verbs under");
 
 /// What a verb does.
 ///

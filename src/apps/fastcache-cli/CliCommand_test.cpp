@@ -5,7 +5,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <format>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -725,5 +730,275 @@ TEST_CASE("every verb has a page, and every page names its own verb", "[cli][com
         CHECK(page.contains(verb.name));
         CHECK(PageCarriesSummary(page, verb.summary));
         CHECK_FALSE(page.empty());
+    }
+}
+
+namespace
+{
+/// A verb row carrying nothing but the wire it declares.
+///
+/// The grouping reads `wire` and nothing else, so every other column is whatever an
+/// aggregate gives it. It exists to make a wire with NO verbs reachable at all: every
+/// wire has verbs in this tree, so that half of the rule can be watched neither
+/// accepting nor refusing against `Verbs()`.
+/// @param name What to call it.
+/// @param wire The wire it declares.
+/// @return The row.
+[[nodiscard]] VerbSpec VerbOn(std::string_view name, Wire wire) noexcept
+{
+    return VerbSpec { .name = name,
+                      .wire = wire,
+                      .minOperands = 0,
+                      .maxOperands = 0,
+                      .operands = "",
+                      .summary = "a synthetic row",
+                      .protocolCommand = "",
+                      .modifiers = Modifier::None,
+                      .handler = nullptr,
+                      .nodeFallback = nullptr };
+}
+
+/// Where @p verb's row begins in @p text.
+///
+/// Matched as the whole rendered term at the start of a line and followed by the
+/// padding every described row carries -- never as the bare name, which would find
+/// `node` inside `node-metrics` and finds several verbs inside other verbs' summaries.
+/// @param text The COMMANDS section's text.
+/// @param verb The verb to locate.
+/// @return The offset of the row's first character, or nullopt when it is absent.
+[[nodiscard]] std::optional<std::size_t> RowOf(std::string_view text, VerbSpec const& verb)
+{
+    auto const at = text.find(std::format("\n  {}{} ", verb.name, verb.operands));
+    if (at == std::string_view::npos)
+        return std::nullopt;
+    return at + 1;
+}
+
+/// The section titled @p title, up to @p next.
+/// @param help The rendered help text.
+/// @param title The section wanted.
+/// @param next The title of the section after it.
+/// @return The slice, title line included.
+[[nodiscard]] std::string_view SectionBody(std::string_view help, std::string_view title, std::string_view next)
+{
+    auto const from = help.find(std::format("\n{}\n", title));
+    auto const to = help.find(std::format("\n{}\n", next));
+    REQUIRE(from != std::string_view::npos);
+    REQUIRE(to != std::string_view::npos);
+    REQUIRE(to > from);
+    return help.substr(from, to - from);
+}
+} // namespace
+
+TEST_CASE("every verb is grouped under the wire its own row names", "[cli][command][help]")
+{
+    auto const verbs = Verbs();
+    auto const groups = GroupVerbsByWire(verbs);
+
+    // Asserted against the TABLES and never against a list of expected headings written
+    // out beside them. Such a list is a second set keyed on the same enum: it agrees on
+    // the day it is typed and decides nothing afterwards, since the only way to change
+    // the grouping is then to edit both. If you are about to add
+    // `CHECK(groups.front().heading == "...")` here, that is the defect this comment is
+    // about, and it is why #1320 exists.
+    REQUIRE_FALSE(groups.empty());
+    for (auto const& group: groups)
+    {
+        auto const& row = WireTable[static_cast<std::size_t>(group.wire)];
+        INFO("wire: " << row.name);
+        CHECK(group.heading == row.heading);
+        CHECK_FALSE(group.verbs.empty());
+        for (auto const* verb: group.verbs)
+            CHECK(verb->wire == group.wire);
+    }
+
+    // Exactly once each, asked per verb rather than by totalling the group sizes: a
+    // verb in two groups and a verb in none cancel out in a sum.
+    for (auto const& verb: verbs)
+    {
+        INFO("verb: " << verb.name);
+        std::ptrdiff_t appearances = 0;
+        for (auto const& group: groups)
+            appearances += std::ranges::count(group.verbs, &verb);
+        CHECK(appearances == 1);
+    }
+}
+
+TEST_CASE("the grouping takes both of its orders from tables", "[cli][command][help]")
+{
+    auto const verbs = Verbs();
+    auto const groups = GroupVerbsByWire(verbs);
+
+    // Groups follow `Wire`'s enumerator order -- asserted as a strictly increasing run
+    // of enumerator values rather than against a written-out sequence, so a wire added
+    // tomorrow is covered by arriving rather than by somebody remembering this case.
+    auto previousWire = std::size_t { 0 };
+    auto firstGroup = true;
+    for (auto const& group: groups)
+    {
+        auto const at = static_cast<std::size_t>(group.wire);
+        INFO("wire: " << WireTable[at].name);
+        if (!firstGroup)
+            CHECK(at > previousWire);
+        firstGroup = false;
+        previousWire = at;
+    }
+
+    // And inside a group, the verb table's own order -- as POSITIONS in `Verbs()`,
+    // which is the property itself. Rebuilding each expected group here would compare
+    // the grouping against a second copy of the grouping.
+    for (auto const& group: groups)
+    {
+        auto previousIndex = std::size_t { 0 };
+        auto firstVerb = true;
+        for (auto const* verb: group.verbs)
+        {
+            auto const at = static_cast<std::size_t>(verb - verbs.data());
+            INFO("verb: " << verb->name);
+            if (!firstVerb)
+                CHECK(at > previousIndex);
+            firstVerb = false;
+            previousIndex = at;
+        }
+    }
+}
+
+TEST_CASE("a wire with no verbs gets no group and a wire with one still does", "[cli][command][help]")
+{
+    // The REFUSING direction is unreachable from `Verbs()`, so it is driven through a
+    // synthetic table -- the same function the help calls, handed a different set. A
+    // guard nobody has watched refuse is not known to work, and "emits no empty
+    // heading" passes vacuously on a tree where every wire has verbs.
+    auto const sparse = std::to_array<VerbSpec>({
+        VerbOn("only-resp", Wire::Resp),
+        VerbOn("only-node", Wire::Node),
+    });
+    auto const groups = GroupVerbsByWire(sparse);
+
+    // Which two, not merely how many: dropping `Memcached` and `Stats` for the wrong
+    // reason -- keeping the first two rows, say -- also gives a count of two.
+    REQUIRE(groups.size() == 2);
+    CHECK(groups.front().wire == Wire::Resp);
+    CHECK(groups.back().wire == Wire::Node);
+    for (auto const& group: groups)
+    {
+        INFO("wire: " << WireTable[static_cast<std::size_t>(group.wire)].name);
+        CHECK(group.verbs.size() == 1);
+        CHECK(group.heading == WireTable[static_cast<std::size_t>(group.wire)].heading);
+    }
+
+    // And the ACCEPTING direction from the real table rather than a synthetic one:
+    // `stats` is this tree's single-verb wire, and a grouping that dropped a group it
+    // thought too small would lose it while every other assertion here stayed green.
+    auto const real = GroupVerbsByWire(Verbs());
+    auto const single = std::ranges::find(real, Wire::Stats, &VerbGroup::wire);
+    REQUIRE(single != real.end());
+    CHECK(single->verbs.size() == 1);
+}
+
+TEST_CASE("the help prints each wire's heading above that wire's own verbs", "[cli][command][help]")
+{
+    auto const help = HelpText();
+    auto const groups = GroupVerbsByWire(Verbs());
+
+    // The COMMANDS section alone. Searching the whole document would find a verb's name
+    // in the NOTES prose and inside other verbs' summaries and measure the wrong line.
+    auto const commands = SectionBody(help, "COMMANDS", "OPTIONS");
+
+    auto previousRow = std::size_t { 0 };
+    for (auto const& group: groups)
+    {
+        INFO("heading: " << group.heading);
+        // Line-anchored: the heading is a text block on a line of its own, so this
+        // cannot match the same words occurring inside a summary.
+        auto const headingAt = commands.find(std::format("\n  {}\n", group.heading));
+        REQUIRE(headingAt != std::string_view::npos);
+
+        // Both halves are load-bearing. A renderer printing every heading and then
+        // every verb satisfies "the heading is above its verbs" on its own; one
+        // printing the groups in the wrong order satisfies "each heading precedes the
+        // next" on its own. Interleaving is what neither alone can see.
+        CHECK(headingAt > previousRow);
+
+        for (auto const* verb: group.verbs)
+        {
+            INFO("verb: " << verb->name);
+            auto const row = RowOf(commands, *verb);
+            REQUIRE(row.has_value());
+            CHECK(*row > headingAt);
+            previousRow = std::max(previousRow, *row);
+        }
+    }
+}
+
+TEST_CASE("grouping the commands leaves every description in one column", "[cli][command][help]")
+{
+    // The groups are BLOCKS of the one COMMANDS section rather than sections of their
+    // own, and that is the entire difference between those two renderings: `UsageDoc`
+    // measures the description column per SECTION, so sections would align each group
+    // against its own widest term and the list would step in and out as a reader scans
+    // down it. Asserted because it is the whole of what the choice buys -- the grouping
+    // itself reads identically either way, so nothing else here can tell them apart.
+    auto const help = HelpText();
+    auto const commands = SectionBody(help, "COMMANDS", "OPTIONS");
+
+    std::vector<std::size_t> columns;
+    for (auto const& verb: Verbs())
+    {
+        INFO("verb: " << verb.name);
+        // A verb with no summary renders its term alone with no column to measure --
+        // and is an undocumented verb -- so it is refused here rather than skipped,
+        // which would quietly shrink the set this case is measuring.
+        REQUIRE_FALSE(verb.summary.empty());
+
+        auto const row = RowOf(commands, verb);
+        REQUIRE(row.has_value());
+
+        auto const term = std::format("{}{}", verb.name, verb.operands);
+        auto const termAt = commands.find(term, *row);
+        REQUIRE(termAt != std::string_view::npos);
+        auto const description = commands.find_first_not_of(' ', termAt + term.size());
+        REQUIRE(description != std::string_view::npos);
+        columns.push_back(description - *row);
+    }
+
+    REQUIRE_FALSE(columns.empty());
+    CHECK(std::ranges::all_of(columns, [&columns](std::size_t column) { return column == columns.front(); }));
+}
+
+TEST_CASE("grouping the commands leaves every other section carrying its own rows", "[cli][command][help]")
+{
+    // COMMANDS is several blocks now rather than one, so every section after it is
+    // reached by an index DERIVED from the grouping. That arithmetic is what this
+    // asserts: shift it by one and the options render under FORMATS, which every
+    // `help.contains(...)` check in this file goes on passing.
+    auto const help = HelpText();
+
+    auto const options = SectionBody(help, "OPTIONS", "FORMATS");
+    for (auto const& option: CliToolOptions())
+    {
+        INFO("option: " << option.primary);
+        CHECK(options.contains(option.primary));
+    }
+
+    auto const formats = SectionBody(help, "FORMATS", "EXIT CODES");
+    for (auto const& format: FormatTable)
+    {
+        INFO("format: " << format.name);
+        CHECK(formats.contains(format.name));
+    }
+
+    auto const codes = SectionBody(help, "EXIT CODES", "ENVIRONMENT");
+    for (auto const& outcome: OutcomeTable)
+    {
+        INFO("outcome: " << outcome.name);
+        CHECK(codes.contains(outcome.name));
+    }
+
+    auto const environment = SectionBody(help, "ENVIRONMENT", "NOTES");
+    for (auto const& variable: CliEnvironment())
+    {
+        INFO("variable: " << variable.name);
+        CHECK(environment.contains(variable.name));
     }
 }

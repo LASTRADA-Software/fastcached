@@ -1908,8 +1908,13 @@ namespace
           .minOperands = 0,
           .maxOperands = 1,
           .operands = " [settings|items|slabs|sizes|conns]",
-          .summary = "the memcached `stats` families, which `stats` above cannot\n"
-                     "reach; no argument gives the 24-field default set",
+          // "which `stats` ABOVE cannot reach" until #1301, and that was a claim about
+          // where the row sat in a flat list. The list is grouped by wire now and
+          // `stats` renders in the LAST group, below this one -- so the sentence
+          // survived the change by no longer being about anything. A summary names the
+          // other verb, never where it is printed.
+          .summary = "the memcached `stats` families, which the `stats` verb\n"
+                     "cannot reach; no argument gives the 24-field default set",
           .protocolCommand = "stats",
           .modifiers = Modifier::None,
           .handler = &TextStats,

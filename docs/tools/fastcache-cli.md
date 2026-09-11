@@ -98,7 +98,15 @@ work.
 
 ## Commands
 
-Run `fastcache-cli --help` for the current list with operand counts. Today:
+Run `fastcache-cli --help` for the current list with operand counts. It groups the
+commands under the **wire** each one declares — which kind of server answers it — since
+that is the one axis that decides whether a verb can work at all, and it is a fact the
+verb table already carried statically while an operator had to discover it by dialling.
+
+The table below splits those same commands by read and write as well, which is the
+question you have *after* the first one is settled. Neither list is written by hand:
+the help renders `Verbs()` grouped by `WireSpec::heading`, and
+`ctest -R cli-verb-docs` refuses a verb that appears in one and not the other.
 
 | | |
 |---|---|
