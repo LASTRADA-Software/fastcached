@@ -107,6 +107,47 @@ Run `fastcache-cli --help` for the current list with operand counts. Today:
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
 | Node (`0xFC`) | `node`, `node-metrics` |
+| Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
+
+### The cluster verbs
+
+They go to the same `0xFC` address as `node` and `node-metrics` — there has been one
+such port since #290 — so they need no extra flag. The leader answers them; anyone
+else refuses with `NotLeader`, which this tool **follows** rather than relays:
+
+```console
+$ fastcache-cli cluster-members --addr=10.0.0.8:6674
+fastcache-cli: 10.0.0.8:6674 does not lead the cluster; ask 10.0.0.7:6674 instead
+```
+
+An election in progress is a different fact, and gets a different sentence — there
+is no address to offer, and saying *ask nobody instead* would be worse than saying
+nothing. The two are separated by whether the refusal's message parses as an
+address, never by whether it is empty: an empty one never reaches the wire.
+
+`cluster-members` and `cluster-settings` both ask the one wire verb
+(`ClusterStatus`) and report different halves of its answer, because each is a
+table in its own right and this tool's unit is a table `--format=json` can carry.
+
+`cluster-settings` lists **every setting this build knows**, whether or not the
+cluster has agreed one — the question is usually *what can I set*, and a report
+showing only what somebody already set answers it wrongly by omission. A setting
+the cluster has agreed and this build does not know keeps its row too, with no
+summary: a fleet is permanently mid-upgrade, and dropping the row would hide a live
+fact because the reader is the older binary.
+
+Absent is not empty in either table. A member that has never led carries no
+scheduler endpoint — a leader announces its own record on election — so that cell
+reads as absent rather than as an address nothing answers at.
+
+The three changing verbs report **accepted**, never committed. The leader cannot
+know the difference until a majority answers.
+
+The same four verbs are also spelled `fastcache-compile-node --cluster-status`,
+`--cluster-set`, `--cluster-forget` and `--cluster-admit`. Prefer these: that path
+needs `--scheduler`, which is also a **startup** flag, so putting it in a unit file
+to run one admin command points that node at one scheduler forever — a registration
+replays its command line. A `--fleet-member` client has no node binary at all.
 
 A modifier that means nothing for a verb is **refused**, not ignored:
 `set k v --raw` is a usage error rather than a store that silently prints

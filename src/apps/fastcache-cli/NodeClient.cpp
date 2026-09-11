@@ -2,6 +2,7 @@
 #include "NodeClient.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <array>
 #include <format>
@@ -72,6 +73,24 @@ std::string ExplainRefusal(std::string_view verb, std::string_view endpoint, Nod
     // The server's own words, when it sent any. A refusal whose detail is empty is
     // ordinary -- most are -- so this is a suffix rather than the whole sentence.
     auto const said = reply.detail.empty() ? std::string {} : std::format(" ({})", reply.detail);
+
+    // `NotLeader` is an INSTRUCTION, not an answer about the fleet, and it carries two
+    // opposite facts under one code. Asked through `LeaderRedirectTarget` rather than
+    // decided here: `ClusterAdminCli` and `fastcache-cc` each wrote this rule once and
+    // came to disagree (#237), and this would have been the third author. It sits above
+    // the classification because it is about WHICH refusal rather than which of the
+    // three kinds -- `NotLeader` classifies as `Reported`, correctly, and relaying it
+    // bare tells an operator their command failed when it was merely sent to the wrong
+    // machine.
+    if (*reply.code == Wire::ErrorCode::NotLeader)
+    {
+        if (auto const leader = LeaderRedirectTarget(*reply.code, reply.detail); leader.has_value())
+            return std::format("{} does not lead the cluster; ask {} instead", endpoint, *leader);
+        // An election in progress. A different fact from *somebody else leads*, with no
+        // address to offer -- and saying so beats relaying a sentence that reads as a
+        // permanent refusal of a command that will work in a moment.
+        return std::format("{} does not lead the cluster, and no leader is known right now; try again shortly", endpoint);
+    }
 
     switch (ClassifyRefusal(*reply.code))
     {
