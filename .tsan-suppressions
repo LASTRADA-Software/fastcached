@@ -32,23 +32,3 @@
 # never have silenced it, and the canary is no evidence about one.
 #
 # Format: https://clang.llvm.org/docs/ThreadSanitizerFlags.html
-
-
-# --------------------------------------------------------------------------
-# Both entries below were found by #316 widening the sanitized scope, and both
-# are the argument for that widening rather than a cost of it: neither is new
-# code, and neither had ever been run under ThreadSanitizer.
-
-# #1207 -- BlockingListener::Close() writes `_native` while the caller's accept
-# thread is inside Accept() reading it. The same shape as #260, one layer down:
-# #260 fixed its CALLER (ask, join, then close) and BlockingListener never gained
-# a thread-safety contract, so a fixture that closes before joining reproduces it.
-# Reached from Net/HealthProbe_test.cpp, which #316 brought into scope.
-race_top:FastCache::BlockingListener::Close
-
-# #1208 -- the reactor server's watchdog runs `onStop` on its own jthread, so
-# Server::Shutdown() detaches listener sockets from a reactor still inside
-# RunLoop() on another thread: Detach walks `_batch` at EpollReactor.cpp:229
-# while RunLoop clears it at :390. Reached from Server/ReactorServerLoop_test.cpp
-# on both the single- and multi-reactor paths.
-race_top:FastCache::EpollReactor::Detach
