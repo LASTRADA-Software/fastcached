@@ -1289,6 +1289,103 @@ TEST_CASE("NodeToolchains: a node serving nothing can still find a compiler agai
     }
 }
 
+TEST_CASE("ClaimsReloadedBetween: the reload-to-resurvey join, which main.cpp cannot assert", "[node][toolchains]")
+{
+    using namespace FastCache::Node;
+
+    // #587. Both decisions either side of this were tested and the step CONNECTING
+    // them was verified only by reading, because it was an expression in a file that
+    // is in no test target. That is `PurgeExpired`'s shape: two correct halves and an
+    // unasserted join, which is the part that decides whether a reload does anything.
+
+    auto const withToolchains = [](std::vector<std::string> toolchains) {
+        NodeConfig cfg;
+        cfg.toolchains = std::move(toolchains);
+        return std::make_shared<NodeConfig const>(cfg);
+    };
+
+    SECTION("no configuration file at all")
+    {
+        // Both null is the ordinary state of a worker started with no file, and it
+        // reaches this every beat forever. It must be `No` rather than a crash and
+        // rather than `Yes`.
+        CHECK(ClaimsReloadedBetween(nullptr, nullptr) == ClaimsReloaded::No);
+    }
+
+    SECTION("one side missing is not a reload")
+    {
+        auto const cfg = withToolchains({ "/usr/bin/g++" });
+        CHECK(ClaimsReloadedBetween(nullptr, cfg) == ClaimsReloaded::No);
+        CHECK(ClaimsReloadedBetween(cfg, nullptr) == ClaimsReloaded::No);
+    }
+
+    SECTION("the same snapshot twice is not a reload")
+    {
+        // The steady state: no reload arrived, so `Current()` hands back the same
+        // object it handed back last beat.
+        auto const cfg = withToolchains({ "/usr/bin/g++" });
+        CHECK(ClaimsReloadedBetween(cfg, cfg) == ClaimsReloaded::No);
+    }
+
+    SECTION("a reload that changed what this worker advertises")
+    {
+        // The case the whole path exists for: an operator edited `--toolchain`, which
+        // moves no witness, so without this answer the change waits for the periodic
+        // sweep -- a configuration saved, seen accepted, and doing nothing for up to
+        // `sweepEveryBeats` heartbeats.
+        CHECK(
+            ClaimsReloadedBetween(withToolchains({ "/usr/bin/g++" }), withToolchains({ "/usr/bin/g++", "/usr/bin/clang++" }))
+            == ClaimsReloaded::Yes);
+    }
+
+    SECTION("a reload that changed something this worker does NOT advertise")
+    {
+        // THE DISCRIMINATING CASE, and the only one that separates this function from
+        // `previous != current`. Two DIFFERENT snapshots that agree about everything
+        // advertised: a reload happened, and it bought nothing the fleet can act on.
+        // Answering `Yes` here spends an include-tree walk -- minutes on a cold
+        // machine -- to tell the scheduler nothing, which is what
+        // `AdvertisedReloadableFlags` exists to prevent. A test suite without this
+        // case passes with the content comparison deleted.
+        auto previous = std::make_shared<NodeConfig>();
+        previous->toolchains = { "/usr/bin/g++" };
+        previous->logLevel = LogLevel::Info;
+        auto current = std::make_shared<NodeConfig>(*previous);
+        current->logLevel = LogLevel::Debug;
+
+        REQUIRE(previous != current); // two objects, or this case asserts the one above
+        CHECK(ClaimsReloadedBetween(previous, current) == ClaimsReloaded::No);
+    }
+
+    SECTION("and the join composes into the depth the heartbeat actually passes")
+    {
+        // The acceptance #587 asks for, spelled as the heartbeat spells it: a reload
+        // that changed the claims causes a re-survey, and one that did not does not.
+        // Asserted through the COMPOSITION rather than on `ClaimsReloadedBetween`
+        // alone, because either half being right is what was already true.
+        //
+        // Beat 3 of a 45-beat sweep, so the cadence is NOT what makes the answer
+        // `Unconditional` -- on a sweep beat both arms agree and the case would pass
+        // with the join removed.
+        constexpr std::uint64_t Beat = 3;
+        constexpr std::uint64_t SweepEveryBeats = 45;
+        static_assert(Beat % SweepEveryBeats != 0, "the cadence must not decide this");
+
+        auto previous = std::make_shared<NodeConfig>();
+        previous->toolchains = { "/usr/bin/g++" };
+
+        auto changed = std::make_shared<NodeConfig>(*previous);
+        changed->toolchains = { "/usr/bin/g++", "/usr/bin/clang++" };
+        CHECK(RecheckDepthFor(ClaimsReloadedBetween(previous, changed), Beat, SweepEveryBeats)
+              == RecheckDepth::Unconditional);
+
+        auto unchanged = std::make_shared<NodeConfig>(*previous);
+        unchanged->logLevel = LogLevel::Debug;
+        CHECK(RecheckDepthFor(ClaimsReloadedBetween(previous, unchanged), Beat, SweepEveryBeats)
+              == RecheckDepth::WhenEvidenceMoved);
+    }
+}
+
 TEST_CASE("SurveyVoiceFor: only the timer sweep whispers", "[node][toolchains]")
 {
     using namespace FastCache::Node;

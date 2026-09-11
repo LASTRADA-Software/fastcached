@@ -21,6 +21,14 @@
 namespace FastCache::Node
 {
 
+ClaimsReloaded ClaimsReloadedBetween(std::shared_ptr<NodeConfig const> const& previous,
+                                     std::shared_ptr<NodeConfig const> const& current)
+{
+    if (previous == nullptr || current == nullptr || previous == current)
+        return ClaimsReloaded::No;
+    return AdvertisedClaimsDiffer(*previous, *current) ? ClaimsReloaded::Yes : ClaimsReloaded::No;
+}
+
 namespace
 {
     /// Whether a compiler can actually be launched.
