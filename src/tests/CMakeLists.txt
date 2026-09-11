@@ -5676,3 +5676,118 @@ if(NOT WIN32)
         TIMEOUT 60
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Every Catch2 test BINARY is sanitized or exempt with a written reason (#1209).
+#
+# `tsan-scope-hygiene` above asks whether a scoped test CASE carries a tag the
+# gate selects. That is a question about cases inside binaries the gate already
+# runs, so it could not see `fastcache-cc-tests`, which was in no row at all: the
+# launcher does not link the FastCache library, so no tag expression could ever
+# have reached it.
+#
+# Derived, not tabulated. The set comes from the `catch_discover_tests(`
+# registrations under `src/`, and the covered set from the gate's own `TARGETS`
+# table read through `check-tsan-scope.cmake` -- so this check holds a copy of
+# neither. That matters because #1209's own hand census listed four test binaries
+# where the tree registers six.
+#
+# In the default set: it reads twelve CMakeLists.txt files and spawns nothing.
+add_test(
+    NAME "tsan-binaries"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-binaries.cmake"
+)
+set_tests_properties("tsan-binaries" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# That check's own decisions, driven over synthetic trees.
+#
+# `tsan-binaries` runs it against THIS tree, where a green run is equally
+# consistent with the check working and with its reader having quietly stopped
+# matching -- and the subject IS a binary nobody noticed, so those two produce the
+# same clean line. The comment-stripping pair is the sharp case: a reader that
+# strips nothing and a reader that strips everything both pass the refusing arm,
+# and only the accepting twin separates them.
+#
+# The trees are staged from the shipped exemption rows and from the real
+# `scripts/tsan-gate.sh`, including one case that DELETES a gate row and requires
+# the binary it named to go uncovered -- which is what proves the check reads the
+# gate rather than carrying its own idea of what runs.
+add_test(
+    NAME "tsan-binaries-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/tsan-binaries-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-tsan-binaries-selftest.cmake"
+)
+set_tests_properties("tsan-binaries-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
+# The local gate's optional-target set matches CI's (#1144, #1197).
+#
+# A ctest total is comparable only against the same tree, the same platform AND
+# the same target set. `FASTCACHED_BUILD_TESTCLIENT` and
+# `FASTCACHED_BUILD_BENCHMARKS` default OFF, so one commit gives two different
+# totals depending only on which `-D` flags were passed -- and the smaller number
+# does not look wrong, the tree just looks smaller.
+#
+# #1144 turned them on in `scripts/local-gate.sh` and kept them in a table, then
+# cited `ctest -R gate-target-set` as already refusing the drift. That test did
+# not exist anywhere in the tree. This is it.
+#
+# Both sides are derived -- the gate's set from `gate_target_flags`, CI's from the
+# `-D` flags in `build.yml` -- plus a third derivation that catches what neither
+# can see alone: a flag name that gates nothing, since a misspelled `-D` sets an
+# unused cache variable and changes no target.
+#
+# In the default set: it reads four files and spawns nothing.
+add_test(
+    NAME "gate-target-set"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-gate-target-set.cmake"
+)
+set_tests_properties("gate-target-set" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
+# That check's own decisions, driven over synthetic trees.
+#
+# `gate-target-set` runs against THIS tree, where the two sides agree -- so it
+# prints the same clean line whether the comparison is live or the reader has
+# stopped matching, and the defect it exists for is invisible on a tree that has
+# never drifted.
+#
+# Each case copies the four real files and mutates one, asserting its anchor
+# matched EXACTLY once -- count rather than presence, so `missing` and `not
+# unique` both fire. A mutation that anchored on nothing stages an unchanged tree
+# and the case then passes or fails for a reason unrelated to the rule.
+#
+# One case caught a defect in the check while it was being written: the app-table
+# marker was a prefix, so `set(FASTCACHED_APPS_RENAMED` still matched it and the
+# renamed-table case could not fire.
+add_test(
+    NAME "gate-target-set-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/gate-target-set-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-gate-target-set-selftest.cmake"
+)
+set_tests_properties("gate-target-set-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)

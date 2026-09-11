@@ -4921,15 +4921,37 @@ Three rules fall out, each generalising past this change:
   which needs an instrumented standard library, or valgrind memcheck over the
   existing release test binaries. It is the other half of #132, deliberately left
   out of the TSan job rather than folded into it.
-- **[#1209](https://github.com/LASTRADA-Software/fastcached/issues/1209)** — the TSan
-  gate's `TARGETS` table names two of this tree's Catch2 test binaries, and
-  `fastcache-cc-tests` is not one of them. `src/apps/fastcache-cc/CompileJob_test.cpp`
-  spawns threads deliberately — a latch-synchronised overlap case, and a
-  `ReplaceToolchains` landing mid-compile whose own comment says the obvious
-  arrangement "would pass against the dangling iterator too" — and has never run under
-  ThreadSanitizer. Left out of #316 rather than folded into it because it costs a
-  `TARGETS` row AND a build target in the `clang-tsan` job, which that job's comment
-  accounts for as deliberately skipped. Expect to file races rather than to flip a
-  switch: #316's own widening surfaced #1207 and #1208 on its first run, neither of
-  them new code. `check-tsan-scope.cmake` cannot see this — it enforces that scoped
-  CASES carry a selected tag and says nothing about which BINARIES run.
+  **The instrumented-standard-library clause is now MEASURED rather than assessed**
+  (`scripts/probes/msan-uninstrumented-libstdcxx.sh`, 2026-09-11, clang++-22 against
+  gcc 14's `libstdc++.so.6`). MSan is live on this toolchain — a plain uninitialised
+  read reports — and the split it produces is the part a smaller probe gets wrong:
+  header-only use is CLEAN, because `vector`, `string`'s inline members and
+  `to_string` are instantiated into instrumented code, while `ostringstream`,
+  `locale`, `filesystem` and throwing an exception each report a
+  use-of-uninitialized-value INSIDE `libstdc++.so.6` on a program that has none.
+  Every Catch2 binary reaches the second set on every run, so an MSan job reports
+  about the standard library before it can report about this tree. `libc++` is no
+  escape and fails EARLIER — its `basic_string::__is_long` is out of line, so even
+  the header-only arm reports there. Three drafts of that probe were silent for
+  reasons that had nothing to do with libstdc++ (`-O1` folded the read away; a
+  store to `volatile` is not a use MSan reports), which is why it refuses when its
+  own control does not fire. Not measured, and the next thing to measure: whether
+  the tree reports under an MSan build with every dependency built from source —
+  this build additionally links `libyaml-cpp.so.0.8`, `libssl.so.3` and
+  `libcrypto.so.3` as system shared objects, of which TLS can be turned off and
+  yaml-cpp can be forced from source. valgrind was absent on the machine that took
+  these readings; apt offers 1:3.22.0-0ubuntu3, and that route needs no rebuild.
+- **[#1272](https://github.com/LASTRADA-Software/fastcached/issues/1272)** —
+  `scripts/check-gate-target-set.cmake` compares the local gate's
+  `gate_target_flags` against every `-DFASTCACHED_BUILD_*=ON` the workflow passes
+  ANYWHERE, and deliberately does not model which jobs run `ctest`: deriving *this
+  job tests* from the YAML is fragile in the direction that fails SILENT, where a
+  job whose test step is conditional or renamed reads as "does not test" and the
+  check quietly stops covering a target set CI really exercises. Failing closed
+  inverts that. The stated consequence is that a job turning one of those flags on
+  WITHOUT running tests makes the check refuse a correct tree — no such job exists
+  today, and when one appears the answer is a decision (exempt the job by name with
+  a reason, model the testing jobs, or narrow the subject) rather than a fix. It is
+  recorded before it fires because the natural response to that refusal will be
+  *the check is broken*, and it will not be: a red gate reads as "my branch is bad"
+  rather than as an instrument asking a question nobody has answered yet.

@@ -1205,10 +1205,24 @@ jobs:
   # are in `.tsan-suppressions` naming their issues, so this job is red for a NEW
   # race and not for those.
   #
-  # What is still NOT claimed is that the scope table is COMPLETE. The census is
-  # a proxy — a test reaching threads through a helper spawns none of its own —
-  # so a check built on it would refuse correct files and miss incorrect ones.
-  # `fastcache-cc-tests` is a known gap and is #1209.
+  # What is still NOT claimed is that the scope table names every threaded FILE.
+  # That census is a proxy — a test reaching threads through a helper spawns none
+  # of its own — so a check built on it would refuse correct files and miss
+  # incorrect ones.
+  #
+  # The BINARY half is no longer a proxy, and #1209 is why. `fastcache-cc-tests`
+  # sat in no row: the launcher does not link the FastCache library, so no tag
+  # expression could ever have reached it. It is a row now, run whole. The ticket
+  # enumerated the test binaries by hand and its table listed four; this tree
+  # registers six with `catch_discover_tests`, five of them in a default
+  # configuration — `fastcache-cli-tests` and `CowTreeTests` were in neither the
+  # table nor any row. Neither is threaded, so the ticket's conclusion survives its
+  # census, but a hand list is exact about what it knows and silent about what it
+  # does not (#492), and that silence reads identically to complete coverage. So
+  # `scripts/check-tsan-scope.cmake` DERIVES the set from the
+  # `catch_discover_tests` registrations and requires each one to be a `TARGETS`
+  # row or a written exemption. That is sound where the threaded census is not:
+  # the registrations are a fact about the build, not an inference about a source.
   #
   # The tags are not claimed to be confined to the scoped locations either: test
   # files elsewhere carry one and are swept in, which is harmless, because running
@@ -1324,16 +1338,42 @@ jobs:
 
       # Only the targets the gate runs — but do not read that as "the scope makes
       # this job cheap". `FastCacheTest` is one binary carrying every library
-      # `*_test.cpp`, so these three targets are 439 of the 552 configured compile
-      # edges: ~79% of a full Debug build. The tag scope buys RUNTIME (18.8s
-      # against minutes of per-process sanitized startup) and almost nothing at
-      # build time. This job's cost is its compile, and naming the four targets it
-      # does skip — daemon, launcher, benchmarks, testclient — is worth about 50
-      # translation units.
+      # `*_test.cpp`, so the tag scope buys RUNTIME and almost nothing at build
+      # time. This job's cost is its compile.
+      #
+      # MEASURED on abb530ed, `cmake --preset clang-tsan
+      # -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DFASTCACHED_ENABLE_TLS=ON`, counting the
+      # object files `ninja -t inputs` says each target set transitively needs:
+      #
+      #     every CXX compile edge this configure declares      675 (107 third-party)
+      #     the three targets before #1209                      498
+      #     the four targets below                              580
+      #
+      # So adding `fastcache-cc-tests` costs **82 compile edges**, which is exactly
+      # its own object count: everything else it needs was already being built for
+      # the other rows. At runtime it costs ~3s against the ~18.8s the first two
+      # take. That trade is what #1209 asked to have decided rather than corrected
+      # in passing, and this is the number it was decided on.
+      #
+      # The figures are PINNED to that commit and that configure line rather than
+      # pointing at them, because they are one tree at one instant — a comment that
+      # tracked its source would one day claim a measurement had been taken under
+      # conditions nobody measured it under. The pair that stood here before
+      # ("439 of 552") is not restated as a corrected pair: its denominator never
+      # said whether third-party edges were in it, so it cannot be compared with
+      # the one above and a reader reconciling them would be reconciling nothing.
+      #
+      # What this job still does NOT build: the daemon, the launcher itself
+      # (`fastcache-cc`, as opposed to its tests), `fastcache-cli` and its tests,
+      # `CowTreeTests`, and the two default-OFF targets (benchmarks, testclient).
+      # `scripts/check-tsan-scope.cmake` is what keeps that list honest — every
+      # Catch2 binary this tree registers is either a `TARGETS` row or carries a
+      # written exemption, so a fourth test binary cannot arrive unnoticed the way
+      # `fastcache-cc-tests` did.
       - name: "Build"
         run: >-
           cmake --build --preset clang-tsan --target
-          FastCacheTest fastcache-compile-node-tests tsan-canary
+          FastCacheTest fastcache-compile-node-tests fastcache-cc-tests tsan-canary
 
       - name: "Report ccache effectiveness"
         run: ccache --show-stats --verbose

@@ -284,12 +284,19 @@ unset _gate_row
 # gates each executable on a row, so a new default-OFF target is invisible to
 # this gate rather than absent from CI.
 #
-# Nothing CHECKS that yet, and this comment previously said something did --
-# it cited `ctest -R gate-target-set`, which does not exist anywhere in the
-# tree. A comment asserting what nothing checks cannot fail, so the claim is
-# gone and the work is #1197: derive the gate's set from HERE and CI's from
-# `build.yml`, failing closed when either scan matches nothing. The table is
-# the place that guard will read.
+# `ctest -R gate-target-set` CHECKS that, and the claim is only now true. This
+# comment cited that test once before it existed anywhere in the tree -- a
+# comment asserting what nothing checks cannot fail -- so the claim was removed
+# and the work became #1197. `scripts/check-gate-target-set.cmake` reads this
+# table and the `-D` flags in `build.yml`, refuses when either scan matches
+# nothing, and refuses a flag name that gates nothing: a misspelled `-D` sets an
+# unused cache variable and changes no target.
+#
+# It does NOT model which jobs run ctest. Every `FASTCACHED_BUILD_*=ON` the
+# workflow passes anywhere is CI's side, because deriving *this job runs tests*
+# from the YAML is fragile in the direction that fails silent. So a job that
+# turns one on WITHOUT running tests makes that check refuse, and the answer is
+# a decision rather than a fix.
 #
 # Turning them on is the half that gives the gate the coverage; STATING the set
 # beside the totals is the half that makes the number readable, and it is kept

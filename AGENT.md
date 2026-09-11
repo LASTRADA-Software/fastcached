@@ -1843,9 +1843,20 @@ what differs between compilers, standard libraries, hosts and tool versions.
   only because the node binary is run whole (#316). A row is now a directory OR a
   FILE, and the file row IS the exemption mechanism — a mostly single-threaded
   directory is scoped one file at a time, so the check never forces an unrelated tag
-  onto a case. What it still cannot check is whether the table is COMPLETE: the
-  census is a proxy (a helper spawns the thread; a comment names one) so promoting it
-  to a check would refuse correct files and miss incorrect ones.
+  onto a case. What it still cannot check is whether the table names every threaded
+  FILE: that census is a proxy (a helper spawns the thread; a comment names one) so
+  promoting it to a check would refuse correct files and miss incorrect ones.
+- **The BINARY half is not a proxy and IS checked** (`ctest -R tsan-binaries`, #1209).
+  `fastcache-cc-tests` was in no row for its whole life and no tag could have put it
+  there — the launcher does not link the library, so it is a separate binary the other
+  rows cannot contain. The set is DERIVED from the `catch_discover_tests(`
+  registrations, and each member is a `TARGETS` row or carries a written exemption; an
+  empty reason, a row naming a binary nothing registers, and a row that is also a
+  `TARGETS` row are each refused. #1209's own hand census listed four test binaries
+  where the tree registers six, which is why this is a check and not a review item.
+  Adding a row is TWO edits — `TARGETS` and the `clang-tsan` job's build step — and
+  the ticket's rule stands: **run the binary under TSan before adding its row**, or the
+  job goes red for the next person.
 - And it proves a CASE, not a FILE. One selected tag ANYWHERE in a file used to cover
   every case in it, so a 28th case tagged `[fleetchart]` in a file of 27
   `[distributed]` ones left the sanitized scope with the check reporting covered —
