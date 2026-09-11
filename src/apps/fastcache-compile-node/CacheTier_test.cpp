@@ -32,9 +32,11 @@
 
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
+#include <tests/WireReply.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
+using FastCache::Testing::StatusOf;
 using FastCache::Testing::Unwrap;
 
 namespace Wire = FastCache::CompileCacheWire;
@@ -132,15 +134,6 @@ template <typename Table>
 [[nodiscard]] std::vector<std::byte> Compressible(std::size_t bytes)
 {
     return std::vector<std::byte>(bytes, std::byte { 0x41 });
-}
-
-/// The status of a framed reply.
-/// @param reply The reply bytes.
-/// @return Its status, or nullopt when it does not decode.
-[[nodiscard]] std::optional<Wire::Status> StatusOf(std::span<std::byte const> reply)
-{
-    auto const header = Wire::DecodeReplyHeader(reply);
-    return header.has_value() ? std::optional { header->status } : std::nullopt;
 }
 
 } // namespace
