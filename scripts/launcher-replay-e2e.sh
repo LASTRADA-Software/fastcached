@@ -73,47 +73,42 @@ while [ $# -gt 0 ]; do
 done
 
 SKIP=77
-top_pid=$$
 
-# `fail` is reached from inside subshells -- the control build runs in one so
-# it can unset the launcher environment without disturbing the two builds
-# after it -- and there a bare `exit` ends the subshell only. The script then
-# carries on and reports a SECOND failure about the artefacts the first one
-# explains: a configure error was followed by `no build.ninja` and `produced
-# no binary`, which names the wrong thing twice and buries the cause.
+# `fail` and `e2e_note` come from here, along with the TERM trap `e2e_begin`
+# installs. This fixture kept private copies of both until #813: the argument
+# for that was that it draws no port (ctest hands it one) and polls no HTTP
+# surface, so it would be sourcing a 1900-line library to reach one three-word
+# function -- and converting a fixture that builds three CMake trees cannot be
+# verified in the session that makes the change.
 #
-# So a stop is a stop wherever it is raised, and the signal is sent
-# UNCONDITIONALLY. There is no way to detect which shell we are in that works
-# on the shells this has to run on. `$$` cannot: bash keeps it at the parent's
-# value inside a subshell, so the comparison always holds. `BASHPID` looks like
-# the answer and is the trap -- it is bash 4.0+, macOS ships 3.2, and there
-# `[ "${BASHPID:-$$}" = "$top_pid" ]` degrades to exactly the `$$` comparison
-# that does nothing. That guard stood here for two tickets, with a comment
-# above it arguing it was correct, and it was silently inert on the one
-# platform this fixture is never run on locally (#627).
+# What decided it the other way is not the duplication. It is that a private
+# copy of a shared helper is an EXEMPTION in `check-e2e-helpers.sh`'s scan, and
+# an exemption is blind to the SECOND divergence as well as the first: the row
+# naming this file cost that scan the ability to see any further drift in this
+# `fail`, which is precisely where #627's silently-inert `BASHPID` guard sat for
+# two tickets with a comment above it arguing it was correct. The copies were
+# correct when the row was written; the scan could not have told anybody when
+# they stopped being.
 #
-# Unconditional costs nothing. At the top level it is a self-signal, taken by
-# the TERM trap below, which exits 1 and runs the EXIT trap; in a subshell the
-# parent takes it and does the same while the subshell exits on its own. Both
-# paths end at status 1 with cleanup run, and neither asks which shell it is
-# in. `scripts/lib/e2e-common.sh` reaches the same shape from the same
-# argument, and `check-e2e-helpers.sh` exercises all three contexts.
-fail() {
-    echo "launcher-replay-e2e FAILED: $*" >&2
-    kill -TERM "$top_pid" 2>/dev/null || true
-    exit 1
-}
+# The reasoning that used to live here -- why a stop is signalled
+# UNCONDITIONALLY rather than guarded on `BASHPID`, which is bash 4.0+ and
+# silently unset on macOS's 3.2 -- is `fail`'s in `lib/e2e-common.sh`, reached
+# from the same argument and exercised by the self-test in all three contexts
+# (top level, `( ... )` and `$( ... )`). This fixture raises `fail` from inside
+# a subshell: the control build runs in one so it can unset the launcher
+# environment without disturbing the two builds after it.
+# shellcheck source=lib/e2e-common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/e2e-common.sh"
+
+# `skip` stays private, and the library grows no equivalent for it here. Every
+# fixture under `scripts/` spells its own `SKIP=77` and its own message, because
+# 77 is a CONTRACT WITH THE CALLER rather than a fact about the library, and this
+# fixture's caller is not the one the others have: it is registered as no ctest
+# at all -- the only caller is `build.yml`'s "A real target, replayed from cache"
+# step, which reads 77 itself and turns it into `::error::replay E2E skipped,
+# nothing verified`. A library `skip` would put that number one indirection away
+# from the one file that agrees with it.
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
-# A private copy of `e2e_note`, deliberately, and this is the whole of the
-# reason: this fixture does not source `lib/e2e-common.sh` at all. It draws no
-# port (ctest hands it one), polls no HTTP surface, and its `skip` predates and
-# outnumbers everything the library would give it -- so sourcing it to reach one
-# three-word function would put the library's `fail`, `e2e_begin` and TERM trap
-# into a fixture whose own equivalents are already correct, in a change no test
-# here can run to completion locally. Taking the shared helpers wholesale is
-# worth doing and is its own ticket (#813); it is not this one, whose subject is
-# a guard that does nothing on macOS.
-note() { echo "   $*"; }
 
 for pair in "fastcached:$fastcached" "launcher:$launcher"; do
     path="${pair#*:}"
@@ -135,10 +130,13 @@ cleanup() {
     rm -rf "$workdir"
 }
 trap cleanup EXIT
-# A `fail` raised in a subshell reaches the top-level shell as SIGTERM, whose
-# default disposition would report 143. One failing status whichever shell
-# raised it; the EXIT trap above still runs and still removes the workdir.
-trap 'exit 1' TERM
+# After the EXIT trap, because the TERM trap `e2e_begin` installs exists to let
+# that EXIT trap run: a `fail` raised in a subshell reaches this shell as
+# SIGTERM, whose default disposition would terminate it at 143 without running
+# cleanup. One failing status whichever shell raised it, and the workdir still
+# goes. The label is what every `FAILED:` line is prefixed with, so it is the
+# spelling this fixture's own messages have always carried.
+e2e_begin "launcher-replay-e2e" "$workdir"
 
 # ---------------------------------------------------------------------------
 echo "== the daemon this build will cache through"
@@ -160,7 +158,7 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 [ "$ready" = "1" ] || { cat "${workdir}/daemon.log" >&2; fail "the daemon never accepted a connection on ${port}"; }
-note "daemon up on 127.0.0.1:${port}"
+e2e_note "daemon up on 127.0.0.1:${port}"
 
 # ---------------------------------------------------------------------------
 # Which unit a HIT or MISS belongs to decides whether the number is a defect, and
@@ -273,7 +271,7 @@ read -r cold_project_hits cold_project_misses cold_deps_hits cold_deps_misses co
     || fail "cold: ${cold_unattributed} launcher outcome(s) could not be attributed to a unit; the split below would be a guess"
 cold_hits=$((cold_project_hits + cold_deps_hits))
 cold_misses=$((cold_project_misses + cold_deps_misses))
-note "cold: ${cold_misses} miss(es), ${cold_hits} hit(s)"
+e2e_note "cold: ${cold_misses} miss(es), ${cold_hits} hit(s)"
 [ "$cold_misses" -gt 0 ] || fail "the cold build missed nothing; the cache was not empty and nothing was stored from this source"
 
 echo "== warm: every unit hits, so every object is REPLAYED"
@@ -284,8 +282,8 @@ read -r warm_project_hits warm_project_misses warm_deps_hits warm_deps_misses wa
     || fail "warm: ${warm_unattributed} launcher outcome(s) could not be attributed to a unit; the split below would be a guess"
 warm_hits=$((warm_project_hits + warm_deps_hits))
 warm_misses=$((warm_project_misses + warm_deps_misses))
-note "warm, this project's sources: ${warm_project_hits} hit(s), ${warm_project_misses} miss(es)"
-note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_misses} miss(es)"
+e2e_note "warm, this project's sources: ${warm_project_hits} hit(s), ${warm_project_misses} miss(es)"
+e2e_note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_misses} miss(es)"
 
 # THE guard. A warm build that missed compiles correctly, passes everything
 # below, and has replayed nothing -- a green run proving only that the compiler
@@ -300,7 +298,7 @@ note "warm, third-party under _deps:  ${warm_deps_hits} hit(s), ${warm_deps_miss
     || fail "${warm_project_misses} of this project's own unit(s) missed on the warm build; the same source in a different build directory must replay, and that is what path canonicalization is for"
 
 if [ "$warm_deps_misses" -gt 0 ]; then
-    note "note: ${warm_deps_misses} third-party unit(s) missed; their sources live UNDER the build directory, so the two builds really do compile different paths"
+    e2e_note "note: ${warm_deps_misses} third-party unit(s) missed; their sources live UNDER the build directory, so the two builds really do compile different paths"
 fi
 
 echo "== the replayed objects must be the objects that were compiled"
@@ -313,7 +311,7 @@ while IFS= read -r cold_obj; do
     compared=$((compared + 1))
     cmp -s "$cold_obj" "$warm_obj" || { echo "   DIFFERS: ${rel}" >&2; differing=$((differing + 1)); }
 done < <(find "${workdir}/cold" -name '*.o' -type f)
-note "compared ${compared} object(s)"
+e2e_note "compared ${compared} object(s)"
 [ "$compared" -gt 0 ] || fail "no objects were compared; the layout assumption in this fixture is wrong"
 [ "$differing" = "0" ] || fail "${differing} replayed object(s) differ from the object that was compiled from this source"
 
@@ -440,7 +438,7 @@ EOF
         tail -20 "${workdir}/canary.tests" >&2
         fail "canary: the suite PASSED with a wrong object linked in. This fixture cannot detect the thing it exists to detect."
     fi
-    note "canary: the suite went red on a wrong object, as it must"
+    e2e_note "canary: the suite went red on a wrong object, as it must"
 fi
 
 echo "launcher-replay-e2e: a real target replayed from cache passes its own tests"
