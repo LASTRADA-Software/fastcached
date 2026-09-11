@@ -5791,3 +5791,60 @@ set_tests_properties("gate-target-set-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# ---------------------------------------------------------------------------
+# The tracked mutation harness and its self-test (#1252).
+#
+# `.agent/rules/testing.md` makes *prove the test can fail* an acceptance step
+# for much of this repository's work, and until #1252 every lane wrote its own
+# harness for it. A derived census over every session scratchpad and every
+# worktree found 54, diverged three ways on restore alone, and four separate
+# defects had been paid for separately -- the worst of which does not fail
+# loudly: it reports that a test did NOT redden under mutation, on which reading
+# the author's correct next move is to DELETE the test, since not reddening is
+# #355's disqualifying property. A harness bug destroys the test that would have
+# caught the next regression while every signal says the test is bad.
+#
+# Only the SELF-TEST is registered. The harness is a tool a developer points at
+# a subject; running it here would need a subject, a build and a verdict command
+# that this tree cannot supply generically, and a check that can only run where
+# a full build is already going is unreachable for the population it is for
+# (#257's argument for `tidy-sweep.sh`'s canary).
+#
+# The case that matters is `stale-binary`, which is #1252's clause 2 and the
+# clause the ticket calls the whole ticket: the restore-rebuild rule needs a test
+# that FAILS when the rebuild is deleted. It drives a COPY of the harness with the
+# post-restore rebuild textually removed and requires it to abort naming a stale
+# binary; `stale-binary-ctl` runs the unmodified harness over the same staged tree
+# and requires a clean pass, without which "aborts when the rebuild is deleted"
+# and "aborts on this tree" would be one passing test.
+#
+# Python, and it reuses the `find_package(Python3)` above rather than asking
+# again -- a third spelling of "find python" would disagree with the other two
+# about which interpreter it means, which is the reason that block gives for not
+# using `find_program`. Verdict from the EXIT CODE and not
+# FAIL_REGULAR_EXPRESSION: that property belongs to `cmake -P` checks, whose
+# `message(WARNING)` exits 0, and this script chooses its own status the way
+# `fetch-transfer-bound` does.
+#
+# It needs no compiler, no daemon, no socket and no network -- the staged subject
+# is a two-line "compiler" deriving a binary from a source -- so it is `hygiene`.
+if(NOT Python3_Interpreter_FOUND)
+    # A WARNING, not a STATUS. The outcome is that the guard on the tool this
+    # repository discharges "prove the test can fail" with is ABSENT from this
+    # build tree, and absent is not the same as passing.
+    message(WARNING
+        "mutation-harness-selftest: no Python 3 interpreter found, so the tracked "
+        "mutation harness (#1252) is NOT guarded in this build tree")
+else()
+    add_test(
+        NAME "mutation-harness-selftest"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/check-mutation-harness-selftest.py"
+    )
+    set_tests_properties("mutation-harness-selftest" PROPERTIES
+        LABELS "hygiene"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+endif()
