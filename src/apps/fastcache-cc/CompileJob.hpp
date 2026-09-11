@@ -314,6 +314,24 @@ class CompileJobRunner final: public ICompileJobRunner
     /// @return Every configured fingerprint, sorted.
     [[nodiscard]] std::vector<std::string> Fingerprints() const;
 
+    /// The compiler this worker would spawn for @p fingerprint, right now.
+    ///
+    /// **A single lookup rather than handing out the map**, because the caller that
+    /// needs this -- the exchange log, naming the toolchain a compile used -- would
+    /// otherwise copy the whole map per line, or hold a reference into state that
+    /// `ReplaceToolchains` swaps under it.
+    ///
+    /// **Answered from the LIVE map on every call, deliberately.** A re-survey
+    /// replaces the set (#238), and a name captured once would go on describing a
+    /// toolchain this worker has stopped serving -- which is the very confusion the
+    /// re-survey exists to end.
+    ///
+    /// @param fingerprint The toolchain fingerprint, as a request named it.
+    /// @return The compiler path, or empty when this worker does not serve it. Empty
+    ///         is a real answer and a useful one: it is a client keying against a
+    ///         toolchain this worker no longer has.
+    [[nodiscard]] std::string CompilerFor(std::string_view fingerprint) const;
+
     /// Serve a different set of toolchains from now on.
     ///
     /// The seam a node needs when the machine changes under it. A compiler patched

@@ -225,6 +225,14 @@ struct FrameServer::State
     IMetricsSink& metrics;
     ILogger& logger;
 
+    /// Resolves a compile's fingerprint to the compiler this node would spawn.
+    ///
+    /// Empty on every surface that has no toolchain map -- the cache tier, the
+    /// scheduler, and every fixture -- and the renderer then says only what it knows.
+    /// Asked per exchange rather than sampled once, because `main` rebuilds the map on
+    /// every re-survey (#238) and a captured name would outlive what it describes.
+    Node::ToolchainNamer namer;
+
     /// Which peers have already been told this node cannot speak their wire version.
     ///
     /// On the SERVER state and not the connection, because a build opens a connection
@@ -264,15 +272,20 @@ struct FrameServer::State
     /// bound after the endpoint claims to have stopped.
     std::atomic<std::size_t> loopsAlive { 0 };
 
-    State(
-        NodeIoLoop& loop, IListener& l, IFrameResponder& r, std::string_view name, IMetricsSink& sink, ILogger& log) noexcept
-        :
+    State(NodeIoLoop& loop,
+          IListener& l,
+          IFrameResponder& r,
+          std::string_view name,
+          IMetricsSink& sink,
+          ILogger& log,
+          Node::ToolchainNamer toolchainNamer = {}) noexcept:
         io { loop },
         listener { l },
         responder { r },
         what { name },
         metrics { sink },
-        logger { log }
+        logger { log },
+        namer { std::move(toolchainNamer) }
     {
     }
 
@@ -1899,9 +1912,10 @@ namespace
                     state->logger,
                     decoded->opRaw,
                     peer,
-                    frame.size(),
+                    frame,
                     reply,
-                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt));
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt),
+                    state->namer);
 
                 // A peer this node cannot speak to AT ALL is louder than its verb's own
                 // level -- a refused `fetch` is `Debug`, so at the default level an
@@ -2123,8 +2137,9 @@ FrameServer::FrameServer(NodeIoLoop& io,
                          IFrameResponder& responder,
                          std::string_view what,
                          IMetricsSink& metrics,
-                         ILogger& logger) noexcept:
-    _state { std::make_shared<State>(io, listener, responder, what, metrics, logger) }
+                         ILogger& logger,
+                         Node::ToolchainNamer namer) noexcept:
+    _state { std::make_shared<State>(io, listener, responder, what, metrics, logger, std::move(namer)) }
 {
 }
 
@@ -2263,10 +2278,11 @@ FrameEndpoint::FrameEndpoint(NodeIoLoop& io,
                              std::string_view what,
                              std::string boundEndpoint,
                              IMetricsSink& metrics,
-                             ILogger& logger):
+                             ILogger& logger,
+                             Node::ToolchainNamer namer):
     _io { io },
     _listener { std::move(listener) },
-    _server { std::make_unique<FrameServer>(io, *_listener, responder, what, metrics, logger) },
+    _server { std::make_unique<FrameServer>(io, *_listener, responder, what, metrics, logger, std::move(namer)) },
     _boundEndpoint { std::move(boundEndpoint) }
 {
     // Adopted rather than started here. The loop is run once, by its owner, after
@@ -2312,13 +2328,20 @@ std::unique_ptr<FrameEndpoint> FrameEndpoint::StartWithListener(NodeIoLoop& io,
                                                                 std::string boundEndpoint,
                                                                 IFrameResponder& responder,
                                                                 IMetricsSink& metrics,
-                                                                ILogger& logger)
+                                                                ILogger& logger,
+                                                                Node::ToolchainNamer namer)
 {
     // `new` rather than `make_unique` because the constructor is private: the ways to
     // reach it are this function and nothing else, and the two factories below have
     // each already proved their listener is bound.
-    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint {
-        io, std::move(listener), responder, RowFor(surface).name, std::move(boundEndpoint), metrics, logger } };
+    return std::unique_ptr<FrameEndpoint> { new FrameEndpoint { io,
+                                                                std::move(listener),
+                                                                responder,
+                                                                RowFor(surface).name,
+                                                                std::move(boundEndpoint),
+                                                                metrics,
+                                                                logger,
+                                                                std::move(namer) } };
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(NodeIoLoop& io,
@@ -2326,7 +2349,8 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
                                                                                 NodeConfig const& cfg,
                                                                                 IFrameResponder& responder,
                                                                                 IMetricsSink& metrics,
-                                                                                ILogger& logger)
+                                                                                ILogger& logger,
+                                                                                Node::ToolchainNamer namer)
 {
     // The row resolves it, so the address this binds and the address
     // `--print-surfaces` prints are the same computation rather than two that agree
@@ -2363,7 +2387,8 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     auto bound = std::format("{}:{}", endpoint.host, listener->BoundPort());
     logger.Logf(LogLevel::Info, "{} listening on {}", row.name, bound);
 
-    return StartWithListener(io, surface, std::move(listener), std::move(bound), responder, metrics, logger);
+    return StartWithListener(
+        io, surface, std::move(listener), std::move(bound), responder, metrics, logger, std::move(namer));
 }
 
 std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartAdopted(NodeIoLoop& io,
@@ -2372,7 +2397,8 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
                                                                                        std::string_view advertisedHost,
                                                                                        IFrameResponder& responder,
                                                                                        IMetricsSink& metrics,
-                                                                                       ILogger& logger)
+                                                                                       ILogger& logger,
+                                                                                       Node::ToolchainNamer namer)
 {
     auto const& row = RowFor(surface);
 
@@ -2413,7 +2439,8 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     auto bound = FormatHostPort(advertisedHost, listener->BoundPort());
     logger.Logf(LogLevel::Info, "{} serving a socket-activated listener, advertised as {}", row.name, bound);
 
-    return StartWithListener(io, surface, std::move(listener), std::move(bound), responder, metrics, logger);
+    return StartWithListener(
+        io, surface, std::move(listener), std::move(bound), responder, metrics, logger, std::move(namer));
 #endif
 }
 

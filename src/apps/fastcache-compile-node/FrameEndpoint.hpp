@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ExchangeLog.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -815,7 +816,8 @@ class FrameServer
                 IFrameResponder& responder,
                 std::string_view what,
                 IMetricsSink& metrics,
-                ILogger& logger) noexcept;
+                ILogger& logger,
+                Node::ToolchainNamer namer = {}) noexcept;
 
     FrameServer(FrameServer const&) = delete;
     FrameServer(FrameServer&&) = delete;
@@ -908,7 +910,8 @@ class FrameEndpoint
                                                                                           NodeConfig const& cfg,
                                                                                           IFrameResponder& responder,
                                                                                           IMetricsSink& metrics,
-                                                                                          ILogger& logger);
+                                                                                          ILogger& logger,
+                                                                                          Node::ToolchainNamer namer = {});
 
     /// Serve a surface on a descriptor a supervisor already bound and listened.
     ///
@@ -951,7 +954,8 @@ class FrameEndpoint
         std::string_view advertisedHost,
         IFrameResponder& responder,
         IMetricsSink& metrics,
-        ILogger& logger);
+        ILogger& logger,
+        Node::ToolchainNamer namer = {});
 
     /// Serve a surface on a listener the CALLER built.
     ///
@@ -987,7 +991,8 @@ class FrameEndpoint
                                                                           std::string boundEndpoint,
                                                                           IFrameResponder& responder,
                                                                           IMetricsSink& metrics,
-                                                                          ILogger& logger);
+                                                                          ILogger& logger,
+                                                                          Node::ToolchainNamer namer = {});
 
     /// Stop serving. The loop's own thread is joined by `NodeIoLoop`.
     ///
@@ -1025,7 +1030,8 @@ class FrameEndpoint
                   std::string_view what,
                   std::string boundEndpoint,
                   IMetricsSink& metrics,
-                  ILogger& logger);
+                  ILogger& logger,
+                  Node::ToolchainNamer namer = {});
 
     /// The loop this endpoint accepts on, and what its listener is handed back to.
     ///

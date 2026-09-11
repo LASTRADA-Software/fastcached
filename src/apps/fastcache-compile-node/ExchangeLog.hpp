@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <ranges>
@@ -228,23 +229,88 @@ inline constexpr std::array StatusNameTable {
 /// @param requestBytes Length of the request frame.
 /// @param reply        The reply frame, empty when none was produced.
 /// @param elapsed      How long the responder took.
+/// Resolves a toolchain fingerprint to the compiler this node would spawn for it.
+///
+/// **A seam rather than a map, because the answer MOVES.** `main` rebuilds the
+/// fingerprint-to-compiler map on every re-survey (#238), so a line that captured a
+/// name at construction would go on naming a compiler this node has stopped serving
+/// -- the failure #238 is about, one level down and in the log instead of the wire.
+/// Asked per exchange, answered from whatever the map holds at that moment.
+///
+/// Injected and defaulted to naming nothing, so every fixture and every surface with
+/// no toolchain map keeps working and says only what it knows.
+using ToolchainNamer = std::function<std::string(std::string_view fingerprint)>;
+
+/// The toolchain clause for one exchange, or empty when there is nothing to say.
+///
+/// **Decoded HERE rather than reported by the responder, and that is a constraint
+/// rather than a shortcut.** `ServeConnection`'s own comment calls the log call site
+/// "the one place this node says anything about a client ... without any of them
+/// knowing about logging" -- so handing the fact up from `CompileResponder` would
+/// have to widen `IFrameResponder::Answer` for every responder and teach one of them
+/// what a log line is. Decoding costs a second pass over a payload whose compile is
+/// about to take seconds, and only for `Compile`, and only once the level has passed.
+///
+/// It spells no offset of its own: `DecodeRequestHeader` and `DecodeCompilePayload`
+/// are the same two calls `WorkerProtocol::Answer` makes, which is what keeps framing
+/// knowledge in one place.
+///
+/// **A fingerprint this node does not serve is NAMED, not dropped.** That is the
+/// interesting case -- a client keying against a toolchain this node has stopped
+/// serving, which is #238's symptom from the client side -- and printing the bare
+/// digest, or nothing at all, would hide exactly the line an operator needs. A
+/// missing clause means "not a compile"; `unserved` means "a compile this node could
+/// not place".
+///
+/// @param opRaw The opcode byte as it arrived.
+/// @param frame The whole request frame, header included.
+/// @param namer How to resolve a fingerprint; may be empty.
+/// @return " toolchain=<fingerprint> (<compiler>)", or empty.
+[[nodiscard]] inline std::string FormatToolchainClause(std::uint8_t opRaw,
+                                                       std::span<std::byte const> frame,
+                                                       ToolchainNamer const& namer)
+{
+    if (opRaw != static_cast<std::uint8_t>(CompileCacheWire::Op::Compile))
+        return {};
+
+    auto const header = CompileCacheWire::DecodeRequestHeader(frame);
+    if (!header.has_value() || frame.size() < CompileCacheWire::RequestHeaderSize + header->payloadLength)
+        return {};
+
+    auto const fields =
+        CompileCacheWire::DecodeCompilePayload(frame.subspan(CompileCacheWire::RequestHeaderSize, header->payloadLength));
+    if (!fields.has_value())
+        return {};
+
+    auto const fingerprint = CompileCacheWire::AsStringView(fields->fingerprint);
+    if (fingerprint.empty())
+        return {};
+
+    auto const compiler = namer ? namer(fingerprint) : std::string {};
+    return std::format(" toolchain={} ({})", fingerprint, compiler.empty() ? "unserved" : compiler);
+}
+
 /// @return The line to log.
 [[nodiscard]] inline std::string FormatExchange(std::uint8_t opRaw,
                                                 std::string_view peer,
-                                                std::size_t requestBytes,
+                                                std::span<std::byte const> frame,
                                                 std::span<std::byte const> reply,
-                                                std::chrono::milliseconds elapsed)
+                                                std::chrono::milliseconds elapsed,
+                                                ToolchainNamer const& namer = {})
 {
     auto const status =
         reply.empty() ? std::string { "no-reply" } : ExchangeStatusName(static_cast<std::uint8_t>(reply.front()));
-    return std::format("{} {} from {} -> {} ({} B in, {} B out, {} ms)",
+    // The byte count is taken FROM the span rather than passed beside it, so the
+    // length and the bytes it describes cannot come to disagree.
+    return std::format("{} {} from {} -> {} ({} B in, {} B out, {} ms){}",
                        "0xFC",
                        ExchangeVerbName(opRaw),
                        peer.empty() ? std::string_view { "<unknown peer>" } : peer,
                        status,
-                       requestBytes,
+                       frame.size(),
                        reply.size(),
-                       elapsed.count());
+                       elapsed.count(),
+                       FormatToolchainClause(opRaw, frame, namer));
 }
 
 /// Record one exchange, if this logger is listening at that verb's level.
@@ -258,23 +324,29 @@ inline constexpr std::array StatusNameTable {
 /// arguments by value: the rendering would otherwise run for every `fetch` on a node
 /// at the default level and be thrown away.
 ///
-/// @param logger       Where the line goes.
-/// @param opRaw        The opcode byte as it arrived.
-/// @param peer         The peer's host, as the kernel reports it.
-/// @param requestBytes Length of the request frame.
-/// @param reply        The reply frame, empty when none was produced.
-/// @param elapsed      How long the responder took.
+/// @param logger  Where the line goes.
+/// @param opRaw   The opcode byte as it arrived.
+/// @param peer    The peer's host, as the kernel reports it.
+/// @param frame   The whole request frame: its size is the byte count, and for a
+///                compile it is also where the toolchain clause is decoded from.
+/// @param reply   The reply frame, empty when none was produced.
+/// @param elapsed How long the responder took.
+/// @param namer   Resolves a fingerprint to a compiler; empty names nothing.
 inline void LogExchange(ILogger& logger,
                         std::uint8_t opRaw,
                         std::string_view peer,
-                        std::size_t requestBytes,
+                        std::span<std::byte const> frame,
                         std::span<std::byte const> reply,
-                        std::chrono::milliseconds elapsed)
+                        std::chrono::milliseconds elapsed,
+                        ToolchainNamer const& namer = {})
 {
     auto const level = LogLevelForOp(opRaw);
+    // This guard now covers a DECODE as well as a format, which is why it stays here
+    // rather than being left to `Logf`: a node at the default level must not pay to
+    // decode a compile payload for a line it is about to discard.
     if (level < logger.MinLevel())
         return;
-    logger.Log(level, FormatExchange(opRaw, peer, requestBytes, reply, elapsed));
+    logger.Log(level, FormatExchange(opRaw, peer, frame, reply, elapsed, namer));
 }
 
 /// How often one peer's version refusal may be reported.
