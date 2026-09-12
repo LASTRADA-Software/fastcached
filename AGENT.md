@@ -13,7 +13,9 @@ src/FastCache/
   Core/         Error taxonomy, Clock, HostPort, IRandomSource, Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
                 SecureBytes (the one zeroing primitive, and the allocator credentials live in),
-                Utf8 (the one strict decoder), Compression, WireFrame + WireFields
+                Utf8 (the one strict decoder), Markup (the one markup escaper, over
+                Utf8 and reached by all three targets that emit XML-family documents),
+                Compression, WireFrame + WireFields
                 (the shared framing), Profiling
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil, DeadlineTimer, AsyncQueue (MPSC,

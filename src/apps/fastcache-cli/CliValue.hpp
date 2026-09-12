@@ -50,7 +50,12 @@ enum class CellKind : std::uint8_t
     /// counter must render `0` rather than absent. Which of the two a given number is
     /// is the caller's decision -- this type only has to be able to say either.
     Absent,
-    Text,    ///< A string that is valid UTF-8. Quoted by the formats that quote.
+    /// A string that is valid UTF-8. Quoted by the formats that quote.
+    ///
+    /// An invariant rather than an assertion since #1356: `TextCell` is the only
+    /// producer and it checks, so a renderer may interpolate `lexical` into a
+    /// document without asking again.
+    Text,
     Number,  ///< Already rendered lexically; emitted unquoted by JSON.
     Boolean, ///< `true` or `false` lexically; emitted unquoted by JSON.
 
@@ -82,20 +87,32 @@ struct Cell
 /// @return An absent cell. See CellKind::Absent for why this is not a zero.
 [[nodiscard]] Cell AbsentCell() noexcept;
 
-/// A cell holding text.
+/// A cell holding text, classified by whether the bytes actually are text.
 ///
-/// The caller is asserting the bytes are valid UTF-8. `TextOrBinaryCell` is what to
-/// use when that is not already known.
-/// @param text The value.
-/// @return The cell.
+/// **The one place the UTF-8 question is asked, and now the only way to reach a
+/// `Text` cell at all.** That sentence used to sit on a second function,
+/// `TextOrBinaryCell`, and it was false as written: nothing enforced it, four sites
+/// called that function and about twenty-nine called this one, and three of those
+/// twenty-nine carried bytes off the wire — a memcached key, `ME`'s key, a meta flag
+/// value — where no caller can assert anything about the encoding. So a non-UTF-8 KEY
+/// rendered as raw bytes and `--format=json` produced a document that was not UTF-8
+/// (#1356).
+///
+/// The two functions are one function now, rather than the wire-sourced callers being
+/// moved over to the other one: **a guard folded INTO the operation is self-enforcing;
+/// a guard called ALONGSIDE one needs a scan.** Moving three call sites would have
+/// left the next site free to skip the question again. What remains unenforced by the
+/// type system is a caller writing `Cell { .kind = CellKind::Text, ... }` past this
+/// factory, and `ctest -R cli-text-cell` is the scan that covers exactly that.
+///
+/// The cost is an `IsValidUtf8` pass over every cell, including the couple of dozen
+/// carrying a compiled-in literal. These are field names, versions and enum
+/// spellings — tens of bytes, once per command invocation by a person at a terminal —
+/// so it is not a trade worth reasoning about, and being unable to skip the question
+/// is worth more than saving it.
+/// @param text The value; need not be valid UTF-8.
+/// @return A `Text` cell when @p text is valid UTF-8, a base64 `Binary` cell otherwise.
 [[nodiscard]] Cell TextCell(std::string text);
-
-/// A cell holding bytes, classified by whether they are text.
-///
-/// The one place the UTF-8 question is asked, so no command can forget to ask it.
-/// @param bytes The raw value.
-/// @return A `Text` cell when @p bytes is valid UTF-8, a base64 `Binary` cell otherwise.
-[[nodiscard]] Cell TextOrBinaryCell(std::string_view bytes);
 
 /// A cell holding an unsigned number.
 /// @param value The value.

@@ -560,3 +560,69 @@ TEST_CASE("the fleet verb offers every section the server serves", "[cli][verbs]
     CHECK(std::ranges::count(fleet->operands, '|') + 1
           == static_cast<std::ptrdiff_t>(Distributed::FleetSectionTable.size()));
 }
+
+TEST_CASE("the base64 reassurance is the WIRE's, not every wire's", "[cli][verbs]")
+{
+    // `NoteBinaryCells` runs from `RunVerb` for EVERY verb, so its sentence -- *a
+    // memcached key is a byte string, so this is ordinary rather than a fault* --
+    // was told to operators of the RESP and node wires as well, about answers that
+    // have no memcached keys in them. The claim is true of exactly one wire, so it
+    // is that wire's row.
+    //
+    // WHAT DISTINGUISHES: the general sentence is on BOTH sides, so asserting it
+    // proves nothing. What separates them is the memcached clause -- present on the
+    // memcached wire and absent here -- so this case asserts its ABSENCE beside the
+    // general sentence's presence. Either assertion alone passes under the defect.
+    //
+    // And the KEY carries the bytes while the value is ordinary text, which is not a
+    // stylistic choice: `ValueCell` explains a binary VALUE itself, and
+    // `NoteBinaryCells` returns early when that advisory is already there -- so an
+    // answer whose only binary cell is a value never reaches the wire note at all,
+    // and a case built on one passes under its own mutant. Measured, not reasoned:
+    // the first draft of this case did exactly that and survived the neutering.
+    auto exchange = ScriptedExchange { { Array({ Bulk("plain") }) } };
+    auto const answer = Run("mget", { "k\x80y" }, exchange);
+
+    REQUIRE(answer.value.shape == Shape::Table);
+    REQUIRE(answer.value.rows.size() == 1);
+    CHECK(answer.value.rows[0][0].kind == CellKind::Binary); // the key
+    CHECK(answer.value.rows[0][1].kind == CellKind::Text);   // the value
+    CHECK(Mentions(answer, "base64"));
+    CHECK(!Mentions(answer, "memcached"));
+
+    // The control on the other half: a wire with a note still says the general
+    // sentence, so an empty column is not what makes the assertion above pass. The
+    // memcached side of it is asserted where a memcached exchange can be scripted,
+    // in "a key shown base64 is explained, as a value already was".
+    CHECK(WireTable[static_cast<std::size_t>(Wire::Memcached)].binaryNote.contains("memcached"));
+    CHECK(WireTable[static_cast<std::size_t>(Wire::Resp)].binaryNote.empty());
+}
+
+TEST_CASE("one answer says the value was base64-encoded once", "[cli][verbs]")
+{
+    // `ValueCell` appended the advisory per VALUE while `NoteBinaryCells`, two
+    // functions below it, already de-duplicated by exact comparison -- so `mget` over
+    // three binary values printed the identical stderr line three times. The
+    // asymmetry was live in one file.
+    //
+    // WHAT DISTINGUISHES: the COUNT. Every assertion about the sentence's content
+    // passes with three copies of it, which is why this one counts rather than
+    // matching, and why three keys are needed -- two binary values out of two is a
+    // count a one-key answer cannot tell apart from one.
+    auto exchange = ScriptedExchange { { Array({ Bulk("a\x80"), Bulk("b\x80"), Bulk("c\x80") }) } };
+    auto const answer = Run("mget", { "k1", "k2", "k3" }, exchange);
+
+    REQUIRE(answer.value.shape == Shape::Table);
+    REQUIRE(answer.value.rows.size() == 3);
+    for (auto const& row: answer.value.rows)
+        CHECK(row[1].kind == CellKind::Binary);
+
+    CHECK(std::ranges::count_if(answer.advisories, [](std::string const& advisory) { return advisory.contains("base64"); })
+          == 1);
+
+    // The control, so "the advisory is never appended" would fail here rather than
+    // pass: three ordinary values say nothing at all.
+    auto plain = ScriptedExchange { { Array({ Bulk("a"), Bulk("b"), Bulk("c") }) } };
+    auto const quiet = Run("mget", { "k1", "k2", "k3" }, plain);
+    CHECK(!Mentions(quiet, "base64"));
+}

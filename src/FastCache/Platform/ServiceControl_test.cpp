@@ -2,6 +2,8 @@
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Compression.hpp>
+#include <FastCache/Core/Markup.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -652,6 +654,240 @@ TEST_CASE("ServiceControl: plist values are XML-escaped", "[platform][service][l
     REQUIRE(!plist.contains("a&b<c>d"));
 }
 
+namespace
+{
+/// A spec whose sole launch argument is exactly @p bytes.
+///
+/// An ARGUMENT, which is a `std::string`, and that is the whole reason these cases
+/// reach the plist through one rather than through `exePath` or `storagePath`: those
+/// are `std::filesystem::path` (or are absolutized into one), and this tree's own rule
+/// records that `path`'s narrow constructor THROWS on a Windows host for bytes that
+/// are not UTF-8 -- before any `error_code` overload runs. A case supplying such bytes
+/// through a path would therefore die in the fixture on three of the CI legs and never
+/// reach the function under test. An argument is one of the four fields #1357 names,
+/// so nothing is given up by going this way.
+///
+/// ONE field, not two. This fixture also set `serviceAccount`, which was harmless for
+/// the assertions and wrong for attribution: reverting the account-name fix then
+/// failed all three cases built on it rather than the one case about the account, so
+/// "the failures are the ones I expect and only those" could not be read. Measured by
+/// doing exactly that revert. The account has its own case, which sets the field
+/// itself.
+/// @param bytes The value to put in the argument.
+/// @return The spec.
+[[nodiscard]] FastCache::ServiceSpec SpecCarrying(std::string bytes)
+{
+    auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, FastCache::Config {});
+    spec.arguments = std::vector<std::string> { std::move(bytes) };
+    return spec;
+}
+} // namespace
+
+TEST_CASE("ServiceControl: a plist field that is not UTF-8 is replaced, not carried", "[platform][service][launchd]")
+{
+    // #1357. macOS paths are BYTES, so an installation under a path carrying a byte
+    // that belongs to no UTF-8 sequence is unusual and legal -- and the five-arm
+    // entity switch this function used to escape with wrote that byte verbatim.
+    //
+    // WHAT DISTINGUISHES: a case over an ordinary ASCII path passes under the defect,
+    // which is why this one supplies the bytes and asserts the DOCUMENT. `0x80` is a
+    // lone continuation byte -- valid in no UTF-8 sequence in any position -- and it
+    // is not a control character in any locale, which keeps this case about ENCODING
+    // rather than about the control-character rule below.
+    auto const replacement = std::string { FastCache::MarkupReplacement };
+    auto const plist = FastCache::BuildLaunchdPlist(SpecCarrying("gcc\x80-1"), ServiceScope::System, "/tmp/logs");
+
+    // The property, stated as the property: whatever it was given, what comes out is
+    // a document a parser will accept. Under the defect this is FALSE -- the raw 0x80
+    // made the whole plist not UTF-8.
+    REQUIRE(FastCache::IsValidUtf8(plist));
+    REQUIRE(!plist.contains("\x80"));
+
+    // And the bytes around it are untouched, so this is a replacement rather than a
+    // field that got dropped.
+    REQUIRE(plist.contains("gcc" + replacement + "-1"));
+
+    // A TRUNCATED sequence is the other invalid shape, and it does not collapse to one
+    // replacement: `0xC3` is a two-byte lead, `0x28` is not a continuation, so the lead
+    // decodes to nothing and is replaced ALONE while the `(` is ordinary text that
+    // survives. That is `EscapeMarkup`'s documented rule -- a code point the production
+    // merely excludes is consumed whole, but bytes that decoded to nothing advance
+    // singly -- and asserting it here is what stops somebody "simplifying" the walk
+    // into one replacement per invalid RUN, which would silently merge a mangled path
+    // with the character after it.
+    auto const truncated = FastCache::BuildLaunchdPlist(SpecCarrying("gcc\xC3\x28-1"), ServiceScope::System, "/tmp/logs");
+    REQUIRE(FastCache::IsValidUtf8(truncated));
+    REQUIRE(truncated.contains("gcc" + replacement + "(-1"));
+}
+
+TEST_CASE("ServiceControl: a C0 control XML forbids is replaced, and the three it allows are kept",
+          "[platform][service][launchd]")
+{
+    // The sharper half of #1357, and the half escaping cannot fix: XML 1.0 forbids
+    // 0x01-0x08, 0x0B, 0x0C and 0x0E-0x1F **outright**, so `&#x1;` is as unparseable
+    // as the raw byte and there is nothing to escape a control TO. Substituting is
+    // the only move available.
+    auto const plist = FastCache::BuildLaunchdPlist(SpecCarrying("a\x01"
+                                                                 "b"),
+                                                    ServiceScope::System,
+                                                    "/tmp/logs");
+
+    // WHAT DISTINGUISHES: the raw byte is what the defect wrote, and the character
+    // reference is what a reader would reach for instead -- neither may appear.
+    REQUIRE(!plist.contains("\x01"));
+    REQUIRE(!plist.contains("&#x1;"));
+    REQUIRE(!plist.contains("&#x01;"));
+    REQUIRE(plist.contains("a" + std::string { FastCache::MarkupReplacement } + "b"));
+
+    // The control bytes the production DOES admit are carried, or this would be a
+    // stricter rule than XML's wearing XML's name. A tab in a launch argument is
+    // legal in the document; whether it is a sensible thing to register is
+    // `SupervisorTextRejection`'s question, and it does not refuse these either.
+    auto const tabbed = FastCache::BuildLaunchdPlist(SpecCarrying("a\tb"), ServiceScope::System, "/tmp/logs");
+    REQUIRE(tabbed.contains("a\tb"));
+    REQUIRE(!FastCache::SupervisorTextRejection(SpecCarrying("a\tb")).has_value());
+}
+
+TEST_CASE("ServiceControl: the account name is escaped like every other text node", "[platform][service][launchd]")
+{
+    // Found while fixing #1357 and fixed with it: `UserName` was interpolated with no
+    // escaping at all, so it was a second route to the malformed document the rest of
+    // this function's escaping exists to prevent. `serviceAccount` is a FIELD rather
+    // than the constant it used to be -- its own comment says a second binary may
+    // want a different one -- so "the daemon's account is always `_fastcached`" was
+    // never a property of the function.
+    //
+    // WHAT DISTINGUISHES: `&` is the byte whose unescaped presence makes the document
+    // malformed, and under the defect it appeared raw.
+    auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, FastCache::Config {});
+    spec.serviceAccount = "cache&co";
+    auto const plist = FastCache::BuildLaunchdPlist(spec, ServiceScope::System, "/tmp/logs");
+
+    REQUIRE(plist.contains("<string>cache&amp;co</string>"));
+    REQUIRE(!plist.contains("<string>cache&co</string>"));
+}
+
+TEST_CASE("ServiceControl: a registration carrying text no supervisor can record is refused", "[platform][service][launchd]")
+{
+    // The other half of #1357, and the half the ticket's acceptance clause offered as
+    // an alternative to substitution. It is BOTH here, because substitution alone
+    // keeps the document parseable while leaving it naming a path that does not
+    // exist: `--install-service` would print success and the job would fail on every
+    // boot with nothing to diagnose it by. That is the same outcome as the malformed
+    // plist, one step further on, and this project's rule for registrations is to
+    // refuse while somebody is watching.
+    //
+    // WHAT DISTINGUISHES: each arm names a byte NO EXISTING RULE refuses.
+    // `ServiceNameRejection` tests `serviceName` alone and tests it with
+    // `std::iscntrl`, which answers false for a UTF-8 encoding error -- so both arms
+    // below returned nullopt before this rule existed.
+    REQUIRE(FastCache::SupervisorTextRejection(SpecCarrying("gcc\xC3\x28-1")).has_value());
+    REQUIRE(FastCache::LaunchdTextRejection(SpecCarrying("a\x01"
+                                                         "b"))
+                .has_value());
+
+    // Encoding is asked of the service name too, which `ServiceNameRejection` does
+    // not do: it answers a path-traversal question and is also called on its own from
+    // the uninstall and status paths, so neither rule subsumes the other.
+    FastCache::Config encoded {};
+    encoded.serviceName = "fast\xC3\x28"
+                          "cached";
+    REQUIRE(FastCache::SupervisorTextRejection(SpecFor("fastcached", encoded)).has_value());
+
+    // The rule is reachable through the gate both platforms' InstallService share,
+    // rather than being a function nothing calls.
+    REQUIRE(FastCache::ServiceRegistrationRejection(SpecCarrying("gcc\xC3\x28-1"), FastCache::SupervisorKind::Launchd)
+                .has_value());
+    REQUIRE(
+        FastCache::ServiceRegistrationRejection(SpecCarrying("gcc\xC3\x28-1"), FastCache::SupervisorKind::Scm).has_value());
+
+    // THE POSITIVE CONTROL, which is the direction a refusal test skips: a guard
+    // nobody has watched ACCEPT is not known to work either, and a rule that refused
+    // everything would pass every assertion above.
+    REQUIRE(!FastCache::SupervisorTextRejection(SpecCarrying("--storage=/var/db/fc")).has_value());
+    REQUIRE(!FastCache::SupervisorTextRejection(SpecCarrying("caf\xC3\xA9")).has_value()); // U+00E9, legal text
+    REQUIRE(!FastCache::LaunchdTextRejection(SpecCarrying("caf\xC3\xA9")).has_value());
+    for (auto const supervisor: { FastCache::SupervisorKind::Scm, FastCache::SupervisorKind::Launchd })
+        REQUIRE(
+            !FastCache::ServiceRegistrationRejection(SpecFor("fastcached", FastCache::Config {}), supervisor).has_value());
+}
+
+TEST_CASE("ServiceControl: a code point only XML forbids is refused for launchd and not for the SCM", "[platform][service]")
+{
+    // The scope of the rule IS the subject here. `SupervisorTextRejection` went into
+    // the gate BOTH platforms' InstallService calls while asking XML's `Char`
+    // production -- so `--display-name $'Fast\x0bCache'` was refused on WINDOWS, where
+    // the SCM stores UTF-16 and carries a vertical tab perfectly well, under a message
+    // about property lists and launchd. A registration replays forever, so that is a
+    // machine that cannot be provisioned until somebody reads a message about an
+    // operating system they are not running.
+    //
+    // WHAT DISTINGUISHES: the SAME spec, asked twice, answering differently. A case
+    // that only asserted the launchd refusal passes under the defect, and so does one
+    // that only asserts the bytes are valid UTF-8 -- they are.
+    FastCache::Config cfg {};
+    auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg);
+    spec.displayName = "Fast\x0b"
+                       "Cache";
+    REQUIRE(FastCache::IsValidUtf8(spec.displayName)); // the premise: this is text.
+
+    CHECK(FastCache::ServiceRegistrationRejection(spec, FastCache::SupervisorKind::Launchd).has_value());
+    CHECK(!FastCache::ServiceRegistrationRejection(spec, FastCache::SupervisorKind::Scm).has_value());
+
+    // U+FFFE is the other half of the `Char` production's exclusions and the half a
+    // byte-wise check cannot see: perfectly good UTF-8, and still not carriable.
+    auto noncharacter = spec;
+    noncharacter.displayName = "Fast\xEF\xBF\xBE"
+                               "Cache";
+    REQUIRE(FastCache::IsValidUtf8(noncharacter.displayName));
+    CHECK(FastCache::ServiceRegistrationRejection(noncharacter, FastCache::SupervisorKind::Launchd).has_value());
+    CHECK(!FastCache::ServiceRegistrationRejection(noncharacter, FastCache::SupervisorKind::Scm).has_value());
+
+    // And the half that is NOT about a document format is asked of both, because this
+    // process's `char` is UTF-8 everywhere it ships: bytes that are not text are not
+    // text for either supervisor, and a registration records them forever.
+    auto mangled = spec;
+    mangled.displayName = "Fast\xC3\x28"
+                          "Cache";
+    REQUIRE(!FastCache::IsValidUtf8(mangled.displayName));
+    for (auto const supervisor: { FastCache::SupervisorKind::Scm, FastCache::SupervisorKind::Launchd })
+        CHECK(FastCache::ServiceRegistrationRejection(mangled, supervisor).has_value());
+}
+
+TEST_CASE("ServiceControl: a refusal names WHICH launch argument carries the byte", "[platform][service]")
+{
+    // Every argument was labelled "a launch argument" and the offset is relative to
+    // that argument, so with six `ProgramArguments` an operator was told *a launch
+    // argument carries a byte at offset 3* and could not tell which one. The index is
+    // what makes it actionable; the flag name is taken only when it is safe to print.
+    //
+    // WHAT DISTINGUISHES: the bad byte is in the THIRD argument, so a refusal naming
+    // no index reads identically whichever argument carries it.
+    FastCache::Config cfg {};
+    auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, cfg);
+    spec.arguments = std::vector<std::string> { "--port=11211", "--threads=4", "--storage=/var/db/f\x01i", "--metrics" };
+
+    auto const rejection = FastCache::LaunchdTextRejection(spec);
+    REQUIRE(rejection.has_value());
+    auto const& refusal = Unwrap(rejection);
+    CHECK(refusal.contains("launch argument 3"));
+    CHECK(refusal.contains("(--storage)"));
+    // The offset is within that argument, so it points at the byte rather than at a
+    // position in a command line nobody assembled.
+    CHECK(refusal.contains("offset 19"));
+
+    // The flag hint is dropped rather than guessed when the argument is not a flag,
+    // and the index still identifies it.
+    auto positional = spec;
+    positional.arguments = std::vector<std::string> { "--metrics", "plain\x01value" };
+    auto const bare = FastCache::LaunchdTextRejection(positional);
+    REQUIRE(bare.has_value());
+    // The label runs straight into the verb with no hint between them. Asserted that
+    // way rather than as "no `(` anywhere": every refusal parenthesises the byte it
+    // names, so a bare-`(` assertion cannot fail for the reason it was written for.
+    CHECK(Unwrap(bare).contains("launch argument 2 carries"));
+}
+
 TEST_CASE("ServiceControl: non-default flags reach ProgramArguments", "[platform][service][launchd]")
 {
     FastCache::Config cfg {};
@@ -904,13 +1140,17 @@ TEST_CASE("ServiceControl: every registration rule gates an install", "[platform
     // on one supervisor and forgotten on the other.
     FastCache::Config named {};
     named.serviceName = "../escape";
-    REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", named)).has_value());
+    REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", named), FastCache::SupervisorKind::Launchd)
+                .has_value());
 
     FastCache::Config secret {};
     secret.requirePass = "hunter2";
-    REQUIRE(FastCache::ServiceRegistrationRejection(SpecFor("fastcached", secret)).has_value());
+    REQUIRE(
+        FastCache::ServiceRegistrationRejection(SpecFor("fastcached", secret), FastCache::SupervisorKind::Scm).has_value());
 
-    REQUIRE(!FastCache::ServiceRegistrationRejection(SpecFor("fastcached", FastCache::Config {})).has_value());
+    REQUIRE(!FastCache::ServiceRegistrationRejection(SpecFor("fastcached", FastCache::Config {}),
+                                                     FastCache::SupervisorKind::Launchd)
+                 .has_value());
 }
 
 TEST_CASE("ServiceControl: the timestamp switch registers whichever spelling produces the value", "[platform][service]")

@@ -198,7 +198,7 @@ std::optional<Value> DecodeNodeCounters(std::span<std::byte const> payload)
         // unparseable for the whole record, which is the fleet page's own rule arriving
         // on a different wire.
         auto const name = Wire::AsStringView((*pair)[0]);
-        auto cell = TextOrBinaryCell(name);
+        auto cell = TextCell(std::string { name });
         if (cell.kind != CellKind::Text)
             return std::nullopt;
 

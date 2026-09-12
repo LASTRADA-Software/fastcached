@@ -43,7 +43,7 @@ TEST_CASE("bytes that are not UTF-8 are classified as binary, not repaired", "[c
     // sent is carried or refused, never silently repaired -- so the cell must say
     // `Binary` rather than substituting U+FFFD and looking like text.
     std::string const invalid = { 'a', '\x80', 'b' };
-    auto const cell = TextOrBinaryCell(invalid);
+    auto const cell = TextCell(invalid);
 
     CHECK(cell.kind == CellKind::Binary);
     // Base64 of "a\x80b". The assertion is that the ORIGINAL bytes are recoverable,
@@ -55,11 +55,11 @@ TEST_CASE("valid UTF-8 stays text, including multi-byte sequences", "[cli][value
 {
     // The positive control for the case above. Without it, a classifier that called
     // everything binary would pass that test.
-    auto const ascii = TextOrBinaryCell("plain");
+    auto const ascii = TextCell("plain");
     CHECK(ascii.kind == CellKind::Text);
     CHECK(ascii.lexical == "plain");
 
-    auto const multibyte = TextOrBinaryCell("caf\xc3\xa9");
+    auto const multibyte = TextCell("caf\xc3\xa9");
     CHECK(multibyte.kind == CellKind::Text);
     CHECK(multibyte.lexical == "caf\xc3\xa9");
 }

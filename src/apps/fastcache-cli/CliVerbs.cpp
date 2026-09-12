@@ -113,16 +113,87 @@ namespace
         return argv;
     }
 
+    /// What the operator is told when a cached VALUE could not be shown as text.
+    ///
+    /// A named constant because `BinaryCellAdvisory` below is suppressed by comparing
+    /// against it -- by equality, never by sniffing the text for a word, so the
+    /// suppression is parsing rather than guessing and reveals itself by failing
+    /// rather than by quietly not firing if either spelling moves.
+    constexpr std::string_view BinaryValueAdvisory =
+        "the value is not valid UTF-8, so it is shown base64-encoded; --raw writes the bytes";
+
+    /// ...and when anything ELSE in the answer could not.
+    ///
+    /// A key, in practice. After the UTF-8 question was folded into `TextCell`, a
+    /// non-UTF-8 key became a base64 cell with nothing saying why, where a value had
+    /// been explained since it was first classified -- and base64 in a `key` column
+    /// with no accompanying sentence is a genuine puzzle for an operator, who has no
+    /// reason to suspect the key rather than the tool.
+    ///
+    /// It says a byte string is ORDINARY rather than a fault, because it is: the
+    /// protocol never promised a key was text, so this is a rendering decision and not
+    /// a report of damage.
+    constexpr std::string_view BinaryCellAdvisory =
+        "some text in this answer is not valid UTF-8, so it is shown base64-encoded rather than repaired";
+
+    /// Whether any cell of @p value could not be shown as text.
+    /// @param value The answer's value.
+    /// @return True when some cell is `Binary`.
+    [[nodiscard]] bool HasBinaryCell(Value const& value)
+    {
+        auto const binary = [](Cell const& cell) {
+            return cell.kind == CellKind::Binary;
+        };
+        if (binary(value.scalar))
+            return true;
+        if (std::ranges::any_of(value.fields, [&](Field const& field) { return binary(field.value); }))
+            return true;
+        return std::ranges::any_of(value.rows,
+                                   [&](std::vector<Cell> const& row) { return std::ranges::any_of(row, binary); });
+    }
+
+    /// Say so when an answer carries bytes that could not be shown as text.
+    ///
+    /// At the ONE place every answer passes through rather than at the handlers that
+    /// happen to produce such cells, for the same reason the UTF-8 question itself was
+    /// folded into `TextCell`: a diagnostic each handler has to remember is one the
+    /// next handler forgets, which is how a key came to be classified and never
+    /// explained while a value was both.
+    ///
+    /// THE LIMIT, stated rather than left to be discovered: when a key AND its value
+    /// are both binary, only the value's advisory is printed, because that one is more
+    /// specific and naming both would be two sentences about one observation. The
+    /// operator still sees base64 in both columns under a sentence that says base64.
+    /// @param answer The finished answer; may gain one advisory.
+    void NoteBinaryCells(Answer& answer, Wire wire)
+    {
+        if (!HasBinaryCell(answer.value))
+            return;
+        if (std::ranges::find(answer.advisories, BinaryValueAdvisory) != answer.advisories.end())
+            return;
+
+        auto const note = WireTable[static_cast<std::size_t>(wire)].binaryNote;
+        if (note.empty())
+            answer.advisories.emplace_back(BinaryCellAdvisory);
+        else
+            answer.advisories.emplace_back(std::format("{}; {}", BinaryCellAdvisory, note));
+    }
+
     /// A value cell plus the remark that goes with it when the bytes are not text.
     /// @param bytes The value.
     /// @param answer The answer being built; gains an advisory for a binary value.
     /// @return The cell.
     [[nodiscard]] Cell ValueCell(std::string_view bytes, Answer& answer)
     {
-        auto cell = TextOrBinaryCell(bytes);
-        if (cell.kind == CellKind::Binary)
-            answer.advisories.emplace_back(
-                "the value is not valid UTF-8, so it is shown base64-encoded; --raw writes the bytes");
+        auto cell = TextCell(std::string { bytes });
+        // Once per ANSWER, not once per value: `mget k1 k2 k3` over three binary
+        // values printed the identical stderr line three times. The sentence says
+        // nothing a second copy adds, and `NoteBinaryCells` below already
+        // de-duplicated by exact comparison -- the asymmetry was live in the same
+        // function block.
+        if (cell.kind == CellKind::Binary
+            && std::ranges::find(answer.advisories, BinaryValueAdvisory) == answer.advisories.end())
+            answer.advisories.emplace_back(BinaryValueAdvisory);
         return cell;
     }
 
@@ -2064,7 +2135,9 @@ Answer RunVerb(VerbSpec const& verb, VerbContext const& context)
     if (!wire.available(scoped))
         return Concluded(Outcome::Unreachable, std::string { wire.unavailable });
 
-    return verb.handler(scoped);
+    auto answer = verb.handler(scoped);
+    NoteBinaryCells(answer, verb.wire);
+    return answer;
 }
 
 } // namespace FastCache::Cli

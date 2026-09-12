@@ -45,47 +45,35 @@ namespace
 
     /// Escape a string for a JSON document.
     ///
-    /// Control characters below 0x20 are escaped because a raw one makes the document
-    /// invalid rather than merely ugly, and a cache key may contain anything.
+    /// `Distributed::AppendJsonText` rather than a `switch` of its own. This was that
+    /// `switch`, and `FleetText.hpp`'s own comment named it as a duplicate that had
+    /// drifted from `JsonEscapes` in BOTH directions (#1356): it spelled `\b` and
+    /// `\f`, which the shared table writes as the numeric escapes `\u0008`
+    /// and `\u000c` -- identical to every JSON parser -- and it carried a byte belonging to no valid UTF-8
+    /// sequence through verbatim, which the shared one replaces.
+    ///
+    /// Not depth beside #1356's fix but part of it, and that was measured rather than
+    /// assumed. With `TextCell` folded and this writer still hand-rolled, `inspect`
+    /// against `ME k<0x80>y s1 t-1 c<0x80>d` still produced a document that was not
+    /// UTF-8: a meta flag is split on `=`, so a flag with no `=` becomes a `name`
+    /// holding the whole wire token, `McFlagName` returns an unrecognised name verbatim
+    /// by design, and a field NAME is not a `Cell` -- so no cell factory is in the path
+    /// at all. The two arguments below that are not cells, a field name and a column
+    /// name, are exactly what this covers.
+    ///
+    /// What it must NOT be read as is the whole remedy. A writer that substituted
+    /// silently would make a wrong VALUE look like a real one, where the base64
+    /// `Binary` cell says what happened and the caller's advisory says why. The cells
+    /// are classified before they arrive here; this is what carries the text around
+    /// them.
+    ///
+    /// The parameter order is this file's rather than the shared function's, so the
+    /// three call sites below read unchanged.
     /// @param text The raw text.
     /// @param out Destination; the quotes are written too.
     void AppendJsonString(std::string_view text, std::string& out)
     {
-        out += '"';
-        for (auto const ch: text)
-        {
-            switch (ch)
-            {
-                case '"':
-                    out += R"(\")";
-                    continue;
-                case '\\':
-                    out += R"(\\)";
-                    continue;
-                case '\n':
-                    out += R"(\n)";
-                    continue;
-                case '\r':
-                    out += R"(\r)";
-                    continue;
-                case '\t':
-                    out += R"(\t)";
-                    continue;
-                case '\b':
-                    out += R"(\b)";
-                    continue;
-                case '\f':
-                    out += R"(\f)";
-                    continue;
-                default:
-                    break;
-            }
-            if (static_cast<unsigned char>(ch) < 0x20U)
-                out += std::format(R"(\u{:04x})", static_cast<unsigned>(static_cast<unsigned char>(ch)));
-            else
-                out += ch;
-        }
-        out += '"';
+        Distributed::AppendJsonText(out, text);
     }
 
     /// One cell as a JSON value.
@@ -507,7 +495,7 @@ std::string EscapeTsvField(std::string_view field)
         // An empty answer means "carry it literally", unambiguous only because no row
         // spells a byte as nothing -- a row writing an empty spelling would mean
         // "delete this byte", which no format here wants.
-        auto const replacement = Distributed::EscapeFor(Distributed::DelimitedEscapes, ch);
+        auto const replacement = EscapeFor(Distributed::DelimitedEscapes, ch);
         if (replacement.empty())
             out += ch;
         else

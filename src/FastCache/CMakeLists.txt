@@ -206,6 +206,7 @@ target_sources(FastCache
             Core/SecureBytes.hpp
             Core/Compression.hpp
             Core/Endian.hpp
+            Core/Markup.hpp
             Core/StringHash.hpp
             Core/Utf8.hpp
             Core/Clock.hpp

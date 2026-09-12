@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CliFormat.hpp"
 #include "CliVerbs.hpp"
 #include "ScriptedExchange.hpp"
+
+#include <FastCache/Core/Utf8.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -430,4 +433,123 @@ TEST_CASE("bytes this client cannot read are a protocol failure", "[cli][verbs][
     auto const answer = Run("touch", { "k", "60" }, garbled);
     CHECK(answer.outcome == Outcome::Protocol);
     CHECK(Mentions(answer, "byte count"));
+}
+
+TEST_CASE("a key that is not UTF-8 renders as a UTF-8 document, base64 and said", "[cli][verbs][memcached]")
+{
+    // #1356's acceptance clause, and it has a named trap: a case over a well-formed
+    // key passes under the defect, and so does a case over a non-UTF-8 VALUE -- the
+    // value path was already correct, routing through the one classifier. The
+    // reachable defect was the KEY, which went through `TextCell` on the caller's
+    // assertion that the bytes were text. A memcached key is a BYTE STRING and no
+    // caller can make that assertion.
+    //
+    // WHAT DISTINGUISHES: the bytes are in the key, they arrive off the wire, and the
+    // assertion is on the rendered DOCUMENT rather than on the call returning. Under
+    // the defect the key cell was `Text` carrying `0x80` and the JSON writer passed it
+    // through, so `IsValidUtf8(json)` was FALSE.
+    //
+    // `0x80` is a lone continuation byte: valid in no UTF-8 sequence, in any position.
+    auto exchange = ScriptedMemcachedExchange { { "VALUE a\x80z 0 1\r\nx\r\nEND\r\n" } };
+    auto const answer = Run("gat", { "60", "a\x80z" }, exchange);
+
+    REQUIRE(answer.value.shape == Shape::Table);
+    REQUIRE(answer.value.rows.size() == 1);
+    auto const& key = answer.value.rows[0][0];
+
+    // Classified, not repaired: the original bytes stay recoverable, which a
+    // substitution of U+FFFD would have destroyed. "a\x80z" -> base64.
+    CHECK(key.kind == CellKind::Binary);
+    CHECK(key.lexical == "YYB6");
+
+    auto const json = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(IsValidUtf8(json));
+    CHECK(!json.contains("\x80"));
+    CHECK(json.contains("YYB6"));
+
+    // The control, so "every key renders base64" and "a key that is not text renders
+    // base64" are not the same passing test. Without it a classifier that called
+    // everything binary would satisfy every assertion above.
+    auto plain = ScriptedMemcachedExchange { { "VALUE caf\xc3\xa9 0 1\r\nx\r\nEND\r\n" } };
+    auto const ordinary = Run("gat", { "60", "caf\xc3\xa9" }, plain);
+    REQUIRE(ordinary.value.shape == Shape::Table);
+    REQUIRE(ordinary.value.rows.size() == 1);
+    CHECK(ordinary.value.rows[0][0].kind == CellKind::Text);
+    CHECK(ordinary.value.rows[0][0].lexical == "caf\xc3\xa9");
+
+    auto const plainJson = RenderValue(ordinary.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(IsValidUtf8(plainJson));
+    CHECK(plainJson.contains("caf\xc3\xa9"));
+}
+
+TEST_CASE("a key shown base64 is explained, as a value already was", "[cli][verbs][memcached]")
+{
+    // Folding the UTF-8 question into `TextCell` classified keys correctly and left
+    // them UNEXPLAINED: a value had carried an advisory since it was first classified,
+    // a key got base64 and silence. Base64 in a `key` column with no sentence beside it
+    // is a real puzzle -- an operator has no reason to suspect the key rather than the
+    // tool.
+    //
+    // WHAT DISTINGUISHES: the key is binary and the VALUE is ordinary text, so the
+    // value's own advisory cannot fire and only the new one can. A case with both
+    // binary passes whichever advisory exists, which is the trap.
+    auto exchange = ScriptedMemcachedExchange { { "VALUE a\x80z 0 5\r\nplain\r\nEND\r\n" } };
+    auto const answer = Run("gat", { "60", "a\x80z" }, exchange);
+
+    REQUIRE(answer.value.shape == Shape::Table);
+    REQUIRE(answer.value.rows.size() == 1);
+    CHECK(answer.value.rows[0][0].kind == CellKind::Binary); // the key
+    CHECK(answer.value.rows[0][1].kind == CellKind::Text);   // the value
+    CHECK(Mentions(answer, "base64"));
+    CHECK(Mentions(answer, "ordinary rather than a fault"));
+
+    // The control: an answer with nothing binary in it says nothing about base64, or
+    // "every answer carries the advisory" would pass the assertion above.
+    auto clean = ScriptedMemcachedExchange { { "VALUE k 0 5\r\nplain\r\nEND\r\n" } };
+    auto const quiet = Run("gat", { "60", "k" }, clean);
+    CHECK(!Mentions(quiet, "base64"));
+}
+
+TEST_CASE("inspect's own key and its flag values are classified too", "[cli][verbs][memcached]")
+{
+    // The other two wire-sourced sites #1356 names: `ME`'s key and a meta flag value.
+    // Both were `TextCell` on an assertion their caller cannot make, and both are
+    // covered by the same fold rather than by three remembered call sites -- which is
+    // the point of folding rather than moving the callers.
+    //
+    // AND a route the fold cannot reach, which this case found rather than predicted.
+    // A meta flag is split on `=`, so a flag with no `=` becomes a `name` holding the
+    // whole wire token; `McFlagName` returns an unrecognised name VERBATIM, by design
+    // ("inspect renames the me inspector's flags and keeps unknown ones"); and a field
+    // NAME is not a `Cell`, so no cell factory is involved. That is why the JSON writer
+    // is part of this fix rather than depth beside it: with `TextCell` folded and the
+    // hand-rolled writer still in place, this case's document was still not UTF-8.
+    auto exchange = ScriptedMemcachedExchange { { "ME k\x80y s1 t-1 c\x80"
+                                                  "d\r\n" } };
+    auto const answer = Run("inspect", { "k\x80y" }, exchange);
+
+    REQUIRE(answer.value.shape == Shape::Record);
+    auto const* const key = FindField(answer.value, "key");
+    REQUIRE(key != nullptr);
+    CHECK(key->value.kind == CellKind::Binary);
+
+    // The field-name route, asserted rather than assumed: some field's NAME carries the
+    // wire's bytes. Pinning that the renderer must handle it is the point -- the name is
+    // deliberately NOT repaired here, because renaming an operator's flag would be a
+    // rendering concern reaching back into what the server may call things.
+    auto const named = std::ranges::any_of(answer.value.fields, [](Field const& field) { return !IsValidUtf8(field.name); });
+    CHECK(named);
+
+    auto const json = RenderValue(answer.value, RenderOptions { .format = OutputFormat::Json });
+    CHECK(IsValidUtf8(json));
+    CHECK(!json.contains("\x80"));
+
+    // The control: an ordinary `ME` reply still reports its key as text, so this is a
+    // classification rather than a blanket downgrade.
+    auto ordinary = ScriptedMemcachedExchange { { "ME plain s1 t-1\r\n" } };
+    auto const good = Run("inspect", { "plain" }, ordinary);
+    auto const* const goodKey = FindField(good.value, "key");
+    REQUIRE(goodKey != nullptr);
+    CHECK(goodKey->value.kind == CellKind::Text);
+    CHECK(goodKey->value.lexical == "plain");
 }

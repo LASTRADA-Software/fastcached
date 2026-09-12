@@ -427,15 +427,78 @@ struct ServiceSpec
 /// @return An explanatory message when the name must be refused, else nullopt.
 [[nodiscard]] std::optional<std::string> ServiceNameRejection(ServiceSpec const& spec);
 
-/// Why @p cfg cannot be handed to a service supervisor at all, if it cannot.
+/// Which supervisor a registration is destined for.
 ///
-/// Runs every registration rule in turn — currently ServiceNameRejection and
-/// InlineCredentialRejection — and reports the first that objects, so both
-/// platforms' InstallService share one gate and a new rule is a new table row.
+/// A PRIVATE enum: nothing transmits or persists it and no ordinal of it is read from
+/// bytes or from a position, so it carries no explicit values. It exists because some
+/// registration rules are true of one supervisor and not the other -- a launchd job
+/// description is XML and the Windows SCM's is not -- and a rule that cannot say where
+/// it applies either refuses too much on one platform or too little on the other.
+enum class SupervisorKind : std::uint8_t
+{
+    Scm,     ///< The Windows Service Control Manager.
+    Launchd, ///< macOS launchd.
+    Last,
+};
+
+/// Why @p spec carries text no supervisor can record, if it does.
+///
+/// A launchd job description is XML, and XML 1.0 cannot carry a byte belonging to no
+/// valid UTF-8 sequence, nor most of the C0 controls — those it forbids *outright*,
+/// so there is no character reference to escape them to and escaping cannot help.
+/// BuildLaunchdPlist therefore replaces what it cannot carry, which keeps the
+/// document parseable; this refuses first, because every field it covers is one
+/// launchd or the SCM must *act* on. A replaced byte in `ProgramArguments[0]` is a
+/// plist that parses and names a path that does not exist — an install that reports
+/// success and a job that fails on every boot with nothing to diagnose it by.
+///
+/// Pure, so the rule is unit-testable on every platform.
+///
+/// Does **not** cover the log directory, which `DefaultLogDirectory` derives from the
+/// user's home: that is a fact about the environment rather than about the parsed
+/// configuration, so an operator could not act on a refusal naming it, and
+/// BuildLaunchdPlist being total is what carries it instead.
 ///
 /// @param spec Service about to be registered.
 /// @return An explanatory message when the install must be refused, else nullopt.
-[[nodiscard]] std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec);
+[[nodiscard]] std::optional<std::string> SupervisorTextRejection(ServiceSpec const& spec);
+
+/// Why @p spec carries text a LAUNCHD job description cannot carry, if it does.
+///
+/// The half of the question that is about a document format rather than about text. A
+/// plist is XML, and XML 1.0's `Char` production forbids most C0 controls outright --
+/// there is no character reference to escape them to -- and stops at U+FFFD, so U+FFFE
+/// and U+FFFF are excluded while being perfectly good UTF-8.
+///
+/// Scoped to launchd on purpose, and that scope was a defect before it was a design:
+/// applied through the shared gate it refused a display name carrying a C0 control on
+/// WINDOWS, where the SCM stores UTF-16 and carries it perfectly well, under a message
+/// about property lists and launchd. A registration replays forever, so an install
+/// refused on one platform for another platform's reason is a machine that cannot be
+/// provisioned until somebody reads a message about an operating system they are not
+/// running.
+///
+/// Pure, so the rule is unit-testable on every platform even though it applies on one.
+///
+/// @param spec Service about to be registered.
+/// @return An explanatory message when the install must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> LaunchdTextRejection(ServiceSpec const& spec);
+
+/// Why @p cfg cannot be handed to a service supervisor at all, if it cannot.
+///
+/// Runs every registration rule in turn and reports the first that objects, so both
+/// platforms' InstallService share one gate and a new rule is a new table row.
+///
+/// The SCOPE is a COLUMN of that table rather than a second gate: a rule true of one
+/// supervisor and not the other names the one it applies to, and everything else runs
+/// everywhere. Without it a launchd-only rule either has to live outside the table --
+/// in the tier that happens to need it, which this project's own rule forbids -- or
+/// refuse on a platform it was never about.
+///
+/// @param spec Service about to be registered.
+/// @param supervisor Which supervisor will record it; selects the scoped rules.
+/// @return An explanatory message when the install must be refused, else nullopt.
+[[nodiscard]] std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec, SupervisorKind supervisor);
 
 /// Parse the `--service-scope` argument.
 /// @param text One of `user` or `system`, lowercase.
@@ -473,12 +536,20 @@ struct ServiceSpec
 /// and so the plists shipped in the package can be generated by the very binary
 /// that later registers them — one implementation, no drift.
 ///
+/// **Total**: every interpolated field goes through `EscapeMarkup`, which replaces
+/// what XML 1.0 cannot carry, so no input produces a document a parser will refuse.
+/// That is the backstop rather than the remedy — `SupervisorTextRejection` refuses
+/// such an input at install time, because a plist that parses and names a path that
+/// does not exist is the same broken registration one step further on. The backstop
+/// still earns its place: @p logDirectory is not part of @p spec and so is beyond
+/// the reach of a rule over the parsed configuration.
+///
 /// @param spec Service to describe; `exePath` and `arguments` become
 ///        `ProgramArguments`, and `daemonFlag` is deliberately not emitted.
 /// @param scope Which domain the job is for; selects the supervision policy
 ///        (see the scope table in the implementation).
 /// @param logDirectory Directory for the job's stdout/stderr files.
-/// @return A complete `<?xml ...?><plist>` document.
+/// @return A complete `<?xml ...?><plist>` document, always well-formed XML.
 [[nodiscard]] std::string BuildLaunchdPlist(ServiceSpec const& spec,
                                             ServiceScope scope,
                                             std::filesystem::path const& logDirectory);

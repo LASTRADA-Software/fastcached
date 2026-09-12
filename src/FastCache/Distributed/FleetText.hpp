@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
@@ -16,14 +17,7 @@
 namespace FastCache::Distributed
 {
 
-/// How markup spells a code point the bytes did not encode.
-///
-/// A numeric character reference rather than the three bytes of U+FFFD, so the
-/// repair is visible in a `view-source:` and costs the document nothing: the
-/// output stays ASCII exactly where the input stopped being text.
-inline constexpr std::string_view MarkupReplacement = "&#xFFFD;";
-
-/// How JSON spells the same thing.
+/// How JSON spells a code point the bytes did not encode.
 inline constexpr std::string_view JsonReplacement = "\\ufffd";
 
 /// How a tab-separated document spells it.
@@ -82,20 +76,6 @@ inline constexpr std::string_view HtmlDocumentPrologue =
     R"(<html lang="en"><head><meta charset="utf-8">)"
     R"(<meta name="viewport" content="width=device-width, initial-scale=1">)";
 
-/// One byte an output format must not carry literally, and what it writes instead.
-///
-/// Outside `Detail` because a SECOND binary spells the same rows: `fastcache-cli`'s
-/// `--format=tsv` writes the same four as `/fleet.txt`, and an operator pipes both
-/// into one script. It was a second struct there, with the replacement field named
-/// `replacement` rather than `spelling` -- and two names for one concept is the
-/// worse half of a duplicate, because a reader who knows one file does not
-/// recognise the other (#1334).
-struct TextEscape
-{
-    char byte;                 ///< The byte.
-    std::string_view spelling; ///< What the format writes in its place.
-};
-
 /// The bytes a tab-separated document cannot carry literally.
 ///
 /// The two delimiters -- and the escape CHARACTER itself, which is the row that
@@ -111,6 +91,10 @@ struct TextEscape
 /// `apps/fastcache-cli/CliFormat.cpp`, which is where somebody is tempted to call
 /// the node's function instead, and restating it here would be this change's own
 /// defect one level up.
+///
+/// `TextEscape` and `EscapeFor` are `Core/Markup.hpp`'s, which is where they went
+/// when `Platform/ServiceControl.cpp` became the third consumer of the markup half
+/// of this header.
 inline constexpr std::array DelimitedEscapes {
     TextEscape { .byte = '\\', .spelling = R"(\\)" },
     TextEscape { .byte = '\t', .spelling = R"(\t)" },
@@ -118,56 +102,21 @@ inline constexpr std::array DelimitedEscapes {
     TextEscape { .byte = '\r', .spelling = R"(\r)" },
 };
 
-/// What one format writes for `byte`, or nothing when it may carry it as it is.
+/// How the formats this header owns spell what they cannot carry.
 ///
-/// `FindOrNull` rather than `std::ranges::find_if`, for the reason `Core/Ranges.hpp`
-/// exists: over a `std::array` libstdc++ and libc++ yield a raw pointer, so
-/// clang-tidy's `readability-qualified-auto` asks for `auto const* const`, which
-/// MSVC's class-type iterator cannot deduce. `TraitsOf` in `Platform/ServiceControl.cpp`
-/// is the same two lines.
-///
-/// This site used to hand-roll the scan, and the rule in
-/// `.agent/rules/build-and-toolchain.md` permits that -- a site wanting a VALUE out
-/// of a range may scan and name no iterator. It takes the helper anyway because the
-/// function became cross-binary API in this change, and a shared helper that
-/// re-derives what a shared helper already solved is how a tree ends up with the
-/// explanation written out seventeen times instead of the answer used once. Where
-/// the helper is genuinely unreachable the scan is still right:
-/// `CompileCacheWire::FindOp` hand-rolls it because that header must stay
-/// dependency-free for the launcher.
-/// @param escapes The format's table.
-/// @param byte The byte to spell.
-/// @return Its spelling, or an empty view when the byte needs none.
-[[nodiscard]] constexpr std::string_view EscapeFor(std::span<TextEscape const> escapes, char byte) noexcept
-{
-    auto const* const row = FindOrNull(escapes, byte, &TextEscape::byte);
-    return row != nullptr ? row->spelling : std::string_view {};
-}
-
-/// How each format spells what it cannot carry.
-///
-/// Namespaced because nothing outside this header reaches these two tables BY
-/// NAME -- which is a statement about spelling and **not** a claim that no other
-/// file implements the same conventions. It is not: `CliFormat.cpp` hand-rolls
-/// the JSON convention as a `switch` and has drifted from `JsonEscapes` in both
-/// directions (#1356), and `fastcache-cc/Stats.cpp` and
-/// `Platform/ServiceControl.cpp` each hand-roll the markup one. Said the other
+/// Namespaced because nothing outside this header reaches this table BY NAME --
+/// which is a statement about spelling and **not** a claim that no other file
+/// implements the same convention. It is not: `CliFormat.cpp` hand-rolls the JSON
+/// convention as a `switch` and has drifted from `JsonEscapes` in both directions
+/// (#1356), and `fastcache-cc/Stats.cpp` hand-rolls the markup one. Said the other
 /// way round, this comment previously read as *nobody else does this*, which is
 /// the sentence a future reader uses to decide not to look.
 ///
-/// `TextEscape`, `DelimitedEscapes` and `EscapeFor` sit OUTSIDE it because a
-/// second binary shares them; the replacement constants stay outside for the
-/// older reason, so a test can assert against the one spelling rather than
-/// against a second copy of it.
+/// `DelimitedEscapes` sits OUTSIDE it because a second binary shares it; the
+/// replacement constants stay outside for the older reason, so a test can assert
+/// against the one spelling rather than against a second copy of it.
 namespace Detail
 {
-
-    /// The bytes markup cannot carry literally.
-    inline constexpr std::array MarkupEscapes {
-        TextEscape { .byte = '&', .spelling = "&amp;" },  TextEscape { .byte = '<', .spelling = "&lt;" },
-        TextEscape { .byte = '>', .spelling = "&gt;" },   TextEscape { .byte = '"', .spelling = "&quot;" },
-        TextEscape { .byte = '\'', .spelling = "&#39;" },
-    };
 
     /// The bytes JSON spells with a short escape rather than with `\uXXXX`.
     ///
@@ -188,106 +137,7 @@ namespace Detail
     /// it, so `FirstPrintableByte` does not cover it.
     inline constexpr unsigned char DeleteByte = 0x7F;
 
-    /// One inclusive range of code points a format may carry.
-    struct CodePointRange
-    {
-        char32_t first; ///< First code point in the range.
-        char32_t last;  ///< Last code point in the range.
-    };
-
-    /// XML 1.0 section 2.2's `Char` production, verbatim.
-    ///
-    /// Markup may carry exactly these and nothing else, and what the production
-    /// EXCLUDES is the part that earns it. Below 0x20 it admits only tab, LF and
-    /// CR, and forbids the rest OUTRIGHT rather than merely unescaped -- `&#xB;`
-    /// is as unparseable as the raw byte, so there is nothing to escape a NUL
-    /// *to* and replacing is the only move available. At the other end it stops at
-    /// U+FFFD, so U+FFFE and U+FFFF are excluded even though both are perfectly
-    /// good UTF-8. That second exclusion is why this is a table of CODE POINTS
-    /// rather than of bytes, and why `DecodeUtf8` answers with the value: a check
-    /// that could only see bytes would call them valid and emit them.
-    ///
-    /// The surrogate hole the production also carves is absent here because it
-    /// cannot arise -- `DecodeUtf8` refuses a surrogate as invalid UTF-8 before
-    /// this is ever asked.
-    ///
-    /// The production rather than HTML's laxer rules because this escape feeds
-    /// BOTH surfaces, and one escaper must meet the stricter of its consumers. The
-    /// page is `text/html`, where a browser repairs most of this quietly; a chart
-    /// is `image/svg+xml`, which is XML, where a parser refuses the whole document
-    /// rather than drawing it with a gap. Only chart labels this build writes
-    /// itself reach the SVG path today -- which is exactly the kind of thing a
-    /// later column labelled by toolchain would change, silently, with no reason
-    /// for anyone to revisit this function.
-    ///
-    /// JSON shares none of it -- every code point has a legal spelling there --
-    /// which is why `AppendJsonText` escapes where this replaces.
-    inline constexpr std::array MarkupCarriable {
-        CodePointRange { .first = 0x0009, .last = 0x0009 }, CodePointRange { .first = 0x000A, .last = 0x000A },
-        CodePointRange { .first = 0x000D, .last = 0x000D }, CodePointRange { .first = 0x0020, .last = 0xD7FF },
-        CodePointRange { .first = 0xE000, .last = 0xFFFD }, CodePointRange { .first = 0x10000, .last = 0x10FFFF },
-    };
-
-    /// Whether markup may carry `value` as itself.
-    /// @param value A decoded code point.
-    /// @return True when the `Char` production admits it.
-    [[nodiscard]] constexpr bool MarkupMayCarry(char32_t value) noexcept
-    {
-        // `any_of` rather than a scan, unlike `EscapeFor` below: this one answers a
-        // boolean and so has a spelling clang-tidy's `readability-use-anyofallof`
-        // accepts, while that one returns a value out of the range and does not.
-        return std::ranges::any_of(
-            MarkupCarriable, [value](CodePointRange const& range) { return value >= range.first && value <= range.last; });
-    }
-
 } // namespace Detail
-
-/// Escape text for HTML or SVG.
-///
-/// Every value the fleet surfaces came off a wire: a toolchain fingerprint and an
-/// endpoint are whatever a peer sent, and the page and the charts both interpolate
-/// them. Shared between the two renderers rather than copied, because two copies
-/// are two places for one of them to be forgotten.
-///
-/// `apps/fastcache-cc/Stats.cpp` keeps its own sibling of this deliberately: that
-/// binary does not link this library at all, which is a documented constraint
-/// rather than an oversight.
-/// @param text Untrusted text.
-/// @return The same text, safe to interpolate into markup, and valid UTF-8
-///         whatever it was given.
-[[nodiscard]] inline std::string EscapeMarkup(std::string_view text)
-{
-    std::string out;
-    out.reserve(text.size());
-    while (!text.empty())
-    {
-        auto const ch = text.front();
-        if (auto const escape = EscapeFor(Detail::MarkupEscapes, ch); !escape.empty())
-        {
-            out += escape;
-            text.remove_prefix(1);
-        }
-        else if (auto const decoded = DecodeUtf8(text); decoded.has_value() && Detail::MarkupMayCarry(decoded->value))
-        {
-            out += text.substr(0, decoded->length);
-            text.remove_prefix(decoded->length);
-        }
-        else
-        {
-            // Replaced rather than escaped, which is the whole difference from the
-            // JSON branch: nothing here has a spelling markup accepts, so the choice
-            // is a replacement or a document nothing will parse.
-            //
-            // A code point the production excludes is consumed WHOLE -- one
-            // replacement for the sequence, not one per byte. Only bytes that
-            // decoded to nothing advance singly, because there is no sequence to
-            // consume.
-            out += MarkupReplacement;
-            text.remove_prefix(decoded.has_value() ? decoded->length : 1);
-        }
-    }
-    return out;
-}
 
 /// Append one JSON string literal, quotes included.
 /// @param out Where to append.

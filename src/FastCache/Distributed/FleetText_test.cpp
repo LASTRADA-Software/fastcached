@@ -9,13 +9,13 @@
 #include <string>
 #include <string_view>
 
+using FastCache::EscapeMarkup;
 using FastCache::IsValidUtf8;
+using FastCache::MarkupReplacement;
 using FastCache::Distributed::AppendJsonText;
 using FastCache::Distributed::DelimitedReplacement;
 using FastCache::Distributed::EscapeDelimited;
-using FastCache::Distributed::EscapeMarkup;
 using FastCache::Distributed::JsonReplacement;
-using FastCache::Distributed::MarkupReplacement;
 using namespace std::string_view_literals;
 
 // Every expectation is built from the header's own constants rather than from a
