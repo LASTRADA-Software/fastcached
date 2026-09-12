@@ -279,14 +279,22 @@ endif()
 #     equivalent went untested until CI found a vendored file the walk excluded by name.
 #
 #     `untracked` plants a violation where CPM actually puts one and leaves it untracked;
-#     it must be ignored. `tracked-bad` tracks one; it must still be caught, so that
-#     "ignore what git does not track" cannot degrade into "ignore everything".
+#     it must be ignored. `tracked-bad` tracks one under `src/`; it must still be caught,
+#     so that "ignore what git is not asked about" cannot degrade into "ignore
+#     everything". `tracked-vendored` is the direction the other two cannot see.
+#
+#     TRACKED used to be the same set as OURS, and `tracked-bad` encoded that identity
+#     by force-adding a file under `.cache/CPM/` -- an accident, but the only way a
+#     tracked non-first-party file could arise. `vendor/` ends the identity: it holds 28
+#     tracked `*_test.cpp` files copied verbatim from upstream, which nobody here may
+#     edit, so the discriminator is now "tracked AND under src/". Both directions are
+#     asserted, because a scan narrowed to nothing at all also reports no violations.
 find_program(FASTCACHED_GIT NAMES git)
 if(NOT FASTCACHED_GIT)
     list(APPEND failures
          "git-mode: no git executable, so the mode CI actually uses could not be exercised at all -- inconclusive, not a pass")
 else()
-    foreach(case "untracked" "tracked-bad" "tracked-deleted")
+    foreach(case "untracked" "tracked-bad" "tracked-vendored" "tracked-deleted")
         set(tree "${root}/git-${case}")
         file(REMOVE_RECURSE "${tree}")
         file(MAKE_DIRECTORY "${tree}/src/thing")
@@ -295,6 +303,19 @@ else()
         file(MAKE_DIRECTORY "${tree}/.cache/CPM/catch2/deadbeef/tests")
         file(WRITE "${tree}/.cache/CPM/catch2/deadbeef/tests/Vendored_test.cpp"
              "TEST_CASE(\"vendored\")\n{\n    SUCCEED(\"cannot run here\")${SEMI}\n}\n")
+        # One violating body, planted at two paths by the two cases below, so that the
+        # only thing separating "caught" from "ignored" is WHERE the file sits. Identical
+        # bytes are the point: differing fixtures could be caught and ignored for reasons
+        # having nothing to do with the path, and neither case would say so.
+        set(trackedViolation
+            "TEST_CASE(\"vendored\")\n{\n    SUCCEED(\"cannot run here\")${SEMI}\n}\n")
+        if(case STREQUAL "tracked-bad")
+            file(WRITE "${tree}/src/thing/Bad_test.cpp" "${trackedViolation}")
+        endif()
+        if(case STREQUAL "tracked-vendored")
+            file(MAKE_DIRECTORY "${tree}/vendor/endo/tui")
+            file(WRITE "${tree}/vendor/endo/tui/Upstream_test.cpp" "${trackedViolation}")
+        endif()
 
         # The fixture's own git commands are CHECKED. When `git add` fails -- it did,
         # with "Filename too long", under a long scratch path -- the tree has no index
@@ -313,12 +334,19 @@ else()
             set(gitSetup "git add: ${gitError}")
         endif()
         if(case STREQUAL "tracked-bad")
-            # Forced in, since a real checkout would have it ignored.
-            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add -f
-                            ".cache/CPM/catch2/deadbeef/tests/Vendored_test.cpp"
+            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+                            "src/thing/Bad_test.cpp"
                             OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
             if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
-                set(gitSetup "git add -f: ${gitError}")
+                set(gitSetup "git add: ${gitError}")
+            endif()
+        endif()
+        if(case STREQUAL "tracked-vendored")
+            execute_process(COMMAND "${FASTCACHED_GIT}" -C "${tree}" add
+                            "vendor/endo/tui/Upstream_test.cpp"
+                            OUTPUT_QUIET ERROR_VARIABLE gitError RESULT_VARIABLE gitStatus)
+            if(NOT gitStatus EQUAL 0 AND gitSetup STREQUAL "")
+                set(gitSetup "git add: ${gitError}")
             endif()
         endif()
         if(NOT gitSetup STREQUAL "")
@@ -350,6 +378,17 @@ else()
                 list(APPEND failures
                      "git-tracked-deleted: a tracked file deleted from the worktree made the check fail -- an unreadable path is not a SUCCEED finding, and the registration cannot tell the two apart")
             endif()
+        elseif(case STREQUAL "tracked-vendored")
+            # The direction that fails OPEN, so it gets the positive control rather
+            # than the bare negative: "nothing reported" is also what a scan narrowed
+            # to the empty set produces, and that would pass here while silently
+            # covering none of this repository's own tests.
+            if(objected)
+                list(APPEND failures
+                     "git-tracked-vendored: a violation in a TRACKED vendored file was reported -- vendor/ is copied verbatim from upstream and nobody here may edit it, so the first upstream sync adding a SUCCEED would redden a check about OUR code")
+            endif()
+            fastcached_expect_text("${output}" "in 2 test source(s)"
+                "git-tracked-vendored: the vendored file was ignored, but the scan did not go on to cover the 2 first-party sources beside it -- a scan narrowed to nothing reports no violations too, so this case would pass with all coverage gone")
         elseif(NOT objected)
             list(APPEND failures
                  "git-tracked-bad: a TRACKED violation was not reported -- deriving the set from git must not degrade into ignoring everything")
@@ -358,7 +397,7 @@ else()
             # a bare `objected` would accept the emptiness guard, or an unreadable file,
             # as proof that a tracked violation was caught.
             fastcached_expect_text("${output}" "says the check could not be performed"
-                "git-tracked-bad: the check objected for some other reason than the vendored file's message, so this case does not show a TRACKED violation being caught")
+                "git-tracked-bad: the check objected for some other reason than the first-party file's message, so this case does not show a TRACKED violation being caught")
         endif()
     endforeach()
 endif()
