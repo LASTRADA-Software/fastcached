@@ -4669,6 +4669,113 @@ TEST_CASE("AllowlistAnnouncement says what changed, and stays quiet when nothing
     }
 }
 
+TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surface, and tells nobody else",
+          "[node][config][observability]")
+{
+    // #1304. `--admin-listen` is off unless asked for, so a worker in a fleet runs with
+    // no `/healthz`, no `/metrics` and no dashboard while everything else works: opt-in
+    // monitoring whose failure mode is silence. The remark is the whole fix -- the
+    // default is deliberately NOT flipped -- and it is a pure function because
+    // `main.cpp` is in no test target (#909).
+
+    // **Every case names `--scheduler`, and that is the point.** It is required of
+    // every startable node, a pure `--serve-scheduler` included, so it is no evidence
+    // of a fleet -- a predicate reading it would fire on every node there is, which is
+    // exactly the single-machine install this remark has to stay off.
+    auto const base = [] {
+        NodeConfig cfg;
+        cfg.scheduler = std::string { SchedulerEndpoint };
+        return cfg;
+    };
+
+    SECTION("a single-machine install says nothing")
+    {
+        CHECK_FALSE(ObservabilityAnnouncement(base()).has_value());
+    }
+
+    SECTION("a loopback-only member list is still one machine")
+    {
+        // This is what picks `AdmitsRemotePeers` out of the three spellings of *is this
+        // a fleet participant* that deliberately disagree: the reachability rows' gate
+        // answers YES here, because `--fleet-member` was given at all.
+        auto cfg = base();
+        cfg.fleetMembers = { "127.0.0.1" };
+        CHECK_FALSE(ObservabilityAnnouncement(cfg).has_value());
+    }
+
+    SECTION("a member named `localhost` is told, because nothing here may trust a name")
+    {
+        // **Not a hole, and not an oversight either way round.** `IsLoopbackHost`
+        // deliberately does not call `localhost` loopback -- it answers security
+        // questions, where a name a resolver decides must not be trusted -- so
+        // `AdmitsRemotePeers` reads such a member as another machine and the remark
+        // fires. That is the safe direction for a REMARK: the worst it costs a
+        // one-machine install spelled this way is one line it did not need, where the
+        // other reading would silence a real fleet whose member list happens to be
+        // written with names. Asserted rather than left to be discovered, because it
+        // is the one input where this case and the one above disagree.
+        auto cfg = base();
+        cfg.fleetMembers = { "localhost" };
+        CHECK(ObservabilityAnnouncement(cfg).has_value());
+    }
+
+    SECTION("a node admitting another machine is told, and told what to type")
+    {
+        auto cfg = base();
+        cfg.fleetMembers = { "10.0.0.2" };
+        auto const said = ObservabilityAnnouncement(cfg);
+        REQUIRE(said.has_value());
+
+        // What is unavailable, all three of them, and the flag that provides it: the
+        // whole of the ticket's acceptance clause.
+        CHECK(Unwrap(said).contains("/healthz"));
+        CHECK(Unwrap(said).contains("/metrics"));
+        CHECK(Unwrap(said).contains("dashboard"));
+        CHECK(Unwrap(said).contains("--admin-listen"));
+        // The REMEDY, not just the flag's name. Dropping `--admin-listen=<port> opens
+        // it` while keeping the sentence that explains what the flag serves left this
+        // case GREEN -- measured -- because the name still appeared in the explanation.
+        // The half an operator acts on is the half that has to be pinned.
+        CHECK(Unwrap(said).contains("--admin-listen=<port>"));
+
+        // And that the node is FINE. A remark read as a fault sends an operator to
+        // inspect a healthy worker, which is worse than having said nothing.
+        CHECK(Unwrap(said).contains("configured rather than broken"));
+    }
+
+    SECTION("--fleet-open and a consensus join reach it too")
+    {
+        // Three routes into `AdmitsRemotePeers` with no member list between them, so a
+        // predicate written against `--fleet-member` alone passes the case above and
+        // fails both of these.
+        auto open = base();
+        open.fleetOpen = true;
+        CHECK(ObservabilityAnnouncement(open).has_value());
+
+        auto joining = base();
+        joining.raftJoin = true;
+        CHECK(ObservabilityAnnouncement(joining).has_value());
+    }
+
+    SECTION("the same node with an admin surface says nothing")
+    {
+        // Asked of the surface ROW, so all three spellings of a served admin port count
+        // -- a bare port, which binds loopback, exactly as an address does.
+        auto cfg = base();
+        cfg.fleetOpen = true;
+
+        // `CAPTURE` rather than three spelled-out assertions: the loop is the same
+        // three cases, and without the capture a failure would name the line instead
+        // of the spelling, which is the one thing the separate statements gave away.
+        for (auto const* const listen: { "9100", "127.0.0.1:9100", "0.0.0.0:9100" })
+        {
+            cfg.adminListen = listen;
+            CAPTURE(listen);
+            CHECK_FALSE(ObservabilityAnnouncement(cfg).has_value());
+        }
+    }
+}
+
 TEST_CASE("The worker parses --seed-config, and no file may carry it", "[node][config]")
 {
     // #397. The verb exists on the WORKER rather than being `fastcached --seed-config`

@@ -177,9 +177,22 @@ extern "C" void HandleNodeReloadSignal(int /*signum*/)
 /// premise is worth more than either half
 /// ([#292](https://github.com/LASTRADA-Software/fastcached/issues/292)).
 ///
-/// So SIGHUP is handled, and what it can change is decided by the table: today only
-/// `--log-level`, which is the field an operator reaches for mid-incident and the one
-/// `ILogger` can actually be told about while running.
+/// So SIGHUP is handled, and **what it can change is decided by the table** --
+/// `NodeOptions()`'s `reloadable` column, which is the one place that answer lives.
+///
+/// This sentence used to finish *"today only `--log-level`"*, and that was a second
+/// source of truth for a fact the table already held. It had gone false: the column
+/// marks several rows now, among them `--requirepass` and the flags that decide who
+/// this node admits. So a reader who believed the comment thought a SIGHUP could not
+/// rotate this node's credential or change its admission policy, when it can do both
+/// -- which is the wrong direction to be wrong in, and exactly the reading somebody
+/// reaches for while deciding whether a reload is safe to send.
+///
+/// **No corrected count replaces it.** A restated figure drifts again, and the reason
+/// to name one here was never good: whoever needs the set can read the column, and
+/// whoever needs it to be RIGHT needs it in one place rather than two that agree
+/// today. `--log-level` is still the field an operator reaches for mid-incident and
+/// the one `ILogger` can be told about while running -- an example, not the set.
 void InstallNodeStopHandlers()
 {
     std::signal(SIGINT, &HandleNodeStopSignal);
@@ -691,6 +704,19 @@ void AdoptAllowlist(Cc::CompileJobRunner& jobs,
     jobs.ReplaceExtraAllowedArgs(appliedExtraArgs);
     if (auto const said = Node::AllowlistAnnouncement(Node::AllowlistMoment::Startup, {}, appliedExtraArgs))
         logger.Log(LogLevel::Warn, *said);
+
+    // **A node that works for other machines and opens no admin surface is told once,
+    // at INFO** (#1304). `--admin-listen` is off unless asked for, so such a node has
+    // no `/healthz`, no `/metrics` and no dashboard: everything works and nothing off
+    // this machine can see it. The default is deliberately NOT flipped -- binding a
+    // port nobody asked for is the decision this binary refuses everywhere.
+    //
+    // WHO it applies to and WHAT it says are `Node::ObservabilityAnnouncement`'s, for
+    // the reason the line above delegates: this file is in no test target (#909), so a
+    // rule written here could only ever be checked by reading it. INFO rather than the
+    // Warn beside it because nothing was widened and nothing is wrong.
+    if (auto const said = Node::ObservabilityAnnouncement(cfg))
+        logger.Log(LogLevel::Info, *said);
 
     // A lease is CHECKED, and by a validator built about a hundred lines below --
     // `MakeWorkerLeaseValidator`, which verifies the grant's MAC, the endpoint it

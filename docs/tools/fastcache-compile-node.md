@@ -2022,6 +2022,29 @@ cache rather than as no cache at all.
 tell that the process is alive but not that it is *answering*, which is the state
 a wedged worker is in. It is what `systemd`'s and Kubernetes' probes want.
 
+**A node that works for other machines and has no `--admin-listen` says so once, at
+startup.** Nothing is wrong with such a node — it registers, caches and compiles
+exactly as configured — but nothing off its own machine can see any of that, so over a
+fleet this is opt-in monitoring whose failure mode is silence
+([#1304](https://github.com/LASTRADA-Software/fastcached/issues/1304)):
+
+```
+[INFO] this node works for machines other than this one and opens no admin surface:
+/healthz, /metrics and the fleet dashboard are all served on --admin-listen, which is
+off unless asked for. …
+```
+
+It is a remark rather than a refusal, and the default is deliberately **not** flipped:
+binding a port nobody asked for is the decision this binary refuses everywhere, and a
+default `--admin-listen` beside `--dashboard` would either publish the fleet page
+unauthenticated or make `--dashboard-token-file` mandatory on every install.
+
+A node whose policy admits only its own machine — the single-machine install — is never
+told, since it has nobody else to be observable to. Naming `--scheduler` is not what
+decides that, because every startable node must name one. A `--fleet-member` written as
+a *name* rather than an address is told: `localhost` is something a resolver decides,
+and nothing that judges who may reach this machine treats one as this machine.
+
 ### Every other series a node exports
 
 The tables below complete the set: every `fastcache_*` series a node renders that is
