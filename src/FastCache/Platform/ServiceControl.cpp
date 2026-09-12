@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
+#include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/PathKind.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -494,16 +497,229 @@ std::optional<std::string> ServiceNameRejection(ServiceSpec const& spec)
     return std::nullopt;
 }
 
-std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec)
+namespace
 {
-    // A table, so a new rule is a new row rather than another `if` threaded
-    // through both platforms' InstallService.
-    using Validator = std::optional<std::string> (*)(ServiceSpec const&);
-    constexpr auto Validators = std::to_array<Validator>({ &ServiceNameRejection, &InlineCredentialRejection });
+    /// One text a supervisor records about a job, and what a refusal calls it.
+    ///
+    /// A row rather than a parameter pair because the refusal walks a LIST: the
+    /// failure this guards against is a field being added to `ServiceSpec` and
+    /// nobody remembering to ask about it, which is the argument `Core/Utf8.hpp`
+    /// makes for `TextField` and the reason that one is a table too. It is not
+    /// `TextField<ServiceSpec>` because two of these are not projectable as a
+    /// `string_view`: `exePath` is a `std::filesystem::path`, whose `string()` is a
+    /// temporary, and `arguments` is a vector that contributes a row each.
+    struct RecordedText
+    {
+        std::string_view what; ///< How a refusal names it.
+        std::string_view text; ///< The text itself.
+    };
 
-    for (auto const validator: Validators)
-        if (auto rejection = validator(spec))
+    /// The offending byte, rendered for a refusal.
+    ///
+    /// The offset and the byte, never the text: a refusal about bytes that are not
+    /// UTF-8 must not print them, or the diagnostic is the corruption one step
+    /// further on.
+    /// @param text The value.
+    /// @param at Offset of the byte to describe.
+    /// @return e.g. `at offset 3 (0x8b)`.
+    [[nodiscard]] std::string ByteAt(std::string_view text, std::size_t at)
+    {
+        return std::format("at offset {} (0x{:02x})", at, static_cast<unsigned>(static_cast<unsigned char>(text[at])));
+    }
+
+    /// Why @p text is not text at all, if it is not.
+    ///
+    /// EVERY supervisor, because this is not a question about a document format. Both
+    /// record what they are given as text, and this process's `char` is UTF-8 on every
+    /// platform it ships to -- the tree declares the UTF-8 process code page and passes
+    /// `/utf-8` -- so a byte belonging to no valid sequence is not text for either of
+    /// them, and a registration replays it forever.
+    /// @param what How to name the field.
+    /// @param text Its value.
+    /// @return The message, or nullopt when @p text is well-formed UTF-8.
+    [[nodiscard]] std::optional<std::string> NotTextForAnySupervisor(std::string_view what, std::string_view text)
+    {
+        if (IsValidUtf8(text))
+            return std::nullopt;
+
+        auto const at = FirstUncarriableByte(text);
+        return std::format("{} carries a byte {} that belongs to no valid UTF-8 sequence, so it is not text. A "
+                           "service registration records what it is given and replays it at every start, so this is "
+                           "refused now rather than stored mangled. This rule asks only whether the bytes are text: "
+                           "what a particular supervisor's job description can carry is a separate question, asked "
+                           "separately.",
+                           what,
+                           ByteAt(text, at.value_or(0)));
+    }
+
+    /// Why @p text cannot go into a launchd job description, if it cannot.
+    ///
+    /// LAUNCHD ONLY, and the scope is the whole point of it being its own rule. A plist
+    /// is XML, and XML 1.0's `Char` production forbids most C0 controls outright --
+    /// `&#xB;` is as unparseable as the raw byte -- and stops at U+FFFD, so U+FFFE and
+    /// U+FFFF are excluded while being perfectly good UTF-8. The Windows SCM stores
+    /// UTF-16 and carries all of those, so applying this there refuses an install that
+    /// previously worked, under a message about an operating system the operator is not
+    /// running.
+    /// @param what How to name the field.
+    /// @param text Its value.
+    /// @return The message, or nullopt when a plist can carry the whole of @p text.
+    [[nodiscard]] std::optional<std::string> UnrecordableText(std::string_view what, std::string_view text)
+    {
+        auto const at = FirstUncarriableByte(text);
+        if (!at.has_value())
+            return std::nullopt;
+
+        // The closing sentences are not padding. A guard's remedy text is the only
+        // part of it most people ever read, nothing tests it, and the question to ask
+        // of it is not *is this accurate* but *if I did exactly what this says, where
+        // do I end up*. Two readers can be sent somewhere useless here: one who
+        // concludes the table gate is the whole protection and deletes
+        // `BuildLaunchdPlist`'s replacement as redundant, and one on Windows who reads
+        // about a property list they do not have.
+        return std::format("{} carries a byte {} that an XML property list cannot express: XML 1.0 forbids the code "
+                           "point outright, and a forbidden C0 control has no character reference to escape it to. "
+                           "launchd would reject the job with no explanation, so this is refused here instead. "
+                           "This rule is about launchd's plist and applies on macOS only -- the Windows SCM stores "
+                           "UTF-16 and carries these code points. And it covers only what the parsed configuration "
+                           "carries: the job's log directory is derived from the environment and is answered by "
+                           "BuildLaunchdPlist replacing what markup cannot carry, which is a separate protection "
+                           "and not redundant with this one.",
+                           what,
+                           ByteAt(text, *at));
+    }
+    /// How a refusal names one field, given its value.
+    ///
+    /// A function pointer rather than two near-identical walks: the FIELD LIST is the
+    /// thing worth writing once -- the failure it guards against is a field being added
+    /// to `ServiceSpec` and nobody remembering to ask about it -- and the two rules
+    /// differ only in what they ask of each value.
+    using FieldRule = std::optional<std::string> (*)(std::string_view, std::string_view);
+
+    /// The flag an argument names, parenthesised, when it can be taken safely.
+    ///
+    /// Read only as far as `=`, and only while every byte stays printable ASCII, so
+    /// naming the argument can never print the bytes a refusal exists NOT to print.
+    /// Anything else yields nothing and the index alone identifies the argument.
+    /// @param argument One launch argument.
+    /// @return e.g. ` (--storage)`, or an empty string.
+    [[nodiscard]] std::string FlagHint(std::string_view argument)
+    {
+        if (!argument.starts_with("--"))
+            return {};
+        auto const name = argument.substr(0, argument.find('='));
+        auto const printable = [](char ch) {
+            auto const byte = static_cast<unsigned char>(ch);
+            return byte >= 0x20U && byte < 0x7FU;
+        };
+        if (name.size() < 3 || !std::ranges::all_of(name, printable))
+            return {};
+        return std::format(" ({})", name);
+    }
+
+    std::optional<std::string> TextRejection(ServiceSpec const& spec, FieldRule rule)
+    {
+        // WHY A REFUSAL AND NOT ONLY THE ESCAPING. Every one of these reaches an
+        // OPERATIVE field: `ProgramArguments[0]` is a path launchd must open, the
+        // arguments are the daemon's command line, `Label` is the handle every
+        // `launchctl` subcommand takes, and `UserName` is an account that has to
+        // resolve. BuildLaunchdPlist replaces what markup cannot carry, which keeps the
+        // document parseable -- but a replaced byte in a PATH is a plist that parses and
+        // names something that does not exist, so the install would report success and
+        // the job would fail on every boot with nothing to diagnose it by. That is the
+        // same outcome as the malformed document, relocated. This project's own rule for
+        // registrations is that a registration replays its command line forever, so
+        // refuse it while somebody is watching.
+        //
+        // WHAT THIS DOES NOT COVER, and why that is the escaping's job rather than this
+        // one's: the log directory. `DefaultLogDirectory` derives it from the user's HOME
+        // for a user-scope job, so it is a fact about the ENVIRONMENT rather than about
+        // the parsed configuration -- and a refusal that depends on nothing but the
+        // parsed configuration is what belongs in this table. An operator cannot act on
+        // "your home directory is not UTF-8" by editing a flag, so that one is carried by
+        // BuildLaunchdPlist being total instead.
+        //
+        // `serviceName` is in the list even though `ServiceNameRejection` also inspects
+        // it. That rule answers a different question -- path traversal -- with a control
+        // check that happens to overlap, it is also called on its own from the uninstall
+        // and status paths where only the name matters, and it says nothing about
+        // ENCODING. So neither rule subsumes the other and neither is redundant.
+        auto const exePath = spec.exePath.string();
+
+        std::vector<RecordedText> recorded {
+            RecordedText { .what = "--service-name", .text = spec.serviceName },
+            RecordedText { .what = "the executable path", .text = exePath },
+            RecordedText { .what = "the service account name", .text = spec.serviceAccount },
+            RecordedText { .what = "the display name", .text = spec.displayName },
+            RecordedText { .what = "the service description", .text = spec.description },
+        };
+        recorded.reserve(recorded.size() + spec.arguments.size());
+
+        // Owns the labels the rows below borrow: `RecordedText::what` is a view, so a
+        // `std::format` temporary would dangle before the walk reads it.
+        std::vector<std::string> argumentLabels;
+
+        // Each argument named INDIVIDUALLY, and the offset is relative to that argument.
+        // Labelled "a launch argument" they were indistinguishable: with six
+        // `ProgramArguments` an operator was told *a launch argument carries a byte at
+        // offset 3* and had no way to tell which. The flag name is included when it can be
+        // taken safely -- it is read only up to `=` and only while it stays printable
+        // ASCII, so naming the argument can never print the bytes the refusal exists to
+        // avoid printing.
+        argumentLabels.reserve(spec.arguments.size());
+        for (auto const index: std::views::iota(std::size_t { 0 }, spec.arguments.size()))
+            argumentLabels.push_back(std::format("launch argument {}{}", index + 1, FlagHint(spec.arguments[index])));
+        for (auto const index: std::views::iota(std::size_t { 0 }, spec.arguments.size()))
+            recorded.push_back(RecordedText { .what = argumentLabels[index], .text = spec.arguments[index] });
+
+        for (auto const& [what, text]: recorded)
+            if (auto rejection = rule(what, text))
+                return rejection;
+
+        return std::nullopt;
+    }
+} // namespace
+
+std::optional<std::string> SupervisorTextRejection(ServiceSpec const& spec)
+{
+    return TextRejection(spec, &NotTextForAnySupervisor);
+}
+
+std::optional<std::string> LaunchdTextRejection(ServiceSpec const& spec)
+{
+    return TextRejection(spec, &UnrecordableText);
+}
+
+std::optional<std::string> ServiceRegistrationRejection(ServiceSpec const& spec, SupervisorKind supervisor)
+{
+    // A table, so a new rule is a new row rather than another `if` threaded through
+    // both platforms' InstallService -- and the SCOPE is a column, so a rule that is
+    // true of one supervisor and not the other does not need a second gate. A rule
+    // with no `onlyFor` runs everywhere.
+    struct RegistrationRule
+    {
+        std::optional<SupervisorKind> onlyFor;                      ///< nullopt = every supervisor.
+        std::optional<std::string> (*validate)(ServiceSpec const&); ///< The rule.
+    };
+
+    auto const rules = std::to_array<RegistrationRule>({
+        RegistrationRule { .onlyFor = std::nullopt, .validate = &ServiceNameRejection },
+        RegistrationRule { .onlyFor = std::nullopt, .validate = &SupervisorTextRejection },
+        // A plist is XML and the SCM is not, so this one is scoped. Applied to the SCM
+        // it refused a display name carrying a C0 control or U+FFFE -- both of which
+        // Windows stores and replays perfectly well -- and told the operator that
+        // launchd would reject their job.
+        RegistrationRule { .onlyFor = SupervisorKind::Launchd, .validate = &LaunchdTextRejection },
+        RegistrationRule { .onlyFor = std::nullopt, .validate = &InlineCredentialRejection },
+    });
+
+    for (auto const& rule: rules)
+    {
+        if (rule.onlyFor.has_value() && *rule.onlyFor != supervisor)
+            continue;
+        if (auto rejection = rule.validate(spec))
             return rejection;
+    }
 
     return std::nullopt;
 }
@@ -606,42 +822,6 @@ namespace
         auto const* const traits = FindOrNull(ScopeTable, scope, &ScopeTraits::scope);
         return traits != nullptr ? *traits : ScopeTable.front();
     }
-
-    /// XML-escape @p text for use as a plist text node.
-    ///
-    /// Not cosmetic: a storage path containing `&` (legal on every filesystem
-    /// fastcached supports) produces a malformed document, and launchd rejects
-    /// the whole job without saying why.
-    [[nodiscard]] std::string XmlEscape(std::string_view text)
-    {
-        std::string out;
-        out.reserve(text.size());
-        for (auto const ch: text)
-        {
-            switch (ch)
-            {
-                case '&':
-                    out += "&amp;";
-                    break;
-                case '<':
-                    out += "&lt;";
-                    break;
-                case '>':
-                    out += "&gt;";
-                    break;
-                case '"':
-                    out += "&quot;";
-                    break;
-                case '\'':
-                    out += "&apos;";
-                    break;
-                default:
-                    out += ch;
-                    break;
-            }
-        }
-        return out;
-    }
 } // namespace
 
 std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text)
@@ -688,9 +868,9 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
     // `spec.daemonFlag` is deliberately not emitted, and that is the whole
     // point of holding it apart: launchd supervises the process it started, and
     // a job that double-forks is reaped instantly as "exited".
-    std::string arguments = std::format("        <string>{}</string>\n", XmlEscape(spec.exePath.string()));
+    std::string arguments = std::format("        <string>{}</string>\n", EscapeMarkup(spec.exePath.string()));
     for (auto const& arg: spec.arguments)
-        arguments += std::format("        <string>{}</string>\n", XmlEscape(arg));
+        arguments += std::format("        <string>{}</string>\n", EscapeMarkup(arg));
 
     // ProcessType is not optional for a cache daemon: launchd gives a job with
     // no declared type the "Background" resource band, which throttles its CPU
@@ -703,7 +883,7 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n";
     out += "<plist version=\"1.0\">\n";
     out += "<dict>\n";
-    out += std::format("    <key>Label</key>\n    <string>{}</string>\n", XmlEscape(label));
+    out += std::format("    <key>Label</key>\n    <string>{}</string>\n", EscapeMarkup(label));
     out += std::format("    <key>ProgramArguments</key>\n    <array>\n{}    </array>\n", arguments);
     out += "    <key>RunAtLoad</key>\n    <true/>\n";
 
@@ -733,9 +913,9 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
            "        <key>NumberOfFiles</key>\n        <integer>8192</integer>\n"
            "    </dict>\n";
     out += std::format("    <key>StandardOutPath</key>\n    <string>{}</string>\n",
-                       XmlEscape((logDirectory / std::format("{}.out.log", label)).string()));
+                       EscapeMarkup((logDirectory / std::format("{}.out.log", label)).string()));
     out += std::format("    <key>StandardErrorPath</key>\n    <string>{}</string>\n",
-                       XmlEscape((logDirectory / std::format("{}.err.log", label)).string()));
+                       EscapeMarkup((logDirectory / std::format("{}.err.log", label)).string()));
     out += "</dict>\n";
     out += "</plist>\n";
 
@@ -1271,7 +1451,7 @@ namespace
 
 ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scope*/)
 {
-    if (auto const rejection = ServiceRegistrationRejection(spec))
+    if (auto const rejection = ServiceRegistrationRejection(spec, SupervisorKind::Scm))
         return { .exitCode = 1, .message = *rejection };
 
     auto const exe = CurrentExecutablePath();
@@ -1774,7 +1954,7 @@ namespace
 
 ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope scope)
 {
-    if (auto const rejection = ServiceRegistrationRejection(spec))
+    if (auto const rejection = ServiceRegistrationRejection(spec, SupervisorKind::Launchd))
         return { .exitCode = 1, .message = *rejection };
 
     if (spec.exePath.empty())

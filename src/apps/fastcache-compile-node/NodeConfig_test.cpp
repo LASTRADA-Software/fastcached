@@ -474,7 +474,7 @@ TEST_CASE("NodeConfig: the credential is never written into a registration", "[n
 
     // Present, so the shared gate refuses the install rather than dropping the
     // secret in silence.
-    CHECK(ServiceRegistrationRejection(spec).has_value());
+    CHECK(ServiceRegistrationRejection(spec, SupervisorKind::Launchd).has_value());
 }
 
 TEST_CASE("NodeConfig: every toolchain is re-emitted", "[node][service]")
