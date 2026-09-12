@@ -5347,9 +5347,13 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
 # here: a credential under a name its table does not carry is invisible to it. The
 # compensating rule is that every row must still MATCH something -- a term that has quietly
 # stopped matching is a guard that has quietly stopped guarding, and reads identically to a
-# clean tree (#492). That arm is not decoration: the table's first draft carried a
-# `clusterKey` row, the check refused the real tree over it, and the row was wrong -- this
-# tree names no such variable, only `clusterKeyFile`, which is a PATH and not the secret.
+# clean tree (#492). That arm is not decoration, and `clusterKey` is the worked example of it
+# firing in BOTH directions: the table's first draft carried that row, the check refused the
+# real tree because the row matched nothing, and the row came out. #1298 then gave the tree a
+# `clusterKey` -- `EnrollReading` holds the secret an enrolling node is handed -- so the row
+# went back in, and the same arm is what makes its absence a refusal now rather than an
+# oversight. The reasoning for the row lives on the script beside the row itself and is not
+# restated here; what this comment owes is the reason the ARM exists, which is unchanged.
 add_test(
     NAME "credential-containers"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh"
