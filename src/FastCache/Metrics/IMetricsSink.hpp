@@ -1251,6 +1251,16 @@ class IMetricsSink
 class AtomicMetricsSink final: public IMetricsSink
 {
   public:
+    /// @note Dropping is the only thing this can do, and that is a constraint
+    ///       rather than a decision: an increment has no return value and this
+    ///       sink has no channel to report on, so there is nowhere for the
+    ///       condition `Carries` names to go from here. The counter is not
+    ///       written -- the alternative is an out-of-range atomic write -- and in
+    ///       a RELEASE build the drop is therefore silent here by necessity,
+    ///       which is exactly why `Carries` exists for callers to ask first. It
+    ///       is not silent everywhere: `CarriesCounter` asserts, so a debug build
+    ///       aborts at this site rather than dropping. See `Carries`' contract on
+    ///       `IMetricsSink`; it is stated there rather than restated here.
     void Increment(Counter counter, std::uint64_t by = 1) noexcept override
     {
         if (!CarriesCounter(counter))

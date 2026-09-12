@@ -793,6 +793,34 @@ static_assert(RowsInEnumeratorOrder(CounterTable, &CounterDescriptor::counter),
 ///
 /// `Last` is not a metric and has no row; it yields nullptr rather than a
 /// placeholder, so a caller that reached here with it fails visibly.
+///
+/// **An ordinal PAST `Last` is a different condition from `Last` itself**, and
+/// this function answers both with nullptr while they mean opposite things.
+/// `Last` is an ordinary caller mistake. Past it is what
+/// `IMetricsSink::Carries` names: a build whose catalogue and sink were compiled
+/// against different versions of `Counter`, which is inconsistent rather than
+/// misused. That contract is stated once on `IMetricsSink` and is not restated
+/// here.
+///
+/// nullptr is what a LOOKUP can honestly answer in both cases -- there is no row
+/// to return and inventing a placeholder would be worse -- so this site matches
+/// the contract rather than implementing it.
+///
+/// **`Carries` does not stand in for the null check here**, and the broader claim
+/// is the one to avoid: the caller that renders the whole table
+/// (`PrometheusFormatter`) walks `CounterTable` itself and asks the SINK's
+/// `Carries` per row, so it never reaches this lookup at all. The two predicates
+/// also answer for different translation units -- in the skew direction where the
+/// SINK saw the longer enum, `Carries` says `true` for an ordinal this catalogue
+/// has no row for, which is this nullptr reached past a `Carries` that agreed. A
+/// skewed build is unsound in both directions, as `IMetricsSink::Carries` states
+/// narrowly.
+///
+/// So what this site owes a caller is a null rather than a plausible value --
+/// whether to CHECK it is the caller's own question, and the one production
+/// caller (`FleetView`) dereferences unconditionally on the strength of the
+/// `static_assert` above. That is sound for its own translation unit, which is
+/// the scope this note declines to generalise past.
 /// @param counter The counter to look up.
 /// @return Its descriptor, or nullptr for `Last` or an out-of-range value.
 [[nodiscard]] constexpr CounterDescriptor const* DescriptorOf(IMetricsSink::Counter counter) noexcept
