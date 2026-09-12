@@ -270,6 +270,66 @@ target_include_directories(fastcache-tui SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_D
 target_link_libraries(fastcache-tui PUBLIC unicode::unicode)
 target_compile_features(fastcache-tui PUBLIC cxx_std_23)
 
+# `/utf-8` on MSVC, and this is CORRECTNESS rather than warning policy -- the
+# distinction matters because the symptom arrives as a warning and the tempting
+# repair is to silence it.
+#
+# `cmake/Utf8CodePage.cmake` applies this flag directory-wide AFTER every
+# third-party fetch, deliberately, "so a third-party source with a byte this would
+# refuse is never handed the flag". That is right for a dependency of unknown
+# encoding. It is wrong for THIS one: the vendored TUI is UTF-8 and its whole job
+# is drawing box characters.
+#
+# Without the flag MSVC reads these sources in the host ANSI code page and
+# re-encodes their narrow literals into it. Measured with cl.exe on a CP-1252
+# host, ~50 diagnostics in Box.cpp alone:
+#
+#     Box.cpp(29): warning C4566: character represented by universal-character-name
+#     '─' cannot be represented in the current code page (1252)
+#
+# `─` is BOX DRAWINGS LIGHT HORIZONTAL. So the failure is not the warning --
+# it is that every frame, gauge and sparkline glyph would be substituted on the way
+# in, and a TUI whose borders are question marks would ship on Windows with nothing
+# but a warning nobody reads. Under PEDANTIC_COMPILER_WERROR (the default on the
+# Windows presets) it is at least loud; suppressing C4566 would make it silent and
+# WRONG, which is the worse of the two.
+#
+# Per TARGET, never `add_compile_options`: this says the vendored TUI is UTF-8, and
+# it must not become a claim about every other third-party source in the build,
+# which is the claim Utf8CodePage.cmake declines to make.
+if(MSVC)
+    target_compile_options(fastcache-tui-objects PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
+
+# The Windows macro trio, for the reason `src/apps/fastcache-cc/CMakeLists.txt`
+# already states: they are PUBLIC on the FastCache target and therefore NOT
+# INHERITED by a target that does not link it. This one does not.
+#
+# `NOMINMAX` is the one that bites here and it bites in vendored code, so it is
+# worth naming what it costs. `vendor/endo/platform/Types.hpp` includes
+# <windows.h>, which `tui/TerminalInput.hpp` pulls in, which `Screen.cpp` reaches
+# -- and <windows.h> defines `min` and `max` as MACROS. `std::min(...)` then
+# preprocesses to `std::(...)`, and MSVC reports:
+#
+#     Screen.cpp(563): error C2589: '(': illegal token on right side of '::'
+#
+# Measured: 17 errors across Screen.cpp alone, none of which names a macro, and
+# the first one masks the rest -- a CI error line is a lower bound. The vendored
+# sources are correct C++ and must not be touched; the definition is what was
+# missing.
+#
+# WIN32_LEAN_AND_MEAN and _WIN32_WINNT ride along rather than waiting to be needed
+# separately: the trio is how this tree spells "this target includes <windows.h>",
+# and splitting it would leave the next vendored Win32 translation unit to
+# rediscover the winsock redefinition that comment describes.
+if(WIN32)
+    target_compile_definitions(fastcache-tui-objects PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _WIN32_WINNT=0x0A00
+    )
+endif()
+
 # Belt AND braces, deliberately.
 #
 # This directory is added BEFORE `include(PedanticCompiler)` / `include(ClangTidy)`
