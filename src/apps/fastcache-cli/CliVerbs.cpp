@@ -1722,7 +1722,13 @@ namespace
           .wire = Wire::Node,
           .minOperands = 1,
           .maxOperands = 1,
-          .operands = " <machines|workers|leases|members|tiers>",
+          // Spelled out rather than joined from `FleetSectionTable`, because this is a
+          // `constexpr` table and the join would be a compile-time string built into a
+          // buffer -- more machinery than the fact is worth. What keeps it honest is
+          // `the fleet verb offers every section the server serves` in
+          // `CliVerbs_test.cpp`, which walks that table: a section added and not
+          // spelled here reddens rather than going quietly missing from the help.
+          .operands = " <kpi|machines|workers|leases|members|tiers>",
           .summary = "one of the leader's fleet tables, read over the node's\n"
                      "own admin surface -- no browser and no JSON parser",
           .protocolCommand = "node-status",
@@ -1908,8 +1914,13 @@ namespace
           .minOperands = 0,
           .maxOperands = 1,
           .operands = " [settings|items|slabs|sizes|conns]",
-          .summary = "the memcached `stats` families, which `stats` above cannot\n"
-                     "reach; no argument gives the 24-field default set",
+          // "which `stats` ABOVE cannot reach" until #1301, and that was a claim about
+          // where the row sat in a flat list. The list is grouped by wire now and
+          // `stats` renders in the LAST group, below this one -- so the sentence
+          // survived the change by no longer being about anything. A summary names the
+          // other verb, never where it is printed.
+          .summary = "the memcached `stats` families, which the `stats` verb\n"
+                     "cannot reach; no argument gives the 24-field default set",
           .protocolCommand = "stats",
           .modifiers = Modifier::None,
           .handler = &TextStats,

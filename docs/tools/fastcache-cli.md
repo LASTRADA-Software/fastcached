@@ -98,7 +98,15 @@ work.
 
 ## Commands
 
-Run `fastcache-cli --help` for the current list with operand counts. Today:
+Run `fastcache-cli --help` for the current list with operand counts. It groups the
+commands under the **wire** each one declares — which kind of server answers it — since
+that is the one axis that decides whether a verb can work at all, and it is a fact the
+verb table already carried statically while an operator had to discover it by dialling.
+
+The table below splits those same commands by read and write as well, which is the
+question you have *after* the first one is settled. Neither list is written by hand:
+the help renders `Verbs()` grouped by `WireSpec::heading`, and
+`ctest -R cli-verb-docs` refuses a verb that appears in one and not the other.
 
 | | |
 |---|---|
@@ -131,10 +139,16 @@ running no admin surface, one serving it over TLS this client cannot speak, and 
 naming the port already being talked `0xFC` to are each refused **by name** — none of
 them is "the fleet is down".
 
+`kpi` is one of the sections, and it is the one that is not a row table: the page's
+headline strip, one line per figure, keyed by a name rather than by a page label. What
+it carries is the number and its scale — never `/ 32 slots`, which a reader would have
+to parse a figure back out of.
+
 The section is required, and the reason is the unit: this verb's answer is one table,
-and the whole document is five of them behind markers. A default would silently pick
-one of the five. A wrong guess is refused by the leader with the accepted keys and what
-each holds, and that refusal is relayed verbatim:
+and the whole document is every section behind a marker. A default would silently pick
+one of them. (No count is written here on purpose — the set grew by one at `kpi` and a
+number in this paragraph would now be wrong.) A wrong guess is refused by the leader
+with the accepted keys and what each holds, and that refusal is relayed verbatim:
 
 ```console
 $ fastcache-cli fleet worker --addr=10.0.0.7:6674

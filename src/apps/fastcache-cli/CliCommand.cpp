@@ -781,11 +781,41 @@ std::string HelpTopicText(VerbSpec const& verb, UsageColor color)
     return RenderUsage({ .sections = sections }, color);
 }
 
+std::vector<VerbGroup> GroupVerbsByWire(std::span<VerbSpec const> verbs)
+{
+    std::vector<VerbGroup> groups;
+    for (auto const& wire: WireTable)
+    {
+        VerbGroup group { .wire = wire.wire, .heading = wire.heading, .verbs = {} };
+        for (auto const& verb: verbs)
+            if (verb.wire == wire.wire)
+                group.verbs.push_back(&verb);
+
+        // The whole of *a wire with no verbs gets no heading*. Dropping the group here
+        // rather than skipping it at the render is what makes an empty one unreachable
+        // instead of merely unrendered.
+        if (group.verbs.empty())
+            continue;
+
+        groups.push_back(std::move(group));
+    }
+    return groups;
+}
+
 std::string HelpText(UsageColor color)
 {
+    auto const groups = GroupVerbsByWire(Verbs());
+
+    // ONE `UsageRows` for every group rather than one each, because `UsageDoc` measures
+    // the description column per SECTION: the groups are BLOCKS of the one `COMMANDS`
+    // section, so every description still starts in the same column and a reader
+    // scanning down the list sees no step. Groups rendered as sections of their own
+    // would each be measured against their own widest term, which is the same
+    // information laid out worse.
     UsageRows commandRows;
-    for (auto const& verb: Verbs())
-        commandRows.Add(RenderVerb(verb), verb.summary);
+    for (auto const& group: groups)
+        for (auto const* verb: group.verbs)
+            commandRows.Add(RenderVerb(*verb), verb->summary);
 
     UsageRows optionRows;
     AddOptionRows(optionRows, CliToolOptions());
@@ -802,25 +832,41 @@ std::string HelpText(UsageColor color)
     for (auto const& variable: CliEnvironment())
         environmentRows.Add(std::string { variable.name }, variable.summary);
 
+    // Every row is laid down before a span is taken: `UsageRows::Rows()` hands out a
+    // view of a vector `Add` is still growing.
+    auto const commandEntries = commandRows.Rows();
+
     std::vector<UsageBlock> blocks;
-    blocks.push_back(UsageBlock { .entries = commandRows.Rows() });
+    std::size_t laid = 0;
+    for (auto const& group: groups)
+    {
+        blocks.push_back(UsageBlock { .text = group.heading, .textIndent = 2 });
+        blocks.push_back(UsageBlock { .entries = commandEntries.subspan(laid, group.verbs.size()) });
+        laid += group.verbs.size();
+    }
+
+    // Derived from the grouping rather than written down, for the reason the count of
+    // verbs is not written down either: a literal here is right until a wire is added.
+    auto const afterCommands = blocks.size();
+
     blocks.push_back(UsageBlock { .entries = optionRows.Rows() });
     blocks.push_back(UsageBlock { .entries = formatRows.Rows() });
     blocks.push_back(UsageBlock { .entries = exitRows.Rows() });
     blocks.push_back(UsageBlock { .entries = environmentRows.Rows() });
+
+    auto const notesFirst = blocks.size();
     for (auto const note: Notes)
         blocks.push_back(UsageBlock { .text = note, .textIndent = 2 });
 
     std::span<UsageBlock const> const all { blocks };
-    auto const notesFirst = std::size_t { 5 };
     auto const sections = std::to_array<UsageSection>({
         { .subject = "fastcache-cli - operate a fastcached cache and a compile fleet from a terminal." },
         { .title = "usage:", .subject = " fastcache-cli [options] <command> [operands]" },
-        { .title = "COMMANDS", .blocks = all.subspan(0, 1) },
-        { .title = "OPTIONS", .blocks = all.subspan(1, 1) },
-        { .title = "FORMATS", .blocks = all.subspan(2, 1) },
-        { .title = "EXIT CODES", .blocks = all.subspan(3, 1) },
-        { .title = "ENVIRONMENT", .blocks = all.subspan(4, 1) },
+        { .title = "COMMANDS", .blocks = all.subspan(0, afterCommands) },
+        { .title = "OPTIONS", .blocks = all.subspan(afterCommands + 0, 1) },
+        { .title = "FORMATS", .blocks = all.subspan(afterCommands + 1, 1) },
+        { .title = "EXIT CODES", .blocks = all.subspan(afterCommands + 2, 1) },
+        { .title = "ENVIRONMENT", .blocks = all.subspan(afterCommands + 3, 1) },
         { .title = "NOTES", .blocks = all.subspan(notesFirst, Notes.size()) },
     });
 

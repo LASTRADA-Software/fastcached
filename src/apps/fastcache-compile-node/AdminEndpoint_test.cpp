@@ -1187,6 +1187,12 @@ TEST_CASE("An unknown range is refused rather than quietly served as another", "
     CHECK(fixture.Get("/fleet", "range=30d").status == "400 Bad Request");
     CHECK(fixture.Get("/fleet/series.json", "range=30d").status == "400 Bad Request");
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").status == "400 Bad Request");
+    // The two machine-readable fleet surfaces take a range too since #1302, because
+    // three of the headline figures they now carry are history-derived -- so the
+    // parameter's rule reaches them, and a window quietly substituted would hand a
+    // scraper figures for a period it did not ask about.
+    CHECK(fixture.Get("/fleet.json", "range=30d").status == "400 Bad Request");
+    CHECK(fixture.Get("/fleet.txt", "range=30d").status == "400 Bad Request");
 
     CHECK(fixture.Get("/fleet/chart/dispatched.svg", "theme=solarized").status == "200 OK");
 
@@ -1200,8 +1206,53 @@ TEST_CASE("An unknown range is refused rather than quietly served as another", "
         CHECK(fixture.Get("/fleet", "range=30d").body.contains(row.key));
         CHECK(fixture.Get("/fleet/series.json", "range=30d").body.contains(row.key));
         CHECK(fixture.Get("/fleet/chart/dispatched.svg", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet.json", "range=30d").body.contains(row.key));
+        CHECK(fixture.Get("/fleet.txt", "range=30d").body.contains(row.key));
         // ...and each of them is genuinely served, or naming it is worse than not.
         CHECK(fixture.Get("/fleet/chart/dispatched.svg", std::format("range={}", row.key)).status == "200 OK");
+        CHECK(fixture.Get("/fleet.json", std::format("range={}", row.key)).status == "200 OK");
+        CHECK(fixture.Get("/fleet.txt", std::format("range={}", row.key)).status == "200 OK");
+    }
+}
+
+TEST_CASE("The machine-readable fleet surfaces reach the history through the one door", "[node][admin][dashboard]")
+{
+    // The wiring, asserted rather than assumed (#1302). A renderer that takes a history
+    // and a route that never hands it one compiles, serves, and answers every
+    // history-derived figure `null` forever -- which reads as a fleet nobody has
+    // sampled rather than as a route that forgot.
+    ChartFixture const fixture;
+
+    auto const json = fixture.Get("/fleet.json", "range=24h");
+    REQUIRE(json.status == "200 OK");
+    CHECK(json.body.contains(R"("kpi":{)"));
+
+    for (auto const key: Distributed::FleetKpiKeys())
+    {
+        INFO("kpi " << key);
+        CHECK(json.body.contains(std::string { "\"" } + std::string { key } + R"(":{"value":)"));
+    }
+
+    // What this fixture can and cannot say, stated rather than glossed. It samples
+    // ONCE, and a folded series is a delta between adjacent present buckets -- so
+    // every history-derived figure is HONESTLY absent here, and asserting one is
+    // non-null would be asserting something about the fixture. The link that a route
+    // consults the range at all is the refusal above: a route ignoring it would serve
+    // `range=30d` a document rather than a 400. That a PLUMBED history changes the
+    // answer is asserted where it can be: `A headline figure nobody sampled is absent
+    // rather than zero` in `FleetView_test.cpp` drives both directions directly.
+    //
+    // A figure off the SNAPSHOT is answered either way, which is what says the
+    // absences above are about the history rather than about a document that failed
+    // to render.
+    CHECK_FALSE(json.body.contains(R"("leases-outstanding":{"value":null)"));
+
+    auto const text = fixture.Get("/fleet.txt", "section=kpi&range=24h");
+    REQUIRE(text.status == "200 OK");
+    for (auto const key: Distributed::FleetKpiKeys())
+    {
+        INFO("kpi " << key);
+        CHECK(text.body.contains(key));
     }
 }
 

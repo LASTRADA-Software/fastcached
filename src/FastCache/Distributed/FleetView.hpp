@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -241,14 +242,29 @@ struct ToolchainPickCoverage
 
 [[nodiscard]] FleetSnapshot CollectFleet(FleetSources const& sources);
 
+/// Defined below, beside the chart it belongs to. Declared here because the two
+/// machine-readable renderers take one and sit above it: a reference parameter needs no
+/// complete type, and moving the struct up would put the history's whole vocabulary in
+/// front of the page's.
+struct FleetHistoryView;
+
 /// Render a fleet snapshot as JSON.
 ///
 /// The endpoint that makes the page replaceable and testable without a browser,
 /// and the reason the column tables carry a machine-readable key beside a label.
 /// A value nobody reported is `null`, never `0`.
+///
+/// **Takes the history because the headline figures do**
+/// ([#1302](https://github.com/LASTRADA-Software/fastcached/issues/1302)). Three of the
+/// seven read a `FleetHistoryView` rather than the snapshot, so a renderer without one
+/// could carry four of them and would have to call the other three absent — which is a
+/// reading, not an absence. The window is the CALLER's: the page takes a `range` and
+/// this must take the same one, or the same fleet reports two different Dispatched
+/// figures depending on which surface asked.
 /// @param snapshot What to render.
+/// @param history The window the headline figures answer for.
 /// @return A JSON document.
-[[nodiscard]] std::string RenderFleetJson(FleetSnapshot const& snapshot);
+[[nodiscard]] std::string RenderFleetJson(FleetSnapshot const& snapshot, FleetHistoryView const& history);
 
 /// One table of the fleet report, as a terminal reader asks for it.
 ///
@@ -263,12 +279,13 @@ struct ToolchainPickCoverage
 /// `EnumTable`'s anchor and not a wire contract.
 enum class FleetSection : std::uint8_t
 {
-    Machines = 0, ///< One row per machine — the grain a fleet total is computed over.
-    Workers,      ///< One row per `(toolchain, endpoint)` registry entry.
-    Leases,       ///< The oldest outstanding leases, bounded as the page bounds them.
-    Members,      ///< What the cluster has agreed, when this node runs one.
-    Tiers,        ///< Per-tier cache figures, for the tiers some member runs.
-    Last,         ///< Not a section, and has no row: the length of a table keyed by one.
+    Kpi = 0,  ///< The headline figures the page's strip carries.
+    Machines, ///< One row per machine — the grain a fleet total is computed over.
+    Workers,  ///< One row per `(toolchain, endpoint)` registry entry.
+    Leases,   ///< The oldest outstanding leases, bounded as the page bounds them.
+    Members,  ///< What the cluster has agreed, when this node runs one.
+    Tiers,    ///< Per-tier cache figures, for the tiers some member runs.
+    Last,     ///< Not a section, and has no row: the length of a table keyed by one.
 };
 
 /// What one section is called.
@@ -277,6 +294,21 @@ struct FleetSectionRow
     FleetSection section;     ///< The section this row describes.
     std::string_view key;     ///< What a reader asks for, and the marker in the full document.
     std::string_view summary; ///< One line, for whoever guessed the key wrong.
+
+    /// Whether this section is a row TABLE on all three surfaces.
+    ///
+    /// True for every section whose shape is `FleetColumn` rows crossed with subjects:
+    /// a header row of column names, then one line per subject, rendered the same way
+    /// as a `<table>`, a JSON array of objects and a tab-separated block.
+    ///
+    /// **False for `Kpi`, and that is a property of the section rather than an
+    /// exemption.** The headline figures are one value per named figure, not many rows
+    /// of one shape: the page draws them as a STRIP with no `<th>` anywhere, and the
+    /// JSON keys them by name rather than listing them. So `FleetColumnNames` has no
+    /// answer for it — and this column is what lets the coverage test say that in both
+    /// directions instead of carrying a silent exception, which is the shape
+    /// [#1320](https://github.com/LASTRADA-Software/fastcached/issues/1320) is about.
+    bool tabular;
 };
 
 /// Every section `/fleet.txt` serves, in the order the page presents them.
@@ -286,20 +318,30 @@ struct FleetSectionRow
 /// than restating them — a hand-listed refusal goes stale in the one place a reader
 /// who just guessed wrong is looking.
 inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
+    FleetSectionRow { .section = FleetSection::Kpi,
+                      .key = "kpi",
+                      .summary = "the headline figures, one row each; the page's strip",
+                      .tabular = false },
     FleetSectionRow { .section = FleetSection::Machines,
                       .key = "machines",
-                      .summary = "one row per machine; the grain a fleet total is computed over" },
-    FleetSectionRow {
-        .section = FleetSection::Workers, .key = "workers", .summary = "one row per (toolchain, endpoint) registry entry" },
+                      .summary = "one row per machine; the grain a fleet total is computed over",
+                      .tabular = true },
+    FleetSectionRow { .section = FleetSection::Workers,
+                      .key = "workers",
+                      .summary = "one row per (toolchain, endpoint) registry entry",
+                      .tabular = true },
     FleetSectionRow { .section = FleetSection::Leases,
                       .key = "leases",
-                      .summary = "the oldest outstanding leases, bounded as the page bounds them" },
+                      .summary = "the oldest outstanding leases, bounded as the page bounds them",
+                      .tabular = true },
     FleetSectionRow { .section = FleetSection::Members,
                       .key = "members",
-                      .summary = "what the cluster has agreed; absent when this node runs none" },
+                      .summary = "what the cluster has agreed; absent when this node runs none",
+                      .tabular = true },
     FleetSectionRow { .section = FleetSection::Tiers,
                       .key = "tiers",
-                      .summary = "per-tier cache figures, for the tiers some member runs" },
+                      .summary = "per-tier cache figures, for the tiers some member runs",
+                      .tabular = true },
 };
 static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section));
 
@@ -307,6 +349,57 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// @param key The `section` value, as typed.
 /// @return The section, or absent when nothing is called that.
 [[nodiscard]] std::optional<FleetSection> FleetSectionFromKey(std::string_view key) noexcept;
+
+/// Every column name @p section renders for @p snapshot, in the order all three
+/// surfaces walk them.
+///
+/// Here so the coverage test can be **derived** rather than written out. It used to
+/// iterate four braced lists of column-name literals under a comment saying it walked
+/// the tables, which is [#492](https://github.com/LASTRADA-Software/fastcached/issues/492)'s
+/// rule one axis over: a column added to a table joined the test's blind spot silently,
+/// the case still passed, and the prose retired the suspicion that would have found the
+/// gap. Two node columns and the whole tier section were uncovered that way.
+///
+/// **Only the NAMES come out; the tables stay file-local.** A `FleetColumn` row carries
+/// a projector over the row type it reads, so publishing the rows would put
+/// `NodeReport`, `WorkerReport`, `LeaseHolding` and `ClusterMember` projections in this
+/// header for no production reader. The column SET is the contract between the page, the
+/// JSON and the text — the projectors are not.
+///
+/// **It takes the snapshot, because one section's column set is not static.** The tier
+/// columns are `StorageTierTable` crossed with the per-tier suffixes and *a tier no
+/// member runs gets no column*, so a fixed list for `Tiers` would name columns the
+/// document does not carry. Composed through the same `TierColumnName` the three
+/// renderers use, so there is no second spelling to disagree with.
+///
+/// A `switch` with no default arm, exactly as `AppendSectionText` has none: a section
+/// added to `FleetSectionTable` is a BUILD failure here rather than one that quietly
+/// reports no columns — which reads identically to a section nothing needs to check.
+///
+/// It answers for EVERY section, the non-tabular ones included: `Kpi` is one value per
+/// named figure rather than rows of one shape, but its text form is the key/value table
+/// that shape implies and those four column names are as real as any other's. What
+/// `FleetSectionRow::tabular` decides is whether those same names also appear as page
+/// headers and JSON keys — for `Kpi` they do not, because the page draws a strip and
+/// the JSON keys by figure. A caller asserting coverage reads that column rather than
+/// carrying a silent exception for one section.
+///
+/// @param section Which section.
+/// @param snapshot The document the names are being asked about.
+/// @return The names, in render order; empty only for `FleetSection::Last`.
+[[nodiscard]] std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot const& snapshot);
+
+/// Every headline figure's machine key, in the order the strip presents them.
+///
+/// The same door `FleetColumnNames` is, for the same reason: the strip's table is
+/// file-local to `FleetView.cpp` because its rows carry projections, and a coverage
+/// test that cannot name the table writes the list out instead — which is the defect
+/// [#1320](https://github.com/LASTRADA-Software/fastcached/issues/1320) records.
+///
+/// KEYS rather than labels. A label is what the page calls a tile and is free to be
+/// reworded; the key is what a scraper keyed on `/fleet.json` depends on.
+/// @return A view of the static table; never empty.
+[[nodiscard]] std::span<std::string_view const> FleetKpiKeys() noexcept;
 
 /// Render a fleet snapshot as tab-separated text.
 ///
@@ -335,7 +428,10 @@ static_assert(RowsInEnumeratorOrder(FleetSectionTable, &FleetSectionRow::section
 /// @param snapshot What to render.
 /// @param section Which table, or absent for every section with its marker line.
 /// @return The document, each line ending in `\n`.
-[[nodiscard]] std::string RenderFleetText(FleetSnapshot const& snapshot, std::optional<FleetSection> section);
+/// @param history The window the `kpi` section's figures answer for; see `RenderFleetJson`.
+[[nodiscard]] std::string RenderFleetText(FleetSnapshot const& snapshot,
+                                          FleetHistoryView const& history,
+                                          std::optional<FleetSection> section);
 
 /// What the page draws over time, gathered before rendering.
 ///

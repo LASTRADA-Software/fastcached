@@ -2,9 +2,12 @@
 #include "CliVerbs.hpp"
 #include "ScriptedExchange.hpp"
 
+#include <FastCache/Distributed/FleetView.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -531,4 +534,29 @@ TEST_CASE("every wire has a row explaining its absence", "[cli][verbs]")
         // one would make the refusal unactionable.
         CHECK_FALSE(row.unavailable.empty());
     }
+}
+
+TEST_CASE("the fleet verb offers every section the server serves", "[cli][verbs]")
+{
+    // `fleet`'s operand list is a literal, because `VerbTable` is `constexpr` and
+    // joining `FleetSectionTable` into it would be a compile-time string built into a
+    // buffer -- more machinery than a display-only field is worth. This is what keeps
+    // it from going stale instead: the guard is a walk over the server's own table, so
+    // a section added there and not spelled in the help reddens HERE rather than
+    // presenting as a key an operator is never told about.
+    auto const* const fleet = FindVerb("fleet");
+    REQUIRE(fleet != nullptr);
+    REQUIRE_FALSE(Distributed::FleetSectionTable.empty());
+
+    for (auto const& row: Distributed::FleetSectionTable)
+    {
+        INFO("section " << row.key);
+        CHECK(fleet->operands.contains(row.key));
+    }
+
+    // The other direction, or the case passes for a list that names every section AND
+    // six that do not exist. Counted by separators rather than by parsing, which is
+    // all the shape needs: `<a|b|c>` has one fewer `|` than it has keys.
+    CHECK(std::ranges::count(fleet->operands, '|') + 1
+          == static_cast<std::ptrdiff_t>(Distributed::FleetSectionTable.size()));
 }

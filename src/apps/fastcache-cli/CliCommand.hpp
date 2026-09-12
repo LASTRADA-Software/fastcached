@@ -120,12 +120,41 @@ struct Command
 ///        is testable without touching the real environment.
 void ApplyEnvironment(Command& command, std::optional<std::string> (*lookup)(std::string_view));
 
+/// One wire's verbs, as `--help` prints them.
+struct VerbGroup
+{
+    Wire wire;                          ///< The wire every verb in this group names.
+    std::string_view heading;           ///< That wire's `WireSpec::heading`, never spelled here.
+    std::vector<VerbSpec const*> verbs; ///< Its verbs, in the verb table's own order; NEVER empty.
+};
+
+/// Group @p verbs by the wire each one declares.
+///
+/// The `COMMANDS` list used to be flat, so *does this verb work against what I am
+/// pointed at* -- the one question that decides whether a verb can work at all -- was
+/// answered by dialling and reading the refusal, though the table knew it statically.
+/// Both orders come from tables and neither is written here: the groups follow `Wire`'s
+/// enumerator order, which `RowsInEnumeratorOrder` already pins, and the verbs inside a
+/// group follow @p verbs.
+///
+/// **A wire that no row names produces NO group**, which is what keeps the renderer
+/// from printing a heading over nothing. The decision is HERE, in the data, rather than
+/// as a skip at the one call site: a group cannot be empty, so there is no line the
+/// renderer could forget the check on. It is also the only reason that behaviour is
+/// observable at all -- every wire has verbs in this tree, so a check living in
+/// `HelpText` could be watched neither accepting nor refusing.
+///
+/// @param verbs The verb table to group; `Verbs()` in production, a synthetic set in
+///        the tests that need a wire with no verbs.
+/// @return One group per wire that @p verbs reaches, in `Wire` enumerator order.
+[[nodiscard]] std::vector<VerbGroup> GroupVerbsByWire(std::span<VerbSpec const> verbs);
+
 /// Render the usage text.
 ///
-/// Every section is generated: the verbs from `Verbs()`, the options from
-/// `CliToolOptions()`, the formats from `FormatTable`, and the exit codes from
-/// `OutcomeTable`. Only the prose explaining *why* a setting matters is written by
-/// hand, because a table cannot carry it.
+/// Every section is generated: the verbs from `Verbs()` grouped by `GroupVerbsByWire`,
+/// the options from `CliToolOptions()`, the formats from `FormatTable`, and the exit
+/// codes from `OutcomeTable`. Only the prose explaining *why* a setting matters is
+/// written by hand, because a table cannot carry it.
 /// @param color Whether to emit ANSI SGR escapes; see StdoutSupportsColor.
 /// @return The complete usage text, ending in a newline.
 [[nodiscard]] std::string HelpText(UsageColor color = UsageColor::Plain);
