@@ -895,7 +895,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   outcome that can be *not attempted* is an enum, not a `bool` — and it is fixed at the seam,
   never at the one call site that noticed.
 - A counter is a tally, so zero is the truth about events that never happened; absence is
-  modelled in the **snapshot**, never by dropping a counter row.
+  modelled in the **snapshot**, never by dropping a counter row. **One carve-out, and it is a
+  different question rather than a softening**: a row this BUILD cannot represent is omitted
+  and counted by `fastcached_metrics_catalogue_skew`, never rendered as a plausible zero.
 - A duration is a `_sum`/`_count` pair, never a gauge.
 - A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
   the split, the `tier` label comes from a table, and a tier the cache does not have renders no
