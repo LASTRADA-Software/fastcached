@@ -375,30 +375,41 @@ NotOurRoots=(vendor)
 # source created but not added yet is exactly the code nothing has ever checked, and
 # dropping it here would drop it silently.
 #
-# The exclusion is ASSERTED, not assumed. A filter that silently stops matching is
-# this script's own stated nightmare -- it would widen the sweep back over upstream
-# code, and the only signal would be a confident failure inside a file nobody here
-# wrote. So when a root exists and carries tracked files, dropping them must actually
-# reduce the set.
+# PURE -- it filters and returns, and refuses nothing. One call site reads it through
+# a process substitution, where an `exit` ends only the subshell: the outer script
+# would carry on with a truncated list and a clean status, which is this script's own
+# nightmare wearing the costume of the guard against it. The assertion that the
+# exclusion still works lives at top level, once, in `AssertNotOurRootsExcluded`.
 #
 # @param @ Optional `git ls-files` pathspec globs.
 FirstPartyFiles() {
-    local all kept root
-    all="$(git ls-files --cached --others --exclude-standard "$@")"
-    kept="$all"
+    local kept root
+    kept="$(git ls-files --cached --others --exclude-standard "$@")"
     for root in "${NotOurRoots[@]}"; do
-        [[ -d "$root" ]] || continue
-        if [[ -z "$(git ls-files "$root")" ]]; then
-            continue
-        fi
-        local before="$kept"
         kept="$(grep -v "^${root}/" <<< "$kept" || true)"
-        if [[ "$before" == "$kept" ]] && grep -q "^${root}/" <<< "$all"; then
-            echo "tidy-sweep: the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own" >&2
-            exit 1
-        fi
     done
     printf '%s\n' "$kept"
+}
+
+# That the exclusion above still bites. Called once, from the top level, where a
+# refusal can actually stop the run.
+#
+# A filter that silently stops matching -- a root renamed, a `grep` pattern that no
+# longer anchors -- would widen the sweep back over code this repository does not
+# own, and the only signal would be a confident clang-tidy failure inside a file
+# nobody here wrote. So for every root that exists AND carries tracked files,
+# dropping it must actually reduce the set.
+AssertNotOurRootsExcluded() {
+    local root all kept
+    for root in "${NotOurRoots[@]}"; do
+        [[ -d "$root" ]] || continue
+        [[ -n "$(git ls-files "$root")" ]] || continue
+        all="$(git ls-files --cached --others --exclude-standard)"
+        grep -q "^${root}/" <<< "$all" || continue
+        kept="$(grep -v "^${root}/" <<< "$all" || true)"
+        [[ "$kept" != "$all" ]] \
+            || fatal "the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own"
+    done
 }
 
 # Which of those are TRANSLATION UNITS, and therefore what the sweep can hand to
@@ -1740,6 +1751,10 @@ if [[ "$mode" == only ]]; then
     echo "TIDY SWEEP: --only, sweeping exactly ${#onlyPaths[@]} named file(s) from ${onlyList}"
     printf 'TIDY SWEEP:   %s\n' "${onlyPaths[@]}"
 fi
+
+# Before either enumeration below reaches `FirstPartyFiles`, and at the top level so
+# a refusal can stop the run.
+AssertNotOurRootsExcluded
 
 if [[ "$mode" != all && "$mode" != only ]]; then
     mapfile -t changed < <({ git diff --name-only "${BASE}...HEAD"
