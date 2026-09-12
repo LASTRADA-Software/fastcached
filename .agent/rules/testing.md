@@ -46,6 +46,90 @@ guest's host time sync moves that in both directions. An interval computed from
 two readings of it is therefore not a lower bound, not an upper bound, and can be
 **negative**.
 
+### And a negative interval does not read as an error, it reads as the BEST answer
+
+That is the half that costs something, and it is not about clocks at all: it is
+about what the negative is then handed to.
+
+`scripts/check-sccache-backend-caveat.cmake` classifies a scan's cost by looking
+its per-file figure up in a table of ascending ceilings, first match wins
+(`msPerFile LESS_EQUAL ${bandCeiling}`). **Every negative number is LESS_EQUAL the
+first row's ceiling**, so a backward step does not produce a refusal or an
+obviously broken figure — it produces the FASTEST band. Measured by injecting a
+100 s backward step on 2026-09-12: `-100s wall in total, about -93 ms/file. That
+is the 'native' band: A filesystem reached directly -- ext4, or NTFS from a
+Windows cmake`, on a run that was on neither, **exit 0**. The instrument whose one
+job is to say which filesystem condition the scan ran under answered confidently,
+wrongly, and passed.
+
+The same cause reaches a second consumer and fails it the OTHER way: a narration
+line appended only when `runSeconds GREATER_EQUAL` a threshold, which a negative
+never is, so a required line goes missing and the check goes **red** with `did not
+say: narrated nothing`. Both failures, one step. **The loud one is what got filed
+(#1313) and the silent one is what was worth fixing** — which is the general
+shape: a wrong answer that passes outranks a true observation that reddens.
+
+What is worth carrying past this check:
+
+* **The fix is a third outcome, never a clamp.** Clamping a negative to zero
+  restores the fastest-band answer by the front door, and it looks like
+  defensiveness while doing it. A mutation that clamped instead of reporting was
+  caught by the new case only because the case asserts the band is ABSENT rather
+  than asserting the number.
+* **Intervals over one clock disagree, so the outcome is recorded where the
+  SUBTRACTION happens** — never rebuilt at the sites the report happens to hold
+  variables for. A step landing inside a sub-interval leaves the enclosing one
+  positive; consulting only the enclosing interval passed both of the first two
+  regression cases, and was caught by a third that places the step inside the
+  inner one (`100,200,150`). Fixing *that* by OR-ing the two intervals the cost
+  line names is the same defect one step along: this check takes **four** — the
+  whole run, the directory walk, one per root at the walk's narration point and
+  one per progress checkpoint — and a step landing in the READ phase, which is
+  where nearly all the wall time is, shows up only in a checkpoint's. Measured
+  with `1000×10,900,1100`: the walk measured `0s`, the run `+100s`, a checkpoint
+  `-100s`, and the check reported `93 ms/file. That is the 'bridged and
+  contended' band` at exit 0 — a band across a clock it had already watched move.
+  So `fastcached_scan_interval` takes a LABEL and files every backward step
+  itself, and the reporting arm reads that record rather than enumerating its
+  sources. An arm that enumerates them is an arm that goes silent about the next
+  interval somebody adds.
+* **And silencing is per INTERVAL, not per run**, so the refusal says what
+  narration DID rather than asserting it is off: a step in the walk leaves every
+  later checkpoint free to fire, and a blanket *"progress narration is off"*
+  printed beside `still scanning` lines the same run emitted is exactly the
+  confident wrong detail a "cost NOT MEASURED" message exists to avoid.
+* **Adding an OUTCOME changes what an old condition does to every case that
+  tolerated the wrong answer.** This is the half that nearly shipped, and it is
+  not about clocks.
+
+  Before the third outcome existed, a backward step made this check print
+  `-93 ms/file / 'native' band` -- wrong, but *shaped like an answer*, so every
+  assertion about `ms/file. That is the '`, the headroom line, `still scanning` and
+  `narrated nothing` was still satisfied and the cases passed. The third outcome
+  replaces all of that with one refusal sentence, so the same step now fails any
+  case that reads the host clock. **Four default-set `hygiene` cases were made
+  flaky by a fix for flakiness**, in the direction that reads as *my branch is
+  bad*, and the author had just finished writing the paragraph explaining why that
+  direction is the expensive one.
+
+  Nothing in the change touched those cases, which is why a diff review does not
+  find it: they were relying on a wrong answer being well-formed. So when a change
+  adds a refusal, an `unknown`, or any arm that REPLACES a previously-plausible
+  output, enumerate what used to be asserted about that output and ask which of
+  those assertions the new arm removes. Measured both ways here -- pinned, the four
+  are green; given a stepping clock, all four go red by name.
+
+  The seam the change itself adds is usually the fix: pin the input so the host
+  cannot take the case away.
+
+* **A clock is a seam like any other.** There is no arrangement of real sleeps
+  that makes a backward step happen on demand, so this was untestable until the
+  clock could be injected — and `string(TIMESTAMP)` is the only clock a `cmake -P`
+  script has, which rules out switching to something monotonic. The readings
+  repeat their last value rather than running out, because a list that exhausts
+  into the host clock would measure an environment nobody chose, which is the
+  defect reappearing inside its own fix.
+
 Measured on a contended WSL2 host (`clocksource: tsc`), twenty `sleep 0.2` calls
 with no fixture around them, timed by three clocks at once:
 

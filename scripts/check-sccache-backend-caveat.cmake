@@ -308,10 +308,142 @@ endforeach()
 # actually being asked, which is which BAND the filesystem is in: the native and
 # contended bands are two orders of magnitude apart, and no rounding closes that.
 #
-# @param outVar Set to the current wall time in whole seconds since the epoch.
+# @param outVar Set to the current wall time in whole seconds since the epoch,
+#        or the next injected reading when FASTCACHED_SCAN_CLOCK_READINGS is set,
+#        the last of which repeats for every call after it.
 function(fastcached_wall_seconds outVar)
-    string(TIMESTAMP nowSeconds "%s")
+    get_property(injected GLOBAL PROPERTY FastCachedSccacheScanClockReadings)
+    # Quoted, because `if(injected STREQUAL "")` does not fire when the variable
+    # is UNSET -- which is what an unset GLOBAL property leaves it as. CMake then
+    # reads the left operand as the literal string `injected`, which is never
+    # empty, so every real run -- the ones with no readings armed at all -- took
+    # the injected branch below and died in `list(GET)` on an empty list.
+    if("${injected}" STREQUAL "")
+        string(TIMESTAMP nowSeconds "%s")
+        set(${outVar} "${nowSeconds}" PARENT_SCOPE)
+        return()
+    endif()
+
+    # The readings are consumed in order and the LAST one repeats. Never a
+    # fall back to the real clock once readings are armed: a run that asked for
+    # an injected clock and then silently started measuring the host would be
+    # reporting on an environment nobody chose -- the very class of defect this
+    # seam exists to close, reappearing inside the seam. Repeating the last
+    # reading keeps that guarantee without making every caller count how many
+    # times this check happens to look at the clock, which is a number that
+    # changes whenever a scan root is added.
+    list(LENGTH injected remaining)
+    list(GET injected 0 nowSeconds)
+    if(remaining GREATER 1)
+        list(REMOVE_AT injected 0)
+        set_property(GLOBAL PROPERTY FastCachedSccacheScanClockReadings "${injected}")
+    endif()
     set(${outVar} "${nowSeconds}" PARENT_SCOPE)
+endfunction()
+
+# The clock is injectable, and that is a seam rather than a test hook: a value
+# this check reads out of the environment decides what it reports, so it is
+# reached through something a test can place -- the same rule every clock in this
+# project is held to.
+#
+# It is what makes the one condition this check CANNOT survive testable at all. A
+# wall clock is not monotonic: WSL2 steps CLOCK_REALTIME backwards by about two
+# seconds every thirty-odd, `string(TIMESTAMP)` is the only clock a `cmake -P`
+# script has, and there is no arrangement of real sleeps that makes a backward
+# step happen on demand. Injected readings place one.
+#
+# NOT a FastCachedSccacheScanKnobs row, and the table says why itself: no field
+# there may contain a ';', and a ';' is exactly what separates these elements. It
+# is a list of whole seconds, so it carries its own guard below.
+if(DEFINED FASTCACHED_SCAN_CLOCK_READINGS)
+    # ','-separated, not ';'. The selftest carries each case as a '|'-delimited
+    # row whose fields may hold neither a ';' -- that splits the CMake list -- nor
+    # a space, which is how the row's extra arguments are split. A comma is
+    # special to none of the three, so the translation happens here rather than
+    # every caller inventing an encoding.
+    string(REPLACE "," ";" clockReadings "${FASTCACHED_SCAN_CLOCK_READINGS}")
+    list(LENGTH clockReadings clockReadingCount)
+    if(clockReadingCount LESS 2)
+        message(FATAL_ERROR
+            "FASTCACHED_SCAN_CLOCK_READINGS holds ${clockReadingCount} reading(s) and an interval "
+            "needs two. It is a ','-separated list of whole seconds handed out in order, the last "
+            "of which repeats -- so `1000,900` is a clock that steps 100s backwards after its "
+            "first reading, and `900,1000` the same step forwards.")
+    endif()
+    foreach(reading IN LISTS clockReadings)
+        # Same reason the knob table asserts shape before use: CMake's numeric
+        # comparisons are FALSE for a non-number, so a bad element would pass
+        # every guard and surface hundreds of lines later as an arithmetic error
+        # naming a line rather than naming the flag.
+        if(NOT reading MATCHES "^[0-9]+$")
+            message(FATAL_ERROR
+                "FASTCACHED_SCAN_CLOCK_READINGS holds '${reading}', which is not a whole number.")
+        endif()
+    endforeach()
+    set_property(GLOBAL PROPERTY FastCachedSccacheScanClockReadings "${clockReadings}")
+endif()
+
+# What an interval MEANS, separated from taking one.
+#
+# A wall clock can step backwards, and the arithmetic does not care: the
+# subtraction yields a negative and every consumer downstream then reads it as a
+# number rather than as a failure to measure. THREE outcomes, not two -- and the
+# third is the one that was missing (#1313).
+#
+# It is a function rather than two comparisons at each site because the two
+# consumers get it wrong in OPPOSITE directions, so a single spelling is what
+# keeps them from disagreeing: a negative interval reads to the narration
+# threshold as `not slow yet` (silence, when the run may have been very slow) and
+# to the cost bands as the FASTEST band (`-76 ms/file` is `LESS_EQUAL 2`, so a
+# bridged run reports itself native). One is a missing line and the other is a
+# confident wrong answer about the very thing this check exists to report.
+#
+# EVERY interval is recorded, not only the two the cost line happens to read.
+# This script takes FOUR -- the whole run, the directory walk, one per root at
+# the walk's narration point, and one per progress checkpoint -- and they can
+# DISAGREE, which is the whole reason the third outcome exists. A step landing
+# inside the read phase makes a checkpoint's interval negative while the
+# whole-run and walk intervals stay positive, so a flag derived from those two
+# alone discards a step this script has already SEEN and then reports a band
+# across it. So the outcome is recorded HERE, where the subtraction happens,
+# rather than at whichever sites the reporting arm remembers to consult: the
+# label is what makes the record readable, and it is required for that reason.
+#
+# Labels are deduplicated, because the per-root and per-checkpoint sites run many
+# times and a reader needs to know WHICH KIND of interval stepped, not how often
+# one of them was looked at.
+#
+# There is deliberately no per-call outcome to inspect. The RECORD is the one
+# representation, so no consumer can enumerate a subset of the sources and be
+# silent about a source somebody adds later -- which is the defect this function
+# exists to close, and it would be reintroduced by a caller that branched on its
+# own interval instead of reading the record.
+#
+# @param label What this interval is, for the report: a noun phrase that reads
+#        after "the wall clock went BACKWARDS during ...". Deduplicated, because
+#        the per-root and per-checkpoint sites run many times and a reader needs
+#        WHICH KIND of interval stepped, not how often one was looked at.
+# @param startSeconds The earlier reading.
+# @param endSeconds The later reading.
+# @param outSeconds Set to the interval. Negative means the clock moved back, and
+#        the record below is what says so to the reporting arm.
+function(fastcached_scan_interval label startSeconds endSeconds outSeconds)
+    math(EXPR intervalSeconds "${endSeconds} - ${startSeconds}")
+    set(${outSeconds} "${intervalSeconds}" PARENT_SCOPE)
+    if(intervalSeconds LESS 0)
+        # `list(APPEND)` treats an unset variable as an empty list, so the read
+        # needs no guard of its own here -- unlike an `if(... STREQUAL "")`, which
+        # is the trap `fastcached_wall_seconds` quotes its own read against.
+        get_property(stepped GLOBAL PROPERTY FastCachedSccacheScanSteppedIntervals)
+        # The VALUE travels with the label, because it is the one figure the
+        # refusal can show that is actually negative. Reporting only the whole-run
+        # and walk intervals leaves a message whose two numbers are positive under
+        # a headline saying the clock went back -- a reader with nothing to look
+        # at, which is the confident wrong detail this arm exists to avoid.
+        list(APPEND stepped "${label} (${intervalSeconds}s)")
+        list(REMOVE_DUPLICATES stepped)
+        set_property(GLOBAL PROPERTY FastCachedSccacheScanSteppedIntervals "${stepped}")
+    endif()
 endfunction()
 
 # CMake honours SOURCE_DATE_EPOCH by returning it from EVERY `string(TIMESTAMP)`
@@ -536,7 +668,15 @@ foreach(row IN LISTS FastCachedSccacheScanRoots)
     # inside the fix for it.
     if(NOT clockFrozen)
         fastcached_wall_seconds(rootWalkSeconds)
-        math(EXPR walkElapsed "${rootWalkSeconds} - ${runStartSeconds}")
+        # Through the shared spelling for the RECORD, not for a branch: this
+        # interval is one of the four, and a step it sees is a step the cost line
+        # below must not report a band across even when the whole-run interval
+        # stays positive. The comparison needs no backwards clause of its own --
+        # the threshold's minimum is 0, so a negative already fails it, and this
+        # site's failure direction is silence on exactly the contended run
+        # narration exists to explain.
+        fastcached_scan_interval(
+            "a root's walk narration point" "${runStartSeconds}" "${rootWalkSeconds}" walkElapsed)
         if(walkElapsed GREATER_EQUAL ${FastCachedSccacheScanNarrateAfterSeconds})
             list(LENGTH scanFiles walkedSoFar)
             message(
@@ -550,7 +690,7 @@ endforeach()
 list(REMOVE_DUPLICATES scanFiles)
 list(SORT scanFiles)
 fastcached_wall_seconds(walkEndSeconds)
-math(EXPR walkSeconds "${walkEndSeconds} - ${walkStartSeconds}")
+fastcached_scan_interval("the directory walk" "${walkStartSeconds}" "${walkEndSeconds}" walkSeconds)
 list(LENGTH scanFiles scanCount)
 
 # ---------------------------------------------------------------------------
@@ -577,7 +717,11 @@ foreach(scanFile IN LISTS scanFiles)
     math(EXPR sinceCheckpoint "${filesVisited} % ${FastCachedSccacheScanProgressEvery}")
     if(sinceCheckpoint EQUAL 0 AND NOT clockFrozen)
         fastcached_wall_seconds(checkpointSeconds)
-        math(EXPR elapsedSeconds "${checkpointSeconds} - ${runStartSeconds}")
+        # Recorded for the walk site's reason, and this is the interval a step
+        # landing in the READ phase shows up in FIRST -- the cost line's whole-run
+        # interval can stay positive right through it.
+        fastcached_scan_interval(
+            "a progress checkpoint" "${runStartSeconds}" "${checkpointSeconds}" elapsedSeconds)
         if(elapsedSeconds GREATER_EQUAL ${FastCachedSccacheScanNarrateAfterSeconds})
             math(EXPR checkpointMsPerFile "${elapsedSeconds} * 1000 / ${filesVisited}")
             math(EXPR projectedSeconds "${elapsedSeconds} * ${scanCount} / ${filesVisited}")
@@ -753,19 +897,91 @@ endforeach()
 # every run cannot. It states the finding and stops -- no remedy is suggested,
 # because an instrument cannot know whether the remedy is the thing in dispute.
 fastcached_wall_seconds(runEndSeconds)
-math(EXPR runSeconds "${runEndSeconds} - ${runStartSeconds}")
+fastcached_scan_interval("the whole run" "${runStartSeconds}" "${runEndSeconds}" runSeconds)
 math(EXPR bytesReadKiB "${bytesRead} / 1024")
+
+# ANY interval going backwards spoils the cost report, and they can disagree: a
+# step landing inside the walk leaves the whole-run interval positive, and one
+# landing inside the read phase leaves BOTH of those positive while a progress
+# checkpoint's own interval is negative. So the flag is read out of the record
+# every interval writes as it is taken, never rebuilt here from the two the cost
+# line happens to hold variables for -- an arm that enumerates its sources is an
+# arm that can be silent about a source somebody adds later.
+get_property(steppedIntervals GLOBAL PROPERTY FastCachedSccacheScanSteppedIntervals)
+
+# What was walked and read is true whether or not a cost could be computed, so it
+# is spelled once for every arm that cannot report one. It also stops two arms
+# from drifting away from the selftest's `Cost NOT MEASURED` needle independently.
+string(CONCAT costNotMeasured
+    "sccache backend caveat: walked ${scanCount} candidate(s) and read ${filesRead} "
+    "(${bytesReadKiB} KiB). Cost NOT MEASURED: ")
 
 if(clockFrozen)
     # Not a fast run. Its own outcome, never folded into the timings: with
     # SOURCE_DATE_EPOCH set every interval this script can take reads as exactly
     # zero, which would otherwise present as the best possible filesystem.
     message(
-        "sccache backend caveat: walked ${scanCount} candidate(s) and read ${filesRead} "
-        "(${bytesReadKiB} KiB). Cost NOT MEASURED: SOURCE_DATE_EPOCH is set in the environment "
+        "${costNotMeasured}SOURCE_DATE_EPOCH is set in the environment "
         "and CMake returns it from every string(TIMESTAMP) call, so every interval this check "
         "can time reads as zero. Unset it to measure. Progress narration is off for the same "
         "reason -- it has no clock to decide on.")
+elseif(NOT "${steppedIntervals}" STREQUAL "")
+    # Its own outcome, for the same reason the frozen clock above is one, and it
+    # is the louder of the two failures this check can have.
+    #
+    # Left as a plain negative number, `runSeconds` does not read as a failure to
+    # measure -- it reads as a measurement. `msPerFile` comes out negative, the
+    # band loop selects on `msPerFile LESS_EQUAL ${bandCeiling}`, and every
+    # negative is LESS_EQUAL the first row's ceiling of 2 -- so a bridged,
+    # contended run reports itself as `native: A filesystem reached directly`.
+    # That is this instrument confidently answering the one question it exists to
+    # answer, wrongly, and PASSING while it does so. A red would have been
+    # cheaper.
+    #
+    # The second consumer fails the other way: `narrated nothing` is appended only
+    # when `runSeconds GREATER_EQUAL` the narration threshold, which a negative
+    # never is, so the line the selftest requires goes missing and the check
+    # reddens with `did not say: narrated nothing` -- a true observation that
+    # names nothing a reader can act on. That is the failure #1313 was filed for,
+    # and it is the CHEAPER of the two: it goes red. The band above passes.
+    #
+    # The step is REPORTED rather than worked around: no clamp to zero, which
+    # would restore the wrong-band answer by the front door, and no retry, which
+    # would make the step disappear from the record. `string(TIMESTAMP)` is the
+    # only clock available here, so there is nothing monotonic to switch to.
+    # Which interval went backwards is named, because they can disagree: a step
+    # landing inside the walk leaves the whole run positive, and one inside the
+    # read phase leaves both of those positive. Saying "a step of Ns" for the
+    # interval that did NOT step is a confident wrong detail in a message whose
+    # whole purpose is to stop one being printed.
+    list(JOIN steppedIntervals " and " backwardsWhich)
+
+    # And what narration did is OBSERVED rather than asserted. Silencing is per
+    # INTERVAL, not per run, so a step in the walk leaves every later checkpoint
+    # free to fire -- and a blanket "narration is off" beside lines this same run
+    # printed is exactly the confident wrong detail the paragraph above refuses.
+    #
+    # `string(CONCAT)`, never a multi-argument `set()`: that builds a LIST, and
+    # interpolating it into the sentence below splices a bare `;` into it -- the
+    # same trap the headroom line carries a comment about further down.
+    if(narrated)
+        string(CONCAT narrationNote
+            "Progress narration DID fire, from the checkpoints whose own interval measured "
+            "forwards -- silencing is per interval, not per run.")
+    else()
+        string(CONCAT narrationNote
+            "Progress narration said nothing, and a stepped interval is one reason it cannot: a "
+            "checkpoint whose own interval is negative has nothing it can trust to decide on.")
+    endif()
+    message(
+        "${costNotMeasured}the wall clock went BACKWARDS during "
+        "${backwardsWhich}, so that interval is not a duration -- a negative reading there is a "
+        "clock that moved back, never a fast run. The whole run measured ${runSeconds}s and the "
+        "walk ${walkSeconds}s, and either can look ordinary while an inner interval stepped. "
+        "string(TIMESTAMP) is the only clock a cmake -P script has and it reads "
+        "CLOCK_REALTIME, which a VM host's time sync steps both ways -- WSL2 steps it back about "
+        "2s every 32s. No band is reported, because a negative per-file cost selects the FASTEST "
+        "band and would report a bridged run as native. ${narrationNote}")
 elseif(scanCount EQUAL 0)
     # Nothing to divide by. The vacuity refusal below is what actually acts on
     # this; saying it here keeps the cost line from reporting a per-file figure

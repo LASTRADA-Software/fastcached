@@ -3552,12 +3552,15 @@ set_tests_properties("sccache-backend-caveat-selftest" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     # Not derived from the budget above, and not a bare number by accident: this
-    # drives the check against a 26-file synthesised tree, so it is six `cmake -P`
-    # spawns over a corpus 30x smaller than the real one and finishes in ~1.4 s on
-    # the bridged filesystem the check itself takes ~4.5 s on. 120 s is the same
-    # backstop every other selftest here carries, and it is two orders of
-    # magnitude clear of what this costs -- which is exactly the margin the check
-    # under test now reports rather than asserts.
+    # drives the check against a 26-file synthesised tree, one `cmake -P` spawn
+    # per case over a corpus 30x smaller than the real one. The case COUNT is not
+    # restated here -- the case table owns it and the selftest prints it on every
+    # run, and the previous version of this comment said "six" and went stale in
+    # the same change that moved the table to ten. 120 s is the same backstop
+    # every other selftest here carries, and it stays orders of magnitude clear of
+    # a per-case cost measured in seconds on the bridged filesystem the check
+    # itself takes ~4.5 s on -- which is exactly the margin the check under test
+    # now reports rather than asserts.
     TIMEOUT 120
 )
 
