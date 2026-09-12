@@ -1631,6 +1631,31 @@ std::optional<std::string> AllowlistAnnouncement(AllowlistMoment moment,
         "compile-argument allowlist reloaded; {} entry/entries now in force: {}", current.size(), JoinAllowedArgs(current));
 }
 
+std::optional<std::string> ObservabilityAnnouncement(NodeConfig const& cfg)
+{
+    // The single-machine install says nothing, and this is the clause that keeps it
+    // quiet: `--scheduler` is required of every shape, so it is no evidence of a fleet.
+    if (!AdmitsRemotePeers(cfg))
+        return std::nullopt;
+
+    // The address `AdminEndpoint::Start` will actually take, asked of the surface's own
+    // row. Empty is that row's spelling of "not served", so this and `--print-surfaces`
+    // cannot disagree about whether the admin port is open.
+    if (!RowFor(NodeSurface::Admin).Resolve(cfg).empty())
+        return std::nullopt;
+
+    // Says what is unavailable and which flag provides it, and says the node is fine --
+    // an operator who reads this as a fault has been sent to look at a healthy worker.
+    return std::string {
+        "this node works for machines other than this one and opens no admin surface: /healthz, /metrics and the "
+        "fleet dashboard are all served on --admin-listen, which is off unless asked for. The node is configured "
+        "rather than broken -- it registers, caches and compiles exactly as told -- but with no admin surface there "
+        "is nothing to probe it through: no /healthz for a supervisor on this machine, and nothing to scrape from "
+        "any other. --admin-listen=<port> opens it, and a bare port "
+        "binds loopback; the dashboard needs --dashboard beside it."
+    };
+}
+
 std::vector<std::string_view> UnreloadableChanges(NodeConfig const& previous, NodeConfig const& candidate)
 {
     std::vector<std::string_view> changed;

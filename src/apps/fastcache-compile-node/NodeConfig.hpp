@@ -1024,6 +1024,44 @@ enum class AllowlistMoment : std::uint8_t
                                                                std::span<std::string const> previous,
                                                                std::span<std::string const> current);
 
+/// The line to log when a node that works for other machines opens no admin surface.
+///
+/// `--admin-listen` is off unless asked for, and its own help calls `/healthz` *"the
+/// liveness probe this worker otherwise has none of"*. A node without one caches,
+/// compiles and registers exactly as configured while being invisible to anything not
+/// on its own machine -- so over a fleet that is opt-in monitoring whose failure mode
+/// is silence
+/// ([#1304](https://github.com/LASTRADA-Software/fastcached/issues/1304)).
+///
+/// **A remark and NOT a flipped default**, which is the ticket's own position and the
+/// right one: binding a port nobody asked for is the decision this binary refuses
+/// everywhere. A default `--admin-listen` would also reach the dashboard-credential
+/// row in `StartupPolicyRejection`, so it would either serve the fleet page
+/// unauthenticated or make `--dashboard-token-file` mandatory on every install.
+///
+/// **The fleet question is `AdmitsRemotePeers`, an EXISTING spelling rather than a
+/// fourth one.** `NodeListenDefaultHost` records that *is this a fleet participant*
+/// already has three that deliberately disagree, and that a value decided by one
+/// predicate and judged by another is how they come apart. What this needs is *does
+/// this node's policy admit a machine that is not this one*, which is that function's
+/// exact subject. It is also what keeps the remark off the single-machine install:
+/// `--scheduler` is required of EVERY shape -- a scheduler registers with itself --
+/// so naming one says nothing about a fleet, and a predicate reading it would fire on
+/// every node there is.
+///
+/// Whether the surface is on is asked of its own ROW, for the reason the
+/// dashboard-credential rule gives: a second reader of that question eventually judges
+/// an address the surface no longer binds.
+///
+/// Pure, and here rather than an expression in `main.cpp`, for
+/// `AllowlistAnnouncement`'s reason: that file is in no test target (#909). Unlike its
+/// two siblings this is INFO and not WARN -- nothing was widened and nothing is wrong,
+/// and warning about a port an operator deliberately did not ask for is how the
+/// warnings that matter get filtered out.
+/// @param cfg The configuration this node is starting with.
+/// @return The message to log at INFO, or nullopt when there is nothing to say.
+[[nodiscard]] std::optional<std::string> ObservabilityAnnouncement(NodeConfig const& cfg);
+
 /// What a bare `--listen-raft` binds.
 ///
 /// The wildcard, like a scheduling node's `--listen-node` and unlike a worker's:
