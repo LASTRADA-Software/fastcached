@@ -348,6 +348,59 @@ SweepEverythingWhen=(
 # invisible.
 SourceExtensions=(c cc cxx h hh hpp cpp ipp hxx inl)
 
+# Roots this repository TRACKS but does not OWN.
+#
+# `vendor/` holds third-party source copied verbatim from upstream (see
+# vendor/VENDOR.md). It is tracked, so `git ls-files` lists it like anything else --
+# and "tracked" was this script's definition of first-party, which was exactly right
+# until there was a tracked tree nobody here may edit.
+#
+# Measured, with the pinned analyser and a real compile database: the vendored TUs
+# are in `compile_commands.json`, and clang-tidy reports
+# `readability-identifier-naming` on them. Under `WarningsAsErrors: "*"` that is a
+# failing sweep over code whose naming convention is upstream's business. And it is
+# not the diff-scoped case that bites first: `*CMakeLists.txt` and `*.cmake` are in
+# `SweepEverythingWhen`, so the very change that vendors anything escalates to a
+# full sweep and hands the analyser every vendored body at once.
+#
+# An INCLUSION list of our own would be the stronger shape and is not available
+# here: this script's subject is "every source this repository has", which is open,
+# whereas the set it does not own is closed and named. So it is stated as roots, the
+# enumeration is asserted below rather than trusted, and a new root is a row.
+NotOurRoots=(vendor)
+
+# Every first-party file, which is every tracked-or-new file outside the roots above.
+#
+# `--cached --others --exclude-standard` rather than plain `git ls-files`: a new
+# source created but not added yet is exactly the code nothing has ever checked, and
+# dropping it here would drop it silently.
+#
+# The exclusion is ASSERTED, not assumed. A filter that silently stops matching is
+# this script's own stated nightmare -- it would widen the sweep back over upstream
+# code, and the only signal would be a confident failure inside a file nobody here
+# wrote. So when a root exists and carries tracked files, dropping them must actually
+# reduce the set.
+#
+# @param @ Optional `git ls-files` pathspec globs.
+FirstPartyFiles() {
+    local all kept root
+    all="$(git ls-files --cached --others --exclude-standard "$@")"
+    kept="$all"
+    for root in "${NotOurRoots[@]}"; do
+        [[ -d "$root" ]] || continue
+        if [[ -z "$(git ls-files "$root")" ]]; then
+            continue
+        fi
+        local before="$kept"
+        kept="$(grep -v "^${root}/" <<< "$kept" || true)"
+        if [[ "$before" == "$kept" ]] && grep -q "^${root}/" <<< "$all"; then
+            echo "tidy-sweep: the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own" >&2
+            exit 1
+        fi
+    done
+    printf '%s\n' "$kept"
+}
+
 # Which of those are TRANSLATION UNITS, and therefore what the sweep can hand to
 # clang-tidy. Spelled as its own table rather than as a `*.cpp` test buried in
 # AffectedTranslationUnits: `c` is on the list above, so a `.c` file added
@@ -1713,7 +1766,7 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     # Filtered to what is actually on disk, because `--cached` also lists a tracked
     # file deleted from the worktree and not yet staged, and the include scan now
     # treats a file it cannot read as fatal rather than as an empty graph.
-    mapfile -t sources < <(git ls-files --cached --others --exclude-standard "${globs[@]}" \
+    mapfile -t sources < <(FirstPartyFiles "${globs[@]}" \
                            | while IFS= read -r candidate; do
                                  [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
                              done)
@@ -1732,10 +1785,7 @@ if [[ "$mode" != all && "$mode" != only ]]; then
     echo "TIDY SWEEP: ${#touched[@]} changed source(s) reach $(wc -l < "$selection" | tr -d ' ') candidate file(s)"
 fi
 
-# `--cached --others --exclude-standard` rather than plain `git ls-files`: a new
-# source that has been created but not added yet is exactly the code nothing has
-# ever checked, and dropping it here would drop it silently.
-git ls-files --cached --others --exclude-standard > "${scratch}/first-party"
+FirstPartyFiles > "${scratch}/first-party"
 
 # Through a file, so the plan's exit status is OBSERVED. `mapfile < <(PlanUnits …)`
 # discards it, and every way the plan can fail -- a compile database this build

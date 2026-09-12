@@ -347,6 +347,15 @@ gate_start_marker="== LOCAL GATE STARTED"
 gate_passed_marker="LOCAL GATE PASSED"
 gate_failed_marker="GATE FAILED:"
 
+# The root this repository TRACKS but does not OWN: third-party source copied
+# verbatim from upstream (vendor/VENDOR.md). Named once here because THIS FILE has
+# two independent tree-wide enumerators that both had to learn about it -- the
+# clang-tidy header-filter coverage count and the ctest registration derivation --
+# and the second was found by review rather than by the first's author, four hundred
+# lines away in the same script. A third would be found the same way, so a reader
+# adding one has at least got a name to grep for.
+GateVendorRoot="vendor"
+
 # ctest's own totals line, which three readers here hinge on: it is what
 # `skip_report` requires before it will conclude anything from a missing block,
 # what terminates the failure excerpt's alternation, and what the green path
@@ -1207,16 +1216,15 @@ header_filter_coverage() {
     # widen the filter -- and widening it is the `deps-leak` defect, arrived at by
     # following the remedy. So the set is partitioned rather than the pattern
     # loosened, and each half is asked its own question.
-    local vendorRoot="vendor"
     local vendored firstParty
-    vendored="$(grep -E "^${vendorRoot}/" <<< "$headers" || true)"
-    firstParty="$(grep -vE "^${vendorRoot}/" <<< "$headers" || true)"
+    vendored="$(grep -E "^${GateVendorRoot}/" <<< "$headers" || true)"
+    firstParty="$(grep -vE "^${GateVendorRoot}/" <<< "$headers" || true)"
 
     # A convention that has stopped describing anything reads exactly like one that
     # is being honoured: if the directory is there, it must carry tracked files, or
     # the two halves below are being taken over an empty set and agree perfectly.
-    if [[ -d "${root}/${vendorRoot}" ]] \
-        && [[ -z "$(git -C "$root" ls-files "$vendorRoot" 2>/dev/null)" ]]; then
+    if [[ -d "${root}/${GateVendorRoot}" ]] \
+        && [[ -z "$(git -C "$root" ls-files "$GateVendorRoot" 2>/dev/null)" ]]; then
         echo "vendor-untracked"
         return 0
     fi
@@ -1225,15 +1233,19 @@ header_filter_coverage() {
     # every first-party finding under code nobody here may edit. Coverage cannot see
     # this one either -- a filter that takes `vendor/` scores 401/401 and looks
     # perfect.
-    local v
-    while IFS= read -r v; do
-        [[ -n "$v" ]] || continue
-        if grep -qE "$include" <<< "$root/$v" \
-            && { [[ -z "$exclude" ]] || ! grep -qE "$exclude" <<< "$root/$v"; }; then
-            echo "vendor-leak"
-            return 0
-        fi
-    done <<< "$vendored"
+    #
+    # Asked through `header_filter_match` rather than by re-testing the pattern here,
+    # because that function OWNS the include/exclude rule and is the half `--self-test`
+    # drives at a synthetic root. A copy of the predicate beside it is an untested
+    # copy, and the model of `llvm::Regex` this file admits to being would then have
+    # three sites to correct instead of one. An empty vendored set answers `0/0`, so
+    # a tree with no vendored headers takes no special case.
+    local vendorHit
+    vendorHit="$(header_filter_match "$include" "$exclude" "$root" <<< "$vendored")"
+    if [[ "${vendorHit%%/*}" != 0 ]]; then
+        echo "vendor-leak"
+        return 0
+    fi
 
     # Coverage is then the #1040 question, unchanged, asked of first-party headers
     # alone. Emptiness is still refused: a repository of nothing but vendored code
@@ -1633,7 +1645,14 @@ target_set_report() {
 # git on this machine, which is #1064 and #336, and it presents as every command
 # listing zero files.
 gate_registration_sources() {
-    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null
+    # `vendor/` is excluded because this build never reads those files: the vendored
+    # tree carries upstream's own CMakeLists, which `vendor/CMakeLists.txt` states it
+    # deliberately does not use. One of them registers `add_test(NAME test-tui ...)`,
+    # and counting a registration from a file no build processes puts a permanently
+    # unclosable row in this derivation -- worse than a red, because a line that can
+    # never be cleared is a line that stops being read.
+    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null \
+        | grep -v "^${GateVendorRoot}/" || true
 }
 
 # Every test name the CMake sources register, and every registration whose name
@@ -2411,34 +2430,38 @@ src/apps/fastcached/Main.hpp"
     # EVERY header would also report no partial match. Each case plants the thing
     # the arm exists to refuse and watches it refuse; the clean case beside them is
     # what stops "refuses everything" reading as "works".
-    _hf_tree="${TMPDIR:-/tmp}/local-gate-selftest-hf.$$"
-    rm -rf "$_hf_tree"
+    # Under `$scratch`, which `--self-test` already created with `mktemp -d` and
+    # already removes on EXIT -- rather than a second `$$`-named tree with its own
+    # cleanup, which leaks on any exit between here and the `rm -rf`, and which
+    # spells uniqueness the one way this repository has been bitten by (`$$` is
+    # shared inside a subshell on bash 3.2).
+    _hf_tree="$scratch/header-filter"
+    _hf_clean='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _hf_config() { printf "HeaderFilterRegex: '%s'\n" "$1" > "$_hf_tree/.clang-tidy"; }
     mkdir -p "$_hf_tree/src/FastCache/Core" "$_hf_tree/vendor/endo/tui"
     : > "$_hf_tree/src/FastCache/Core/Base64.hpp"
     : > "$_hf_tree/vendor/endo/tui/Sixel.hpp"
     if git -C "$_hf_tree" init -q . 2>/dev/null \
         && git -C "$_hf_tree" add -A 2>/dev/null; then
-        printf "HeaderFilterRegex: '%s'\n" '.*/src/(CowTree|FastCache|apps|tests)/.*' \
-            > "$_hf_tree/.clang-tidy"
+        _hf_config "$_hf_clean"
         expect "a vendored header is excluded from coverage, and the first-party one still counts" \
             "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
 
         # PLANTED: widen the pattern the way the partial-match remedy tempts you to,
         # and the vendor arm must fire rather than the count going 2/2.
         #
-        # The widening keeps the real first-party alternation and ADDS vendor to it,
-        # rather than the broader `.*/(src|vendor)/.*` written first: that one also
-        # takes `.../_deps/catch2-src/src/catch2/...`, so `deps-leak` fired and the
-        # case passed for the wrong reason -- it would have gone green with the vendor
-        # arm deleted entirely. A discriminating case has to reach the arm it names.
-        printf "HeaderFilterRegex: '%s'\n" \
-            '.*/src/(CowTree|FastCache|apps|tests)/.*|.*/vendor/.*' > "$_hf_tree/.clang-tidy"
+        # The widening is the real pattern PLUS vendor, which is what the tempting
+        # edit actually looks like -- and not the broader `.*/(src|vendor)/.*` written
+        # first: that one also takes `.../_deps/catch2-src/src/catch2/...`, so
+        # `deps-leak` fired and the case passed for the wrong reason. It would have
+        # gone green with the vendor arm deleted entirely. A discriminating case has
+        # to reach the arm it names.
+        _hf_config "${_hf_clean}|.*/vendor/.*"
         expect "widening the filter over vendor/ is caught, not scored as full coverage" \
             "vendor-leak" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
 
         # PLANTED: a vendor/ directory git knows nothing about.
-        printf "HeaderFilterRegex: '%s'\n" '.*/src/(CowTree|FastCache|apps|tests)/.*' \
-            > "$_hf_tree/.clang-tidy"
+        _hf_config "$_hf_clean"
         git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
         expect "a vendor/ directory tracking nothing is refused by name" \
             "vendor-untracked" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
@@ -2450,7 +2473,7 @@ src/apps/fastcached/Main.hpp"
         expect "the header-filter vendored/first-party split was exercised" \
             "exercised" "no usable git, so the split was never driven -- inconclusive, not a pass"
     fi
-    rm -rf "$_hf_tree"
+    unset -f _hf_config
 
     # THE WIRING, which none of the above can see: the real `.clang-tidy` in this
     # very tree must cover every header this repository tracks. This is the case

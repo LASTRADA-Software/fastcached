@@ -30,7 +30,7 @@
 #
 # @param FASTCACHED_SOURCE_DIR Repository root.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
@@ -107,6 +107,16 @@ string(REPLACE "\r\n" "\n" manifestRaw "${manifestRaw}")
 # The fast path needs no list handling at all, which is where a `cmake -P` reader
 # usually goes wrong: `;`, `\` and brackets in content are re-interpreted by
 # `foreach(... IN LISTS ...)` and quietly change what is being compared.
+#
+# NOT `fastcached_split_lines_verbatim` from scripts/lib/CheckCommon.cmake, and this
+# is a deliberate non-reuse rather than an oversight. That helper BLANKS `[` and `]`
+# and escapes `;`, which is right for its job -- scanning source text for a pattern,
+# where a bracket is noise. Here the lines are round-tripped and compared for BYTE
+# EQUALITY against a freshly computed set, so any transformation of the content makes
+# an unmodified tree report a mismatch. A vendored path containing a bracket would
+# fail loudly rather than silently, but it would fail, and the refusal would name the
+# wrong cause. CheckCommon's own header records that a reader whose lines must stay
+# verbatim is the case it does not serve.
 set(expected "")
 string(REPLACE "\n" ";" manifestLines "${manifestRaw}")
 foreach(line IN LISTS manifestLines)

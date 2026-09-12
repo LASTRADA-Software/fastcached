@@ -24,7 +24,6 @@ from the contents.
 | [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 161 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError}.hpp`, `testing/SuppressWindowsDialogs.hpp` |
 | [contour-terminal/contour](https://github.com/contour-terminal/contour) | `243d776aed99bcc0f634b0608189609fd4e548ba` | 5 | `coro/{Task,Cancellation,WhenAny,UniqueCoroHandle}.hpp`, `crispy/FNV.hpp` |
 
-<!-- table-total: 166 files -->
 
 **Why `coro/` and `crispy/` come from contour and not from endo:** endo's own
 `.gitignore` lists `/src/crispy` and `/src/coro`. They are not part of endo's
@@ -85,23 +84,29 @@ Two facts that make this much less alarming than it sounds, both measured:
 **None.** All 166 files are byte-identical to their upstream blobs, which is
 checked rather than asserted — see below.
 
-Every local change goes in a commit **after** the import commit
-(`0d21d8d7 vendor: import endo's src/tui verbatim`), never folded into it, so that
-
-```sh
-git diff 0d21d8d7..HEAD -- vendor/endo
-```
-
-**is** the patch to send upstream. When you add one, add a row here saying what and
-why, and the diff above stays the thing you upload.
+Every local change goes in its own commit, never folded into the import, and gets a
+row here saying what, why, and which upstream it belongs to.
 
 ## How to send a change back
 
+**Diff against UPSTREAM, not against a local commit.** The import commit is the
+obvious anchor and it is the wrong one: this project rebases every branch before it
+merges, so that SHA does not survive, and a range anchored to a commit that no
+longer exists fails by printing an error about an unknown revision — months later,
+to whoever is trying to upstream a fix. The fork points in the table above are
+immutable and are already the thing being diffed *from*.
+
 1. Work out which upstream owns the file, from the table above. `coro/` and
    `crispy/` are contour's; everything else is endo's.
-2. `git diff 0d21d8d7..HEAD -- vendor/endo/<path>` is the patch.
-3. Open the pull request against that repository, at the paths it uses: this tree's
-   `vendor/endo/X` is upstream's `src/X` in both cases.
+2. Take the diff against that upstream at its fork point. This tree's
+   `vendor/endo/X` is upstream's `src/X` in both cases:
+
+   ```sh
+   git -C <upstream> -c core.autocrlf=false -c core.eol=lf show <fork-point>:src/<path> \
+       | diff -u --label "a/src/<path>" --label "b/src/<path>" - vendor/endo/<path>
+   ```
+
+3. Open the pull request against that repository.
 4. When it merges, re-sync (below) and delete the row from "Local changes".
 
 ## How to re-sync
@@ -133,12 +138,23 @@ used: it names `endo-platform`, `coro`, `stb_image` and three endo-only CMake
 helper functions, none of which exist here, and editing it would put a local change
 inside the contribution diff on day one.
 
-The 19 upstream translation units not built are the ones reaching the two
-dependency groups this tree did not take (`stb_image` → image loading; `coro` → the
-event runtime) plus an interactive editor's widgets — popups, completion, Markdown,
-input fields — that a stats view never calls. They remain **on disk, verbatim**:
-subsetting the build is not subsetting the copy, and adding one back is a line in
-`vendor/CMakeLists.txt` rather than a new import.
+Every vendored translation unit this target does **not** build is named in that
+file's `_fcTuiNotBuilt`, with one of three reasons: it reaches `stb_image` (image
+decoding), it reaches `coro` (the event runtime), or nothing on a stats panel's
+path reaches it — an interactive editor's widgets, present and working and simply
+not called here.
+
+The two lists are asserted at configure time to **partition** the vendored `.cpp`
+files on disk, so the counts are derived rather than written down, and a re-sync
+that adds a file refuses by name instead of leaving it built by nothing and
+classified by nothing. That assertion exists because the prose version of this
+paragraph was wrong on the day it was written: it claimed 40 upstream units and 19
+excluded, where upstream's target is 48 per platform and 27 are excluded, and
+`HyperlinkEmitter.cpp` appeared in no list and no rationale at all.
+
+Unbuilt sources remain **on disk, verbatim** — subsetting the build is not
+subsetting the copy — and building one is moving its row from one list to the
+other, not a new import.
 
 `libunicode` is a genuine new third-party dependency, fetched `find_package`-first
 then CPM like every other, pinned at **0.9.3** as a floor: earlier versions have a
@@ -159,7 +175,6 @@ each spelling names this directory:
 | `scripts/check-succeed-not-skip.cmake` | `src/`-anchored, so it scans this repository's own tests | the first upstream sync adding a `SUCCEED` reddens a check about *our* code |
 | `vendor/CMakeLists.txt` | added before the pedantic/clang-tidy includes, and clears `CXX_CLANG_TIDY` on the target as well | see the two rows above |
 
-<!-- table-total: 5 rows -->
 
 `local-gate.sh` also refuses when `vendor/` exists but git tracks nothing inside it:
 a convention that has stopped describing anything reads exactly like one being
