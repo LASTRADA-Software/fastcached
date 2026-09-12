@@ -5927,3 +5927,40 @@ else()
         TIMEOUT 300
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Every `RequiredContexts=(` declaration says at its own site what it is (#1360).
+#
+# Four files under `scripts/` declare that array and three are self-test fixtures. The
+# 11-row one in `check-merge-group-report.sh` is a strict SUBSET of the live 14-row table
+# whose every row is a real context name, which is the shape that reports "11 of 11
+# passed" and trips nothing -- a lane's hand-rolled reader did exactly that, on a pull
+# request that had already merged.
+#
+# `ci-pr-required.sh` already refuses when not ONE check run matches a required name, and
+# that guard cannot catch this: 11 of 11 matched real contexts. Its real protection is
+# that it pins the source FILE, so the defect is choosing the wrong file -- which nothing
+# inside a reader can detect.
+#
+# Needs no compiler, no daemon, no socket and no network; it reads `scripts/`.
+add_test(
+    NAME "required-context-table"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-table.sh" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("required-context-table" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Fifteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
+# a guard that refuses every tree passes every negative case, and one stood here for two
+# days (#1031). Case 13 is the accepting arm of the data-REGION mechanism, which is the
+# one part of this check that can reduce its own coverage.
+add_test(
+    NAME "required-context-table-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-table.sh" --self-test
+)
+set_tests_properties("required-context-table-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

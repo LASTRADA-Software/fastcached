@@ -482,6 +482,10 @@ SelfTest() {
     # asserts that.
     local required="${scratch}/required.sh"
     cat > "$required" <<'REQ'
+# required-context-table: fixture -- a stand-in pinned to the state these cases were
+# captured in (2026-09-04). Deliberately a strict SUBSET of the live table, which is
+# what makes it the dangerous decoy of #1360: every row is a real context name, so a
+# reader that lands here reports a true statement about a set nobody asked about.
 RequiredContexts=(
     "Windows-cl-release|.github/workflows/build.yml"
     "Windows-clangcl-release|.github/workflows/build.yml"

@@ -596,6 +596,9 @@ SelfTest() {
 
     local requiredFile="${scratch}/required.sh"
     cat > "$requiredFile" <<'REQ'
+# required-context-table: fixture -- two rows, enough for the generated workflows below
+# to show a required and an unrequired job. Not the live table, and not meant to track
+# it: these cases assert what the rules do with a GIVEN required set (#1360).
 RequiredContexts=(
     "Check C++ style|.github/workflows/build.yml"
     "clang-tidy|.github/workflows/build.yml"
