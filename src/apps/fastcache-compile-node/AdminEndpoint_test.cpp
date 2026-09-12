@@ -1065,15 +1065,50 @@ TEST_CASE("The history path follows the directories a node already has", "[node]
 namespace
 {
 
-/// The fleet routes over a leading scheduler and a sampler that has sampled.
+/// The fleet routes over a leading scheduler and a sampler that has sampled `Readings`
+/// times.
+///
+/// **That the history holds several readings a RENDER bucket apart is the whole point
+/// of this fixture rather than a detail of it**
+/// ([#1345](https://github.com/LASTRADA-Software/fastcached/issues/1345)). Against a
+/// history holding one sample every series is a run of one -- which `FleetChart` draws
+/// as a `<circle>` dot and a bare `M x y` that strokes nothing -- so a route handing
+/// the renderer a populated history and a route handing it an empty one produce the
+/// same `200`, the same `image/svg+xml` and the same `<svg ` prefix, and the cases
+/// below could assert only what both states produce. How many readings, and how far
+/// apart, are each stated where they are spelled.
+///
+/// The clock is a PLACED one for the same reason: with a system clock the readings land
+/// in whichever buckets real time puts them in, so they can share one and the fixture
+/// would look fixed while staying vacuous. `Testing::PlacedWallClock` rather than a
+/// `ManualWallClock` of this file's own, because it already carries the pinned
+/// 2026-01-01T00:00:00Z instant this needs -- a `ManualWallClock` defaults to 1970,
+/// where the handover case below, which places a bucket three minutes BEFORE
+/// `wall.Now()`, would compute a negative bucket start.
 struct ChartFixture
 {
+    /// How many readings the history is given.
+    ///
+    /// **Three, and the arithmetic is why.** A rate series is the delta between
+    /// adjacent PRESENT buckets, so N buckets carry N-1 rate points: two readings give
+    /// ONE, which `FleetChart` draws as a dot. Three give two, and two points are a
+    /// line. Measured -- at two readings `dispatched` and `refusals` both came back
+    /// without a stroke while the gauge chart already had one.
+    static constexpr int Readings = 3;
+
     ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock wall;
-    ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+
+    /// One notion of now, read by the sampler and by the scheduler alike.
+    ///
+    /// Two would be two: a second clock left at its own default puts the scheduler's
+    /// instants 56 years from the sampler's, and the first case to join a
+    /// scheduler-stamped time to a sample bucket would get that gap. The pin belongs to
+    /// the fixture rather than to whichever clock the newest assertion needed.
+    Testing::PlacedWallClock wall;
+
+    Distributed::SchedulerService scheduler { clock, wall, metrics, logger, {}, {} };
     std::unique_ptr<FleetSampler> sampler;
     std::vector<AdminRoute> routes;
 
@@ -1082,10 +1117,74 @@ struct ChartFixture
         scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
         Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
         sampler = std::make_unique<FleetSampler>(sources, metrics, NodeFacts(), wall, HistoryPaths {}, logger);
-        REQUIRE(sampler->SampleOnce());
+
+        // **A whole RENDER bucket between readings, not a whole SAMPLE bucket, and that
+        // distinction is the one this fixture got wrong first.** The cases below draw
+        // at `range=24h`, which `FleetRangeTable` buckets at FIVE minutes -- so
+        // readings one `FleetSampleInterval` apart share a render bucket, collapse to a
+        // run of one, and every chart comes back a dot with no line. Measured:
+        // advancing by the sample interval left every chart in the table failing
+        // `DrawsALine`, back when the assertion was asked of all of them. Derived from
+        // the row rather than written as five minutes, or this silently stops covering
+        // the range it names the day that column moves.
+        auto const bucket = Distributed::FleetRangeTable[static_cast<std::size_t>(Distributed::FleetRange::Day)].bucket;
+        for (auto const reading: std::views::iota(0, Readings))
+        {
+            // **BETWEEN readings, never after the last one**, and that asymmetry is
+            // load-bearing rather than a tidier spelling away from it. `FleetSampler`
+            // records on a thread of its own as well, so a clock left standing one
+            // bucket past the final reading gives that thread a FOURTH bucket to file
+            // -- which moves the chart ETag and turns the revalidation case's `304`
+            // into a `200`. Measured at 13 of 20 runs, with the tag reading
+            // `dispatched-24h-auto-4` against the `...-3` the first render was served.
+            if (reading != 0)
+                wall.Advance(bucket);
+            REQUIRE(sampler->SampleOnce());
+        }
+
         // Through the view the production wiring uses, so a route drawing the raw
         // series would fail here rather than on the leader that lost an election.
         routes = MakeFleetRoutes(sources, AdminCredential {}, DashboardRefreshSeconds, sampler.get());
+    }
+
+    /// Whether any path in @p svg strokes a run of two or more readings.
+    ///
+    /// **`L` inside a `d` attribute, and the reason is not the obvious one.** A run of
+    /// one contributes nothing to the path at all: `RunsGeometry`'s dot branch emits a
+    /// `<circle>` and returns before the run is appended, and every `<path` the
+    /// renderer writes is guarded on a non-empty `d`. So on today's renderer `<path`
+    /// presence and `L` presence are the SAME answer, and this comment claimed the
+    /// opposite -- that a one-sample chart still carries `<path` for its bands.
+    ///
+    /// `L` is still what this asks, because that equivalence is a property of the dot
+    /// branch rather than of the question: the first static frame, axis or guide path
+    /// makes `<path` true for a chart with no series at all, which is exactly the
+    /// vacuity this fixture exists to rule out (#1345). An `L` cannot be produced by
+    /// one reading whatever else the document grows.
+    ///
+    /// The needle carries its leading SPACE for the mirror reason: `d="` also matches
+    /// `id="`, so the first `<clipPath>`, `<linearGradient>` or `<mask>` whose id
+    /// happens to contain an `L` would report a stroked run for an empty chart.
+    /// @param svg The rendered document.
+    /// @return Whether some `d` attribute carries a line-to command.
+    [[nodiscard]] static bool DrawsALine(std::string_view svg)
+    {
+        constexpr std::string_view attribute = R"( d=")";
+        for (std::size_t at = svg.find(attribute); at != std::string_view::npos;
+             at = svg.find(attribute, at + attribute.size()))
+        {
+            auto const open = at + attribute.size();
+            auto const close = svg.find('"', open);
+            // `return` rather than `break`, and they are the same answer here: no
+            // closing quote anywhere after `open` means no later `d="` exists either,
+            // since that spelling carries one. So this does not fold "malformed" into
+            // "no line" -- the second state cannot follow the first.
+            if (close == std::string_view::npos)
+                return false;
+            if (svg.substr(open, close - open).contains('L'))
+                return true;
+        }
+        return false;
     }
 
     [[nodiscard]] AdminResponse Get(std::string_view path, std::string_view query = {}, std::string_view etag = {}) const
@@ -1124,6 +1223,28 @@ TEST_CASE("A chart is served as its own SVG resource, per chart the table names"
         CHECK(response.status == "200 OK");
         CHECK(response.contentType == "image/svg+xml");
         CHECK(response.body.starts_with("<svg "));
+    }
+
+    // **The assertion the three above cannot make, and it is asked of NAMED charts
+    // rather than of every row.** A 200, an SVG content type and an `<svg ` prefix are
+    // all true of a chart with nothing in it, so on their own this case passed over a
+    // route that handed the renderer an empty history (#1345). A stroked run is what
+    // an empty history cannot produce.
+    //
+    // Two charts, because they fail for different reasons if the hand-over breaks: a
+    // GAUGE draws from the readings themselves, a RATE draws from the deltas between
+    // them, and a history that arrived empty kills both.
+    //
+    // `hit-rate` is deliberately not among them and that is not an exemption: it is
+    // hits over misses, and this fleet has compiled nothing, so the ratio is genuinely
+    // UNDEFINED rather than zero and the series is correctly absent. Asserting a line
+    // there would force the fixture to fake a busy cache to test a route's wiring, and
+    // would assert that an idle fleet draws a hit rate -- which is the absent-is-not-zero
+    // rule pointing the other way.
+    for (auto const* const key: { "capacity", "dispatched" })
+    {
+        INFO("chart " << key);
+        CHECK(ChartFixture::DrawsALine(fixture.Get(std::format("/fleet/chart/{}.svg", key), "range=24h").body));
     }
 
     // One prefix route covers the whole table, so a tail that names nothing is a
@@ -1166,7 +1287,14 @@ TEST_CASE("The page draws what the other machines handed over", "[node][admin][c
     // to be asserted, not the merge.
     ChartFixture fixture;
 
-    // A window this leader has no reading for: it sampled once, at "now".
+    // A window this leader has no reading for -- and an ARITHMETIC dependency rather
+    // than a safe margin, which is worth saying because the sentence here used to be
+    // "it sampled once, at now" and outlived the fixture that made it true. The
+    // readings sit a render bucket apart, five minutes, at now, now-5m and now-10m;
+    // `range=1h` buckets by the MINUTE, so the minute three back carries none of them.
+    // Change how far apart `ChartFixture` places its readings and re-derive this
+    // offset, or the case quietly starts asserting about a window the leader sampled
+    // itself and stops testing the handover at all.
     auto const missed = Testing::MinuteBucketStart(fixture.wall.Now()) - (3 * 60'000);
     auto bucket = Testing::ClosedBucket(missed);
     bucket.values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] = 4242;
@@ -1233,14 +1361,21 @@ TEST_CASE("The machine-readable fleet surfaces reach the history through the one
         CHECK(json.body.contains(std::string { "\"" } + std::string { key } + R"(":{"value":)"));
     }
 
-    // What this fixture can and cannot say, stated rather than glossed. It samples
-    // ONCE, and a folded series is a delta between adjacent present buckets -- so
-    // every history-derived figure is HONESTLY absent here, and asserting one is
-    // non-null would be asserting something about the fixture. The link that a route
-    // consults the range at all is the refusal above: a route ignoring it would serve
-    // `range=30d` a document rather than a 400. That a PLUMBED history changes the
-    // answer is asserted where it can be: `A headline figure nobody sampled is absent
-    // rather than zero` in `FleetView_test.cpp` drives both directions directly.
+    // What this fixture can and cannot say, stated rather than glossed -- and this
+    // paragraph said the opposite until the fixture stopped sampling once (#1345),
+    // which is the shape worth flagging: a comment claiming something CANNOT be
+    // asserted instructs the next reader not to try. `ChartFixture` now records
+    // several readings a render bucket apart, so at `range=24h` the history-derived
+    // figures here are POPULATED rather than absent.
+    //
+    // What the loop above pins is that every KPI key is PRESENT, which a null-filled
+    // document satisfies just as well. An assertion on a populated figure is available
+    // here now and is deliberately not taken: it would pin the fixture's reading count
+    // as firmly as the route, while `A headline figure nobody sampled is absent rather
+    // than zero` in `FleetView_test.cpp` already drives both directions directly
+    // against the renderer. The link that a route consults the range at all is the
+    // refusal above: a route ignoring it would serve `range=30d` a document rather
+    // than a 400.
     //
     // A figure off the SNAPSHOT is answered either way, which is what says the
     // absences above are about the history rather than about a document that failed
