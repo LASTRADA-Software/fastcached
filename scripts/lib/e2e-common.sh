@@ -247,6 +247,336 @@ free_port() {
 }
 
 # ---------------------------------------------------------------------------
+# Who owns the listener?
+# ---------------------------------------------------------------------------
+#
+# `port_answers` asks whether ANYTHING is listening. `wait_for_port` used to stop there,
+# so *my process is up* and *somebody's process is up* were one answer and a fixture could
+# run its whole body against a foreign listener and pass (#1321). Measured during #183 by
+# planting a squatter on the fixture's port: the wait returned after ONE poll and the
+# fixture then passed. The `pid` argument was already there and does not help -- it is
+# used to notice the process DYING, which is only consulted on the failure path, so the
+# port probe wins the race that matters.
+#
+# Per-run ports narrow this and do not close it. `free_port` draws below the ephemeral
+# range and probes by CONNECTING, and this repository already records that a connect probe
+# cannot see a port held as an outbound connection's local endpoint -- so a drawn port is
+# not proven free -- and between the draw and the bind there is a window nothing re-checks.
+# A rare silent wrong answer is worse than a common loud one: it surfaces as an
+# unreproducible failure somewhere else entirely.
+#
+# ## FIVE answers, because three of them get folded
+#
+#   owned           the listener belongs to $pid or a DESCENDANT of it
+#   foreign         it belongs to a process that is neither -- terminal, the wait fails
+#   unattributable  this platform, or this privilege level, cannot answer
+#   no-subject-pid  the caller passed `-`: there is no subject to attribute to
+#   not-listening   nothing is listening this instant -- a TRANSIENT, not a verdict
+#
+# `unattributable` and `no-subject-pid` both end in "proceed on the port alone" and are
+# still two states, because they are two different diagnoses: one is a missing tool and
+# one is a fixture that never had a pid to offer (a launchd job under a service account).
+# Folding them would print a platform complaint at a call site that is working correctly.
+#
+# `not-listening` is a transient rather than a verdict. The port answered and the owner
+# lookup found nobody, which happens when a socket closes between the two questions; the
+# wait keeps polling and the deadline still bounds it.
+#
+# ## It fails OPEN, deliberately
+#
+# A listener that exists and cannot be attributed is `unattributable`, never `foreign`.
+# The failure directions are not symmetric: a missed squatter costs the wrong answer this
+# was written to catch, while a wrong `foreign` REFUSES the subject's own listener and
+# fails a healthy tree -- and nine fixtures call this, including the heaviest in the tree.
+# Refusing looks like rigour, which is why this says so out loud.
+#
+# The residual, stated rather than implied: a squatter owned by ANOTHER USER is invisible
+# to an unprivileged `ss`/`lsof`, so it lands in `unattributable` and is waved through
+# with a warning. The realistic case -- a leftover from this user's own previous run --
+# is attributable, and that is the one the port-reaper rule is about.
+#
+# ## Attribution accepts the pid OR ANY DESCENDANT
+#
+# A fixture starts a wrapper which starts the daemon, so the listener belongs to the
+# grandchild. Matching the pid exactly would report `foreign` for the process the fixture
+# launched itself, which is the wrong-`foreign` failure above arriving by the front door.
+
+# Bound on the ancestry walk. A process table is a forest and cannot be 64 deep here; the
+# guard exists because a walk that meets a cycle or a pid it cannot read would otherwise
+# spin, and a bound nobody has watched fire is untested rather than proven -- the
+# self-test drives it.
+_e2e_ancestry_bound=64
+
+# The parent of $1, in the SAME numbering $1 is in, or "" when it cannot be read.
+#
+# THREE rows, and the MSYS one is not a nicety. MSYS `ps` has **no `-o`** -- it accepts
+# only `[-aefls] [-u UID] [-p PID]` -- so the portable-looking `ps -o ppid= -p` prints
+# `ps: unknown option -- o` there and yields NOTHING. The ancestry walk then terminates on
+# its first hop and every GRANDCHILD reads `foreign`, which is the wrong-`foreign` failure
+# that refuses a fixture's own daemon. Measured: a `bash -c` wrapper (MSYS 816981) whose
+# python child (MSYS 816983, WINPID 32148) held the listener was reported `foreign` until
+# this row existed.
+_e2e_parent_pid() {
+    case "$(uname -s)" in
+        Linux)
+            # Field 4 of /proc/<pid>/stat. Read positionally after the comm field, which
+            # may itself contain spaces and parentheses -- so the text up to the LAST
+            # `)` is dropped rather than split on.
+            [ -r "/proc/$1/stat" ] || return 0
+            awk '{ sub(/^.*\) /, ""); print $2 }' "/proc/$1/stat" 2>/dev/null
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            # `PID PPID PGID WINPID ...`, header first. The row is matched on its PID
+            # rather than taken by position, because `-p` prints a header whether or not
+            # the process exists -- so a dead pid would otherwise yield the word `PPID`.
+            ps -p "$1" 2>/dev/null | awk -v p="$1" 'NR > 1 && $1 == p { print $2 }'
+            ;;
+        *)
+            ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '
+            ;;
+    esac
+}
+
+# Is $1 the pid $2, or a descendant of it? Numbering-agnostic: both are in whatever
+# numbering `_e2e_parent_pid` walks.
+_e2e_is_descendant() {
+    local p="$1" want="$2" hops=0
+    while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ]; do
+        [ "$p" = "$want" ] && return 0
+        hops=$(( hops + 1 ))
+        if [ "$hops" -gt "$_e2e_ancestry_bound" ]; then
+            return 1
+        fi
+        p="$(_e2e_parent_pid "$p")"
+    done
+    [ "$p" = "$want" ]
+}
+
+# The pids listening on $1:$2, one per line, in the numbering this platform reports.
+#
+# Exit 0 means ANSWERED -- possibly with nothing, which is `not-listening`. Exit 1 means
+# COULD NOT ASK, which is `unattributable`. Those are the two states a tool's empty output
+# collapses, and collapsing them is what turns a missing tool into a silent pass.
+#
+# A per-platform table rather than one clever command, because the three hosts these
+# fixtures run on answer in three different ways and one of them answers in a different
+# pid NUMBERING:
+#
+#   Linux    `ss -ltnpH`, then `lsof`. GitHub's ubuntu images carry both.
+#   macOS    `lsof`, which is in the base system.
+#   MSYS     Windows `netstat -ano` reports WINDOWS pids while `$!` yields an MSYS pid.
+#            They join through `ps`, which prints both columns. Measured on Windows 11
+#            (2026-09-12): a listener backgrounded from Git Bash had MSYS pid 749567,
+#            `ps` gave it WINPID 45220, and `netstat -ano` named 45220 as the LISTENING
+#            owner. A prior reading of this recorded the two numberings as uncomparable;
+#            they are not, and `ps` is the join. `ss`, `lsof` and `fuser` are all absent
+#            there, so this row is the only one that can answer on that host.
+
+# `ss -ltnH ... -p` prints `users:(("name",pid=NNN,fd=N))`, one socket per line and
+# possibly several owners on one socket under SO_REUSEPORT.
+# EVERY backend returns 0 for ANSWERED (possibly with nothing, which is `not-listening`)
+# and 1 for COULD NOT ASK. That distinction is the whole of `unattributable`, and each
+# backend has to make it for itself: a pipeline's status is its LAST command's, so a tool
+# that failed at the head of one is invisible from the end of it.
+#
+# `ss`'s own status is captured BEFORE the parse, for exactly that reason: piped straight
+# into `sed`, an `ss` too old for `-H`, or one refused by the kernel, yields empty output
+# and `sort`'s cheerful 0.
+_e2e_listener_pids_ss() {
+    local raw rc=0
+    raw="$(ss -ltnH "sport = :${2}" -p 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    printf '%s\n' "$raw" \
+        | sed -n 's/.*users:(\(.*\))$/\1/p' \
+        | tr ',' '\n' \
+        | sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' \
+        | sort -u
+}
+
+# `lsof -t` exits **1 for NO MATCH and 1 for an error alike**, so its status alone cannot
+# tell `not-listening` from `unattributable` -- which is the same conflation this whole
+# predicate exists to refuse, one layer down.
+#
+# `-t` prints bare pids and nothing else, so the OUTPUT discriminates where the status
+# cannot: any non-numeric line is a diagnostic (a permission refusal, an unknown flag)
+# rather than an owner. `-w` suppresses the routine warnings, which are not errors and
+# would otherwise read as one.
+#
+# Matched on the PORT alone, not `-iTCP@host:port`, so this agrees with the other two
+# backends: a subject bound to a wildcard address and probed on loopback would otherwise
+# yield zero owners here and be read as `not-listening` -- finding 1's collapse through a
+# second door, and reachable the first time a fixture passes `--bind=0.0.0.0`.
+_e2e_listener_pids_lsof() {
+    local out rc=0
+    out="$(lsof -w -nP "-iTCP:${2}" -sTCP:LISTEN -t 2>&1)" || rc=$?
+    [ "$rc" -le 1 ] || return 1
+    [ -n "$out" ] || return 0
+    if grep -qv '^[0-9][0-9]*$' <<< "$out"; then return 1; fi
+    sort -u <<< "$out"
+}
+
+# `netstat -ano` prints `TCP  <local>  <remote>  LISTENING  <winpid>`, then the WINPID is
+# joined back to an MSYS pid through `ps`, so the ancestry walk runs in ONE numbering.
+#
+# The local address is matched on its PORT rather than on the host text: Windows spells a
+# wildcard bind `0.0.0.0` and `[::]` while the fixture may have asked about `127.0.0.1`.
+# Anchored at the END of the field, or `:2195` would also match `:21955`.
+_e2e_listener_pids_netstat() {
+    local raw winpids w mapped rc=0
+    # `netstat`'s own status, before the parse -- see the note on `ss` above.
+    raw="$(netstat -ano 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    winpids="$(printf '%s\n' "$raw" \
+        | awk -v p=":${2}" '
+            $1 == "TCP" && $4 == "LISTENING" {
+                if (substr($2, length($2) - length(p) + 1) == p) print $5
+            }' \
+        | sort -u)"
+    [ -n "$winpids" ] || return 0
+    mapped=""
+    while IFS= read -r w; do
+        [ -n "$w" ] || continue
+        mapped="${mapped}$(ps -W 2>/dev/null | awk -v w="$w" '$4 == w { print $1 }')
+"
+    done <<EOF
+$winpids
+EOF
+    # `netstat` named an owner and the join produced nothing, so the WINPID could not be
+    # resolved to an MSYS pid. That is COULD NOT ASK, not "nobody is listening" -- the
+    # difference between `unattributable` and `not-listening`, and the second would wave a
+    # squatter through.
+    #
+    # Tested by its OUTCOME rather than by `command -v ps`, on purpose. A `command -v ps`
+    # guard is what this file used first, and it declared `ps` optional TREE-WIDE: the
+    # optional set in `check-unguarded-prerequisites.sh` is seeded AND derived from every
+    # tool any script is seen to guard, so one guard here retroactively made
+    # `reap-my-gate.sh`'s three unguarded uses violations. No file on master guards `ps`,
+    # so the tree's settled position is that it is a prerequisite. Testing the outcome is
+    # also strictly wider: it covers `ps -W` failing for any reason, not only absence.
+    # A HERESTRING and not `printf ... | grep -q`: under `pipefail` that pipeline is a
+    # false negative on its SUCCESS path, because `grep -q` exits at the first match and
+    # the producer dies of SIGPIPE.
+    grep -q '[0-9]' <<< "$mapped" || return 1
+    grep '[0-9]' <<< "$mapped" | sort -u
+}
+
+# Which tool this host answers with: `ss`, `lsof`, `netstat`, or `none`.
+#
+# Overridable through `FASTCACHED_E2E_LISTENER_TOOL` **only so the self-test can drive the
+# rows this host cannot reach**; production sets nothing. Without it, `lsof` is dead code
+# on Linux and on Windows, `netstat` is dead code everywhere but Windows, and `none` --
+# the arm the whole `unattributable` outcome exists for -- is reachable on no developer
+# machine at all. An arm nobody has watched fire is untested rather than proven, and this
+# one fails OPEN, so an untested `none` would look exactly like a working one.
+_e2e_listener_tool() {
+    if [ -n "${FASTCACHED_E2E_LISTENER_TOOL:-}" ]; then
+        echo "$FASTCACHED_E2E_LISTENER_TOOL"
+        return 0
+    fi
+    case "$(uname -s)" in
+        Linux)
+            command -v ss   >/dev/null 2>&1 && { echo ss;   return 0; }
+            command -v lsof >/dev/null 2>&1 && { echo lsof; return 0; }
+            ;;
+        Darwin)
+            command -v lsof >/dev/null 2>&1 && { echo lsof; return 0; }
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            # `netstat` only. `ps` is a PREREQUISITE in this tree -- no file on master
+            # guards it -- and guarding it here would declare it optional tree-wide,
+            # because the optional set is derived from every tool any script is seen to
+            # guard. The netstat row detects a failed `ps` join by its OUTCOME instead.
+            command -v netstat >/dev/null 2>&1 && { echo netstat; return 0; }
+            ;;
+    esac
+    echo none
+}
+
+# NO `return 0` after the `case`. The backend's status IS this function's answer, and an
+# unconditional one here discarded it -- so the three REAL backends could never report
+# "could not ask" and `unattributable` was reachable in production by no route at all. It
+# fired only through the `none` arm, which is the synthetic override, which is precisely
+# what made it look covered.
+#
+# What that cost: a missing tool, a refused `lsof`, an `ss` too old for `-H` all yielded
+# rc=0 with empty output, which reads as `not-listening`, which is treated as a transient
+# -- so the wait burned its whole budget and reported "gave up waiting for X to listen on
+# host:port" while X was listening the entire time.
+#
+# The comment on the `*)` arm below stated this rule correctly while the line after the
+# `esac` did the opposite for every arm that matters. A `case` yields its last command's
+# status on its own; adding one is what breaks it.
+_e2e_listener_pids() {
+    case "$(_e2e_listener_tool)" in
+        ss)      _e2e_listener_pids_ss "$1" "$2" ;;
+        lsof)    _e2e_listener_pids_lsof "$1" "$2" ;;
+        netstat) _e2e_listener_pids_netstat "$1" "$2" ;;
+        none)    return 1 ;;
+        # A tool name this file does not implement is COULD NOT ASK rather than a silent
+        # empty answer, which would read as `not-listening` and wave a squatter through.
+        *)       return 1 ;;
+    esac
+}
+
+# Who owns the listener on $1:$2, relative to the subject pid $3? Echoes one word from
+# the five above and never fails the run -- the CALLER decides what each answer means,
+# because "proceed" and "stop" differ per wait.
+#
+# @param 1 host
+# @param 2 port
+# @param 3 subject pid, or "-"
+_e2e_port_owner() {
+    local host="$1" port="$2" pid="$3" owners=""
+    # `-` is a documented honest reading in this file, not a parse failure: a launchd job
+    # under a service account has no pid this user may signal. It is an INPUT to this
+    # question rather than an error in it.
+    #
+    # EMPTY is folded in with it, and that is not tidiness. An empty pid reaching the
+    # ancestry walk makes the verdict PLATFORM-DEPENDENT for one input: `foreign` on
+    # Linux, where `_e2e_parent_pid` reads `/proc` and the loop terminates, and `owned`
+    # wherever it returns empty. A hard fail on one host and a silent accept on another.
+    # `wait_for_port` refuses an empty pid by name before any of this runs; this arm is
+    # the belt to that pair of braces, for a caller that reaches the predicate directly.
+    if [ "$pid" = "-" ] || [ -z "$pid" ]; then
+        echo "no-subject-pid"
+        return 0
+    fi
+    if ! owners="$(_e2e_listener_pids "$host" "$port")"; then
+        echo "unattributable"
+        return 0
+    fi
+    if [ -z "$owners" ]; then
+        echo "not-listening"
+        return 0
+    fi
+    local o
+    while IFS= read -r o; do
+        [ -n "$o" ] || continue
+        if _e2e_is_descendant "$o" "$pid"; then
+            echo "owned"
+            return 0
+        fi
+    done <<EOF
+$owners
+EOF
+    echo "foreign"
+    return 0
+}
+
+# Said once per run, not once per wait: a fixture with eight waits on a host that cannot
+# attribute a socket would otherwise print eight identical complaints and bury its own
+# output.
+_e2e_attribution_warned=""
+_e2e_warn_unattributed() {
+    [ -z "$_e2e_attribution_warned" ] || return 0
+    _e2e_attribution_warned="yes"
+    e2e_note "note: $1"
+    e2e_note "      A wait can only confirm that SOMETHING is listening here, not that it"
+    e2e_note "      is the process this fixture started (#1321). Stated rather than"
+    e2e_note "      silently falling back, because a silent fallback is the defect."
+}
+
+# ---------------------------------------------------------------------------
 # Bounded waits
 # ---------------------------------------------------------------------------
 #
@@ -932,7 +1262,76 @@ _e2e_expire() {
 wait_for_port() {
     local host="$1" port="$2" pid="$3" what="$4" logfile="$5"
     local seconds="${6:-$_e2e_wait_seconds}" armed="${7:-}"
-    _e2e_port_ready() { port_answers "$host" "$port"; }
+    # An EMPTY pid is a caller defect, and naming it here is the whole point: `-` means
+    # *there is no pid to watch* and empty means *a pid was expected and is missing* --
+    # a pidfile created but not yet written is how it arrives
+    # (`check-compile-cache-daemon-start.sh`). Left to run, `wait_until`'s `kill -0 ""`
+    # fails and the run dies reporting a DEAD PROCESS two lines before the accurate
+    # message. Refusing by name converts a misattributed death into the cause.
+    [ -n "$pid" ] || fail "wait_for_port was given an EMPTY pid for ${what} (${host}:${port}).
+       Pass \`-\` when there is deliberately no pid to watch. An empty one usually means a
+       pidfile was created but not yet written, and the value was read too early."
+    # ATTRIBUTION RUNS ONLY ONCE THE PORT HAS ANSWERED, which is what makes it free: a
+    # wait that never sees a listener never asks the question, and a successful wait asks
+    # it exactly once. Asking every poll would spend two process spawns per poll on a
+    # host where a spawn costs 21 ms.
+    # UNDERSCORE-PREFIXED, because this function runs INSIDE `wait_until` and bash scopes
+    # dynamically: `what` and `pid` are locals of `wait_until` too, and a bare `$what`
+    # here resolves to ITS copy -- which is `"<what> to listen on <host>:<port>"`, not the
+    # subject. Measured: the refusal read "a listener that is NOT a process that never
+    # bound to listen on 127.0.0.1:24048", with the endpoint stated twice. `pid` collides
+    # as well and is currently the same value, which is luck rather than design.
+    local _e2e_pfp_what="$what" _e2e_pfp_pid="$pid"
+    _e2e_port_ready() {
+        port_answers "$host" "$port" || return 1
+        case "$(_e2e_port_owner "$host" "$port" "$_e2e_pfp_pid")" in
+            owned)
+                return 0
+                ;;
+            foreign)
+                # TERMINAL, and reported the moment it is noticed rather than after the
+                # budget -- for the same reason `wait_until` reports a death immediately.
+                # A squatter will not become the subject, so calling it a timeout would
+                # send the reader to the bound.
+                local owners
+                owners="$(_e2e_listener_pids "$host" "$port" 2>/dev/null \
+                    | tr '\n' ' ' | sed 's/ *$//')"
+                # RETIRE THE DEADLINE FIRST, as every other terminal path here does.
+                # `_e2e_deadline_arm` forks a timer, and a `fail` that steps over the
+                # retirement leaves it running after the fixture is gone -- on a
+                # `fleet-dashboard-e2e` budget that is a `sleep 240` outliving its run.
+                # The self-test does not expose it, because `run_case` reaps background
+                # jobs that a real fixture's cleanup does not.
+                _e2e_wait_retire_deadline
+                fail "${host}:${port} is held by a listener that is NOT ${_e2e_pfp_what}.
+       waiting for: ${_e2e_pfp_what}, pid ${_e2e_pfp_pid} (or a descendant of it)
+       listening:   pid(s) ${owners:-unknown}
+       This is not a timeout and waiting longer will not fix it. Something else is on
+       the port -- a leftover daemon from an earlier run, or another fixture -- and
+       everything this fixture did next would have been done against it (#1321)."
+                ;;
+            not-listening)
+                # The port answered and the owner lookup found nobody, so a socket closed
+                # between the two questions. Transient: keep polling, the deadline bounds
+                # it, and a persistent one expires with the ordinary verdict.
+                return 1
+                ;;
+            unattributable)
+                _e2e_warn_unattributed "this host cannot attribute a listening socket to a process, so ${host}:${port} is accepted on the port alone."
+                return 0
+                ;;
+            no-subject-pid)
+                _e2e_warn_unattributed "${_e2e_pfp_what} was started without a pid this fixture may signal, so ${host}:${port} is accepted on the port alone."
+                return 0
+                ;;
+            *)
+                # `_e2e_port_owner` answers from a closed set of five. A sixth value is a
+                # code defect rather than a state of the world, and the arm that swallows
+                # one silently is where this repository's state collapses come from.
+                fail "the port-owner predicate answered a word this file does not enumerate, waiting for ${_e2e_pfp_what}"
+                ;;
+        esac
+    }
     wait_until _e2e_port_ready "${what} to listen on ${host}:${port}" \
         "$pid" "$logfile" "$seconds" "$armed"
 }

@@ -1625,6 +1625,31 @@ run_case() {
     # long enough by luck: a reaper whose KILL arm was dead would still reach zero
     # survivors for the polite child and would leave the stubborn one alive, so
     # the two numbers together discriminate where either alone does not.
+    # `_e2e_ancestry_bound` (#1321). The header claims "a bound nobody has watched fire is
+    # untested rather than proven -- the self-test drives it", and until this case existed
+    # nothing outside the library referenced it: a plausible claim with no reader, which
+    # makes an untested bound read as a proven one.
+    #
+    # BOTH directions, because a bound that refused everything would satisfy the firing
+    # arm alone: the same true parent/child pair is `owned` at the default bound and given
+    # up on at zero. One input, two bounds, so the bound is the only variable.
+    ancestry-bound-fires)
+        sleep 30 &
+        child=$!
+        if _e2e_is_descendant "$child" "$$"; then
+            echo "at the default bound a real child is a descendant"
+        else
+            echo "BUG: a real child was not recognised at the default bound"
+        fi
+        _e2e_ancestry_bound=0
+        if _e2e_is_descendant "$child" "$$"; then
+            echo "BUG: the ancestry bound did not fire at zero hops"
+        else
+            echo "the ancestry bound gave up rather than walking on"
+        fi
+        kill "$child" 2>/dev/null || true
+        ;;
+
     reap-takes-what-nothing-recorded)
         sleep 30 &
         polite=$!
@@ -1664,6 +1689,53 @@ run_case() {
         wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/listener.log" 15
         kill "$listener" 2>/dev/null || true
         echo "wait_for_port returned on a real listener"
+        ;;
+
+    # --- #1321: whose listener is it? ---------------------------------------
+    #
+    # `wait_for_port` used to report ready when ANYTHING answered on the port, so a
+    # fixture could run its whole body against a foreign process and pass. Planted, not
+    # argued: a squatter binds the port and the wait is told to watch a DIFFERENT live
+    # process, which is what a leftover daemon from an earlier run looks like.
+    #
+    # The assertion is on WHICH refusal, not that one happened. A wait that expired would
+    # also exit 1 here, and the two are fixed in completely different places -- so the
+    # table below requires the attribution wording and REFUSES the expiry wording.
+    wait-for-port-foreign)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/foreign.log" \
+            >/dev/null 2>>"${scratch}/foreign.log" &
+        squatter=$!
+        # A live process that is neither the squatter nor any ancestor of it. It must
+        # stay alive, or `wait_until`'s death arm fires first and the case would pass for
+        # the wrong reason.
+        sleep 60 &
+        stranger=$!
+        wait_for_port 127.0.0.1 "$p" "$stranger" "a process that never bound" \
+            "${scratch}/foreign.log" 10
+        # Not reached: the wait above must not return. Printed so a build where it DOES
+        # return says so in words rather than presenting as a silent pass.
+        echo "BUG: wait_for_port accepted a listener belonging to somebody else"
+        kill "$squatter" "$stranger" 2>/dev/null || true
+        ;;
+
+    # The third acceptance clause: where the platform cannot attribute a socket, that is
+    # a STATED outcome and never a silent fall back to the old behaviour.
+    #
+    # Driven through the tool seam because no developer machine has zero of the three
+    # tools -- and this arm fails OPEN, so an untested one looks exactly like a working
+    # one. The wait must still PASS (refusing every unattributable host would break nine
+    # fixtures on any platform this cannot read) and must SAY it could not attribute.
+    wait-for-port-unattributable)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/unattr.log" \
+            >/dev/null 2>>"${scratch}/unattr.log" &
+        listener=$!
+        FASTCACHED_E2E_LISTENER_TOOL=none \
+            wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" \
+                "${scratch}/unattr.log" 15
+        kill "$listener" 2>/dev/null || true
+        echo "wait_for_port accepted an unattributable listener and said so"
         ;;
 
     # THE regression. `read` sets its variable and returns non-zero on a final
@@ -2711,6 +2783,7 @@ cases=(
     "bounded-fast-path-bites|0|the staged flat-pause defect asked for|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "reap-takes-what-nothing-recorded|0|escalated=1, still alive: none|!BUG:"
+    "ancestry-bound-fires|0|at the default bound a real child is a descendant|the ancestry bound gave up rather than walking on|!BUG:"
     "ask-leader-first-answer|0|asked 1 time(s)|!BUG:"
     "ask-leader-retries|0|recovered after a moved leadership|asked 2 time(s)|re-derived: whoever leads now|!BUG:"
     "ask-leader-election|0|recovered from an election in progress|asked 2 time(s)|!BUG:"
@@ -2723,6 +2796,15 @@ cases=(
 # the pass, which is the collapse this repository makes about once a session.
 socket_cases=(
     "wait-for-port|0|wait_for_port returned on a real listener"
+    # #1321, both directions. The row above is the POSITIVE control and is not
+    # decoration: a fix that refused every listener would satisfy the foreign row alone,
+    # and nine fixtures call this.
+    #
+    # The negative assertions are what make the foreign row test anything. `!gave up
+    # waiting` refuses an EXPIRY, which exits 1 with the same colour and sends a reader to
+    # the budget instead of to the squatter; `!BUG:` refuses the wait returning at all.
+    "wait-for-port-foreign|1|is held by a listener that is NOT|listening:   pid(s)|!gave up waiting|!BUG:"
+    "wait-for-port-unattributable|0|accepted an unattributable listener and said so|cannot attribute a listening socket|!BUG:"
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
