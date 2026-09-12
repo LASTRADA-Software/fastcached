@@ -6025,3 +6025,69 @@ set_tests_properties("required-context-table-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# The markup escaping convention has one home and nothing else spells its entities
+# (#1359).
+#
+# Three targets implemented it — the fleet page's table, the launcher's `EscapeHtml`
+# switch and the plist writer's `XmlEscape` switch — and the two that AGREED were the
+# library and the launcher, while the one sharing a target with the table was the one
+# that differed. Converging them put the escaper in `Core/Markup.hpp`, which is where
+# `Platform/` can reach it without depending on `Distributed/`.
+#
+# WHY THIS SHAPE, because the obvious guard is vacuous here. #1334 shared a TABLE, so a
+# consumer could keep its own walk and drift from the rows — which a test walking the
+# table catches. This shared the FUNCTION, so that drift cannot happen and such a test
+# would keep passing however many new escapers appeared beside it. What survives
+# consolidation is somebody writing a NEW escaper, and the only instrument that sees
+# that is the census that found the three sites originally: look for the emitted
+# ARTEFACT rather than for the implementation shape.
+#
+# In the DEFAULT set: no compiler, no daemon, no socket, and the failure it guards is
+# silent — a second escaper works fine until the day the two disagree.
+add_test(
+    NAME "markup-entities"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-markup-entities.cmake"
+)
+set_tests_properties("markup-entities" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be seen to refuse a second escaper AND to accept the prose.
+#
+# Fifteen synthetic trees. The accepting arm is the load-bearing half: this check's
+# whole subject is string literals that appear correctly in a comment explaining the
+# rule, in four test files asserting what the escaper emits, and in one page of
+# hand-escaped documentation — so a version that refused those could be satisfied only
+# by deleting a comment or an assertion, and would be deleted instead.
+#
+# The retired `&apos;` has its own arm, refused BY NAME rather than as an ordinary
+# duplicate: its return is the drift in the exact shape it took last time. Both
+# fail-closed arms are driven, and so is a STALE exemption row — an opt-out whose
+# subject has gone is worse than none, because it reads as a considered decision while
+# covering nothing.
+#
+# Two defects the check had before this fixture existed are cases here so they cannot
+# come back: `&lt;` and `&gt;` each contain a `;`, CMake's list separator, so a list of
+# the full spellings is silently ragged; and the table is indented inside `Detail`, so
+# a home signature anchored at column 0 found nothing. Both were caught by the check's
+# own fail-closed guards rather than by review.
+add_test(
+    NAME "markup-entities-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/markup-entities-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-markup-entities-selftest.cmake"
+)
+set_tests_properties("markup-entities-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 240
+)

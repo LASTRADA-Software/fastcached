@@ -2,8 +2,11 @@
 #include "Stats.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
-// Header-only and std-only, so it adds no row to `_fc_cc_core` -- which the
+// Header-only and std-only, so they add no row to `_fc_cc_core` -- which the
 // launcher's CMakeLists is strict about, since it does not link the library.
+// `Markup.hpp` pulls in `Ranges.hpp` and `Utf8.hpp` and there is no `.cpp` between
+// the three, which is what makes the shared escaper reachable from here at all.
+#include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
@@ -1044,40 +1047,6 @@ bool ResetLog()
 
 namespace
 {
-    /// Escape the five characters HTML gives meaning to. Every value folded
-    /// into the dashboard — a prefetch group name, a fall-back reason, a translation
-    /// unit path — comes from the invocations log, which a compile can steer
-    /// (a path or a fallback detail string), so nothing is trusted verbatim.
-    [[nodiscard]] std::string EscapeHtml(std::string_view text)
-    {
-        std::string out;
-        out.reserve(text.size());
-        for (char const c: text)
-        {
-            switch (c)
-            {
-                case '&':
-                    out += "&amp;";
-                    break;
-                case '<':
-                    out += "&lt;";
-                    break;
-                case '>':
-                    out += "&gt;";
-                    break;
-                case '"':
-                    out += "&quot;";
-                    break;
-                case '\'':
-                    out += "&#39;";
-                    break;
-                default:
-                    out += c;
-            }
-        }
-        return out;
-    }
-
     /// One rendered SVG bar, in the `<rect>` attributes the template writes
     /// verbatim: `x`/`y`/`w`(idth)/`h`(eight), already formatted as compact
     /// decimal text so the renderer never round-trips through iostream twice.
@@ -1266,7 +1235,7 @@ namespace
     /// Render one outcome tally card.
     void AppendTallyCard(std::ostringstream& out, std::string_view label, std::uint64_t value, std::string_view cssClass)
     {
-        out << R"(<div class="card )" << cssClass << R"("><span class="card-label">)" << EscapeHtml(label)
+        out << R"(<div class="card )" << cssClass << R"("><span class="card-label">)" << EscapeMarkup(label)
             << R"(</span><span class="card-value">)" << value << "</span></div>";
     }
 
@@ -1284,8 +1253,8 @@ namespace
         for (auto const& [reason, count]: ranked)
         {
             auto const pct = worst == 0 ? 0.0 : (100.0 * static_cast<double>(count)) / static_cast<double>(worst);
-            out << R"(<div><div class="reason-row"><span>)" << EscapeHtml(reason) << R"(</span><span class="mono">)" << count
-                << R"(&times;</span></div><div class="reason-bar"><div class="reason-fill" style="width:)"
+            out << R"(<div><div class="reason-row"><span>)" << EscapeMarkup(reason) << R"(</span><span class="mono">)"
+                << count << R"(&times;</span></div><div class="reason-bar"><div class="reason-fill" style="width:)"
                 << FormatCoord(pct) << R"(%"></div></div></div>)";
         }
         out << "</div>";
@@ -1302,8 +1271,8 @@ namespace
     /// @param trailer What it is a percentage of.
     void AppendHeadline(std::ostringstream& out, std::string_view label, std::string_view rate, std::string_view trailer)
     {
-        out << R"(<div class="headline"><span class="label">)" << EscapeHtml(label) << R"(</span><span class="rate">)"
-            << rate << R"(</span><span class="label">)" << EscapeHtml(trailer) << "</span></div>";
+        out << R"(<div class="headline"><span class="label">)" << EscapeMarkup(label) << R"(</span><span class="rate">)"
+            << rate << R"(</span><span class="label">)" << EscapeMarkup(trailer) << "</span></div>";
     }
 
     /// Render one label/count row of a panel list.
@@ -1323,7 +1292,7 @@ namespace
                         std::uint64_t count,
                         std::string_view countSuffix = {})
     {
-        out << R"(<div class="never-row"><span>)" << EscapeHtml(label) << R"(</span><span>)" << count << countSuffix
+        out << R"(<div class="never-row"><span>)" << EscapeMarkup(label) << R"(</span><span>)" << count << countSuffix
             << "</span></div>";
     }
 
@@ -1361,7 +1330,7 @@ namespace
         constexpr double ChartWidth = 480;
         constexpr double ChartHeight = 40;
         auto const hist = BuildHistogramSvg(samples, 24, ChartWidth, ChartHeight);
-        out << R"(<div class="hist"><div class="hist-title">)" << EscapeHtml(title) << R"(<span class="hist-meta">)"
+        out << R"(<div class="hist"><div class="hist-title">)" << EscapeMarkup(title) << R"(<span class="hist-meta">)"
             << samples.size() << " samples, " << FormatMs(hist.low) << "-" << FormatMs(hist.high)
             << R"(</span></div><svg viewBox="0 0 )" << FormatCoord(ChartWidth) << ' ' << FormatCoord(ChartHeight)
             << R"(" class="hist-chart" preserveAspectRatio="none">)";
@@ -1481,7 +1450,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
         << "<style>" << DashboardStyle << R"(</style></head><body><div class="wrap">)";
 
     out << R"(<div class="header"><div><div class="title">fastcache-cc / stats</div>)"
-        << R"(<div class="logpath">)" << EscapeHtml(path) << "</div></div>";
+        << R"(<div class="logpath">)" << EscapeMarkup(path) << "</div></div>";
     AppendHeadline(out, "hit rate", hitRate, std::format("of {} cacheable", servable));
     out << "</div>";
 
@@ -1521,7 +1490,7 @@ std::string FormatHtmlReport(std::string_view groupFilter)
             // Custom delimiter (html(...)html): the attribute value contains a
             // literal `)"` (CSS var(--hit) followed by the closing quote),
             // which would otherwise terminate a plain R"(...)" early.
-            out << "<tr><td>" << EscapeHtml(prefetchGroup.empty() ? "(unset)" : prefetchGroup) << "</td><td>"
+            out << "<tr><td>" << EscapeMarkup(prefetchGroup.empty() ? "(unset)" : prefetchGroup) << "</td><td>"
                 << tally.Total() << R"html(</td><td style="color:var(--hit)">)html" << groupRate
                 << R"(</td><td class="bar-cell">)"
                 << R"(<div class="bar-track"><div class="bar-fill" style="width:)" << FormatCoord(ratePct)

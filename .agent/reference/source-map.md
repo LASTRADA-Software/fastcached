@@ -21,7 +21,13 @@ src/FastCache/
                 the wipe happens at each RELEASE and not only at the holder's death),
                 Utf8 (one strict RFC 3629 decoder -- overlongs,
                 surrogates and anything above U+10FFFF refused, so what it accepts
-                a strict parser on the far end accepts too), Profiling (Tracy wrappers)
+                a strict parser on the far end accepts too),
+                Markup (the one markup escaper, over Utf8: it tests decoded CODE
+                POINTS against XML 1.0's `Char` production rather than bytes, because
+                what that production excludes includes perfectly good UTF-8 -- and it
+                is here rather than beside its first consumer because three targets
+                spell the convention, two of which have no business reaching into
+                Distributed/), Profiling (Tracy wrappers)
   Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
                 InterruptibleSleepUntil (a bounded wait a stop can interrupt),
                 DeadlineTimer (the same shape with a callback, for a timeout that

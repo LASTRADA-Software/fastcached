@@ -507,7 +507,7 @@ std::string EscapeTsvField(std::string_view field)
         // An empty answer means "carry it literally", unambiguous only because no row
         // spells a byte as nothing -- a row writing an empty spelling would mean
         // "delete this byte", which no format here wants.
-        auto const replacement = Distributed::EscapeFor(Distributed::DelimitedEscapes, ch);
+        auto const replacement = EscapeFor(Distributed::DelimitedEscapes, ch);
         if (replacement.empty())
             out += ch;
         else
