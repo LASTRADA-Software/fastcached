@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -78,6 +81,10 @@ struct TerminalSize
 ///   * `Closed` -- the channel ended mid-exchange. The terminal went away; that
 ///     is fixed somewhere else entirely from a slow one.
 ///   * `Refused` -- something answered and it was not a well-formed reply.
+///   * `Abandoned` -- WE stopped asking, mid-exchange. The terminal was never
+///     given its budget, so nothing at all is known about the capability; this
+///     is what a shutdown during startup looks like. Folded into `NoReply` it
+///     would report the terminal as silent when the silence was ours.
 ///
 /// Folding any pair of those would make a platform limitation look like a
 /// terminal saying no, which is #1321's `unattributable` lesson arriving in a
@@ -86,12 +93,13 @@ struct TerminalSize
 /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
 enum class TerminalQueryAnswer : std::uint8_t
 {
-    Yes,      ///< The terminal answered and the reply carries the capability.
-    No,       ///< The terminal answered and the reply does not carry it.
-    NotAsked, ///< No query was written. Not a failure -- see above.
-    NoReply,  ///< The query was written and the budget expired in silence.
-    Closed,   ///< The channel ended before a complete reply arrived.
-    Refused,  ///< Something answered and it was not a well-formed reply.
+    Yes,       ///< The terminal answered and the reply carries the capability.
+    No,        ///< The terminal answered and the reply does not carry it.
+    NotAsked,  ///< No query was written. Not a failure -- see above.
+    NoReply,   ///< The query was written and the budget expired in silence.
+    Closed,    ///< The channel ended before a complete reply arrived.
+    Refused,   ///< Something answered and it was not a well-formed reply.
+    Abandoned, ///< The wait was cancelled from this side before the budget ran out.
     Last,
 };
 
@@ -147,6 +155,11 @@ inline constexpr EnumTable<TerminalQueryAnswer, TerminalQueryAnswerSpec> Termina
       .permitsUse = false,
       .key = "refused",
       .diagnosis = "something answered and it was not a well-formed reply" },
+    { .answer = TerminalQueryAnswer::Abandoned,
+      .permitsUse = false,
+      .key = "abandoned",
+      .diagnosis = "the wait was cancelled from this side; the terminal was never given its budget "
+                   "and nothing is known about the capability" },
 } };
 
 static_assert(RowsInEnumeratorOrder(TerminalQueryAnswerTable, &TerminalQueryAnswerSpec::answer),
@@ -195,15 +208,43 @@ struct TerminalCapabilities
 // Asking the terminal
 // ---------------------------------------------------------------------------
 
-/// How a single read from the terminal ended.
+/// How one non-blocking look at the terminal ended.
+///
+/// Separate from `TerminalReadOutcome`, and the separation is the point.
+/// *Nothing has arrived yet* and *the budget expired* produce the same zero
+/// bytes and are different facts: the first is the ordinary state between two
+/// looks and says nothing at all about the terminal, the second is a verdict
+/// about it. One enum carrying both would make the driver's loop condition and
+/// the caller's answer the same value, which is this repository's most-repaired
+/// defect in miniature.
+///
+/// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
+enum class TerminalPollOutcome : std::uint8_t
+{
+    Bytes,      ///< Some bytes were there; `bytes` holds them.
+    NothingYet, ///< Nothing readable at this instant. Neither a failure nor a timeout.
+    Closed,     ///< End of input: the terminal will send nothing more.
+    Failed,     ///< The look itself failed.
+    Last,
+};
+
+/// The result of one non-blocking look.
+struct TerminalPollResult
+{
+    TerminalPollOutcome outcome = TerminalPollOutcome::Failed;
+    std::string bytes;
+};
+
+/// How a bounded read ended.
 ///
 /// TRANSMITTED/PERSISTED: no. Private; enumerators may be inserted.
 enum class TerminalReadOutcome : std::uint8_t
 {
-    Bytes,   ///< Some bytes arrived; `bytes` holds them.
-    Timeout, ///< The budget expired with nothing readable.
-    Closed,  ///< End of input: the terminal will send nothing more.
-    Failed,  ///< The read itself failed.
+    Bytes,     ///< Some bytes arrived; `bytes` holds them.
+    Timeout,   ///< The budget expired with nothing readable.
+    Closed,    ///< End of input: the terminal will send nothing more.
+    Failed,    ///< The read itself failed.
+    Cancelled, ///< `CancelRead` was called while the read was parked.
     Last,
 };
 
@@ -213,6 +254,70 @@ struct TerminalRead
     TerminalReadOutcome outcome = TerminalReadOutcome::Failed;
     std::string bytes;
 };
+
+/// How often a parked read looks again while racing the probe's budget.
+///
+/// **The poll interval is a PARAMETER, not a constant, and the two defaults here
+/// are an order of magnitude apart on purpose. Do not tidy them into one.**
+/// Everything below is the argument for why one number cannot serve both
+/// callers, written here because the next reader meets the constants before they
+/// meet either call site.
+///
+/// ### Why a read polls at all
+///
+/// MEASURED at `6e9b2456`: `IReactor`'s entire public surface is `Run`, `Stop`,
+/// `Submit`, `Schedule`, `CancelPending`, `Clock` and `RunLoop`. There is **no
+/// descriptor-registration API at all** -- readiness reaches a reactor only
+/// through `ISocket` and the platform socket classes -- so a terminal descriptor
+/// cannot be readiness-parked without extending `IReactor` and all three
+/// platform reactors. That is
+/// [#1372](https://github.com/LASTRADA-Software/fastcached/issues/1372) and it is
+/// deliberately not done here. Until it lands, a read that must suspend parks on
+/// a TIMER: look, sleep, look again. The interval is what that costs.
+///
+/// ### What the interval buys and what it costs
+///
+/// Two things, and the two callers weigh them oppositely:
+///
+///   * **Latency.** An answer that arrives just after a look waits up to one
+///     interval to be noticed.
+///   * **Wakeups.** An idle read wakes once per interval for as long as it is
+///     parked, and each wakeup is a reactor turn.
+///
+/// The PROBE races a 500 ms budget **once, at startup**. At 5 ms the worst case
+/// is 100 wakeups for the entire life of the process, and the latency is at most
+/// 1% of the budget -- while the common case is one or two looks, because a
+/// local terminal answers inside a round trip. Spending 50 ms of a 500 ms budget
+/// on nothing would also make a fast terminal MEASURE slower than it is, and
+/// `TerminalQueryResult::elapsed` exists to be believed.
+///
+/// The INPUT loop runs for the **life of the session** and is idle almost all of
+/// it. At 5 ms an idle dashboard wakes 200 times a second forever; at 50 ms it
+/// wakes 20 times a second, below the rate it is already waking at to draw
+/// frames. INFERRED, not measured here: 50 ms of input latency is imperceptible,
+/// on the conventional ~100 ms threshold at which interaction begins to feel
+/// sluggish -- and it is not additive with anything, since the keystroke is not
+/// waiting on a round trip.
+///
+/// So a single constant is wrong at one end whichever value it takes: 5 ms burns
+/// an idle session's wakeups for a property nobody can perceive, and 50 ms
+/// spends a tenth of the probe's one-shot budget doing nothing and reports a
+/// slower terminal than is there.
+///
+/// A non-positive interval means *do not poll* rather than *spin* -- see
+/// `NextWakeStep`, which both callers reach through -- i.e. one sleep straight
+/// through to the deadline and a single look at the end. That is legal and makes
+/// every answer cost the full budget, so neither default is that.
+///
+/// When #1372 lands, BOTH numbers go away rather than being retuned. The
+/// parameter stays on the seam so that removal is not a caller change.
+inline constexpr std::chrono::milliseconds ProbeTerminalPollInterval { 5 };
+
+/// How often a parked read looks again while serving a render loop's input.
+///
+/// Ten times `ProbeTerminalPollInterval`, deliberately; the reasoning for both
+/// numbers is stated there, once, rather than half at each.
+inline constexpr std::chrono::milliseconds InputTerminalPollInterval { 50 };
 
 /// A terminal control channel: somewhere to write a query and read its reply.
 ///
@@ -229,43 +334,41 @@ struct TerminalRead
 /// destroyed, because a process that dies between those two points leaves the
 /// operator's shell with echo off.
 ///
-/// ## SCOPE: this is THE terminal read seam, and `Read` BLOCKS today
+/// ## SCOPE: this is THE terminal read seam, and the read SUSPENDS
 ///
-/// Stated because the signature alone cannot say it, and the two readings pull
-/// opposite ways on a real trade. This is not a probe-only object: raw mode is
-/// SESSION-scoped rather than read-scoped, so one channel held for the whole run
-/// gives one clean mode transition, where a separate probe channel would enter
-/// and restore twice at startup and leave a window in between with the terminal
-/// cooked. And a second channel means a second read path on ONE descriptor,
-/// which is the hazard `ISocket`'s one-read-slot rule exists for -- arming a
-/// read while another is parked drops the parked one, and a terminal fd is not a
-/// socket but the failure mode transfers.
+/// Stated because the signature alone cannot say it. This is not a probe-only
+/// object: raw mode is SESSION-scoped rather than read-scoped, so one channel
+/// held for the whole run gives one clean mode transition, where a separate
+/// probe channel would enter and restore twice at startup and leave a window in
+/// between with the terminal cooked. And a second channel means a second read
+/// path on ONE descriptor, which is the hazard `ISocket`'s one-read-slot rule
+/// exists for -- arming a read while another is parked drops the parked one, and
+/// a terminal descriptor is not a socket but the failure mode transfers.
 ///
-/// So the dashboard's input path is meant to be THIS object, and that carries an
-/// obligation this file does not yet discharge: **`Read` blocks, so it must gain
-/// a SUSPENDING form before any render loop reads through it.** A loop built on
-/// the blocking one either cannot use it or must run it on a thread it then has
-/// to join, which is a thread the caller does not own.
+/// So the dashboard's input path is meant to be THIS object, and `Read` is
+/// therefore a `Task` that genuinely parks rather than a bounded blocking call.
+/// A blocking primitive wrapped in a coroutine is the shape that passes review
+/// and then holds a thread its caller does not own; this one holds none.
 ///
-/// Why it is not suspending already, so the next reader does not assume it was
-/// an oversight: MEASURED at `6e9b2456`, `IReactor`'s entire public surface is
-/// `Run`, `Stop`, `Submit`, `Schedule`, `CancelPending`, `Clock` and `RunLoop`
-/// -- there is **no descriptor-parking API at all**, and readiness reaches a
-/// reactor only through `ISocket` and the platform socket classes. A terminal fd
-/// therefore cannot be readiness-parked without extending `IReactor` and all
-/// three platform reactors. The reachable answer inside this file is a
-/// timer-parked coroutine: `co_await` a wakeup scheduled through
-/// `IReactor::Schedule`, a non-blocking read, re-park until the reply completes
-/// or the deadline passes. That suspends for real, holds no thread and is
-/// cancellable -- and swapping in readiness-parking later changes no caller.
+/// ## The parking lives HERE, and an implementation cannot opt out of it
 ///
-/// What must NOT be done instead is a `Task<>` that resolves synchronously. It
-/// would satisfy the signature and make every property defined by parking
-/// vacuous, which is worse than blocking honestly: a fake that resolves what
-/// production suspends on cannot exercise a suspension protocol.
+/// `Read` is **not virtual**. Each channel supplies `TryRead` -- one
+/// non-blocking look -- and this class owns the loop that parks between looks.
+/// Two reasons, and the second is the one that matters:
 ///
-/// The probe is one-shot at startup, before any loop exists, so blocking costs
-/// nothing TODAY. The obligation is about the second caller, not the first.
+///   * One copy of the deadline arithmetic instead of one per platform plus one
+///     per fake, which is this project's table rule applied to a loop.
+///   * **A fake cannot then resolve synchronously what production suspends on.**
+///     That is a rule in `.agent/rules/testing.md` and it is stated there as the
+///     HARDER half: nothing is wrong with such a fake, which is exactly what
+///     makes every property defined by parking quietly vacuous over it. Here a
+///     fake scripts what a LOOK answers and inherits the real suspension, so a
+///     case driving a scripted terminal is driving the production parking
+///     protocol rather than a rehearsal of it.
+///
+/// The reactor is **passed in at the call**, never owned and never stored: one
+/// event loop per process, and a channel that acquired its own would be the
+/// ambient dependency this seam exists to remove.
 class ITerminalChannel
 {
   public:
@@ -285,10 +388,59 @@ class ITerminalChannel
     /// @return true when every byte was written.
     [[nodiscard]] virtual bool Write(std::string_view bytes) = 0;
 
-    /// Read whatever is available, waiting at most @p budget.
-    /// @param budget How long to wait.
+    /// Look once, without waiting.
+    ///
+    /// **Must return promptly whatever the terminal is doing.** It is called from
+    /// a reactor's loop thread, so a look that can block is a loop that can
+    /// stall, and the whole point of `Read` suspending is lost one level down
+    /// where nobody is looking for it.
+    ///
+    /// @return What was there, or `NothingYet`.
+    [[nodiscard]] virtual TerminalPollResult TryRead() = 0;
+
+    /// Read whatever arrives, waiting at most @p budget, without holding a thread.
+    ///
+    /// Looks first and parks only when there is nothing -- a reply already
+    /// sitting in the buffer is not charged a poll interval.
+    ///
+    /// @param reactor      Where to park, and whose clock the deadline is
+    ///                     measured against. A REFERENCE rather than
+    ///                     `SleepUntil`'s nullable pointer: a null reactor makes
+    ///                     every sleep resolve inline, which here is not a
+    ///                     fallback but a spin, because nothing else will wake
+    ///                     this read.
+    /// @param budget       How long to wait in total.
+    /// @param pollInterval How long to sleep between looks. Named, not
+    ///                     defaulted: see `ProbeTerminalPollInterval`.
     /// @return What arrived, and how the read ended.
-    [[nodiscard]] virtual TerminalRead Read(std::chrono::milliseconds budget) = 0;
+    [[nodiscard]] Task<TerminalRead> Read(IReactor& reactor,
+                                          std::chrono::milliseconds budget,
+                                          std::chrono::milliseconds pollInterval);
+
+    /// Abandon a parked read.
+    ///
+    /// The only spelling of *stop waiting* that is not destroying the channel,
+    /// mirroring `ISocket::CancelRead`. Non-virtual, because a poll-parked read
+    /// is abandoned with a flag rather than by retracting anything: a coroutine
+    /// does not hold its own handle, so it cannot hand one to
+    /// `IReactor::CancelPending` -- the same constraint `InterruptibleSleepUntil`
+    /// is built around, and the reason both sleep in steps.
+    ///
+    /// So the latency is **bounded by the poll interval rather than immediate**,
+    /// which is the honest statement: a cancel during an input-loop read is
+    /// observed within `InputTerminalPollInterval`. A cancel issued while no read
+    /// is in flight is dropped at the next `Read` rather than remembered -- a
+    /// sticky flag would abandon the NEXT read on behalf of one that had already
+    /// finished.
+    void CancelRead() noexcept;
+
+  private:
+    /// Set by `CancelRead`, cleared by `Read`, read once per turn of its loop.
+    ///
+    /// Atomic because `IReactor::Submit` and `Schedule` are documented safe from
+    /// any thread, so the coroutine this flag stops may be resumed on the
+    /// reactor's loop thread while the cancel comes from another.
+    std::atomic<bool> _readCancelled { false };
 };
 
 // ---------------------------------------------------------------------------
@@ -526,19 +678,26 @@ struct TerminalQueryResult
 ///
 /// Writes the query, then reads until the reply completes, the budget expires,
 /// the channel closes, or the bytes stop being a reply. Every ending is one of
-/// `TerminalQueryAnswer`'s and none of them throws.
+/// `TerminalQueryAnswer`'s and none of them throws. It SUSPENDS while it waits
+/// and holds no thread of its own.
 ///
-/// @param channel Where to write and read. Not asked anything when it reports
-///                itself non-interactive, which is `NotAsked`.
-/// @param clock   The clock the deadline is measured against. Injected, or every
-///                deadline test is a real sleep.
-/// @param kind    Which question.
-/// @param budget  How long to wait in total.
+/// @param channel      Where to write and read. Not asked anything when it
+///                     reports itself non-interactive, which is `NotAsked`.
+/// @param reactor      Where the waiting parks. **The clock comes from
+///                     `reactor.Clock()`** rather than from a second parameter:
+///                     a deadline measured against one clock and slept against
+///                     another is two clocks that can disagree, and this seam
+///                     had exactly that shape before it suspended.
+/// @param kind         Which question.
+/// @param budget       How long to wait in total.
+/// @param pollInterval How long to sleep between looks; see
+///                     `ProbeTerminalPollInterval` for why it is a parameter.
 /// @return The answer, the measured elapsed time, and the reply if there was one.
-[[nodiscard]] TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
-                                                   IClock& clock,
-                                                   TerminalQueryKind kind,
-                                                   std::chrono::milliseconds budget = DefaultTerminalQueryBudget);
+[[nodiscard]] Task<TerminalQueryResult> RunTerminalQuery(ITerminalChannel& channel,
+                                                         IReactor& reactor,
+                                                         TerminalQueryKind kind,
+                                                         std::chrono::milliseconds budget = DefaultTerminalQueryBudget,
+                                                         std::chrono::milliseconds pollInterval = ProbeTerminalPollInterval);
 
 // ---------------------------------------------------------------------------
 // Size
@@ -614,14 +773,23 @@ enum class ResizeNotification : std::uint8_t
 
 /// Ask this terminal everything, once.
 ///
-/// @param channel Where the queries go. A null channel means every query is
-///                `NotAsked` and the record is the non-interactive one.
-/// @param clock   The clock deadlines are measured against.
-/// @param budget  Per-query budget.
+/// **Probing and the RECORD are separable, and that is the point of returning
+/// one.** `TerminalCapabilities` is a value: a caller that already knows what it
+/// is rendering to -- a fixture, a golden-output test, an operator overriding a
+/// wrong guess -- constructs one and never calls this. Nothing downstream may
+/// ask a terminal a question of its own; it reads the record it was handed.
+///
+/// @param channel      Where the queries go. A null channel means every query is
+///                     `NotAsked` and the record is the non-interactive one.
+/// @param reactor      Where the waiting parks; its clock measures the deadlines.
+/// @param budget       Per-query budget.
+/// @param pollInterval How long a parked read sleeps between looks.
 /// @return The record.
-[[nodiscard]] TerminalCapabilities ProbeTerminalCapabilities(ITerminalChannel* channel,
-                                                             IClock& clock,
-                                                             std::chrono::milliseconds budget = DefaultTerminalQueryBudget);
+[[nodiscard]] Task<TerminalCapabilities> ProbeTerminalCapabilities(
+    ITerminalChannel* channel,
+    IReactor& reactor,
+    std::chrono::milliseconds budget = DefaultTerminalQueryBudget,
+    std::chrono::milliseconds pollInterval = ProbeTerminalPollInterval);
 
 /// What colour depth the environment advertises.
 ///

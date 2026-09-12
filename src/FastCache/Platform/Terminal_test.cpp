@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/IReactor.hpp>
+#include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
@@ -7,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,27 +51,51 @@ struct ScopedNoColor
 /// A terminal that answers however a case tells it to.
 ///
 /// The whole point of the `ITerminalChannel` seam. Every ending a real terminal
-/// can produce is a scripted step here, including the three no real terminal can
-/// be made to produce on demand: never answering, closing mid-reply, and
-/// answering late but inside the budget.
+/// can produce is a scripted step here, including the four no real terminal can
+/// be made to produce on demand: never answering, closing mid-reply, answering
+/// late but inside the budget, and dribbling a reply one byte at a time.
 ///
-/// Each step ADVANCES THE INJECTED CLOCK before it answers, which is what makes
-/// "late" mean anything without a real sleep -- and what lets a case assert the
-/// MEASURED elapsed rather than the budget that was requested.
+/// ## This fake PARKS, and it could not have been written not to
+///
+/// It supplies `TryRead` -- one look -- and inherits `ITerminalChannel::Read`,
+/// which is the production parking loop. So a case driving this terminal is
+/// driving the real suspension protocol rather than a rehearsal of it. That is
+/// deliberate and it is the reason the loop lives on the base class:
+/// `.agent/rules/testing.md` names a fake that resolves synchronously what
+/// production suspends on as the harder half of the fake rules, precisely
+/// because nothing about such a fake looks wrong while every property defined by
+/// parking is vacuous over it. Here that fake is not expressible.
+///
+/// ## A step's time is measured from the QUERY going out
+///
+/// Steps are grouped one script per `Write`, so "the DA1 query gets nothing and
+/// the DECRQM query gets an answer" is sayable -- a single flat list would hand
+/// whichever answer came first to whichever query asked first, which is how a
+/// two-query case ends up asserting something other than what it reads like.
+///
+/// Nothing here advances the clock. The clock is the TEST's, driven by
+/// `RunParked` in poll-interval steps the way real time would move, so an
+/// "arrives at 240 ms" step is observed at the first look at or after 240 ms and
+/// not a microsecond earlier.
 class ScriptedTerminal final: public FastCache::ITerminalChannel
 {
   public:
     struct Step
     {
-        std::chrono::milliseconds takes { 0 };     ///< How long this read appears to take.
-        FastCache::TerminalReadOutcome outcome {}; ///< How it ends.
+        std::chrono::milliseconds after { 0 };     ///< When it becomes available, from the query going out.
+        FastCache::TerminalPollOutcome outcome {}; ///< How the look ends once it is available.
         std::string bytes {};                      ///< What it hands back.
     };
 
-    ScriptedTerminal(FastCache::ManualClock& clock, bool interactive, std::vector<Step> steps):
+    using Script = std::vector<Step>;
+
+    /// @param clock       The clock a step's arrival time is measured against.
+    /// @param interactive What `IsInteractive` answers.
+    /// @param scripts     One script per query, in the order the queries go out.
+    ScriptedTerminal(FastCache::IClock& clock, bool interactive, std::vector<Script> scripts):
         _clock { clock },
         _interactive { interactive },
-        _steps { std::move(steps) }
+        _scripts { std::move(scripts) }
     {
     }
 
@@ -79,35 +107,31 @@ class ScriptedTerminal final: public FastCache::ITerminalChannel
     [[nodiscard]] bool Write(std::string_view bytes) override
     {
         _written.emplace_back(bytes);
+        // The origin every step's `after` is measured from, re-taken per query.
+        _writtenAt = _clock.Now();
+        _step = 0;
         return !_writeFails;
     }
 
-    [[nodiscard]] FastCache::TerminalRead Read(std::chrono::milliseconds budget) override
+    [[nodiscard]] FastCache::TerminalPollResult TryRead() override
     {
-        _budgets.push_back(budget);
+        ++_looks;
 
-        // Out of script: behave like a terminal that has gone quiet, spending the
-        // whole remaining budget. A fake that answered something here would make
-        // every "never answers" case pass for the wrong reason.
-        if (_next >= _steps.size())
-        {
-            _clock.Advance(budget);
-            return { .outcome = FastCache::TerminalReadOutcome::Timeout, .bytes = {} };
-        }
+        // Off the end of the script: behave like a terminal that has gone quiet.
+        // A fake that answered something here would make every "never answers"
+        // case pass for the wrong reason.
+        if (_written.empty() || _written.size() > _scripts.size())
+            return { .outcome = FastCache::TerminalPollOutcome::NothingYet, .bytes = {} };
 
-        Step const& step = _steps.at(_next);
-        ++_next;
+        Script const& script = _scripts.at(_written.size() - 1);
+        if (_step >= script.size())
+            return { .outcome = FastCache::TerminalPollOutcome::NothingYet, .bytes = {} };
 
-        // A step that would outlast the budget is a TIMEOUT, exactly as a real
-        // read is: the fake must not hand back bytes that arrived after the
-        // deadline, or it would test a driver that cannot be written.
-        if (step.takes > budget)
-        {
-            _clock.Advance(budget);
-            return { .outcome = FastCache::TerminalReadOutcome::Timeout, .bytes = {} };
-        }
+        Step const& step = script.at(_step);
+        if (_clock.Now() - _writtenAt < step.after)
+            return { .outcome = FastCache::TerminalPollOutcome::NothingYet, .bytes = {} };
 
-        _clock.Advance(step.takes);
+        ++_step;
         return { .outcome = step.outcome, .bytes = step.bytes };
     }
 
@@ -119,12 +143,15 @@ class ScriptedTerminal final: public FastCache::ITerminalChannel
         return _written;
     }
 
-    /// The budget each read was handed, in order. A shrinking sequence is what
-    /// proves the deadline was carried rather than re-armed per read.
-    /// @return The budgets.
-    [[nodiscard]] std::vector<std::chrono::milliseconds> const& Budgets() const noexcept
+    /// How many times the parking loop has LOOKED.
+    ///
+    /// The cost the poll interval is chosen against, counted at the only place
+    /// that can count it. Zero is the load-bearing value: it says the seam never
+    /// reached the terminal at all.
+    /// @return The count.
+    [[nodiscard]] std::size_t Looks() const noexcept
     {
-        return _budgets;
+        return _looks;
     }
 
     /// Make `Write` report failure, so the query never leaves.
@@ -134,30 +161,193 @@ class ScriptedTerminal final: public FastCache::ITerminalChannel
     }
 
   private:
-    FastCache::ManualClock& _clock;
+    FastCache::IClock& _clock;
     std::vector<std::string> _written;
-    std::vector<std::chrono::milliseconds> _budgets;
+    FastCache::TimePoint _writtenAt {};
+    std::size_t _looks = 0;
+    std::size_t _step = 0;
     bool _writeFails = false;
     bool _interactive;
-    std::vector<Step> _steps;
-    std::size_t _next = 0;
+    std::vector<Script> _scripts;
 };
 
-/// A step that hands back bytes immediately.
+/// A step that hands back bytes once @p after has elapsed since the query left.
 /// @param bytes What the terminal says.
-/// @param takes How long it appears to take.
+/// @param after When it becomes readable.
 /// @return The step.
-[[nodiscard]] ScriptedTerminal::Step Says(std::string bytes, std::chrono::milliseconds takes = 0ms)
+[[nodiscard]] ScriptedTerminal::Step Says(std::string bytes, std::chrono::milliseconds after = 0ms)
 {
-    return { .takes = takes, .outcome = FastCache::TerminalReadOutcome::Bytes, .bytes = std::move(bytes) };
+    return { .after = after, .outcome = FastCache::TerminalPollOutcome::Bytes, .bytes = std::move(bytes) };
 }
 
 /// A step where the channel ends.
-/// @param takes How long it appears to take.
+/// @param after When the end becomes visible.
 /// @return The step.
-[[nodiscard]] ScriptedTerminal::Step Closes(std::chrono::milliseconds takes = 0ms)
+[[nodiscard]] ScriptedTerminal::Step Closes(std::chrono::milliseconds after = 0ms)
 {
-    return { .takes = takes, .outcome = FastCache::TerminalReadOutcome::Closed, .bytes = {} };
+    return { .after = after, .outcome = FastCache::TerminalPollOutcome::Closed, .bytes = {} };
+}
+
+/// What driving a parked task cost, and -- if it never finished -- which kind of
+/// failure that was.
+///
+/// Two numbers rather than a bool, because a wait that did not finish has two
+/// causes that are fixed in different places: it is still parked and needed more
+/// time, or nothing is left to resume it and it is lost. `stillParked` is what
+/// tells them apart, and a case that only asserted `finished` would report the
+/// same red for both.
+struct ParkedRun
+{
+    std::size_t steps = 0;       ///< Clock steps taken; equals the times the read parked.
+    bool finished = false;       ///< Whether the task ran to completion.
+    std::size_t stillParked = 0; ///< Timers pending when the drive gave up.
+};
+
+/// Submit a task and drive it the way real time would.
+///
+/// Advances the manual clock one poll interval at a time and runs the reactor at
+/// each step, so the steps taken ARE the wakeups the interval costs. A
+/// synchronous implementation cannot produce that number at all, which is what
+/// makes asserting on it worth doing.
+///
+/// The reactor outlives the task in every case here, and a task that did not
+/// finish is holding only BORROWED parked work (`Submit(task.Native())`), so an
+/// unfinished drive is a red rather than a crash.
+///
+/// @param reactor      Where the task parks.
+/// @param clock        The clock to advance.
+/// @param task         The task to drive; not started yet.
+/// @param pollInterval The step size, which must match what the read was given.
+/// @param maxSteps     Runaway guard.
+/// @return What it cost, and whether it finished.
+[[nodiscard]] ParkedRun RunParked(FastCache::TestReactor& reactor,
+                                  FastCache::ManualClock& clock,
+                                  FastCache::Task<void>& task,
+                                  std::chrono::milliseconds pollInterval,
+                                  std::size_t maxSteps = 1000)
+{
+    ParkedRun run {};
+    reactor.Submit(task.Native());
+    reactor.Run();
+    while (!task.IsReady() && run.steps < maxSteps)
+    {
+        clock.Advance(pollInterval);
+        reactor.Run();
+        ++run.steps;
+    }
+    run.finished = task.IsReady();
+    run.stillParked = reactor.PendingTimers();
+    return run;
+}
+
+/// Run one query and store its result where a test can read it.
+/// @param channel      The terminal.
+/// @param reactor      Where the waiting parks.
+/// @param kind         Which question.
+/// @param budget       Total budget.
+/// @param pollInterval How long a parked read sleeps between looks.
+/// @param out          Where the result lands.
+/// @return The driving task.
+FastCache::Task<void> QueryInto(FastCache::ITerminalChannel& channel,
+                                FastCache::IReactor& reactor,
+                                FastCache::TerminalQueryKind kind,
+                                std::chrono::milliseconds budget,
+                                std::chrono::milliseconds pollInterval,
+                                FastCache::TerminalQueryResult* out)
+{
+    *out = co_await FastCache::RunTerminalQuery(channel, reactor, kind, budget, pollInterval);
+}
+
+/// Probe the whole record and store it where a test can read it.
+/// @param channel      The terminal, or nullptr.
+/// @param reactor      Where the waiting parks.
+/// @param budget       Per-query budget.
+/// @param pollInterval How long a parked read sleeps between looks.
+/// @param out          Where the record lands.
+/// @return The driving task.
+FastCache::Task<void> ProbeInto(FastCache::ITerminalChannel* channel,
+                                FastCache::IReactor& reactor,
+                                std::chrono::milliseconds budget,
+                                std::chrono::milliseconds pollInterval,
+                                FastCache::TerminalCapabilities* out)
+{
+    *out = co_await FastCache::ProbeTerminalCapabilities(channel, reactor, budget, pollInterval);
+}
+
+/// One query, driven to completion, with what the waiting cost beside it.
+struct QueryRun
+{
+    FastCache::TerminalQueryResult result {};
+    ParkedRun run {};
+};
+
+/// Put one question and drive the answer out.
+/// @param terminal     The scripted terminal.
+/// @param reactor      Where the waiting parks.
+/// @param clock        The clock to advance.
+/// @param kind         Which question.
+/// @param budget       Total budget.
+/// @param pollInterval How long a parked read sleeps between looks.
+/// @return The answer and the cost.
+[[nodiscard]] QueryRun Ask(ScriptedTerminal& terminal,
+                           FastCache::TestReactor& reactor,
+                           FastCache::ManualClock& clock,
+                           FastCache::TerminalQueryKind kind,
+                           std::chrono::milliseconds budget,
+                           std::chrono::milliseconds pollInterval = FastCache::ProbeTerminalPollInterval)
+{
+    QueryRun out {};
+    auto task = QueryInto(terminal, reactor, kind, budget, pollInterval, &out.result);
+    out.run = RunParked(reactor, clock, task, pollInterval);
+    return out;
+}
+
+/// A channel whose every look claims bytes and hands back none.
+///
+/// A contract violation rather than a terminal anybody has: both platform looks
+/// gate on a positive count, so neither can produce this. It exists because the
+/// violation is not inert -- a `Bytes` carrying no bytes sends the driver round
+/// again having spent no time and parked nothing, which against an injected
+/// clock is a loop that never ends, since nothing advances the clock the
+/// deadline is measured on.
+///
+/// The case that uses it asks `Read` directly rather than going through the
+/// driver, deliberately: at the `Read` level a missing guard is an immediate
+/// wrong ANSWER, where through the driver it is a hang, and a test that hangs
+/// when its property is removed has not reported anything.
+class AlwaysEmptyTerminal final: public FastCache::ITerminalChannel
+{
+  public:
+    [[nodiscard]] bool IsInteractive() const noexcept override
+    {
+        return true;
+    }
+
+    [[nodiscard]] bool Write(std::string_view /*bytes*/) override
+    {
+        return true;
+    }
+
+    [[nodiscard]] FastCache::TerminalPollResult TryRead() override
+    {
+        return { .outcome = FastCache::TerminalPollOutcome::Bytes, .bytes = {} };
+    }
+};
+
+/// Read once and store the result where a test can read it.
+/// @param channel      The terminal.
+/// @param reactor      Where the waiting parks.
+/// @param budget       Total budget.
+/// @param pollInterval How long a parked read sleeps between looks.
+/// @param out          Where the result lands.
+/// @return The driving task.
+FastCache::Task<void> ReadInto(FastCache::ITerminalChannel& channel,
+                               FastCache::IReactor& reactor,
+                               std::chrono::milliseconds budget,
+                               std::chrono::milliseconds pollInterval,
+                               FastCache::TerminalRead* out)
+{
+    *out = co_await channel.Read(reactor, budget, pollInterval);
 }
 
 /// A DA1 reply listing sixel (parameter 4).
@@ -217,6 +407,7 @@ TEST_CASE("Terminal: exactly one answer permits use, and every row says what it 
     CHECK_FALSE(FastCache::PermitsUse(FastCache::TerminalQueryAnswer::NoReply));
     CHECK_FALSE(FastCache::PermitsUse(FastCache::TerminalQueryAnswer::Closed));
     CHECK_FALSE(FastCache::PermitsUse(FastCache::TerminalQueryAnswer::Refused));
+    CHECK_FALSE(FastCache::PermitsUse(FastCache::TerminalQueryAnswer::Abandoned));
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +489,13 @@ TEST_CASE("Terminal: a well-formed CSI sequence that is not OUR reply parses, an
     CHECK(decoder.Reply().finalByte == 'z');
 
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?6z", 1ms) } };
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Refused);
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?6z", 5ms) } } };
+
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Refused);
 }
 
 TEST_CASE("Terminal: a reply that never terminates is refused at a bound", "[platform][terminal][da1]")
@@ -349,19 +544,213 @@ TEST_CASE("Terminal: an omitted parameter is the default rather than absent", "[
 }
 
 // ---------------------------------------------------------------------------
+// The wait SUSPENDS -- both directions, because one direction proves nothing
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Terminal: a wait that must park is REFUSED by SyncRun", "[platform][terminal][parking]")
+{
+    // The control for every parked case in this file, and the one assertion
+    // nothing else can make. `SyncRun` throws when a task is still suspended
+    // after one resume, so this passes only while the read genuinely parks.
+    //
+    // What it catches is the failure `.agent/rules/testing.md` says reading
+    // assertions cannot: a `Task` that resolves synchronously, or a fake that
+    // answers inline. Either would make this call RETURN, and every case
+    // asserting an elapsed or a wakeup count would go on passing with its
+    // property vacuous.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 50ms) } } };
+
+    REQUIRE_THROWS_AS(FastCache::SyncRun(FastCache::RunTerminalQuery(
+                          terminal, reactor, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms)),
+                      std::logic_error);
+}
+
+TEST_CASE("Terminal: a reply already waiting is answered without parking at all", "[platform][terminal][parking]")
+{
+    // The ACCEPTING direction of the case above, and a property in its own
+    // right: the loop looks BEFORE it parks, so a terminal that has already
+    // answered -- the common case on a local terminal, which replies inside a
+    // round trip -- is not charged a poll interval it did not need.
+    //
+    // A guard nobody has watched accept is not known to work, and here the two
+    // cases share one mechanism: if this one threw, the case above would be
+    // passing for the wrong reason.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }) } } };
+
+    auto const result = FastCache::SyncRun(
+        FastCache::RunTerminalQuery(terminal, reactor, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms));
+
+    CHECK(result.answer == FastCache::TerminalQueryAnswer::Yes);
+    CHECK(result.elapsed == 0ms);
+    CHECK(terminal.Looks() == static_cast<std::size_t>(1));
+    CHECK(reactor.PendingTimers() == static_cast<std::size_t>(0));
+}
+
+TEST_CASE("Terminal: the poll interval changes what waiting COSTS and not what it answers", "[platform][terminal][parking]")
+{
+    // Why the interval is a parameter rather than a constant, asserted rather
+    // than argued. The same silence is put to the same budget twice, once at the
+    // probe's interval and once at the input loop's: the answer and the measured
+    // elapsed are identical, and the number of wakeups is not.
+    //
+    // Both numbers are derived here rather than written down, so a change to
+    // either constant moves the expectation with it instead of reddening a case
+    // that was only ever restating the header.
+    auto const silentRun = [](std::chrono::milliseconds interval) {
+        FastCache::ManualClock clock;
+        FastCache::TestReactor reactor { clock };
+        ScriptedTerminal terminal { clock, true, {} };
+        return Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, interval);
+    };
+
+    auto const tight = silentRun(FastCache::ProbeTerminalPollInterval);
+    auto const coarse = silentRun(FastCache::InputTerminalPollInterval);
+
+    REQUIRE(tight.run.finished);
+    REQUIRE(coarse.run.finished);
+
+    // Same answer, same measured time: the interval is a cost, not a verdict.
+    CHECK(tight.result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(coarse.result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(tight.result.elapsed == coarse.result.elapsed);
+    CHECK(tight.result.elapsed == 500ms);
+
+    // And the cost the header is chosen against: one wakeup per interval, so the
+    // coarse one wakes proportionally less. The strict inequality is what would
+    // fail if somebody folded the two constants into one.
+    CHECK(tight.run.steps == static_cast<std::size_t>(500ms / FastCache::ProbeTerminalPollInterval));
+    CHECK(coarse.run.steps == static_cast<std::size_t>(500ms / FastCache::InputTerminalPollInterval));
+    CHECK(coarse.run.steps < tight.run.steps);
+}
+
+TEST_CASE("Terminal: an answer landing between two looks is seen at the NEXT look", "[platform][terminal][parking]")
+{
+    // The latency the poll interval costs, pinned. The reply becomes readable at
+    // 7 ms and the loop is looking every 5, so it is observed at 10 -- never
+    // earlier, and never rounded away. Every other timing case in this file
+    // deliberately uses arrival times that are multiples of the interval so
+    // their assertions are exact; this is the one that says what happens when
+    // they are not, which is the property those cases are quietly relying on.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 7ms) } } };
+
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms);
+
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Yes);
+    CHECK(asked.result.elapsed == 10ms);
+    CHECK(asked.run.steps == static_cast<std::size_t>(2));
+}
+
+TEST_CASE("Terminal: a look that claims bytes and has none is not an answer", "[platform][terminal][parking]")
+{
+    // Asked of `Read` rather than of the driver, because that is where the two
+    // outcomes differ: here a missing guard answers `Bytes` immediately and this
+    // case goes red, while through the driver it would spin forever against a
+    // clock nobody advances and report nothing at all.
+    //
+    // Found by NEUTERING rather than by review: the loop was written, read and
+    // green before anybody asked what an empty `Bytes` would do to it.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    AlwaysEmptyTerminal terminal;
+
+    FastCache::TerminalRead read {};
+    auto task = ReadInto(terminal, reactor, 50ms, 5ms, &read);
+    auto const run = RunParked(reactor, clock, task, 5ms);
+
+    REQUIRE(run.finished);
+    // It waited its budget out rather than answering from an empty look.
+    CHECK(read.outcome == FastCache::TerminalReadOutcome::Timeout);
+    CHECK(read.outcome != FastCache::TerminalReadOutcome::Bytes);
+    CHECK(read.bytes.empty());
+    CHECK(run.steps == static_cast<std::size_t>(50ms / 5ms));
+}
+
+TEST_CASE("Terminal: a cancelled wait is Abandoned -- our silence, not the terminal's", "[platform][terminal][parking]")
+{
+    // `CancelRead` is the only way to abandon a parked read that is not tearing
+    // the channel down, and the answer it produces must not be `NoReply`: the
+    // terminal was never given its budget, so reporting it as silent would
+    // blame it for a shutdown.
+    //
+    // The positive control is inside the fixture: this terminal WOULD have
+    // answered `Yes` at 400 ms, so a cancel that did nothing produces a `Yes`
+    // here rather than a hang, and the case fails for the right reason.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 400ms) } } };
+
+    FastCache::TerminalQueryResult result {};
+    auto task = QueryInto(terminal, reactor, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms, &result);
+    reactor.Submit(task.Native());
+    reactor.Run();
+
+    for (int step = 0; step < 4; ++step)
+    {
+        clock.Advance(5ms);
+        reactor.Run();
+    }
+
+    // Genuinely parked, or the cancel below would be cancelling nothing.
+    REQUIRE_FALSE(task.IsReady());
+    REQUIRE(reactor.PendingTimers() == static_cast<std::size_t>(1));
+
+    terminal.CancelRead();
+    clock.Advance(5ms);
+    reactor.Run();
+
+    REQUIRE(task.IsReady());
+    CHECK(result.answer == FastCache::TerminalQueryAnswer::Abandoned);
+    CHECK(result.answer != FastCache::TerminalQueryAnswer::NoReply);
+    CHECK_FALSE(FastCache::PermitsUse(result.answer));
+
+    // It stopped where it was stopped, not at the budget and not at the answer
+    // the terminal was about to give.
+    CHECK(result.elapsed == 25ms);
+    CHECK(reactor.PendingTimers() == static_cast<std::size_t>(0));
+}
+
+TEST_CASE("Terminal: a cancel aimed at a finished read does not abandon the next one", "[platform][terminal][parking]")
+{
+    // The flag is cleared when a read STARTS rather than remembered. A sticky
+    // one would answer `Abandoned` for a query that was never cancelled, which
+    // is a wrong answer nobody would look for because the cancel really did
+    // happen -- just to something else.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 10ms) } } };
+
+    terminal.CancelRead();
+
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms);
+
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Yes);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::Abandoned);
+}
+
+// ---------------------------------------------------------------------------
 // Putting the question -- scripted channel, manual clock, no terminal
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Terminal: a terminal that reports sixel answers Yes", "[platform][terminal][da1]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says(std::string { Da1WithSixel }, 3ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 5ms) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Yes);
-    CHECK(FastCache::PermitsUse(result.answer));
-    CHECK(result.elapsed == 3ms);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Yes);
+    CHECK(FastCache::PermitsUse(asked.result.answer));
+    CHECK(asked.result.elapsed == 5ms);
     REQUIRE(terminal.Written().size() == 1);
     CHECK(terminal.Written().front() == "\x1b[c");
 }
@@ -374,37 +763,43 @@ TEST_CASE("Terminal: answering no sixel and never answering are DIFFERENT answer
     // behind a slow link. A case asserting only `!PermitsUse` on both passes
     // under exactly the collapse this is written to refuse.
     FastCache::ManualClock answering;
-    ScriptedTerminal saysNo { answering, true, { Says(std::string { Da1WithoutSixel }, 2ms) } };
-    auto const no = FastCache::RunTerminalQuery(saysNo, answering, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    FastCache::TestReactor answeringReactor { answering };
+    ScriptedTerminal saysNo { answering, true, { { Says(std::string { Da1WithoutSixel }, 5ms) } } };
+    auto const no = Ask(saysNo, answeringReactor, answering, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
     FastCache::ManualClock silent;
+    FastCache::TestReactor silentReactor { silent };
     ScriptedTerminal saysNothing { silent, true, {} };
-    auto const quiet =
-        FastCache::RunTerminalQuery(saysNothing, silent, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const quiet = Ask(saysNothing, silentReactor, silent, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(no.answer == FastCache::TerminalQueryAnswer::No);
-    CHECK(quiet.answer == FastCache::TerminalQueryAnswer::NoReply);
-    CHECK(no.answer != quiet.answer);
+    REQUIRE(no.run.finished);
+    REQUIRE(quiet.run.finished);
+
+    CHECK(no.result.answer == FastCache::TerminalQueryAnswer::No);
+    CHECK(quiet.result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(no.result.answer != quiet.result.answer);
 
     // Both refuse the capability -- that is the safe direction and it must hold.
-    CHECK_FALSE(FastCache::PermitsUse(no.answer));
-    CHECK_FALSE(FastCache::PermitsUse(quiet.answer));
+    CHECK_FALSE(FastCache::PermitsUse(no.result.answer));
+    CHECK_FALSE(FastCache::PermitsUse(quiet.result.answer));
 
     // And their diagnoses differ, which is what an operator reads.
-    CHECK(FastCache::SpecFor(no.answer).diagnosis != FastCache::SpecFor(quiet.answer).diagnosis);
+    CHECK(FastCache::SpecFor(no.result.answer).diagnosis != FastCache::SpecFor(quiet.result.answer).diagnosis);
 }
 
 TEST_CASE("Terminal: a silent terminal expires at its budget and reports the MEASURED elapsed", "[platform][terminal][da1]")
 {
     FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
     ScriptedTerminal terminal { clock, true, {} };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 250ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 250ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::NoReply);
     // The elapsed is what the clock recorded, not the number that was requested.
     // Those coincide here by construction; the case below is where they part.
-    CHECK(result.elapsed == 250ms);
+    CHECK(asked.result.elapsed == 250ms);
 }
 
 TEST_CASE("Terminal: an answer that is late but inside the budget is still an answer", "[platform][terminal][da1]")
@@ -413,15 +808,19 @@ TEST_CASE("Terminal: an answer that is late but inside the budget is still an an
     // of a 500 ms budget -- a plausible trans-continental round trip -- and must
     // be honoured rather than discarded.
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says(std::string { Da1WithSixel }, 240ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }, 240ms) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Yes);
-    CHECK(result.elapsed == 240ms);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Yes);
+    CHECK(asked.result.elapsed == 240ms);
     // MEASURED rather than requested: the two differ here, which is the whole
     // reason the field is not simply the budget.
-    CHECK(result.elapsed < 500ms);
+    CHECK(asked.result.elapsed < 500ms);
+    // And it waited for it rather than answering from nowhere.
+    CHECK(asked.run.steps == static_cast<std::size_t>(240ms / FastCache::ProbeTerminalPollInterval));
 }
 
 TEST_CASE("Terminal: a channel that closes mid-reply is Closed, not NoReply", "[platform][terminal][da1]")
@@ -430,43 +829,51 @@ TEST_CASE("Terminal: a channel that closes mid-reply is Closed, not NoReply", "[
     // from one that is merely slow, so folding the two would send a reader to
     // the budget for a problem the budget cannot cause.
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?62;", 1ms), Closes(1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?62;", 5ms), Closes(10ms) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Closed);
-    CHECK(result.answer != FastCache::TerminalQueryAnswer::NoReply);
-    CHECK(result.elapsed == 2ms);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Closed);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(asked.result.elapsed == 10ms);
 }
 
 TEST_CASE("Terminal: garbage is Refused, and Refused is not No", "[platform][terminal][da1]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?6z2c", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?6z2c", 5ms) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Refused);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Refused);
     // Something ANSWERED -- that is a different fact from a terminal that
     // considered the question and said no, and an operator debugging a terminal
     // needs to know which.
-    CHECK(result.answer != FastCache::TerminalQueryAnswer::No);
-    CHECK(result.answer != FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::No);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::NoReply);
 }
 
 TEST_CASE("Terminal: a non-interactive channel is NotAsked and nothing is written", "[platform][terminal][da1]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, false, { Says(std::string { Da1WithSixel }) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, false, { { Says(std::string { Da1WithSixel }) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    // `SyncRun` rather than the reactor, and that is an assertion in itself: a
+    // query that is never asked must not park, so this call must not throw.
+    auto const result = FastCache::SyncRun(
+        FastCache::RunTerminalQuery(terminal, reactor, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms));
 
     CHECK(result.answer == FastCache::TerminalQueryAnswer::NotAsked);
     // The load-bearing half: writing an escape sequence at a pipe corrupts it.
     // Asserting only the answer would pass for an implementation that wrote the
     // query and then ignored the reply.
     CHECK(terminal.Written().empty());
-    CHECK(terminal.Budgets().empty());
+    CHECK(terminal.Looks() == static_cast<std::size_t>(0));
     CHECK(result.elapsed == 0ms);
 }
 
@@ -478,49 +885,90 @@ TEST_CASE("Terminal: a well-formed reply to a DIFFERENT question is Refused", "[
     // another -- and here it would be a wrong `No` rather than a wrong `Yes`,
     // which is why the check is on the FINAL byte and not on the parameters.
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?2026;1$y", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?2026;1$y", 5ms) } } };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::Refused);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Refused);
 }
 
 TEST_CASE("Terminal: a write that fails ends the exchange rather than waiting out the budget", "[platform][terminal][da1]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says(std::string { Da1WithSixel }) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says(std::string { Da1WithSixel }) } } };
     terminal.FailWrites();
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 500ms);
+    // As with the non-interactive case: this must not park, so `SyncRun`
+    // returning at all is half the assertion.
+    auto const result = FastCache::SyncRun(
+        FastCache::RunTerminalQuery(terminal, reactor, FastCache::TerminalQueryKind::DeviceAttributes, 500ms, 5ms));
 
     CHECK(result.answer == FastCache::TerminalQueryAnswer::Closed);
     // Nothing was read: waiting 500 ms for a reply to a query that never left is
     // the shape a per-read timeout produces and this must not.
-    CHECK(terminal.Budgets().empty());
+    CHECK(terminal.Looks() == static_cast<std::size_t>(0));
 }
 
 TEST_CASE("Terminal: the budget is a total, not a per-read timeout", "[platform][terminal][da1]")
 {
     // A terminal dribbling one byte at a time re-arms a per-read timeout forever
     // and never expires -- the same defect as a per-call SO_RCVTIMEO standing in
-    // for a deadline. Each step here costs 100 ms and none of them completes the
-    // reply, so a correct driver gives up at the budget.
+    // for a deadline. Each byte here arrives 100 ms after the query and none of
+    // them completes the reply, so a correct driver gives up at the budget.
+    //
+    // The DISCRIMINATING assertion is the elapsed. A driver that handed each read
+    // the whole budget afresh would answer `NoReply` too -- just 350 ms later,
+    // having pushed its deadline out on every byte.
     FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
     ScriptedTerminal terminal {
         clock,
         true,
-        { Says("\x1b", 100ms), Says("[", 100ms), Says("?", 100ms), Says("6", 100ms), Says("2", 100ms), Says(";", 100ms) }
+        { { Says("\x1b", 100ms), Says("[", 200ms), Says("?", 300ms), Says("6", 400ms), Says("2", 500ms), Says(";", 600ms) } }
     };
 
-    auto const result = FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::DeviceAttributes, 250ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 250ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::NoReply);
-    CHECK(result.elapsed == 250ms);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(asked.result.elapsed == 250ms);
+    CHECK(asked.result.elapsed <= 250ms);
+    // The query did go out, so this is not a case that passed by never reaching
+    // the terminal at all -- and bytes did come back, which is what makes the
+    // deadline the only thing that can have ended it.
+    REQUIRE(terminal.Written().size() == 1);
+    CHECK(terminal.Looks() > static_cast<std::size_t>(0));
+    CHECK(asked.run.steps == static_cast<std::size_t>(250ms / FastCache::ProbeTerminalPollInterval));
+}
 
-    // And the budget handed to each read SHRANK, which is what proves the
-    // deadline was carried rather than re-armed.
-    REQUIRE(terminal.Budgets().size() >= 2);
-    CHECK(terminal.Budgets()[1] < terminal.Budgets()[0]);
+TEST_CASE("Terminal: a partial reply arriving exactly at the deadline is NoReply", "[platform][terminal][da1]")
+{
+    // The driver's own deadline check, which the read's cannot cover. A read
+    // that finds bytes reports them without consulting the deadline -- rightly,
+    // it has an answer -- so a reply that lands at the last instant and does not
+    // COMPLETE leaves the driver holding an incomplete decode with its whole
+    // budget spent. That arm is what answers, and the next `Read` would
+    // otherwise be handed a negative budget.
+    //
+    // This case exists because NEUTERING found nothing watching that arm: folding
+    // its `NoReply` into `No` left all 40 cases passing, which is a state
+    // distinction no test could have lost, since no test reached it.
+    FastCache::ManualClock clock;
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?62;", 250ms) } } };
+
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::DeviceAttributes, 250ms);
+
+    REQUIRE(asked.run.finished);
+    // Nothing was asked twice and nothing was invented: the terminal said
+    // something, it was not an answer, and the budget is gone.
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::NoReply);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::No);
+    CHECK(asked.result.answer != FastCache::TerminalQueryAnswer::Refused);
+    CHECK(asked.result.elapsed == 250ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -536,25 +984,29 @@ TEST_CASE("Terminal: DECRPM reports supported for every non-zero mode value", "[
     for (auto const value: { 1, 2, 3, 4 })
     {
         FastCache::ManualClock clock;
-        ScriptedTerminal terminal { clock, true, { Says("\x1b[?2026;" + std::to_string(value) + "$y", 1ms) } };
-        auto const result =
-            FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
-        CHECK(result.answer == FastCache::TerminalQueryAnswer::Yes);
+        FastCache::TestReactor reactor { clock };
+        ScriptedTerminal terminal { clock, true, { { Says("\x1b[?2026;" + std::to_string(value) + "$y", 5ms) } } };
+
+        auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
+
+        REQUIRE(asked.run.finished);
+        CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::Yes);
     }
 }
 
 TEST_CASE("Terminal: DECRPM mode value 0 means the terminal does not know the mode", "[platform][terminal][decrqm]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?2026;0$y", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?2026;0$y", 5ms) } } };
 
-    auto const result =
-        FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
 
     // `No`, not `Refused`: the terminal answered the question correctly and the
     // answer was negative. The positive control is the case above -- without it,
     // an implementation that reported `No` for every DECRPM reply would pass.
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::No);
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::No);
     CHECK(terminal.Written().front() == "\x1b[?2026$p");
 }
 
@@ -564,13 +1016,14 @@ TEST_CASE("Terminal: a DECRPM reply too short to carry its answer is not a defau
     // position as a defaulted 0 would be luck rather than design here; what the
     // seam must not do is invent a `Yes`.
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("\x1b[?2026$y", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { { Says("\x1b[?2026$y", 5ms) } } };
 
-    auto const result =
-        FastCache::RunTerminalQuery(terminal, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
+    auto const asked = Ask(terminal, reactor, clock, FastCache::TerminalQueryKind::SynchronizedOutput, 500ms);
 
-    CHECK(result.answer == FastCache::TerminalQueryAnswer::No);
-    CHECK_FALSE(FastCache::PermitsUse(result.answer));
+    REQUIRE(asked.run.finished);
+    CHECK(asked.result.answer == FastCache::TerminalQueryAnswer::No);
+    CHECK_FALSE(FastCache::PermitsUse(asked.result.answer));
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +1034,11 @@ TEST_CASE("Terminal: with no channel every query is NotAsked rather than a plaus
           "[platform][terminal][capabilities]")
 {
     FastCache::ManualClock clock;
-    auto const caps = FastCache::ProbeTerminalCapabilities(nullptr, clock);
+    FastCache::TestReactor reactor { clock };
+
+    // No channel means no query and therefore no waiting, so this resolves
+    // without touching the reactor at all.
+    auto const caps = FastCache::SyncRun(FastCache::ProbeTerminalCapabilities(nullptr, reactor));
 
     CHECK_FALSE(caps.interactive);
     CHECK(caps.color == FastCache::ColorDepth::None);
@@ -596,13 +1053,46 @@ TEST_CASE("Terminal: with no channel every query is NotAsked rather than a plaus
     CHECK(caps.sixel != FastCache::TerminalQueryAnswer::No);
 }
 
+TEST_CASE("Terminal: the record is a VALUE a caller can supply instead of probing", "[platform][terminal][capabilities]")
+{
+    // Probing and the record are separable, and this is what that buys: a caller
+    // that already knows what it renders to constructs the record and asks no
+    // terminal anything. Nothing downstream may put a question of its own, so a
+    // fixture, a golden-output test and an operator override all reach the same
+    // rungs the probe would have chosen.
+    FastCache::TerminalCapabilities const supplied { .interactive = true,
+                                                     .color = FastCache::ColorDepth::TrueColor,
+                                                     .unicode = true,
+                                                     .sixel = FastCache::TerminalQueryAnswer::Yes,
+                                                     .synchronizedOutput = FastCache::TerminalQueryAnswer::No,
+                                                     .altScreen = true,
+                                                     .size = { .columns = 120, .rows = 40 } };
+
+    CHECK(FastCache::PermitsUse(supplied.sixel));
+    CHECK_FALSE(FastCache::PermitsUse(supplied.synchronizedOutput));
+    CHECK(supplied.size.columns == 120);
+
+    // And the default is the closed one: a record nobody filled in claims
+    // nothing, rather than claiming a terminal was asked and said no.
+    FastCache::TerminalCapabilities const unfilled {};
+    CHECK(unfilled.sixel == FastCache::TerminalQueryAnswer::NotAsked);
+    CHECK(unfilled.synchronizedOutput == FastCache::TerminalQueryAnswer::NotAsked);
+    CHECK_FALSE(unfilled.interactive);
+}
+
 TEST_CASE("Terminal: both queries are put to an interactive channel, in table order", "[platform][terminal][capabilities]")
 {
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says(std::string { Da1WithSixel }, 1ms), Says("\x1b[?2026;2$y", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock,
+                                true,
+                                { { Says(std::string { Da1WithSixel }, 5ms) }, { Says("\x1b[?2026;2$y", 5ms) } } };
 
-    auto const caps = FastCache::ProbeTerminalCapabilities(&terminal, clock);
+    FastCache::TerminalCapabilities caps {};
+    auto task = ProbeInto(&terminal, reactor, 500ms, 5ms, &caps);
+    auto const run = RunParked(reactor, clock, task, 5ms);
 
+    REQUIRE(run.finished);
     CHECK(caps.interactive);
     CHECK(caps.sixel == FastCache::TerminalQueryAnswer::Yes);
     CHECK(caps.synchronizedOutput == FastCache::TerminalQueryAnswer::Yes);
@@ -620,11 +1110,19 @@ TEST_CASE("Terminal: one query's failure does not decide the other", "[platform]
     // record on the first non-answer would report `NotAsked` for synchronized
     // output on every terminal that ignores DA1 -- a state that would then read
     // as "not interactive".
+    //
+    // The first script is EMPTY, which is how this fake spells a query that gets
+    // nothing: scripts are per query, so the second query's answer cannot be
+    // consumed by the first one asking earlier.
     FastCache::ManualClock clock;
-    ScriptedTerminal terminal { clock, true, { Says("", 500ms), Says("\x1b[?2026;1$y", 1ms) } };
+    FastCache::TestReactor reactor { clock };
+    ScriptedTerminal terminal { clock, true, { {}, { Says("\x1b[?2026;1$y", 5ms) } } };
 
-    auto const caps = FastCache::ProbeTerminalCapabilities(&terminal, clock, 500ms);
+    FastCache::TerminalCapabilities caps {};
+    auto task = ProbeInto(&terminal, reactor, 500ms, 5ms, &caps);
+    auto const run = RunParked(reactor, clock, task, 5ms);
 
+    REQUIRE(run.finished);
     CHECK(caps.sixel == FastCache::TerminalQueryAnswer::NoReply);
     CHECK(caps.synchronizedOutput == FastCache::TerminalQueryAnswer::Yes);
 }

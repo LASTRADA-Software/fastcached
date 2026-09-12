@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <utility>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -193,6 +195,84 @@ bool CsiReplyDecoder::PushParameter() noexcept
 }
 
 // ---------------------------------------------------------------------------
+// Waiting for the terminal without holding a thread
+// ---------------------------------------------------------------------------
+
+void ITerminalChannel::CancelRead() noexcept
+{
+    _readCancelled.store(true, std::memory_order_release);
+}
+
+Task<TerminalRead> ITerminalChannel::Read(IReactor& reactor,
+                                          std::chrono::milliseconds budget,
+                                          std::chrono::milliseconds pollInterval)
+{
+    // Cleared at ENTRY, not at exit. A cancel that arrived while nothing was
+    // parked was aimed at a read that has already ended, and remembering it here
+    // would abandon the next read on that read's behalf.
+    _readCancelled.store(false, std::memory_order_release);
+
+    auto const deadline = reactor.Clock().Now() + budget;
+
+    for (;;)
+    {
+        // Look BEFORE parking. A reply already sitting in the buffer -- the
+        // common case for a local terminal, which answers inside a round trip --
+        // must not be charged a poll interval it did not need.
+        TerminalPollResult got = TryRead();
+        switch (got.outcome)
+        {
+            case TerminalPollOutcome::Bytes:
+                // A look that produced no BYTES did not produce bytes, whatever it
+                // called itself, and this is a BOUND on what a channel may claim
+                // rather than a case that happens: both platform looks gate on a
+                // positive count. Reporting it as `Bytes` would hand the driver an
+                // empty read to decode and send it round again with no time spent
+                // and nothing parked -- a spin rather than a wait, and against an
+                // injected clock a spin that never ends, because nothing advances
+                // the clock the deadline is measured on.
+                if (got.bytes.empty())
+                    break;
+                co_return TerminalRead { .outcome = TerminalReadOutcome::Bytes, .bytes = std::move(got.bytes) };
+            case TerminalPollOutcome::Closed:
+                co_return TerminalRead { .outcome = TerminalReadOutcome::Closed, .bytes = {} };
+            case TerminalPollOutcome::Failed:
+            case TerminalPollOutcome::Last:
+                co_return TerminalRead { .outcome = TerminalReadOutcome::Failed, .bytes = {} };
+            case TerminalPollOutcome::NothingYet:
+                break;
+        }
+
+        // ONE cancellation check per turn, and it is here rather than after the
+        // park. A second check on the far side of the `co_await` reads as
+        // diligence and is not distinguishable from this one: the loop always
+        // re-enters `TryRead` on resuming, so a cancel that arrived during the
+        // park is seen at this check on the very next turn. MEASURED by
+        // neutering -- the post-park copy was removed and every one of the 40
+        // cases still passed, which is the definition of a claim nothing checks.
+        //
+        // What the ordering DOES decide, deliberately: a cancel racing an answer
+        // that has actually arrived loses. `TryRead` is consulted first, so bytes
+        // already in hand are reported rather than thrown away for a wait nobody
+        // is waiting on any more.
+        if (_readCancelled.load(std::memory_order_acquire))
+            co_return TerminalRead { .outcome = TerminalReadOutcome::Cancelled, .bytes = {} };
+
+        auto const now = reactor.Clock().Now();
+        if (now >= deadline)
+            co_return TerminalRead { .outcome = TerminalReadOutcome::Timeout, .bytes = {} };
+
+        // The park. `NextWakeStep` is the one place this project writes the
+        // polling rule down, and it is shared rather than re-derived here --
+        // three bounded waits had drifted into three copies of it once already.
+        // The loop is INLINE rather than delegated to `InterruptibleSleepUntil`
+        // because the condition being re-read at each step is `TryRead`, not a
+        // token; the cancellation flag rides along with it.
+        co_await SleepUntil { .reactor = &reactor, .deadline = NextWakeStep(now, deadline, pollInterval) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Putting a question to the terminal
 // ---------------------------------------------------------------------------
 
@@ -223,10 +303,11 @@ namespace
     }
 } // namespace
 
-TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
-                                     IClock& clock,
-                                     TerminalQueryKind kind,
-                                     std::chrono::milliseconds budget)
+Task<TerminalQueryResult> RunTerminalQuery(ITerminalChannel& channel,
+                                           IReactor& reactor,
+                                           TerminalQueryKind kind,
+                                           std::chrono::milliseconds budget,
+                                           std::chrono::milliseconds pollInterval)
 {
     TerminalQuerySpec const& spec = SpecFor(kind);
     TerminalQueryResult result {};
@@ -235,8 +316,12 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
     // all land here, and none of them has said anything about the capability.
     // Writing an escape sequence at a file would also corrupt it.
     if (!channel.IsInteractive())
-        return result;
+        co_return result;
 
+    // ONE clock, the reactor's. The deadline and the sleeps that race it are
+    // then the same reading; a second injected clock could disagree with the one
+    // the parking actually uses, and nothing would say so.
+    IClock& clock = reactor.Clock();
     auto const started = clock.Now();
     auto const elapsedSince = [&clock, started]() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started);
@@ -246,7 +331,7 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
     {
         result.answer = TerminalQueryAnswer::Closed;
         result.elapsed = elapsedSince();
-        return result;
+        co_return result;
     }
 
     CsiReplyDecoder decoder;
@@ -260,10 +345,10 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
         {
             result.answer = TerminalQueryAnswer::NoReply;
             result.elapsed = spent;
-            return result;
+            co_return result;
         }
 
-        TerminalRead const read = channel.Read(budget - spent);
+        TerminalRead const read = co_await channel.Read(reactor, budget - spent, pollInterval);
         switch (read.outcome)
         {
             case TerminalReadOutcome::Bytes:
@@ -271,18 +356,24 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
             case TerminalReadOutcome::Timeout:
                 result.answer = TerminalQueryAnswer::NoReply;
                 result.elapsed = elapsedSince();
-                return result;
+                co_return result;
             case TerminalReadOutcome::Closed:
                 // Distinguished from `NoReply` on purpose: the terminal went away,
                 // which is fixed somewhere else entirely from one that is slow.
                 result.answer = TerminalQueryAnswer::Closed;
                 result.elapsed = elapsedSince();
-                return result;
+                co_return result;
+            case TerminalReadOutcome::Cancelled:
+                // WE stopped asking. The terminal was never given its budget, so
+                // this is not silence on its part and must not be reported as any.
+                result.answer = TerminalQueryAnswer::Abandoned;
+                result.elapsed = elapsedSince();
+                co_return result;
             case TerminalReadOutcome::Failed:
             case TerminalReadOutcome::Last:
                 result.answer = TerminalQueryAnswer::Closed;
                 result.elapsed = elapsedSince();
-                return result;
+                co_return result;
         }
 
         switch (decoder.Feed(read.bytes))
@@ -292,13 +383,13 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
             case CsiDecodeState::Malformed:
                 result.answer = TerminalQueryAnswer::Refused;
                 result.elapsed = elapsedSince();
-                return result;
+                co_return result;
             case CsiDecodeState::Complete:
                 break;
             case CsiDecodeState::Last:
                 result.answer = TerminalQueryAnswer::Refused;
                 result.elapsed = elapsedSince();
-                return result;
+                co_return result;
         }
 
         result.elapsed = elapsedSince();
@@ -311,13 +402,13 @@ TerminalQueryResult RunTerminalQuery(ITerminalChannel& channel,
         if (result.reply.finalByte != spec.finalByte || result.reply.intermediate != spec.intermediate)
         {
             result.answer = TerminalQueryAnswer::Refused;
-            return result;
+            co_return result;
         }
 
         bool const yes = spec.answerIndex == AnswerByPresence ? result.reply.HasParameter(spec.wantParameter)
                                                               : AnswerAtIndex(result.reply, spec.answerIndex);
         result.answer = yes ? TerminalQueryAnswer::Yes : TerminalQueryAnswer::No;
-        return result;
+        co_return result;
     }
 }
 
@@ -410,6 +501,19 @@ bool DetectUnicodeSupport(bool interactive)
 
 namespace
 {
+    /// How many pending console records one look inspects.
+    ///
+    /// A bound rather than the whole queue, and the failure it accepts is stated
+    /// rather than hoped away: a queue whose first `PeekDepth` records all
+    /// translate to nothing reports `NothingYet` even if a key-down sits behind
+    /// them, so a flood of untranslatable records would expire the budget and
+    /// answer `NoReply`. That is the safe direction for this seam -- a wrong
+    /// *the terminal did not answer* rather than a stalled loop -- and the flood
+    /// itself is closed off at the source: `OpenTerminalChannel` clears
+    /// `ENABLE_MOUSE_INPUT`, which leaves focus and window-size records, both of
+    /// which arrive one at a time and only when the operator does something.
+    constexpr DWORD PeekDepth = 32;
+
     /// A console channel: raw input for the duration, restored on destruction.
     ///
     /// The mode change is RAII because the failure it prevents is not ours to
@@ -448,18 +552,64 @@ namespace
             return written == bytes.size();
         }
 
-        [[nodiscard]] TerminalRead Read(std::chrono::milliseconds budget) override
+        /// One non-blocking look at the console.
+        ///
+        /// **`ReadFile` is only reached once a record that will TRANSLATE is
+        /// known to be pending, and that guard is the whole of this function.**
+        /// With `ENABLE_VIRTUAL_TERMINAL_INPUT` the console translates its input
+        /// RECORDS into VT bytes, and records that translate to nothing -- a
+        /// focus change, a window-size change -- are consumed and dropped rather
+        /// than answered. So a handle that is SIGNALLED is not a handle that has
+        /// bytes: `WaitForSingleObject` fires for any record at all, and a
+        /// `ReadFile` behind it blocks until something translatable arrives. On
+        /// a reactor's loop thread that is the stall this seam exists to
+        /// prevent, arriving one level below where anybody is looking for it.
+        ///
+        /// Peeking answers it without consuming anything: if any pending record
+        /// is a key-down, `ReadFile` is guaranteed to return -- it will drop the
+        /// untranslatable records ahead of it on the way. If none is, there are
+        /// no bytes to be had and the junk stays queued, which costs one
+        /// `PeekConsoleInput` per look and loses nothing.
+        ///
+        /// NOT MEASURED: whether Windows Terminal and the legacy console agree
+        /// about which records they queue in this mode. The guard is written to
+        /// be safe either way -- it asks what is THERE rather than what ought to
+        /// be -- but a reader wiring the input loop should drive a real session
+        /// on both before assuming the peek can be dropped.
+        ///
+        /// @return What was there, or `NothingYet`.
+        [[nodiscard]] TerminalPollResult TryRead() override
         {
-            TerminalRead result {};
-            auto const waited = ::WaitForSingleObject(_input, static_cast<DWORD>(budget.count()));
-            if (waited == WAIT_TIMEOUT)
+            TerminalPollResult result {};
+
+            DWORD pending = 0;
+            if (::GetNumberOfConsoleInputEvents(_input, &pending) == 0)
             {
-                result.outcome = TerminalReadOutcome::Timeout;
+                result.outcome = TerminalPollOutcome::Failed;
                 return result;
             }
-            if (waited != WAIT_OBJECT_0)
+            if (pending == 0)
             {
-                result.outcome = TerminalReadOutcome::Failed;
+                result.outcome = TerminalPollOutcome::NothingYet;
+                return result;
+            }
+
+            std::array<INPUT_RECORD, PeekDepth> records {};
+            DWORD peeked = 0;
+            auto const look = std::min<DWORD>(pending, static_cast<DWORD>(records.size()));
+            if (::PeekConsoleInputW(_input, records.data(), look, &peeked) == 0)
+            {
+                result.outcome = TerminalPollOutcome::Failed;
+                return result;
+            }
+
+            auto const translates = [](INPUT_RECORD const& record) noexcept {
+                return record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown != 0;
+            };
+            auto const last = std::next(records.begin(), static_cast<std::ptrdiff_t>(peeked));
+            if (std::none_of(records.begin(), last, translates))
+            {
+                result.outcome = TerminalPollOutcome::NothingYet;
                 return result;
             }
 
@@ -467,15 +617,18 @@ namespace
             DWORD read = 0;
             if (::ReadFile(_input, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) == 0)
             {
-                result.outcome = TerminalReadOutcome::Failed;
+                result.outcome = TerminalPollOutcome::Failed;
                 return result;
             }
             if (read == 0)
             {
-                result.outcome = TerminalReadOutcome::Closed;
+                // A console `ReadFile` that returns zero bytes having been told a
+                // translatable record was waiting is end of input, not *nothing
+                // yet* -- the nothing-yet answers all left above without reading.
+                result.outcome = TerminalPollOutcome::Closed;
                 return result;
             }
-            result.outcome = TerminalReadOutcome::Bytes;
+            result.outcome = TerminalPollOutcome::Bytes;
             result.bytes.assign(buffer.data(), read);
             return result;
         }
@@ -506,8 +659,14 @@ std::unique_ptr<ITerminalChannel> OpenTerminalChannel()
     // echoed at the operator and held until they press Return.
     // `ENABLE_VIRTUAL_TERMINAL_INPUT` is what makes the console hand back the
     // reply as the VT bytes the decoder expects rather than as key records.
-    DWORD const raw =
-        (previousMode & ~static_cast<DWORD>(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    //
+    // `ENABLE_MOUSE_INPUT` goes OFF as well, and that is not tidiness: it is
+    // typically set on a console's default mode, and every mouse MOVE then
+    // queues a record that translates to no VT bytes at all. `TryRead`'s peek is
+    // bounded (`PeekDepth`), so a queue full of them is a look that cannot see
+    // past them -- closing the source is what keeps that bound sufficient.
+    DWORD const raw = (previousMode & ~static_cast<DWORD>(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT))
+                      | ENABLE_VIRTUAL_TERMINAL_INPUT;
     if (::SetConsoleMode(input, raw) == 0)
         return nullptr;
 
@@ -583,27 +742,49 @@ namespace
             return true;
         }
 
-        [[nodiscard]] TerminalRead Read(std::chrono::milliseconds budget) override
+        /// One non-blocking look at the tty.
+        ///
+        /// **The `read` is GATED on `poll`, and that gate is what makes a zero
+        /// return mean anything.** This channel sets `VMIN=0`/`VTIME=0`, under
+        /// which a bare `read` returns **0 for both** *nothing is there yet* and
+        /// *the terminal has gone* -- two answers this seam is built to keep
+        /// apart, since one is the ordinary state between polls and the other
+        /// ends the exchange. Asking `poll` first splits them: a descriptor that
+        /// is not readable never reaches the `read` at all, so a zero from a
+        /// readable one is end of input.
+        ///
+        /// `EAGAIN` is the same fact from the other side and is reported the
+        /// same way -- nothing yet -- even though this descriptor is not
+        /// `O_NONBLOCK`. It is one comparison and it removes the one way the
+        /// distinction could come back: `O_NONBLOCK` is deliberately NOT set
+        /// here, because it is a property of the open file description and would
+        /// make `Write` fail partially with `EAGAIN` for no gain that
+        /// `VMIN`/`VTIME` has not already bought.
+        ///
+        /// @return What was there, or `NothingYet`.
+        [[nodiscard]] TerminalPollResult TryRead() override
         {
-            TerminalRead result {};
+            TerminalPollResult result {};
 
             pollfd waiting {};
             waiting.fd = _fd;
             waiting.events = POLLIN;
-            auto const ready = ::poll(&waiting, 1, static_cast<int>(budget.count()));
+
+            // Timeout ZERO: this must not wait. The waiting is the caller's, and
+            // it is done by suspending rather than by sitting in a syscall.
+            auto const ready = ::poll(&waiting, 1, 0);
             if (ready == 0)
             {
-                result.outcome = TerminalReadOutcome::Timeout;
+                result.outcome = TerminalPollOutcome::NothingYet;
                 return result;
             }
             if (ready < 0)
             {
                 // EINTR is not an ENDING -- the caller's deadline is still the
                 // bound, so this reports nothing-yet rather than a failure and
-                // the loop re-arms against whatever budget remains. Reporting
-                // `Failed` here would turn an ordinary signal into "this
-                // terminal has no sixel".
-                result.outcome = errno == EINTR ? TerminalReadOutcome::Timeout : TerminalReadOutcome::Failed;
+                // the loop looks again. Reporting `Failed` here would turn an
+                // ordinary signal into "this terminal has no sixel".
+                result.outcome = errno == EINTR ? TerminalPollOutcome::NothingYet : TerminalPollOutcome::Failed;
                 return result;
             }
 
@@ -611,15 +792,29 @@ namespace
             auto const got = ::read(_fd, buffer.data(), buffer.size());
             if (got < 0)
             {
-                result.outcome = errno == EINTR ? TerminalReadOutcome::Timeout : TerminalReadOutcome::Failed;
-                return result;
+                // The tree's spelling: `EAGAIN` and `EWOULDBLOCK` are one value on
+                // Linux and are permitted to differ, so the second label is
+                // conditional rather than written twice.
+                switch (errno)
+                {
+                    case EINTR:
+                    case EWOULDBLOCK:
+    #if EAGAIN != EWOULDBLOCK
+                    case EAGAIN:
+    #endif
+                        result.outcome = TerminalPollOutcome::NothingYet;
+                        return result;
+                    default:
+                        result.outcome = TerminalPollOutcome::Failed;
+                        return result;
+                }
             }
             if (got == 0)
             {
-                result.outcome = TerminalReadOutcome::Closed;
+                result.outcome = TerminalPollOutcome::Closed;
                 return result;
             }
-            result.outcome = TerminalReadOutcome::Bytes;
+            result.outcome = TerminalPollOutcome::Bytes;
             result.bytes.assign(buffer.data(), static_cast<std::size_t>(got));
             return result;
         }
@@ -682,7 +877,10 @@ TerminalSize QueryTerminalSize() noexcept
 // The whole record
 // ---------------------------------------------------------------------------
 
-TerminalCapabilities ProbeTerminalCapabilities(ITerminalChannel* channel, IClock& clock, std::chrono::milliseconds budget)
+Task<TerminalCapabilities> ProbeTerminalCapabilities(ITerminalChannel* channel,
+                                                     IReactor& reactor,
+                                                     std::chrono::milliseconds budget,
+                                                     std::chrono::milliseconds pollInterval)
 {
     TerminalCapabilities caps {};
     caps.interactive = channel != nullptr && channel->IsInteractive();
@@ -698,11 +896,13 @@ TerminalCapabilities ProbeTerminalCapabilities(ITerminalChannel* channel, IClock
     caps.altScreen = caps.interactive;
 
     if (channel == nullptr)
-        return caps;
+        co_return caps;
 
-    caps.sixel = RunTerminalQuery(*channel, clock, TerminalQueryKind::DeviceAttributes, budget).answer;
-    caps.synchronizedOutput = RunTerminalQuery(*channel, clock, TerminalQueryKind::SynchronizedOutput, budget).answer;
-    return caps;
+    caps.sixel =
+        (co_await RunTerminalQuery(*channel, reactor, TerminalQueryKind::DeviceAttributes, budget, pollInterval)).answer;
+    caps.synchronizedOutput =
+        (co_await RunTerminalQuery(*channel, reactor, TerminalQueryKind::SynchronizedOutput, budget, pollInterval)).answer;
+    co_return caps;
 }
 
 } // namespace FastCache
