@@ -394,10 +394,21 @@ static void AppendConsensusMetrics(std::string& out, ConsensusStatus const& stat
 std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const& snapshot)
 {
     std::string out;
-    // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a generous
-    // per-row estimate, so one reserve avoids the handful of reallocations the
-    // += loop would otherwise do on every scrape.
-    out.reserve((StorageMetricCount + CounterTable.size() + 1) * 200);
+    // Each metric renders ~3 lines (HELP/TYPE/value); ~200 bytes is a per-row
+    // estimate, so one reserve avoids some of the reallocations the += loop would
+    // otherwise do on every scrape.
+    //
+    // The `+ 2` is the two rows that are neither a storage metric nor a catalogue
+    // row: uptime, and the catalogue-skew gauge. It was `+ 1` until the gauge
+    // arrived, which is the shape where a number beside a table stops describing
+    // it -- so it is spelled as the count of named extras rather than as a
+    // constant somebody has to re-derive.
+    //
+    // NOT a claim that the reserve is sufficient: ~100 catalogue rows alone exceed
+    // it, so a realloc already happens on every scrape. That is pre-existing and
+    // deliberately left alone here rather than retuned in a change about skew --
+    // a corrected estimate would want measuring, not guessing.
+    out.reserve((StorageMetricCount + CounterTable.size() + 2) * 200);
 
     // Only when there is a cache. A worker running this same endpoint would
     // otherwise report an empty, unbounded one — zeroes that read as facts.

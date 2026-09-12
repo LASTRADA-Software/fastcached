@@ -544,6 +544,7 @@ TEST_CASE("A counter the sink has no slot for is omitted and named, never render
     CHECK_FALSE(healthyBody.contains("# SKEW"));
 
     SkewedSink skewed { missing };
+    skewed.Increment(IMetricsSink::Counter::ConnectionsTotal, 5);
     auto const body = RenderPrometheus(skewed, snapshot);
 
     // What DISTINGUISHES the fix from the defect. Under the defect this is the
@@ -559,9 +560,13 @@ TEST_CASE("A counter the sink has no slot for is omitted and named, never render
     // assertion can tell a marker naming THIS row from one naming another.
     CHECK(body.contains(std::format("# SKEW {} is", series)));
 
-    // And nothing else is lost: the skew costs one series, not the endpoint.
+    // And nothing else is lost: the skew costs one series, not the endpoint. The
+    // carried counter is asserted with its VALUE rather than by name, which is what
+    // separates "the endpoint survived" from "the endpoint survived and still means
+    // something": a fix that dropped every counter row, or one that rendered the
+    // carried rows as zero, satisfies a name-only check and fails this one.
     CHECK(body.contains("fastcached_uptime_seconds"));
-    CHECK(body.contains(PrometheusNameOf(IMetricsSink::Counter::ConnectionsTotal)));
+    CHECK(body.contains(std::format("{} 5\n", PrometheusNameOf(IMetricsSink::Counter::ConnectionsTotal))));
 
     // The machine-readable half, and the VALUE rather than the presence. A scraper
     // discards every `#` comment, so on its own the marker above reaches monitoring
@@ -575,19 +580,4 @@ TEST_CASE("A counter the sink has no slot for is omitted and named, never render
     // so `> 0` is a usable alert rather than an absence somebody has to notice.
     // A zero here is a reading, not a missing line.
     CHECK(healthyBody.contains("fastcached_metrics_catalogue_skew 0\n"));
-}
-
-TEST_CASE("A skewed sink still reports every counter it does carry", "[metrics][prometheus][skew]")
-{
-    auto const missing = IMetricsSink::Counter::ConnectionsAdmissionRejected;
-    SkewedSink skewed { missing };
-    skewed.Increment(IMetricsSink::Counter::ConnectionsTotal, 5);
-
-    StorageStats const stats;
-    auto const body =
-        RenderPrometheus(skewed, MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = Uptime { 1s } });
-
-    // The value, not merely the name: a fix that dropped every counter row would
-    // satisfy an assertion about the omitted one and is caught only here.
-    CHECK(body.contains(std::format("{} 5\n", PrometheusNameOf(IMetricsSink::Counter::ConnectionsTotal))));
 }
