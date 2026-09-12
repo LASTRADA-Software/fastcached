@@ -4,6 +4,7 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
+#include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -1615,7 +1616,10 @@ TEST_CASE("The fleet 401 is a page a phone can read, and says what the challenge
     auto const refused = page->handler(AdminRequest { .path = "/fleet", .query = {} });
     REQUIRE(refused.status == "401 Unauthorized");
 
-    CHECK(refused.body.contains(R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"));
+    // The constant rather than a third copy of the literal (#1344): what the next
+    // case asserts is that both pages carry it, so a fourth spelling here would be the
+    // one place a divergence could hide.
+    CHECK(refused.body.contains(Distributed::HtmlDocumentPrologue));
 
     // **The discrimination, and the reason the sentence is not redundant.** The
     // header carries `Basic` and cannot carry `Bearer`; the body carries both. If a
@@ -1623,4 +1627,67 @@ TEST_CASE("The fleet 401 is a page a phone can read, and says what the challenge
     // where asserting only "the body mentions a scheme" would not.
     REQUIRE(refused.extraHeaders.size() == 1);
     CHECK((refused.body.contains("Bearer") && !refused.extraHeaders[0].contains("Bearer")));
+}
+
+TEST_CASE("Both pages this binary serves open with the one document prologue", "[node][admin][dashboard]")
+{
+    // **A discrimination rather than a coverage assertion** (#1344). The fleet
+    // dashboard and the node's own small pages each spelled the doctype, the language,
+    // the charset and the viewport out, and the copies agreed on everything but a
+    // newline. A case asking each page for a viewport meta passes with the copies
+    // already agreeing and goes on passing after either one drifts, which is a test
+    // that cannot fail for the reason it exists. What is asserted instead is the
+    // SHARED CONSTANT: inline a divergent literal at one of the two call sites and
+    // exactly that site's CHECK reddens, naming which page lost it.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    NullLogger schedulerLogger;
+    ManualWallClock wallClock;
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+
+    auto const routes =
+        Node::MakeFleetRoutes(Distributed::FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics },
+                              AdminCredential { "s3cret" },
+                              Node::DashboardRefreshSeconds);
+
+    // By path, not by index: every assertion below names a page, and a route inserted
+    // ahead of this one would otherwise make them fail for a reason that has nothing
+    // to do with what they are named for.
+    auto const fleet = std::ranges::find(routes, "/fleet", &AdminRoute::path);
+    REQUIRE(fleet != routes.end());
+
+    // The two documents, from the two renderers. The credential is what selects
+    // between them: with one the LIBRARY renders the dashboard, without one this file
+    // renders the small page, and those are the two sites the prologue was spelled at.
+    auto const page = fleet->handler(AdminRequest { .path = "/fleet", .query = {}, .headers = { "Bearer s3cret" } });
+    REQUIRE(page.status == "200 OK");
+    auto const refused = fleet->handler(AdminRequest { .path = "/fleet", .query = {} });
+    REQUIRE(refused.status == "401 Unauthorized");
+
+    // **The constant's VALUE, pinned once, and it is what stops the two CHECKs below
+    // being vacuous.** A symbol both sites spell can only ever test that they agree:
+    // gut it to `""` and every document on earth contains it, both sites pass and
+    // nothing says the viewport tag is gone. So the bytes that earn the constant are
+    // asserted here, in the one place they are written down -- the viewport meta the
+    // 401 page was filed for, and the charset a peer-chosen display name needs.
+    CHECK(Distributed::HtmlDocumentPrologue.starts_with("<!doctype html>"));
+    CHECK(Distributed::HtmlDocumentPrologue.contains(R"(<meta charset="utf-8">)"));
+    CHECK(Distributed::HtmlDocumentPrologue.contains(
+        R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"));
+
+    // One page, and what to call it when it is the one that failed.
+    struct ShellSite
+    {
+        std::string_view what;
+        std::string_view body;
+    };
+
+    for (auto const& site:
+         { ShellSite { .what = "the fleet dashboard, rendered by Distributed::RenderFleetHtml", .body = page.body },
+           ShellSite { .what = "the node's own small page, rendered by MinimalHtmlPage", .body = refused.body } })
+    {
+        INFO("site: " << site.what);
+        CHECK(site.body.contains(Distributed::HtmlDocumentPrologue));
+    }
 }
