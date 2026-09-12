@@ -196,6 +196,12 @@ option(FASTCACHED_ENABLE_COMPRESSION "Enable on-disk value compression (zstd + l
 option(TRACY_ENABLE "Enable Tracy profiler instrumentation (fetches & links the Tracy client)" OFF)
 option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" ON)
 
+# The vendored endo TUI, behind `fastcache-cli live-stats` (#134). ON, because a
+# view nobody builds is a view nobody runs and its tests would not report -- the
+# option exists so a build that wants neither the terminal view nor a libunicode
+# fetch can say so, not as a way to keep it out of CI. See vendor/VENDOR.md.
+option(FASTCACHED_BUILD_TUI "Build the vendored terminal UI (fastcache-cli live-stats)" ON)
+
 # ----------------------------------------------------------------------------
 # Compiler caching. Loaded before any compiler invocation so that CPM-fetched
 # dependencies also get cached. CompileCache.cmake prefers our own fastcache-cc
@@ -387,6 +393,59 @@ if(FASTCACHED_ENABLE_COMPRESSION)
             "BUILD_SHARED_LIBS OFF"
             "BUILD_STATIC_LIBS ON"
     )
+endif()
+
+# libunicode, for the vendored endo TUI's grapheme segmentation and character
+# widths (#134). Fetched here with the other third-party code, BEFORE the
+# pedantic/clang-tidy includes below, for the same reason they are: those install
+# -Werror -Wconversion and CMAKE_CXX_CLANG_TIDY directory-wide and must not reach
+# code that is not ours to fix.
+#
+# 0.9.3 is a floor rather than a preference. It fixes a scan_text() bug that drops
+# a zero-width codepoint following an ASCII base: the scanner splits a run at the
+# ASCII/non-ASCII boundary, the zero-width codepoint arrives in the non-ASCII half
+# alone and joins the cluster the ASCII half left open without widening it, so the
+# reported end lags and those bytes are never emitted. The vendored TUI's width
+# handling is downstream of that scanner, and a terminal view that mismeasures a
+# cluster corrupts every column to its right.
+#
+# `CPM_USE_LOCAL_PACKAGES` is ON above, so this already tries `find_package` first
+# and falls back to the fetch -- the same one door yaml-cpp, Catch2, zstd and lz4
+# go through, rather than a second spelling of the same policy.
+if(FASTCACHED_BUILD_TUI)
+    CPMAddPackage(
+        NAME libunicode
+        GITHUB_REPOSITORY contour-terminal/libunicode
+        VERSION 0.9.3
+        EXCLUDE_FROM_ALL YES
+        SYSTEM YES
+        OPTIONS
+            "LIBUNICODE_TESTING OFF"
+            "LIBUNICODE_BENCHMARK OFF"
+            "LIBUNICODE_TOOLS OFF"
+            "LIBUNICODE_EXAMPLES OFF"
+            "BUILD_SHARED_LIBS OFF"
+            # THIRD-PARTY SOURCES ARE NOT GOVERNED BY THIS PROJECT'S WARNING POLICY.
+            #
+            # Stated as the policy rather than as a fix for one warning, because the
+            # next version of any dependency produces a different one and a
+            # named-warning suppression would not cover it. Measured on CI: libunicode
+            # 0.9.3's `scan.cpp:39` has an unused function template, which is
+            # `-Wunused-template` -- a warning THIS project turns on and makes fatal,
+            # and libunicode does not.
+            #
+            # The leak is specific and worth naming, because being fetched before
+            # `include(PedanticCompiler)` -- which is what keeps yaml-cpp, Catch2, zstd
+            # and lz4 clean -- does NOT protect this one. libunicode is a sibling
+            # project of the same author and ships the SAME `cmake/PedanticCompiler.cmake`
+            # with the SAME two option names. CMP0077 makes `option()` defer to a
+            # variable that already exists, so our cache entries reach straight into its
+            # build and it compiles its own sources under our settings. Ordering cannot
+            # help: the collision is by NAME, not by scope.
+            "PEDANTIC_COMPILER OFF"
+            "PEDANTIC_COMPILER_WERROR OFF"
+    )
+    add_subdirectory(vendor)
 endif()
 
 # ----------------------------------------------------------------------------

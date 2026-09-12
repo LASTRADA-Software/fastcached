@@ -1,0 +1,16 @@
+# Paths clang-format must not touch, in clang-format's own syntax (LLVM 18+).
+#
+# `vendor/` holds third-party sources copied VERBATIM from upstream, and verbatim
+# is the whole point: `git diff <import>..HEAD -- vendor/endo` is what gets sent
+# back upstream, so a reformat silently turns a contributable copy into a fork.
+#
+# This file rather than a path filter in the gate, because the hazard is anybody
+# running the formatter at all -- `scripts/local-gate.sh` offers it every tracked
+# `*.h` `*.hpp` `*.cpp` with no path filter, and so does a developer typing
+# `clang-format -i` over the tree. Excluding it HERE means the formatter itself
+# declines, once, for every caller.
+#
+# The convention is that everything under `vendor/` is third-party. `local-gate.sh`
+# asserts the directory is non-empty and outside clang-tidy's header filter, so the
+# convention cannot quietly stop describing anything.
+vendor/**

@@ -347,6 +347,15 @@ gate_start_marker="== LOCAL GATE STARTED"
 gate_passed_marker="LOCAL GATE PASSED"
 gate_failed_marker="GATE FAILED:"
 
+# The root this repository TRACKS but does not OWN: third-party source copied
+# verbatim from upstream (vendor/VENDOR.md). Named once here because THIS FILE has
+# two independent tree-wide enumerators that both had to learn about it -- the
+# clang-tidy header-filter coverage count and the ctest registration derivation --
+# and the second was found by review rather than by the first's author, four hundred
+# lines away in the same script. A third would be found the same way, so a reader
+# adding one has at least got a name to grep for.
+GateVendorRoot="vendor"
+
 # ctest's own totals line, which three readers here hinge on: it is what
 # `skip_report` requires before it will conclude anything from a missing block,
 # what terminates the failure excerpt's alternation, and what the green path
@@ -1193,7 +1202,57 @@ header_filter_coverage() {
         fi
     done
 
-    header_filter_match "$include" "$exclude" "$root" <<< "$headers"
+    # TRACKED used to be the same set as FIRST-PARTY, and everything above rests on
+    # that: "dependency trees are untracked" is why coverage cannot see `deps-leak`,
+    # and why a partial match can only mean a first-party root fell out of the
+    # pattern. `vendor/` ends the identity. It holds third-party source copied
+    # verbatim from upstream -- tracked, so counted here, and deliberately outside
+    # clang-tidy's filter, because it is not ours to fix and `WarningsAsErrors: "*"`
+    # would fail the build on naming rules it has no reason to satisfy.
+    #
+    # This is the SAME SHAPE as the partial-match refusal below for the OPPOSITE
+    # reason, which is exactly how a guard rots: without this split the gate refuses
+    # every tree carrying a vendored header, with a sentence telling the reader to
+    # widen the filter -- and widening it is the `deps-leak` defect, arrived at by
+    # following the remedy. So the set is partitioned rather than the pattern
+    # loosened, and each half is asked its own question.
+    local vendored firstParty
+    vendored="$(grep -E "^${GateVendorRoot}/" <<< "$headers" || true)"
+    firstParty="$(grep -vE "^${GateVendorRoot}/" <<< "$headers" || true)"
+
+    # A convention that has stopped describing anything reads exactly like one that
+    # is being honoured: if the directory is there, it must carry tracked files, or
+    # the two halves below are being taken over an empty set and agree perfectly.
+    if [[ -d "${root}/${GateVendorRoot}" ]] \
+        && [[ -z "$(git -C "$root" ls-files "$GateVendorRoot" 2>/dev/null)" ]]; then
+        echo "vendor-untracked"
+        return 0
+    fi
+
+    # The tracked half of `deps-leak`: a vendored header INSIDE the filter buries
+    # every first-party finding under code nobody here may edit. Coverage cannot see
+    # this one either -- a filter that takes `vendor/` scores 401/401 and looks
+    # perfect.
+    #
+    # Asked through `header_filter_match` rather than by re-testing the pattern here,
+    # because that function OWNS the include/exclude rule and is the half `--self-test`
+    # drives at a synthetic root. A copy of the predicate beside it is an untested
+    # copy, and the model of `llvm::Regex` this file admits to being would then have
+    # three sites to correct instead of one. An empty vendored set answers `0/0`, so
+    # a tree with no vendored headers takes no special case.
+    local vendorHit
+    vendorHit="$(header_filter_match "$include" "$exclude" "$root" <<< "$vendored")"
+    if [[ "${vendorHit%%/*}" != 0 ]]; then
+        echo "vendor-leak"
+        return 0
+    fi
+
+    # Coverage is then the #1040 question, unchanged, asked of first-party headers
+    # alone. Emptiness is still refused: a repository of nothing but vendored code
+    # is not a tree this gate can report on.
+    [[ -n "$firstParty" ]] || { echo "no-headers"; return 0; }
+
+    header_filter_match "$include" "$exclude" "$root" <<< "$firstParty"
 }
 
 # The matching itself, over repo-relative header paths on stdin, as
@@ -1259,17 +1318,25 @@ header_filter_report() {
             echo "clang-tidy's header filter in $config would report findings inside a DEPENDENCY tree, which carries no .clang-tidy of its own and would bury every first-party finding under someone else's code -- measured at 228 reported catch2 lines from a single test translation unit. Coverage cannot see this, because dependency trees are untracked and so are absent from the set the count is taken over: a filter that takes catch2 still reports perfect coverage. Both layouts are checked, because they disagree -- FetchContent unpacks into out/build/*/_deps/ locally while build.yml sets CPM_SOURCE_CACHE to .cache/CPM, and a pattern excluding only the first passed every developer machine and failed CI inside catch2. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, not by adding another dependency location to exclude -- an exclusion bets on where the world puts things, and that bet has now lost once"
             return 1
             ;;
+        vendor-leak)
+            echo "clang-tidy's header filter in $config reaches inside vendor/, which holds third-party source copied VERBATIM from upstream. Those files are not ours to fix, and with WarningsAsErrors: \"*\" the build would fail on naming rules they have no reason to satisfy -- while every first-party finding drowns underneath them, which is the same drowning measured at 228 catch2 lines from one translation unit. Coverage cannot see this: a filter that takes vendor/ counts every tracked header as covered and reports a perfect score. Fix it by narrowing what the filter INCLUDES to this repository's own roots under src/, never by adding vendor/ to an exclusion -- an exclusion bets on where third-party code will be put next, and that bet has already lost once here"
+            return 1
+            ;;
+        vendor-untracked)
+            echo "a vendor/ directory exists in this tree but git tracks nothing inside it, so the split this check makes between first-party and vendored headers is being taken over an empty set -- and two empty sets agree perfectly. Either the vendored source is untracked (it must be committed, since the whole point is that the copy is reviewable and diffable against upstream) or vendor/ is a leftover directory that should be removed. This is the CHECK refusing to report, not a verdict about the filter"
+            return 1
+            ;;
         0/*)
-            echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked headers, so every header finding would be discarded as non-user code and the analyser would report clean by analysing nothing (#1040). This is a property of where this checkout LIVES: three patterns anchored on the directory name have now missed a real layout, most recently every lane worktree at .../fastcached-worktrees/<lane>/src/. Fix the pattern, do not delete this check"
+            echo "clang-tidy's HeaderFilterRegex in $config matches NONE of this tree's $total tracked first-party headers, so every header finding would be discarded as non-user code and the analyser would report clean by analysing nothing (#1040). This is a property of where this checkout LIVES: three patterns anchored on the directory name have now missed a real layout, most recently every lane worktree at .../fastcached-worktrees/<lane>/src/. Fix the pattern, do not delete this check"
             return 1
             ;;
     esac
 
     if [[ "$matched" == "$total" ]]; then
-        echo "== clang-tidy header filter covers all $total tracked headers"
+        echo "== clang-tidy header filter covers all $total tracked first-party headers"
         return 0
     fi
-    echo "clang-tidy's HeaderFilterRegex in $config matches only $matched of this tree's $total tracked headers, so findings in the other $((total - matched)) would be discarded silently -- for example $missed. A partial match is worse than none, because the analyser still reports findings and so looks like it is working (#1040)"
+    echo "clang-tidy's HeaderFilterRegex in $config matches only $matched of this tree's $total tracked first-party headers, so findings in the other $((total - matched)) would be discarded silently -- for example $missed. A partial match is worse than none, because the analyser still reports findings and so looks like it is working (#1040)"
     return 1
 }
 
@@ -1578,7 +1645,14 @@ target_set_report() {
 # git on this machine, which is #1064 and #336, and it presents as every command
 # listing zero files.
 gate_registration_sources() {
-    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null
+    # `vendor/` is excluded because this build never reads those files: the vendored
+    # tree carries upstream's own CMakeLists, which `vendor/CMakeLists.txt` states it
+    # deliberately does not use. One of them registers `add_test(NAME test-tui ...)`,
+    # and counting a registration from a file no build processes puts a permanently
+    # unclosable row in this derivation -- worse than a red, because a line that can
+    # never be cleared is a line that stops being read.
+    git ls-files '*CMakeLists.txt' 'cmake/*.cmake' 2>/dev/null \
+        | grep -v "^${GateVendorRoot}/" || true
 }
 
 # Every test name the CMake sources register, and every registration whose name
@@ -2327,7 +2401,7 @@ src/apps/fastcached/Main.hpp"
     # STATUS beside the text, since a reporter that says the right words and
     # returns 0 lets the gate analyse nothing and call it clean.
     expect "full coverage is reported and the gate carries on" \
-        "== clang-tidy header filter covers all 285 tracked headers|0" \
+        "== clang-tidy header filter covers all 285 tracked first-party headers|0" \
         "$(text="$(header_filter_report /w/.clang-tidy 285/285)"; printf '%s|%s' "$text" "$?")"
     expect "zero coverage refuses, naming #1040 and the lane layout" \
         "said|1" "$(report_says 'matches NONE of this tree' header_filter_report /w/.clang-tidy 0/285)"
@@ -2343,6 +2417,63 @@ src/apps/fastcached/Main.hpp"
         "said|1" "$(report_says 'produced NO verdict' header_filter_report /w/.clang-tidy '')"
     expect "a filter that would take _deps refuses, and says why coverage cannot see it" \
         "said|1" "$(report_says 'dependency trees are untracked' header_filter_report /w/.clang-tidy deps-leak)"
+    expect "a filter that would take vendor/ refuses, and says not to exclude it" \
+        "said|1" "$(report_says 'reaches inside vendor/' header_filter_report /w/.clang-tidy vendor-leak)"
+    expect "a vendor/ directory tracking nothing refuses as the CHECK, not the filter" \
+        "said|1" "$(report_says 'two empty sets agree perfectly' header_filter_report /w/.clang-tidy vendor-untracked)"
+
+    # -----------------------------------------------------------------------
+    # The vendored/first-party SPLIT, driven through `header_filter_coverage` at a
+    # synthetic root -- the arms above only prove the reporter can say the words.
+    #
+    # Both directions, and the negative one is not optional: a split that dropped
+    # EVERY header would also report no partial match. Each case plants the thing
+    # the arm exists to refuse and watches it refuse; the clean case beside them is
+    # what stops "refuses everything" reading as "works".
+    # Under `$scratch`, which `--self-test` already created with `mktemp -d` and
+    # already removes on EXIT -- rather than a second `$$`-named tree with its own
+    # cleanup, which leaks on any exit between here and the `rm -rf`, and which
+    # spells uniqueness the one way this repository has been bitten by (`$$` is
+    # shared inside a subshell on bash 3.2).
+    _hf_tree="$scratch/header-filter"
+    _hf_clean='.*/src/(CowTree|FastCache|apps|tests)/.*'
+    _hf_config() { printf "HeaderFilterRegex: '%s'\n" "$1" > "$_hf_tree/.clang-tidy"; }
+    mkdir -p "$_hf_tree/src/FastCache/Core" "$_hf_tree/vendor/endo/tui"
+    : > "$_hf_tree/src/FastCache/Core/Base64.hpp"
+    : > "$_hf_tree/vendor/endo/tui/Sixel.hpp"
+    if git -C "$_hf_tree" init -q . 2>/dev/null \
+        && git -C "$_hf_tree" add -A 2>/dev/null; then
+        _hf_config "$_hf_clean"
+        expect "a vendored header is excluded from coverage, and the first-party one still counts" \
+            "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+
+        # PLANTED: widen the pattern the way the partial-match remedy tempts you to,
+        # and the vendor arm must fire rather than the count going 2/2.
+        #
+        # The widening is the real pattern PLUS vendor, which is what the tempting
+        # edit actually looks like -- and not the broader `.*/(src|vendor)/.*` written
+        # first: that one also takes `.../_deps/catch2-src/src/catch2/...`, so
+        # `deps-leak` fired and the case passed for the wrong reason. It would have
+        # gone green with the vendor arm deleted entirely. A discriminating case has
+        # to reach the arm it names.
+        _hf_config "${_hf_clean}|.*/vendor/.*"
+        expect "widening the filter over vendor/ is caught, not scored as full coverage" \
+            "vendor-leak" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+
+        # PLANTED: a vendor/ directory git knows nothing about.
+        _hf_config "$_hf_clean"
+        git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
+        expect "a vendor/ directory tracking nothing is refused by name" \
+            "vendor-untracked" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree")"
+    else
+        # Not a skip, and deliberately not a silently-passing `expect X X`: the split
+        # is what keeps the gate from refusing every tree carrying vendored code, so
+        # a run that could not exercise it has not shown the gate works. Inconclusive
+        # is reported AS a failure rather than as the nearest clean-looking neighbour.
+        expect "the header-filter vendored/first-party split was exercised" \
+            "exercised" "no usable git, so the split was never driven -- inconclusive, not a pass"
+    fi
+    unset -f _hf_config
 
     # THE WIRING, which none of the above can see: the real `.clang-tidy` in this
     # very tree must cover every header this repository tracks. This is the case
@@ -3072,12 +3203,45 @@ if [[ "$format" -eq 1 ]]; then
         fail "git ls-files matched no C++ source in $(pwd), so $formatter was never run and this tree's formatting is UNEXAMINED -- this is NOT a formatting failure. A linked worktree whose .git file holds an absolute 'gitdir:' is how this happens: the other git cannot resolve it and lists nothing, where the same tree lists hundreds of files once the pointer is relative (#1064)"
     fi
 
-    printf '%s\n' "$format_list" | xargs "$formatter" -i --style=file \
-        || fail "clang-format"
+    # `--verbose` makes the formatter name every file it PROCESSES, one line each --
+    # and name none of the files it DECLINES. That is what lets both numbers below
+    # come out of the same walk that does the work, rather than a second walk whose
+    # answer could drift from it.
+    #
+    # ON STDERR, not stdout. Measured with clang-format-22: stdout carries nothing at
+    # all. A counter reading stdout would score `formatted` as 0 and compute
+    # `declined` as the whole offered set -- which renders as ".clang-format-ignore is
+    # declining everything", the most reassuring sentence available, while the
+    # instrument measures nothing. That is the direction this control must not fail in,
+    # so the redirection is deliberate and is the point of this comment.
+    # No `local`: this block is at statement level, inside `if [[ "$format" -eq 1 ]]`
+    # rather than in a function, and bash answers `local: can only be used in a
+    # function` on stderr and carries on -- so the line still printed the right
+    # numbers while the gate emitted two errors per run.
+    format_log="$(mktemp)"
+    printf '%s\n' "$format_list" | xargs "$formatter" -i --verbose --style=file 2>"$format_log" \
+        || { rm -f "$format_log"; fail "clang-format"; }
+
+    # Counted from a FILE rather than through a pipe: `grep -c` exits 1 on a zero
+    # count, and under `pipefail` that reading is indistinguishable from the producer
+    # having died. `|| true` because zero declined files is a legitimate answer on a
+    # tree with no vendored code.
+    format_done="$(grep -c '^Formatting ' "$format_log" || true)"
+    rm -f "$format_log"
+    format_declined=$(( format_count - format_done ))
 
     # The COUNT, not just the tool: zero and 683 must not render the same sentence,
     # which is the whole defect one line up.
-    echo "== formatted ${format_count} file(s) with $formatter"
+    #
+    # And `declined` is a LIVE CONTROL on `.clang-format-ignore`, not decoration. The
+    # vendored tree under `vendor/` is kept byte-identical to upstream so improvements
+    # can be sent back, and that file is what stops the formatter rewriting it -- 146
+    # of 165 files on the first run, measured. If it is deleted or stops matching,
+    # `declined` falls toward zero HERE, in the step that caused it, on every run.
+    # `vendor-verbatim` catches the same break later in the same run, which is the
+    # second witness; this one names the cause rather than the symptom. Neither is
+    # redundant: keep both.
+    echo "== formatted ${format_done} file(s), declined ${format_declined} (.clang-format-ignore) with $formatter"
 fi
 
 # @param 1 The preset to build and test.
