@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -1082,27 +1083,105 @@ class IMetricsSink
 };
 
 /// Default atomic-counter sink.
+///
+/// `Counter` is a closed enum and every caller names an enumerator, so an index
+/// at or past `Counter::Last` is not a bad argument -- it is a build in which two
+/// translation units disagree about how many counters there are. `_counters`'
+/// extent is `Counter::Last` too, so such a build also disagrees about
+/// `sizeof(AtomicMetricsSink)`, which is an ODR violation rather than a stale
+/// guard.
+///
+/// It is reachable in practice: while #1298 added seven counters, a unit compiled
+/// before the enum grew still carried a definition bounded by the OLD `Last`, and
+/// every counter at the new highest ordinal was dropped. Deleting the two
+/// obviously-affected objects did not clear it; only rebuilding the target's 120
+/// objects did. Everything measured in between had to be discarded.
+///
+/// What that cost was not the drop, it was the SILENCE. Answering `0` for *this
+/// build cannot represent that counter* collapses it with *no such event has
+/// happened*, and the second is what every reader of `/metrics` takes a zero to
+/// mean -- `.agent/rules/metrics-and-observability.md`, where absent is not zero
+/// and a counter is a tally whose zero is the truth about events that never
+/// happened. An acceptance case failed with its counter reading zero while the
+/// refusal it counted was demonstrably correct on the wire, and the zero pointed
+/// at the code rather than at the build.
 class AtomicMetricsSink final: public IMetricsSink
 {
   public:
     void Increment(Counter counter, std::uint64_t by = 1) noexcept override
     {
-        auto const idx = static_cast<std::size_t>(counter);
-        if (idx >= static_cast<std::size_t>(Counter::Last))
+        if (!CarriesCounter(counter))
             return;
-        _counters[idx].fetch_add(by, std::memory_order_relaxed);
+        _counters[static_cast<std::size_t>(counter)].fetch_add(by, std::memory_order_relaxed);
     }
 
+    /// @note The `0` an unrepresentable counter reads back is not an answer this
+    ///       function is happy with -- it is indistinguishable from an honest
+    ///       tally of nothing. Telling the two apart needs the RETURN TYPE to say
+    ///       so, which is every caller of `IMetricsSink::Read`; it is deliberately
+    ///       out of scope here and reported rather than left as a silent
+    ///       residual. `PrometheusFormatter` walks `CounterTable` and calls this,
+    ///       so on a skewed build the scrape still renders that counter as a real
+    ///       line reading zero.
     [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
     {
-        auto const idx = static_cast<std::size_t>(counter);
-        if (idx >= static_cast<std::size_t>(Counter::Last))
+        if (!CarriesCounter(counter))
             return 0;
-        return _counters[idx].load(std::memory_order_relaxed);
+        return _counters[static_cast<std::size_t>(counter)].load(std::memory_order_relaxed);
     }
 
   private:
-    std::atomic<std::uint64_t> _counters[static_cast<std::size_t>(Counter::Last)] {};
+    /// How many counters this build can represent.
+    ///
+    /// Spelled once. It was four `static_cast<std::size_t>(Counter::Last)` across
+    /// two accessors and the array extent, which is three chances for two of them
+    /// to stop agreeing. Deliberately NOT `EnumeratorCount<Counter>`: this header
+    /// is included by `fastcache-cc`'s `WorkerProtocol.hpp` and
+    /// `CodecEnvelope.hpp`, which do not link FastCache, so pulling in
+    /// `Core/EnumTable.hpp` -- and with it `<ranges>`, `<algorithm>` and
+    /// `<functional>` -- would be the wrong trade for one alias.
+    static constexpr std::size_t CounterCount = static_cast<std::size_t>(Counter::Last);
+
+    /// Whether this build can represent @p counter at all.
+    ///
+    /// ONE place that converts a `Counter` to an index and states the contract,
+    /// because a guard folded into the operation is self-enforcing while a guard
+    /// called alongside one needs a scan. Both accessors go through it, and a
+    /// third added later -- a `Snapshot()`, a test-only `Reset()` -- has an
+    /// obvious thing to call rather than reaching `_counters` with no diagnostic,
+    /// which is the same silence class this is about.
+    ///
+    /// The assert is a PROGRAMMER ERROR rather than a condition to handle, so a
+    /// debug build aborts at the site instead of reporting one metric that will
+    /// not move hundreds of milliseconds later. `noexcept` rules out the
+    /// exception this project would otherwise raise for a violated precondition.
+    ///
+    /// The bounds check STAYS in release rather than being replaced by the assert,
+    /// because removing it would turn a silent zero into an out-of-range atomic
+    /// write on the path where the array is the longer of the two -- a
+    /// memory-safety bug introduced to make a reporting bug louder.
+    ///
+    /// It is NOT a guarantee, and the claim is worth stating narrowly: these are
+    /// inline functions emitted weakly by every TU, so a skewed build can also
+    /// link the definition compiled against the NEW, longer enum against storage
+    /// allocated by a TU that saw the OLD, shorter array -- and then this check
+    /// accepts an ordinal past the real extent and writes past the object anyway.
+    /// An ODR-skewed build is unsound in both directions. What this check buys is
+    /// the direction where the stale definition wins; what the assert buys is the
+    /// odds of somebody NOTICING, which is what was missing.
+    ///
+    /// @param counter The counter a caller named.
+    /// @return Whether it is inside this build's range.
+    [[nodiscard]] static bool CarriesCounter(Counter counter) noexcept
+    {
+        auto const idx = static_cast<std::size_t>(counter);
+        assert(idx < CounterCount
+               && "counter past Counter::Last -- two translation units disagree about the enum, "
+                  "so this build is inconsistent rather than misused (#1332)");
+        return idx < CounterCount;
+    }
+
+    std::atomic<std::uint64_t> _counters[CounterCount] {};
 };
 
 } // namespace FastCache

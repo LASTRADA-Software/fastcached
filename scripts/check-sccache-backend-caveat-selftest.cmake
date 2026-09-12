@@ -228,14 +228,135 @@ endfunction()
 # else. Give the quiet case the DEFAULT checkpoint interval instead and it goes
 # green for the wrong reason: a 26-file tree can never reach a 100-file
 # checkpoint, so it would stay silent even had narration become unconditional.
+# How many readings the check takes before the read phase begins -- DERIVED from
+# the check's own scan-root table, never counted here.
+#
+# The READ-phase case has to place its backward step on a progress checkpoint, and
+# checkpoints only start once the walk is done. Before the first one the check
+# reads the clock at the run start, at the walk start, once per scan root at the
+# walk's narration point, and once at the walk end. Spelling that as a literal run
+# of `1000`s would be two numbers that agree today: add a row to
+# `FastCachedSccacheScanRoots` and the step lands on the directory walk instead,
+# and the case fails naming an interval that is not its subject.
+#
+# A parse that matched nothing is a REFUSAL, not a zero -- an empty root list would
+# silently produce a readings string that steps in the wrong place. The opening
+# pattern is anchored at BOTH ends: unanchored, it also matched a renamed
+# `FastCachedSccacheScanRootsRenamed`, so the derivation read a table the check
+# no longer consults and this refusal could not fire. The control caught that,
+# which is what a control is for.
+file(STRINGS "${check}" checkSourceLines)
+set(scanRootRows 0)
+set(inRootTable FALSE)
+foreach(line IN LISTS checkSourceLines)
+    if(inRootTable)
+        if(line MATCHES "^\\)")
+            break()
+        endif()
+        if(line MATCHES "^ +\"")
+            math(EXPR scanRootRows "${scanRootRows} + 1")
+        endif()
+    elseif(line MATCHES "^set\\(FastCachedSccacheScanRoots$")
+        set(inRootTable TRUE)
+    endif()
+endforeach()
+if(scanRootRows EQUAL 0)
+    message(FATAL_ERROR
+        "read no rows from FastCachedSccacheScanRoots in ${check}, so the READ-phase case's "
+        "clock readings cannot be derived. The table moved or was renamed; a hand-written run "
+        "of readings here would step on whichever interval the count happened to land on.")
+endif()
+
+# run start + walk start + one per root + walk end.
+math(EXPR readingsBeforeReadPhase "3 + ${scanRootRows}")
+set(FastCachedSelftestReadPhaseReadings "")
+foreach(unused RANGE 1 ${readingsBeforeReadPhase})
+    string(APPEND FastCachedSelftestReadPhaseReadings "1000,")
+endforeach()
+# Then back, then forward again: the step is on a checkpoint, and the whole run
+# and the walk both still measure forwards.
+string(APPEND FastCachedSelftestReadPhaseReadings "900,1100")
+
 set(FastCachedSccacheSelftestCases
-    "narrates once a run is slow|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|still scanning --  && file(s) after  &&  ms/file, so the whole scan needs |narrated nothing"
-    "quiet below the narration threshold, and reports headroom against the budget|-|-DFASTCACHED_SCAN_NARRATE_AFTER=${FastCachedSelftestQuietNarrateAfterSeconds} -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestQuietBudgetSeconds}|walked  &&  ms/file. That is the ' && % of the ${FastCachedSelftestQuietBudgetSeconds}s budget|still scanning && No budget was given"
-    "reports no headroom when given no budget|-|-DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery}|walked  &&  ms/file. That is the ' && No budget was given|% of the"
+    "narrates once a run is slow|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_CLOCK_READINGS=1000,1000 -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|still scanning --  && file(s) after  &&  ms/file, so the whole scan needs |narrated nothing"
+    "quiet below the narration threshold, and reports headroom against the budget|-|-DFASTCACHED_SCAN_NARRATE_AFTER=${FastCachedSelftestQuietNarrateAfterSeconds} -DFASTCACHED_SCAN_CLOCK_READINGS=1000,1000 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestQuietBudgetSeconds}|walked  &&  ms/file. That is the ' && % of the ${FastCachedSelftestQuietBudgetSeconds}s budget|still scanning && No budget was given"
+    "reports no headroom when given no budget|-|-DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_CLOCK_READINGS=1000,1000|walked  &&  ms/file. That is the ' && No budget was given|% of the"
     "a frozen clock is its own outcome, never speed|1700000000|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|Cost NOT MEASURED && SOURCE_DATE_EPOCH is set| ms/file && still scanning"
-    "a checkpoint wider than the corpus reports that it explained nothing|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|narrated nothing|still scanning"
+    "a checkpoint wider than the corpus reports that it explained nothing|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_CLOCK_READINGS=1000,1000 -DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestBudgetSeconds}|narrated nothing|still scanning"
     "a budget too close to the narration threshold is refused before scanning|-|-DFASTCACHED_SCAN_BUDGET_SECONDS=${FastCachedSelftestCrampedBudgetSeconds}|at least twice the narration threshold|walked "
+    "a clock that steps backwards is its own outcome, never a band|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_CLOCK_READINGS=1000,900|Cost NOT MEASURED: the wall clock went BACKWARDS && No band is reported|ms/file. That is the '"
+    "the same seam stepping forwards still reports a band and its narration|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_CLOCK_READINGS=900,1000|ms/file. That is the ' && narrated nothing|Cost NOT MEASURED"
+    "a step inside the WALK is caught even though the whole run still measures forwards|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=100000 -DFASTCACHED_SCAN_CLOCK_READINGS=100,200,150|Cost NOT MEASURED: the wall clock went BACKWARDS during the directory walk|ms/file. That is the '"
+    "a step inside the READ phase is caught even though the walk and the whole run both measure forwards|-|-DFASTCACHED_SCAN_NARRATE_AFTER=0 -DFASTCACHED_SCAN_PROGRESS_EVERY=${FastCachedSelftestCheckpointEvery} -DFASTCACHED_SCAN_CLOCK_READINGS=${FastCachedSelftestReadPhaseReadings}|Cost NOT MEASURED: the wall clock went BACKWARDS during a progress checkpoint && Progress narration DID fire|ms/file. That is the '"
 )
+
+# EVERY case here pins the clock, and that is not tidiness.
+#
+# The third outcome this change adds means a backward step no longer produces a
+# plausible-looking band -- it produces `Cost NOT MEASURED`, which removes
+# `ms/file. That is the '`, the headroom line, `still scanning` and
+# `narrated nothing` ALL AT ONCE. So a step landing inside a case that reads the
+# host clock fails it, where before this change the same step left every needle
+# present and the case passed on a wrong band. That is not a marginal exposure on
+# the environment this ticket is about: the quiet case's own runs are recorded
+# above at 15.56 s and 19.84 s under `ctest --parallel 32`, and WSL2 steps
+# CLOCK_REALTIME back about 2 s every 32 s, so a 20 s window very likely contains
+# one. A default-set `hygiene` test made flaky in the direction that reads as "my
+# branch is bad" is the exact failure this whole check exists to stop.
+#
+# `1000,1000` is a clock that does not move: every interval measures 0, which is
+# already what these cases arrange by setting their thresholds, so pinning changes
+# what they PROVE not at all -- only whether the host can take it away.
+#
+# The two rows the epoch column covers need no pinning: the frozen case is decided
+# from the environment before any interval is taken, and the cramped-budget case
+# is refused before the scan starts.
+#
+# The four backward/forward rows are one discrimination each way, and no half of
+# it is worth having alone.
+#
+# On the tree this ticket was filed against, the backward case reports
+# `-93 ms/file. That is the 'native' band: A filesystem reached directly` and
+# EXITS 0 -- the instrument whose only job is to say which filesystem condition
+# the scan ran under, answering confidently, wrongly, and passing. So the
+# `ms/file. That is the '` needle is asserted ABSENT here: it is present under the
+# defect and absent under the fix, which is what makes it evidence.
+#
+# `narrated nothing` is deliberately NOT asserted absent in the backward case. It
+# is absent under the defect too -- that absence IS the red #1313 was filed for --
+# so a needle for it would pass either way and assert nothing. It is asserted
+# PRESENT in the forward case instead, where it discriminates, and where it is
+# also the exact string whose absence was the reported failure.
+#
+# The forward case is the other half for the reason a refusal always needs one: a
+# guard nobody has watched ACCEPT is not known to work. Both cases drive the same
+# injected clock and differ only in its DIRECTION, so a seam that had simply
+# broken the check would fail the forward case rather than passing both.
+#
+# The third case exists because a mutation showed the first two could not see it.
+# The two intervals can DISAGREE -- a step landing inside the directory walk
+# leaves the whole-run interval positive -- and consulting only the run interval
+# passed both cases above. `100,200,150` places exactly that: the walk starts at
+# 200 and ends at 150 while the run goes 100 to 150, so the walk is -50s and the
+# run is +50s. It also pins the message to naming WHICH interval stepped, which
+# is the detail a reader needs and the one an `OR` of two flags loses.
+#
+# The fourth case is that same argument carried to its end, and it is the one the
+# first three could not see. The check takes FOUR intervals, not two: a step
+# landing in the READ phase -- which is where nearly all the wall time is -- shows
+# up in a progress checkpoint's interval while the directory walk's and the whole
+# run's both stay positive, so a flag built from those two discards a step the
+# script has already SEEN and reports a band across it. Measured before the fix:
+# `93 ms/file. That is the 'bridged and contended' band` at exit 0, for a run
+# whose clock had demonstrably moved.
+#
+# The readings place exactly that. Ten 1000s cover the run start, the walk start,
+# one per scan root and the walk end, so the walk measures 0s; the eleventh is the
+# first checkpoint at 900 (-100s); the last repeats at 1100, so every later
+# checkpoint and the run end measure forwards. Hence the second needle: narration
+# is silenced per INTERVAL rather than per run, so this run DOES narrate, and a
+# blanket `narration is off` in the refusal would be a confident wrong detail
+# beside lines the same run printed.
 
 # Which sense each substring field is asserted in, so the two assertion loops are
 # one loop over a table rather than two blocks differing in a `NOT`.

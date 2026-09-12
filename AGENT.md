@@ -1379,7 +1379,19 @@ and what they may assume.
   **BIDIRECTIONAL** — a forward step SHORTENS a bound, so a healthy wait gives up early and reads
   as a slow runner, which is the direction that gets "fixed" by raising a budget. **A derivation
   is only as sound as the premise it does not state**: the algebra here rested on *the clock does
-  not move*, which nobody wrote down and a census cannot falsify.
+  not move*, which nobody wrote down and a census cannot falsify. **And a negative interval reads
+  as the BEST answer, not as an error** — every negative is `LESS_EQUAL` the first ceiling of an
+  ascending band table, so an instrument classifying a cost reports the FASTEST band and EXITS 0.
+  Measured: `-93 ms/file` rendered as *"the 'native' band: a filesystem reached directly"* on a
+  bridged run. The repair is a third OUTCOME, never a clamp — a clamp restores the same wrong
+  answer by the front door — and intervals over one clock DISAGREE, so the outcome is recorded
+  where the SUBTRACTION happens and never rebuilt from the ones the report names.
+- **Adding an OUTCOME changes what an old condition does to every case that tolerated the wrong
+  answer.** A wrong answer that is well-SHAPED satisfies every assertion about its shape, so the
+  cases pass; an arm that REPLACES it with a refusal fails them. Four default-set `hygiene` cases
+  were made flaky by a fix FOR flakiness, and nothing in the diff touched them — so a diff review
+  cannot find it. When a change adds a refusal or an `unknown`, enumerate what used to be asserted
+  about the output it replaces. The seam the change itself adds is usually the fix: pin the input.
 - **Assert what DISTINGUISHES, not what both sides produce.** Four lanes in one evening found
   five tests that could not fail for the reason they existed, three of them acceptance criteria
   written by whoever understood the defect best. Each asserted something the healthy AND the
