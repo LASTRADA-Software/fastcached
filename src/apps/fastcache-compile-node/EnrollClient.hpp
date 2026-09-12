@@ -7,12 +7,15 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Net/IConnector.hpp>
+#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -239,6 +242,50 @@ enum class ConsensusHistory : std::uint8_t
                                                                      EnrollCommand const& request,
                                                                      ICredentialSource const& credential);
 
+/// How `--enroll-from` opens a connection to a seed.
+///
+/// A seam at the DIAL rather than at the connector, and the altitude is the whole
+/// point. The property this client owns -- that the redirect budget bounds a
+/// CONSECUTIVE chain rather than a whole run -- is expressible only if a test can
+/// script what comes BACK. Replies arrive on the socket, so the socket is what has to
+/// be scriptable; a connector seam would let a test vary HOW the dial happens while
+/// the property is about WHAT the seed answered.
+///
+/// Deliberately **not** an `IConnector`. `Cc::DialEndpointBlocking` takes a
+/// `BlockingConnector&` by concrete type because its soundness rests on the connector
+/// resolving inline and never leaving its task suspended -- there the type IS the
+/// rule, and relaxing that parameter would delete a guard rather than widen one
+/// (`apps/fastcache-cc/EndpointDial.hpp`). This seam keeps the concrete type inside
+/// the default implementation, where that function still sees exactly what it
+/// requires.
+///
+/// `RunEnrollAdmin` above and `ClusterAdminCli` construct the same connector inline
+/// and can adopt this without a redesign -- the interface names an endpoint and
+/// returns a socket, which is all either needs. Neither is converted here,
+/// deliberately: #1348 is scoped to the loop whose property is untestable.
+class IEnrollDialer
+{
+  public:
+    IEnrollDialer() = default;
+    IEnrollDialer(IEnrollDialer const&) = delete;
+    IEnrollDialer(IEnrollDialer&&) = delete;
+    IEnrollDialer& operator=(IEnrollDialer const&) = delete;
+    IEnrollDialer& operator=(IEnrollDialer&&) = delete;
+    virtual ~IEnrollDialer() = default;
+
+    /// Dial one endpoint and hand back a connected socket.
+    /// @param endpoint `host:port`; a bare port names no machine and is refused.
+    /// @param options Ceiling on the dial.
+    /// @return The connected socket, or nullptr when it could not be reached.
+    [[nodiscard]] virtual std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) = 0;
+};
+
+/// Process-singleton blocking dialer, so a production enrol path does not have to
+/// carry a seam it has no reason to vary. Mirrors `DefaultDrainWait()` in
+/// `Core/BoundedDrain.hpp`; tests pass their own.
+/// @return Reference to a singleton blocking dialer with static storage.
+[[nodiscard]] IEnrollDialer& DefaultEnrollDialer() noexcept;
+
 /// Run `--enroll-from` to completion.
 ///
 /// @param cfg The resolved configuration; `enrollFrom`, `clusterDir` and
@@ -249,10 +296,13 @@ enum class ConsensusHistory : std::uint8_t
 ///        the bound it is spending -- the seam `DrainWithin` takes, for the reason it
 ///        takes one: a loop that counts its requested sleeps states a bound and
 ///        enforces some multiple of it.
+/// @param dialer How each poll reaches the seed. Defaulted for the reason
+///        `DefaultDrainWait` is: production never varies it, and a test always does.
 /// @return What to print on success, or what to print on failure.
 [[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                                       ICredentialSource const& credential,
                                                                       IRandomSource& random,
-                                                                      IDrainWait& wait = DefaultDrainWait());
+                                                                      IDrainWait& wait = DefaultDrainWait(),
+                                                                      IEnrollDialer& dialer = DefaultEnrollDialer());
 
 } // namespace FastCache::Node

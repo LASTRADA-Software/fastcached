@@ -8,14 +8,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <CacheProtocol.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -446,4 +449,224 @@ TEST_CASE("A closed window with nothing waiting renders as a reading, not as an 
     CHECK(openAndEmpty.contains("OPEN"));
     CHECK(openAndEmpty.contains("nothing waiting"));
     CHECK(openAndEmpty != shut);
+}
+
+namespace
+{
+
+/// Hands back one scripted socket per dial, and records where it was asked to go.
+///
+/// The seam `RunEnrollClient` takes, standing in for `BlockingEnrollDialer`. A fresh
+/// socket per dial is what production does -- the loop re-dials each poll, and a
+/// redirect moves the endpoint -- so one script per reply is the shape, not a
+/// convenience.
+///
+/// **A script that RAN OUT and a dial that FAILED are different facts, and this fake
+/// refuses to spell them the same way.** Production answers `nullptr` for a failed
+/// dial and the loop reports it as *cannot reach the seed at ...*. If exhaustion
+/// answered `nullptr` too, a case that dialled once more than its author anticipated
+/// would redden with that same sentence -- pointing a reader at the connector, at
+/// `BlockingEnrollDialer`, at anything but the property the case is named for. That
+/// is a true failure carrying a false diagnosis, which is the defect these cases
+/// exist to avoid, relocated into the scaffolding where nothing looks wrong because
+/// a fake is always more convenient than the thing it stands for.
+///
+/// So the two are separated: an EMPTY entry is a dial this script fails deliberately,
+/// and running past the end is a `FAIL` in the fake's own voice naming how far the
+/// code under test got.
+class ScriptedDialer final: public IEnrollDialer
+{
+  public:
+    /// @param replies One framed reply per dial, in order.
+    explicit ScriptedDialer(std::vector<std::vector<std::byte>> replies):
+        _replies { std::move(replies) }
+    {
+    }
+
+    /// @copydoc IEnrollDialer::Dial
+    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions /*options*/) override
+    {
+        _dialed.emplace_back(endpoint);
+        if (_next >= _replies.size())
+        {
+            FAIL("scripted dialer exhausted: the code under test dialled "
+                 << _dialed.size() << " time(s) against a script of " << _replies.size()
+                 << ". That is this fixture running out, NOT a dial failure -- read it as the loop "
+                    "going further than this case anticipated");
+            return nullptr;
+        }
+
+        auto const& frame = _replies[_next++];
+        if (frame.empty())
+            return nullptr; // A dial this script fails on purpose, which production spells the same way.
+        return std::make_unique<Testing::ScriptedSocket>(frame);
+    }
+
+    /// @return Every endpoint dialled, in order.
+    [[nodiscard]] std::vector<std::string> const& Dialed() const noexcept
+    {
+        return _dialed;
+    }
+
+  private:
+    std::vector<std::vector<std::byte>> _replies;
+    std::vector<std::string> _dialed;
+    std::size_t _next { 0 };
+};
+
+/// A wait that advances its own clock by exactly what was requested and never blocks.
+///
+/// The pause a loop REQUESTS is exact and host-independent, which is what makes this
+/// assertable where a real sleep would only be slow.
+class InstantWait final: public IDrainWait
+{
+  public:
+    /// @return The accumulated instant.
+    [[nodiscard]] TimePoint Now() const noexcept override
+    {
+        return _now;
+    }
+
+    /// @param requested Added to the clock rather than slept.
+    void Sleep(std::chrono::milliseconds requested) noexcept override
+    {
+        _now += requested;
+    }
+
+  private:
+    TimePoint _now {};
+};
+
+/// A seed answering `NotLeader` and naming where to go instead.
+/// @param leader The endpoint the reply names.
+/// @return The framed refusal.
+[[nodiscard]] std::vector<std::byte> RedirectTo(std::string_view leader)
+{
+    return Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, std::string { leader });
+}
+
+/// A seed that recorded the request and is waiting for a person.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> Recorded()
+{
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Pending, {}));
+}
+
+/// A seed whose operator refused this machine.
+/// @return The framed reply.
+[[nodiscard]] std::vector<std::byte> Rejected()
+{
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Rejected, {}));
+}
+
+} // namespace
+
+TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[enrollment][client]")
+{
+    // **The property #1348 exists for, and it was untestable until the dial became a
+    // seam.** `MaxRedirects` bounds a CONSECUTIVE chain -- the loop two nodes with a
+    // stale `_knownLeader` make by naming each other -- and NOT the whole run. This
+    // mode waits up to ten minutes for a person, which is hundreds of polls, so a
+    // budget accumulated across the run would abort a healthy enrolment after three
+    // ordinary leadership changes, reporting "gave up after 3 leader redirect(s)"
+    // about a loop that never happened.
+    //
+    // Four redirects with a `Waiting` in the middle: two, then an answer on the
+    // seed's own behalf, then two more. Neither run reaches the bound.
+    //
+    // **Two rather than three on each side, deliberately.** `MaxRedirects` is 3 and
+    // the guard is `>=`, so three consecutive redirects are still followed and the
+    // fourth aborts -- a post-reset run of three would pass on the last value that
+    // still works, with zero margin. An off-by-one anywhere else, the bound moving or
+    // `>=` becoming `>`, would then redden THIS case and read as *the reset is
+    // broken*: a true failure carrying a false diagnosis. The bound itself is pinned
+    // by the case below, which is named for it.
+    Testing::ScratchDirectory scratch { "enroll-redirect-chain" };
+    NodeConfig cfg;
+    cfg.clusterDir = scratch.Path();
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.enrollFrom = "10.0.0.1:7000";
+
+    // A consensus identity of its own, because a joiner asks to be admitted AS a
+    // member the cluster can dial -- `EnrollClaim` refuses without it, before any
+    // dial. The same pair `EnrollTrap_test` stages for the same reason.
+    cfg.raftListen = "7100";
+    cfg.raftSelf = "198.51.100.4";
+
+    ScriptedDialer dialer { {
+        RedirectTo("10.0.0.2:7000"),
+        RedirectTo("10.0.0.3:7000"),
+        Recorded(),
+        RedirectTo("10.0.0.4:7000"),
+        RedirectTo("10.0.0.5:7000"),
+        Rejected(),
+    } };
+
+    InstantWait wait;
+    SystemRandomSource random;
+    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
+
+    REQUIRE(!outcome.has_value());
+
+    // Named on the failure path: every refusal on this route produces an error string,
+    // so a case that fails without printing WHICH one cannot be diagnosed from its output.
+    INFO("refusal: " << outcome.error());
+    INFO("dialled: " << dialer.Dialed().size() << " endpoint(s)");
+
+    // **The assertion that DISTINGUISHES.** Both readings end in an error, so
+    // asserting that this failed proves nothing. With the reset the run reaches the
+    // sixth reply and ends on the operator's refusal; without it the count
+    // accumulates and the FIFTH reply trips the bound instead. Remove `redirects = 0`
+    // from the `Waiting`/`Closed` arm and all three of these flip together.
+    CHECK(outcome.error().contains("refused this machine"));
+    CHECK_FALSE(outcome.error().contains("gave up after"));
+    CHECK(dialer.Dialed().size() == 6);
+
+    // And it followed each redirect to the endpoint the reply named rather than
+    // re-asking the seed, which is what makes the five above a chain at all.
+    CHECK(dialer.Dialed().front() == "10.0.0.1:7000");
+    CHECK(dialer.Dialed().back() == "10.0.0.5:7000");
+}
+
+TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]")
+{
+    // The control, and the direction the reset could have broken: the anti-loop
+    // property has to survive the fix. Four back-to-back redirects with nothing
+    // answering on its own behalf, so the count never resets and the bound bites.
+    // Without this case, deleting `MaxRedirects` entirely would leave the case above
+    // green.
+    Testing::ScratchDirectory scratch { "enroll-redirect-loop" };
+    NodeConfig cfg;
+    cfg.clusterDir = scratch.Path();
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.enrollFrom = "10.0.0.1:7000";
+
+    // A consensus identity of its own, because a joiner asks to be admitted AS a
+    // member the cluster can dial -- `EnrollClaim` refuses without it, before any
+    // dial. The same pair `EnrollTrap_test` stages for the same reason.
+    cfg.raftListen = "7100";
+    cfg.raftSelf = "198.51.100.4";
+
+    ScriptedDialer dialer { {
+        RedirectTo("10.0.0.2:7000"),
+        RedirectTo("10.0.0.1:7000"),
+        RedirectTo("10.0.0.2:7000"),
+        RedirectTo("10.0.0.1:7000"),
+    } };
+
+    InstantWait wait;
+    SystemRandomSource random;
+    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
+
+    REQUIRE(!outcome.has_value());
+
+    // Named on the failure path: every refusal on this route produces an error string,
+    // so a case that fails without printing WHICH one cannot be diagnosed from its output.
+    INFO("refusal: " << outcome.error());
+    INFO("dialled: " << dialer.Dialed().size() << " endpoint(s)");
+    CHECK(outcome.error().contains("gave up after"));
+
+    // Four dials rather than all four replies consumed: the fourth REPLY is never
+    // read, because the bound is checked before the redirect is followed.
+    CHECK(dialer.Dialed().size() == 4);
 }
