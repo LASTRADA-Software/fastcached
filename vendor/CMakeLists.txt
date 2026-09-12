@@ -110,10 +110,25 @@ endif()
 #               has `Async/Task`, `Async/Cancellation` and `IClock`, and the vendored
 #               TUI reaches them through one adapter layer instead.
 #
+#               SECOND REASON, and it is the stronger one -- recorded because the
+#               first would not survive its own resolution. The dependency argument
+#               above says runtime/ is not BUILDABLE here; a later re-sync that
+#               settles the coro question could then build it in good faith and be
+#               right about everything this comment said. But `live-stats` runs a
+#               COROUTINE-NATIVE event loop of ours, and `runtime/`'s
+#               `EventSource::wait(int timeoutMs)` is a poll with a timeout -- the
+#               blocking design that loop exists not to be. So runtime/ is REPLACED,
+#               not merely unbuildable, and it stays out even once its dependencies
+#               would link. We vendored the rendering surface and left the event
+#               loop behind, deliberately.
+#
+#               A decision that is load-bearing for two reasons and records one is a
+#               cleanup away from being reversed for free.
+#
 #               That is arguable, and someone may later decide the adapter is worse
 #               than the duplication. What is not acceptable is the change happening
-#               by accident, so `_fcTuiNoRuntime` below refuses it rather than leaving
-#               a sentence for a reader who has already stopped reading.
+#               by accident, so the guard below refuses it rather than leaving a
+#               sentence for a reader who has already stopped reading.
 #               QuestionComponent is in this group rather than `unreached` because it
 #               reaches coro through runtime/Modal.hpp.
 #   unreached   an interactive editor's widgets. Present, working, and simply not
@@ -211,6 +226,13 @@ foreach(_src IN LISTS _fcTuiSources)
             "Upstream's own src/tui/CMakeLists.txt DOES compile runtime/, so this "
             "exclusion looks like an oversight beside it and that is exactly why it is "
             "guarded rather than merely commented.\n\n"
+            "AND THERE IS A SECOND REASON, which outlives the first: `live-stats` runs a "
+            "COROUTINE-NATIVE event loop, and runtime/'s EventSource::wait(int timeoutMs) "
+            "is a poll with a timeout -- the blocking design that loop exists not to be. "
+            "So runtime/ is REPLACED rather than merely unbuildable, and it stays out even "
+            "once the coro dependency question is settled and it WOULD link. If you are "
+            "reading this because you just solved that question: solving it is not "
+            "sufficient.\n\n"
             "If the adapter layer has turned out worse than the duplication, that is a "
             "decision worth making -- make it deliberately: delete this guard, say why "
             "in vendor/VENDOR.md's \"Two of some things\", and vendor the coro and "
