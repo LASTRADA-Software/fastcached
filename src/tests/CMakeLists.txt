@@ -6091,3 +6091,72 @@ set_tests_properties("markup-entities-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 240
 )
+
+# ---------------------------------------------------------------------------
+# Nothing but `TextCell` itself builds a `CellKind::Text` cell (#1356).
+#
+# That enumerator means *these bytes are valid UTF-8*, and `--format=json`
+# interpolates a cell's text into a document that has to be UTF-8 end to end.
+# `TextCell` is where the property is established -- it asks `IsValidUtf8` and
+# answers with a base64 `Binary` cell when the answer is no.
+#
+# The question used to be asked by a SECOND function whose doc comment claimed to
+# be "the one place the UTF-8 question is asked, so no command can forget to ask
+# it". That sentence was false as written and its falseness WAS the defect: four
+# sites called that function and about twenty-nine called `TextCell`, three of them
+# with bytes off the wire -- a memcached key, `ME`'s key, a meta flag value -- so a
+# non-UTF-8 KEY rendered as raw bytes. The fix folded the question in, which is the
+# stronger half of the rule that a guard folded INTO an operation is
+# self-enforcing while one called ALONGSIDE needs a scan.
+#
+# This is the residual the folding cannot reach: `Cell` is an aggregate, so
+# `Cell { .kind = CellKind::Text, ... }` compiles anywhere and asks nothing. In the
+# DEFAULT set because it needs no compiler, no daemon and no socket, and because
+# the failure it guards is silent -- a wrong key renders as a plausible one.
+add_test(
+    NAME "cli-text-cell"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-text-cell.cmake"
+)
+set_tests_properties("cli-text-cell" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# And that check must be seen to refuse a bypass AND to accept the reads.
+#
+# Seventeen synthetic trees. The accepting arm is not the decorative half here:
+# `kind == CellKind::Text` differs from an assignment by one character and
+# `case CellKind::Text:` is how every renderer consumes the model, so a check that
+# refused either would be satisfied only by deleting a renderer -- and would be
+# deleted instead. #1356's acceptance clause asks for both directions in as many
+# words.
+#
+# Three bypass spellings are driven separately, because they reach one hole and a
+# pattern that saw only the designated initialiser would report clean over the
+# positional aggregate. Both fail-closed arms are driven too: the factory no longer
+# writing a shape the scan recognises, and the enumerator renamed so nothing reads
+# it -- each of which produces a result indistinguishable from a clean tree unless
+# it is reported.
+#
+# The enumeration MODE is asserted on both sides, with the git path staged for real
+# via `git init` plus `git add`: a synthetic tree is not a git repository, so every
+# case would otherwise exercise the directory walk while CI exercises git. And one
+# case plants `;`, `\`, `[` and `]` ABOVE a violation and asserts the exact
+# `file:line`, since a filename-only assertion passes when lines merge.
+add_test(
+    NAME "cli-text-cell-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-text-cell-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-cli-text-cell-selftest.cmake"
+)
+set_tests_properties("cli-text-cell-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)

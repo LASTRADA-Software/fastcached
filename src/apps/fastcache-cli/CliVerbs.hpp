@@ -82,6 +82,18 @@ struct WireSpec
 
     WireAvailable available; ///< Which collaborator says this wire is open.
 
+    /// What this wire can add when a value could not be shown as text.
+    ///
+    /// A COLUMN because the reassurance is true of ONE wire: a memcached key is a
+    /// byte string and the protocol never promised otherwise, so base64 there is
+    /// ordinary rather than a fault. Said on every wire it is a claim about keys to
+    /// an answer that has no keys -- `fleet`, `cluster settings` and `node info` all
+    /// reach the same advisory through `RunVerb`.
+    ///
+    /// EMPTY is a real answer rather than an absence standing in for one: every wire
+    /// gets the general sentence, and this is only what a particular one adds to it.
+    std::string_view binaryNote;
+
     /// Whether this wire can present a credential at all.
     ///
     /// **False for `Memcached`, and that is a property of the PROTOCOL rather than of
@@ -171,6 +183,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .unavailable = "no connection to the cache was opened",
       .heading = "a cache daemon, over RESP",
       .available = [](VerbContext const& context) { return context.resp != nullptr; },
+      .binaryNote = "",
       .authenticable = true,
       .needsResp = true,
       .needsMemcached = false,
@@ -180,6 +193,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .unavailable = "no memcached-text connection to the cache was opened",
       .heading = "a cache daemon, over the memcached text protocol",
       .available = [](VerbContext const& context) { return context.memcached != nullptr; },
+      .binaryNote = "a memcached key is a byte string, so this is ordinary rather than a fault",
       .authenticable = false,
       .needsResp = false,
       .needsMemcached = true,
@@ -189,6 +203,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .unavailable = "no 0xFC connection to the node was opened",
       .heading = "a compile node, over the 0xFC wire",
       .available = [](VerbContext const& context) { return context.node != nullptr; },
+      .binaryNote = "",
       // `AUTH` IS a `0xFC` verb, unlike on the memcached wire -- so this wire can
       // present a credential and a refusal about one is about the credential.
       .authenticable = true,
@@ -200,6 +215,7 @@ inline constexpr EnumTable<Wire, WireSpec> WireTable { {
       .unavailable = "no stats source was configured",
       .heading = "either, over whichever surface answers",
       .available = [](VerbContext const& context) { return context.stats != nullptr; },
+      .binaryNote = "",
       .authenticable = true,
       .needsResp = true,
       .needsMemcached = false,

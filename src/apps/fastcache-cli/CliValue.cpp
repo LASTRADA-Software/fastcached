@@ -21,15 +21,15 @@ Cell AbsentCell() noexcept
 
 Cell TextCell(std::string text)
 {
-    return Cell { .kind = CellKind::Text, .lexical = std::move(text) };
-}
+    if (IsValidUtf8(text))
+        return Cell { .kind = CellKind::Text, .lexical = std::move(text) };
 
-Cell TextOrBinaryCell(std::string_view bytes)
-{
-    if (IsValidUtf8(bytes))
-        return TextCell(std::string { bytes });
-
-    std::span<std::byte const> const raw { reinterpret_cast<std::byte const*>(bytes.data()), bytes.size() };
+    // Encoded and SAID, rather than substituted. A renderer that repaired the bytes
+    // would make a wrong key look like a real one -- the operator would see a
+    // plausible key that no `get` will ever match -- where a base64 `Binary` cell
+    // says what happened and the caller's advisory says why. That is this tree's
+    // rule for text a peer sent: refuse it or carry it, never repair it.
+    std::span<std::byte const> const raw { reinterpret_cast<std::byte const*>(text.data()), text.size() };
     return Cell { .kind = CellKind::Binary, .lexical = Base64Encode(raw) };
 }
 

@@ -69,7 +69,7 @@ namespace
     {
         if (auto const number = AsUnsigned(text); number.has_value())
             return NumberCell(*number);
-        return TextOrBinaryCell(text);
+        return TextCell(std::string { text });
     }
 
     /// Trim ASCII spaces and tabs from both ends.
