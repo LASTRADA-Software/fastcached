@@ -33,21 +33,70 @@ inline constexpr std::string_view JsonReplacement = "\\ufffd";
 /// the output of this format is text, not a document another parser will re-read.
 inline constexpr std::string_view DelimitedReplacement = "\xEF\xBF\xBD";
 
-/// How each format spells what it cannot carry, and the walk that applies it.
+/// One byte an output format must not carry literally, and what it writes instead.
 ///
-/// Namespaced because the two functions below are the whole of what a caller
-/// wants; these are how they agree with each other. The replacement constants
-/// stay outside it deliberately, so a test can assert against the one spelling
-/// rather than against a second copy of it.
+/// Outside `Detail` because a SECOND binary spells the same rows: `fastcache-cli`'s
+/// `--format=tsv` writes the same four as `/fleet.txt`, and an operator pipes both
+/// into one script. It was a second struct there, with the replacement field named
+/// `replacement` rather than `spelling` -- and two names for one concept is the
+/// worse half of a duplicate, because a reader who knows one file does not
+/// recognise the other (#1334).
+struct TextEscape
+{
+    char byte;                 ///< The byte.
+    std::string_view spelling; ///< What the format writes in its place.
+};
+
+/// The bytes a tab-separated document cannot carry literally.
+///
+/// The two delimiters -- and the escape CHARACTER itself, which is the row that
+/// is easy to leave out and the one that makes the mapping injective: without it
+/// a value holding a literal backslash-t comes back out of any reader that
+/// unescapes as a TAB, forging a column boundary it never contained. Arm order
+/// is not what carries that, since this is one pass over each byte; the row
+/// being PRESENT is.
+///
+/// Shared with `fastcache-cli`, and the TABLE is the shared part rather than the
+/// walk. `EscapeDelimited` below also spells control bytes and replaces invalid
+/// UTF-8, because `/fleet.txt` is read by a terminal; the client's TSV carries a
+/// cached value a terminal never sees and touches only these four. That
+/// divergence is deliberate and `CliFormat_test.cpp` asserts it in both
+/// directions -- so sharing the FUNCTION would silently change a format that was
+/// already correct, which is why only the rows move.
+inline constexpr std::array DelimitedEscapes {
+    TextEscape { .byte = '\\', .spelling = R"(\\)" },
+    TextEscape { .byte = '\t', .spelling = R"(\t)" },
+    TextEscape { .byte = '\n', .spelling = R"(\n)" },
+    TextEscape { .byte = '\r', .spelling = R"(\r)" },
+};
+
+/// What one format writes for `byte`, or nothing when it may carry it as it is.
+///
+/// A range-based scan rather than `std::ranges::find_if`, and the reason is
+/// portability rather than taste: over a `std::array`, libc++ and libstdc++ yield
+/// a raw pointer -- so clang-tidy's `readability-qualified-auto` requires
+/// `auto const* const` -- while MSVC yields a class-type iterator that such a
+/// declaration cannot deduce. See `.agent/rules/build-and-toolchain.md`.
+/// @param escapes The format's table.
+/// @param byte The byte to spell.
+/// @return Its spelling, or an empty view when the byte needs none.
+[[nodiscard]] constexpr std::string_view EscapeFor(std::span<TextEscape const> escapes, char byte) noexcept
+{
+    for (auto const& row: escapes)
+        if (row.byte == byte)
+            return row.spelling;
+    return {};
+}
+
+/// How each format spells what it cannot carry.
+///
+/// Namespaced because these tables are how the functions below agree with each
+/// other rather than anything a caller names. `TextEscape`, `DelimitedEscapes`
+/// and `EscapeFor` sit OUTSIDE it because a second binary shares them; the
+/// replacement constants stay outside for the older reason, so a test can assert
+/// against the one spelling rather than against a second copy of it.
 namespace Detail
 {
-
-    /// One byte an output format must not carry literally, and what it writes instead.
-    struct TextEscape
-    {
-        char byte;                 ///< The byte.
-        std::string_view spelling; ///< What the format writes in its place.
-    };
 
     /// The bytes markup cannot carry literally.
     inline constexpr std::array MarkupEscapes {
@@ -65,21 +114,6 @@ namespace Detail
         TextEscape { .byte = '"', .spelling = "\\\"" }, TextEscape { .byte = '\\', .spelling = "\\\\" },
         TextEscape { .byte = '\n', .spelling = "\\n" }, TextEscape { .byte = '\r', .spelling = "\\r" },
         TextEscape { .byte = '\t', .spelling = "\\t" },
-    };
-
-    /// The bytes a tab-separated document cannot carry literally.
-    ///
-    /// The two delimiters -- and the escape CHARACTER itself, which is the row that
-    /// is easy to leave out and the one that makes the mapping injective: without it
-    /// a value holding a literal backslash-t comes back out of any reader that
-    /// unescapes as a TAB, forging a column boundary it never contained. Arm order
-    /// is not what carries that, since this is one pass over each byte; the row
-    /// being PRESENT is.
-    inline constexpr std::array DelimitedEscapes {
-        TextEscape { .byte = '\\', .spelling = R"(\\)" },
-        TextEscape { .byte = '\t', .spelling = R"(\t)" },
-        TextEscape { .byte = '\n', .spelling = R"(\n)" },
-        TextEscape { .byte = '\r', .spelling = R"(\r)" },
     };
 
     /// The lowest byte a text format may carry literally; everything below is a
@@ -142,25 +176,6 @@ namespace Detail
             MarkupCarriable, [value](CodePointRange const& range) { return value >= range.first && value <= range.last; });
     }
 
-    /// What one format writes for `byte`, or nothing when it may carry it as it is.
-    ///
-    /// A range-based scan rather than `std::ranges::find_if`, and the reason is
-    /// portability rather than taste: over a `std::array`, libc++ and libstdc++ yield
-    /// a raw pointer -- so clang-tidy's `readability-qualified-auto` requires
-    /// `auto const* const` -- while MSVC yields a class-type iterator that such a
-    /// declaration cannot deduce. `CompileCacheWire::FindOp` and `SchedulerService`'s
-    /// refusal table already scan this way.
-    /// @param escapes The format's table.
-    /// @param byte The byte to spell.
-    /// @return Its spelling, or an empty view when the byte needs none.
-    [[nodiscard]] constexpr std::string_view EscapeFor(std::span<TextEscape const> escapes, char byte) noexcept
-    {
-        for (auto const& row: escapes)
-            if (row.byte == byte)
-                return row.spelling;
-        return {};
-    }
-
 } // namespace Detail
 
 /// Escape text for HTML or SVG.
@@ -183,7 +198,7 @@ namespace Detail
     while (!text.empty())
     {
         auto const ch = text.front();
-        if (auto const escape = Detail::EscapeFor(Detail::MarkupEscapes, ch); !escape.empty())
+        if (auto const escape = EscapeFor(Detail::MarkupEscapes, ch); !escape.empty())
         {
             out += escape;
             text.remove_prefix(1);
@@ -220,7 +235,7 @@ inline void AppendJsonText(std::string& out, std::string_view text)
     while (!text.empty())
     {
         auto const ch = text.front();
-        if (auto const escape = Detail::EscapeFor(Detail::JsonEscapes, ch); !escape.empty())
+        if (auto const escape = EscapeFor(Detail::JsonEscapes, ch); !escape.empty())
         {
             out += escape;
             text.remove_prefix(1);
@@ -294,7 +309,7 @@ inline void AppendJsonText(std::string& out, std::string_view text)
     {
         auto const ch = text.front();
         auto const byte = static_cast<unsigned char>(ch);
-        if (auto const escape = Detail::EscapeFor(Detail::DelimitedEscapes, ch); !escape.empty())
+        if (auto const escape = EscapeFor(DelimitedEscapes, ch); !escape.empty())
         {
             out += escape;
             text.remove_prefix(1);

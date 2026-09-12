@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliFormat.hpp"
 
+#include <FastCache/Distributed/FleetText.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -429,48 +431,32 @@ namespace
         return out;
     }
 
-    /// One character TSV cannot carry raw, and what it is written as.
-    struct TextEscape
-    {
-        char byte;
-        std::string_view replacement;
-    };
-
-    /// The four `/fleet.txt` spells out, in one pass so the escape character cannot be
-    /// escaped twice.
-    ///
-    /// A table rather than a `switch` for the usual reason, and one that bites here: the
-    /// fifth character this format cannot carry is a row, not a new arm -- and a table is
-    /// also what lets the set be compared against `/fleet.txt`'s by reading rather than
-    /// by tracing control flow.
-    constexpr auto TsvEscapes = std::to_array<TextEscape>({
-        { .byte = '\\', .replacement = "\\\\" },
-        { .byte = '\t', .replacement = "\\t" },
-        { .byte = '\n', .replacement = "\\n" },
-        { .byte = '\r', .replacement = "\\r" },
-    });
-
     /// What TSV writes for @p byte, or nothing when it may carry it as it is.
     ///
-    /// A range-based scan rather than `std::ranges::find`, and the reason is
-    /// portability rather than taste: over a `std::array`, libstdc++ and libc++ yield a
-    /// raw POINTER, so clang-tidy's `readability-qualified-auto` demands
-    /// `auto const* const` -- which MSVC, whose iterator is a class type, cannot deduce.
-    /// The first spelling here was the `find` one, and it was red on the analyser and
-    /// would have been red on all three Windows legs for opposite reasons.
-    /// `FleetText.hpp`'s `EscapeFor` scans for exactly this reason and says so.
+    /// The TABLE and the scan are the node's: `Distributed::DelimitedEscapes` and
+    /// `Distributed::EscapeFor`, which `/fleet.txt` writes with. This file used to
+    /// carry its own `TextEscape` and its own four rows, and the row type's
+    /// replacement field was even named differently -- two names for one concept,
+    /// which is the worse half of a duplicate because a reader who knows one file
+    /// does not recognise the other (#1334).
     ///
-    /// An empty answer means "carry it literally", which is unambiguous only because no
-    /// row spells a byte as nothing -- the four below are all non-empty, and a row that
-    /// wrote `""` would mean "delete this byte", which no format here wants.
+    /// What is NOT shared is the walk, and that is deliberate rather than
+    /// unfinished. `Distributed::EscapeDelimited` also spells control bytes and
+    /// replaces invalid UTF-8, because `/fleet.txt` is read by a terminal; this
+    /// client's TSV carries a cached value a terminal never sees, so it touches
+    /// only the four. `CliFormat_test.cpp` asserts that divergence in BOTH
+    /// directions, so calling the node's function here would silently change a
+    /// format that was already correct -- and would redden that case, which is the
+    /// test doing its job.
+    ///
+    /// An empty answer means "carry it literally", which is unambiguous only because
+    /// no row spells a byte as nothing -- a row that wrote `""` would mean "delete
+    /// this byte", which no format here wants.
     /// @param byte The byte to spell.
     /// @return Its spelling, or an empty view when it needs none.
     [[nodiscard]] constexpr std::string_view EscapeForTsv(char byte) noexcept
     {
-        for (auto const& row: TsvEscapes)
-            if (row.byte == byte)
-                return row.replacement;
-        return {};
+        return Distributed::EscapeFor(Distributed::DelimitedEscapes, byte);
     }
 } // namespace
 
