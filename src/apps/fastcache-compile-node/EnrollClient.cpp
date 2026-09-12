@@ -4,6 +4,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
@@ -350,6 +351,32 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
     return std::unexpected { std::format("gave up after {} leader redirect(s)", MaxRedirects) };
 }
 
+std::expected<ConsensusHistory, std::string> ReadConsensusHistory(std::filesystem::path const& stateDirectory)
+{
+    auto storage = Consensus::FileRaftStorage::Open(stateDirectory);
+    if (!storage.has_value())
+        return std::unexpected { std::format("cannot read {}: {}", stateDirectory.string(), storage.error().context) };
+
+    auto recovered = storage->Load();
+    if (!recovered.has_value())
+        return std::unexpected { std::format(
+            "cannot read the consensus state in {}: {}", stateDirectory.string(), recovered.error().context) };
+
+    // Every durable trace, not one of them. A node that campaigned wrote a term AND a
+    // self-vote AND a log entry, so any single field would do for the case this exists
+    // to catch -- and asking all four is what makes the ANSWER right for the cases it
+    // does not: a node admitted to somebody else's cluster carries a term it was told
+    // and entries it was sent, and must be refused here too.
+    //
+    // The default-constructed value is documented as *a node that has never run*, which
+    // is exactly the question, so this is that sentence rather than a reading of the
+    // format.
+    auto const& state = *recovered;
+    auto const ran = state.state.currentTerm.value != 0 || state.state.votedFor.has_value() || !state.entries.empty()
+                     || state.snapshot.has_value();
+    return ran ? ConsensusHistory::Recorded : ConsensusHistory::None;
+}
+
 std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(NodeConfig const& cfg)
 {
     // `ClusterSelfMember` is the one place this node's own `(id, endpoint)` pair is
@@ -528,6 +555,32 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
             "{} already exists; this machine already holds a cluster key. Remove it deliberately if it is to join a "
             "different cluster. Nothing has been asked of the seed, so no enrollment request was spent",
             cfg.clusterKeyFile.string()) };
+
+    // **The one-way mistake, caught before anything is asked of anybody (#1299).**
+    //
+    // A node started without `--raft-join` bootstraps a cluster of itself, elects
+    // itself, and can never afterwards be admitted to anybody else's. It is silent: the
+    // node comes up, leads a cluster of one, and looks healthy on every surface. A
+    // forty-machine rollout offers that mistake thirty-nine times, and enrollment makes
+    // it sharper rather than softer -- an open window will be entered by machines that
+    // are, some of the time, permanently unable to join.
+    //
+    // Refused BEFORE the identity is resolved, so a refusal writes nothing: a directory
+    // that already holds consensus state also already holds an id, and a fresh one is
+    // left untouched for whoever fixes the configuration and runs this again.
+    auto const history = ReadConsensusHistory(NodeStateDirectory(cfg));
+    if (!history.has_value())
+        return std::unexpected { std::move(history).error() };
+    if (*history == ConsensusHistory::Recorded)
+        return std::unexpected { std::format(
+            "{} already holds consensus state: this node has taken part in a cluster before. Either it was started "
+            "without --raft-join, in which case it bootstrapped a cluster of ITSELF and can never be admitted to "
+            "anybody else's; or it is already a member of one, in which case it does not need enrolling. Both are "
+            "fixed the same way and only if you mean it: stop this node, delete {}, and run this again. A wiped "
+            "state directory gets a NEW identity, which is what admission needs -- clearing only the log would "
+            "leave this node's old identity in place holding a vote record for the cluster it led.",
+            NodeStateDirectory(cfg).string(),
+            NodeStateDirectory(cfg).string()) };
 
     // The identity is MINTED here, into `--cluster-dir`, before anything is asked of
     // anybody -- because it is what the seed is asked to admit. A joiner that asked

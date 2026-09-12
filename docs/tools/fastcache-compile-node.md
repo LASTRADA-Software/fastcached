@@ -1340,6 +1340,31 @@ left open is visible in the ordinary log rather than only to whoever thinks to a
 no state in which a stranger's request is remembered without an operator having
 opened the door first.
 
+#### A joiner that already bootstrapped a cluster of itself
+
+`--enroll-from` refuses, before it dials anything, a node whose `--cluster-dir`
+already carries consensus history — a term, a vote, or a log. That is the
+`--raft-join` trap above arriving through the other door, and it is worth refusing
+by name because the symptom otherwise is silence: such a machine enrolls perfectly,
+is admitted, is counted towards the quorum, and then refuses `AppendEntries` from
+every leader its own configuration does not name. Nothing is wrong until the leader
+goes and the cluster cannot re-elect.
+
+The refusal names both ways of getting there — starting the node once without
+`--raft-join` before enrolling it, and re-using a `--cluster-dir` from a machine
+that was a member of something else — and it names the remedy, which is to **wipe
+the state directory** rather than to delete the log inside it. Deleting only the log
+looks like the smaller, safer fix and is the wrong one: the node's identity is
+minted into that directory and read back forever, so a node that keeps it comes back
+as the same member it was, with a new empty log and the same id — a machine the
+cluster believes it already knows, whose vote record no longer exists. A wiped
+directory mints a new identity, which is the property that makes it safe.
+
+The refusal is on the `--enroll-from` path rather than in the startup policy table
+on purpose. That table judges a configuration this node will *serve* with, and a
+directory holding consensus history is exactly what every healthy running member
+has — a row there would refuse every legitimate one-machine install at every boot.
+
 ### Changing it while it runs
 
 The log carries the cluster's configuration so it can be changed without editing a

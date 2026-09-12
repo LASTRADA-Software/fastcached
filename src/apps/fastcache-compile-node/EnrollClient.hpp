@@ -125,6 +125,56 @@ struct EnrollReading
 /// @return What this client should do next.
 [[nodiscard]] EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome);
 
+/// Whether a state directory records that this node has already taken part in a
+/// cluster.
+///
+/// A private enum: nothing transmits or persists these ordinals.
+enum class ConsensusHistory : std::uint8_t
+{
+    /// Nothing has ever been recorded -- term zero, no vote, no log, no snapshot.
+    ///
+    /// A machine that has never run consensus, and also a machine started with
+    /// `--raft-join` that has not been admitted yet: a node whose bootstrap set is
+    /// EMPTY never stands for election, so it writes nothing. Those two are one state
+    /// deliberately, because both may enrol.
+    None,
+
+    /// A term, a vote, a log entry or a snapshot is present.
+    Recorded,
+};
+
+/// What `--cluster-dir` says about this node's consensus past.
+///
+/// **This is #1299, and its whole difficulty is WHERE it is asked rather than what it
+/// asks.** A node started without `--raft-join` bootstraps a cluster of itself, elects
+/// itself, and can never afterwards be admitted to anybody else's -- a one-way mistake
+/// a forty-machine rollout offers thirty-nine times, and a silent one: the node comes
+/// up, leads a cluster of one, and looks healthy on every surface.
+///
+/// **It is deliberately not a `StartupPolicyRejection` row**, and the reason is the
+/// whole of why the obvious implementation would be worse than the bug. A one-machine
+/// deployment with `--listen-raft` and no `--raft-join` bootstraps a cluster of itself
+/// ON PURPOSE and correctly, and it is indistinguishable on disk from the trapped node
+/// -- same self-election, same records. What separates them is not the state, it is
+/// what the operator is trying to do RIGHT NOW, and only the enrol path knows that: a
+/// node running `--enroll-from` is by definition asking to join somebody else's
+/// cluster. In the startup table this predicate would refuse a legitimate single-node
+/// install at every boot.
+///
+/// **It reports what is OBSERVED and asserts no cause**, for the reason a worker may
+/// not call a lower scheduler term a reset: this directory holding a term and a vote is
+/// a fact, and *it bootstrapped a cluster of itself* is one of two readings of it. The
+/// other is a node that was already admitted to a cluster and is being pointed at
+/// another. Both are refused and both have the same remedy, so the caller names both
+/// rather than guessing between them.
+///
+/// Through `FileRaftStorage`, which is the one reader of this format in the tree: a
+/// second one here would be a second thing to be wrong about a file whose misreading
+/// refuses a machine that could have joined.
+/// @param stateDirectory Where consensus keeps its durable state -- `--cluster-dir`.
+/// @return What is recorded there, or why it could not be read.
+[[nodiscard]] std::expected<ConsensusHistory, std::string> ReadConsensusHistory(std::filesystem::path const& stateDirectory);
+
 /// What this node will claim about itself when it asks to join.
 ///
 /// Derived from the resolved configuration rather than taken as two strings, so the

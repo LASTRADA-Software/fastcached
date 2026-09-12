@@ -107,6 +107,7 @@ if(FASTCACHED_BUILD_TESTS)
         EnrollmentResponder_test.cpp
         EnrollmentWindow.cpp
         EnrollmentWindow_test.cpp
+        EnrollTrap_test.cpp
         ExchangeLog_test.cpp
         NodeAnnounce_test.cpp
         SchedulerLink.cpp
