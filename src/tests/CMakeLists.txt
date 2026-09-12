@@ -6160,3 +6160,64 @@ set_tests_properties("cli-text-cell-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# ----------------------------------------------------------------------------
+# vendor/ is still byte-for-byte what was imported (#134).
+#
+# The copy under vendor/ is third-party source taken verbatim from upstream, and
+# it is only worth having while it stays diffable against upstream -- `git diff
+# <import>..HEAD -- vendor/endo` is the patch that gets contributed back. An edit
+# applied in place breaks nothing here, which is exactly why nothing else would
+# catch it: the build stays green and the loss surfaces months later, when
+# somebody tries to upstream a fix and finds the diff full of local noise.
+#
+# In the default set with the other hygiene checks: it hashes files and compares
+# strings. No compiler, no daemon, no socket -- and no git either, so it answers
+# in a source export too, which is why the manifest holds SHA-256 rather than git
+# blob hashes.
+add_test(
+    NAME "vendor-verbatim"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-verbatim.cmake"
+)
+set_tests_properties("vendor-verbatim" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 300
+)
+
+# ----------------------------------------------------------------------------
+# The vendored TUI's source set is a LINK closure, not just an include closure (#134).
+#
+# `fastcache-tui-linkprobe` is an executable over the vendored objects whose `main`
+# does nothing: the LINK is the test, and it already fails the build when a symbol
+# does not resolve. This registration exists so the guard is visible to `ctest -N`
+# and so a `Not Run` stays distinguishable from a pass -- which is why it RUNS the
+# binary rather than merely naming it.
+#
+# What it defends, measured: the first source set was derived by reading `#include`
+# lines and left FIFTEEN unresolved `tui::` symbols. Everything compiled. A static
+# archive never resolves symbols, so `ninja` was green, the vendor partition
+# assertion was green and `vendor-verbatim` was green -- the wall of link errors
+# waits for the first consumer, which is the worst place to meet it because it looks
+# like the consumer is broken. Proved by deletion: dropping one source while
+# reclassifying it so the partition still passes leaves this the ONLY guard that
+# reddens, naming `tui::HyperlinkEmitter::HyperlinkEmitter(...)` at `Buffer.cpp:289`.
+#
+# Guarded on `TARGET` as well as on the option. `$<TARGET_FILE:>` naming a target
+# that was not built is a hard error at GENERATE time, which fails the whole
+# configure with a message blaming CMake rather than the option the operator set --
+# the two conditions are independent and both are owed.
+#
+# It needs no daemon, socket or compiler, so it is `hygiene`, in the default set.
+if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe)
+    add_test(
+        NAME "vendor-tui-link-closure"
+        COMMAND $<TARGET_FILE:fastcache-tui-linkprobe>
+    )
+    set_tests_properties("vendor-tui-link-closure" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+endif()

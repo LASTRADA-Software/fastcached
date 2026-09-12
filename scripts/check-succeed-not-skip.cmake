@@ -149,6 +149,17 @@ endfunction()
 # of `SUCCEED` and nobody here can edit them.
 #
 # The same idiom, and the same fallback, as `check-catch-skip-return-code.cmake`.
+#
+# Anchored at `src/`, which is an INCLUSION list naming this repository's own layout
+# rather than a denylist betting on where third-party code lands. Untracked is no
+# longer the same question as third-party: `vendor/` holds 28 tracked `*_test.cpp`
+# files copied verbatim from upstream, and the unanchored `*_test.cpp` pattern took
+# every one of them -- 261 scanned files became 289. They passed, which is the
+# hazard: nobody here can edit them, so the first upstream sync that adds a
+# `SUCCEED` reddens a check about OUR code on a change that is not ours. Measured:
+# every one of this repository's 236 own `*_test.cpp` files is under `src/`, so the
+# anchor loses no coverage. Both enumeration paths carry it, or the two modes
+# disagree and the selftest's mode assertion stops meaning anything.
 if(NOT GIT_EXECUTABLE)
     find_program(GIT_EXECUTABLE NAMES git)
 endif()
@@ -166,7 +177,7 @@ if(GIT_EXECUTABLE)
     if(gitStatus EQUAL 0 AND insideWorkTree STREQUAL "true")
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" -C "${FASTCACHED_SOURCE_DIR}" ls-files
-                    -- "*_test.cpp" "src/tests/*.cpp" "src/tests/*.hpp"
+                    -- "src/*_test.cpp" "src/tests/*.cpp" "src/tests/*.hpp"
             OUTPUT_VARIABLE tracked
             RESULT_VARIABLE lsStatus
             OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -192,7 +203,7 @@ endif()
 if(NOT testFiles)
     set(excludeNames "out" "build" "_deps" ".git" ".cache" ".claude")
     file(GLOB_RECURSE walked RELATIVE "${FASTCACHED_SOURCE_DIR}"
-         "${FASTCACHED_SOURCE_DIR}/*_test.cpp"
+         "${FASTCACHED_SOURCE_DIR}/src/*_test.cpp"
          "${FASTCACHED_SOURCE_DIR}/src/tests/*.cpp"
          "${FASTCACHED_SOURCE_DIR}/src/tests/*.hpp")
     foreach(candidate IN LISTS walked)
