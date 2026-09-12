@@ -1080,6 +1080,37 @@ class IMetricsSink
 
     /// Read the current value of a counter.
     [[nodiscard]] virtual std::uint64_t Read(Counter counter) const noexcept = 0;
+
+    /// Whether this sink can represent @p counter at all.
+    ///
+    /// Asked of the SINK rather than computed by the caller, because a caller that
+    /// tested `counter < Counter::Last` would be asking its OWN build -- the one
+    /// that already believes the row exists -- and would answer yes every time.
+    ///
+    /// What this does NOT do, stated here because the claim is easy to overstate
+    /// and this header already argues the narrow version of it further down: it is
+    /// not a guarantee. `AtomicMetricsSink::Carries` is an inline function emitted
+    /// weakly by every translation unit, and an enum skew is an ODR violation
+    /// within one link, so the definition the linker keeps may be the one compiled
+    /// against the NEWER, longer enum -- and then this answers `true` for exactly
+    /// the rows it exists to catch. An ODR-skewed build is unsound in both
+    /// directions. What this buys is the direction where the SINK's shorter
+    /// definition wins, which is the same direction the bounds check covers, and
+    /// in that direction it turns a plausible zero into a named omission.
+    ///
+    /// A `false` is never an ordinary runtime condition. It means the catalogue
+    /// and the sink were compiled against different versions of `Counter`, so the
+    /// build is inconsistent rather than misused (#1332, #1353). Callers report
+    /// it; they do not route around it.
+    ///
+    /// It is a separate question from `Read`, which answers `0` for such a counter
+    /// because it must return something and reading past the array is worse. `0`
+    /// is indistinguishable from an honest tally of nothing, which is what makes
+    /// this predicate necessary rather than redundant.
+    ///
+    /// @param counter The counter a caller is about to name.
+    /// @return Whether this build's sink has a slot for it.
+    [[nodiscard]] virtual bool Carries(Counter counter) const noexcept = 0;
 };
 
 /// Default atomic-counter sink.
@@ -1115,19 +1146,26 @@ class AtomicMetricsSink final: public IMetricsSink
         _counters[static_cast<std::size_t>(counter)].fetch_add(by, std::memory_order_relaxed);
     }
 
-    /// @note The `0` an unrepresentable counter reads back is not an answer this
-    ///       function is happy with -- it is indistinguishable from an honest
-    ///       tally of nothing. Telling the two apart needs the RETURN TYPE to say
-    ///       so, which is every caller of `IMetricsSink::Read`; it is deliberately
-    ///       out of scope here and reported rather than left as a silent
-    ///       residual. `PrometheusFormatter` walks `CounterTable` and calls this,
-    ///       so on a skewed build the scrape still renders that counter as a real
-    ///       line reading zero.
+    /// @note The `0` an unrepresentable counter reads back is indistinguishable
+    ///       from an honest tally of nothing, and this function cannot fix that --
+    ///       telling the two apart needs the RETURN TYPE to say so, which is every
+    ///       caller of `IMetricsSink::Read`. What closes the reporting half is
+    ///       `Carries` below: a caller that renders a whole table asks FIRST and
+    ///       never reaches this `0` for a row the sink has no slot for (#1353).
     [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
     {
         if (!CarriesCounter(counter))
             return 0;
         return _counters[static_cast<std::size_t>(counter)].load(std::memory_order_relaxed);
+    }
+
+    /// @note No assert here, unlike the accessors: ASKING whether a counter is
+    ///       carried is a legitimate question with a legitimate `false`, and it is
+    ///       the question a caller asks precisely so it does not have to reach an
+    ///       accessor it should not call.
+    [[nodiscard]] bool Carries(Counter counter) const noexcept override
+    {
+        return static_cast<std::size_t>(counter) < CounterCount;
     }
 
   private:
@@ -1172,13 +1210,16 @@ class AtomicMetricsSink final: public IMetricsSink
     ///
     /// @param counter The counter a caller named.
     /// @return Whether it is inside this build's range.
-    [[nodiscard]] static bool CarriesCounter(Counter counter) noexcept
+    [[nodiscard]] bool CarriesCounter(Counter counter) const noexcept
     {
-        auto const idx = static_cast<std::size_t>(counter);
-        assert(idx < CounterCount
+        // Qualified, so this is a direct call rather than a dispatch: the
+        // accessors are hot, the class is `final`, and the question being asked
+        // here is about THIS object's own storage.
+        auto const carried = AtomicMetricsSink::Carries(counter);
+        assert(carried
                && "counter past Counter::Last -- two translation units disagree about the enum, "
                   "so this build is inconsistent rather than misused (#1332)");
-        return idx < CounterCount;
+        return carried;
     }
 
     std::atomic<std::uint64_t> _counters[CounterCount] {};

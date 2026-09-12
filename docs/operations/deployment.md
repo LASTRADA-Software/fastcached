@@ -515,6 +515,7 @@ is where they are explained one by one.
 | Series | Says |
 |---|---|
 | `fastcached_uptime_seconds` | Seconds since this process started. A gauge; a reset is a restart. |
+| `fastcached_metrics_catalogue_skew` | How many counters this build's metrics catalogue names that its sink has no slot for. A gauge, and **zero on any correctly built process** -- a nonzero reading means the catalogue and the sink were compiled against different versions of the counter enum, so the binary is inconsistent and every counter at the affected ordinals is missing from this scrape rather than reading zero. Alert on `> 0`. |
 
 This table is checked against the exposition the daemon actually renders — see
 `MetricsDocumentation_test.cpp`, which fails in both directions.

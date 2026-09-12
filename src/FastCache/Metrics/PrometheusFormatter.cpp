@@ -435,10 +435,62 @@ std::string RenderPrometheus(IMetricsSink const& metrics, MetricsSnapshot const&
     // rather than a hand-picked subset is the whole point: seven of the nine
     // live counters used to be absent here, including all five the distributed-
     // compilation guide tells an operator to read.
+    //
+    // ASKED before read, and that is the whole of #1353. `CounterTable` is
+    // `static_assert`ed to cover every enumerator, so within ONE build the
+    // question cannot fail -- but this loop's build and the sink's need not be the
+    // same one. On a skewed build the catalogue carries a row the sink has no slot
+    // for, `Read` answers `0` because it must answer something, and this loop
+    // rendered a well-formed sample with a plausible value for a counter that
+    // cannot exist. A zero here is indistinguishable from a real one, which is the
+    // defect this project names as *absent reported as zero* -- and #1350's bounds
+    // check made the line better formed rather than absent, which is right for
+    // memory safety and worse for the operator reading it.
+    //
+    // Omitted rather than zeroed, because that is already this file's answer for
+    // something a build does not have: a tier the cache does not run renders no
+    // line at all. And NAMED rather than silently dropped, because a scrape that
+    // is quietly short is the same failure one step along. The marker is a comment
+    // line, which the exposition format allows and every scraper ignores, so a
+    // skewed build degrades to "fewer series plus a visible reason" rather than to
+    // a wrong number or a refused endpoint.
+    std::uint64_t omittedBySkew = 0;
     for (auto const& row: CounterTable)
+    {
+        if (!metrics.Carries(row.counter))
+        {
+            ++omittedBySkew;
+            out += std::format("# SKEW {} is in the metrics catalogue and this build's sink has no "
+                               "slot for it; omitted rather than rendered as zero. The catalogue "
+                               "and the sink were compiled against different versions of the "
+                               "counter enum, so this build is inconsistent.\n",
+                               row.prometheusName);
+            continue;
+        }
         Append(
             out,
             Metric { .name = row.prometheusName, .help = row.help, .type = row.type, .value = metrics.Read(row.counter) });
+    }
+
+    // How many catalogue rows this build's sink could not carry, as a SERIES.
+    //
+    // The `# SKEW` lines above are for a human curling the endpoint; a scraper
+    // discards every comment, so on its own the skew reaches monitoring as a
+    // series that silently vanished -- indistinguishable from a rename, a relabel
+    // or a down target, and the one shape an alert cannot fire on. This is the
+    // machine-readable half, and it is a gauge rather than a `Counter` row for the
+    // reason the uptime line below is: it describes THIS RENDER, not an event the
+    // sink tallied -- and a counter row for it would have to survive the very skew
+    // it reports.
+    //
+    // Zero on a healthy build is a real reading rather than an absence, which is
+    // what makes `> 0` alertable.
+    Append(out,
+           Metric { .name = "fastcached_metrics_catalogue_skew",
+                    .help = "Catalogue rows this build's metrics sink has no slot for; nonzero means the "
+                            "catalogue and the sink were compiled against different versions of the counter enum.",
+                    .type = MetricType::Gauge,
+                    .value = omittedBySkew });
 
     // Uptime is neither the cache's nor the sink's: every process that serves
     // this endpoint has one, and a worker's is as useful as a daemon's.
