@@ -748,6 +748,25 @@ TEST_CASE("ServiceControl: a C0 control XML forbids is replaced, and the three i
     REQUIRE(!FastCache::SupervisorTextRejection(SpecCarrying("a\tb")).has_value());
 }
 
+TEST_CASE("ServiceControl: the account name is escaped like every other text node", "[platform][service][launchd]")
+{
+    // Found while fixing #1357 and fixed with it: `UserName` was interpolated with no
+    // escaping at all, so it was a second route to the malformed document the rest of
+    // this function's escaping exists to prevent. `serviceAccount` is a FIELD rather
+    // than the constant it used to be -- its own comment says a second binary may
+    // want a different one -- so "the daemon's account is always `_fastcached`" was
+    // never a property of the function.
+    //
+    // WHAT DISTINGUISHES: `&` is the byte whose unescaped presence makes the document
+    // malformed, and under the defect it appeared raw.
+    auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, FastCache::Config {});
+    spec.serviceAccount = "cache&co";
+    auto const plist = FastCache::BuildLaunchdPlist(spec, ServiceScope::System, "/tmp/logs");
+
+    REQUIRE(plist.contains("<string>cache&amp;co</string>"));
+    REQUIRE(!plist.contains("<string>cache&co</string>"));
+}
+
 TEST_CASE("ServiceControl: a registration carrying text no supervisor can record is refused", "[platform][service][launchd]")
 {
     // The other half of #1357, and the half the ticket's acceptance clause offered as

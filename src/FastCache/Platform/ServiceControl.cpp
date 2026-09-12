@@ -903,7 +903,13 @@ std::string BuildLaunchdPlist(ServiceSpec const& spec, ServiceScope scope, std::
         // indefinitely, and the `kickstart` that waits for the spawn hangs with
         // it until something kills the installer. One name to resolve is one
         // failure mode, not two.
-        out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", spec.serviceAccount);
+        //
+        // Escaped like every other text node here. It was NOT, and that was a
+        // second route to the malformed document this function's escaping exists to
+        // prevent -- a second one, because an account name reaches this from
+        // `ServiceSpec::serviceAccount`, which a second binary may set to whatever
+        // it wants (the field's own comment says so).
+        out += std::format("    <key>UserName</key>\n    <string>{}</string>\n", EscapeMarkup(spec.serviceAccount));
     }
 
     out += "    <key>ProcessType</key>\n    <string>Interactive</string>\n";
