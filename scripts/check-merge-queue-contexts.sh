@@ -364,6 +364,16 @@ fi
 # Promoting `clang-asan-ubsan` and `clang-tsan` adds no new KIND of instance
 # of it -- said out loud so the next reader does not meet it here and file it as
 # a regression this change introduced (#629's acceptance, clause 4).
+#
+# THE MARKER BELOW IS LOAD-BEARING and `check-required-context-table.sh` enforces
+# it. Four files in this tree declare `RequiredContexts=(` and three of them are
+# self-test fixtures, so a reader that finds the array by searching for its name
+# has a one-in-four chance of landing here -- and the 11-row fixture in
+# `check-merge-group-report.sh` is a strict SUBSET whose every row is a real
+# context, which is the shape that reports "11 of 11 passed" and trips nothing
+# (#1360). This is the copy everything reads; the marker says so at the
+# declaration, where a searcher arrives.
+# required-context-table: live
 RequiredContexts=(
     "Windows-cl-release|.github/workflows/build.yml"
     "Windows-clangcl-release|.github/workflows/build.yml"

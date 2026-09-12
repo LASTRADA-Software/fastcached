@@ -5354,6 +5354,67 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
 # went back in, and the same arm is what makes its absence a refusal now rather than an
 # oversight. The reasoning for the row lives on the script beside the row itself and is not
 # restated here; what this comment owes is the reason the ARM exists, which is unchanged.
+#
+# ## What this costs, on which shell, and what that means for the 300 s below (#1331)
+#
+# #1331 reported this at 296 s against the budget and timing out under `ctest -j3`, and
+# asked for a baseline before anything was changed. Here it is -- taken twice, because
+# the subject moved between the two and that is the most useful thing in it.
+#
+# Timed against `time.monotonic()`, never `SECONDS` or `date`, which are `CLOCK_REALTIME`
+# and step on these hosts in both directions. Three standalone runs per row.
+#
+#                                        13baf8ca              563beb83
+#                                   3 identifiers,        4 identifiers,
+#                                    36 mentions           66 mentions
+#   Linux, WSL2 5.15, ext4          3.68/3.60/3.56 s      6.56/6.52/6.40 s
+#   Linux, WSL2 5.15, 9p /mnt/d     8.71/8.88/8.68 s     13.57/13.86/13.99 s
+#   Windows 11 26200, Git Bash,
+#     D: = ReFS                   261.40/287.31/354.80 s  620.45/496.42/444.45 s
+#
+# These conditions are PINNED, not pointed at. They are two states of one machine on
+# 2026-09-12, and a measurement whose conditions track their source gets silently
+# re-attributed by an unrelated edit to conditions it was never taken under. Each column
+# names the commit it describes for the same reason.
+#
+# ## Read the two columns together, because the second is the point
+#
+# `13baf8ca` was the baseline #1331 asked for. `563beb83` is the same host four merges
+# later: #1333 added a `clusterKey` row, which took the scan from 3 identifiers to 4 and
+# from 36 matched mentions to 66, and the cost went up 1.6-1.8x with it. Nobody did
+# anything wrong; the cost is simply proportional to (identifiers x files), so every row
+# added here is paid for again on every run.
+#
+# ## The variable is the SHELL, not the filesystem
+#
+# This is the answer everyone reaches for here and it is wrong. ext4 to 9p is 2.1x, while
+# Linux-on-9p to Windows-on-ReFS is 33-46x *with the filesystem arguably worse on the
+# Linux side*. The scan makes 9193 external process spawns at `13baf8ca` -- measured by
+# wrapping the tools on PATH and counting, not derived -- and a spawn costs 21.28 ms under
+# Git Bash against 0.62 ms under WSL2, 34x. 9193 x 21.28 ms is 196 s, most of that
+# column's runtime. Somebody optimising the filesystem would get nothing.
+#
+# ## What that means for the budget, in two different answers
+#
+# **CI is nowhere near it.** 6.5 s against 300 s is 2.2 %, with the three readings
+# spanning 0.16 s. There is nothing to fix for the leg that gates a merge.
+#
+# **A Windows developer's local `ctest` now always exceeds it.** 444-620 s standalone,
+# with nothing else running: 1.5-2.1x the budget on every run, where at `13baf8ca` it was
+# a near miss. That is not a hypothetical and it is not contention -- #1331's own
+# contention model does not survive this, since run 3 of the first column already exceeded
+# 300 s standalone on master.
+#
+# The budget is deliberately LEFT ALONE here, and that is a decision rather than an
+# oversight. Raising it is the move this project's timeout rule exists to refuse, and a
+# number large enough for Git Bash (900 s?) would stop describing anything on the platform
+# that actually gates merges. Lowering it would redden a tree for a cost CI does not pay.
+# What the numbers argue for is making the scan cheaper -- one pass over the files instead
+# of one per identifier -- and that is #1331's remaining work, deliberately not taken here
+# because this file's scan was held by another lane while this was measured.
+#
+# So: if you are on Windows and this entry times out, it is the shell and the identifier
+# count, not your branch. The Linux legs are the ones that gate.
 add_test(
     NAME "credential-containers"
     COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-credential-containers.sh"
@@ -5927,3 +5988,40 @@ else()
         TIMEOUT 300
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# Every `RequiredContexts=(` declaration says at its own site what it is (#1360).
+#
+# Four files under `scripts/` declare that array and three are self-test fixtures. The
+# 11-row one in `check-merge-group-report.sh` is a strict SUBSET of the live 14-row table
+# whose every row is a real context name, which is the shape that reports "11 of 11
+# passed" and trips nothing -- a lane's hand-rolled reader did exactly that, on a pull
+# request that had already merged.
+#
+# `ci-pr-required.sh` already refuses when not ONE check run matches a required name, and
+# that guard cannot catch this: 11 of 11 matched real contexts. Its real protection is
+# that it pins the source FILE, so the defect is choosing the wrong file -- which nothing
+# inside a reader can detect.
+#
+# Needs no compiler, no daemon, no socket and no network; it reads `scripts/`.
+add_test(
+    NAME "required-context-table"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-table.sh" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("required-context-table" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Fifteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
+# a guard that refuses every tree passes every negative case, and one stood here for two
+# days (#1031). Case 13 is the accepting arm of the data-REGION mechanism, which is the
+# one part of this check that can reduce its own coverage.
+add_test(
+    NAME "required-context-table-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-table.sh" --self-test
+)
+set_tests_properties("required-context-table-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

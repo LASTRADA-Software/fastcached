@@ -41,6 +41,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # line, and the authoritative count comes from bash's own view of the array,
     # which cannot see a comment and stayed right throughout.
     cat > "$scratch/table.sh" <<'TABLE'
+# required-context-table: fixture -- three SYNTHETIC names, so no case here depends on
+# the repository's real table and no promotion to it moves a verdict below (#1360).
 RequiredContexts=(
     "Alpha|.github/workflows/a.yml"
     "Beta|.github/workflows/a.yml"
