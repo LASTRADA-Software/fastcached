@@ -604,6 +604,13 @@ TEST_CASE("The page carries no script and refreshes itself without one", "[distr
     // JavaScript at all.
     auto const html = RenderFleetHtml(LeadingSnapshot(), NoHistory(), 10);
     CHECK(html.starts_with("<!doctype html>"));
+    // The shared prologue, asserted HERE as well as from the node's suite, because
+    // this half of it is the library's: `starts_with("<!doctype html>")` above is
+    // satisfied by a prologue that has lost its viewport meta, so without this an
+    // inlined literal in `RenderFleetHtml` leaves the whole library suite green and
+    // only an app binary notices (#1344). Which SITE lost it is what the node's case
+    // names; that it is still here is what this one says.
+    CHECK(html.contains(HtmlDocumentPrologue));
     CHECK_FALSE(html.contains("<script"));
     CHECK_FALSE(html.contains("http://"));
     CHECK_FALSE(html.contains("https://"));

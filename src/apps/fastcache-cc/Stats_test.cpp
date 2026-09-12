@@ -644,6 +644,18 @@ TEST_CASE("FormatHtmlReport is a self-contained HTML document")
     // run, emailed, opened offline).
     CHECK_FALSE(report.contains("http://"));
     CHECK_FALSE(report.contains("https://"));
+
+    // **And travelling is exactly why the head matters**, which this case asserted
+    // nothing about while asserting self-containment. The device that opens a shared
+    // report is not the one that wrote it: with no viewport meta a browser lays this
+    // responsive page out at desktop width and scales it down, and with no `lang` a
+    // screen reader guesses the language. Both were absent.
+    //
+    // Asserted as the exact bytes rather than as "contains viewport", because a
+    // `<meta name="viewport">` carrying no `width=device-width` is the shape that
+    // reads as fixed and is not.
+    CHECK(report.contains(R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"));
+    CHECK(report.contains(R"(<html lang="en">)"));
 }
 
 TEST_CASE("FormatHtmlReport surfaces the headline hit rate and tallies")

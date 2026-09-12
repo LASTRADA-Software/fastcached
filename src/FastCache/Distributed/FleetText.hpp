@@ -34,6 +34,54 @@ inline constexpr std::string_view JsonReplacement = "\\ufffd";
 /// the output of this format is text, not a document another parser will re-read.
 inline constexpr std::string_view DelimitedReplacement = "\xEF\xBF\xBD";
 
+/// How the fleet dashboard and the node's small pages both open.
+///
+/// **Two documents, and there is no reading of either on which these bytes may
+/// differ.** `RenderFleetHtml` and the node's own one-paragraph pages -- its 401 and
+/// its bad-range refusal -- each spelled this prologue out, and the two copies had
+/// already drifted apart by a newline before anybody consolidated them
+/// ([#1344](https://github.com/LASTRADA-Software/fastcached/issues/1344)). Neither
+/// half is cosmetic: a document with no viewport meta renders at desktop zoom on a
+/// phone, and the 401 is the most-seen page of a rollout, while a charset one document
+/// declares and the other does not is how a peer's display name comes back mojibake on
+/// one page and reads correctly on the next.
+///
+/// **It stops where the pages legitimately diverge, which is why this is a constant
+/// and not a helper.** What the dashboard writes next is a conditional
+/// `<meta http-equiv="refresh">` that the 401 must not carry, and then each page's own
+/// title and stylesheet. A helper spanning that would take a refresh interval, a title
+/// and a stylesheet -- three parameters to place one shared line -- so what is shared
+/// is exactly the bytes that must never differ and nothing below them.
+///
+/// **The two `<title>` literals are identical text today and are deliberately not in
+/// here**, and the reason is not that a title names its page -- in this tree it does
+/// not: `MinimalHtmlPage` hands the same `fastcache fleet` title to the 401 and to the
+/// bad-range refusal, so the title already spans three documents on one URL. The reason
+/// is that the prologue is a CORRECTNESS property of any document -- how it renders,
+/// which encoding it is read in, whether a screen reader knows its language -- while a
+/// title is CONTENT. Two documents disagreeing about a title is cosmetic; two
+/// disagreeing about a charset is mojibake.
+///
+/// The newline is the dashboard's, kept so that page's bytes are unchanged: its
+/// `<style>` block is multi-line, so its source is readable in a `view-source:`.
+/// Nothing pinned it -- the doctype assertions on both surfaces are
+/// `starts_with("<!doctype html>")`, which both spellings satisfy -- and the node's
+/// small pages gaining one costs them nothing.
+///
+/// `apps/fastcache-cc/Stats.cpp` opens its report with a third spelling and keeps it
+/// for now, and **not because that binary cannot reach this header**: the launcher's
+/// own rule is header-only and std-only -- stated at the top of `Stats.cpp` against
+/// its own `Core/Ranges.hpp` include -- and this header plus both `Core/` headers it
+/// pulls in, `Ranges.hpp` and `Utf8.hpp`, have no `.cpp` between them. One of the two
+/// is the very header `Stats.cpp` already compiles in. It is excluded because that page is a
+/// DIFFERENT document: it declares no language and no viewport at all, so giving it
+/// this prologue changes what it renders. That is a fix to that report, not a fourth
+/// site to fold in here.
+inline constexpr std::string_view HtmlDocumentPrologue =
+    "<!doctype html>\n"
+    R"(<html lang="en"><head><meta charset="utf-8">)"
+    R"(<meta name="viewport" content="width=device-width, initial-scale=1">)";
+
 /// One byte an output format must not carry literally, and what it writes instead.
 ///
 /// Outside `Detail` because a SECOND binary spells the same rows: `fastcache-cli`'s

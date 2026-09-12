@@ -1454,7 +1454,30 @@ std::string FormatHtmlReport(std::string_view groupFilter)
     auto const hitRate = Percent(overall.hits, servable);
 
     std::ostringstream out;
-    out << R"(<!doctype html><html><head><meta charset="utf-8"><title>fastcache-cc stats</title>)"
+    // **The head this document needs, and the two halves are stated separately because
+    // one was measured and the other is not.**
+    //
+    // MEASURED, on this file: the prologue carried neither `lang` nor a viewport meta
+    // -- the only one of the tree's three prologue spellings lacking both -- while the
+    // page it opens is laid out on two CSS grids (`.cards` at
+    // `repeat(4,minmax(0,1fr))`, `.two-col` at `1.4fr 1fr`), and `RunHtmlStatsReport`
+    // writes it to a path the operator names rather than serving it, so the device it
+    // is opened on is not the one that produced it.
+    //
+    // INFERRED from how browsers and screen readers read HTML, not from anything
+    // observed here: a grid-laid page with no viewport is composed at a desktop width
+    // and scaled down on a phone, and a document with no `lang` gives a screen reader
+    // nothing to select a voice from. Neither was reproduced on a device.
+    //
+    // Spelled here rather than taken from `Distributed::HtmlDocumentPrologue`, which is
+    // now the one spelling for the library and the node. This is therefore a THIRD copy
+    // and is recorded as one: the launcher does not link `FastCache`, and while its own
+    // rule -- header-only and std-only, stated at the top of this file -- would admit
+    // that header, whether this binary should reach across for a constant is a decision
+    // rather than a consequence of adding the tags.
+    out << R"(<!doctype html><html lang="en"><head><meta charset="utf-8">)"
+           R"(<meta name="viewport" content="width=device-width, initial-scale=1">)"
+           R"(<title>fastcache-cc stats</title>)"
         << "<style>" << DashboardStyle << R"(</style></head><body><div class="wrap">)";
 
     out << R"(<div class="header"><div><div class="title">fastcache-cc / stats</div>)"

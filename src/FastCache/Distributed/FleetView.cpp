@@ -2217,8 +2217,7 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
 {
     std::string out;
     out.reserve(16384);
-    out += "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">";
-    out += R"(<meta name="viewport" content="width=device-width, initial-scale=1">)";
+    out += HtmlDocumentPrologue;
     if (refreshSeconds != 0)
         out += std::format(R"(<meta http-equiv="refresh" content="{}">)", refreshSeconds);
     out += "<title>fastcache fleet</title><style>";
