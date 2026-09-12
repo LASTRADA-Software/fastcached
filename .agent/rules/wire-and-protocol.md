@@ -646,12 +646,13 @@ Every rule below has already been a bug.
     `Net/NetError.hpp`, `Async/Task.hpp` and `Core/Profiling.hpp`, all
     header-only and all std-only, so the launcher stays free of yaml-cpp, OpenSSL
     and the reactor and can still link the CRT statically.
-  - **`std::array`'s iterator is a raw pointer on libstdc++ and libc++ and a class
-    on MSVC**, so `readability-qualified-auto` asks for `auto const* const` while
-    MSVC cannot deduce it — no spelling of `auto` satisfies both. The lookup
-    returns the row by value instead of picking a side. Found by building Windows
-    immediately after Linux rather than in CI a phase later, the same ordering that
-    the `ParsePort` entry above exists to argue for.
+  - **The lookup returns the row by value rather than an iterator**, because no
+    spelling of `auto` is portable over a `std::array`'s iterator. That is a
+    toolchain fact rather than a wire one and it lives in
+    [`.agent/rules/build-and-toolchain.md`](build-and-toolchain.md); what belongs
+    here is only that it was found by building Windows immediately after Linux
+    rather than in CI a phase later, the same ordering the `ParsePort` entry above
+    exists to argue for.
 
 - **A daemon that ignores SIGPIPE process-wide hands that decision to every
   program it launches.** `Detail::EnsureNetworkInitialised` did

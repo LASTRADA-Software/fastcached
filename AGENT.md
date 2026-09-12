@@ -1075,6 +1075,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   says, where do I end up.** And state what the rule does NOT cover in the refusal itself, or the
   next reader over-applies it and deletes a property that is load-bearing elsewhere.
 - Never silence clang-tidy with `NOLINT` — fix the source.
+- **And `readability-qualified-auto`'s own suggested fix does not COMPILE on MSVC**, so taking
+  the analyser's advice trades a Linux-only lint for a Windows-only build failure. Over a
+  `std::array` libstdc++ and libc++ hand back a raw pointer, so the check asks for
+  `auto const* const`, which MSVC's class-type iterator cannot deduce; writing the type out
+  trips `modernize-use-auto` instead. Use `Core/Ranges.hpp`'s `FindOrNull` / `FindIfOrNull`,
+  or scan for a VALUE and name no iterator.
 - A return type is not part of a function's mangled name on Linux, so two functions differing
   only in return type silently collide.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure.

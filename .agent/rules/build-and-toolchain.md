@@ -2608,6 +2608,37 @@ makes it anyway and says so there.
 
 ## Language and ABI pitfalls
 
+- **`readability-qualified-auto`'s own suggested fix does not COMPILE on MSVC, so
+  applying it converts a Linux-only lint into a Windows-only build failure.** Over a
+  `std::array`, libstdc++ and libc++ give `std::ranges::find` a **raw pointer**, so
+  the check demands `auto const* const`; the MSVC STL's iterator is a **class type**,
+  which that declaration cannot deduce (C3535). Writing the type out instead trips
+  `modernize-use-auto`. No spelling of the declaration satisfies every toolchain.
+  - **The trade is the wrong way round in both directions.** The lint is seen by
+    whoever runs the sweep; the build failure lands on whoever next builds on
+    Windows, which may be a different person on a different day.
+  - **The tree's answer is `Core/Ranges.hpp`** -- `FindOrNull` and `FindIfOrNull`.
+    Inside a template the iterator's type is dependent, so the conflict resolves
+    once, there, and callers get a plain pointer with `nullptr` as the idiomatic
+    *not found*. Prefer them over `std::ranges::find`/`find_if` whenever the range
+    may be a `std::array` or a raw array; for `std::vector` and friends the iterator
+    is a class type everywhere and either form is portable. Where a site wants a
+    VALUE out of the range rather than a pointer -- a spelling, a code -- a plain
+    range-based scan is also fine and names no iterator at all.
+  - **`NOLINT` is not the alternative.** The rule against it is unchanged; the fix
+    is to restructure so that no iterator is named.
+  - **It has an entry because it kept being RE-DERIVED.** Written down in six source
+    files when #1342 was filed, each discovered independently, and a census while
+    closing that ticket found **17** files under `src/` carrying the explanation --
+    pattern: the literal `qualified-auto`, over tracked `*.cpp` and `*.hpp`. It cost
+    two lanes in one evening, both of whom diagnosed it from scratch and were right
+    only because they went looking rather than applying the fix; a third would have
+    applied it. It previously lived in
+    [`wire-and-protocol.md`](wire-and-protocol.md), which is the wrong file for a
+    toolchain fact, and had no `AGENT.md` tripwire -- so it fired in no session that
+    did not already open a rules file, which is the population it was written for.
+
+
 - **A return type is not part of a function's name on Linux, and MSVC's mangling
   hides that.** `Core/HostPort.hpp` added an `inline FastCache::ParsePort(
   std::string_view)` returning `std::optional<std::uint16_t>` while
