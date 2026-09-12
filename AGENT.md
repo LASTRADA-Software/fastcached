@@ -1872,9 +1872,13 @@ per-machine one. `CPM_SOURCE_CACHE` defaults to `%LOCALAPPDATA%\fastcached\cpm` 
 `~/.cache/fastcached/cpm`; anything that already set it wins, including the environment
 variable CI uses to point it inside the workspace for its own cache action. Override
 with `FASTCACHED_CPM_CACHE`, and a machine where no home directory can be found simply
-fetches into the build tree as before. Measured (native NTFS, Git Bash, Windows 11,
-cold build tree): **45 s and 118 MB fetched without it, 24 s and 1.1 MB with** — and
-over DrvFs, where #545 found it, the same fetch is slow enough to read as a hang.
+fetches into the build tree as before. Measured (Git Bash, Windows 11, cold build tree,
+native Windows volumes rather than DrvFs): **45 s and 118 MB fetched without it, 24 s
+and 1.1 MB with** — and over DrvFs, where #545 found it, the same fetch is slow enough
+to read as a hang. *Volumes* rather than a filesystem NAME, because the two halves of
+this measurement do not share one: the cache sits under `%LOCALAPPDATA%` and the build
+tree does not, so on the machine this was taken on they are different filesystems. The
+contrast the figure exists to draw is native-against-DrvFs, and that holds either way.
 
 CMake presets live in `CMakePresets.json`. Common entry points:
 
