@@ -507,11 +507,22 @@ class SkewedSink final: public IMetricsSink
     IMetricsSink::Counter _missing;
 };
 
-/// The catalogue row for @p counter, so the case names the series the way the
-/// exporter does rather than writing the string out twice.
+/// The catalogue row's series name for @p counter, so the case names the series the
+/// way the exporter does rather than writing the string out twice.
+///
+/// Through `DescriptorOf` rather than by indexing `CounterTable`, and the reason is
+/// this file's own subject: a raw `CounterTable[ordinal]` assumes the table covers
+/// every ordinal, which is exactly what the change under test stops the EXPORTER
+/// doing. Written the raw way here it would have been the one lookup in the tree
+/// making the assumption the branch exists to deny -- in the test that proves the
+/// denial. `DescriptorOf` answers nullptr for `Last` and for anything past the end.
+/// @param counter The counter to name.
+/// @return Its Prometheus series name.
 [[nodiscard]] std::string_view PrometheusNameOf(IMetricsSink::Counter counter)
 {
-    return CounterTable[static_cast<std::size_t>(counter)].prometheusName;
+    auto const* const row = DescriptorOf(counter);
+    REQUIRE(row != nullptr);
+    return row->prometheusName;
 }
 } // namespace
 

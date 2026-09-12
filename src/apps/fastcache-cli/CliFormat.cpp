@@ -4,7 +4,6 @@
 #include <FastCache/Distributed/FleetText.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <format>
 #include <ranges>
