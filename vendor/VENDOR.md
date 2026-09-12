@@ -21,7 +21,7 @@ from the contents.
 
 | upstream | fork point | files | what |
 |---|---|---|---|
-| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 161 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError}.hpp`, `testing/SuppressWindowsDialogs.hpp` |
+| [contour-terminal/endo](https://github.com/contour-terminal/endo) | `687b90a042a3eee96f50f8f46cf811a03155b786` | 164 | `tui/**` (154 files, all of `src/tui`), `platform/{Types,Wakeup,Clock,SignalHandler,SystemPipe,PlatformError}.hpp`, the three per-platform `platform/{linux,posix,windows}/*Wakeup.cpp`, `testing/SuppressWindowsDialogs.hpp` |
 | [contour-terminal/contour](https://github.com/contour-terminal/contour) | `243d776aed99bcc0f634b0608189609fd4e548ba` | 5 | `coro/{Task,Cancellation,WhenAny,UniqueCoroHandle}.hpp`, `crispy/FNV.hpp` |
 
 
@@ -36,16 +36,26 @@ contour, not against endo.** They were verified byte-identical between contour
 Both repositories are Apache-2.0, and so is this copy. `endo/tui` was last touched
 upstream at `37d875f8` (2026-08-15).
 
-`src/tui` upstream is 154 files and ~46k lines; with the twelve headers below the
-copy is **166 files, 47,643 lines**.
+`src/tui` upstream is 154 files and ~46k lines; with the fifteen supporting files below the
+copy is **169 files, 47,804 lines**.
 
-## The twelve extra headers
+## The fifteen supporting files
 
 `tui` does not stand alone: it includes headers from three sibling libraries. The
 set copied here is the **measured transitive closure** of those includes — every
 non-`tui`, non-system header reachable from `src/tui`, followed until it
-terminates. It is twelve headers and 1,597 lines, all header-only, and none of
-them reaches any further into either upstream.
+terminates. It is fifteen files and 1,758 lines: twelve headers, plus the three
+per-platform implementations of `endo::platform::Wakeup`, which
+`tui/platform/TerminalInput.cpp` calls into. None of them reaches any further into
+either upstream.
+
+**Twelve of the fifteen are header-only and the first import assumed all of them
+were.** `platform/Wakeup.hpp` declares a class whose methods are defined elsewhere,
+and reading `#include` lines cannot see that — a header graph and a symbol graph are
+different graphs. The build did not see it either: a static archive never resolves
+symbols, so it compiled clean and simply carried two undefined references for
+whoever linked it first. `fastcache-tui-linkprobe` is what found it and is what
+stops it coming back.
 
 That number is worth stating because the obvious estimate is an order of magnitude
 larger. `coro` and `endo-platform` are together about 12,000 lines, and "vendor the
@@ -90,7 +100,7 @@ Two facts that make this much less alarming than it sounds, both measured:
 
 ## Local changes
 
-**None.** All 166 files are byte-identical to their upstream blobs, which is
+**None.** All 169 files are byte-identical to their upstream blobs, which is
 checked rather than asserted — see below.
 
 Every local change goes in its own commit, never folded into the import, and gets a

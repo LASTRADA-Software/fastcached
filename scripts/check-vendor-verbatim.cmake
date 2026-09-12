@@ -3,9 +3,9 @@
 # Refuses when a file under `vendor/` no longer matches `vendor/MANIFEST`.
 #
 # `vendor/` holds third-party source copied VERBATIM from upstream, and verbatim is
-# load-bearing rather than tidy: `git diff <import>..HEAD -- vendor/endo` is what
-# gets sent back upstream, so a vendored file edited in place quietly converts a
-# contributable copy into a private fork. Nothing else notices. The build stays
+# load-bearing rather than tidy: the diff against the UPSTREAM fork points in
+# vendor/VENDOR.md is what gets sent back, so a vendored file edited in place quietly
+# converts a contributable copy into a private fork. Nothing else notices. The build stays
 # green, the tests pass, and the discovery comes months later when somebody tries to
 # upstream a fix and finds the diff full of unrelated local edits.
 #
@@ -180,9 +180,10 @@ endif()
 message(FATAL_ERROR
     "check-vendor-verbatim: vendor/ no longer matches vendor/MANIFEST.${report}\n\n"
     "vendor/ is third-party source copied verbatim from upstream, and the copy is only "
-    "worth having while it stays diffable against upstream: `git diff <import>..HEAD -- "
-    "vendor/endo` is the patch that gets contributed back. An edit made in place does not "
-    "break anything here, which is exactly why nothing else catches it.\n\n"
+    "worth having while it stays diffable against the UPSTREAM fork points recorded in "
+    "vendor/VENDOR.md -- that diff is the patch that gets contributed back. An edit made "
+    "in place does not break anything here, which is exactly why nothing else catches "
+    "it.\n\n"
     "If the change is a MISTAKE -- a stray formatter run, an edit applied to the copy "
     "instead of to first-party code -- revert the file.\n\n"
     "If the change is DELIBERATE, it needs both halves: add a row to vendor/VENDOR.md's "
