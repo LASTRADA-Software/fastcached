@@ -2477,6 +2477,26 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     (void) metrics;
     (void) logger;
     (void) row;
+    // **`namer` is deliberately not in that list, and both ways of "fixing" its
+    // absence are worse than the asymmetry.** It is a `ToolchainNamer`, which is a
+    // `std::function` -- a by-value parameter whose type has a non-trivial
+    // destructor, so MSVC's C4100 is not issued for it: the destructor call is a
+    // use. The seven above are references, an `int` and a `string_view`, every one
+    // trivially destructible, which is why they need the cast and this one does not.
+    //
+    // `clang-cl` cannot reach `-Wunused-parameter` either: it takes the MSVC `/W4`
+    // arm of `cmake/portable/PedanticCompiler.cmake`, whose frontend-variant check is
+    // where that routing is stated, and the warning arrives only with the `-Wextra`
+    // the Clang arm adds.
+    //
+    // Written down because the gap READS as an omission and was filed as one
+    // ([#1347](https://github.com/LASTRADA-Software/fastcached/issues/1347)): a
+    // `(void) namer;` would assert a warning this build cannot emit, and splitting
+    // the signature per platform would contradict the paragraph above -- the
+    // identical signature is the whole reason this arm exists rather than an
+    // `#ifdef` in the header. Measured rather than argued: all three Windows legs
+    // built this file green under `PEDANTIC_COMPILER_WERROR=ON`, which is the
+    // default for the Windows presets.
     return std::unexpected { std::string { "socket activation is not available on this platform" } };
 #else
     auto listener = PlatformListener::Adopt(io.Reactor(), descriptor);
