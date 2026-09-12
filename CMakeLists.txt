@@ -425,6 +425,25 @@ if(FASTCACHED_BUILD_TUI)
             "LIBUNICODE_TOOLS OFF"
             "LIBUNICODE_EXAMPLES OFF"
             "BUILD_SHARED_LIBS OFF"
+            # THIRD-PARTY SOURCES ARE NOT GOVERNED BY THIS PROJECT'S WARNING POLICY.
+            #
+            # Stated as the policy rather than as a fix for one warning, because the
+            # next version of any dependency produces a different one and a
+            # named-warning suppression would not cover it. Measured on CI: libunicode
+            # 0.9.3's `scan.cpp:39` has an unused function template, which is
+            # `-Wunused-template` -- a warning THIS project turns on and makes fatal,
+            # and libunicode does not.
+            #
+            # The leak is specific and worth naming, because being fetched before
+            # `include(PedanticCompiler)` -- which is what keeps yaml-cpp, Catch2, zstd
+            # and lz4 clean -- does NOT protect this one. libunicode is a sibling
+            # project of the same author and ships the SAME `cmake/PedanticCompiler.cmake`
+            # with the SAME two option names. CMP0077 makes `option()` defer to a
+            # variable that already exists, so our cache entries reach straight into its
+            # build and it compiles its own sources under our settings. Ordering cannot
+            # help: the collision is by NAME, not by scope.
+            "PEDANTIC_COMPILER OFF"
+            "PEDANTIC_COMPILER_WERROR OFF"
     )
     add_subdirectory(vendor)
 endif()

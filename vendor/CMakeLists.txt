@@ -34,7 +34,12 @@ set(_fcTuiSources
     endo/tui/Canvas.cpp
     endo/tui/Cell.cpp
     endo/tui/Component.cpp
+    endo/tui/GenericSyntaxHighlighter.cpp
     endo/tui/HoverState.cpp
+    endo/tui/HyperlinkEmitter.cpp
+    endo/tui/MarkdownHtml.cpp
+    endo/tui/MarkdownRenderer.cpp
+    endo/tui/MarkdownTable.cpp
     endo/tui/MockTerminalOutput.cpp
     endo/tui/Screen.cpp
     endo/tui/SgrBuilder.cpp
@@ -72,6 +77,18 @@ else()
     list(APPEND _fcTuiSources ${_fcTuiPosixSources})
 endif()
 
+# `endo::platform::Wakeup`, which `TerminalInput.cpp` calls into on both platforms.
+# Not part of the tui tree and not header-only: Wakeup.hpp declares the class and
+# the three files below define it, one per platform, exactly as upstream selects
+# them. Linux gets an eventfd, other UNIX a self-pipe, Windows a manual-reset Event.
+if(WIN32)
+    list(APPEND _fcTuiSources endo/platform/windows/WindowsWakeup.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND _fcTuiSources endo/platform/linux/LinuxWakeup.cpp)
+else()
+    list(APPEND _fcTuiSources endo/platform/posix/PosixWakeup.cpp)
+endif()
+
 # Every vendored translation unit this target does NOT build, and why. Three
 # groups, and the third is the one that needs stating: "nothing reached it" is a
 # real reason, but it is indistinguishable from "nobody looked" unless it is
@@ -79,15 +96,31 @@ endif()
 #
 #   stb_image   image decoding, which a stats view does none of. The sources stay
 #               on disk verbatim; only the target is subset.
-#   coro        the event runtime. fastcached has Async/Task and IReactor, and
-#               endo's must not become a second one -- see VENDOR.md, "Two of some
-#               things". QuestionComponent is here rather than below because it
+#   coro        the event runtime. UPSTREAM'S OWN TARGET COMPILES runtime/ --
+#               TuiRuntime.cpp and PollEventSource.cpp unconditionally, plus a
+#               per-platform TerminalEventSource -- so leaving it out is a decision
+#               this file is making, not a property of the vendored code, and beside
+#               upstream's build file it reads like an oversight.
+#
+#               The decision: runtime/ is the only thing that reaches `coro/Task.hpp`,
+#               `coro/Cancellation.hpp` and `platform/Clock.hpp`. Compiling it would
+#               put a SECOND coroutine library and a SECOND clock into a tree whose
+#               central rule is one source of truth per concept -- the tree that says
+#               there is exactly one TCP client and not to write a second. fastcached
+#               has `Async/Task`, `Async/Cancellation` and `IClock`, and the vendored
+#               TUI reaches them through one adapter layer instead.
+#
+#               That is arguable, and someone may later decide the adapter is worse
+#               than the duplication. What is not acceptable is the change happening
+#               by accident, so `_fcTuiNoRuntime` below refuses it rather than leaving
+#               a sentence for a reader who has already stopped reading.
+#               QuestionComponent is in this group rather than `unreached` because it
 #               reaches coro through runtime/Modal.hpp.
 #   unreached   an interactive editor's widgets. Present, working, and simply not
 #               on any path from a stats panel.
 set(_fcTuiNotBuilt
     # stb_image
-    ImageLoader.cpp ImageProvider.cpp StbImageImpl.cpp MarkdownRenderer.cpp
+    ImageLoader.cpp ImageProvider.cpp StbImageImpl.cpp
     # coro
     QuestionComponent.cpp
     runtime/PollEventSource.cpp runtime/TuiRuntime.cpp
@@ -95,9 +128,9 @@ set(_fcTuiNotBuilt
     runtime/platform/TerminalEventSourceWin32.cpp
     # unreached
     CommandPalettePopup.cpp CommandRegistry.cpp CompletionPopup.cpp Dialog.cpp
-    FuzzyPickerPopup.cpp GenericSyntaxHighlighter.cpp HyperlinkEmitter.cpp
-    InputField.cpp KeyBindings.cpp List.cpp LogPanel.cpp MarkdownHtml.cpp
-    MarkdownTable.cpp SemanticBlockClient.cpp Spinner.cpp StatusBar.cpp
+    FuzzyPickerPopup.cpp
+    InputField.cpp KeyBindings.cpp List.cpp LogPanel.cpp
+    SemanticBlockClient.cpp Spinner.cpp StatusBar.cpp
     completer/Completer.cpp completer/FuzzyMatch.cpp completer/SmartCaseMatch.cpp
 )
 
@@ -131,12 +164,20 @@ endif()
 # is what makes this a statement about the tree rather than about this host.
 set(_fcTuiClassified ${_fcTuiNotBuilt})
 foreach(_src IN LISTS _fcTuiSources _fcTuiWin32Sources _fcTuiPosixSources)
-    string(REPLACE "endo/tui/" "" _rel "${_src}")
-    list(APPEND _fcTuiClassified "${_rel}")
+    # Only the `endo/tui/` half: the partition is a statement about that tree, and
+    # `_fcTuiSources` also carries the Wakeup implementation from `endo/platform/`,
+    # which lives outside it. Without the filter those entries survive the REPLACE
+    # unchanged and the existence check below looks for `endo/tui/endo/platform/...`.
+    if(_src MATCHES "^endo/tui/")
+        string(REPLACE "endo/tui/" "" _rel "${_src}")
+        list(APPEND _fcTuiClassified "${_rel}")
+    endif()
 endforeach()
 list(REMOVE_DUPLICATES _fcTuiClassified)
 
 foreach(_src IN LISTS _fcTuiOnDisk)
+    # The partition covers endo/tui only; the Wakeup sources sit outside that tree
+    # and are named directly above, so they are not candidates here.
     if(NOT _src IN_LIST _fcTuiClassified)
         message(FATAL_ERROR
             "vendor: endo/tui/${_src} is in the vendored tree but appears in neither "
@@ -144,6 +185,37 @@ foreach(_src IN LISTS _fcTuiOnDisk)
             "which it is -- build it, or name it in _fcTuiNotBuilt with the reason -- "
             "because a source that is classified by nothing is built by nothing and "
             "mentioned nowhere, and the build stays green either way.")
+    endif()
+endforeach()
+
+foreach(_src IN LISTS _fcTuiSources)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_src}")
+        message(FATAL_ERROR
+            "vendor: ${_src} is built by this target but is not in the tree. "
+            "If this followed an upstream re-sync, the file moved or was removed "
+            "there: update the list and record the change in vendor/VENDOR.md.")
+    endif()
+    # The runtime/ guard. Folded into the loop the source list already walks, rather
+    # than written as a separate scan, because a guard riding on something the site
+    # must do cannot be forgotten -- adding a source is what trips it.
+    if(_src MATCHES "^endo/tui/runtime/")
+        message(FATAL_ERROR
+            "vendor: ${_src} is under endo/tui/runtime/, which this target does not "
+            "build.\n\n"
+            "runtime/ is the ONLY thing in the vendored tree that reaches coro/Task.hpp, "
+            "coro/Cancellation.hpp and platform/Clock.hpp. Building it puts a second "
+            "coroutine library and a second clock into a tree that has one of each -- "
+            "FastCache::Async::Task, FastCache::Async::Cancellation and FastCache::IClock "
+            "are the authoritative ones, and vendor/VENDOR.md says so in the words a "
+            "reader of this refusal needs.\n\n"
+            "Upstream's own src/tui/CMakeLists.txt DOES compile runtime/, so this "
+            "exclusion looks like an oversight beside it and that is exactly why it is "
+            "guarded rather than merely commented.\n\n"
+            "If the adapter layer has turned out worse than the duplication, that is a "
+            "decision worth making -- make it deliberately: delete this guard, say why "
+            "in vendor/VENDOR.md's \"Two of some things\", and vendor the coro and "
+            "platform/Clock sources the runtime needs, which this import does not carry "
+            "as built sources. Adding the row alone will not link.")
     endif()
 endforeach()
 
@@ -157,7 +229,10 @@ foreach(_src IN LISTS _fcTuiClassified)
     endif()
 endforeach()
 
-add_library(fastcache-tui STATIC ${_fcTuiSources})
+# Compiled ONCE, linked twice -- as the static library the CLI will use, and as a
+# shared library that exists only to make the linker check the source set.
+add_library(fastcache-tui-objects OBJECT ${_fcTuiSources})
+add_library(fastcache-tui STATIC $<TARGET_OBJECTS:fastcache-tui-objects>)
 
 # The include root is `vendor/endo`, which is what makes the copy verbatim
 # possible: upstream spells its own includes `<tui/...>`, `<platform/...>` and
@@ -191,8 +266,59 @@ target_compile_features(fastcache-tui PUBLIC cxx_std_23)
 # anyway. It also removes three `unknown argument` errors (`-fdeps-format`,
 # `-fmodule-mapper`, `-fmodules-ts`) that any clang-tidy invocation over these
 # TUs would otherwise report before it got as far as the code.
-set_target_properties(fastcache-tui PROPERTIES
+set_target_properties(fastcache-tui-objects fastcache-tui PROPERTIES
     CXX_CLANG_TIDY ""
     C_CLANG_TIDY ""
     CXX_SCAN_FOR_MODULES OFF
+)
+target_include_directories(fastcache-tui-objects SYSTEM PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/endo")
+target_link_libraries(fastcache-tui-objects PUBLIC unicode::unicode)
+target_compile_features(fastcache-tui-objects PUBLIC cxx_std_23)
+
+# ----------------------------------------------------------------------------
+# THE LINK-CLOSURE PROBE, and it is not decoration.
+#
+# The source set above is a CLOSURE, and the first version of it was derived by
+# reading `#include` lines. That produced a set with FIFTEEN unresolved `tui::`
+# symbols -- `HyperlinkEmitter`, `MarkdownTable`, `GenericSyntaxHighlighter` and
+# `MarkdownRenderer::defaultTheme`, all called from translation units that WERE
+# built. Every one of them compiled. `ninja` was green, the partition assertion
+# above was green, and `vendor-verbatim` was green, because a STATIC ARCHIVE NEVER
+# RESOLVES SYMBOLS: it is a bag of objects, and the complaint is deferred to
+# whoever links it. The first consumer would have met a wall of link errors naming
+# upstream symbols, one ticket later, with nothing here to explain why.
+#
+# A header graph and a symbol graph are different graphs. So the question is put to
+# the LINKER rather than to a reader: a shared library over the same objects must
+# resolve everything, and every platform this project builds on fails that link by
+# default when it cannot -- `--no-undefined` on ELF, `-undefined error` on Mach-O,
+# and a DLL link on Windows, where unresolved externals are already fatal.
+#
+# It costs one link, not one compile: the objects are shared with the static
+# library through `$<TARGET_OBJECTS:>`. `EXCLUDE_FROM_ALL` is deliberately NOT set
+# -- a check that only runs when somebody names it is a check that runs never.
+#
+# An EXECUTABLE over the objects, not a shared library. The shared-library form was
+# tried first and it works on ELF only by accident: libunicode builds its static
+# libraries without -fPIC, so the link dies on a relocation error before it can say
+# anything about the vendored objects -- a probe that fails for a reason having
+# nothing to do with its subject. An executable needs no PIC, and linking the
+# OBJECTS directly (rather than the archive) is what makes every one of them
+# participate: an archive contributes only the members something references, which
+# is precisely the leniency being tested for.
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp"
+     "// Generated. See vendor/CMakeLists.txt: this exists so the linker is made to\n"
+     "// resolve every symbol the vendored objects reference. It is never run.\n"
+     "int main() { return 0; }\n")
+add_executable(fastcache-tui-linkprobe
+    "${CMAKE_CURRENT_BINARY_DIR}/linkprobe.cpp"
+    $<TARGET_OBJECTS:fastcache-tui-objects>
+)
+target_link_libraries(fastcache-tui-linkprobe PRIVATE unicode::unicode)
+set_target_properties(fastcache-tui-linkprobe PROPERTIES
+    CXX_CLANG_TIDY ""
+    C_CLANG_TIDY ""
+    CXX_SCAN_FOR_MODULES OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/linkprobe"
 )

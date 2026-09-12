@@ -73,6 +73,15 @@ Two facts that make this much less alarming than it sounds, both measured:
   a later ticket that wants the runtime needs no second import. **Nothing compiles
   them today.** The built library's entire external surface is libunicode,
   `platform/Types.hpp`, `platform/Wakeup.hpp` and `crispy/FNV.hpp`.
+
+  **That sentence is true because something enforces it, not because it is written
+  here.** "Never compiled" is not a property of the vendored code — **upstream's own
+  `src/tui/CMakeLists.txt` compiles `runtime/`**, so our exclusion reads like an
+  oversight beside it and is the obvious thing for the next person to "fix". A source
+  list naming `endo/tui/runtime/` therefore **refuses at configure time**
+  (`vendor/CMakeLists.txt`), and the refusal explains the trade and says what a
+  deliberate reversal would have to do. Four absent lines were the only thing holding
+  this up before that guard existed.
 - **The two vocabularies meet in one place.** Vendored code serves the vendored TUI
   only; no vendored file reaches `FastCache::*`, and first-party code reaches the TUI
   through a single adapter layer. If you find yourself wanting to cross that boundary
@@ -111,14 +120,31 @@ immutable and are already the thing being diffed *from*.
 
 ## How to re-sync
 
-Read upstream **blobs**, never a working tree. Both source clones used for the
-original import ran `core.autocrlf=true` and neither upstream ships a
-`.gitattributes`, so their working trees hold CRLF while their blobs hold LF —
+**Read upstream BLOBS, never a working tree.** This is the one sentence that will
+save the next person re-syncing, and it is not obvious until it has cost you an hour.
+
+Both source clones run `core.autocrlf=true` and **neither upstream ships a
+`.gitattributes`**, so their **working trees hold CRLF while their blobs hold LF** —
 46,046 CR bytes across `src/tui` alone, belonging to the clone rather than to
-upstream. `git archive` applies that conversion too. A copy taken from a working
-tree is a copy of one machine's checkout settings, and `.gitattributes` here would
-then normalise it on commit, so the difference only shows up as a failed
-byte-identity check afterwards — or, worse, not at all.
+upstream. **`git archive` applies that conversion too**, which is the part that
+surprises: it reads the repository, so it looks like it should be immune, and it is
+not. The first import here did exactly that and arrived with all 46,046 of them,
+failing its own byte-identity check.
+
+It has teeth in *this* repository specifically. `.gitattributes` enforces
+`* text=auto eol=lf`, so a CRLF copy is silently normalised on commit — the working
+tree you verified and the blob you committed are then different bytes, and the
+identity check that passed before the commit says nothing about what landed. And a
+CRLF `.sh` here does not misbehave, it **fails to start at all**.
+
+So the reader is pinned in the command, not left to remember it:
+
+    -c core.autocrlf=false -c core.eol=lf
+
+`scripts/`-adjacent tooling aside, the durable part is the **mechanism**: the import
+script that produced this tree reads blobs at a pinned SHA, compares every file
+against its blob, asserts the count, and refuses on any CR byte. Re-run that rather
+than re-deriving it.
 
 ```sh
 git -C <endo> -c core.autocrlf=false -c core.eol=lf archive <sha> src/tui | tar -x --strip-components=1 -C vendor/endo
