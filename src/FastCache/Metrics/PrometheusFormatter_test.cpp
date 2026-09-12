@@ -460,3 +460,124 @@ TEST_CASE("A node in an election names no leader rather than an empty one", "[me
     CHECK(body.contains("fastcache_node_consensus_members 2\n"));
     CHECK(body.contains("fastcache_node_consensus_role{role=\"candidate\"} 1\n"));
 }
+
+namespace
+{
+/// A sink that answers exactly like `AtomicMetricsSink` except that it reports one
+/// named counter as one it has no slot for.
+///
+/// This is how the skew is CONSTRUCTED, and constructing it is the whole
+/// difficulty of #1353. The real defect is cross-TU -- a catalogue compiled
+/// against a newer `Counter` than the sink -- and `CounterTable` is
+/// `static_assert`ed to cover every enumerator, so no edit to one file can
+/// produce it and no single translation unit can contain it. What CAN be
+/// reproduced in one TU is the thing the formatter actually observes: a sink that
+/// answers `Carries(x) == false` while the catalogue still carries a row for `x`.
+/// That is the seam the fix put there, and driving it is what makes the case able
+/// to fail.
+///
+/// Deliberately NOT a sink that merely reads zero: a zero is what the defect
+/// produces and what an honest idle counter produces, so a case asserting on the
+/// VALUE could not tell them apart. The case asserts on the LINE.
+class SkewedSink final: public IMetricsSink
+{
+  public:
+    explicit SkewedSink(IMetricsSink::Counter missing) noexcept:
+        _missing { missing }
+    {
+    }
+
+    void Increment(Counter counter, std::uint64_t by = 1) noexcept override
+    {
+        _inner.Increment(counter, by);
+    }
+
+    [[nodiscard]] std::uint64_t Read(Counter counter) const noexcept override
+    {
+        return _inner.Read(counter);
+    }
+
+    [[nodiscard]] bool Carries(Counter counter) const noexcept override
+    {
+        return counter != _missing;
+    }
+
+  private:
+    AtomicMetricsSink _inner;
+    IMetricsSink::Counter _missing;
+};
+
+/// The catalogue row's series name for @p counter, so the case names the series the
+/// way the exporter does rather than writing the string out twice.
+///
+/// Through `DescriptorOf` rather than by indexing `CounterTable`, and the reason is
+/// this file's own subject: a raw `CounterTable[ordinal]` assumes the table covers
+/// every ordinal, which is exactly what the change under test stops the EXPORTER
+/// doing. Written the raw way here it would have been the one lookup in the tree
+/// making the assumption the branch exists to deny -- in the test that proves the
+/// denial. `DescriptorOf` answers nullptr for `Last` and for anything past the end.
+/// @param counter The counter to name.
+/// @return Its Prometheus series name.
+[[nodiscard]] std::string_view PrometheusNameOf(IMetricsSink::Counter counter)
+{
+    auto const* const row = DescriptorOf(counter);
+    REQUIRE(row != nullptr);
+    return row->prometheusName;
+}
+} // namespace
+
+TEST_CASE("A counter the sink has no slot for is omitted and named, never rendered as zero", "[metrics][prometheus][skew]")
+{
+    auto const missing = IMetricsSink::Counter::ConnectionsAdmissionRejected;
+    auto const series = PrometheusNameOf(missing);
+
+    StorageStats const stats;
+    auto const snapshot = MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = Uptime { 42s } };
+
+    // The CONTROL first, and it is not decoration: a guard nobody has watched
+    // ACCEPT is not known to work, and an assertion that the line is absent would
+    // pass just as well against an exporter that had stopped emitting it at all.
+    AtomicMetricsSink healthy;
+    auto const healthyBody = RenderPrometheus(healthy, snapshot);
+    INFO("the control must show this series IS exported on a healthy build");
+    REQUIRE(healthyBody.contains(std::format("{} 0\n", series)));
+    CHECK_FALSE(healthyBody.contains("# SKEW"));
+
+    SkewedSink skewed { missing };
+    skewed.Increment(IMetricsSink::Counter::ConnectionsTotal, 5);
+    auto const body = RenderPrometheus(skewed, snapshot);
+
+    // What DISTINGUISHES the fix from the defect. Under the defect this is the
+    // one line that appears, well-formed, with a plausible value.
+    INFO("body:\n" << body);
+    CHECK_FALSE(body.contains(std::format("{} 0\n", series)));
+
+    // Omission alone is the same failure one step along -- a scrape that is
+    // quietly short. The reason has to be IN the scrape.
+    // The marker AND the series in one needle. Asserting them separately is weaker
+    // than it looks: the marker line embeds the name, so `contains(series)` is
+    // satisfied by construction once `contains("# SKEW")` holds, and neither
+    // assertion can tell a marker naming THIS row from one naming another.
+    CHECK(body.contains(std::format("# SKEW {} is", series)));
+
+    // And nothing else is lost: the skew costs one series, not the endpoint. The
+    // carried counter is asserted with its VALUE rather than by name, which is what
+    // separates "the endpoint survived" from "the endpoint survived and still means
+    // something": a fix that dropped every counter row, or one that rendered the
+    // carried rows as zero, satisfies a name-only check and fails this one.
+    CHECK(body.contains("fastcached_uptime_seconds"));
+    CHECK(body.contains(std::format("{} 5\n", PrometheusNameOf(IMetricsSink::Counter::ConnectionsTotal))));
+
+    // The machine-readable half, and the VALUE rather than the presence. A scraper
+    // discards every `#` comment, so on its own the marker above reaches monitoring
+    // as a series that silently vanished -- indistinguishable from a rename or a
+    // down target. This is the part an alert can fire on, and asserting `1` rather
+    // than "the line is there" is what separates a real count from a line that
+    // always reads zero.
+    CHECK(body.contains("fastcached_metrics_catalogue_skew 1\n"));
+
+    // The control for it: the healthy render carries the same series reading zero,
+    // so `> 0` is a usable alert rather than an absence somebody has to notice.
+    // A zero here is a reading, not a missing line.
+    CHECK(healthyBody.contains("fastcached_metrics_catalogue_skew 0\n"));
+}

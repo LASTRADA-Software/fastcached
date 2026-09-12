@@ -188,7 +188,13 @@ fault.
   The temptation on the above is to render no upstream lines at all, the way
   `SnapshotTiers()` omits a tier the cache does not have. Every counter is exported,
   without exception, and a per-counter "does this apply?" predicate is precisely the
-  mechanism that once left seven of nine live counters unexported. The distinction:
+  mechanism that once left seven of nine live counters unexported. **One carve-out,
+  and it is a different question rather than a softening**: *can this build
+  REPRESENT this counter at all* is about the BUILD, not the world, and a zero there
+  is a number for an event that could not have been counted. A catalogue row the
+  sink has no slot for is omitted and reported as its own series
+  (`fastcached_metrics_catalogue_skew`), never rendered as a plausible zero (#1353).
+  That licenses nothing for the *does this apply* case below. The distinction:
   a *snapshot* value is a reading, so a zero is a claim about the world and absence
   must be spellable -- a *counter* is a tally of events, and zero is the truth about
   events that never happened. What the counters genuinely cannot answer, because

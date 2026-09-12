@@ -304,6 +304,34 @@ TEST_CASE("the TSV rule agrees with the one /fleet.txt writes", "[cli][format][t
     CHECK(Distributed::EscapeDelimited(control) != control);
 }
 
+TEST_CASE("every row the node's delimited table carries is a row this client writes", "[cli][format][tsv]")
+{
+    // The one-spelling property as a DERIVATION rather than as an agreement.
+    //
+    // The case above compares the two encoders over a corpus written out here, so it
+    // answers "do they agree on these seven inputs". This one walks the node's table
+    // and asserts the client's output for EVERY row in it -- so a fifth row added to
+    // `Distributed::DelimitedEscapes` is covered here without this file being touched,
+    // and a client that had gone back to carrying its own copy fails on the row the
+    // copy lacks. That is what separates *shared* from *agreeing today*, which is the
+    // whole of #1334.
+    //
+    // Derived, never listed: a list of the four here would be the third copy of the
+    // thing this change exists to stop having two of.
+    std::size_t rows = 0;
+    for (auto const& row: Distributed::DelimitedEscapes)
+    {
+        CAPTURE(row.byte);
+        CHECK(EscapeTsvField(std::string { row.byte }) == row.spelling);
+        ++rows;
+    }
+
+    // A walk over an empty table asserts nothing while passing, and an empty table is
+    // exactly what a botched consolidation leaves behind.
+    CHECK(rows == Distributed::DelimitedEscapes.size());
+    CHECK(rows > 0);
+}
+
 TEST_CASE("the CSV path is untouched by the TSV rule", "[cli][format][tsv]")
 {
     // A tab is not a CSV special (RFC 4180 names `,` `"` CR and LF), so CSV carries it

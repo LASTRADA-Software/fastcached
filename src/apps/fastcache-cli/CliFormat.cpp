@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CliFormat.hpp"
 
+#include <FastCache/Distributed/FleetText.hpp>
+
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <format>
 #include <ranges>
@@ -429,49 +430,6 @@ namespace
         return out;
     }
 
-    /// One character TSV cannot carry raw, and what it is written as.
-    struct TextEscape
-    {
-        char byte;
-        std::string_view replacement;
-    };
-
-    /// The four `/fleet.txt` spells out, in one pass so the escape character cannot be
-    /// escaped twice.
-    ///
-    /// A table rather than a `switch` for the usual reason, and one that bites here: the
-    /// fifth character this format cannot carry is a row, not a new arm -- and a table is
-    /// also what lets the set be compared against `/fleet.txt`'s by reading rather than
-    /// by tracing control flow.
-    constexpr auto TsvEscapes = std::to_array<TextEscape>({
-        { .byte = '\\', .replacement = "\\\\" },
-        { .byte = '\t', .replacement = "\\t" },
-        { .byte = '\n', .replacement = "\\n" },
-        { .byte = '\r', .replacement = "\\r" },
-    });
-
-    /// What TSV writes for @p byte, or nothing when it may carry it as it is.
-    ///
-    /// A range-based scan rather than `std::ranges::find`, and the reason is
-    /// portability rather than taste: over a `std::array`, libstdc++ and libc++ yield a
-    /// raw POINTER, so clang-tidy's `readability-qualified-auto` demands
-    /// `auto const* const` -- which MSVC, whose iterator is a class type, cannot deduce.
-    /// The first spelling here was the `find` one, and it was red on the analyser and
-    /// would have been red on all three Windows legs for opposite reasons.
-    /// `FleetText.hpp`'s `EscapeFor` scans for exactly this reason and says so.
-    ///
-    /// An empty answer means "carry it literally", which is unambiguous only because no
-    /// row spells a byte as nothing -- the four below are all non-empty, and a row that
-    /// wrote `""` would mean "delete this byte", which no format here wants.
-    /// @param byte The byte to spell.
-    /// @return Its spelling, or an empty view when it needs none.
-    [[nodiscard]] constexpr std::string_view EscapeForTsv(char byte) noexcept
-    {
-        for (auto const& row: TsvEscapes)
-            if (row.byte == byte)
-                return row.replacement;
-        return {};
-    }
 } // namespace
 
 FormatSpec const* DescriptorOf(OutputFormat format) noexcept
@@ -521,6 +479,21 @@ std::string QuoteCsvField(std::string_view field)
     return out;
 }
 
+// The TABLE is the node's -- `Distributed::DelimitedEscapes`, which `/fleet.txt`
+// writes with -- and this file used to carry its own copy of it and its own row
+// type, whose replacement field was even named differently: two names for one
+// concept, which is the worse half of a duplicate because a reader who knows one
+// file does not recognise the other (#1334).
+//
+// What is NOT shared is the WALK, and that is deliberate rather than unfinished.
+// `Distributed::EscapeDelimited` also spells control bytes and replaces invalid
+// UTF-8, because `/fleet.txt` is read by a terminal; this client's TSV carries a
+// cached value a terminal never sees, so it touches only the four.
+// `CliFormat_test.cpp` asserts that divergence in BOTH directions, so calling the
+// node's function here would silently change a format that was already correct --
+// and would redden that case, which is the test doing its job. It is argued HERE
+// rather than beside the table because here is where somebody reaches for the
+// node's function.
 std::string EscapeTsvField(std::string_view field)
 {
     std::string out;
@@ -530,7 +503,11 @@ std::string EscapeTsvField(std::string_view field)
         // One pass over the table, so the escape character is never escaped twice: a
         // two-pass implementation that spells tabs and then backslashes turns one tab
         // into `\\t`, which reads back as a literal backslash followed by a `t`.
-        auto const replacement = EscapeForTsv(ch);
+        //
+        // An empty answer means "carry it literally", unambiguous only because no row
+        // spells a byte as nothing -- a row writing an empty spelling would mean
+        // "delete this byte", which no format here wants.
+        auto const replacement = Distributed::EscapeFor(Distributed::DelimitedEscapes, ch);
         if (replacement.empty())
             out += ch;
         else

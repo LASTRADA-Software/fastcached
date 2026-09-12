@@ -178,6 +178,12 @@ struct MetricsSnapshot
     /// "does this apply?" predicate is the mechanism that once left seven of nine
     /// live counters unexported. Absence is modelled HERE, in the snapshot, the way
     /// `storage`, `storageTiers` and `host` already model it.
+    /// One carve-out, and it is a different QUESTION rather than a softening of
+    /// this one: a row this BUILD cannot represent is omitted and counted by
+    /// `fastcached_metrics_catalogue_skew` (#1353). It is argued once, in
+    /// `.agent/rules/metrics-and-observability.md`, and nothing about it licenses
+    /// dropping a row for the *does this apply to my deployment* reason above.
+    ///
     /// Default-initialized like `storageTiers`, and for a mechanical reason as well
     /// as a semantic one: a designated-initializer list that omits a field WITHOUT a
     /// default member initializer is a clang-tidy error, so a field added without one

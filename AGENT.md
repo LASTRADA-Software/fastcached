@@ -895,7 +895,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   outcome that can be *not attempted* is an enum, not a `bool` — and it is fixed at the seam,
   never at the one call site that noticed.
 - A counter is a tally, so zero is the truth about events that never happened; absence is
-  modelled in the **snapshot**, never by dropping a counter row.
+  modelled in the **snapshot**, never by dropping a counter row. **One carve-out, and it is a
+  different question rather than a softening**: a row this BUILD cannot represent is omitted
+  and counted by `fastcached_metrics_catalogue_skew`, never rendered as a plausible zero.
 - A duration is a `_sum`/`_count` pair, never a gauge.
 - A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
   the split, the `tier` label comes from a table, and a tier the cache does not have renders no
@@ -1075,6 +1077,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   says, where do I end up.** And state what the rule does NOT cover in the refusal itself, or the
   next reader over-applies it and deletes a property that is load-bearing elsewhere.
 - Never silence clang-tidy with `NOLINT` — fix the source.
+- **And `readability-qualified-auto`'s own suggested fix does not COMPILE on MSVC**, so taking
+  the analyser's advice trades a Linux-only lint for a Windows-only build failure. Over a
+  `std::array` libstdc++ and libc++ hand back a raw pointer, so the check asks for
+  `auto const* const`, which MSVC's class-type iterator cannot deduce; writing the type out
+  trips `modernize-use-auto` instead. Use `Core/Ranges.hpp`'s `FindOrNull` / `FindIfOrNull`,
+  or scan for a VALUE and name no iterator.
 - A return type is not part of a function's mangled name on Linux, so two functions differing
   only in return type silently collide.
 - `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure.
