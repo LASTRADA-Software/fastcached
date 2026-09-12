@@ -6160,3 +6160,29 @@ set_tests_properties("cli-text-cell-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
+
+# ----------------------------------------------------------------------------
+# vendor/ is still byte-for-byte what was imported (#134).
+#
+# The copy under vendor/ is third-party source taken verbatim from upstream, and
+# it is only worth having while it stays diffable against upstream -- `git diff
+# <import>..HEAD -- vendor/endo` is the patch that gets contributed back. An edit
+# applied in place breaks nothing here, which is exactly why nothing else would
+# catch it: the build stays green and the loss surfaces months later, when
+# somebody tries to upstream a fix and finds the diff full of local noise.
+#
+# In the default set with the other hygiene checks: it hashes files and compares
+# strings. No compiler, no daemon, no socket -- and no git either, so it answers
+# in a source export too, which is why the manifest holds SHA-256 rather than git
+# blob hashes.
+add_test(
+    NAME "vendor-verbatim"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-verbatim.cmake"
+)
+set_tests_properties("vendor-verbatim" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 300
+)
