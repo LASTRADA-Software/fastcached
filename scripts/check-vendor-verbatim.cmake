@@ -94,6 +94,13 @@ if(NOT EXISTS "${manifestPath}")
 endif()
 
 file(READ "${manifestPath}" manifestRaw)
+
+# NOT redundant, and not about the vendored files: CMake's own `file(WRITE)` emits
+# CRLF on Windows, so the generator above produces a CRLF manifest there while
+# .gitattributes stores it as LF. Without this the check passes for whoever
+# regenerated it and fails for everyone who then checks it out -- or the reverse,
+# depending on which machine ran last. The comparison below is over text, so the
+# line endings have to be settled before it.
 string(REPLACE "\r\n" "\n" manifestRaw "${manifestRaw}")
 
 # Strip comments, then compare the whole thing as TEXT before splitting anything.
